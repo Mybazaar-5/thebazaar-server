@@ -504,42 +504,48 @@ public sealed class V11CompassAndServerParityTests
                 var m = fx.Monsters.First(x => string.Equals(x.Id, tpl.MonsterTemplateId, StringComparison.OrdinalIgnoreCase));
                 Assert.False(MonsterPool.IsExcludedDevOrTestMonsterName(tpl.InternalName));
                 Assert.False(MonsterPool.IsExcludedDevOrTestMonsterName(m.InternalName));
-                Assert.InRange(m.HealthMax, 31, 9999);
-                return (Tpl: tpl, Hp: m.HealthMax, Lv: tpl.MonsterLevel);
+                Assert.InRange(m.HealthMax, 75, 9999);
+                return (Tpl: tpl, Hp: m.HealthMax, Lv: tpl.MonsterLevel, Tier: MonsterPool.GetMonsterTier(tpl));
             }).ToList();
 
-            Assert.True(metas[0].Hp <= metas[1].Hp && metas[1].Hp <= metas[2].Hp,
-                $"Day {day} 野怪血量应呈左<=中<=右梯度: {metas[0].Hp}, {metas[1].Hp}, {metas[2].Hp}");
+            // V13.1 官方规则按品阶与等级左<=中<=右递增（允许低血高阶官方怪如 Day 1 Viper 75HP / Day 5 Drone Operator 850HP / Day 8 Lich 1800HP）
+            Assert.True(metas[0].Tier <= metas[1].Tier && metas[1].Tier <= metas[2].Tier,
+                $"Day {day} 野怪品阶应呈左<=中<=右梯度: {metas[0].Tier}, {metas[1].Tier}, {metas[2].Tier}");
+            Assert.True(metas[0].Lv <= metas[1].Lv && metas[1].Lv <= metas[2].Lv,
+                $"Day {day} 野怪等级应呈左<=中<=右梯度: {metas[0].Lv}, {metas[1].Lv}, {metas[2].Lv}");
 
             if (day == 1)
             {
                 Assert.Equal(1, metas[0].Lv);
-                Assert.InRange(metas[0].Hp, 75, 150);
+                Assert.InRange(metas[0].Hp, 75, 100);
                 Assert.Equal(1, metas[1].Lv);
-                Assert.InRange(metas[1].Hp, 75, 150);
+                Assert.InRange(metas[1].Hp, 75, 100);
                 Assert.Equal(2, metas[2].Lv);
-                Assert.InRange(metas[2].Hp, 200, 300);
+                Assert.InRange(metas[2].Hp, 75, 100);
             }
             else if (day == 2)
             {
-                Assert.InRange(metas[0].Lv, 1, 2);
-                Assert.InRange(metas[0].Hp, 100, 300);
-                Assert.InRange(metas[1].Lv, 2, 3);
-                Assert.InRange(metas[1].Hp, 100, 350);
-                Assert.InRange(metas[2].Lv, 3, 4);
-                Assert.InRange(metas[2].Hp, 350, 600);
+                Assert.Equal(2, metas[0].Lv);
+                Assert.InRange(metas[0].Hp, 200, 300);
+                Assert.Equal(3, metas[1].Lv);
+                Assert.InRange(metas[1].Hp, 300, 350);
+                Assert.Equal(4, metas[2].Lv);
+                Assert.InRange(metas[2].Hp, 450, 600);
             }
             else if (day == 3)
             {
-                Assert.Equal(2, metas[0].Lv);
-                Assert.InRange(metas[0].Hp, 200, 450);
-                Assert.Equal(3, metas[1].Lv);
-                Assert.InRange(metas[1].Hp, 200, 450);
-                Assert.Equal(4, metas[2].Lv);
+                Assert.Equal(3, metas[0].Lv);
+                Assert.InRange(metas[0].Hp, 300, 350);
+                Assert.Equal(4, metas[1].Lv);
+                Assert.InRange(metas[1].Hp, 450, 600);
+                Assert.Equal(5, metas[2].Lv);
+                Assert.InRange(metas[2].Hp, 650, 700);
             }
             else
             {
-                Assert.True(metas[0].Lv <= day && metas[1].Lv >= metas[0].Lv && metas[2].Lv >= metas[1].Lv);
+                Assert.Equal(day, metas[0].Lv);
+                Assert.Equal(day + 1, metas[1].Lv);
+                Assert.Equal(day + 2, metas[2].Lv);
             }
         }
 

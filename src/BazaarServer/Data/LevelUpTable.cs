@@ -630,9 +630,21 @@ public sealed class LevelUpTable
                     if (!reqOk) continue;
                 }
 
-                // 关键修复（P1-12）：严格接入 includeCommonAndHero 与 excludePlayerHero：
-                // 对随机查询中的 Item，除非显式声明 includeCommonAndHero 或 IdList，否则排除纯 Common 野怪专属中立物品。
-                if (!ignoreHero && tpl.Heroes.Count > 0)
+                // 关键修复（V13.1 问题 #5）：GameData.db 中 Heroes==["Common"] 的 124 张活跃技能有 123 张是野怪专属技能，
+                // 跨职业通用技能本身已在 Heroes 中显式列全全部 8 英雄；因此对 Item 与 Skill 均禁止无条件放行 Common，
+                // 仅在显式声明 includeCommonAndHero、IdList 或正向 ConstraintHero 时才放行。
+                bool hasPositiveHeroConstraint = false;
+                foreach (var qf in queryFilters)
+                {
+                    var cons = qf.GetSingleConstraint(GameDatabaseLoader.JsonOptions);
+                    if (cons != null && HasPositiveHeroConstraint(cons))
+                    {
+                        hasPositiveHeroConstraint = true;
+                        break;
+                    }
+                }
+
+                if (!ignoreHero && !hasPositiveHeroConstraint && tpl.Heroes.Count > 0)
                 {
                     if (excludePlayerHero)
                     {
@@ -642,7 +654,9 @@ public sealed class LevelUpTable
                     else
                     {
                         bool matchesPlayerHero = tpl.Heroes.Contains(playerHero, StringComparer.OrdinalIgnoreCase);
-                        bool allowCommon = !string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                        bool isItemOrSkill = string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                                          || string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase);
+                        bool allowCommon = !isItemOrSkill
                                         || hasExplicitIdList
                                         || includeCommonAndHero;
                         bool matchesCommon = allowCommon && tpl.Heroes.Contains(HeroNames.Common, StringComparer.OrdinalIgnoreCase);
@@ -811,6 +825,23 @@ public sealed class LevelUpTable
         }
 
         return Math.Min(limit, maxPossiblePicks) >= 3;
+    }
+
+    private static bool HasPositiveHeroConstraint(RuleNode? node, bool inverted = false)
+    {
+        if (node == null) return false;
+        bool nextInverted = inverted ^ (node.IsNot == true);
+        if (!nextInverted && node.Type is "ConstraintHero" or "ConstraintIsOnlyHero" && node.Heroes is { Count: > 0 })
+            return true;
+        if (node.Type is "ConstraintAnd" or "ConstraintOr")
+        {
+            foreach (var sub in node.GetConstraintList(GameDatabaseLoader.JsonOptions))
+            {
+                if (HasPositiveHeroConstraint(sub, nextInverted))
+                    return true;
+            }
+        }
+        return false;
     }
 
     private LevelUpEntry? ResolveLevelEntry(int targetNewLevel)

@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 1,
+  "modId": "demo-forge",
+  "events": [
+    {
+      "eventId": "demo-forge:event_forge_dock",
+      "eventType": "EventEncounter",
+      "baseVisualTemplateId": "11287697-dd45-4edc-9539-780a26001043",
+      "titleZh": "星港秘密锻造坞",
+      "descZh": "一名黑市匠人正守着滚烫的星火炉，愿意为你淬火或回收废料。",
+      "heroes": ["Common"],
+      "minDay": 2,
+      "maxDay": 10,
+      "weight": 5.0,
+      "steps": [
+        {
+          "customId": "demo-forge:step_enter_inner_room",
+          "type": "EncounterStep",
+          "size": "Medium",
+          "startingTier": "Bronze",
+          "baseVisualTemplateId": "0659ca31-9f4d-412e-84b2-d535b502afa6",
+          "titleZh": "支付 4 金币进入内室",
+          "descZh": "花费 4 金币进入密室，领取锻造好的风暴弯刀。",
+          "attributes": { "BuyPrice": 4 },
+          "abilities": {},
+          "nextEncounterOnSelection": [
+            { "id": "demo-forge:event_forge_inner", "weight": 1.0 }
+          ]
+        },
+        {
+          "customId": "demo-forge:step_salvage_scrap",
+          "type": "EncounterStep",
+          "size": "Medium",
+          "startingTier": "Bronze",
+          "baseVisualTemplateId": "0d275fc2-b4de-42d6-a0c4-ba7c76c950b2",
+          "titleZh": "回收废料换取赏金",
+          "descZh": "立刻获得 5 金币与 1 点经验。",
+          "attributes": { "BuyPrice": 0 },
+          "abilities": {
+            "0": {
+              "id": "0",
+              "trigger": { "$type": "TTriggerOnCardSelected" },
+              "action": {
+                "$type": "TActionAnd",
+                "actions": [
+                  {
+                    "$type": "TActionPlayerModifyAttribute",
+                    "attributeType": "Gold",
+                    "operation": "Add",
+                    "value": { "$type": "TFixedValue", "value": 5.0 },
+                    "target": { "$type": "TTargetPlayerAbsolute", "targetMode": "Player" }
+                  },
+                  {
+                    "$type": "TActionPlayerModifyAttribute",
+                    "attributeType": "Experience",
+                    "operation": "Add",
+                    "value": { "$type": "TFixedValue", "value": 1.0 },
+                    "target": { "$type": "TTargetPlayerAbsolute", "targetMode": "Player" }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "eventId": "demo-forge:event_forge_inner",
+      "eventType": "EventEncounter",
+      "baseVisualTemplateId": "04ac552f-c292-455e-bf5f-438119dfa196",
+      "titleZh": "锻造坞内室",
+      "descZh": "锻炉边摆放着刚淬火完成的风暴弯刀。",
+      "heroes": ["Common"],
+      "minDay": 99,
+      "maxDay": 99,
+      "weight": 0.0,
+      "steps": [
+        {
+          "customId": "demo-forge:step_claim_storm_kukri",
+          "type": "EncounterStep",
+          "size": "Medium",
+          "startingTier": "Silver",
+          "baseVisualTemplateId": "0c71aef1-c049-483a-b9a0-19c5005b4fc7",
+          "titleZh": "带走风暴弯刀",
+          "descZh": "获得一件【风暴弯刀】。",
+          "attributes": { "BuyPrice": 0 },
+          "abilities": {
+            "0": {
+              "id": "0",
+              "trigger": { "$type": "TTriggerOnCardSelected" },
+              "action": {
+                "$type": "TActionGameSpawnCards",
+                "target": { "$type": "TTargetPlayerAbsolute", "targetMode": "Player" },
+                "spawnContext": {
+                  "$type": "TSpawnContextQuery",
+                  "limit": { "$type": "TFixedValue", "value": 1.0 },
+                  "groups": [
+                    {
+                      "$type": "TSpawnGroup",
+                      "filters": [
+                        { "$type": "TSpawnFilterIdList", "ids": ["demo-forge:storm_kukri"] }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

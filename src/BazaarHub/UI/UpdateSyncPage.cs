@@ -22,6 +22,7 @@ public sealed class UpdateSyncPage : UserControl
 
     public event Action<bool>? SyncRequested; // true = 下载同步, false = 仅检查
     public event Action? OpenModCacheRequested;
+    public event Action? OpenWorkshopRequested;
 
     public UpdateSyncPage()
     {
@@ -61,6 +62,16 @@ public sealed class UpdateSyncPage : UserControl
             AutoSize = true,
             Location = new Point(2, 30)
         });
+        var btnWorkshop = new GoldButton
+        {
+            Text = "打开创意工坊编辑器（Web）",
+            Variant = GoldButtonVariant.OutlineGold,
+            Size = new Size(204, 34),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            Location = new Point(header.Width - 206, 8)
+        };
+        btnWorkshop.Click += (_, _) => OpenWorkshopRequested?.Invoke();
+        header.Controls.Add(btnWorkshop);
         root.Controls.Add(header, 0, 0);
 
         // 三张统计概览卡

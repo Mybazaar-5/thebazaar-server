@@ -264,18 +264,41 @@ public static class MonsterPool
             return pool[rng.Next(pool.Count)];
         }
 
-        CardTier desiredSlotTier = slot switch
+        // V13.1 问题 #3：回退分桶目标品阶与等级严格对齐官方公式：
+        //   · Day 1：Left=Lv1 Bronze / Mid=Lv1 Bronze / Right=Lv2 Silver；
+        //   · Day 2..10：Left=Lv(D) Bronze / Mid=Lv(D+1) Silver / Right=Lv(D+2) Gold+；
+        //   · Day 11：Left=Lv11 Silver / Mid=Lv12 Gold / Right=Lv13 Diamond+；
+        //   · Day 12+：Left=Lv12 Gold / Mid=Lv13 Diamond / Right=Lv15 Legendary。
+        CardTier desiredSlotTier = day switch
         {
-            EMonsterSlotTier.LeftBronze => CardTier.Bronze,
-            EMonsterSlotTier.MidSilver => CardTier.Silver,
-            _ => CardTier.Gold,
+            <= 1 => slot == EMonsterSlotTier.RightGold ? CardTier.Silver : CardTier.Bronze,
+            11 => slot switch
+            {
+                EMonsterSlotTier.LeftBronze => CardTier.Silver,
+                EMonsterSlotTier.MidSilver => CardTier.Gold,
+                _ => CardTier.Diamond,
+            },
+            >= 12 => slot switch
+            {
+                EMonsterSlotTier.LeftBronze => CardTier.Gold,
+                EMonsterSlotTier.MidSilver => CardTier.Diamond,
+                _ => CardTier.Legendary,
+            },
+            _ => slot switch
+            {
+                EMonsterSlotTier.LeftBronze => CardTier.Bronze,
+                EMonsterSlotTier.MidSilver => CardTier.Silver,
+                _ => CardTier.Gold,
+            },
         };
+
+        bool allowHigherTierForSlot = slot == EMonsterSlotTier.RightGold;
 
         List<CardPool.CardTemplate> PreferTierAndMonotonic(IReadOnlyList<CardPool.CardTemplate> source)
         {
             var exactSlot = source
                 .Where(c => GetMonsterTier(c) >= minTier
-                         && (slot == EMonsterSlotTier.RightGold ? GetMonsterTier(c) >= desiredSlotTier : GetMonsterTier(c) == desiredSlotTier))
+                         && (allowHigherTierForSlot ? GetMonsterTier(c) >= desiredSlotTier : GetMonsterTier(c) == desiredSlotTier))
                 .ToList();
             if (exactSlot.Count > 0) return exactSlot;
 
@@ -288,34 +311,18 @@ public static class MonsterPool
             return slot switch
             {
                 EMonsterSlotTier.LeftBronze => Pick(
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 1 && GetMonsterHealthMax(c, repo) is >= 75 and <= 150).ToList()),
+                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 1 && GetMonsterTier(c) == CardTier.Bronze).ToList()),
                     PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 1).ToList())),
                 EMonsterSlotTier.MidSilver => Pick(
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 1 && GetMonsterHealthMax(c, repo) is >= 75 and <= 150 && GetMonsterHealthMax(c, repo) >= minHp).ToList()),
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) is 1 or 2 && GetMonsterHealthMax(c, repo) is >= 100 and <= 200 && GetMonsterHealthMax(c, repo) >= minHp).ToList())),
+                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 1 && GetMonsterTier(c) == CardTier.Bronze).ToList()),
+                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) is 1 or 2).ToList())),
                 _ => Pick(
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 2 && GetMonsterHealthMax(c, repo) is >= 200 and <= 300 && GetMonsterHealthMax(c, repo) > minHp).ToList()),
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 2 && GetMonsterHealthMax(c, repo) is >= 200 and <= 300).ToList())),
+                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 2 && GetMonsterTier(c) == CardTier.Silver).ToList()),
+                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 2).ToList())),
             };
         }
 
-        if (day == 2)
-        {
-            return slot switch
-            {
-                EMonsterSlotTier.LeftBronze => Pick(
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) == 2 && GetMonsterHealthMax(c, repo) is >= 100 and <= 200).ToList()),
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) is 1 or 2 && GetMonsterHealthMax(c, repo) <= 200).ToList())),
-                EMonsterSlotTier.MidSilver => Pick(
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) is 2 or 3 && GetMonsterHealthMax(c, repo) is >= 200 and <= 300 && GetMonsterHealthMax(c, repo) >= minHp).ToList()),
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) is 2 or 3 && GetMonsterHealthMax(c, repo) is >= 200 and <= 350 && GetMonsterHealthMax(c, repo) >= minHp).ToList())),
-                _ => Pick(
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) is 3 or 4 && GetMonsterHealthMax(c, repo) is >= 350 and <= 600 && GetMonsterHealthMax(c, repo) > minHp).ToList()),
-                    PreferTierAndMonotonic(all.Where(c => GetEffectiveMonsterLevel(c, repo) is 3 or 4 && GetMonsterHealthMax(c, repo) is >= 350 and <= 600 && GetMonsterHealthMax(c, repo) >= minHp).ToList())),
-            };
-        }
-
-        int maxAvailLv = all.Count > 0 ? all.Max(c => GetEffectiveMonsterLevel(c, repo)) : day + 1;
+        int maxAvailLv = all.Count > 0 ? all.Max(c => GetEffectiveMonsterLevel(c, repo)) : Math.Max(day + 2, 15);
         List<CardPool.CardTemplate> GetBucketWithDirection(int targetLv, int dir)
         {
             for (int step = 0; step <= 4; step++)
@@ -339,46 +346,41 @@ public static class MonsterPool
             return all.OrderBy(c => Math.Abs(GetEffectiveMonsterLevel(c, repo) - targetLv)).ToList();
         }
 
-        var (targetLevel, dir) = slot switch
+        var (targetLevel, dir) = day switch
         {
-            EMonsterSlotTier.LeftBronze => (Math.Max(1, day - 1), -1),
-            EMonsterSlotTier.MidSilver => (day, -1),
-            _ => (day + 1, +1),
+            11 => slot switch
+            {
+                EMonsterSlotTier.LeftBronze => (11, -1),
+                EMonsterSlotTier.MidSilver => (12, -1),
+                _ => (13, +1),
+            },
+            >= 12 => slot switch
+            {
+                EMonsterSlotTier.LeftBronze => (12, -1),
+                EMonsterSlotTier.MidSilver => (13, -1),
+                _ => (15, +1),
+            },
+            _ => slot switch
+            {
+                EMonsterSlotTier.LeftBronze => (day, -1),
+                EMonsterSlotTier.MidSilver => (day + 1, -1),
+                _ => (day + 2, +1),
+            },
         };
-        var bucket = GetBucketWithDirection(targetLevel, dir);
-        if (day == 3 && slot == EMonsterSlotTier.LeftBronze)
-        {
-            var filtered = PreferTierAndMonotonic(bucket.Where(c => GetMonsterHealthMax(c, repo) is >= 200 and <= 450).ToList());
-            if (filtered.Count > 0)
-                return Pick(filtered, PreferTierAndMonotonic(bucket));
-        }
 
+        var bucket = GetBucketWithDirection(targetLevel, dir);
         var orderedPref = PreferTierAndMonotonic(
             bucket.Where(c => GetMonsterTier(c) >= minTier
-                           && GetEffectiveMonsterLevel(c, repo) >= minLevel
-                           && (preferStrictlyHigherHp ? GetMonsterHealthMax(c, repo) > minHp : GetMonsterHealthMax(c, repo) >= minHp)
-                           && (day != 3 || slot != EMonsterSlotTier.MidSilver || GetMonsterHealthMax(c, repo) <= 450))
+                           && GetEffectiveMonsterLevel(c, repo) >= minLevel)
                   .ToList());
         if (orderedPref.Count == 0)
         {
             orderedPref = PreferTierAndMonotonic(
                 all.Where(c => !used.Contains(c.Id)
                             && GetMonsterTier(c) >= minTier
-                            && GetEffectiveMonsterLevel(c, repo) >= minLevel
-                            && (preferStrictlyHigherHp ? GetMonsterHealthMax(c, repo) > minHp : GetMonsterHealthMax(c, repo) >= minHp))
+                            && GetEffectiveMonsterLevel(c, repo) >= minLevel)
                    .OrderBy(c => Math.Abs(GetEffectiveMonsterLevel(c, repo) - targetLevel))
-                   .ThenBy(c => GetMonsterHealthMax(c, repo))
                    .Take(6)
-                   .ToList());
-        }
-        if (orderedPref.Count == 0 && preferStrictlyHigherHp)
-        {
-            orderedPref = PreferTierAndMonotonic(
-                all.Where(c => !used.Contains(c.Id)
-                            && GetMonsterTier(c) >= minTier
-                            && GetEffectiveMonsterLevel(c, repo) >= minLevel
-                            && GetMonsterHealthMax(c, repo) >= minHp)
-                   .OrderBy(c => Math.Abs(GetEffectiveMonsterLevel(c, repo) - targetLevel))
                    .ToList());
         }
         return Pick(orderedPref, PreferTierAndMonotonic(bucket));

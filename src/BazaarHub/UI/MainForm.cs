@@ -97,7 +97,17 @@ public sealed class MainForm : Form
         _navPerf.Click += (_, _) => SwitchPage(2);
         _navDiag.Click += (_, _) => SwitchPage(3);
 
-        navStack.Controls.AddRange(new Control[] { _navLaunch, _navSync, _navPerf, _navDiag });
+        var btnSidebarWorkshop = new GoldButton
+        {
+            Text = "创意工坊编辑器 (Web)",
+            Variant = GoldButtonVariant.OutlineGold,
+            Width = 208,
+            Height = 40,
+            Margin = new Padding(0, 14, 0, 0)
+        };
+        btnSidebarWorkshop.Click += async (_, _) => await OpenWorkshopInBrowserAsync();
+
+        navStack.Controls.AddRange(new Control[] { _navLaunch, _navSync, _navPerf, _navDiag, btnSidebarWorkshop });
 
         // 底部迷你状态面板
         var footerPanel = new Panel { Dock = DockStyle.Bottom, Height = 92, BackColor = HubTheme.BgSidebar, Padding = new Padding(14, 10, 14, 12) };
@@ -176,9 +186,11 @@ public sealed class MainForm : Form
         _launchPage.ProbeRefreshRequested += async () => await RefreshAllServerProbesAsync();
         _launchPage.SavePlayerAndConfigRequested += () => SaveClientConfigFromUi(showFeedback: true);
         _launchPage.LaunchRequested += async () => await LaunchWorkflowAsync();
+        _launchPage.OpenWorkshopRequested += async () => await OpenWorkshopInBrowserAsync();
 
         // 标签页 2 事件
         _syncPage.SyncRequested += async applyDownloads => await RunManualSyncAsync(applyDownloads);
+        _syncPage.OpenWorkshopRequested += async () => await OpenWorkshopInBrowserAsync();
         _syncPage.OpenModCacheRequested += () =>
         {
             if (_gameInstall?.IsValidGameInstall == true)
@@ -681,6 +693,56 @@ public sealed class MainForm : Form
         catch
         {
             // 忽略打开资源管理器失败
+        }
+    }
+
+    /// <summary>
+    /// 一键在系统默认浏览器打开当前所选服务器的零代码 Web 创意工坊（/workshop/）；
+    /// 若当前处于本地单机离线模式且本机 8080 服务尚未就绪，则自动拉起托管单机服后再打开。
+    /// </summary>
+    private async Task OpenWorkshopInBrowserAsync()
+    {
+        try
+        {
+            ServerMode mode = _launchPage.SelectedMode;
+            string serverBase = LauncherConfigService.ResolveServerBase(mode, _launchPage.CustomServerUrl);
+
+            if (mode == ServerMode.PureOfficial || string.IsNullOrWhiteSpace(serverBase))
+            {
+                DialogResult choice = MessageBox.Show(
+                    this,
+                    "当前处于「纯净官方原版」模式。是否自动拉起本机单机服务器并打开本地零代码创意工坊（http://127.0.0.1:8080/workshop/）？",
+                    "打开创意工坊编辑器",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+                if (choice != DialogResult.Yes) return;
+                mode = ServerMode.LocalStandalone;
+                serverBase = LauncherConstants.LocalStandaloneUrl;
+            }
+
+            if (mode == ServerMode.LocalStandalone)
+            {
+                ServerProbeResult probe = await _probeService.ProbeAsync(LauncherConstants.LocalStandaloneUrl);
+                if (!probe.IsOnline)
+                {
+                    AppendLog("[工坊] 正在自动拉起本地单机服务端以承载 /workshop/ 创意工坊编辑器...");
+                    (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog);
+                    if (!ready)
+                    {
+                        MessageBox.Show(this, $"无法启动本地单机服务端：\n{msg}", "创意工坊启动失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        return;
+                    }
+                }
+            }
+
+            string workshopUrl = $"{serverBase.TrimEnd('/')}/workshop/";
+            AppendLog($"[工坊] 正在浏览器打开创意工坊编辑器：{workshopUrl}");
+            Process.Start(new ProcessStartInfo(workshopUrl) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[错误] 打开创意工坊编辑器失败：{ex.Message}");
+            MessageBox.Show(this, $"打开创意工坊编辑器失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 

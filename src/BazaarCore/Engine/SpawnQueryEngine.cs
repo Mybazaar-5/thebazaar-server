@@ -230,15 +230,18 @@ public static class SpawnQueryEngine
                 }
             }
 
-            // 若多组 Sequential 仍有未填满的配额，从无显式 Limit 的有效组补足至 totalLimit
+            // 若多组 Sequential 仍有未填满的配额，仅对具备多选潜力（含 Query / 多 ID 列表 / Target）且无显式 Limit 的有效组补足至 totalLimit，
+            // 彻底消除对单 ID 固定选项组（如 Tiny Furry Creature / BazaarCON / The Docks 等 11 个事件）的 40 次重复空转。
+            var refillableSeqGroups = eligibleSeqGroups
+                .Where(g => g.Limit == null && HasMultiPickPotential(g))
+                .ToList();
             int seqSafety = 0;
-            while (results.Count < totalLimit && eligibleSeqGroups.Count > 0 && seqSafety++ < 40)
+            while (results.Count < totalLimit && refillableSeqGroups.Count > 0 && seqSafety++ < 40)
             {
                 bool anyAdded = false;
-                foreach (var grp in eligibleSeqGroups)
+                foreach (var grp in refillableSeqGroups)
                 {
                     if (results.Count >= totalLimit) break;
-                    if (grp.Limit != null) continue;
                     int? curMaxWidth = maxItemSlotWidthProvider?.Invoke();
                     var picked = PickFromGroup(grp, topBehaviors, ctx, results, ownedLookup, validAssetLookup, archetypeResolver, rules, curMaxWidth, spawnAppliesTiny);
                     if (picked != null && (tryAcceptCard == null || tryAcceptCard(picked)))
@@ -379,6 +382,27 @@ public static class SpawnQueryEngine
     private static RuleNode? PickWeightedGroup(List<RuleNode> groups, Random rng)
         => PickWeighted(groups, g => g.RandomWeight ?? 100, rng);
 
+    /// <summary>
+    /// 判断 Sequential 分组是否具备跨多次抽取产出不同卡牌的潜力（含 Query / Target / 多 ID 列表），
+    /// 避免在第二轮补抽时对单 ID 固定选项组（如 Tiny Furry Creature / BazaarCON / The Docks）无意义空转。
+    /// </summary>
+    private static bool HasMultiPickPotential(RuleNode grp)
+    {
+        if (grp.Filters is not { Count: > 0 } filters)
+            return false;
+
+        foreach (var f in filters)
+        {
+            if (f.Type is "TSpawnFilterQuery" or "TSpawnFilterTarget" or "TSpawnFilterUpgrade")
+                return true;
+            if (f.Type == "TSpawnFilterIdList" && f.Ids is { Count: > 1 })
+                return true;
+        }
+        return false;
+    }
+
+    private const string FaraiEncounterId = "412fb3ec-88de-40b4-a475-10e583189d8a";
+
     private static CardInstance? PickFromGroup(
         RuleNode grp,
         List<RuleNode> topBehaviors,
@@ -464,7 +488,17 @@ public static class SpawnQueryEngine
             {
                 bool isSynthetic = GameDataRepository.IsSyntheticTestTemplate(tpl);
                 bool isExplicitSynthetic = (idListFilter != null || targetTemplateIds != null) && isSynthetic;
-                if (string.Equals(tpl.SpawningEligibility, "Never", StringComparison.OrdinalIgnoreCase) && !isExplicitSynthetic)
+                // V13.1 问题 #6：Farai（法莱，412fb3ec）的 29 张商人送货包裹在 DB 中标为 Never，但 100% 在资产白名单且具简中译名；
+                // 仅在 Farai 自身显式 IdList 上下文中对其 Package 子卡优雅放行，防止 Farai 选项残缺或空架。
+                bool isFaraiExplicitPackage = idListFilter != null
+                    && string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                    && (tpl.InternalName?.Contains("Package", StringComparison.OrdinalIgnoreCase) == true)
+                    && (string.Equals(ctx.CurrentEncounterId, FaraiEncounterId, StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(ctx.SelfCard?.Template.Id, FaraiEncounterId, StringComparison.OrdinalIgnoreCase));
+
+                if (string.Equals(tpl.SpawningEligibility, "Never", StringComparison.OrdinalIgnoreCase)
+                    && !isExplicitSynthetic
+                    && !isFaraiExplicitPackage)
                     return false;
 
                 bool isAlways = string.Equals(tpl.SpawningEligibility, "Always", StringComparison.OrdinalIgnoreCase);
@@ -472,8 +506,8 @@ public static class SpawnQueryEngine
 
                 if (idListFilter != null)
                 {
-                    // TSpawnFilterIdList 显式放行有效且具简中译名的 Always / GuidOnly（如 Fates/Crossroads/Expedition 房间与门票），Never 严格禁用
-                    if (!isAlways && !isGuidOnly && !isExplicitSynthetic)
+                    // TSpawnFilterIdList 显式放行有效且具简中译名的 Always / GuidOnly（如 Fates/Crossroads/Expedition 房间与门票），Never 严格禁用（Farai 官方包裹除外）
+                    if (!isAlways && !isGuidOnly && !isExplicitSynthetic && !isFaraiExplicitPackage)
                         return false;
                 }
                 else if (targetTemplateIds == null && !isAlways && !isSynthetic)
@@ -525,9 +559,11 @@ public static class SpawnQueryEngine
                     return false;
 
                 // 未启用 IgnoreHero 且未显式声明正向 ConstraintHero/ConstraintIsOnlyHero 时：
-                // - Item：仅匹配当前玩家英雄（或携带 TSpawnBehaviorExcludePlayerHero 时的其他可玩英雄，以及无归属测试模板），
-                //   严格排除仅属于 Common 的中立野怪物品（除非携带 TSpawnBehaviorIncludeCommonAndHero、IdList 或显式允许 Loot）；
-                // - Skill / 遭遇卡：允许当前玩家英雄（或 ExcludePlayerHero 下的其他英雄）及 Common 归属卡。
+                // - Item / Skill：仅匹配当前玩家英雄（或携带 TSpawnBehaviorExcludePlayerHero 时的其他可玩英雄，以及无归属测试模板）；
+                //   V13.1 问题 #5 根治：GameData.db 中 Heroes==["Common"] 的 124 张活跃技能有 123 张为野怪专属技能，
+                //   跨职业通用技能本身已在 Heroes 中显式列全全部 8 位英雄，故仅在显式 ConstraintHero:["Common"]（如 Zurphin's Safari / Tiny Furry 5%）、
+                //   TSpawnBehaviorIncludeCommonAndHero、IdList 或显式允许 Loot 时才放行 Common；
+                // - 遭遇卡（EventEncounter / EncounterStep / PedestalEncounter）：继续允许 Common 归属。
                 if (!ignoreHero && !hasPositiveHeroConstraint)
                 {
                     bool isCrossHeroMayhem = rules?.SpecialModeId == ESpecialModeId.CrossHeroMayhem;
@@ -548,7 +584,9 @@ public static class SpawnQueryEngine
                         matchesAllowedHero = tpl.Heroes.Count == 0
                             || tpl.Heroes.Contains(ctx.SelfPlayer.Hero, StringComparer.OrdinalIgnoreCase);
                     }
-                    bool allowCommon = !string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                    bool isItemOrSkill = string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                                      || string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase);
+                    bool allowCommon = !isItemOrSkill
                                     || idListFilter != null
                                     || includeCommonAndHero
                                     || (allowsLootTag && tpl.Tags.Contains("Loot", StringComparer.OrdinalIgnoreCase));
@@ -618,6 +656,11 @@ public static class SpawnQueryEngine
                     AttachedStandardPrices = ctx.Repo?.GameMode.StandardPrices
                 };
             }
+
+            // V13.1 问题 #5：100% 纯升级组（如 Grandmaster，UpgradeChance >= 1.0）在无可升级的已拥有卡牌时直接返回 null，
+            // 严禁跌落到下方全新卡池并在 IgnoreHero 作用下抽出跨职业或野怪技能。
+            if (upgradeFilter.UpgradeChance!.Value >= 1.0 - 1e-9)
+                return null;
         }
 
         IEnumerable<CardTemplate> pool;
@@ -675,7 +718,8 @@ public static class SpawnQueryEngine
             candidates.Add(tpl);
         }
 
-        // 若仅因去重导致池空，优先从 ruleCompliantPool 恢复（绝不绕过 PassesGroupTemplateRules 及显式 AllowPlayerDuplicates=false 的禁止玩家重复约束）
+        // 若仅因去重导致池空，优先从 ruleCompliantPool 恢复（绝不绕过 PassesGroupTemplateRules 及显式 AllowPlayerDuplicates=false 的禁止玩家重复约束）；
+        // V13.1 问题 #6：在 !allowDup 模式下绝不把已在 alreadyPicked 中的重复模板塞回结果，防止单 ID 组空转重复发卡。
         if (candidates.Count == 0 && ruleCompliantPool.Count > 0 && (idListFilter?.Ids != null || allowDup))
         {
             var fallbackPool = (explicitForbidPlayerDup && targetTemplateIds == null)
@@ -684,7 +728,7 @@ public static class SpawnQueryEngine
             candidates = fallbackPool
                 .Where(c => !alreadyPicked.Any(a => a.Template.Id == c.Id))
                 .ToList();
-            if (candidates.Count == 0)
+            if (candidates.Count == 0 && allowDup)
                 candidates = fallbackPool;
         }
         if (candidates.Count == 0) return null;

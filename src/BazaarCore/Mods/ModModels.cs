@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using BazaarCore.Data;
 using BazaarCore.Models;
@@ -12,6 +13,9 @@ public sealed class ModContentRoots
     [JsonPropertyName("cards")]
     public string Cards { get; set; } = "cards/*.json";
 
+    [JsonPropertyName("patches")]
+    public string Patches { get; set; } = "patches/*.json";
+
     [JsonPropertyName("events")]
     public string Events { get; set; } = "events/*.json";
 
@@ -22,7 +26,10 @@ public sealed class ModContentRoots
     public string Localization { get; set; } = "localization/zh-CN.json";
 
     [JsonPropertyName("assets")]
-    public string Assets { get; set; } = "assets/*.*";
+    public string Assets { get; set; } = "assets/*.png";
+
+    [JsonPropertyName("artManifest")]
+    public string? ArtManifest { get; set; } = "assets/art_manifest.json";
 }
 
 /// <summary>
@@ -374,6 +381,41 @@ public sealed class CustomCardDefinition
     [JsonPropertyName("rewardDefeat")]
     public CombatRewardData? RewardDefeat { get; set; }
 
+    /// <summary>用于 Gate #1 静态检测非引擎废字段（如奇遇步骤中虚构的 effects / costGold）。</summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; set; }
+
+    /// <summary>
+    /// 标准化四阶能力与光环绑定：若已声明 <see cref="Tiers"/> 且所有阶均未显式列出 abilityIds/auraIds，
+    /// 则自动为各阶补齐卡模板声明的全部 Abilities/Auras Key，彻底根治自定义卡战斗 0 触发。
+    /// </summary>
+    public bool NormalizeTierBindings()
+    {
+        if (Tiers == null || Tiers.Count == 0)
+            return false;
+
+        bool changed = false;
+        if (Abilities.Count > 0 && !Tiers.Values.Any(t => t.AbilityIds.Count > 0))
+        {
+            var allAbilityKeys = Abilities.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList();
+            foreach (var td in Tiers.Values)
+            {
+                td.AbilityIds.AddRange(allAbilityKeys);
+            }
+            changed = true;
+        }
+        if (Auras.Count > 0 && !Tiers.Values.Any(t => t.AuraIds.Count > 0))
+        {
+            var allAuraKeys = Auras.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList();
+            foreach (var td in Tiers.Values)
+            {
+                td.AuraIds.AddRange(allAuraKeys);
+            }
+            changed = true;
+        }
+        return changed;
+    }
+
     /// <summary>
     /// 结合已校验的原版载体模板转换为运行时可由 CombatSimulator / SpawnQueryEngine 直接执行的标准 <see cref="CardTemplate"/>。
     /// </summary>
@@ -400,6 +442,27 @@ public sealed class CustomCardDefinition
             });
         }
 
+        Dictionary<string, TierData>? clonedTiers = null;
+        if (Tiers != null)
+        {
+            bool autoFillAbilities = Abilities.Count > 0 && !Tiers.Values.Any(t => t.AbilityIds.Count > 0);
+            bool autoFillAuras = Auras.Count > 0 && !Tiers.Values.Any(t => t.AuraIds.Count > 0);
+            var allAbilityKeys = autoFillAbilities ? Abilities.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList() : null;
+            var allAuraKeys = autoFillAuras ? Auras.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList() : null;
+
+            clonedTiers = new Dictionary<string, TierData>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (tk, tv) in Tiers)
+            {
+                clonedTiers[tk] = new TierData
+                {
+                    Attributes = new Dictionary<string, double>(tv.Attributes, StringComparer.OrdinalIgnoreCase),
+                    AbilityIds = autoFillAbilities ? new List<string>(allAbilityKeys!) : new List<string>(tv.AbilityIds),
+                    AuraIds = autoFillAuras ? new List<string>(allAuraKeys!) : new List<string>(tv.AuraIds),
+                    TooltipIds = new List<int>(tv.TooltipIds)
+                };
+            }
+        }
+
         return new CardTemplate
         {
             TypeDiscriminator = MapCardTypeToDiscriminator(Type),
@@ -424,7 +487,7 @@ public sealed class CustomCardDefinition
                 Tooltips = tooltips
             },
             Attributes = Attributes != null ? new Dictionary<string, double>(Attributes, StringComparer.OrdinalIgnoreCase) : null,
-            Tiers = Tiers != null ? new Dictionary<string, TierData>(Tiers, StringComparer.OrdinalIgnoreCase) : null,
+            Tiers = clonedTiers,
             Enchantments = Enchantments != null ? new Dictionary<string, EnchantmentData>(Enchantments, StringComparer.OrdinalIgnoreCase) : null,
             Abilities = new Dictionary<string, AbilityDefinition>(Abilities),
             Auras = new Dictionary<string, AuraDefinition>(Auras),
@@ -538,6 +601,10 @@ public sealed class CustomEventDefinition
     /// <summary>当事件为 CombatEncounter 时可选内联的自定义野怪模板。</summary>
     [JsonPropertyName("combatMonster")]
     public MonsterTemplate? CombatMonster { get; set; }
+
+    /// <summary>用于 Gate #1 静态检测事件对象上的非引擎废字段。</summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; set; }
 
     /// <summary>转换为标准事件/战斗遭遇卡牌定义供统一校验与注入仓库。</summary>
     public CustomCardDefinition ToCardDefinition()
@@ -690,6 +757,283 @@ public sealed class ModAssetEntry
 }
 
 /// <summary>
+/// 原位魔改原版卡牌补丁契约（V13.1 新增，对应 mods/&lt;mod-id&gt;/patches/*.json）：
+/// 仅覆写非 null 的差量字段（四阶数值、冷却、品质、标签、附魔、技能、中文名/描述与卡图），
+/// 绝不破坏基础只读库，卸载或回滚 Mod 时自动 100% 复原。
+/// </summary>
+public sealed class CardPatchDefinition
+{
+    private static readonly JsonSerializerOptions CloneOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    /// <summary>目标原版卡牌模板 GUID（必须存在于 GameData.db）。</summary>
+    [JsonPropertyName("targetTemplateId")]
+    public string TargetTemplateId { get; set; } = string.Empty;
+
+    [JsonPropertyName("note")]
+    public string? Note { get; set; }
+
+    [JsonPropertyName("startingTier")]
+    public string? StartingTier { get; set; }
+
+    [JsonPropertyName("spawningEligibility")]
+    public string? SpawningEligibility { get; set; }
+
+    [JsonPropertyName("heroes")]
+    public List<string>? Heroes { get; set; }
+
+    [JsonPropertyName("addTags")]
+    public List<string> AddTags { get; set; } = new();
+
+    [JsonPropertyName("removeTags")]
+    public List<string> RemoveTags { get; set; } = new();
+
+    [JsonPropertyName("addHiddenTags")]
+    public List<string> AddHiddenTags { get; set; } = new();
+
+    [JsonPropertyName("removeHiddenTags")]
+    public List<string> RemoveHiddenTags { get; set; } = new();
+
+    [JsonPropertyName("attributeOverrides")]
+    public Dictionary<string, double>? AttributeOverrides { get; set; }
+
+    [JsonPropertyName("tierAttributeOverrides")]
+    public Dictionary<string, Dictionary<string, double>>? TierAttributeOverrides { get; set; }
+
+    [JsonPropertyName("enchantmentOverrides")]
+    public Dictionary<string, EnchantmentData>? EnchantmentOverrides { get; set; }
+
+    [JsonPropertyName("abilitiesOverride")]
+    public Dictionary<string, AbilityDefinition>? AbilitiesOverride { get; set; }
+
+    [JsonPropertyName("aurasOverride")]
+    public Dictionary<string, AuraDefinition>? AurasOverride { get; set; }
+
+    [JsonPropertyName("titleZh")]
+    public string? TitleZh { get; set; }
+
+    [JsonPropertyName("titleEn")]
+    public string? TitleEn { get; set; }
+
+    [JsonPropertyName("descZh")]
+    public string? DescZh { get; set; }
+
+    [JsonPropertyName("descEn")]
+    public string? DescEn { get; set; }
+
+    [JsonPropertyName("activeTooltipsZh")]
+    public List<string>? ActiveTooltipsZh { get; set; }
+
+    [JsonPropertyName("passiveTooltipsZh")]
+    public List<string>? PassiveTooltipsZh { get; set; }
+
+    [JsonPropertyName("enchantTooltipsZh")]
+    public Dictionary<string, List<string>>? EnchantTooltipsZh { get; set; }
+
+    [JsonPropertyName("customArtFile")]
+    public string? CustomArtFile { get; set; }
+
+    [JsonPropertyName("artRect")]
+    public CustomCardArtRect? ArtRect { get; set; }
+
+    [JsonPropertyName("accentColor")]
+    public string? AccentColor { get; set; }
+
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; set; }
+
+    /// <summary>深拷贝原版模板并增量合并补丁差量，产出全新不可变覆写模板（不修改原版实例）。</summary>
+    public CardTemplate ApplyToTemplate(CardTemplate sourceCard, string modId)
+    {
+        // 通过 JSON 往返深拷贝确保 Tier/Ability/Aura/Enchantment 零引用共享污染
+        string raw = JsonSerializer.Serialize(sourceCard, CloneOptions);
+        var cloned = JsonSerializer.Deserialize<CardTemplate>(raw, CloneOptions)
+            ?? throw new InvalidOperationException($"无法深拷贝目标原版卡牌模板 '{sourceCard.Id}'。");
+
+        cloned.Version = $"patch:{modId}";
+        if (!string.IsNullOrWhiteSpace(StartingTier))
+            cloned.StartingTier = StartingTier.Trim();
+        if (!string.IsNullOrWhiteSpace(SpawningEligibility))
+            cloned.SpawningEligibility = SpawningEligibility.Trim();
+        if (Heroes is { Count: > 0 })
+            cloned.Heroes = new List<string>(Heroes);
+
+        if (AddTags.Count > 0 || RemoveTags.Count > 0)
+        {
+            var tagSet = new List<string>(cloned.Tags);
+            foreach (var r in RemoveTags)
+                tagSet.RemoveAll(t => string.Equals(t, r, StringComparison.OrdinalIgnoreCase));
+            foreach (var a in AddTags)
+            {
+                if (!string.IsNullOrWhiteSpace(a) && !tagSet.Any(t => string.Equals(t, a, StringComparison.OrdinalIgnoreCase)))
+                    tagSet.Add(a.Trim());
+            }
+            cloned.Tags = tagSet;
+        }
+
+        if (AddHiddenTags.Count > 0 || RemoveHiddenTags.Count > 0)
+        {
+            var hSet = new List<string>(cloned.HiddenTags);
+            foreach (var r in RemoveHiddenTags)
+                hSet.RemoveAll(t => string.Equals(t, r, StringComparison.OrdinalIgnoreCase));
+            foreach (var a in AddHiddenTags)
+            {
+                if (!string.IsNullOrWhiteSpace(a) && !hSet.Any(t => string.Equals(t, a, StringComparison.OrdinalIgnoreCase)))
+                    hSet.Add(a.Trim());
+            }
+            cloned.HiddenTags = hSet;
+        }
+
+        if (AttributeOverrides is { Count: > 0 })
+        {
+            cloned.Attributes ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (k, v) in AttributeOverrides)
+                cloned.Attributes[k] = v;
+        }
+
+        if (TierAttributeOverrides is { Count: > 0 })
+        {
+            cloned.Tiers ??= new Dictionary<string, TierData>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (tierName, attrDelta) in TierAttributeOverrides)
+            {
+                if (attrDelta == null) continue;
+                var existingKey = cloned.Tiers.Keys.FirstOrDefault(k => string.Equals(k, tierName, StringComparison.OrdinalIgnoreCase));
+                if (existingKey == null)
+                {
+                    var newTier = new TierData
+                    {
+                        Attributes = new Dictionary<string, double>(attrDelta, StringComparer.OrdinalIgnoreCase)
+                    };
+                    // 继承相邻已有品阶的 AbilityIds / AuraIds / TooltipIds，防止新开阶 0 技能
+                    var donor = cloned.Tiers.Values.FirstOrDefault();
+                    if (donor != null)
+                    {
+                        newTier.AbilityIds.AddRange(donor.AbilityIds);
+                        newTier.AuraIds.AddRange(donor.AuraIds);
+                        newTier.TooltipIds.AddRange(donor.TooltipIds);
+                    }
+                    cloned.Tiers[tierName] = newTier;
+                }
+                else
+                {
+                    var td = cloned.Tiers[existingKey];
+                    foreach (var (ak, av) in attrDelta)
+                        td.Attributes[ak] = av;
+                }
+            }
+        }
+
+        if (EnchantmentOverrides is { Count: > 0 })
+        {
+            cloned.Enchantments ??= new Dictionary<string, EnchantmentData>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (ek, ev) in EnchantmentOverrides)
+            {
+                if (ev != null)
+                    cloned.Enchantments[ek] = ev;
+            }
+        }
+
+        if (AbilitiesOverride is { Count: > 0 })
+        {
+            cloned.Abilities = new Dictionary<string, AbilityDefinition>(AbilitiesOverride);
+            if (cloned.Tiers != null && cloned.Tiers.Count > 0)
+            {
+                var allKeys = cloned.Abilities.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList();
+                foreach (var td in cloned.Tiers.Values)
+                {
+                    td.AbilityIds.Clear();
+                    td.AbilityIds.AddRange(allKeys);
+                }
+            }
+        }
+
+        if (AurasOverride is { Count: > 0 })
+        {
+            cloned.Auras = new Dictionary<string, AuraDefinition>(AurasOverride);
+            if (cloned.Tiers != null && cloned.Tiers.Count > 0)
+            {
+                var allKeys = cloned.Auras.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList();
+                foreach (var td in cloned.Tiers.Values)
+                {
+                    td.AuraIds.Clear();
+                    td.AuraIds.AddRange(allKeys);
+                }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(TitleEn))
+            cloned.InternalName = TitleEn.Trim();
+
+        if (!string.IsNullOrWhiteSpace(TitleZh) || !string.IsNullOrWhiteSpace(DescZh)
+            || ActiveTooltipsZh != null || PassiveTooltipsZh != null)
+        {
+            cloned.Localization ??= new LocalizationBlock();
+            if (!string.IsNullOrWhiteSpace(TitleZh))
+            {
+                cloned.Localization.Title = new LocalizedText
+                {
+                    Key = OverlayLocalizationStore.ComputeOfficialMd5Hash(TitleZh),
+                    Text = TitleZh
+                };
+            }
+            if (!string.IsNullOrWhiteSpace(DescZh))
+            {
+                cloned.InternalDescription = DescZh;
+                cloned.Localization.Description = new LocalizedText
+                {
+                    Key = OverlayLocalizationStore.ComputeOfficialMd5Hash(DescZh),
+                    Text = DescZh
+                };
+            }
+            if (ActiveTooltipsZh != null || PassiveTooltipsZh != null)
+            {
+                var tips = new List<TooltipEntry>();
+                if (ActiveTooltipsZh != null)
+                {
+                    foreach (var tip in ActiveTooltipsZh)
+                    {
+                        tips.Add(new TooltipEntry
+                        {
+                            TooltipType = "Active",
+                            Content = new LocalizedText { Key = OverlayLocalizationStore.ComputeOfficialMd5Hash(tip), Text = tip }
+                        });
+                    }
+                }
+                if (PassiveTooltipsZh != null)
+                {
+                    foreach (var tip in PassiveTooltipsZh)
+                    {
+                        tips.Add(new TooltipEntry
+                        {
+                            TooltipType = "Passive",
+                            Content = new LocalizedText { Key = OverlayLocalizationStore.ComputeOfficialMd5Hash(tip), Text = tip }
+                        });
+                    }
+                }
+                cloned.Localization.Tooltips = tips;
+                if (cloned.Tiers != null)
+                {
+                    foreach (var td in cloned.Tiers.Values)
+                        td.TooltipIds.Clear();
+                }
+            }
+        }
+
+        return cloned;
+    }
+
+    public bool HasVisualOrTextOverride =>
+        !string.IsNullOrWhiteSpace(TitleZh)
+        || !string.IsNullOrWhiteSpace(DescZh)
+        || !string.IsNullOrWhiteSpace(CustomArtFile)
+        || (ActiveTooltipsZh is { Count: > 0 })
+        || (PassiveTooltipsZh is { Count: > 0 })
+        || (EnchantTooltipsZh is { Count: > 0 });
+}
+
+/// <summary>
 /// 单个已解析的 Mod 完整内容包。
 /// </summary>
 public sealed class ModPackage
@@ -697,11 +1041,14 @@ public sealed class ModPackage
     public required ModManifest Manifest { get; init; }
     public required string RootDirectory { get; init; }
     public List<CustomCardDefinition> Cards { get; } = new();
+    public List<CardPatchDefinition> Patches { get; } = new();
     public List<CustomEventDefinition> Events { get; } = new();
     public List<MonsterTemplate> Monsters { get; } = new();
     public List<CustomModeDefinition> Modes { get; } = new();
     public LocalizationOverlayDocument? LocalizationOverlay { get; set; }
     public Dictionary<string, ModAssetEntry> AssetsByLogicalPath { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>由 assets/art_manifest.json 读取的逻辑路径 -> 预期 SHA-256，用于 Gate #8 完整性比对。</summary>
+    public Dictionary<string, string> ExpectedAssetSha256ByPath { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, CustomCardVisualBinding> VisualBindingsByCustomId { get; } = new(StringComparer.OrdinalIgnoreCase);
     public string PackageHash { get; set; } = string.Empty;
 }
@@ -715,13 +1062,121 @@ public enum ModValidationSeverity
     Error = 2
 }
 
-/// <summary>单条 Mod 校验问题记录。</summary>
+/// <summary>单条 Mod 校验问题记录（含所属闸门编号 1~10 与精准中文修复建议）。</summary>
 public sealed record ModValidationIssue(
     ModValidationSeverity Severity,
     string ModId,
     string Code,
     string Message,
-    string? TargetId = null);
+    string? TargetId = null,
+    int GateId = 0,
+    string? FixHintZh = null);
+
+/// <summary>单道防 Bug 铁闸执行结果 DTO。</summary>
+public sealed class ModGateResult
+{
+    [JsonPropertyName("gateId")]
+    public int GateId { get; set; }
+
+    [JsonPropertyName("key")]
+    public string Key { get; set; } = string.Empty;
+
+    [JsonPropertyName("nameZh")]
+    public string NameZh { get; set; } = string.Empty;
+
+    /// <summary>PASS | WARN | FAIL | SKIP。</summary>
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "PASS";
+
+    [JsonPropertyName("durationMs")]
+    public long DurationMs { get; set; }
+
+    [JsonPropertyName("issues")]
+    public List<ModValidationIssue> Issues { get; set; } = new();
+}
+
+/// <summary>闸门 #9：50 场真实 CombatSimulator 沙盒压力体检报告 DTO。</summary>
+public sealed class ModCombatStressReport
+{
+    [JsonPropertyName("matchesRun")]
+    public int MatchesRun { get; set; }
+
+    [JsonPropertyName("seedBase")]
+    public int SeedBase { get; set; }
+
+    [JsonPropertyName("exceptions")]
+    public int Exceptions { get; set; }
+
+    [JsonPropertyName("maxDurationHits")]
+    public int MaxDurationHits { get; set; }
+
+    [JsonPropertyName("cascadeGuardTrips")]
+    public int CascadeGuardTrips { get; set; }
+
+    [JsonPropertyName("numericCorruptions")]
+    public int NumericCorruptions { get; set; }
+
+    [JsonPropertyName("slowMatchesOver200ms")]
+    public int SlowMatchesOver200ms { get; set; }
+
+    [JsonPropertyName("avgMatchMs")]
+    public double AvgMatchMs { get; set; }
+
+    [JsonPropertyName("p95MatchMs")]
+    public double P95MatchMs { get; set; }
+
+    [JsonPropertyName("maxMatchMs")]
+    public double MaxMatchMs { get; set; }
+
+    [JsonPropertyName("modSideWins")]
+    public int ModSideWins { get; set; }
+
+    [JsonPropertyName("modSideWinRatePct")]
+    public double ModSideWinRatePct { get; set; }
+
+    [JsonPropertyName("avgFightDurationSec")]
+    public double AvgFightDurationSec { get; set; }
+
+    [JsonPropertyName("testedCardIds")]
+    public List<string> TestedCardIds { get; set; } = new();
+
+    [JsonPropertyName("balanceHintZh")]
+    public string BalanceHintZh { get; set; } = string.Empty;
+}
+
+/// <summary>V13.1 工业级 10 道防 Bug 铁闸完整诊断报告 DTO。</summary>
+public sealed class ModTenGateValidationReport
+{
+    [JsonPropertyName("ok")]
+    public bool Ok { get; set; } = true;
+
+    [JsonPropertyName("passed")]
+    public bool Passed { get; set; }
+
+    [JsonPropertyName("modId")]
+    public string ModId { get; set; } = string.Empty;
+
+    [JsonPropertyName("validatedAtUtc")]
+    public DateTimeOffset ValidatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+
+    [JsonPropertyName("totalDurationMs")]
+    public long TotalDurationMs { get; set; }
+
+    [JsonPropertyName("errorCount")]
+    public int ErrorCount { get; set; }
+
+    [JsonPropertyName("warningCount")]
+    public int WarningCount { get; set; }
+
+    [JsonPropertyName("summaryZh")]
+    public string SummaryZh { get; set; } = string.Empty;
+
+    [JsonPropertyName("gates")]
+    public List<ModGateResult> Gates { get; set; } = new();
+
+    [JsonPropertyName("combatStressReport")]
+    public ModCombatStressReport? CombatStressReport { get; set; }
+}
 
 /// <summary>
 /// 一次全量 Mod 扫描、校验与加载的详细报告。
@@ -734,6 +1189,7 @@ public sealed class ModLoadReport
     public List<string> RejectedModIds { get; } = new();
     public List<ModValidationIssue> Issues { get; } = new();
     public int TotalCustomCards { get; set; }
+    public int TotalCardPatches { get; set; }
     public int TotalCustomEvents { get; set; }
     public int TotalCustomMonsters { get; set; }
     public int TotalCustomModes { get; set; }

@@ -61,7 +61,9 @@
             "GoldGainAmount": 1,
             "Custom_0": 4,
             "CritChance": 5
-          }
+          },
+          "abilityIds": ["0", "1", "2"],
+          "auraIds": []
         },
         "Silver": {
           "attributes": {
@@ -72,7 +74,9 @@
             "GoldGainAmount": 1,
             "Custom_0": 8,
             "CritChance": 10
-          }
+          },
+          "abilityIds": ["0", "1", "2"],
+          "auraIds": []
         },
         "Gold": {
           "attributes": {
@@ -83,7 +87,9 @@
             "GoldGainAmount": 2,
             "Custom_0": 16,
             "CritChance": 15
-          }
+          },
+          "abilityIds": ["0", "1", "2"],
+          "auraIds": []
         },
         "Diamond": {
           "attributes": {
@@ -94,7 +100,9 @@
             "GoldGainAmount": 3,
             "Custom_0": 32,
             "CritChance": 20
-          }
+          },
+          "abilityIds": ["0", "1", "2"],
+          "auraIds": []
         }
       },
       "abilities": {
@@ -223,7 +231,9 @@
             "ShieldApplyAmount": 35,
             "HasteAmount": 1000,
             "HasteTargets": 2
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": ["0"]
         },
         "Gold": {
           "attributes": {
@@ -233,7 +243,9 @@
             "ShieldApplyAmount": 70,
             "HasteAmount": 1500,
             "HasteTargets": 2
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": ["0"]
         },
         "Diamond": {
           "attributes": {
@@ -243,7 +255,9 @@
             "ShieldApplyAmount": 140,
             "HasteAmount": 2000,
             "HasteTargets": 2
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": ["0"]
         }
       },
       "abilities": {
@@ -283,12 +297,19 @@
           "activeIn": "HandOnly",
           "prerequisites": [
             {
-              "$type": "TPrerequisitePlayerAttribute",
-              "attributeType": "Gold",
-              "comparison": "GreaterThanOrEqual",
-              "value": {
-                "$type": "TFixedValue",
-                "value": 20.0
+              "$type": "TPrerequisitePlayer",
+              "subject": {
+                "$type": "TTargetPlayerAbsolute",
+                "targetMode": "Player",
+                "conditions": {
+                  "$type": "TPlayerConditionalAttribute",
+                  "attributeType": "Gold",
+                  "comparisonOperator": "GreaterThanOrEqual",
+                  "comparisonValue": {
+                    "$type": "TFixedValue",
+                    "value": 20.0
+                  }
+                }
               }
             }
           ],
@@ -363,7 +384,9 @@
             "CooldownMax": 6000,
             "BurnApplyAmount": 4,
             "ChargeAmount": 1000
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": []
         },
         "Silver": {
           "attributes": {
@@ -372,7 +395,9 @@
             "CooldownMax": 6000,
             "BurnApplyAmount": 8,
             "ChargeAmount": 1000
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": []
         },
         "Gold": {
           "attributes": {
@@ -381,7 +406,9 @@
             "CooldownMax": 5500,
             "BurnApplyAmount": 14,
             "ChargeAmount": 1200
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": []
         },
         "Diamond": {
           "attributes": {
@@ -390,7 +417,9 @@
             "CooldownMax": 5000,
             "BurnApplyAmount": 24,
             "ChargeAmount": 1500
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": []
         }
       },
       "abilities": {
@@ -491,7 +520,9 @@
             "BurnApplyAmount": 8,
             "Custom_0": 15,
             "Custom_1": 3
-          }
+          },
+          "abilityIds": ["0", "1", "2", "3"],
+          "auraIds": ["0", "1"]
         },
         "Diamond": {
           "attributes": {
@@ -503,7 +534,9 @@
             "BurnApplyAmount": 16,
             "Custom_0": 30,
             "Custom_1": 5
-          }
+          },
+          "abilityIds": ["0", "1", "2", "3"],
+          "auraIds": ["0", "1"]
         }
       },
       "abilities": {
@@ -661,7 +694,9 @@
             "SellPrice": 5,
             "Custom_0": 3,
             "Custom_1": 3
-          }
+          },
+          "abilityIds": ["0"],
+          "auraIds": ["0"]
         },
         "Gold": {
           "attributes": {
@@ -669,7 +704,9 @@
             "SellPrice": 10,
             "Custom_0": 6,
             "Custom_1": 5
-          }
+          },
+          "abilityIds": ["0"],
+          "auraIds": ["0"]
         },
         "Diamond": {
           "attributes": {
@@ -677,7 +714,9 @@
             "SellPrice": 20,
             "Custom_0": 12,
             "Custom_1": 8
-          }
+          },
+          "abilityIds": ["0"],
+          "auraIds": ["0"]
         }
       },
       "abilities": {
@@ -778,7 +817,9 @@
             "SellPrice": 2,
             "Custom_0": 6,
             "Custom_1": 1
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": []
         },
         "Silver": {
           "attributes": {
@@ -786,7 +827,9 @@
             "SellPrice": 5,
             "Custom_0": 12,
             "Custom_1": 2
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": []
         },
         "Gold": {
           "attributes": {
@@ -794,7 +837,9 @@
             "SellPrice": 10,
             "Custom_0": 24,
             "Custom_1": 3
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": []
         },
         "Diamond": {
           "attributes": {
@@ -802,7 +847,9 @@
             "SellPrice": 20,
             "Custom_0": 48,
             "Custom_1": 5
-          }
+          },
+          "abilityIds": ["0", "1"],
+          "auraIds": []
         }
       },
       "abilities": {

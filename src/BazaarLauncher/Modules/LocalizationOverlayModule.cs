@@ -1,11 +1,13 @@
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using BazaarGameShared.Domain.Core.Types;
 using BazaarLauncher.Core;
 using BazaarModSdk;
@@ -60,8 +62,69 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         public readonly List<CardTextOverride> CardOverrides = new();
     }
 
+    /// <summary>无锁只读词典快照：热路径读取 0 锁竞争，并将全局正则与限定 Scope 正则（如 NetMessageError）严格隔离。</summary>
+    private sealed class LocaleSnapshot
+    {
+        public (int Priority, IReadOnlyDictionary<string, string> Map)[] HashLayers = Array.Empty<(int, IReadOnlyDictionary<string, string>)>();
+        public (int Priority, IReadOnlyDictionary<string, string> Map)[] GlobalExactLayers = Array.Empty<(int, IReadOnlyDictionary<string, string>)>();
+        public Dictionary<string, (int Priority, IReadOnlyDictionary<string, string> Map)[]> ContextExactLayers = new(StringComparer.OrdinalIgnoreCase);
+        public RegexEntry[] GlobalRegexLayers = Array.Empty<RegexEntry>();
+        public Dictionary<string, RegexEntry[]> ScopedRegexLayers = new(StringComparer.OrdinalIgnoreCase);
+        public CardTextOverride[] CardOverrides = Array.Empty<CardTextOverride>();
+    }
+
+    private readonly struct ResolveMemoKey : IEquatable<ResolveMemoKey>
+    {
+        public readonly string Locale;
+        public readonly string Hash;
+        public readonly string ContextKey;
+        public readonly string Text;
+
+        public ResolveMemoKey(string locale, string hash, string contextKey, string text)
+        {
+            Locale = locale ?? string.Empty;
+            Hash = hash ?? string.Empty;
+            ContextKey = contextKey ?? string.Empty;
+            Text = text ?? string.Empty;
+        }
+
+        public bool Equals(ResolveMemoKey other)
+            => string.Equals(Text, other.Text, StringComparison.Ordinal)
+               && string.Equals(Hash, other.Hash, StringComparison.Ordinal)
+               && string.Equals(ContextKey, other.ContextKey, StringComparison.OrdinalIgnoreCase)
+               && string.Equals(Locale, other.Locale, StringComparison.OrdinalIgnoreCase);
+
+        public override bool Equals(object obj) => obj is ResolveMemoKey other && Equals(other);
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int h = StringComparer.Ordinal.GetHashCode(Text);
+                h = (h * 397) ^ StringComparer.Ordinal.GetHashCode(Hash);
+                h = (h * 397) ^ StringComparer.OrdinalIgnoreCase.GetHashCode(ContextKey);
+                h = (h * 397) ^ StringComparer.OrdinalIgnoreCase.GetHashCode(Locale);
+                return h;
+            }
+        }
+    }
+
+    /// <summary>按运行时真实卡牌类型分桶缓存反射属性，彻底消除跨子类 InvalidCastException 沉睡炸弹。</summary>
+    private sealed class CardMemberCache
+    {
+        public PropertyInfo InstanceId;
+        public PropertyInfo TemplateId;
+        public PropertyInfo Attributes;
+        public PropertyInfo Enchantment;
+        public PropertyInfo Id;
+    }
+
     private readonly object _sync = new();
     private readonly Dictionary<string, LocaleLayerStore> _byLocale = new(StringComparer.OrdinalIgnoreCase);
+    private volatile Dictionary<string, LocaleSnapshot> _snapshots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<ResolveMemoKey, string> _resolveMemo = new();
+    private const int MaxResolveMemoEntries = 4096;
+    private static readonly string NoMatchSentinel = new('\0', 1);
     private readonly List<IDisposable> _overlayHandles = new();
 
     private string _overlayRevision = "builtin";
@@ -72,15 +135,17 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
     private static PropertyInfo _prefsLangProp;
     private static PropertyInfo _tooltipCardInstanceProp;
     private static PropertyInfo _tooltipCardTemplateProp;
-    private static PropertyInfo _cardInstanceIdProp;
-    private static PropertyInfo _cardTemplateIdProp;
-    private static PropertyInfo _cardAttributesProp;
-    private static PropertyInfo _cardEnchantmentProp;
+    private static readonly ConcurrentDictionary<Type, CardMemberCache> _cardMembersByType = new();
     private static Type _tLocalizableTextType;
     private static ConstructorInfo _tLocCtor2;
     private static PropertyInfo _tLocTextProp;
     private static FieldInfo _tLocTextField;
     private static readonly Regex AttrPlaceholderRegex = new(@"\{attr\.([A-Za-z0-9_]+)\}", RegexOptions.Compiled);
+    private static int _l10nHookErrorCount;
+
+    [ThreadStatic] private static MD5 _tsMd5;
+    [ThreadStatic] private static byte[] _tsUtf8Buf;
+    private static readonly char[] HexDigits = "0123456789abcdef".ToCharArray();
 
     public string CurrentLocale => DetectCurrentGameLocale();
     internal string OverlayRevision => _overlayRevision;
@@ -125,10 +190,18 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             var store = GetOrCreateLocaleStoreLocked(loc);
             store.HashLayers.Add(entry);
             store.HashLayers.Sort((a, b) => b.Priority.CompareTo(a.Priority));
+            RebuildSnapshotsLocked();
         }
         return new CallbackDisposable(() =>
         {
-            lock (_sync) { if (_byLocale.TryGetValue(loc, out var s)) s.HashLayers.Remove(entry); }
+            lock (_sync)
+            {
+                if (_byLocale.TryGetValue(loc, out var s))
+                {
+                    s.HashLayers.Remove(entry);
+                    RebuildSnapshotsLocked();
+                }
+            }
         });
     }
 
@@ -159,6 +232,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 list.Add(entry);
                 list.Sort((a, b) => b.Priority.CompareTo(a.Priority));
             }
+            RebuildSnapshotsLocked();
         }
         return new CallbackDisposable(() =>
         {
@@ -167,6 +241,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 if (!_byLocale.TryGetValue(loc, out var s)) return;
                 if (string.IsNullOrWhiteSpace(contextKey)) s.GlobalExactLayers.Remove(entry);
                 else if (s.ContextExactLayers.TryGetValue(contextKey, out var list)) list.Remove(entry);
+                RebuildSnapshotsLocked();
             }
         });
     }
@@ -201,11 +276,19 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             var store = GetOrCreateLocaleStoreLocked(loc);
             store.RegexLayers.Add(re);
             store.RegexLayers.Sort((a, b) => b.Priority.CompareTo(a.Priority));
+            RebuildSnapshotsLocked();
         }
 
         return new CallbackDisposable(() =>
         {
-            lock (_sync) { if (_byLocale.TryGetValue(loc, out var s)) s.RegexLayers.Remove(re); }
+            lock (_sync)
+            {
+                if (_byLocale.TryGetValue(loc, out var s))
+                {
+                    s.RegexLayers.Remove(re);
+                    RebuildSnapshotsLocked();
+                }
+            }
         });
     }
 
@@ -217,10 +300,18 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         {
             var store = GetOrCreateLocaleStoreLocked(loc);
             store.CardOverrides.Add(cardOverride);
+            RebuildSnapshotsLocked();
         }
         return new CallbackDisposable(() =>
         {
-            lock (_sync) { if (_byLocale.TryGetValue(loc, out var s)) s.CardOverrides.Remove(cardOverride); }
+            lock (_sync)
+            {
+                if (_byLocale.TryGetValue(loc, out var s))
+                {
+                    s.CardOverrides.Remove(cardOverride);
+                    RebuildSnapshotsLocked();
+                }
+            }
         });
     }
 
@@ -230,7 +321,13 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         string loc = NormalizeLocale(locale);
         if (!IsChineseLocale(loc)) return false;
 
+        var snapshots = _snapshots;
+        if (!snapshots.TryGetValue(loc, out var snap)) return false;
+
         bool hasRaw = !string.IsNullOrEmpty(rawText);
+        bool hasHash = !string.IsNullOrEmpty(hash);
+        if (!hasRaw && !hasHash) return false;
+
         // 避免无条件 Trim() 产生热路径 GC 分配（修复 P1-9）
         string lookupText = rawText;
         if (hasRaw && (char.IsWhiteSpace(rawText[0]) || char.IsWhiteSpace(rawText[rawText.Length - 1])))
@@ -238,79 +335,160 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             lookupText = rawText.Trim();
         }
 
-        lock (_sync)
-        {
-            if (!_byLocale.TryGetValue(loc, out var store)) return false;
+        bool hasContext = !string.IsNullOrWhiteSpace(contextKey);
 
-            // 1. 上下文消歧精确覆盖（最高文本优先级）
-            if (!string.IsNullOrWhiteSpace(contextKey) && !string.IsNullOrEmpty(lookupText)
-                && store.ContextExactLayers.TryGetValue(contextKey, out var ctxList))
+        // ── 快速路径 1：纯中文且无待替换英文/占位符的卡面或 UI 文本，O(1) 零分配短路 ──
+        // 彻底杜绝已翻译中文文本反复执行 lock + MD5.Create() + 53 条正则遍历（拖拽 Top 3）
+        if (!hasHash && hasRaw && IsPureChineseWithoutPendingEnglish(lookupText))
+        {
+            if (TryResolveExactOnly(snap, lookupText, hasContext ? contextKey : null, out string exactZh))
             {
-                for (int i = 0; i < ctxList.Count; i++)
+                translated = exactZh;
+                return true;
+            }
+            return false;
+        }
+
+        // ── 快速路径 2：有界并发记忆缓存（同一英文/混排文本 100% O(1) 命中）──
+        var memoKey = new ResolveMemoKey(loc, hasHash ? hash : string.Empty, hasContext ? contextKey : string.Empty, lookupText ?? string.Empty);
+        if (_resolveMemo.TryGetValue(memoKey, out string memoVal))
+        {
+            if (ReferenceEquals(memoVal, NoMatchSentinel))
+            {
+                return false;
+            }
+            translated = memoVal;
+            return true;
+        }
+
+        bool matched = TryResolveFromSnapshotSlow(snap, hash, rawText, lookupText, hasContext ? contextKey : null, out string resolved);
+
+        if (_resolveMemo.Count >= MaxResolveMemoEntries)
+        {
+            _resolveMemo.Clear();
+        }
+        _resolveMemo[memoKey] = matched ? resolved : NoMatchSentinel;
+
+        if (matched)
+        {
+            translated = resolved;
+            return true;
+        }
+        return false;
+    }
+
+    private static bool TryResolveExactOnly(LocaleSnapshot snap, string lookupText, string contextKey, out string translated)
+    {
+        translated = null;
+        if (string.IsNullOrEmpty(lookupText)) return false;
+
+        if (contextKey != null && snap.ContextExactLayers.TryGetValue(contextKey, out var ctxArr))
+        {
+            for (int i = 0; i < ctxArr.Length; i++)
+            {
+                if (ctxArr[i].Map.TryGetValue(lookupText, out string hit) && !string.IsNullOrEmpty(hit))
                 {
-                    if (ctxList[i].Map.TryGetValue(lookupText, out string hit) && !string.IsNullOrEmpty(hit))
-                    {
-                        translated = hit;
-                        return true;
-                    }
+                    translated = hit;
+                    return true;
                 }
             }
+        }
 
-            // 2. Hash O(1) 查表（对齐官方 zh-CN.bytes 与 custom_zh_overlay.json hashOverrides）
+        var globalArr = snap.GlobalExactLayers;
+        for (int i = 0; i < globalArr.Length; i++)
+        {
+            if (globalArr[i].Map.TryGetValue(lookupText, out string hit) && !string.IsNullOrEmpty(hit))
+            {
+                translated = hit;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryResolveFromSnapshotSlow(
+        LocaleSnapshot snap,
+        string hash,
+        string rawText,
+        string lookupText,
+        string contextKey,
+        out string translated)
+    {
+        translated = null;
+        bool hasRaw = !string.IsNullOrEmpty(rawText);
+
+        // 1. 上下文消歧精确覆盖（最高文本优先级）
+        if (contextKey != null && !string.IsNullOrEmpty(lookupText)
+            && snap.ContextExactLayers.TryGetValue(contextKey, out var ctxArr))
+        {
+            for (int i = 0; i < ctxArr.Length; i++)
+            {
+                if (ctxArr[i].Map.TryGetValue(lookupText, out string hit) && !string.IsNullOrEmpty(hit))
+                {
+                    translated = hit;
+                    return true;
+                }
+            }
+        }
+
+        // 2. Hash O(1) 查表（仅在存在 hashOverrides 时才按需计算 MD5，且复用 ThreadStatic MD5）
+        var hashArr = snap.HashLayers;
+        if (hashArr.Length > 0)
+        {
             string effectiveHash = !string.IsNullOrEmpty(hash)
                 ? hash
                 : (hasRaw ? ComputeMd5HexUtf8(rawText) : null);
 
             if (!string.IsNullOrEmpty(effectiveHash))
             {
-                for (int i = 0; i < store.HashLayers.Count; i++)
+                for (int i = 0; i < hashArr.Length; i++)
                 {
-                    if (store.HashLayers[i].Map.TryGetValue(effectiveHash, out string hit) && !string.IsNullOrEmpty(hit))
+                    if (hashArr[i].Map.TryGetValue(effectiveHash, out string hit) && !string.IsNullOrEmpty(hit))
                     {
                         translated = hit;
                         return true;
                     }
                 }
             }
+        }
 
-            // 3. 全局原文精确覆盖（Mod 词典 > 外挂 uiExactOverrides）
-            if (!string.IsNullOrEmpty(lookupText))
+        // 3. 全局原文精确覆盖（Mod 词典 > 外挂 uiExactOverrides）
+        if (!string.IsNullOrEmpty(lookupText))
+        {
+            var globalArr = snap.GlobalExactLayers;
+            for (int i = 0; i < globalArr.Length; i++)
             {
-                for (int i = 0; i < store.GlobalExactLayers.Count; i++)
+                if (globalArr[i].Map.TryGetValue(lookupText, out string hit) && !string.IsNullOrEmpty(hit))
                 {
-                    if (store.GlobalExactLayers[i].Map.TryGetValue(lookupText, out string hit) && !string.IsNullOrEmpty(hit))
-                    {
-                        translated = hit;
-                        return true;
-                    }
-                }
-
-                // 带末尾冒号的表单标签支持（如 "Player Cap:"）
-                if (lookupText.Length > 1 && lookupText[lookupText.Length - 1] == ':')
-                {
-                    string stem = lookupText.Substring(0, lookupText.Length - 1).TrimEnd();
-                    for (int i = 0; i < store.GlobalExactLayers.Count; i++)
-                    {
-                        if (store.GlobalExactLayers[i].Map.TryGetValue(stem, out string hit) && !string.IsNullOrEmpty(hit))
-                        {
-                            translated = hit + "：";
-                            return true;
-                        }
-                    }
+                    translated = hit;
+                    return true;
                 }
             }
 
-            // 4. 正则覆盖（插值文案与服务端报错）
-            if (!string.IsNullOrEmpty(lookupText) && store.RegexLayers.Count > 0)
+            // 带末尾冒号的表单标签支持（如 "Player Cap:"）
+            if (lookupText.Length > 1 && lookupText[lookupText.Length - 1] == ':')
             {
-                for (int i = 0; i < store.RegexLayers.Count; i++)
+                string stem = lookupText.Substring(0, lookupText.Length - 1).TrimEnd();
+                for (int i = 0; i < globalArr.Length; i++)
                 {
-                    var re = store.RegexLayers[i];
-                    if (re.Scopes != null && !string.IsNullOrWhiteSpace(contextKey)
-                        && !re.Scopes.Contains(contextKey) && !re.Scopes.Contains("global"))
+                    if (globalArr[i].Map.TryGetValue(stem, out string hit) && !string.IsNullOrEmpty(hit))
                     {
-                        continue;
+                        translated = hit + "：";
+                        return true;
                     }
+                }
+            }
+        }
+
+        // 4. 正则覆盖：严格按 Scope 隔离（修复 L309 反转 Bug，33 条服务端报错正则仅在对应 contextKey 下运行）
+        if (!string.IsNullOrEmpty(lookupText))
+        {
+            if (contextKey != null && snap.ScopedRegexLayers.TryGetValue(contextKey, out var scopedArr))
+            {
+                for (int i = 0; i < scopedArr.Length; i++)
+                {
+                    var re = scopedArr[i];
                     try
                     {
                         if (re.Compiled.IsMatch(lookupText))
@@ -322,9 +500,65 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                     catch { }
                 }
             }
+
+            var globalRegexArr = snap.GlobalRegexLayers;
+            for (int i = 0; i < globalRegexArr.Length; i++)
+            {
+                var re = globalRegexArr[i];
+                try
+                {
+                    if (re.Compiled.IsMatch(lookupText))
+                    {
+                        translated = re.Compiled.Replace(lookupText, re.Replacement);
+                        return true;
+                    }
+                }
+                catch { }
+            }
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// 零分配快速判定：判断文本是否已为纯中文（忽略 Unity TMP 富文本 &lt;...&gt; 标签）且不包含需要正则翻译的英文字母或占位符。
+    /// </summary>
+    private static bool IsPureChineseWithoutPendingEnglish(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+
+        bool hasCjk = false;
+        bool inTag = false;
+        int len = text.Length;
+        for (int i = 0; i < len; i++)
+        {
+            char c = text[i];
+            if (c == '<')
+            {
+                inTag = true;
+                continue;
+            }
+            if (inTag)
+            {
+                if (c == '>') inTag = false;
+                continue;
+            }
+            if (c == '{')
+            {
+                // 含动态占位符（如 {attr.*}）不走纯中文短路
+                return false;
+            }
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+            {
+                // 标签外存在 ASCII 字母，可能仍有英文词条/混合词待替换
+                return false;
+            }
+            if ((c >= '\u4E00' && c <= '\u9FFF') || (c >= '\u3400' && c <= '\u4DBF'))
+            {
+                hasCjk = true;
+            }
+        }
+        return hasCjk;
     }
 
     public bool TryResolveCardText(
@@ -338,39 +572,38 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         string loc = NormalizeLocale(locale);
         if (!IsChineseLocale(loc)) return false;
 
-        int bestScore = -1;
-        lock (_sync)
+        var snapshots = _snapshots;
+        if (!snapshots.TryGetValue(loc, out var snap) || snap.CardOverrides.Length == 0)
         {
-            if (!_byLocale.TryGetValue(loc, out var store) || store.CardOverrides.Count == 0)
+            return false;
+        }
+
+        int bestScore = -1;
+        var arr = snap.CardOverrides;
+        for (int i = 0; i < arr.Length; i++)
+        {
+            var c = arr[i];
+            int score = -1;
+            if (!string.IsNullOrEmpty(instanceId) && !string.IsNullOrEmpty(c.InstanceId)
+                && string.Equals(instanceId, c.InstanceId, StringComparison.OrdinalIgnoreCase))
             {
-                return false;
+                score = 30000 + c.Priority;
+            }
+            else if (!string.IsNullOrEmpty(customCardId) && !string.IsNullOrEmpty(c.CustomCardId)
+                && string.Equals(customCardId, c.CustomCardId, StringComparison.OrdinalIgnoreCase))
+            {
+                score = 20000 + c.Priority;
+            }
+            else if (!string.IsNullOrEmpty(templateId) && !string.IsNullOrEmpty(c.TemplateId)
+                && string.Equals(templateId, c.TemplateId, StringComparison.OrdinalIgnoreCase))
+            {
+                score = 10000 + c.Priority;
             }
 
-            for (int i = 0; i < store.CardOverrides.Count; i++)
+            if (score > bestScore)
             {
-                var c = store.CardOverrides[i];
-                int score = -1;
-                if (!string.IsNullOrEmpty(instanceId) && !string.IsNullOrEmpty(c.InstanceId)
-                    && string.Equals(instanceId, c.InstanceId, StringComparison.OrdinalIgnoreCase))
-                {
-                    score = 30000 + c.Priority;
-                }
-                else if (!string.IsNullOrEmpty(customCardId) && !string.IsNullOrEmpty(c.CustomCardId)
-                    && string.Equals(customCardId, c.CustomCardId, StringComparison.OrdinalIgnoreCase))
-                {
-                    score = 20000 + c.Priority;
-                }
-                else if (!string.IsNullOrEmpty(templateId) && !string.IsNullOrEmpty(c.TemplateId)
-                    && string.Equals(templateId, c.TemplateId, StringComparison.OrdinalIgnoreCase))
-                {
-                    score = 10000 + c.Priority;
-                }
-
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    cardOverride = c;
-                }
+                bestScore = score;
+                cardOverride = c;
             }
         }
 
@@ -383,6 +616,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         {
             _overlayRevision = overlayRevision;
         }
+        _resolveMemo.Clear();
         MainThreadDispatcher.Enqueue(() =>
         {
             FlushNativeLocalizationServiceCache();
@@ -620,7 +854,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             label: "L10n.LocalizableText.GetLocalizedText");
 
         // 3. CardTooltipData 实例级标题 / 描述 / 主动被动词条拦截
-        var tooltipType = AccessTools.TypeByName("TheBazaar.Tooltips.CardTooltipData");
+        var tooltipType = GameInspector.FindTypeSafe("TheBazaar.Tooltips.CardTooltipData");
         if (tooltipType != null)
         {
             _tooltipCardInstanceProp = AccessTools.Property(tooltipType, "CardInstance");
@@ -642,7 +876,10 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 optional: true,
                 label: "L10n.CardTooltipData.GetCardDescription");
 
-            var eTooltipType = AccessTools.TypeByName("BazaarGameShared.Domain.Core.Types.ETooltipType");
+            // 修正命名空间：真实类型为 BazaarGameShared.Domain.Tooltips.ETooltipType，消除启动告警 #1
+            var eTooltipType = GameInspector.FindTypeSafe(
+                "BazaarGameShared.Domain.Tooltips.ETooltipType",
+                "BazaarGameShared.Domain.Core.Types.ETooltipType");
             if (eTooltipType != null)
             {
                 patcher.TryPatch(
@@ -658,35 +895,58 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
 
     // ── Harmony 钩子回调 ─────────────────────────────────────────────────────
 
+    private static void LogL10nHookErrorThrottled(string hookName, Exception ex)
+    {
+        int cnt = Interlocked.Increment(ref _l10nHookErrorCount);
+        if (cnt <= 5 || cnt % 50 == 0)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"[LocalizationOverlay] {hookName} 已安全拦截异常 (count={cnt}): {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     private static bool LocalizationServiceTryGetTextPrefix(string hash, string text, out string translation, ref bool __result)
     {
         translation = null;
-        var inst = Instance;
-        if (inst == null) return true;
-
-        string locale = inst.CurrentLocale;
-        if (!IsChineseLocale(locale)) return true;
-
-        if (inst.TryResolveText(locale, hash, text, null, out string zh))
+        try
         {
-            translation = zh;
-            __result = true;
-            return false;
+            var inst = Instance;
+            if (inst == null) return true;
+
+            string locale = inst.CurrentLocale;
+            if (!IsChineseLocale(locale)) return true;
+
+            if (inst.TryResolveText(locale, hash, text, null, out string zh))
+            {
+                translation = zh;
+                __result = true;
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogL10nHookErrorThrottled(nameof(LocalizationServiceTryGetTextPrefix), ex);
         }
         return true;
     }
 
     private static void LocalizableTextGetPostfix(ref string __result)
     {
-        var inst = Instance;
-        if (inst == null || string.IsNullOrEmpty(__result)) return;
-
-        string locale = inst.CurrentLocale;
-        if (!IsChineseLocale(locale)) return;
-
-        if (inst.TryResolveText(locale, null, __result, null, out string zh))
+        try
         {
-            __result = zh;
+            var inst = Instance;
+            if (inst == null || string.IsNullOrEmpty(__result)) return;
+
+            string locale = inst.CurrentLocale;
+            if (!IsChineseLocale(locale)) return;
+
+            if (inst.TryResolveText(locale, null, __result, null, out string zh))
+            {
+                __result = zh;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogL10nHookErrorThrottled(nameof(LocalizableTextGetPostfix), ex);
         }
     }
 
@@ -771,11 +1031,11 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 if (locObj != null) customList.Add(locObj);
             }
 
-            // 附魔词条自动追加（若自定义卡配置了对应附魔说明）
+            // 附魔词条自动追加（按运行时真实类型查反射缓存，彻底杜绝 ItemCard.Enchantment 误用于 SkillCard/Card 的沉睡炸弹）
             if (ov.EnchantmentTooltips != null && cardInst != null && string.Equals(tipKind, "Passive", StringComparison.OrdinalIgnoreCase))
             {
-                _cardEnchantmentProp ??= cardInst.GetType().GetProperty("Enchantment", BindingFlags.Public | BindingFlags.Instance);
-                string ench = _cardEnchantmentProp?.GetValue(cardInst)?.ToString();
+                var cardMembers = GetCardMemberCache(cardInst.GetType());
+                string ench = SafeGetPropertyValue(cardMembers.Enchantment, cardInst)?.ToString();
                 if (!string.IsNullOrEmpty(ench) && ov.EnchantmentTooltips.TryGetValue(ench, out var enchLines) && enchLines != null)
                 {
                     foreach (var el in enchLines)
@@ -796,28 +1056,53 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
 
     // ── 工具方法 ─────────────────────────────────────────────────────────────
 
+    private static CardMemberCache GetCardMemberCache(Type runtimeType)
+    {
+        return _cardMembersByType.GetOrAdd(runtimeType, static t => new CardMemberCache
+        {
+            InstanceId = t.GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance),
+            TemplateId = t.GetProperty("TemplateId", BindingFlags.Public | BindingFlags.Instance),
+            Attributes = t.GetProperty("Attributes", BindingFlags.Public | BindingFlags.Instance),
+            Enchantment = t.GetProperty("Enchantment", BindingFlags.Public | BindingFlags.Instance),
+            Id = t.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance),
+        });
+    }
+
+    private static object SafeGetPropertyValue(PropertyInfo prop, object instance)
+    {
+        if (prop == null || instance == null) return null;
+        if (prop.DeclaringType != null && !prop.DeclaringType.IsInstanceOfType(instance)) return null;
+        try
+        {
+            return prop.GetValue(instance);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static bool TryExtractCardOverride(object tooltipData, string locale, out CardTextOverride ov, out object cardInst)
     {
         ov = null;
-        cardInst = _tooltipCardInstanceProp?.GetValue(tooltipData);
+        cardInst = SafeGetPropertyValue(_tooltipCardInstanceProp, tooltipData);
         string iid = null;
         string tplId = null;
 
         if (cardInst != null)
         {
-            Type ct = cardInst.GetType();
-            _cardInstanceIdProp ??= ct.GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance);
-            _cardTemplateIdProp ??= ct.GetProperty("TemplateId", BindingFlags.Public | BindingFlags.Instance);
-            iid = _cardInstanceIdProp?.GetValue(cardInst)?.ToString();
-            tplId = _cardTemplateIdProp?.GetValue(cardInst)?.ToString();
+            var members = GetCardMemberCache(cardInst.GetType());
+            iid = SafeGetPropertyValue(members.InstanceId, cardInst)?.ToString();
+            tplId = SafeGetPropertyValue(members.TemplateId, cardInst)?.ToString();
         }
 
         if (string.IsNullOrEmpty(tplId))
         {
-            object tpl = _tooltipCardTemplateProp?.GetValue(tooltipData);
+            object tpl = SafeGetPropertyValue(_tooltipCardTemplateProp, tooltipData);
             if (tpl != null)
             {
-                tplId = tpl.GetType().GetProperty("Id", BindingFlags.Public | BindingFlags.Instance)?.GetValue(tpl)?.ToString();
+                var tplMembers = GetCardMemberCache(tpl.GetType());
+                tplId = SafeGetPropertyValue(tplMembers.Id, tpl)?.ToString();
             }
         }
 
@@ -831,8 +1116,8 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             return template ?? string.Empty;
         }
 
-        _cardAttributesProp ??= cardInst.GetType().GetProperty("Attributes", BindingFlags.Public | BindingFlags.Instance);
-        if (_cardAttributesProp?.GetValue(cardInst) is not IDictionary attrs)
+        var members = GetCardMemberCache(cardInst.GetType());
+        if (SafeGetPropertyValue(members.Attributes, cardInst) is not IDictionary attrs)
         {
             return template;
         }
@@ -854,7 +1139,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
     private static void EnsureTLocalizableTextMeta()
     {
         if (_tLocalizableTextType != null) return;
-        _tLocalizableTextType = AccessTools.TypeByName("BazaarGameShared.Domain.Core.TLocalizableText");
+        _tLocalizableTextType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Core.TLocalizableText");
         if (_tLocalizableTextType == null) return;
         _tLocCtor2 = _tLocalizableTextType.GetConstructor(new[] { typeof(string), typeof(string) });
         _tLocTextProp = _tLocalizableTextType.GetProperty("Text", BindingFlags.Public | BindingFlags.Instance);
@@ -949,6 +1234,66 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         return store;
     }
 
+    /// <summary>在 _sync 锁内重建所有语种的无锁只读快照，同时清空记忆缓存。</summary>
+    private void RebuildSnapshotsLocked()
+    {
+        var next = new Dictionary<string, LocaleSnapshot>(_byLocale.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in _byLocale)
+        {
+            var src = kv.Value;
+            var snap = new LocaleSnapshot
+            {
+                HashLayers = src.HashLayers.ToArray(),
+                GlobalExactLayers = src.GlobalExactLayers.ToArray(),
+                CardOverrides = src.CardOverrides.ToArray(),
+            };
+
+            foreach (var ctxKv in src.ContextExactLayers)
+            {
+                if (ctxKv.Value.Count > 0)
+                {
+                    snap.ContextExactLayers[ctxKv.Key] = ctxKv.Value.ToArray();
+                }
+            }
+
+            // 将全局正则与限定 Scope 正则（如 NetMessageError）严格拆分，绝不让服务端报错正则污染卡面/UI 渲染热路径
+            var globalRegexList = new List<RegexEntry>();
+            var scopedBuckets = new Dictionary<string, List<RegexEntry>>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < src.RegexLayers.Count; i++)
+            {
+                var re = src.RegexLayers[i];
+                if (re.Scopes == null || re.Scopes.Count == 0 || re.Scopes.Contains("global"))
+                {
+                    globalRegexList.Add(re);
+                }
+                else
+                {
+                    foreach (var sc in re.Scopes)
+                    {
+                        if (string.IsNullOrWhiteSpace(sc)) continue;
+                        if (!scopedBuckets.TryGetValue(sc, out var bucket))
+                        {
+                            bucket = new List<RegexEntry>();
+                            scopedBuckets[sc] = bucket;
+                        }
+                        bucket.Add(re);
+                    }
+                }
+            }
+
+            snap.GlobalRegexLayers = globalRegexList.ToArray();
+            foreach (var sbKv in scopedBuckets)
+            {
+                snap.ScopedRegexLayers[sbKv.Key] = sbKv.Value.ToArray();
+            }
+
+            next[kv.Key] = snap;
+        }
+
+        _snapshots = next;
+        _resolveMemo.Clear();
+    }
+
     private static Dictionary<string, string> ParseStringMap(JObject obj, StringComparer cmp)
     {
         var dict = new Dictionary<string, string>(cmp);
@@ -969,11 +1314,28 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
 
     private static string ComputeMd5HexUtf8(string text)
     {
-        using var md5 = MD5.Create();
-        byte[] bytes = md5.ComputeHash(Encoding.UTF8.GetBytes(text));
-        var sb = new StringBuilder(32);
-        for (int i = 0; i < bytes.Length; i++) sb.Append(bytes[i].ToString("x2"));
-        return sb.ToString();
+        var md5 = _tsMd5 ??= MD5.Create();
+        int maxBytes = Encoding.UTF8.GetMaxByteCount(text.Length);
+        var buf = _tsUtf8Buf;
+        if (buf == null || buf.Length < maxBytes)
+        {
+            buf = new byte[Math.Max(256, maxBytes)];
+            if (buf.Length <= 16384)
+            {
+                _tsUtf8Buf = buf;
+            }
+        }
+        int byteLen = Encoding.UTF8.GetBytes(text, 0, text.Length, buf, 0);
+        byte[] hashBytes = md5.ComputeHash(buf, 0, byteLen);
+
+        Span<char> hex = stackalloc char[32];
+        for (int i = 0; i < 16; i++)
+        {
+            byte b = hashBytes[i];
+            hex[i * 2] = HexDigits[b >> 4];
+            hex[i * 2 + 1] = HexDigits[b & 0x0F];
+        }
+        return new string(hex);
     }
 
     private sealed class CallbackDisposable : IDisposable

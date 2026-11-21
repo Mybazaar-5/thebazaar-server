@@ -221,7 +221,8 @@ public sealed class EncountersLootAndWhitelistTests
             {
                 var entry = run.Cards[cid];
                 Assert.Equal(ECardType.EventEncounter, entry.Type);
-                Assert.Equal(ETier.Bronze, entry.Tier);
+                // V13.1 官方 Day 1 遭遇开放 Bronze 与 Silver（告别 3 青铜事件死循环），严禁 Gold/Diamond/Legendary 泄露
+                Assert.True(entry.Tier is ETier.Bronze or ETier.Silver, $"英雄 {hero} Day 1 Hour 1 遭遇 {entry.TemplateId} 品阶={entry.Tier} 违规越阶");
                 Assert.True(pool.IsAssetValid(entry.TemplateId.ToString()), $"英雄 {hero} 开局遭遇 {entry.TemplateId} 未通过白名单");
             }
 

@@ -541,7 +541,7 @@ public sealed class CustomRunRuleSet
     public int StartingIncome { get; set; } = 5;
 
     [JsonPropertyName("startingExperience")]
-    public int StartingExperience { get; set; } = 3;
+    public int StartingExperience { get; set; } = 0;
 
     [JsonPropertyName("startingPrestige")]
     public int StartingPrestige { get; set; } = 20;
@@ -687,7 +687,7 @@ public sealed class CustomRunRuleSet
         bool isStandardStats =
             StartingGold == 15 &&
             StartingIncome == 5 &&
-            StartingExperience == 3 &&
+            StartingExperience == 0 &&
             StartingPrestige == 20 &&
             StartingHealth == 250 &&
             Math.Abs(ShopHighTierBonusPct) < 1e-6 &&

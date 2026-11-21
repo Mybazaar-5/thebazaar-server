@@ -1156,19 +1156,26 @@ internal static class CombatPatch
     private static MethodInfo _animGetBoolIntMethod;
     private static MethodInfo _animSetBoolIntMethod;
     private static PropertyInfo _itemVfxProp;
-    private static FieldInfo _vfxIsFreezeField;
-    private static FieldInfo _vfxFreezeFxGoField;
-    private static FieldInfo _vfxFreezeStartGoField;
-    private static FieldInfo _vfxFreezeIdleGoField;
-    private static FieldInfo _vfxFreezeEndGoField;
-    private static FieldInfo _vfxFreezeRemoveGoField;
-    private static FieldInfo _vfxFreezeTimerField;
-    private static FieldInfo _vfxDisableFreezeCoField;
-    private static MethodInfo _vfxUpdateFreezeMethod;
-    private static FieldInfo _vfxIsSlowField;
-    private static MethodInfo _vfxUpdateSlowMethod;
-    private static FieldInfo _vfxIsHasteField;
-    private static MethodInfo _vfxUpdateHasteMethod;
+
+    // 按运行时真实 VFX 控制器类型隔离缓存反射成员，杜绝异构/派生 VFX 控制器跨类型强转风险（P2 加固）
+    private sealed class VfxControllerMemberBag
+    {
+        public FieldInfo IsFreeze;
+        public FieldInfo FreezeFxGo;
+        public FieldInfo FreezeStartGo;
+        public FieldInfo FreezeIdleGo;
+        public FieldInfo FreezeEndGo;
+        public FieldInfo FreezeRemoveGo;
+        public FieldInfo FreezeTimer;
+        public FieldInfo DisableFreezeCo;
+        public MethodInfo UpdateFreeze;
+        public FieldInfo IsSlow;
+        public MethodInfo UpdateSlow;
+        public FieldInfo IsHaste;
+        public MethodInfo UpdateHaste;
+    }
+
+    private static readonly ConcurrentDictionary<Type, VfxControllerMemberBag> _vfxMembersByType = new();
     private static bool _combatEndedListenersAdded;
 
     private static void PatchPostCombatVisualCleanup(Harmony harmony)
@@ -1386,27 +1393,38 @@ internal static class CombatPatch
         return 0;
     }
 
+    private static VfxControllerMemberBag GetVfxMembers(Type runtimeType)
+    {
+        return _vfxMembersByType.GetOrAdd(runtimeType, static vt => new VfxControllerMemberBag
+        {
+            IsFreeze = vt.GetField("isFreeze", BindingFlags.NonPublic | BindingFlags.Instance),
+            FreezeFxGo = vt.GetField("freezeFXGO", BindingFlags.NonPublic | BindingFlags.Instance),
+            FreezeStartGo = vt.GetField("freezeFXStateStartGO", BindingFlags.NonPublic | BindingFlags.Instance),
+            FreezeIdleGo = vt.GetField("freezeFXStateIdleGO", BindingFlags.NonPublic | BindingFlags.Instance),
+            FreezeEndGo = vt.GetField("freezeFXStateEndGO", BindingFlags.NonPublic | BindingFlags.Instance),
+            FreezeRemoveGo = vt.GetField("freezeFXStateRemoveGO", BindingFlags.NonPublic | BindingFlags.Instance),
+            FreezeTimer = vt.GetField("freezeTimer", BindingFlags.NonPublic | BindingFlags.Instance),
+            DisableFreezeCo = vt.GetField("disableFreezeFX", BindingFlags.NonPublic | BindingFlags.Instance),
+            UpdateFreeze = vt.GetMethod("UpdateFreezeVFX", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance),
+            IsSlow = vt.GetField("isSlow", BindingFlags.NonPublic | BindingFlags.Instance),
+            UpdateSlow = vt.GetMethod("UpdateSlow", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance),
+            IsHaste = vt.GetField("isHaste", BindingFlags.NonPublic | BindingFlags.Instance),
+            UpdateHaste = vt.GetMethod("UpdateHaste", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance),
+        });
+    }
+
     private static void ClearItemFreezeVfx(object itemCtrl)
     {
         _itemVfxProp ??= _itemControllerType.GetProperty("CardVFXController", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
         var vfx = _itemVfxProp?.GetValue(itemCtrl) ?? GameInspector.GetMember(itemCtrl, "cardVFXController");
         if (vfx == null || (vfx is UnityEngine.Object vuo && vuo == null)) return;
 
-        var vt = vfx.GetType();
-        _vfxIsFreezeField ??= vt.GetField("isFreeze", BindingFlags.NonPublic | BindingFlags.Instance);
-        _vfxFreezeFxGoField ??= vt.GetField("freezeFXGO", BindingFlags.NonPublic | BindingFlags.Instance);
-        _vfxFreezeStartGoField ??= vt.GetField("freezeFXStateStartGO", BindingFlags.NonPublic | BindingFlags.Instance);
-        _vfxFreezeIdleGoField ??= vt.GetField("freezeFXStateIdleGO", BindingFlags.NonPublic | BindingFlags.Instance);
-        _vfxFreezeEndGoField ??= vt.GetField("freezeFXStateEndGO", BindingFlags.NonPublic | BindingFlags.Instance);
-        _vfxFreezeRemoveGoField ??= vt.GetField("freezeFXStateRemoveGO", BindingFlags.NonPublic | BindingFlags.Instance);
-        _vfxFreezeTimerField ??= vt.GetField("freezeTimer", BindingFlags.NonPublic | BindingFlags.Instance);
-        _vfxDisableFreezeCoField ??= vt.GetField("disableFreezeFX", BindingFlags.NonPublic | BindingFlags.Instance);
-        _vfxUpdateFreezeMethod ??= vt.GetMethod("UpdateFreezeVFX", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var bag = GetVfxMembers(vfx.GetType());
 
-        bool isFreeze = _vfxIsFreezeField?.GetValue(vfx) is bool f && f;
-        var freezeGo = _vfxFreezeFxGoField?.GetValue(vfx) as GameObject;
-        var freezeIdleGo = _vfxFreezeIdleGoField?.GetValue(vfx) as GameObject;
-        var freezeTimer = _vfxFreezeTimerField?.GetValue(vfx) as TMP_Text;
+        bool isFreeze = bag.IsFreeze?.GetValue(vfx) is bool f && f;
+        var freezeGo = bag.FreezeFxGo?.GetValue(vfx) as GameObject;
+        var freezeIdleGo = bag.FreezeIdleGo?.GetValue(vfx) as GameObject;
+        var freezeTimer = bag.FreezeTimer?.GetValue(vfx) as TMP_Text;
 
         bool hasResidual = isFreeze
             || (freezeGo != null && freezeGo.activeSelf)
@@ -1415,34 +1433,34 @@ internal static class CombatPatch
 
         if (!hasResidual) return;
 
-        if (_vfxDisableFreezeCoField?.GetValue(vfx) is Coroutine co && co != null && vfx is MonoBehaviour mb && mb != null)
+        if (bag.DisableFreezeCo?.GetValue(vfx) is Coroutine co && co != null && vfx is MonoBehaviour mb && mb != null)
         {
             mb.StopCoroutine(co);
-            _vfxDisableFreezeCoField.SetValue(vfx, null);
+            bag.DisableFreezeCo.SetValue(vfx, null);
         }
 
         if (vfx is MonoBehaviour vmb && vmb != null && vmb.gameObject != null && vmb.gameObject.activeInHierarchy)
         {
-            _vfxUpdateFreezeMethod?.Invoke(vfx, new object[] { 0f });
-            if (_vfxDisableFreezeCoField?.GetValue(vfx) is Coroutine co2 && co2 != null)
+            bag.UpdateFreeze?.Invoke(vfx, new object[] { 0f });
+            if (bag.DisableFreezeCo?.GetValue(vfx) is Coroutine co2 && co2 != null)
             {
                 vmb.StopCoroutine(co2);
-                _vfxDisableFreezeCoField.SetValue(vfx, null);
+                bag.DisableFreezeCo.SetValue(vfx, null);
             }
         }
 
         if (freezeGo != null) freezeGo.SetActive(false);
-        if (_vfxFreezeStartGoField?.GetValue(vfx) is GameObject sGo && sGo != null) sGo.SetActive(false);
+        if (bag.FreezeStartGo?.GetValue(vfx) is GameObject sGo && sGo != null) sGo.SetActive(false);
         if (freezeIdleGo != null) freezeIdleGo.SetActive(false);
-        if (_vfxFreezeEndGoField?.GetValue(vfx) is GameObject eGo && eGo != null) eGo.SetActive(false);
-        if (_vfxFreezeRemoveGoField?.GetValue(vfx) is GameObject rGo && rGo != null) rGo.SetActive(false);
+        if (bag.FreezeEndGo?.GetValue(vfx) is GameObject eGo && eGo != null) eGo.SetActive(false);
+        if (bag.FreezeRemoveGo?.GetValue(vfx) is GameObject rGo && rGo != null) rGo.SetActive(false);
 
         if (freezeTimer != null)
         {
             freezeTimer.text = string.Empty;
             freezeTimer.gameObject.SetActive(false);
         }
-        _vfxIsFreezeField?.SetValue(vfx, false);
+        bag.IsFreeze?.SetValue(vfx, false);
     }
 
     private static void ClearItemSlowVfx(object itemCtrl)
@@ -1451,12 +1469,10 @@ internal static class CombatPatch
         var vfx = _itemVfxProp?.GetValue(itemCtrl) ?? GameInspector.GetMember(itemCtrl, "cardVFXController");
         if (vfx == null || (vfx is UnityEngine.Object vuo && vuo == null)) return;
 
-        var vt = vfx.GetType();
-        _vfxIsSlowField ??= vt.GetField("isSlow", BindingFlags.NonPublic | BindingFlags.Instance);
-        if (_vfxIsSlowField?.GetValue(vfx) is bool s && s)
+        var bag = GetVfxMembers(vfx.GetType());
+        if (bag.IsSlow?.GetValue(vfx) is bool s && s)
         {
-            _vfxUpdateSlowMethod ??= vt.GetMethod("UpdateSlow", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            _vfxUpdateSlowMethod?.Invoke(vfx, new object[] { 0f });
+            bag.UpdateSlow?.Invoke(vfx, new object[] { 0f });
         }
     }
 
@@ -1466,12 +1482,10 @@ internal static class CombatPatch
         var vfx = _itemVfxProp?.GetValue(itemCtrl) ?? GameInspector.GetMember(itemCtrl, "cardVFXController");
         if (vfx == null || (vfx is UnityEngine.Object vuo && vuo == null)) return;
 
-        var vt = vfx.GetType();
-        _vfxIsHasteField ??= vt.GetField("isHaste", BindingFlags.NonPublic | BindingFlags.Instance);
-        if (_vfxIsHasteField?.GetValue(vfx) is bool h && h)
+        var bag = GetVfxMembers(vfx.GetType());
+        if (bag.IsHaste?.GetValue(vfx) is bool h && h)
         {
-            _vfxUpdateHasteMethod ??= vt.GetMethod("UpdateHaste", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            _vfxUpdateHasteMethod?.Invoke(vfx, new object[] { 0f });
+            bag.UpdateHaste?.Invoke(vfx, new object[] { 0f });
         }
     }
 

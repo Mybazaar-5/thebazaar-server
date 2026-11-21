@@ -175,7 +175,16 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
     }
 
     private static void AfterSetupCommandArgs()
-        => ApplyUrls(AccessTools.TypeByName("TheBazaar.Config"));
+    {
+        try
+        {
+            ApplyUrls(GameInspector.FindTypeSafe("TheBazaar.Config"));
+        }
+        catch (Exception ex)
+        {
+            Log?.LogWarning("[BazaarLauncher] AfterSetupCommandArgs 异常已拦截: " + ex.Message);
+        }
+    }
 
     private static void ApplyUrls(Type t)
     {

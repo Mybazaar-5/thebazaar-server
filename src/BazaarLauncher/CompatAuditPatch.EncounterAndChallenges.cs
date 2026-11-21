@@ -267,19 +267,20 @@ internal static partial class CompatAuditPatch
         if (localizableTextObj == null) return null;
         try
         {
-            if (_tooltipGetLocalizedTextMethod == null)
+            Type argType = localizableTextObj.GetType();
+            var m = _tooltipGetLocalizedTextByArgType.GetOrAdd(argType, static t =>
             {
                 var extType = GameInspector.FindTypeSafe("TheBazaar.Tooltips.TooltipExtensions");
-                _tooltipGetLocalizedTextMethod = extType?.GetMethod(
+                return extType?.GetMethod(
                     "GetLocalizedText",
                     BindingFlags.Public | BindingFlags.Static,
                     null,
-                    new[] { localizableTextObj.GetType() },
+                    new[] { t },
                     null);
-            }
-            if (_tooltipGetLocalizedTextMethod != null)
+            });
+            if (m != null)
             {
-                var res = _tooltipGetLocalizedTextMethod.Invoke(null, new[] { localizableTextObj }) as string;
+                var res = m.Invoke(null, new[] { localizableTextObj }) as string;
                 if (!string.IsNullOrWhiteSpace(res)) return res;
             }
         }
@@ -400,7 +401,11 @@ internal static partial class CompatAuditPatch
 
     private static void DataResetEncounterCachePostfix()
     {
-        ClearParentEncounterCache("Data.Reset");
+        try
+        {
+            ClearParentEncounterCache("Data.Reset");
+        }
+        catch { }
     }
 
     private static bool EncounterSetupPrefix(object __instance, object cardData, ref Task __result)
@@ -633,8 +638,15 @@ internal static partial class CompatAuditPatch
                 var boxObj = _encBoxColliderProp?.GetValue(controller);
                 if (IsUnityObjectAlive(boxObj))
                 {
-                    _encColliderEnabledProp ??= boxObj.GetType().GetProperty("enabled", BindingFlags.Public | BindingFlags.Instance);
-                    if (_encColliderEnabledProp != null && _encColliderEnabledProp.GetValue(boxObj) is bool colEnabled && !colEnabled)
+                    if (_encColliderEnabledProp == null)
+                    {
+                        var colliderBaseType = GameInspector.FindTypeSafe("UnityEngine.Collider");
+                        _encColliderEnabledProp = colliderBaseType?.GetProperty("enabled", BindingFlags.Public | BindingFlags.Instance)
+                            ?? boxObj.GetType().GetProperty("enabled", BindingFlags.Public | BindingFlags.Instance);
+                    }
+                    if (_encColliderEnabledProp != null
+                        && (_encColliderEnabledProp.DeclaringType == null || _encColliderEnabledProp.DeclaringType.IsInstanceOfType(boxObj))
+                        && _encColliderEnabledProp.GetValue(boxObj) is bool colEnabled && !colEnabled)
                     {
                         _encColliderEnabledProp.SetValue(boxObj, true);
                     }

@@ -73,7 +73,11 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     private int _rulesVersion;
     private bool _hudDirty = true;
     private string _lastObservedAppState = "";
+    private float _nextAppStatePollTime;
     private float _nextPerfTabRefreshTime;
+
+    internal static bool IsPerformanceTabVisible
+        => Instance != null && Instance._isOpen && Instance._activeTab == UiTab.Performance;
 
     // ── #16 锦标赛 PvP 等待状态与中文倒计时横幅缓存 ───────────────────────────
     private sealed class TourneyStatusSnapshot
@@ -257,12 +261,16 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             }
         }
 
-        // 事件驱动按需刷新（修复 P1-1）：仅当脏标记置位、AppState 变更或低频保底 1.0s 时刷新，严禁战斗中 0.15s 高频刷新
-        string curAppState = GameInspector.GetAppStateName();
-        if (!string.Equals(curAppState, _lastObservedAppState, StringComparison.Ordinal))
+        // 事件驱动按需刷新（修复 P1-1 & 拖拽 Top 10）：将 AppState 反射轮询降频至 0.25s，避免每帧反射开销
+        if (_hudDirty || now >= _nextAppStatePollTime)
         {
-            _lastObservedAppState = curAppState;
-            _hudDirty = true;
+            _nextAppStatePollTime = now + 0.25f;
+            string curAppState = GameInspector.GetAppStateName();
+            if (!string.Equals(curAppState, _lastObservedAppState, StringComparison.Ordinal))
+            {
+                _lastObservedAppState = curAppState;
+                _hudDirty = true;
+            }
         }
 
         if (_hudDirty || now >= _nextHudSyncTime)

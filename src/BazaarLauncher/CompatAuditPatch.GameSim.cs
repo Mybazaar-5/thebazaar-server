@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -70,21 +71,35 @@ internal static partial class CompatAuditPatch
 
     private static bool TryCacheTransformedCardPrefix(CombatSimEventCardTransformed evt, CombatSimFrame frame)
     {
-        if (evt == null || frame == null || evt.TransformedCards == null)
-            return false;
+        try
+        {
+            if (evt == null || frame == null || evt.TransformedCards == null)
+                return false;
 
-        EnsureCombatFrameCardUpdates(evt, frame);
+            EnsureCombatFrameCardUpdates(evt, frame);
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.TryCacheTransformedCardPrefix: " + ex.Message);
+        }
         return true;
     }
 
     private static bool CombatProcessEventsPrefix(ICombatSimEvent combatSimEvent, CombatSimFrame frame)
     {
-        if (combatSimEvent is CombatSimEventCardTransformed evt)
+        try
         {
-            if (evt.TransformedCards == null || frame == null)
-                return false;
+            if (combatSimEvent is CombatSimEventCardTransformed evt)
+            {
+                if (evt.TransformedCards == null || frame == null)
+                    return false;
 
-            EnsureCombatFrameCardUpdates(evt, frame);
+                EnsureCombatFrameCardUpdates(evt, frame);
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.CombatProcessEventsPrefix: " + ex.Message);
         }
         return true;
     }
@@ -148,16 +163,21 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    // P1-3 修复：缓存战斗 VFX 热路径全部反射成员，彻底消除每次触发 6 次无缓存反射与装箱
-    private static PropertyInfo _vfxEventDataProp;
-    private static PropertyInfo _vfxShouldPlayProp;
-    private static FieldInfo _vfxManagerSoField;
-    private static PropertyInfo _vfxActionTypeProp;
-    private static PropertyInfo _vfxTargetCardProp;
-    private static PropertyInfo _vfxSourceCardProp;
-    private static PropertyInfo _vfxTargetInstanceIdProp;
-    private static PropertyInfo _vfxCardInstanceIdProp;
-    private static MethodInfo _vfxIsActionMappedMethod;
+    // P1-3 & P2 加固：按运行时真实类型分桶缓存战斗 VFX 反射成员，彻底消除跨类型强转风险与每次触发无缓存反射
+    private sealed class VfxEventDataMemberBag
+    {
+        public PropertyInfo ShouldPlay;
+        public PropertyInfo ActionType;
+        public PropertyInfo TargetCard;
+        public PropertyInfo SourceCard;
+        public PropertyInfo TargetInstanceId;
+    }
+
+    private static readonly ConcurrentDictionary<Type, PropertyInfo> _vfxEventDataPropByType = new();
+    private static readonly ConcurrentDictionary<Type, VfxEventDataMemberBag> _vfxDataBagByType = new();
+    private static readonly ConcurrentDictionary<Type, FieldInfo> _vfxManagerSoFieldByType = new();
+    private static readonly ConcurrentDictionary<Type, MethodInfo> _vfxIsActionMappedByType = new();
+    private static readonly ConcurrentDictionary<Type, PropertyInfo> _vfxCardInstanceIdPropByType = new();
 
     private static bool GenerateCombatVfxPrefix(object __instance, object eventData)
     {
@@ -171,40 +191,51 @@ internal static partial class CompatAuditPatch
                 return false;
             }
 
-            _vfxEventDataProp ??= eventData.GetType().GetProperty("Data", BindingFlags.Public | BindingFlags.Instance);
-            var data = _vfxEventDataProp?.GetValue(eventData);
+            var evDataProp = _vfxEventDataPropByType.GetOrAdd(
+                eventData.GetType(),
+                static t => t.GetProperty("Data", BindingFlags.Public | BindingFlags.Instance));
+            var data = evDataProp?.GetValue(eventData);
             if (data == null) return false;
 
-            Type dataType = data.GetType();
-            _vfxShouldPlayProp ??= dataType.GetProperty("VFXShouldPlay", BindingFlags.Public | BindingFlags.Instance);
-            if (_vfxShouldPlayProp != null && _vfxShouldPlayProp.GetValue(data) is bool play && !play)
+            var dataBag = _vfxDataBagByType.GetOrAdd(data.GetType(), static dt => new VfxEventDataMemberBag
+            {
+                ShouldPlay = dt.GetProperty("VFXShouldPlay", BindingFlags.Public | BindingFlags.Instance),
+                ActionType = dt.GetProperty("ActionType", BindingFlags.Public | BindingFlags.Instance),
+                TargetCard = dt.GetProperty("TargetCard", BindingFlags.Public | BindingFlags.Instance),
+                SourceCard = dt.GetProperty("SourceCard", BindingFlags.Public | BindingFlags.Instance),
+                TargetInstanceId = dt.GetProperty("TargetInstanceId", BindingFlags.Public | BindingFlags.Instance),
+            });
+
+            if (dataBag.ShouldPlay != null && dataBag.ShouldPlay.GetValue(data) is bool play && !play)
                 return true;
 
-            _vfxManagerSoField ??= __instance.GetType().GetField("vfxManagerSO", BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
-            var vfxSo = _vfxManagerSoField?.GetValue(__instance);
+            var mgrSoField = _vfxManagerSoFieldByType.GetOrAdd(
+                __instance.GetType(),
+                static mt => mt.GetField("vfxManagerSO", BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public));
+            var vfxSo = mgrSoField?.GetValue(__instance);
             if (vfxSo == null) return false;
 
-            _vfxActionTypeProp ??= dataType.GetProperty("ActionType", BindingFlags.Public | BindingFlags.Instance);
-            _vfxTargetCardProp ??= dataType.GetProperty("TargetCard", BindingFlags.Public | BindingFlags.Instance);
-            var actionType = _vfxActionTypeProp?.GetValue(data);
-            var targetCard = _vfxTargetCardProp?.GetValue(data);
+            var actionType = dataBag.ActionType?.GetValue(data);
+            var targetCard = dataBag.TargetCard?.GetValue(data);
 
-            _vfxIsActionMappedMethod ??= vfxSo.GetType().GetMethod("IsActionAttributeMapped", BindingFlags.Public | BindingFlags.Instance);
-            if (_vfxIsActionMappedMethod != null && actionType != null)
+            var isMappedMethod = _vfxIsActionMappedByType.GetOrAdd(
+                vfxSo.GetType(),
+                static st => st.GetMethod("IsActionAttributeMapped", BindingFlags.Public | BindingFlags.Instance));
+            if (isMappedMethod != null && actionType != null)
             {
-                bool isMapped = (bool)_vfxIsActionMappedMethod.Invoke(vfxSo, new[] { actionType });
+                bool isMapped = (bool)isMappedMethod.Invoke(vfxSo, new[] { actionType });
                 if (isMapped && targetCard == null)
                 {
-                    _vfxSourceCardProp ??= dataType.GetProperty("SourceCard", BindingFlags.Public | BindingFlags.Instance);
-                    var srcCard = _vfxSourceCardProp?.GetValue(data);
+                    var srcCard = dataBag.SourceCard?.GetValue(data);
                     if (srcCard != null)
                     {
-                        _vfxCardInstanceIdProp ??= srcCard.GetType().GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance);
-                        _vfxTargetInstanceIdProp ??= dataType.GetProperty("TargetInstanceId", BindingFlags.Public | BindingFlags.Instance);
-                        if (_vfxCardInstanceIdProp != null && _vfxTargetInstanceIdProp != null && _vfxTargetInstanceIdProp.CanWrite)
+                        var srcIdProp = _vfxCardInstanceIdPropByType.GetOrAdd(
+                            srcCard.GetType(),
+                            static ct => ct.GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance));
+                        if (srcIdProp != null && dataBag.TargetInstanceId != null && dataBag.TargetInstanceId.CanWrite)
                         {
-                            _vfxTargetInstanceIdProp.SetValue(data, _vfxCardInstanceIdProp.GetValue(srcCard));
-                            if (_vfxTargetCardProp?.GetValue(data) != null) return true;
+                            dataBag.TargetInstanceId.SetValue(data, srcIdProp.GetValue(srcCard));
+                            if (dataBag.TargetCard?.GetValue(data) != null) return true;
                         }
                     }
 
@@ -262,19 +293,26 @@ internal static partial class CompatAuditPatch
         IEnumerable<GameSimEventCardTransformed> events,
         ref Dictionary<string, SimUpdateCard> simUpdates)
     {
-        simUpdates ??= new Dictionary<string, SimUpdateCard>();
-        if (events == null) return;
-        foreach (var ev in events)
+        try
         {
-            if (ev?.TransformedCards == null) continue;
-            foreach (var tc in ev.TransformedCards)
+            simUpdates ??= new Dictionary<string, SimUpdateCard>();
+            if (events == null) return;
+            foreach (var ev in events)
             {
-                if (tc == null || string.IsNullOrEmpty(tc.InstanceId)) continue;
-                if (!simUpdates.ContainsKey(tc.InstanceId))
+                if (ev?.TransformedCards == null) continue;
+                foreach (var tc in ev.TransformedCards)
                 {
-                    simUpdates[tc.InstanceId] = new SimUpdateCard { InstanceId = tc.InstanceId };
+                    if (tc == null || string.IsNullOrEmpty(tc.InstanceId)) continue;
+                    if (!simUpdates.ContainsKey(tc.InstanceId))
+                    {
+                        simUpdates[tc.InstanceId] = new SimUpdateCard { InstanceId = tc.InstanceId };
+                    }
                 }
             }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.ProcessCardTransformedEventsPrefix: " + ex.Message);
         }
     }
 
@@ -282,15 +320,22 @@ internal static partial class CompatAuditPatch
         IEnumerable<GameSimEventCardTransformReverted> events,
         ref Dictionary<string, SimUpdateCard> simUpdates)
     {
-        simUpdates ??= new Dictionary<string, SimUpdateCard>();
-        if (events == null) return;
-        foreach (var ev in events)
+        try
         {
-            if (ev?.OriginalCard == null || string.IsNullOrEmpty(ev.OriginalCard.InstanceId)) continue;
-            if (!simUpdates.ContainsKey(ev.OriginalCard.InstanceId))
+            simUpdates ??= new Dictionary<string, SimUpdateCard>();
+            if (events == null) return;
+            foreach (var ev in events)
             {
-                simUpdates[ev.OriginalCard.InstanceId] = new SimUpdateCard { InstanceId = ev.OriginalCard.InstanceId };
+                if (ev?.OriginalCard == null || string.IsNullOrEmpty(ev.OriginalCard.InstanceId)) continue;
+                if (!simUpdates.ContainsKey(ev.OriginalCard.InstanceId))
+                {
+                    simUpdates[ev.OriginalCard.InstanceId] = new SimUpdateCard { InstanceId = ev.OriginalCard.InstanceId };
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.ProcessTransformRevertedEventsPrefix: " + ex.Message);
         }
     }
 
@@ -302,9 +347,13 @@ internal static partial class CompatAuditPatch
 
         try
         {
+            // 推进 GameSim 版本号，使悬停标签同步与 ShowCardHint 仅在牌局真正变动时刷新
+            Interlocked.Increment(ref _gameSimVersion);
+            ResetShowCardHintDedupeCache();
+
             if (_cachedDataEntitiesField == null)
             {
-                var dataType = AccessTools.TypeByName("TheBazaar.Data");
+                var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
                 _cachedDataEntitiesField = dataType?.GetField("Entities", BindingFlags.Public | BindingFlags.Static);
             }
             var entities = _cachedDataEntitiesField?.GetValue(null) as IDictionary;
@@ -312,6 +361,7 @@ internal static partial class CompatAuditPatch
 
             var spawnedInBatch = new HashSet<string>(StringComparer.Ordinal);
             bool hasSkillEquipped = false;
+            bool shouldArmHour6Watchdog = false;
             for (int i = 0; i < events.Count; i++)
             {
                 var ev = events[i];
@@ -328,6 +378,10 @@ internal static partial class CompatAuditPatch
                 }
                 else if (ev is GameSimEventStateTransitioned stEv)
                 {
+                    if (stEv.ToState is ERunState.Choice or ERunState.TournamentPvpChoice)
+                    {
+                        shouldArmHour6Watchdog = true;
+                    }
                     if (stEv.ToState is ERunState.Choice or ERunState.Combat or ERunState.PVPCombat or ERunState.EndRunVictory or ERunState.EndRunDefeat
                         || string.IsNullOrEmpty(stEv.CurrentEncounterId))
                     {
@@ -335,14 +389,25 @@ internal static partial class CompatAuditPatch
                         if (stEv.ToState is ERunState.EndRunVictory or ERunState.EndRunDefeat)
                         {
                             _enchDynamicSyncedTags.Clear();
+                            _cardTagSyncStamps.Clear();
+                            _lastTriggeredPvpSnapshot = default;
                         }
                     }
                     BazaarLauncherPlugin.Host?.EventBus.Publish(new BazaarModSdk.RunStateChangedModEvent(string.Empty, stEv.ToState.ToString()));
+                }
+                else if (ev is GameSimEventCardDealt)
+                {
+                    shouldArmHour6Watchdog = true;
                 }
                 else if (ev is GameSimEventPlayerSkillEquipped)
                 {
                     hasSkillEquipped = true;
                 }
+            }
+
+            if (shouldArmHour6Watchdog)
+            {
+                ScheduleHour6ChoiceRevealWatchdogIfNeeded();
             }
 
             if (!hasSkillEquipped) return;
@@ -727,7 +792,14 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    private static void OnRunConfigCacheUpdatedPostfix() => RefreshActiveMainMenuUiFromData();
+    private static void OnRunConfigCacheUpdatedPostfix()
+    {
+        try
+        {
+            RefreshActiveMainMenuUiFromData();
+        }
+        catch { }
+    }
 
     /// <summary>
     /// 当主大厅正在显示时（如放弃对局、deleteactivesave 或 RunConfig 刷新后），同步切换恢复条与三模式入口可见性。
@@ -837,9 +909,10 @@ internal static partial class CompatAuditPatch
 
         if (needInit)
         {
-            var respType = AccessTools.TypeByName("BazaarGameShared.TempoNet.Models.RunRewardLevelResponse")
-                           ?? AccessTools.TypeByName("BazaarGameShared.TempoNet.Responses.RunRewardLevelResponse");
-            var curType = AccessTools.TypeByName("BazaarGameShared.TempoNet.Models.CurrencyValue");
+            var respType = GameInspector.FindTypeSafe(
+                "BazaarGameShared.TempoNet.Responses.RunRewardLevelResponse",
+                "BazaarGameShared.TempoNet.Models.RunRewardLevelResponse");
+            var curType = GameInspector.FindTypeSafe("BazaarGameShared.TempoNet.Models.CurrencyValue");
             var updateM = tr.GetType().GetMethod("Update", BindingFlags.Public | BindingFlags.Instance);
             if (respType != null && updateM != null)
             {
@@ -865,7 +938,9 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    // ── 7. SoundEventListener.OnCardMoved：Controller 尚未生成时防 NRE ─────────
+    // ── 7. SoundEventListener.OnCardMoved：Controller 尚未生成时防 NRE（Top 10：缓存 _soundManager 字段）──
+
+    private static FieldInfo _soundManagerField;
 
     private static void PatchSoundEventListener(Harmony harmony)
     {
@@ -873,6 +948,8 @@ internal static partial class CompatAuditPatch
         {
             var soundType = GameInspector.FindTypeSafe("TheBazaar.SoundEventListener");
             if (soundType == null) return;
+
+            _soundManagerField = soundType.GetField("_soundManager", BindingFlags.NonPublic | BindingFlags.Instance);
 
             var itemCardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.ItemCard");
             var onMoved = itemCardType != null
@@ -904,9 +981,14 @@ internal static partial class CompatAuditPatch
                 return false;
             }
 
-            var soundMgr = __instance.GetType()
-                .GetField("_soundManager", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?.GetValue(__instance);
+            if (_soundManagerField == null)
+            {
+                var soundType = GameInspector.FindTypeSafe("TheBazaar.SoundEventListener");
+                _soundManagerField = soundType?.GetField("_soundManager", BindingFlags.NonPublic | BindingFlags.Instance);
+            }
+            var soundMgr = (_soundManagerField != null && _soundManagerField.DeclaringType.IsInstanceOfType(__instance))
+                ? _soundManagerField.GetValue(__instance)
+                : GameInspector.GetMember(__instance, "_soundManager");
             if (soundMgr == null || GameInspector.GetMember(soundMgr, "SFXPlayer") == null)
             {
                 Interlocked.Increment(ref _suppressedSoundMoveCount);
@@ -998,16 +1080,23 @@ internal static partial class CompatAuditPatch
 
     private static bool GetCardContainerBoundsPrefix(List<Bounds> bounds, ref Bounds __result)
     {
-        if (bounds == null || bounds.Count == 0)
+        try
         {
-            int cnt = Interlocked.Increment(ref _suppressedRevealBoundsCount);
-            if (cnt <= 3 || cnt % 25 == 0)
+            if (bounds == null || bounds.Count == 0)
             {
-                BazaarLauncherPlugin.Log?.LogInfo(
-                    $"CompatAuditPatch: skipped empty BaseCardRevealAnimationDriver.GetCardContainerBounds (count={cnt})");
+                int cnt = Interlocked.Increment(ref _suppressedRevealBoundsCount);
+                if (cnt <= 3 || cnt % 25 == 0)
+                {
+                    BazaarLauncherPlugin.Log?.LogInfo(
+                        $"CompatAuditPatch: skipped empty BaseCardRevealAnimationDriver.GetCardContainerBounds (count={cnt})");
+                }
+                __result = new Bounds(Vector3.zero, Vector3.zero);
+                return false;
             }
-            __result = new Bounds(Vector3.zero, Vector3.zero);
-            return false;
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.GetCardContainerBoundsPrefix: " + ex.Message);
         }
         return true;
     }
@@ -1068,15 +1157,66 @@ internal static partial class CompatAuditPatch
         return loadout == null ? null : GameInspector.GetMember(loadout, "accountId") as string;
     }
 
+    private static (int Day, int Hour, int OppMaxHealth) ReadRunDayHourAndOppHealth()
+    {
+        int day = 0;
+        int hour = 0;
+        int maxHealth = 0;
+        try
+        {
+            var run = GameInspector.GetDataRun();
+            if (run != null)
+            {
+                var dayObj = GameInspector.GetMember(run, "Day");
+                if (dayObj != null) day = Convert.ToInt32(dayObj);
+                var hourObj = GameInspector.GetMember(run, "Hour");
+                if (hourObj != null) hour = Convert.ToInt32(hourObj);
+
+                var opp = GameInspector.GetMember(run, "Opponent");
+                if (opp != null && GameInspector.GetMember(opp, "Attributes") is IDictionary attrs && attrs.Contains(EPlayerAttributeType.HealthMax))
+                {
+                    var hm = attrs[EPlayerAttributeType.HealthMax];
+                    if (hm != null) maxHealth = Convert.ToInt32(hm);
+                }
+            }
+        }
+        catch { }
+        return (day, hour, maxHealth);
+    }
+
+    private static PvpOpponentSnapshot BuildPvpSnapshot(object simPvpOpponent)
+    {
+        var (day, hour, maxHealth) = ReadRunDayHourAndOppHealth();
+        if (simPvpOpponent == null)
+        {
+            return new PvpOpponentSnapshot
+            {
+                HadOpponent = false,
+                Day = day,
+                Hour = hour,
+                MaxHealth = maxHealth,
+            };
+        }
+
+        return new PvpOpponentSnapshot
+        {
+            HadOpponent = true,
+            AccountId = ReadPvpAccountId(simPvpOpponent),
+            Hero = GameInspector.GetMember(simPvpOpponent, "Hero")?.ToString(),
+            Name = GameInspector.GetMember(simPvpOpponent, "Name")?.ToString(),
+            Day = day,
+            Hour = hour,
+            MaxHealth = maxHealth,
+        };
+    }
+
     private static void ApplySimPvpOpponentPrefix(out PvpOpponentSnapshot __state)
     {
         __state = default;
         try
         {
             var cur = _dataSimPvpOpponentProp?.GetValue(null);
-            __state.HadOpponent = cur != null;
-            __state.AccountId = ReadPvpAccountId(cur);
-            __state.Hero = cur != null ? GameInspector.GetMember(cur, "Hero")?.ToString() : null;
+            __state = BuildPvpSnapshot(cur);
         }
         catch { }
     }
@@ -1088,21 +1228,32 @@ internal static partial class CompatAuditPatch
             var cur = _dataSimPvpOpponentProp?.GetValue(null);
             if (cur == null) return;
 
-            string newAccountId = ReadPvpAccountId(cur);
-            string newHero = GameInspector.GetMember(cur, "Hero")?.ToString();
+            var nowSnap = BuildPvpSnapshot(cur);
 
-            // 原版 Data.cs:297 仅在前后 accountId 均非空且不相等时触发；此处避免重复触发
+            // 原版 Data.cs:297 仅在前后 accountId 均非空且不相等时触发；此处记录并避免重复触发
             bool nativeTriggered = !string.IsNullOrEmpty(__state.AccountId)
-                && !string.IsNullOrEmpty(newAccountId)
-                && !string.Equals(__state.AccountId, newAccountId, StringComparison.OrdinalIgnoreCase);
-            if (nativeTriggered) return;
+                && !string.IsNullOrEmpty(nowSnap.AccountId)
+                && !string.Equals(__state.AccountId, nowSnap.AccountId, StringComparison.OrdinalIgnoreCase);
+            if (nativeTriggered)
+            {
+                _lastTriggeredPvpSnapshot = nowSnap;
+                return;
+            }
 
-            bool firstValid = !__state.HadOpponent && (!string.IsNullOrEmpty(newAccountId) || !string.IsNullOrEmpty(newHero));
-            bool becameNonEmptyAccount = string.IsNullOrEmpty(__state.AccountId) && !string.IsNullOrEmpty(newAccountId);
-            bool heroChanged = !string.IsNullOrEmpty(newHero)
-                && !string.Equals(__state.Hero, newHero, StringComparison.OrdinalIgnoreCase);
+            // 修复 Hour 6 跨天同 accountId+hero 去重误跳：
+            // 引入 (Day, Hour, AccountId, Hero, MaxHealth, Name) 多维比对，确保跨天抽到同 FallbackGhost/锦标赛同对手时必刷新头像与血条！
+            var last = _lastTriggeredPvpSnapshot;
+            bool firstValid = !__state.HadOpponent && (!string.IsNullOrEmpty(nowSnap.AccountId) || !string.IsNullOrEmpty(nowSnap.Hero));
+            bool becameNonEmptyAccount = string.IsNullOrEmpty(__state.AccountId) && !string.IsNullOrEmpty(nowSnap.AccountId);
+            bool heroChanged = !string.IsNullOrEmpty(nowSnap.Hero)
+                && !string.Equals(__state.Hero, nowSnap.Hero, StringComparison.OrdinalIgnoreCase);
+            bool dayChanged = nowSnap.Day > 0 && last.Day != nowSnap.Day;
+            bool hourEnteredPvp = nowSnap.Hour > 0 && last.Hour != nowSnap.Hour && nowSnap.Hour >= GetHoursInADaySafe();
+            bool healthChanged = nowSnap.MaxHealth > 0 && last.MaxHealth != nowSnap.MaxHealth;
+            bool nameChanged = !string.IsNullOrEmpty(nowSnap.Name)
+                && !string.Equals(last.Name, nowSnap.Name, StringComparison.Ordinal);
 
-            if (!firstValid && !becameNonEmptyAccount && !heroChanged)
+            if (!firstValid && !becameNonEmptyAccount && !heroChanged && !dayChanged && !hourEnteredPvp && !healthChanged && !nameChanged)
                 return;
 
             if (_pvpOpponentChangedEventObj == null || _pvpOpponentChangedTriggerMethod == null)
@@ -1117,14 +1268,275 @@ internal static partial class CompatAuditPatch
             {
                 var ps = _pvpOpponentChangedTriggerMethod.GetParameters();
                 _pvpOpponentChangedTriggerMethod.Invoke(_pvpOpponentChangedEventObj, ps.Length == 0 ? null : new object[] { null });
+                _lastTriggeredPvpSnapshot = nowSnap;
                 int cnt = Interlocked.Increment(ref _pvpOpponentChangedFixedCount);
                 BazaarLauncherPlugin.Log?.LogInfo(
-                    $"CompatAuditPatch: triggered missing Events.PvpOpponentChanged (count={cnt}, hero={newHero}, accountId={newAccountId})");
+                    $"CompatAuditPatch: triggered missing Events.PvpOpponentChanged (count={cnt}, day={nowSnap.Day}, hour={nowSnap.Hour}, hero={nowSnap.Hero}, accountId={nowSnap.AccountId}, hp={nowSnap.MaxHealth})");
             }
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.ApplySimPvpOpponentPostfix: " + ex.Message);
+        }
+    }
+
+    // ── 9.5 TransitionInComponent Hour 6 竞态死锁根治（三道防线） ─────────────
+    // 根因：进入 Hour 6 Choice 第 1 帧（或 Hour 5->6 LevelUp 隐藏选牌器时）TryUpdateClock() 立即把
+    // _waitForNewDayTransition 置为 true；若异步 SpawnCards([pvpCard]) 晚于首帧 TryRevealCards()，
+    // 后续每帧 ShouldWaitForNewDayTransition() 因 Hour == HoursInADay (6) 永远返回 true，永久冻结翻牌！
+
+    private static FieldInfo _tiWaitForNewDayField;
+    private static PropertyInfo _tiIsProcessingProp;
+    private static MethodInfo _tiTryRevealCardsMethod;
+    private static PropertyInfo _dataHoursInADayProp;
+    private static PropertyInfo _dataNewDayCtrlProp;
+    private static PropertyInfo _newDayIsActiveProp;
+    private static PropertyInfo _newDayHasPendingProp;
+    private static MethodInfo _bmHasCardsToRevealMethod;
+    private static int _hour6WatchdogSeq;
+
+    private static void PatchTransitionInHour6Guard(Harmony harmony)
+    {
+        try
+        {
+            var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
+            if (dataType != null)
+            {
+                _dataHoursInADayProp = dataType.GetProperty("HoursInADay", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                _dataNewDayCtrlProp = dataType.GetProperty("NewDayTransitionController", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            }
+
+            var bmType = GameInspector.FindTypeSafe("BoardManager");
+            if (bmType != null)
+            {
+                _bmHasCardsToRevealMethod = AccessTools.Method(bmType, "HasCardsToReveal", Type.EmptyTypes);
+            }
+
+            var tiType = GameInspector.FindTypeSafe("TheBazaar.SequenceFramework.VisualSequences.TransitionInComponent");
+            if (tiType == null) return;
+
+            _tiWaitForNewDayField = tiType.GetField("_waitForNewDayTransition", BindingFlags.NonPublic | BindingFlags.Instance);
+            _tiIsProcessingProp = tiType.GetProperty("IsProcessing", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            _tiTryRevealCardsMethod = AccessTools.Method(tiType, "TryRevealCards", Type.EmptyTypes);
+
+            var shouldWaitMethod = AccessTools.Method(tiType, "ShouldWaitForNewDayTransition", Type.EmptyTypes);
+            if (shouldWaitMethod != null)
+            {
+                harmony.Patch(
+                    shouldWaitMethod,
+                    postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(TransitionInShouldWaitForNewDayPostfix))));
+                _patchedCount++;
+            }
+
+            var tryUpdateClockMethod = AccessTools.Method(tiType, "TryUpdateClock", Type.EmptyTypes);
+            if (tryUpdateClockMethod != null)
+            {
+                harmony.Patch(
+                    tryUpdateClockMethod,
+                    postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(TransitionInTryUpdateClockPostfix))));
+                _patchedCount++;
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.PatchTransitionInHour6Guard: " + ex.Message);
+        }
+    }
+
+    private static int GetHoursInADaySafe()
+    {
+        try
+        {
+            if (_dataHoursInADayProp != null && _dataHoursInADayProp.GetValue(null) is int h && h > 0)
+            {
+                return h;
+            }
+        }
+        catch { }
+        return 6;
+    }
+
+    private static bool IsNewDayTransitionActiveOrPending()
+    {
+        try
+        {
+            var ctrl = _dataNewDayCtrlProp?.GetValue(null);
+            if (ctrl == null || (ctrl is UnityEngine.Object uo && uo == null)) return false;
+
+            Type ct = ctrl.GetType();
+            if (_newDayIsActiveProp == null || (_newDayIsActiveProp.DeclaringType != null && !_newDayIsActiveProp.DeclaringType.IsInstanceOfType(ctrl)))
+            {
+                _newDayIsActiveProp = ct.GetProperty("IsActive", BindingFlags.Public | BindingFlags.Instance);
+            }
+            if (_newDayHasPendingProp == null || (_newDayHasPendingProp.DeclaringType != null && !_newDayHasPendingProp.DeclaringType.IsInstanceOfType(ctrl)))
+            {
+                _newDayHasPendingProp = ct.GetProperty("HasPendingDayChanged", BindingFlags.Public | BindingFlags.Instance);
+            }
+
+            if (_newDayIsActiveProp?.GetValue(ctrl) is bool active && active) return true;
+            if (_newDayHasPendingProp?.GetValue(ctrl) is bool pending && pending) return true;
+        }
+        catch { }
+        return false;
+    }
+
+    /// <summary>
+    /// Hour 6 死锁防线 1：在 Hour 6 Choice / TournamentPvpChoice 阶段且不存在真正新一天切场（!IsActive &amp;&amp; !HasPendingDayChanged）时，
+    /// 强制解除误设的 _waitForNewDayTransition 锁并返回 false，允许异步发牌后的 PvP 镜像正常翻牌！
+    /// </summary>
+    private static void TransitionInShouldWaitForNewDayPostfix(object __instance, ref bool __result)
+    {
+        try
+        {
+            if (!__result || __instance == null) return;
+
+            var dataState = GameInspector.GetDataCurrentState();
+            if (GameInspector.GetMember(dataState, "StateName") is not ERunState runState) return;
+            if (runState != ERunState.Choice && runState != ERunState.TournamentPvpChoice) return;
+
+            var run = GameInspector.GetDataRun();
+            if (run == null) return;
+            object hourObj = GameInspector.GetMember(run, "Hour");
+            if (hourObj == null) return;
+            int curHour = Convert.ToInt32(hourObj);
+            int hoursInDay = GetHoursInADaySafe();
+            if (curHour != hoursInDay) return;
+
+            // 若确实正在或即将跨日切场，严格尊重原版等待，绝不提前翻牌
+            if (IsNewDayTransitionActiveOrPending()) return;
+
+            if (_tiWaitForNewDayField != null && _tiWaitForNewDayField.DeclaringType.IsInstanceOfType(__instance))
+            {
+                _tiWaitForNewDayField.SetValue(__instance, false);
+            }
+            __result = false;
+
+            int cnt = Interlocked.Increment(ref _hour6TransitionUnblockedCount);
+            if (cnt <= 5 || cnt % 20 == 0)
+            {
+                BazaarLauncherPlugin.Log?.LogInfo(
+                    $"CompatAuditPatch: unblocked Hour {curHour} Choice TransitionIn deadlock (count={cnt})");
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.TransitionInShouldWaitForNewDayPostfix: " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Hour 6 死锁防线 2：在 Hour 5-&gt;6 离场升级或 Hour 6 中途升级（LevelUp 状态）时，
+    /// 禁止 TryUpdateClock() 提前将 _waitForNewDayTransition 置为 true，彻底根治升级完回 Hour 6 必现空桌！
+    /// </summary>
+    private static void TransitionInTryUpdateClockPostfix(object __instance)
+    {
+        try
+        {
+            if (__instance == null || _tiWaitForNewDayField == null) return;
+            if (!_tiWaitForNewDayField.DeclaringType.IsInstanceOfType(__instance)) return;
+            if (_tiWaitForNewDayField.GetValue(__instance) is not bool waiting || !waiting) return;
+
+            var dataState = GameInspector.GetDataCurrentState();
+            if (GameInspector.GetMember(dataState, "StateName") is not ERunState runState) return;
+            if (runState != ERunState.LevelUp && runState != ERunState.Choice && runState != ERunState.TournamentPvpChoice)
+                return;
+
+            var run = GameInspector.GetDataRun();
+            if (run == null) return;
+            object hourObj = GameInspector.GetMember(run, "Hour");
+            if (hourObj == null) return;
+            if (Convert.ToInt32(hourObj) != GetHoursInADaySafe()) return;
+
+            if (IsNewDayTransitionActiveOrPending()) return;
+
+            _tiWaitForNewDayField.SetValue(__instance, false);
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.TransitionInTryUpdateClockPostfix: " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Hour 6 死锁防线 3（1.2s 兜底翻牌看门狗）：进入 Hour 6 Choice 后 1.2s 检查，
+    /// 若 Data.Entities 中存在 PvpEncounter 且 BoardManager.HasCardsToReveal() 为真但仍未翻牌，主动触发一次 TryRevealCards()。
+    /// </summary>
+    private static void ScheduleHour6ChoiceRevealWatchdogIfNeeded()
+    {
+        try
+        {
+            int seq = Interlocked.Increment(ref _hour6WatchdogSeq);
+            _ = Task.Delay(1200).ContinueWith(_ =>
+            {
+                if (Volatile.Read(ref _hour6WatchdogSeq) != seq) return;
+                BazaarLauncher.Core.MainThreadDispatcher.Enqueue(() => RunHour6ChoiceRevealWatchdogOnMain(seq));
+            }, TaskScheduler.Default);
+        }
+        catch { }
+    }
+
+    private static void RunHour6ChoiceRevealWatchdogOnMain(int expectedSeq)
+    {
+        try
+        {
+            if (Volatile.Read(ref _hour6WatchdogSeq) != expectedSeq) return;
+
+            var dataState = GameInspector.GetDataCurrentState();
+            if (GameInspector.GetMember(dataState, "StateName") is not ERunState runState) return;
+            if (runState != ERunState.Choice && runState != ERunState.TournamentPvpChoice) return;
+
+            var run = GameInspector.GetDataRun();
+            if (run == null) return;
+            object hourObj = GameInspector.GetMember(run, "Hour");
+            if (hourObj == null || Convert.ToInt32(hourObj) != GetHoursInADaySafe()) return;
+
+            if (IsNewDayTransitionActiveOrPending()) return;
+
+            // 确认 Data.Entities 中确实存在 PvpEncounter
+            bool hasPvpCard = false;
+            var entities = GameInspector.GetDataEntities();
+            if (entities != null)
+            {
+                foreach (DictionaryEntry kv in entities)
+                {
+                    if (kv.Value is ICard c && c.Type == ECardType.PvpEncounter)
+                    {
+                        hasPvpCard = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasPvpCard) return;
+
+            var bm = GameInspector.GetBoardManagerCached();
+            if (!IsUnityObjectAlive(bm) || _bmHasCardsToRevealMethod == null) return;
+            if (_bmHasCardsToRevealMethod.Invoke(bm, null) is not bool hasToReveal || !hasToReveal) return;
+
+            var ti = GetStaticDataMember("TransitionIn");
+            if (!IsUnityObjectAlive(ti)) return;
+
+            if (_tiIsProcessingProp != null && _tiIsProcessingProp.DeclaringType.IsInstanceOfType(ti)
+                && _tiIsProcessingProp.GetValue(ti) is bool proc && proc)
+            {
+                return;
+            }
+
+            if (_tiWaitForNewDayField != null && _tiWaitForNewDayField.DeclaringType.IsInstanceOfType(ti))
+            {
+                _tiWaitForNewDayField.SetValue(ti, false);
+            }
+
+            if (_tiTryRevealCardsMethod != null && _tiTryRevealCardsMethod.DeclaringType.IsInstanceOfType(ti))
+            {
+                _ = _tiTryRevealCardsMethod.Invoke(ti, null);
+                int cnt = Interlocked.Increment(ref _hour6WatchdogRevealCount);
+                BazaarLauncherPlugin.Log?.LogInfo(
+                    $"CompatAuditPatch: Hour 6 watchdog triggered fallback TryRevealCards() for PvpEncounter (count={cnt})");
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.RunHour6ChoiceRevealWatchdogOnMain: " + ex.Message);
         }
     }
 

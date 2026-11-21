@@ -131,6 +131,27 @@ public static partial class TooltipFormatter
                     return hasUnitSuffix ? $"{v / 1000.0:0.##}" : $"{v / 1000.0:0.##}s";
                 return $"{Math.Round(v):0.##}";
             }
+            else if (kind.Equals("attr", StringComparison.OrdinalIgnoreCase))
+            {
+                // V13.1：兼容自定义 Mod 卡与客户端 LocalizationOverlayModule 的 {attr.AttributeName} 四阶属性模板占位符
+                bool hasDeclared = card.BaseAttributes.ContainsKey(id)
+                    || card.CombatAdd.ContainsKey(id)
+                    || card.AuraAdd.ContainsKey(id)
+                    || card.PermanentAdd.ContainsKey(id)
+                    || card.DayAdd.ContainsKey(id)
+                    || card.HourAdd.ContainsKey(id);
+                double v = card.GetAttribute(id);
+                if (!hasDeclared && Math.Abs(v) <= 1e-6)
+                    return "?";
+
+                if (IsDurationMsAttribute(id) && Math.Abs(v) >= 100)
+                {
+                    double sec = v / 1000.0;
+                    if (hasUnitSuffix) return $"{sec:0.##}";
+                    return isZh ? $"{sec:0.##}秒" : $"{sec:0.##}s";
+                }
+                return $"{Math.Round(v, 1):0.#}";
+            }
         }
 
         // 兜底尝试按属性直接读取
@@ -138,6 +159,14 @@ public static partial class TooltipFormatter
         if (Math.Abs(direct) > 1e-6) return $"{Math.Round(direct):0.##}";
         return "?";
     }
+
+    private static bool IsDurationMsAttribute(string attrName)
+        => attrName.Contains("Cooldown", StringComparison.OrdinalIgnoreCase)
+           || attrName.Equals("HasteAmount", StringComparison.OrdinalIgnoreCase)
+           || attrName.Equals("SlowAmount", StringComparison.OrdinalIgnoreCase)
+           || attrName.Equals("FreezeAmount", StringComparison.OrdinalIgnoreCase)
+           || attrName.Equals("ChargeAmount", StringComparison.OrdinalIgnoreCase)
+           || attrName.EndsWith("Duration", StringComparison.OrdinalIgnoreCase);
 
     private static RuleNode? ResolveAbilityAction(CardInstance card, string id)
     {

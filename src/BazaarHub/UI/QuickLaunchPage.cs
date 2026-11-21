@@ -37,6 +37,7 @@ public sealed class QuickLaunchPage : UserControl
     public event Action? ProbeRefreshRequested;
     public event Action? SavePlayerAndConfigRequested;
     public event Action? LaunchRequested;
+    public event Action? OpenWorkshopRequested;
 
     public QuickLaunchPage()
     {
@@ -75,6 +76,17 @@ public sealed class QuickLaunchPage : UserControl
         };
         headerPanel.Controls.Add(lblTitle);
         headerPanel.Controls.Add(lblDesc);
+
+        var btnOpenWorkshop = new GoldButton
+        {
+            Text = "打开创意工坊编辑器（Web）",
+            Variant = GoldButtonVariant.OutlineGold,
+            Size = new Size(204, 34),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            Location = new Point(headerPanel.Width - 206, 8)
+        };
+        btnOpenWorkshop.Click += (_, _) => OpenWorkshopRequested?.Invoke();
+        headerPanel.Controls.Add(btnOpenWorkshop);
         root.Controls.Add(headerPanel);
 
         // 卡片 1：游戏路径与本体状态

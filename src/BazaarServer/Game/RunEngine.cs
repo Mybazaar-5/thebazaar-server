@@ -134,9 +134,21 @@ public sealed class RunEngine
                 string anchorEncId = ResolvePortraitAnchorEncounterId(_run.CurrentEncounterId);
                 ActivateEncounterCard(anchorEncId, selectedCard: null, new List<IGameSimEvent>(), emitPurchaseIfSelected: false);
             }
-            if (_run.State == ERunState.Choice && _run.Hour == (uint)_mode.HoursInADay)
+            if (_run.State == ERunState.Choice)
             {
-                EnsurePendingHour6PvpOpponentLocked();
+                bool isPvpHour = _run.Hour == (uint)_mode.HoursInADay;
+                bool missingHour6Pvp = isPvpHour && !_run.SelectionSet.Any(id =>
+                    _run.Cards.TryGetValue(id, out var ce) && ce.Type == ECardType.PvpEncounter);
+                if (_run.SelectionSet.Count == 0 || missingHour6Pvp)
+                {
+                    // V13.1 Hour 6 Resume 自愈：若 Choice 候选集为空或 Hour 6 缺少 PvpEncounter，立即重建防死局
+                    _run.SelectionsMadeInCurrentContext = 0;
+                    DealHourEncountersAndClearActive();
+                }
+                if (isPvpHour)
+                {
+                    EnsurePendingHour6PvpOpponentLocked();
+                }
             }
             ReconcileAndVerifyBoardInvariants("ResumeInit");
         }
@@ -370,7 +382,7 @@ public sealed class RunEngine
         int startGold = Math.Max(0, rules.StartingGold != 15 ? rules.StartingGold : _mode.StartingGold);
         int startIncome = Math.Max(0, rules.StartingIncome != 5 ? rules.StartingIncome : _mode.StartingIncome);
         int startPrestige = Math.Max(1, rules.StartingPrestige != 20 ? rules.StartingPrestige : _mode.PrestigeInitial);
-        int startExp = Math.Max(0, rules.StartingExperience != 3 ? rules.StartingExperience : _mode.StartingExperience);
+        int startExp = Math.Max(0, rules.StartingExperience != 0 ? rules.StartingExperience : _mode.StartingExperience);
 
         if (rules.HasMutator(MutatorCatalog.DoubleEconomy))
         {
@@ -477,10 +489,9 @@ public sealed class RunEngine
 
             var skillPool = _pool.AllSkills
                 .Where(c => _pool.IsPlayerSpawnable(c) &&
-                            (rules.SpecialModeId == ESpecialModeId.CrossHeroMayhem ||
-                             c.Heroes.Length == 0 ||
-                             c.Heroes.Contains(heroName, StringComparer.OrdinalIgnoreCase) ||
-                             c.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase)))
+                            (rules.SpecialModeId == ESpecialModeId.CrossHeroMayhem
+                                ? c.Heroes.Any(h => HeroNames.PlayableHeroes.Contains(h, StringComparer.OrdinalIgnoreCase))
+                                : (c.Heroes.Length == 0 || c.Heroes.Contains(heroName, StringComparer.OrdinalIgnoreCase))))
                 .ToList();
             if (skillPool.Count > 0)
             {
@@ -1157,7 +1168,8 @@ public sealed class RunEngine
     private Outcome MoveOwnedCard(RunState.CardEntry card, List<EContainerSocketId>? targetSockets, EInventorySection targetSection)
     {
         var coreCard = EnsureCoreCard(card);
-        string fromLoc = $"{card.Section}:{card.Socket}";
+        EInventorySection? fromSection = card.Section;
+        string fromLoc = $"{fromSection}:{card.Socket}";
         int desiredSlot = targetSockets is { Count: > 0 } ? targetSockets.Min(s => (int)s) : -1;
         var preMoveSnapshot = SnapshotPlayerItemPlacements();
         var moved = new List<(RunState.CardEntry Entry, EContainerSocketId NewSocket, EInventorySection Section)>();
@@ -1177,20 +1189,126 @@ public sealed class RunEngine
             EmitMoveEventIfNotPresent(o.Events, mv.Entry.InstanceId, mv.Section, mv.NewSocket);
         }
 
-        // 摆盘/挤位后立刻重算局外光环（含货架商店折扣/门票光环）并全盘对比属性差分，向客户端推送最新卡面数值
-        var p1Core = BuildCorePlayerFromRun();
-        var selectionCards = CollectSelectionCoreCards();
-        var moveBatch = OutOfCombatController.OnCardMoved(
-            p1Core, _repo, activeEncounterCard: _run.CurrentEncounterCoreCard,
-            selectionCards: selectionCards);
-        ApplyOutOfCombatBatch(p1Core, moveBatch, o.Events, syncBoardDiffs: true);
-        if (selectionCards.Count > 0)
-            SyncShelfEntriesDiff(o.Events);
+        // V13.1 拖拽加速（Top 9）：纯储藏箱内部换位不影响任何场上光环与相邻触发；
+        // 若挪动涉及带 HandAndStash 光环（如 Golden 附魔 SellPrice*=2）的卡牌，仍走完整光环刷新确保价格/属性 100% 精准。
+        bool isPureStashReorder = fromSection == EInventorySection.Stash && targetSection == EInventorySection.Stash;
+        if (isPureStashReorder && !HasStashRelevantAura(card, moved))
+        {
+            if (card.Socket.HasValue) coreCard.StartSlot = (int)card.Socket.Value;
+            foreach (var mv in moved)
+            {
+                if (mv.Entry.CoreCard != null)
+                    mv.Entry.CoreCard.StartSlot = (int)mv.NewSocket;
+            }
+            LogBoardAudit("MoveCard", card.InstanceId, card.TemplateId.ToString(), fromLoc, $"{card.Section}:{card.Socket}");
+            return o;
+        }
 
-        ReconcileAndVerifyBoardInvariants("MoveCard", o.DirtyCardIds, o.Events, preMoveSnapshot);
-        SyncDisplacedCorePlacementsAndEmitDiffs(p1Core, preMoveSnapshot, o.DirtyCardIds, o.Events);
+        // V13.1 拖拽加速（Top 9）：若场上、技能、货架与当前遭遇均不存在任何活跃光环源或已挂载光环修饰，
+        // 直接跳过全量 CorePlayer 重建与 AuraEngine 双趟重算，仅确保网格不变量并同步移位差分。
+        bool needsAuraRecalc = HasAnyRelevantAuraForMove();
+        if (needsAuraRecalc)
+        {
+            int prevEventCount = o.Events.Count;
+            var p1Core = BuildCorePlayerFromRun();
+            var selectionCards = CollectSelectionCoreCards();
+            var moveBatch = OutOfCombatController.OnCardMoved(
+                p1Core, _repo, activeEncounterCard: _run.CurrentEncounterCoreCard,
+                selectionCards: selectionCards);
+            ApplyOutOfCombatBatch(p1Core, moveBatch, o.Events, syncBoardDiffs: true);
+            if (selectionCards.Count > 0)
+                SyncShelfEntriesDiff(o.Events);
+
+            // 将本轮光环属性/品质/附魔发生变化的卡牌精准登记进 DirtyCardIds，供 BuildDeltaGameSim 轻量增量同步给客户端
+            for (int i = prevEventCount; i < o.Events.Count; i++)
+            {
+                switch (o.Events[i])
+                {
+                    case GameSimEventEffectAuraExecuted auraEv when auraEv.AppliedTo != null:
+                        foreach (var target in auraEv.AppliedTo)
+                        {
+                            if (target is EffectTargetCard cardTarget && !string.IsNullOrEmpty(cardTarget.Target.Value))
+                                o.DirtyCardIds.Add(cardTarget.Target.Value);
+                        }
+                        break;
+                    case GameSimEventCardUpgraded upgEv when !string.IsNullOrEmpty(upgEv.InstanceId):
+                        o.DirtyCardIds.Add(upgEv.InstanceId);
+                        break;
+                    case GameSimEventCardEnchanted encEv when !string.IsNullOrEmpty(encEv.InstanceId):
+                        o.DirtyCardIds.Add(encEv.InstanceId);
+                        break;
+                }
+            }
+
+            ReconcileAndVerifyBoardInvariants("MoveCard", o.DirtyCardIds, o.Events, preMoveSnapshot);
+            SyncDisplacedCorePlacementsAndEmitDiffs(p1Core, preMoveSnapshot, o.DirtyCardIds, o.Events);
+        }
+        else
+        {
+            if (card.Socket.HasValue) coreCard.StartSlot = (int)card.Socket.Value;
+            foreach (var mv in moved)
+            {
+                if (mv.Entry.CoreCard != null)
+                    mv.Entry.CoreCard.StartSlot = (int)mv.NewSocket;
+            }
+            ReconcileAndVerifyBoardInvariants("MoveCard", o.DirtyCardIds, o.Events, preMoveSnapshot);
+        }
+
         LogBoardAudit("MoveCard", card.InstanceId, card.TemplateId.ToString(), fromLoc, $"{card.Section}:{card.Socket}");
         return o;
+    }
+
+    private static bool HasStashRelevantAura(
+        RunState.CardEntry primary,
+        List<(RunState.CardEntry Entry, EContainerSocketId NewSocket, EInventorySection Section)> moved)
+    {
+        static bool EntryNeedsStashAura(RunState.CardEntry entry)
+        {
+            if (entry.Enchantment.HasValue)
+                return true;
+            var ci = entry.CoreCard;
+            if (ci == null) return false;
+            foreach (var aura in ci.ActiveAuras)
+            {
+                if (string.Equals(aura.ActiveIn, "HandAndStash", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        if (EntryNeedsStashAura(primary)) return true;
+        foreach (var mv in moved)
+        {
+            if (EntryNeedsStashAura(mv.Entry)) return true;
+        }
+        return false;
+    }
+
+    private bool HasAnyRelevantAuraForMove()
+    {
+        if (_run.PlayerAuraAdd.Count > 0 || _run.PlayerAuraMult.Count > 0)
+            return true;
+        if (_run.CurrentEncounterCoreCard?.ActiveAuras.Count > 0)
+            return true;
+
+        foreach (var entry in _run.Cards.Values)
+        {
+            if (entry.Owner != ECombatantId.Player && !_run.SelectionSet.Contains(entry.InstanceId))
+                continue;
+            var ci = entry.CoreCard;
+            if (ci != null)
+            {
+                if (ci.ActiveAuras.Count > 0 || ci.AuraAdd.Count > 0 || ci.AuraMult.Count > 0 || ci.AuraTags.Count > 0)
+                    return true;
+            }
+            else if (entry.Type is ECardType.Item or ECardType.Skill or ECardType.SocketEffect)
+            {
+                var tpl = _repo.GetCard(RunState.ResolveCoreTemplateId(entry));
+                if (tpl?.Auras is { Count: > 0 })
+                    return true;
+            }
+        }
+        return false;
     }
 
     private Outcome OnSelectSkill(SelectSkillCommand cmd)
@@ -1525,7 +1643,7 @@ public sealed class RunEngine
         string typeStr = tpl?.Type ?? coreTpl?.Type ?? "EventEncounter";
         ECardType cardType = ShopEngine.ParseCardType(typeStr);
 
-        if ((tpl?.IsSingleSpawn ?? false) || (coreTpl?.IsSingleSpawn ?? false))
+        if (ShopEngine.IsEffectiveSingleSpawnEncounter(tpl, coreTpl))
         {
             _run.VisitedSingleSpawnEncounterIds.Add(encId);
         }
@@ -2112,6 +2230,17 @@ public sealed class RunEngine
 
             string? transitionEncId = ResolveClientTransitionEncounterId(restored.CurrentEncounterId);
 
+            // V13.1 Hour 6 保底（根因 #5）：若恢复目标是 Hour 6 Choice（如在 Hour 6 桌面卖经验道具触发中途升级后返回），
+            // 严禁复用已被 GameSimEventCardDisposed 销毁过的旧 pvp_xxxx InstanceId（避免与客户端 DisposedCards 竞态吞卡），
+            // 强制重新发一张全新 InstanceId 的 PvpEncounter 并同步锁定对手镜像！
+            if (restored.State == ERunState.Choice && _run.Hour == (uint)_mode.HoursInADay)
+            {
+                _run.SelectionsMadeInCurrentContext = 0;
+                events.AddRange(DealHourEncountersAndClearActive());
+                EnsurePendingHour6PvpOpponentLocked(events);
+                return;
+            }
+
             if (restored.SuspendedCards.Count > 0)
             {
                 foreach (var ce in restored.SuspendedCards)
@@ -2456,9 +2585,10 @@ public sealed class RunEngine
         }
 
         // 4. 预先计算 PvE 胜负金币/经验，供 CombatSimConverter 生成血条刻度与跳币/飞经验事件
-        //    P0-1 根治：战斗小时（Hour 3 野怪与 Hour 6 PvP）同步关闭小时双门控，绝不额外叠加 ExperiencePerHour
-        _run.GainedHourXpThisHour = true;
-        _run.GainedAdvanceHourXpThisHour = true;
+        //    V13.1 问题 #1 权威对齐（Wiki / Mobalytics）：
+        //    - Hour 6 PvP 战斗本身给 0 战斗 XP 与 0 战斗金币（严禁再读取 DB 占位残留 RewardCombatXp=3 白送 3 XP！），
+        //      保留小时门控未置位，交由战后 AdvanceHourOrDay 跨日推进时自然发放 +1 小时 XP（标准一天总计精确 8 XP，打钻/传怪 9 XP）；
+        //    - Hour 3 PvE 野怪战斗发放 RewardCombatXp（铜/银/金=3 XP，钻/传=4 XP）并同步关闭小时双门控，绝不额外叠加 +1 小时 XP。
         int goldGain;
         int xpGain;
         int pveGoldForSim = 0;
@@ -2466,11 +2596,14 @@ public sealed class RunEngine
 
         if (isPvp)
         {
-            goldGain = encTpl?.RewardCombatGold ?? 0;
-            xpGain = encTpl?.RewardCombatXp ?? 3;
+            goldGain = 0;
+            xpGain = 0;
         }
         else
         {
+            _run.GainedHourXpThisHour = true;
+            _run.GainedAdvanceHourXpThisHour = true;
+
             int monsterMaxHp = Math.Max(1, p2Core.HealthMax);
             int monsterRemHp = Math.Clamp(result.Player2RemainingHp, 0, monsterMaxHp);
             if (win)
@@ -2501,10 +2634,6 @@ public sealed class RunEngine
             }
             pveGoldForSim = goldGain;
             pveXpForSim = xpGain;
-        }
-        if (isPvp && _run.CustomRules.HasMutator(MutatorCatalog.DoubleEconomy))
-        {
-            goldGain *= 2;
         }
 
         // 5. 构造第 1 条消息：SpawnMessage（必须带 Combat/PVPCombat 状态 + 敌方初始血量 + 敌方盘面卡）
@@ -2734,10 +2863,12 @@ public sealed class RunEngine
 
                 if (_run.State == ERunState.Loot && _run.SelectionSet.Count == 0)
                 {
-                    // #1 空战利品兜底：绝不停留在空 Loot 货架卡死，立刻销毁怪物头像卡并顺畅进入升级或下一小时
+                    // #1 空战利品兜底：绝不停留在空 Loot 货架卡死，立刻销毁怪物头像卡并顺畅进入升级/恢复挂起栈/下一小时
                     ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
                     if (_run.PendingLevelUp)
                         ConsumeNextPendingLevelUpToEvents(despawnEvents);
+                    else if (_run.SuspendedStates.Count > 0)
+                        AdvanceAfterSubStateToEvents(despawnEvents);
                     else
                         AdvanceHourOrDay(despawnEvents);
                 }
@@ -2750,6 +2881,12 @@ public sealed class RunEngine
             {
                 ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
                 ConsumeNextPendingLevelUpToEvents(despawnEvents);
+            }
+            else if (_run.SuspendedStates.Count > 0)
+            {
+                // V13.1 Hour 6 保底（根因 #6）：若由升级奖励或子状态意外触发战斗，战后优先通过 SuspendedStates 恢复挂起现场避免脏栈残留
+                ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
+                AdvanceAfterSubStateToEvents(despawnEvents);
             }
             else
             {
@@ -6203,17 +6340,26 @@ public sealed class RunEngine
                 : (_run.CustomRules.FixedRunSeed is int dSeed && dSeed != 0
                     ? DailyChallengeSeedGenerator.CreateStreamRng(dSeed, DailyChallengeSeedGenerator.StreamPvpOpponent, day, (int)_run.Hour)
                     : _rng);
-            _run.PendingPvpGhost = _ghosts.PickOpponent(
-                day,
-                (int)_run.Victories,
-                (int)_run.Defeats,
-                ghostRng,
-                _repo,
-                includeCustomRuleGhosts: _run.IsCustomRuleRun,
-                poolPartition: ghostPartition);
+            try
+            {
+                _run.PendingPvpGhost = _ghosts?.PickOpponent(
+                    day,
+                    (int)_run.Victories,
+                    (int)_run.Defeats,
+                    ghostRng,
+                    _repo,
+                    includeCustomRuleGhosts: _run.IsCustomRuleRun,
+                    poolPartition: ghostPartition);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[RunEngine][WARN] PickOpponent failed on Day {day}, falling back to emergency ghost: {ex.Message}");
+                _run.PendingPvpGhost = null;
+            }
+            _run.PendingPvpGhost ??= BuildEmergencyFallbackGhost(day, ghostPartition, ghostRng);
         }
 
-        var ghost = _run.PendingPvpGhost!;
+        var ghost = _run.PendingPvpGhost ?? BuildEmergencyFallbackGhost(day, ghostPartition, _rng);
         string oppAccountId = tourneyAssignment?.OpponentAccountId
             ?? (!string.IsNullOrWhiteSpace(ghost.BoardId) ? $"ghost_{ghost.BoardId}" : $"ghost_{Guid.NewGuid():N}");
         string oppDisplayName = tourneyAssignment != null
@@ -6249,6 +6395,57 @@ public sealed class RunEngine
             gold: 0,
             income: fallbackIncome);
         EmitHour6OpponentInitializedIfNeeded(events, oppHero);
+    }
+
+    /// <summary>
+    /// V13.1 Hour 6 保底（根因 #7）：当幽灵镜像池异常、锁超时或为空时，本地构造符合当天合理血量/等级/卡槽的安全兜底对手镜像，
+    /// 绝不中断 Hour 6 推进或令客户端拿不到 PvpOpponent。
+    /// </summary>
+    private PvpGhostPool.GhostBoard BuildEmergencyFallbackGhost(int day, string ghostPartition, Random rng)
+    {
+        int clampedDay = Math.Max(1, day);
+        string[] heroes = ["Vanessa", "Dooley", "Pygmalien", "Mak", "Karnok", "Jules", "Stelle", "Hero8"];
+        string hero = heroes[rng.Next(heroes.Length)];
+        int hp = clampedDay == 1 ? 250 : Math.Min(4500, 250 + (clampedDay - 1) * 350);
+        var items = new List<PvpGhostPool.GhostItem>();
+        try
+        {
+            var pool = _repo.GetSpawnableItemsForHero(hero).Where(c => c.CardSize != CardSize.Large).ToList();
+            int slot = 3;
+            for (int i = 0; i < 3 && pool.Count > 0 && slot < 7; i++)
+            {
+                var tpl = pool[rng.Next(pool.Count)];
+                int w = tpl.CardSize == CardSize.Medium ? 2 : 1;
+                if (slot + w > 8) break;
+                items.Add(new PvpGhostPool.GhostItem
+                {
+                    Slot = slot,
+                    Width = w,
+                    TemplateId = tpl.Id,
+                    InternalName = tpl.InternalName,
+                    Tier = clampedDay >= 6 ? "Gold" : clampedDay >= 3 ? "Silver" : "Bronze",
+                });
+                slot += w;
+            }
+        }
+        catch { }
+
+        return new PvpGhostPool.GhostBoard
+        {
+            BoardId = $"emergency_fallback_d{clampedDay}_{rng.Next(1000, 9999)}",
+            Day = clampedDay,
+            Hero = hero,
+            Level = clampedDay,
+            HealthMax = hp,
+            Prestige = 20,
+            UnlockedSlotsMask = PvpGhostPool.DefaultUnlockedMaskForDay(clampedDay),
+            PowerBucket = "Normal",
+            EstimatedWinRate = 0.5,
+            IsPlayerGhost = false,
+            IsCustomRule = _run.IsCustomRuleRun,
+            PoolPartition = string.IsNullOrWhiteSpace(ghostPartition) ? PvpGhostPool.StandardPartition : ghostPartition,
+            Items = items,
+        };
     }
 
     private static void EmitHour6OpponentInitializedIfNeeded(List<IGameSimEvent>? events, EHero oppHero)

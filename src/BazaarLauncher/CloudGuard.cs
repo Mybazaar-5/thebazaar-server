@@ -30,7 +30,6 @@ internal static class CloudGuard
 
     private static PropertyInfo _cachedUwrUrlProp;
     private static MethodInfo _cachedUwrAbortMethod;
-    private static PropertyInfo _cachedUwrDisposeMethod;
 
     internal static long AllowedCount => Interlocked.Read(ref _allowedCount);
     internal static long BlockedExternalCount => Interlocked.Read(ref _blockedExternalCount);
@@ -76,7 +75,7 @@ internal static class CloudGuard
     {
         try
         {
-            var crType = AccessTools.TypeByName("UnityEngine.CrashReportHandler.CrashReportHandler");
+            var crType = GameInspector.FindTypeSafe("UnityEngine.CrashReportHandler.CrashReportHandler");
             var prop = crType?.GetProperty("enableCaptureExceptions", BindingFlags.Public | BindingFlags.Static);
             if (prop != null && prop.CanWrite)
             {
@@ -92,8 +91,10 @@ internal static class CloudGuard
 
     private static void DisableAnalytics(SafeHarmonyPatcher patcher)
     {
+        var analyticsType = GameInspector.FindTypeSafe("AnalyticsManager", "TheBazaar.AnalyticsManager");
+        if (analyticsType == null) return;
         patcher.TryPatch(
-            "AnalyticsManager",
+            analyticsType,
             "Initialize",
             prefix: AccessTools.Method(typeof(CloudGuard), nameof(SkipVoid)),
             optional: true);
@@ -101,10 +102,13 @@ internal static class CloudGuard
 
     private static void DisableSentryIfPresent(SafeHarmonyPatcher patcher)
     {
+        // 使用静默查找避免 Release 裁剪掉 Sentry 程序集时触发 HarmonyX 黄色反射告警
         foreach (var typeName in new[] { "Sentry.SentrySdk", "Sentry.Unity.SentryUnity" })
         {
+            var sentryType = GameInspector.FindTypeSafe(typeName);
+            if (sentryType == null) continue;
             patcher.TryPatch(
-                typeName,
+                sentryType,
                 "Init",
                 prefix: AccessTools.Method(typeof(CloudGuard), nameof(SkipVoid)),
                 optional: true);
@@ -148,12 +152,11 @@ internal static class CloudGuard
 
     private static void PatchUnityWebRequest(SafeHarmonyPatcher patcher)
     {
-        var uwrType = AccessTools.TypeByName("UnityEngine.Networking.UnityWebRequest");
+        var uwrType = GameInspector.FindTypeSafe("UnityEngine.Networking.UnityWebRequest");
         if (uwrType == null) return;
 
         _cachedUwrUrlProp = uwrType.GetProperty("url", BindingFlags.Public | BindingFlags.Instance);
         _cachedUwrAbortMethod = uwrType.GetMethod("Abort", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
-        _cachedUwrDisposeMethod = uwrType.GetProperty("isDone", BindingFlags.Public | BindingFlags.Instance);
 
         patcher.TryPatch(
             uwrType,

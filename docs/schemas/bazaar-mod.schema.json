@@ -1,0 +1,311 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thebazaar-local.dev/schemas/bazaar-mod.schema.json",
+  "title": "TheBazaar V13.1 标准化 Mod 数据包统一 Schema",
+  "description": "面向 IDE 自动补全、tools/mod_sdk_cli.py 与 AI Skill 创作的工业级 JSON Schema（Draft 2020-12），覆盖 mod.json、custom_cards.json、vanilla_patches.json、custom_events.json 与权威 RuleNode 规则树。",
+  "type": "object",
+  "$defs": {
+    "GuidString": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "ModIdString": {
+      "type": "string",
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|[a-z0-9]{2})$",
+      "description": "2~64 位小写字母、数字或连字符，严禁包含空格、大写字母或路径穿越字符。"
+    },
+    "NamespacedIdString": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}:[a-zA-Z0-9_-]{2,80}$",
+      "description": "强制带 <mod-id>: 命名空间前缀的全局唯一 ID，防止多 Mod 撞名。"
+    },
+    "SafeRelativePath": {
+      "type": "string",
+      "not": {
+        "pattern": "(^/|^[A-Za-z]:|\\.\\.)"
+      }
+    },
+    "CardTypeEnum": {
+      "type": "string",
+      "enum": ["Item", "Skill", "EventEncounter", "EncounterStep", "PedestalEncounter", "CombatEncounter"]
+    },
+    "CardSizeEnum": {
+      "type": "string",
+      "enum": ["Small", "Medium", "Large"]
+    },
+    "CardTierEnum": {
+      "type": "string",
+      "enum": ["Bronze", "Silver", "Gold", "Diamond", "Legendary"]
+    },
+    "HeroEnum": {
+      "type": "string",
+      "enum": ["Common", "Vanessa", "Dooley", "Pygmalien", "Mak", "Karnok", "Jules", "Stelle", "Hero8"]
+    },
+    "ModManifest": {
+      "type": "object",
+      "required": ["schemaVersion", "id", "name", "version", "scope"],
+      "properties": {
+        "$schema": { "type": "string" },
+        "schemaVersion": { "const": 1 },
+        "id": { "$ref": "#/$defs/ModIdString" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "displayNameZh": { "type": "string" },
+        "displayNameEn": { "type": "string" },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+(-[a-zA-Z0-9.-]+)?$" },
+        "author": { "type": "string" },
+        "description": { "type": "string" },
+        "descriptionZh": { "type": "string" },
+        "scope": {
+          "type": "string",
+          "enum": ["singleplayer-only", "multiplayer-safe", "cosmetic-only"]
+        },
+        "affectsGhostPool": {
+          "type": "boolean",
+          "default": false,
+          "description": "玩法 Mod 必须为 false，强制隔离标准天梯幽灵池。"
+        },
+        "enabledByDefault": { "type": "boolean", "default": true },
+        "loadOrder": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 100 },
+        "dependencies": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ModIdString" }
+        },
+        "contentRoots": {
+          "type": "object",
+          "properties": {
+            "cards": { "$ref": "#/$defs/SafeRelativePath" },
+            "patches": { "$ref": "#/$defs/SafeRelativePath" },
+            "events": { "$ref": "#/$defs/SafeRelativePath" },
+            "modes": { "$ref": "#/$defs/SafeRelativePath" },
+            "localization": { "$ref": "#/$defs/SafeRelativePath" },
+            "assets": { "$ref": "#/$defs/SafeRelativePath" },
+            "artManifest": { "$ref": "#/$defs/SafeRelativePath" }
+          }
+        }
+      }
+    },
+    "AttributeMap": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number",
+        "minimum": -10000,
+        "maximum": 100000
+      },
+      "properties": {
+        "CooldownMax": {
+          "type": "number",
+          "minimum": 1000,
+          "maximum": 60000,
+          "description": "主动冷却时间，单位必须为毫秒（例如 4 秒 = 4000）。"
+        }
+      }
+    },
+    "TierData": {
+      "type": "object",
+      "properties": {
+        "attributes": { "$ref": "#/$defs/AttributeMap" },
+        "abilityIds": { "type": "array", "items": { "type": "string" } },
+        "auraIds": { "type": "array", "items": { "type": "string" } },
+        "tooltipIds": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+      }
+    },
+    "RuleNode": {
+      "type": "object",
+      "required": ["$type"],
+      "properties": {
+        "$type": {
+          "type": "string",
+          "pattern": "^(T(Card|Trigger|Action|AuraAction|Target|FixedValue|RangeValue|ReferenceValue|CombatDuration|DeterminantDuration|VariableDuration|Prerequisite|PlayerConditional|RunConditional|Spawn|PedestalBehavior|Combatant)[A-Za-z0-9_]*|Constraint[A-Za-z0-9_]+|T(Action|Trigger)Mod_[A-Za-z0-9_]+)$"
+        },
+        "id": { "type": "string" },
+        "ids": { "type": "array", "items": { "type": "string" } },
+        "attributeType": { "type": "string" },
+        "operation": { "type": "string", "enum": ["Add", "Subtract", "Multiply", "Set"] },
+        "comparisonOperator": { "type": "string", "enum": ["Equal", "NotEqual", "GreaterThan", "GreaterThanOrEqual", "LessThan", "LessThanOrEqual"] },
+        "comparison": { "type": "string" },
+        "operator": { "type": "string" },
+        "targetMode": { "type": "string" },
+        "targetSection": { "type": "string" },
+        "origin": { "type": "string" },
+        "changeType": { "type": "string" },
+        "combatOutcome": { "type": "string" },
+        "amount": { "type": "number" },
+        "value": { "oneOf": [{ "type": "number" }, { "$ref": "#/$defs/RuleNode" }] },
+        "comparisonValue": { "oneOf": [{ "type": "number" }, { "$ref": "#/$defs/RuleNode" }] },
+        "target": { "$ref": "#/$defs/RuleNode" },
+        "subject": { "$ref": "#/$defs/RuleNode" },
+        "subjectOther": { "$ref": "#/$defs/RuleNode" },
+        "conditions": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } }] },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
+        "triggers": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
+        "filters": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
+        "behaviors": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
+        "prerequisites": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
+        "spawnContext": { "$ref": "#/$defs/RuleNode" },
+        "limit": { "$ref": "#/$defs/RuleNode" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "hiddenTags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "AbilityDefinition": {
+      "type": "object",
+      "required": ["id", "trigger", "action"],
+      "properties": {
+        "id": { "type": "string" },
+        "trigger": { "$ref": "#/$defs/RuleNode" },
+        "activeIn": { "type": "string", "enum": ["HandOnly", "HandAndStash", "StashOnly", "Always"] },
+        "action": { "$ref": "#/$defs/RuleNode" },
+        "prerequisites": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
+        "priority": { "type": "string" }
+      }
+    },
+    "AuraDefinition": {
+      "type": "object",
+      "required": ["id", "action"],
+      "properties": {
+        "id": { "type": "string" },
+        "activeIn": { "type": "string" },
+        "action": { "$ref": "#/$defs/RuleNode" },
+        "prerequisites": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } }
+      }
+    },
+    "CustomCardDefinition": {
+      "type": "object",
+      "required": ["customId", "baseVisualTemplateId", "type", "size", "startingTier"],
+      "not": {
+        "anyOf": [{ "required": ["effects"] }, { "required": ["costGold"] }]
+      },
+      "properties": {
+        "customId": { "$ref": "#/$defs/NamespacedIdString" },
+        "baseVisualTemplateId": { "$ref": "#/$defs/GuidString" },
+        "type": { "$ref": "#/$defs/CardTypeEnum" },
+        "size": { "$ref": "#/$defs/CardSizeEnum" },
+        "startingTier": { "$ref": "#/$defs/CardTierEnum" },
+        "spawningEligibility": { "type": "string", "enum": ["Always", "GuidOnly", "Never"] },
+        "heroes": { "type": "array", "items": { "$ref": "#/$defs/HeroEnum" } },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "hiddenTags": { "type": "array", "items": { "type": "string" } },
+        "titleZh": { "type": "string", "minLength": 1 },
+        "nameZh": { "type": "string", "minLength": 1 },
+        "titleEn": { "type": "string" },
+        "descZh": { "type": "string" },
+        "activeTooltipsZh": { "type": "array", "items": { "type": "string" } },
+        "passiveTooltipsZh": { "type": "array", "items": { "type": "string" } },
+        "enchantTooltipsZh": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "customArtFile": { "$ref": "#/$defs/SafeRelativePath" },
+        "attributes": { "$ref": "#/$defs/AttributeMap" },
+        "tiers": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/TierData" }
+        },
+        "abilities": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" }
+        },
+        "auras": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/AuraDefinition" }
+        }
+      }
+    },
+    "CustomCardFile": {
+      "type": "object",
+      "required": ["schemaVersion", "modId", "cards"],
+      "properties": {
+        "$schema": { "type": "string" },
+        "schemaVersion": { "const": 1 },
+        "modId": { "$ref": "#/$defs/ModIdString" },
+        "cards": { "type": "array", "items": { "$ref": "#/$defs/CustomCardDefinition" } }
+      }
+    },
+    "CardPatchDefinition": {
+      "type": "object",
+      "required": ["targetTemplateId"],
+      "properties": {
+        "targetTemplateId": { "$ref": "#/$defs/GuidString" },
+        "note": { "type": "string" },
+        "startingTier": { "type": ["string", "null"] },
+        "heroes": { "type": ["array", "null"], "items": { "$ref": "#/$defs/HeroEnum" } },
+        "addTags": { "type": "array", "items": { "type": "string" } },
+        "removeTags": { "type": "array", "items": { "type": "string" } },
+        "attributeOverrides": { "type": ["object", "null"], "additionalProperties": { "type": "number" } },
+        "tierAttributeOverrides": {
+          "type": ["object", "null"],
+          "additionalProperties": { "$ref": "#/$defs/AttributeMap" }
+        },
+        "abilitiesOverride": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" } },
+        "aurasOverride": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AuraDefinition" } },
+        "titleZh": { "type": ["string", "null"] },
+        "descZh": { "type": ["string", "null"] },
+        "customArtFile": { "type": ["string", "null"] }
+      }
+    },
+    "CardPatchFile": {
+      "type": "object",
+      "required": ["schemaVersion", "modId", "patches"],
+      "properties": {
+        "$schema": { "type": "string" },
+        "schemaVersion": { "const": 1 },
+        "modId": { "$ref": "#/$defs/ModIdString" },
+        "patches": { "type": "array", "items": { "$ref": "#/$defs/CardPatchDefinition" } }
+      }
+    },
+    "EncounterStepDefinition": {
+      "allOf": [
+        { "$ref": "#/$defs/CustomCardDefinition" },
+        {
+          "properties": {
+            "type": { "const": "EncounterStep" },
+            "nextEncounterOnSelection": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "weight": { "type": "number", "minimum": 0 }
+                }
+              }
+            }
+          },
+          "not": {
+            "anyOf": [{ "required": ["effects"] }, { "required": ["costGold"] }]
+          }
+        }
+      ]
+    },
+    "CustomEventDefinition": {
+      "type": "object",
+      "required": ["eventId", "eventType", "baseVisualTemplateId", "titleZh"],
+      "not": {
+        "anyOf": [{ "required": ["effects"] }, { "required": ["costGold"] }]
+      },
+      "properties": {
+        "eventId": { "$ref": "#/$defs/NamespacedIdString" },
+        "eventType": { "type": "string", "enum": ["EventEncounter", "PedestalEncounter", "CombatEncounter"] },
+        "baseVisualTemplateId": { "$ref": "#/$defs/GuidString" },
+        "titleZh": { "type": "string", "minLength": 1 },
+        "descZh": { "type": "string" },
+        "heroes": { "type": "array", "items": { "$ref": "#/$defs/HeroEnum" } },
+        "minDay": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "maxDay": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "weight": { "type": "number", "minimum": 0 },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EncounterStepDefinition" }
+        }
+      }
+    },
+    "CustomEventFile": {
+      "type": "object",
+      "required": ["schemaVersion", "modId", "events"],
+      "properties": {
+        "$schema": { "type": "string" },
+        "schemaVersion": { "const": 1 },
+        "modId": { "$ref": "#/$defs/ModIdString" },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/CustomEventDefinition" } }
+      }
+    }
+  }
+}

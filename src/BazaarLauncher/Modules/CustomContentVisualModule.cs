@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using BazaarLauncher.Core;
 using BazaarModSdk;
@@ -55,11 +57,21 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     private static FieldInfo _encounterBackgroundRendererField;
     private static FieldInfo _encounterInstancedBgMatField;
     private static MethodInfo _cardFrameUpdateBgMethod;
+    private static Type _skillIconUpdaterType;
 
-    private static PropertyInfo _cardInstanceIdProp;
-    private static PropertyInfo _cardTemplateIdProp;
-    private static PropertyInfo _cardTierProp;
-    private static PropertyInfo _cardEnchantmentProp;
+    // 按运行时真实类型隔离缓存卡牌反射属性（彻底杜绝 ItemCard.Enchantment 复用到 SkillCard/Card 抛出 InvalidCastException）
+    private sealed class CardPropBag
+    {
+        public PropertyInfo InstanceId;
+        public PropertyInfo TemplateId;
+        public PropertyInfo Tier;
+        public PropertyInfo Enchantment;
+        public PropertyInfo Id;
+    }
+
+    private static readonly ConcurrentDictionary<Type, CardPropBag> _cardPropsByType = new();
+    private static readonly ConcurrentDictionary<Type, MethodInfo> _skillUpdaterMethodByType = new();
+    private static int _hookErrorCount;
 
     public void OnLoad(IModContext context)
     {
@@ -186,14 +198,17 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     private static void InstallFourRenderPipelinePatches(SafeHarmonyPatcher patcher)
     {
         // 通路 1：3D 物品与战报回放 (ItemVisualsController)
-        var itemVisType = AccessTools.TypeByName("TheBazaar.Game.CardFrames.ItemVisualsController");
+        var itemVisType = GameInspector.FindTypeSafe("TheBazaar.Game.CardFrames.ItemVisualsController");
         if (itemVisType != null)
         {
             _itemMatInstanceField = AccessTools.Field(itemVisType, "materialInstance");
             _itemArtRendererField = AccessTools.Field(itemVisType, "cardIllustrationRenderer");
 
-            var cardType = AccessTools.TypeByName("BazaarGameClient.Domain.Models.Cards.Card");
-            var loadoutType = AccessTools.TypeByName("TheBazaar.BazaarCollectionLoadout");
+            var cardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.Card");
+            // 修正命名空间：真实类型为 BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout，消除启动告警 #5
+            var loadoutType = GameInspector.FindTypeSafe(
+                "BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout",
+                "TheBazaar.BazaarCollectionLoadout");
             if (cardType != null && loadoutType != null)
             {
                 patcher.TryPatch(
@@ -205,7 +220,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     label: "Visual.P1.ItemVisualsController.Setup(Card)");
             }
 
-            var itCardType = AccessTools.TypeByName("BazaarGameShared.Domain.Cards.ITCard");
+            var itCardType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Cards.ITCard");
             if (itCardType != null)
             {
                 patcher.TryPatch(
@@ -226,7 +241,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
 
         // 通路 2：3D 技能圆牌与技能代理 (SkillController / SkillProxyRenderer)
-        var skillCtrlType = AccessTools.TypeByName("SkillController");
+        var skillCtrlType = GameInspector.FindTypeSafe("SkillController", "TheBazaar.SkillController");
         if (skillCtrlType != null)
         {
             _skillUpdateIconMethod = AccessTools.Method(skillCtrlType, "UpdateSkillIcon", new[] { typeof(Texture) });
@@ -244,7 +259,9 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 label: "Visual.P2.SkillController.UpdateCard");
         }
 
-        var skillProxyType = AccessTools.TypeByName("SkillProxyRenderer") ?? AccessTools.TypeByName("TheBazaar.SkillProxyRenderer");
+        _skillIconUpdaterType = GameInspector.FindTypeSafe("SkillIconUpdater", "TheBazaar.SkillIconUpdater");
+
+        var skillProxyType = GameInspector.FindTypeSafe("SkillProxyRenderer", "TheBazaar.SkillProxyRenderer");
         if (skillProxyType != null)
         {
             patcher.TryPatch(
@@ -256,7 +273,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
 
         // 通路 3：2D UI 预览 (CardPreviewItem / CardPreviewSkill / CardPreviewEncounter)
-        var previewBase = AccessTools.TypeByName("TheBazaar.UI.CardPreviewBase");
+        var previewBase = GameInspector.FindTypeSafe("TheBazaar.UI.CardPreviewBase");
         if (previewBase != null)
         {
             _previewCardDataField = AccessTools.Field(previewBase, "_cardData");
@@ -264,7 +281,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _previewCardImageField = AccessTools.Field(previewBase, "_cardImage");
         }
 
-        var previewItem = AccessTools.TypeByName("TheBazaar.UI.CardPreviewItem");
+        var previewItem = GameInspector.FindTypeSafe("TheBazaar.UI.CardPreviewItem");
         if (previewItem != null)
         {
             _previewItemMaterialField = AccessTools.Field(previewItem, "_cardMaterial");
@@ -276,7 +293,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 label: "Visual.P3.CardPreviewItem.UpdateCardImageMaterial");
         }
 
-        var previewSkill = AccessTools.TypeByName("TheBazaar.UI.CardPreviewSkill");
+        var previewSkill = GameInspector.FindTypeSafe("TheBazaar.UI.CardPreviewSkill");
         if (previewSkill != null)
         {
             patcher.TryPatch(
@@ -287,7 +304,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 label: "Visual.P3.CardPreviewSkill.LoadArt");
         }
 
-        var previewEncounter = AccessTools.TypeByName("TheBazaar.UI.CardPreviewEncounter");
+        var previewEncounter = GameInspector.FindTypeSafe("TheBazaar.UI.CardPreviewEncounter");
         if (previewEncounter != null)
         {
             _previewEncounterPortraitField = AccessTools.Field(previewEncounter, "_portraitImage");
@@ -300,7 +317,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
 
         // 通路 4：遭遇卡与战斗立绘 (EncounterController)
-        var encCtrl = AccessTools.TypeByName("EncounterController");
+        var encCtrl = GameInspector.FindTypeSafe("EncounterController", "TheBazaar.EncounterController");
         if (encCtrl != null)
         {
             _encounterPortraitRendererField = AccessTools.Field(encCtrl, "portrait");
@@ -308,7 +325,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _encounterBackgroundRendererField = AccessTools.Field(encCtrl, "backgroundRenderer");
             _encounterInstancedBgMatField = AccessTools.Field(encCtrl, "instancedBackgroundMaterial");
 
-            var frameType = AccessTools.TypeByName("CardFrameController") ?? AccessTools.TypeByName("TheBazaar.CardFrameController");
+            var frameType = GameInspector.FindTypeSafe("CardFrameController", "TheBazaar.CardFrameController");
             if (frameType != null)
             {
                 _cardFrameUpdateBgMethod = AccessTools.Method(frameType, "UpdateBackgroundMaterial", new[] { typeof(Texture) });
@@ -327,95 +344,158 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
 
     private static void ItemVisualsSetupCardPostfix(Component __instance, object __0, Task __result)
     {
-        if (__instance == null || __0 == null || Instance == null) return;
-        var agent = GetOrAddAgent(__instance);
-        var query = BuildQueryFromCard(__0, CardVisualTarget.ItemArt);
-        agent.SetContext(query);
+        try
+        {
+            if (__instance == null || __0 == null || Instance == null) return;
+            var agent = GetOrAddAgent(__instance);
+            var query = BuildQueryFromCard(__0, CardVisualTarget.ItemArt);
+            agent.SetContext(query);
 
-        if (__result != null && !__result.IsCompleted)
-        {
-            uint epoch = agent.Epoch;
-            _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(() => TryApplyItemVisual(__instance, agent, epoch)), TaskScheduler.Default);
+            if (__result != null && !__result.IsCompleted)
+            {
+                uint epoch = agent.Epoch;
+                _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(() => TryApplyItemVisual(__instance, agent, epoch)), TaskScheduler.Default);
+            }
+            else
+            {
+                TryApplyItemVisual(__instance, agent, agent.Epoch);
+            }
         }
-        else
+        catch (Exception ex)
         {
-            TryApplyItemVisual(__instance, agent, agent.Epoch);
+            LogHookErrorThrottled(nameof(ItemVisualsSetupCardPostfix), ex);
         }
     }
 
     private static void ItemVisualsSetupTemplatePostfix(Component __instance, object __0, Task __result)
     {
-        if (__instance == null || __0 == null || Instance == null) return;
-        string tplId = ReadTemplateId(__0);
-        if (string.IsNullOrEmpty(tplId)) return;
-
-        var agent = GetOrAddAgent(__instance);
-        agent.SetContext(new CardVisualQuery(null, null, tplId, 0, null, CardVisualTarget.ItemArt));
-
-        if (__result != null && !__result.IsCompleted)
+        try
         {
-            uint epoch = agent.Epoch;
-            _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(() => TryApplyItemVisual(__instance, agent, epoch)), TaskScheduler.Default);
+            if (__instance == null || __0 == null || Instance == null) return;
+            string tplId = ReadTemplateId(__0);
+            if (string.IsNullOrEmpty(tplId)) return;
+
+            var agent = GetOrAddAgent(__instance);
+            agent.SetContext(new CardVisualQuery(null, null, tplId, 0, null, CardVisualTarget.ItemArt));
+
+            if (__result != null && !__result.IsCompleted)
+            {
+                uint epoch = agent.Epoch;
+                _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(() => TryApplyItemVisual(__instance, agent, epoch)), TaskScheduler.Default);
+            }
+            else
+            {
+                TryApplyItemVisual(__instance, agent, agent.Epoch);
+            }
         }
-        else
+        catch (Exception ex)
         {
-            TryApplyItemVisual(__instance, agent, agent.Epoch);
+            LogHookErrorThrottled(nameof(ItemVisualsSetupTemplatePostfix), ex);
         }
     }
 
     private static void ItemVisualsSetMaterialPostfix(Component __instance)
     {
-        if (__instance == null || Instance == null) return;
-        var agent = __instance.GetComponent<CardVisualOverrideAgent>();
-        if (agent == null || !agent.HasContext) return;
-        TryApplyItemVisual(__instance, agent, agent.Epoch);
+        try
+        {
+            if (__instance == null || Instance == null) return;
+            var agent = __instance.GetComponent<CardVisualOverrideAgent>();
+            if (agent == null || !agent.HasContext) return;
+            TryApplyItemVisual(__instance, agent, agent.Epoch);
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(ItemVisualsSetMaterialPostfix), ex);
+        }
     }
 
     private static void TryApplyItemVisual(Component visualsComp, CardVisualOverrideAgent agent, uint capturedEpoch)
     {
-        if (visualsComp == null || agent == null || agent.Epoch != capturedEpoch || Instance == null) return;
-        if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
-
-        Material mat = _itemMatInstanceField?.GetValue(visualsComp) as Material;
-        if (mat == null) return;
-
-        CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+        try
         {
-            if (entry == null || entry.Texture == null) return;
-            if (visualsComp == null || agent == null || agent.Epoch != capturedEpoch)
-            {
-                CardTextureCache.Instance.Release(entry);
-                return;
-            }
+            if (visualsComp == null || agent == null || agent.Epoch != capturedEpoch || Instance == null) return;
+            if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
 
-            Material currentMat = _itemMatInstanceField?.GetValue(visualsComp) as Material;
-            if (currentMat == null)
-            {
-                CardTextureCache.Instance.Release(entry);
-                return;
-            }
+            Material mat = _itemMatInstanceField?.GetValue(visualsComp) as Material;
+            if (mat == null) return;
 
-            if (CardTextureCache.Instance.ApplyTextureToUrpMaterial(currentMat, entry.Texture, binding.DisableParallaxPremium))
+            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
             {
-                agent.BindTextureEntry(entry);
-            }
-            else
-            {
-                CardTextureCache.Instance.Release(entry);
-            }
-        });
+                if (entry == null || entry.Texture == null) return;
+                try
+                {
+                    if (visualsComp == null || agent == null || agent.Epoch != capturedEpoch)
+                    {
+                        CardTextureCache.Instance.Release(entry);
+                        return;
+                    }
+
+                    Material currentMat = _itemMatInstanceField?.GetValue(visualsComp) as Material;
+                    if (currentMat == null)
+                    {
+                        CardTextureCache.Instance.Release(entry);
+                        return;
+                    }
+
+                    if (CardTextureCache.Instance.ApplyTextureToUrpMaterial(currentMat, entry.Texture, binding.DisableParallaxPremium))
+                    {
+                        agent.BindTextureEntry(entry);
+                    }
+                    else
+                    {
+                        CardTextureCache.Instance.Release(entry);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    CardTextureCache.Instance.Release(entry);
+                    LogHookErrorThrottled("TryApplyItemVisual.Callback", ex);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(TryApplyItemVisual), ex);
+        }
     }
 
     // ── 通路 2 回调：3D 技能圆牌 ────────────────────────────────────────────
 
     private static void SkillControllerSetupPostfix(Component __instance, object __1, Task __result)
-        => ScheduleSkillVisual(__instance, __1, __result);
+    {
+        try
+        {
+            ScheduleSkillVisual(__instance, __1, __result);
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(SkillControllerSetupPostfix), ex);
+        }
+    }
 
     private static void SkillControllerUpdateCardPostfix(Component __instance, object __0, Task __result)
-        => ScheduleSkillVisual(__instance, __0, __result);
+    {
+        try
+        {
+            ScheduleSkillVisual(__instance, __0, __result);
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(SkillControllerUpdateCardPostfix), ex);
+        }
+    }
 
     private static void SkillProxyInitializePostfix(Component __instance, object __0)
-        => ScheduleSkillVisual(__instance, __0, null);
+    {
+        try
+        {
+            ScheduleSkillVisual(__instance, __0, null);
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(SkillProxyInitializePostfix), ex);
+        }
+    }
 
     private static void ScheduleSkillVisual(Component skillComp, object cardObj, Task pendingTask)
     {
@@ -426,41 +506,59 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
 
         void ApplyAction()
         {
-            if (skillComp == null || agent == null || agent.Epoch != epoch || Instance == null) return;
-            if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
-
-            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+            try
             {
-                if (entry == null || entry.Texture == null) return;
-                if (skillComp == null || agent == null || agent.Epoch != epoch)
+                if (skillComp == null || agent == null || agent.Epoch != epoch || Instance == null) return;
+                if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
+
+                CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
                 {
+                    if (entry == null || entry.Texture == null) return;
+                    if (skillComp == null || agent == null || agent.Epoch != epoch)
+                    {
+                        CardTextureCache.Instance.Release(entry);
+                        return;
+                    }
+
+                    try
+                    {
+                        if (_skillUpdateIconMethod != null && _skillUpdateIconMethod.DeclaringType.IsInstanceOfType(skillComp))
+                        {
+                            _skillUpdateIconMethod.Invoke(skillComp, new object[] { entry.Texture });
+                            agent.BindTextureEntry(entry);
+                            return;
+                        }
+
+                        // SkillProxyRenderer 兼容兜底：查找子组件 SkillIconUpdater
+                        if (_skillIconUpdaterType != null)
+                        {
+                            var updater = skillComp.GetComponentInChildren(_skillIconUpdaterType, true);
+                            if (updater != null)
+                            {
+                                var m = _skillUpdaterMethodByType.GetOrAdd(
+                                    updater.GetType(),
+                                    static ut => ut.GetMethod("UpdateSkillIconMaterial", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(Texture) }, null));
+                                if (m != null)
+                                {
+                                    m.Invoke(updater, new object[] { entry.Texture });
+                                    agent.BindTextureEntry(entry);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogHookErrorThrottled("ScheduleSkillVisual.Callback", ex);
+                    }
+
                     CardTextureCache.Instance.Release(entry);
-                    return;
-                }
-
-                try
-                {
-                    if (_skillUpdateIconMethod != null && _skillUpdateIconMethod.DeclaringType.IsInstanceOfType(skillComp))
-                    {
-                        _skillUpdateIconMethod.Invoke(skillComp, new object[] { entry.Texture });
-                        agent.BindTextureEntry(entry);
-                        return;
-                    }
-
-                    // SkillProxyRenderer 兼容兜底：查找子组件 SkillIconUpdater
-                    var updater = skillComp.GetComponentInChildren(AccessTools.TypeByName("SkillIconUpdater"), true);
-                    var m = updater?.GetType().GetMethod("UpdateSkillIconMaterial", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(Texture) }, null);
-                    if (m != null)
-                    {
-                        m.Invoke(updater, new object[] { entry.Texture });
-                        agent.BindTextureEntry(entry);
-                        return;
-                    }
-                }
-                catch { }
-
-                CardTextureCache.Instance.Release(entry);
-            });
+                });
+            }
+            catch (Exception ex)
+            {
+                LogHookErrorThrottled("ScheduleSkillVisual.ApplyAction", ex);
+            }
         }
 
         if (pendingTask != null && !pendingTask.IsCompleted)
@@ -477,232 +575,356 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
 
     private static void CardPreviewItemPostfix(Component __instance, Task __result)
     {
-        if (__instance == null || Instance == null) return;
-        var agent = GetOrAddAgent(__instance);
-        var query = BuildQueryFromPreview(__instance, CardVisualTarget.ItemArt);
-        agent.SetContext(query);
-        uint epoch = agent.Epoch;
-
-        void ApplyAction()
+        try
         {
-            if (__instance == null || agent == null || agent.Epoch != epoch || Instance == null) return;
-            if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
+            if (__instance == null || Instance == null) return;
+            var agent = GetOrAddAgent(__instance);
+            var query = BuildQueryFromPreview(__instance, CardVisualTarget.ItemArt);
+            agent.SetContext(query);
+            uint epoch = agent.Epoch;
 
-            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+            void ApplyAction()
             {
-                if (entry == null || entry.Texture == null) return;
-                if (__instance == null || agent == null || agent.Epoch != epoch)
+                try
                 {
-                    CardTextureCache.Instance.Release(entry);
-                    return;
-                }
+                    if (__instance == null || agent == null || agent.Epoch != epoch || Instance == null) return;
+                    if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
 
-                Material mat = _previewItemMaterialField?.GetValue(__instance) as Material;
-                if (mat != null && CardTextureCache.Instance.ApplyTextureToUrpMaterial(mat, entry.Texture, binding.DisableParallaxPremium))
+                    CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+                    {
+                        if (entry == null || entry.Texture == null) return;
+                        try
+                        {
+                            if (__instance == null || agent == null || agent.Epoch != epoch)
+                            {
+                                CardTextureCache.Instance.Release(entry);
+                                return;
+                            }
+
+                            Material mat = _previewItemMaterialField?.GetValue(__instance) as Material;
+                            if (mat != null && CardTextureCache.Instance.ApplyTextureToUrpMaterial(mat, entry.Texture, binding.DisableParallaxPremium))
+                            {
+                                agent.BindTextureEntry(entry);
+                                return;
+                            }
+
+                            RawImage rawImg = _previewCardImageField?.GetValue(__instance) as RawImage;
+                            if (rawImg != null)
+                            {
+                                rawImg.texture = entry.Texture;
+                                agent.BindTextureEntry(entry);
+                                return;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogHookErrorThrottled("CardPreviewItem.Callback", ex);
+                        }
+
+                        CardTextureCache.Instance.Release(entry);
+                    });
+                }
+                catch (Exception ex)
                 {
-                    agent.BindTextureEntry(entry);
-                    return;
+                    LogHookErrorThrottled("CardPreviewItem.ApplyAction", ex);
                 }
+            }
 
-                RawImage rawImg = _previewCardImageField?.GetValue(__instance) as RawImage;
-                if (rawImg != null)
-                {
-                    rawImg.texture = entry.Texture;
-                    agent.BindTextureEntry(entry);
-                    return;
-                }
-
-                CardTextureCache.Instance.Release(entry);
-            });
+            if (__result != null && !__result.IsCompleted)
+                _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
+            else
+                ApplyAction();
         }
-
-        if (__result != null && !__result.IsCompleted)
-            _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
-        else
-            ApplyAction();
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(CardPreviewItemPostfix), ex);
+        }
     }
 
     private static void CardPreviewSkillPostfix(Component __instance, Task __result)
     {
-        if (__instance == null || Instance == null) return;
-        var agent = GetOrAddAgent(__instance);
-        agent.SetContext(BuildQueryFromPreview(__instance, CardVisualTarget.SkillIcon));
-        uint epoch = agent.Epoch;
-
-        void ApplyAction()
+        try
         {
-            if (__instance == null || agent == null || agent.Epoch != epoch || Instance == null) return;
-            if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
+            if (__instance == null || Instance == null) return;
+            var agent = GetOrAddAgent(__instance);
+            agent.SetContext(BuildQueryFromPreview(__instance, CardVisualTarget.SkillIcon));
+            uint epoch = agent.Epoch;
 
-            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+            void ApplyAction()
             {
-                if (entry == null || entry.Texture == null) return;
-                if (__instance == null || agent == null || agent.Epoch != epoch)
+                try
                 {
-                    CardTextureCache.Instance.Release(entry);
-                    return;
-                }
+                    if (__instance == null || agent == null || agent.Epoch != epoch || Instance == null) return;
+                    if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
 
-                RawImage rawImg = _previewCardImageField?.GetValue(__instance) as RawImage;
-                if (rawImg != null)
-                {
-                    rawImg.texture = entry.Texture;
-                    agent.BindTextureEntry(entry);
+                    CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+                    {
+                        if (entry == null || entry.Texture == null) return;
+                        try
+                        {
+                            if (__instance == null || agent == null || agent.Epoch != epoch)
+                            {
+                                CardTextureCache.Instance.Release(entry);
+                                return;
+                            }
+
+                            RawImage rawImg = _previewCardImageField?.GetValue(__instance) as RawImage;
+                            if (rawImg != null)
+                            {
+                                rawImg.texture = entry.Texture;
+                                agent.BindTextureEntry(entry);
+                                return;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogHookErrorThrottled("CardPreviewSkill.Callback", ex);
+                        }
+
+                        CardTextureCache.Instance.Release(entry);
+                    });
                 }
-                else
+                catch (Exception ex)
                 {
-                    CardTextureCache.Instance.Release(entry);
+                    LogHookErrorThrottled("CardPreviewSkill.ApplyAction", ex);
                 }
-            });
+            }
+
+            if (__result != null && !__result.IsCompleted)
+                _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
+            else
+                ApplyAction();
         }
-
-        if (__result != null && !__result.IsCompleted)
-            _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
-        else
-            ApplyAction();
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(CardPreviewSkillPostfix), ex);
+        }
     }
 
     private static void CardPreviewEncounterPostfix(Component __instance, Task __result)
     {
-        if (__instance == null || Instance == null) return;
-        var agent = GetOrAddAgent(__instance);
-        agent.SetContext(BuildQueryFromPreview(__instance, CardVisualTarget.EncounterPortrait));
-        uint epoch = agent.Epoch;
-
-        void ApplyAction()
+        try
         {
-            if (__instance == null || agent == null || agent.Epoch != epoch || Instance == null) return;
-            if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
+            if (__instance == null || Instance == null) return;
+            var agent = GetOrAddAgent(__instance);
+            agent.SetContext(BuildQueryFromPreview(__instance, CardVisualTarget.EncounterPortrait));
+            uint epoch = agent.Epoch;
 
-            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+            void ApplyAction()
             {
-                if (entry == null || entry.Texture == null) return;
-                if (__instance == null || agent == null || agent.Epoch != epoch)
+                try
                 {
-                    CardTextureCache.Instance.Release(entry);
-                    return;
-                }
+                    if (__instance == null || agent == null || agent.Epoch != epoch || Instance == null) return;
+                    if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
 
-                Image portraitImg = _previewEncounterPortraitField?.GetValue(__instance) as Image;
-                Sprite sp = CardTextureCache.Instance.GetOrCreateSpriteOnMain(entry);
-                if (portraitImg != null && sp != null)
-                {
-                    portraitImg.sprite = sp;
-                    portraitImg.enabled = true;
-                    agent.BindTextureEntry(entry);
+                    CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+                    {
+                        if (entry == null || entry.Texture == null) return;
+                        try
+                        {
+                            if (__instance == null || agent == null || agent.Epoch != epoch)
+                            {
+                                CardTextureCache.Instance.Release(entry);
+                                return;
+                            }
+
+                            Image portraitImg = _previewEncounterPortraitField?.GetValue(__instance) as Image;
+                            Sprite sp = CardTextureCache.Instance.GetOrCreateSpriteOnMain(entry);
+                            if (portraitImg != null && sp != null)
+                            {
+                                portraitImg.sprite = sp;
+                                portraitImg.enabled = true;
+                                agent.BindTextureEntry(entry);
+                                return;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogHookErrorThrottled("CardPreviewEncounter.Callback", ex);
+                        }
+
+                        CardTextureCache.Instance.Release(entry);
+                    });
                 }
-                else
+                catch (Exception ex)
                 {
-                    CardTextureCache.Instance.Release(entry);
+                    LogHookErrorThrottled("CardPreviewEncounter.ApplyAction", ex);
                 }
-            });
+            }
+
+            if (__result != null && !__result.IsCompleted)
+                _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
+            else
+                ApplyAction();
         }
-
-        if (__result != null && !__result.IsCompleted)
-            _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
-        else
-            ApplyAction();
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(CardPreviewEncounterPostfix), ex);
+        }
     }
 
     // ── 通路 4 回调：遭遇卡与战斗立绘 ────────────────────────────────────────
 
     private static void EncounterControllerSetupPostfix(Component __instance, object __0, Task __result)
     {
-        if (__instance == null || __0 == null || Instance == null) return;
-        var agent = GetOrAddAgent(__instance);
-        var portraitQuery = BuildQueryFromCard(__0, CardVisualTarget.EncounterPortrait);
-        var bgQuery = BuildQueryFromCard(__0, CardVisualTarget.EncounterBackground);
-        agent.SetContext(portraitQuery);
-        uint epoch = agent.Epoch;
-
-        void ApplyAction()
+        try
         {
-            if (__instance == null || agent == null || agent.Epoch != epoch || Instance == null) return;
+            if (__instance == null || __0 == null || Instance == null) return;
+            var agent = GetOrAddAgent(__instance);
+            var portraitQuery = BuildQueryFromCard(__0, CardVisualTarget.EncounterPortrait);
+            var bgQuery = BuildQueryFromCard(__0, CardVisualTarget.EncounterBackground);
+            agent.SetContext(portraitQuery);
+            uint epoch = agent.Epoch;
 
-            if (Instance.TryResolveVisual(portraitQuery, out var pBinding) && pBinding != null)
+            void ApplyAction()
             {
-                CardTextureCache.Instance.AcquireTextureAsync(pBinding.LocalImagePath, pBinding.ContentSha256, entry =>
+                try
                 {
-                    if (entry == null || entry.Texture == null) return;
-                    if (__instance == null || agent == null || agent.Epoch != epoch)
-                    {
-                        CardTextureCache.Instance.Release(entry);
-                        return;
-                    }
+                    if (__instance == null || agent == null || agent.Epoch != epoch || Instance == null) return;
 
-                    SpriteRenderer sr = _encounterPortraitRendererField?.GetValue(__instance) as SpriteRenderer;
-                    Sprite sp = CardTextureCache.Instance.GetOrCreateSpriteOnMain(entry);
-                    if (sr != null && sp != null)
+                    if (Instance.TryResolveVisual(portraitQuery, out var pBinding) && pBinding != null)
                     {
-                        sr.sprite = sp;
-                        sr.enabled = true;
-                        // 隐藏可能重叠穿帮的 Spine 动态骨骼立绘
-                        if (_encounterAnimatedPortraitField?.GetValue(__instance) is GameObject animGo && animGo != null)
+                        CardTextureCache.Instance.AcquireTextureAsync(pBinding.LocalImagePath, pBinding.ContentSha256, entry =>
                         {
-                            animGo.SetActive(false);
-                        }
-                        agent.BindTextureEntry(entry);
-                    }
-                    else
-                    {
-                        CardTextureCache.Instance.Release(entry);
-                    }
-                });
-            }
-
-            if (Instance.TryResolveVisual(bgQuery, out var bgBinding) && bgBinding != null)
-            {
-                CardTextureCache.Instance.AcquireTextureAsync(bgBinding.LocalImagePath, bgBinding.ContentSha256, entry =>
-                {
-                    if (entry == null || entry.Texture == null) return;
-                    if (__instance == null || agent == null || agent.Epoch != epoch)
-                    {
-                        CardTextureCache.Instance.Release(entry);
-                        return;
-                    }
-
-                    Material bgMat = _encounterInstancedBgMatField?.GetValue(__instance) as Material;
-                    if (bgMat == null && _encounterBackgroundRendererField?.GetValue(__instance) is MeshRenderer bgMr && bgMr != null)
-                    {
-                        bgMat = bgMr.material;
-                    }
-                    if (bgMat != null)
-                    {
-                        try
-                        {
-                            if (bgMat.HasProperty("_BaseMap")) bgMat.SetTexture("_BaseMap", entry.Texture);
-                            else bgMat.mainTexture = entry.Texture;
-                            agent.BindSecondaryTextureEntry(entry);
-                            return;
-                        }
-                        catch { }
-                    }
-                    if (_cardFrameUpdateBgMethod != null)
-                    {
-                        var frameComp = __instance.GetComponentInChildren(_cardFrameUpdateBgMethod.DeclaringType, true);
-                        if (frameComp != null)
-                        {
+                            if (entry == null || entry.Texture == null) return;
                             try
                             {
-                                _cardFrameUpdateBgMethod.Invoke(frameComp, new object[] { entry.Texture });
-                                agent.BindSecondaryTextureEntry(entry);
-                                return;
-                            }
-                            catch { }
-                        }
-                    }
-                    CardTextureCache.Instance.Release(entry);
-                });
-            }
-        }
+                                if (__instance == null || agent == null || agent.Epoch != epoch)
+                                {
+                                    CardTextureCache.Instance.Release(entry);
+                                    return;
+                                }
 
-        if (__result != null && !__result.IsCompleted)
-            _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
-        else
-            ApplyAction();
+                                SpriteRenderer sr = _encounterPortraitRendererField?.GetValue(__instance) as SpriteRenderer;
+                                Sprite sp = CardTextureCache.Instance.GetOrCreateSpriteOnMain(entry);
+                                if (sr != null && sp != null)
+                                {
+                                    sr.sprite = sp;
+                                    sr.enabled = true;
+                                    // 隐藏可能重叠穿帮的 Spine 动态骨骼立绘
+                                    if (_encounterAnimatedPortraitField?.GetValue(__instance) is GameObject animGo && animGo != null)
+                                    {
+                                        animGo.SetActive(false);
+                                    }
+                                    agent.BindTextureEntry(entry);
+                                    return;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                LogHookErrorThrottled("EncounterSetup.PortraitCallback", ex);
+                            }
+
+                            CardTextureCache.Instance.Release(entry);
+                        });
+                    }
+
+                    if (Instance.TryResolveVisual(bgQuery, out var bgBinding) && bgBinding != null)
+                    {
+                        CardTextureCache.Instance.AcquireTextureAsync(bgBinding.LocalImagePath, bgBinding.ContentSha256, entry =>
+                        {
+                            if (entry == null || entry.Texture == null) return;
+                            try
+                            {
+                                if (__instance == null || agent == null || agent.Epoch != epoch)
+                                {
+                                    CardTextureCache.Instance.Release(entry);
+                                    return;
+                                }
+
+                                Material bgMat = _encounterInstancedBgMatField?.GetValue(__instance) as Material;
+                                if (bgMat == null && _encounterBackgroundRendererField?.GetValue(__instance) is MeshRenderer bgMr && bgMr != null)
+                                {
+                                    bgMat = bgMr.material;
+                                }
+                                if (bgMat != null)
+                                {
+                                    try
+                                    {
+                                        if (bgMat.HasProperty("_BaseMap")) bgMat.SetTexture("_BaseMap", entry.Texture);
+                                        else bgMat.mainTexture = entry.Texture;
+                                        agent.BindSecondaryTextureEntry(entry);
+                                        return;
+                                    }
+                                    catch { }
+                                }
+                                if (_cardFrameUpdateBgMethod != null)
+                                {
+                                    var frameComp = __instance.GetComponentInChildren(_cardFrameUpdateBgMethod.DeclaringType, true);
+                                    if (frameComp != null)
+                                    {
+                                        try
+                                        {
+                                            _cardFrameUpdateBgMethod.Invoke(frameComp, new object[] { entry.Texture });
+                                            agent.BindSecondaryTextureEntry(entry);
+                                            return;
+                                        }
+                                        catch { }
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                LogHookErrorThrottled("EncounterSetup.BgCallback", ex);
+                            }
+
+                            CardTextureCache.Instance.Release(entry);
+                        });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogHookErrorThrottled("EncounterSetup.ApplyAction", ex);
+                }
+            }
+
+            if (__result != null && !__result.IsCompleted)
+                _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
+            else
+                ApplyAction();
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(EncounterControllerSetupPostfix), ex);
+        }
     }
 
     // ── 辅助工具与防异步竞态代理组件（铁律四） ──────────────────────────────
+
+    private static void LogHookErrorThrottled(string hookName, Exception ex)
+    {
+        int cnt = Interlocked.Increment(ref _hookErrorCount);
+        if (cnt <= 5 || cnt % 50 == 0)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"[CustomVisual] {hookName} 已安全拦截异常 (count={cnt}): {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static CardPropBag GetCardPropBag(Type runtimeType)
+    {
+        return _cardPropsByType.GetOrAdd(runtimeType, static t => new CardPropBag
+        {
+            InstanceId = t.GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance),
+            TemplateId = t.GetProperty("TemplateId", BindingFlags.Public | BindingFlags.Instance),
+            Tier = t.GetProperty("Tier", BindingFlags.Public | BindingFlags.Instance),
+            Enchantment = t.GetProperty("Enchantment", BindingFlags.Public | BindingFlags.Instance),
+            Id = t.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance),
+        });
+    }
+
+    private static object SafeGetPropertyValue(PropertyInfo prop, object instance)
+    {
+        if (prop == null || instance == null) return null;
+        if (prop.DeclaringType != null && !prop.DeclaringType.IsInstanceOfType(instance)) return null;
+        try
+        {
+            return prop.GetValue(instance);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     private static CardVisualOverrideAgent GetOrAddAgent(Component host)
     {
@@ -714,22 +936,17 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     {
         if (cardObj == null) return new CardVisualQuery(null, null, string.Empty, 0, null, target);
 
-        Type t = cardObj.GetType();
-        _cardInstanceIdProp ??= t.GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance);
-        _cardTemplateIdProp ??= t.GetProperty("TemplateId", BindingFlags.Public | BindingFlags.Instance);
-        _cardTierProp ??= t.GetProperty("Tier", BindingFlags.Public | BindingFlags.Instance);
-        _cardEnchantmentProp ??= t.GetProperty("Enchantment", BindingFlags.Public | BindingFlags.Instance);
-
-        string iid = _cardInstanceIdProp?.GetValue(cardObj)?.ToString();
-        string tplId = _cardTemplateIdProp?.GetValue(cardObj)?.ToString() ?? ReadTemplateId(cardObj);
+        CardPropBag bag = GetCardPropBag(cardObj.GetType());
+        string iid = SafeGetPropertyValue(bag.InstanceId, cardObj)?.ToString();
+        string tplId = SafeGetPropertyValue(bag.TemplateId, cardObj)?.ToString() ?? ReadTemplateId(cardObj);
         int tier = 0;
         try
         {
-            object tv = _cardTierProp?.GetValue(cardObj);
+            object tv = SafeGetPropertyValue(bag.Tier, cardObj);
             if (tv != null) tier = Convert.ToInt32(tv);
         }
         catch { }
-        string ench = _cardEnchantmentProp?.GetValue(cardObj)?.ToString();
+        string ench = SafeGetPropertyValue(bag.Enchantment, cardObj)?.ToString();
 
         return new CardVisualQuery(iid, null, tplId, tier, ench, target);
     }
@@ -751,9 +968,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         if (obj == null) return string.Empty;
         try
         {
-            var p = obj.GetType().GetProperty("Id", BindingFlags.Public | BindingFlags.Instance)
-                ?? obj.GetType().GetProperty("TemplateId", BindingFlags.Public | BindingFlags.Instance);
-            return p?.GetValue(obj)?.ToString() ?? string.Empty;
+            CardPropBag bag = GetCardPropBag(obj.GetType());
+            return SafeGetPropertyValue(bag.Id, obj)?.ToString()
+                ?? SafeGetPropertyValue(bag.TemplateId, obj)?.ToString()
+                ?? string.Empty;
         }
         catch
         {

@@ -436,7 +436,7 @@ public sealed class V10RunAndTournamentSyncTests
         Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
         Assert.Equal(5, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
-        // Hour 4 & Hour 5 各进出一次商店（各 +1 XP）→ Hour 6 PvP 前达 7/8 XP；Hour 6 PvP (+3 XP) → 10 XP 升至 Lv2（余 2/8 XP）
+        // Hour 4 & Hour 5 各进出一次商店（各 +1 XP）→ Hour 6 PvP 前达 7/8 XP；V13.1 官方规则：Hour 6 PvP 战斗本身 0 XP，跨日 +1 XP → 合计 8 XP 升至 Lv2（余 0/8 XP）
         var pol4 = InjectChoiceEncounter(run, ov.Pool, PolShopId);
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol4.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
@@ -474,7 +474,7 @@ public sealed class V10RunAndTournamentSyncTests
         Assert.Equal(2u, run.Day);
         Assert.Equal(1u, run.Hour);
         Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
         // 验证事件自身不双算（P0-1）：Aldric(1 XP) + Exploit(1 XP) 同小时严格去重，且不再额外叠加小时推进经验 = 1 XP
         var (aldricRun, aldricEngine) = CreateStartedEngine(ov.Pool, ov.Monsters, ov.LevelUps, ov.Mode, ov.Repo, ov.Ghosts, seed: 405);

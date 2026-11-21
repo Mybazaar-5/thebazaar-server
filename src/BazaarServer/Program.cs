@@ -121,6 +121,7 @@ var validVisualWhitelist = TryLoadValidAssetWhitelist(dataRoot);
 // 2. 启动服务端 Mod 热加载主机与四层 OverlayLocalizationStore
 var modHost = new ServerModHost(rawCoreRepo, dataRoot, stateDir, validVisualWhitelist);
 builder.Services.AddSingleton(modHost);
+builder.Services.AddSingleton<WorkshopValidatorService>();
 builder.Services.AddSingleton<OverlayLocalizationStore>(sp => sp.GetRequiredService<ServerModHost>().ActiveLocalization);
 builder.Services.AddSingleton<GameDataRepository>(modHost.BaseRepository);
 
@@ -214,6 +215,7 @@ GameServerEndpoints.Map(app);
 BazaarServer.Tournament.TournamentEndpoints.Map(app, lobbyStore);
 CustomRuleEndpoints.Map(app, playerRuleStore, accountsStore, GetCurrentCatalog, sessionStore, persistence);
 ModEndpoints.Map(app);
+WorkshopEndpoints.Map(app);
 ClientUpdateEndpoints.Map(app, dataRoot);
 MultiplayerEndpointModule.MapEndpoints(app);
 

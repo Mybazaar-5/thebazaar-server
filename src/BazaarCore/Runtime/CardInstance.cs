@@ -526,6 +526,13 @@ public sealed class CardInstance
                 ActiveAuras.Add(au);
         }
 
+        // 仅对自定义/Mod 卡牌（Version 以 "mod:" 开头或非原版 GUID ID）启用全空 tiers 回退，
+        // 严禁对官方 GameData.db 原版卡启用——官方库中 114 张卡（如 Clamera / Bombs Away! / Lucky Clover / A-G Minor）
+        // 在 Template.Auras 中保留了未启用的 "Tooltip Handling"（Aura "9"），其 Tiers.*.AuraIds 故意置空。
+        bool allowUnlistedTierFallback =
+            (Template.Version?.StartsWith("mod:", StringComparison.OrdinalIgnoreCase) == true)
+            || (!string.IsNullOrEmpty(Template.Id) && !Guid.TryParse(Template.Id, out _));
+
         if (activeAbilityIds != null)
         {
             for (int i = 0; i < activeAbilityIds.Count; i++)
@@ -534,11 +541,41 @@ public sealed class CardInstance
                     ActiveAbilities.Add(ab);
             }
         }
+        else if (allowUnlistedTierFallback && Template.Tiers != null && Template.Tiers.Count > 0 && Template.Abilities.Count > 0)
+        {
+            // 兜底修复（V13.1）：若自定义 Mod 卡声明了 tiers 与 abilities，但所有阶均未显式配置 abilityIds，
+            // 自动回退激活卡牌声明的全部 Abilities，避免战斗中静默 0 触发；同时绝不影响“低阶未解锁、高阶才配 abilityIds”语义。
+            bool anyTierDeclaresAbilities = false;
+            foreach (var td in Template.Tiers.Values)
+            {
+                if (td.AbilityIds.Count > 0) { anyTierDeclaresAbilities = true; break; }
+            }
+            if (!anyTierDeclaresAbilities)
+            {
+                foreach (var ab in Template.Abilities.Values)
+                    ActiveAbilities.Add(ab);
+            }
+        }
+
         if (activeAuraIds != null)
         {
             for (int i = 0; i < activeAuraIds.Count; i++)
             {
                 if (Template.Auras.TryGetValue(activeAuraIds[i], out var au))
+                    ActiveAuras.Add(au);
+            }
+        }
+        else if (allowUnlistedTierFallback && Template.Tiers != null && Template.Tiers.Count > 0 && Template.Auras.Count > 0)
+        {
+            // 兜底修复（V13.1）：同理，仅对自定义 Mod 卡在全部阶均未显式配置 auraIds 时自动回退激活全部 Auras。
+            bool anyTierDeclaresAuras = false;
+            foreach (var td in Template.Tiers.Values)
+            {
+                if (td.AuraIds.Count > 0) { anyTierDeclaresAuras = true; break; }
+            }
+            if (!anyTierDeclaresAuras)
+            {
+                foreach (var au in Template.Auras.Values)
                     ActiveAuras.Add(au);
             }
         }

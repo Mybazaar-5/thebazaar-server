@@ -63,7 +63,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
             return false;
         }
 
-        Type targetType = AccessTools.TypeByName(typeName);
+        Type targetType = GameInspector.FindTypeSafe(typeName);
         if (targetType == null)
         {
             RecordDegraded(tag, $"目标类型不存在: {typeName}", optional);
@@ -193,7 +193,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         MethodInfo postfix = null,
         bool optional = false)
     {
-        Type t = AccessTools.TypeByName(typeName);
+        Type t = GameInspector.FindTypeSafe(typeName);
         if (t == null)
         {
             RecordDegraded($"{typeName}.get_{propertyName}", $"目标类型不存在: {typeName}", optional);

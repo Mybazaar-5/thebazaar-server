@@ -386,7 +386,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
             label: "NativeUi.MainMenuBaseView.OnEnable");
 
         // 锚点二：全局左侧导航抽屉 (NavigationMenuController.PopulateData & SceneSelectOptionContainer.HandleSceneChange)
-        var navType = AccessTools.TypeByName("TheBazaar.UI.Menu.NavigationMenuController");
+        var navType = GameInspector.FindTypeSafe("TheBazaar.UI.Menu.NavigationMenuController");
         if (navType != null)
         {
             _navDataField = AccessTools.Field(navType, "_data");
@@ -399,10 +399,11 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 label: "NativeUi.NavigationMenuController.PopulateData");
         }
 
-        _sceneIdEnumType = AccessTools.TypeByName("TheBazaar.SceneID")
-            ?? AccessTools.TypeByName("TheBazaar.UI.Menu.SceneID");
-        _traversableSceneType = AccessTools.TypeByName("TheBazaar.UI.Menu.TraversableScenesSO+TraversableScene")
-            ?? AccessTools.TypeByName("TraversableScenesSO+TraversableScene");
+        // 优先使用真实全局命名空间类型名并静默查找，彻底清零 HarmonyX 反射告警 #6
+        _sceneIdEnumType = GameInspector.FindTypeSafe("TheBazaar.SceneID", "TheBazaar.UI.Menu.SceneID");
+        _traversableSceneType = GameInspector.FindTypeSafe(
+            "TraversableScenesSO+TraversableScene",
+            "TheBazaar.UI.Menu.TraversableScenesSO+TraversableScene");
 
         patcher.TryPatch(
             "TheBazaar.UI.Menu.SceneSelectOptionContainer",
@@ -412,7 +413,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
             label: "NativeUi.SceneSelectOptionContainer.HandleSceneChange");
 
         // 锚点三：局内 ESC 暂停菜单 (FightMenuDialog.Start / UpdateButtonsState)
-        var fightMenuType = AccessTools.TypeByName("FightMenuDialog");
+        var fightMenuType = GameInspector.FindTypeSafe("FightMenuDialog");
         if (fightMenuType != null)
         {
             _fightSettingsBtnField = AccessTools.Field(fightMenuType, "SettingButton")
@@ -434,7 +435,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         }
 
         // 锚点四：原生设置页 (OptionsDialogController.Awake)
-        var optType = AccessTools.TypeByName("OptionsDialogController");
+        var optType = GameInspector.FindTypeSafe("OptionsDialogController");
         if (optType != null)
         {
             _optionsGameplayBtnField = AccessTools.Field(optType, "_gameplayButton");
@@ -452,8 +453,15 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
 
     private static void PlaymodeSelectionInitializePostfix(Component __instance)
     {
-        if (__instance == null || Instance == null) return;
-        MainThreadDispatcher.Enqueue(() => Instance?.MountLobbyModeSelector(__instance));
+        try
+        {
+            if (__instance == null || Instance == null) return;
+            MainThreadDispatcher.Enqueue(() => Instance?.MountLobbyModeSelector(__instance));
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("[NativeMenuEmbed] PlaymodeSelectionInitializePostfix 异常已拦截: " + ex.Message);
+        }
     }
 
     private static void MainMenuBaseViewOnEnablePostfix(Component __instance)

@@ -24,7 +24,7 @@ public static class ModLoader
 
     private static readonly HashSet<string> SupportedImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".png", ".webp"
+        ".png", ".webp", ".jpg", ".jpeg"
     };
 
     /// <summary>
@@ -116,11 +116,13 @@ public static class ModLoader
             RootDirectory = fullDir
         };
 
-        // 1. 扫描客户端资产目录（仅接收 PNG/WebP，并读取魔数与宽高供 ModValidator 统一校验）
+        // 1. 扫描客户端资产目录（记录全部候选图像及 art_manifest.json 预期 SHA-256，交由 ModValidator Gate #8 统一判定）
         ScanAssets(pkg, issues);
+        LoadArtManifestExpectations(pkg, issues);
 
-        // 2. 加载自定义卡牌、事件、可选独立野怪与自定义模式（支持目录、通配符或精确单文件配置，并自动解包顶层数组包裹对象）
+        // 2. 加载自定义卡牌、原位补丁(patches/*.json)、事件、可选独立野怪与自定义模式
         LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Cards, "cards"), pkg.Cards, "CARD_JSON_ERROR", "cards", issues);
+        LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Patches, "patches"), pkg.Patches, "PATCH_JSON_ERROR", "patches", issues);
         LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Events, "events"), pkg.Events, "EVENT_JSON_ERROR", "events", issues);
         LoadJsonEntries(pkg, Path.Combine(fullDir, "monsters"), pkg.Monsters, "MONSTER_JSON_ERROR", "monsters", issues);
         LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Modes, "modes"), pkg.Modes, "MODE_JSON_ERROR", "modes", issues, skipMutatorOnlyFiles: true);
@@ -192,6 +194,46 @@ public static class ModLoader
             for (int j = 0; j < ev.Steps.Count; j++)
                 RegisterBinding(ev.Steps[j]);
         }
+
+        for (int i = 0; i < pkg.Patches.Count; i++)
+        {
+            var patch = pkg.Patches[i];
+            if (string.IsNullOrWhiteSpace(patch.TargetTemplateId) || !patch.HasVisualOrTextOverride)
+                continue;
+
+            string tid = patch.TargetTemplateId.Trim();
+            string? artSha256 = null;
+            string? normalizedArt = null;
+            if (!string.IsNullOrWhiteSpace(patch.CustomArtFile))
+            {
+                normalizedArt = ModValidator.NormalizeLogicalPath(patch.CustomArtFile);
+                if (pkg.AssetsByLogicalPath.TryGetValue(normalizedArt, out var asset))
+                    artSha256 = asset.Sha256;
+            }
+
+            pkg.VisualBindingsByCustomId[tid] = new CustomCardVisualBinding
+            {
+                CustomTemplateId = tid,
+                ModId = modId,
+                BaseVisualTemplateId = tid,
+                CardType = "Item",
+                Size = "Medium",
+                TitleZh = patch.TitleZh ?? string.Empty,
+                DescZh = patch.DescZh ?? string.Empty,
+                ActiveTooltipsZh = patch.ActiveTooltipsZh != null ? new List<string>(patch.ActiveTooltipsZh) : new List<string>(),
+                PassiveTooltipsZh = patch.PassiveTooltipsZh != null ? new List<string>(patch.PassiveTooltipsZh) : new List<string>(),
+                EnchantTooltipsZh = patch.EnchantTooltipsZh != null
+                    ? patch.EnchantTooltipsZh.ToDictionary(kv => kv.Key, kv => new List<string>(kv.Value), StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase),
+                CustomArtFile = normalizedArt,
+                CustomArtSha256 = artSha256,
+                ArtRect = patch.ArtRect != null
+                    ? new CustomCardArtRect { Width = patch.ArtRect.Width, Height = patch.ArtRect.Height, CropMode = patch.ArtRect.CropMode }
+                    : null,
+                Tags = new List<string>(patch.AddTags),
+                AccentColor = patch.AccentColor
+            };
+        }
     }
 
     /// <summary>
@@ -214,6 +256,13 @@ public static class ModLoader
               .Append(card.TitleZh).Append('|')
               .Append(card.DescZh).Append('|')
               .Append(card.CustomArtFile ?? string.Empty).Append('\n');
+        }
+
+        foreach (var patch in pkg.Patches.OrderBy(p => p.TargetTemplateId, StringComparer.OrdinalIgnoreCase))
+        {
+            string patchRaw = JsonSerializer.Serialize(patch, ModJsonOptions);
+            sb.Append("P:").Append(patch.TargetTemplateId).Append('=')
+              .Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(patchRaw))).ToLowerInvariant()).Append('\n');
         }
 
         foreach (var ev in pkg.Events.OrderBy(e => e.EventId, StringComparer.OrdinalIgnoreCase))
@@ -303,15 +352,6 @@ public static class ModLoader
                 byte[] bytes = File.ReadAllBytes(fullFile);
                 string sha = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
                 bool headerOk = ModValidator.TryValidateImageHeader(bytes, out int w, out int h, out string contentType);
-                if (!headerOk)
-                {
-                    issues.Add(new ModValidationIssue(
-                        ModValidationSeverity.Error,
-                        pkg.Manifest.Id,
-                        "INVALID_ASSET_IMAGE_HEADER",
-                        $"资产文件 '{relPath}' 不是合法的 PNG 或 WebP 图像（魔数头校验失败）。",
-                        relPath));
-                }
 
                 pkg.AssetsByLogicalPath[relPath] = new ModAssetEntry
                 {
@@ -322,7 +362,7 @@ public static class ModLoader
                     Bytes = bytes.LongLength,
                     Width = headerOk ? w : 0,
                     Height = headerOk ? h : 0,
-                    ContentType = headerOk ? contentType : "application/octet-stream"
+                    ContentType = headerOk ? contentType : (ext.Equals(".webp", StringComparison.OrdinalIgnoreCase) ? "image/webp" : "application/octet-stream")
                 };
             }
             catch (Exception ex)
@@ -332,8 +372,58 @@ public static class ModLoader
                     pkg.Manifest.Id,
                     "ASSET_READ_ERROR",
                     $"读取资产文件 '{relPath}' 失败：{ex.Message}",
-                    relPath));
+                    relPath,
+                    GateId: 8));
             }
+        }
+    }
+
+    private static void LoadArtManifestExpectations(ModPackage pkg, List<ModValidationIssue> issues)
+    {
+        string relManifest = string.IsNullOrWhiteSpace(pkg.Manifest.ContentRoots.ArtManifest)
+            ? "assets/art_manifest.json"
+            : pkg.Manifest.ContentRoots.ArtManifest!;
+        if (!ModValidator.IsSafeRelativePath(relManifest))
+            return;
+
+        string fullPath = Path.Combine(pkg.RootDirectory, relManifest.Replace('/', Path.DirectorySeparatorChar));
+        if (!File.Exists(fullPath))
+            return;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(fullPath, Encoding.UTF8));
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return;
+            if (!TryGetPropertyIgnoreCase(doc.RootElement, "assets", out var arr) || arr.ValueKind != JsonValueKind.Array)
+                return;
+
+            foreach (var item in arr.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object) continue;
+                string? lp = null;
+                if (TryGetPropertyIgnoreCase(item, "logicalPath", out var lpEl) && lpEl.ValueKind == JsonValueKind.String)
+                    lp = lpEl.GetString();
+                else if (TryGetPropertyIgnoreCase(item, "filename", out var fnEl) && fnEl.ValueKind == JsonValueKind.String)
+                    lp = "assets/" + fnEl.GetString();
+
+                if (string.IsNullOrWhiteSpace(lp)) continue;
+                if (TryGetPropertyIgnoreCase(item, "sha256", out var shaEl) && shaEl.ValueKind == JsonValueKind.String)
+                {
+                    string sha = (shaEl.GetString() ?? string.Empty).Trim();
+                    if (!string.IsNullOrEmpty(sha))
+                        pkg.ExpectedAssetSha256ByPath[ModValidator.NormalizeLogicalPath(lp)] = sha;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            issues.Add(new ModValidationIssue(
+                ModValidationSeverity.Warning,
+                pkg.Manifest.Id,
+                "ART_MANIFEST_PARSE_WARNING",
+                $"解析 '{relManifest}' 失败（将在保存时重建）：{ex.Message}",
+                relManifest,
+                GateId: 8));
         }
     }
 

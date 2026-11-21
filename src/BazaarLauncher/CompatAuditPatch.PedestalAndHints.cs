@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -324,9 +325,49 @@ internal static partial class CompatAuditPatch
         return false;
     }
 
+    // P2 反射基类显式锚定辅助，避免从派生实例懒缓存导致跨控制器强转风险
+    private static object _cachedPedestalUpgradeModeEnum;
+    private static object _cachedDefaultTooltipModeEnum;
+
+    private static void EnsurePedestalPreviewReflectionAnchored()
+    {
+        var cardCtrlType = GameInspector.FindTypeSafe("CardController", "TheBazaar.CardController");
+        if (cardCtrlType != null)
+        {
+            _enterUpgradePreviewMethod ??= cardCtrlType.GetMethod("EnterUpgradePreview", BindingFlags.Public | BindingFlags.Instance);
+            _exitUpgradePreviewCardMethod ??= cardCtrlType.GetMethod("ExitUpgradePreview", BindingFlags.Public | BindingFlags.Instance);
+            _refreshFullTooltipMethod ??= cardCtrlType.GetMethod("RefreshFullTooltip", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        }
+
+        var tipParentType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.TooltipParentComponent");
+        if (tipParentType != null)
+        {
+            _exitUpgradePreviewAllMethod ??= tipParentType.GetMethod("ExitUpgradePreviewOnAllPlayerCards", BindingFlags.Public | BindingFlags.Instance);
+            _cardTooltipControllerProp ??= tipParentType.GetProperty("CardTooltipController", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+        }
+
+        var tipCtrlType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.CardTooltipController");
+        if (tipCtrlType != null)
+        {
+            _getDisplayModeMethod ??= tipCtrlType.GetMethod("GetDisplayMode", BindingFlags.Public | BindingFlags.Instance);
+            _setDisplayModeMethod ??= tipCtrlType.GetMethod("SetDisplayMode", BindingFlags.Public | BindingFlags.Instance);
+            if (_setDisplayModeMethod != null && (_cachedPedestalUpgradeModeEnum == null || _cachedDefaultTooltipModeEnum == null))
+            {
+                try
+                {
+                    var modeType = _setDisplayModeMethod.GetParameters()[0].ParameterType;
+                    _cachedPedestalUpgradeModeEnum ??= Enum.Parse(modeType, "PedestalUpgradeTooltip");
+                    _cachedDefaultTooltipModeEnum ??= Enum.Parse(modeType, "Default");
+                }
+                catch { }
+            }
+        }
+    }
+
     private static void CanUsePedestalUpgradePostfix(object card, object cardToSelect, ref bool __result)
     {
-        if (__result || cardToSelect == null) return;
+        // 拖拽 Top 10：非升级底座态 O(1) 零反射直接短路！
+        if (__result || !_wasInUpgradePedestal || cardToSelect == null) return;
         try
         {
             if (!IsUpgradeablePlayerItem(cardToSelect)) return;
@@ -343,7 +384,8 @@ internal static partial class CompatAuditPatch
 
     private static void IsUpgradePedestalStatePostfix(object tooltipData, ref bool __result)
     {
-        if (__result || tooltipData == null) return;
+        // 拖拽 Top 10：非升级底座态 O(1) 零反射直接短路！
+        if (__result || !_wasInUpgradePedestal || tooltipData == null) return;
         try
         {
             var curAppState = GameInspector.GetCurrentAppState();
@@ -407,6 +449,7 @@ internal static partial class CompatAuditPatch
 
     private static void RefreshHoveredUpgradePreviewOnEnter(TCardEncounterPedestal pedTpl)
     {
+        EnsurePedestalPreviewReflectionAnchored();
         var lookup = GameInspector.GetDataLookup();
         if (lookup == null) return;
         if (GameInspector.GetMember(lookup, "CardControllerDictionary") is not IDictionary dict) return;
@@ -422,16 +465,18 @@ internal static partial class CompatAuditPatch
             if (!IsUpgradeablePlayerItem(cardData) || !EvaluatePedestalSelectionCriteria(pedTpl, cardData))
                 continue;
 
-            _enterUpgradePreviewMethod ??= ctrl.GetType().GetMethod("EnterUpgradePreview", BindingFlags.Public | BindingFlags.Instance);
-            _enterUpgradePreviewMethod?.Invoke(ctrl, null);
+            if (_enterUpgradePreviewMethod != null && _enterUpgradePreviewMethod.DeclaringType.IsInstanceOfType(ctrl))
+            {
+                _enterUpgradePreviewMethod.Invoke(ctrl, null);
+            }
 
             var cardTipData = GameInspector.GetMember(ctrl, "_cardTooltipData");
             cardTipData?.GetType().GetProperty("CanFuse", BindingFlags.Public | BindingFlags.Instance)?.SetValue(cardTipData, true);
 
-            if (tipParent != null && !(tipParent is UnityEngine.Object tpuo && tpuo == null))
+            if (tipParent != null && !(tipParent is UnityEngine.Object tpuo && tpuo == null)
+                && _cardTooltipControllerProp != null && _cardTooltipControllerProp.DeclaringType.IsInstanceOfType(tipParent))
             {
-                _cardTooltipControllerProp ??= tipParent.GetType().GetProperty("CardTooltipController", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
-                var tipCtrl = _cardTooltipControllerProp?.GetValue(tipParent);
+                var tipCtrl = _cardTooltipControllerProp.GetValue(tipParent);
                 if (tipCtrl != null && !(tipCtrl is UnityEngine.Object tcuo && tcuo == null))
                 {
                     var tipData = GameInspector.GetMember(tipCtrl, "CurrentTooltipData");
@@ -439,18 +484,19 @@ internal static partial class CompatAuditPatch
                     if (ReferenceEquals(tipCard, cardData))
                     {
                         tipData?.GetType().GetProperty("CanFuse", BindingFlags.Public | BindingFlags.Instance)?.SetValue(tipData, true);
-                        _setDisplayModeMethod ??= tipCtrl.GetType().GetMethod("SetDisplayMode", BindingFlags.Public | BindingFlags.Instance);
-                        if (_setDisplayModeMethod != null)
+                        if (_setDisplayModeMethod != null && _cachedPedestalUpgradeModeEnum != null
+                            && _setDisplayModeMethod.DeclaringType.IsInstanceOfType(tipCtrl))
                         {
-                            var modeType = _setDisplayModeMethod.GetParameters()[0].ParameterType;
-                            _setDisplayModeMethod.Invoke(tipCtrl, new[] { Enum.Parse(modeType, "PedestalUpgradeTooltip") });
+                            _setDisplayModeMethod.Invoke(tipCtrl, new[] { _cachedPedestalUpgradeModeEnum });
                         }
                     }
                 }
             }
 
-            _refreshFullTooltipMethod ??= ctrl.GetType().GetMethod("RefreshFullTooltip", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            _refreshFullTooltipMethod?.Invoke(ctrl, null);
+            if (_refreshFullTooltipMethod != null && _refreshFullTooltipMethod.DeclaringType.IsInstanceOfType(ctrl))
+            {
+                _refreshFullTooltipMethod.Invoke(ctrl, null);
+            }
             break;
         }
     }
@@ -460,6 +506,7 @@ internal static partial class CompatAuditPatch
         try
         {
             if (__instance == null || (__instance is UnityEngine.Object bmUo && bmUo == null) || obj == null) return;
+            ResetShowCardHintDedupeCache();
             var prev = GameInspector.GetMember(obj, "PreviousState");
             var cur = GameInspector.GetMember(obj, "CurrentState");
             string curStateName = cur?.GetType().Name ?? "";
@@ -475,6 +522,11 @@ internal static partial class CompatAuditPatch
             {
                 _wasInAnyPedestal = true;
                 _pedestalVerifyNonPedestalExit = true;
+                // 断线重连直接切入底座态时兜底同步升级底座标志，确保非底座态 O(1) 短路始终精准
+                if (!_wasInUpgradePedestal && ResolveActiveUpgradePedestalTemplate(null, nowPedestal ? cur : null) != null)
+                {
+                    _wasInUpgradePedestal = true;
+                }
                 var curPres = GetBoardStatePresentationObj(__instance);
                 if (curPres != null)
                 {
@@ -997,25 +1049,30 @@ internal static partial class CompatAuditPatch
 
     private static void ExitAllUpgradePreviewsSafely()
     {
+        EnsurePedestalPreviewReflectionAnchored();
         var tipParent = GetStaticDataMember("TooltipParentComponent");
         if (tipParent != null && !(tipParent is UnityEngine.Object tpuo && tpuo == null))
         {
-            _exitUpgradePreviewAllMethod ??= tipParent.GetType().GetMethod("ExitUpgradePreviewOnAllPlayerCards", BindingFlags.Public | BindingFlags.Instance);
-            _exitUpgradePreviewAllMethod?.Invoke(tipParent, null);
-
-            _cardTooltipControllerProp ??= tipParent.GetType().GetProperty("CardTooltipController", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
-            var tipCtrl = _cardTooltipControllerProp?.GetValue(tipParent);
-            if (tipCtrl != null && !(tipCtrl is UnityEngine.Object tcuo && tcuo == null))
+            if (_exitUpgradePreviewAllMethod != null && _exitUpgradePreviewAllMethod.DeclaringType.IsInstanceOfType(tipParent))
             {
-                _getDisplayModeMethod ??= tipCtrl.GetType().GetMethod("GetDisplayMode", BindingFlags.Public | BindingFlags.Instance);
-                var mode = _getDisplayModeMethod?.Invoke(tipCtrl, null);
-                if (mode != null && string.Equals(mode.ToString(), "PedestalUpgradeTooltip", StringComparison.Ordinal))
+                _exitUpgradePreviewAllMethod.Invoke(tipParent, null);
+            }
+
+            if (_cardTooltipControllerProp != null && _cardTooltipControllerProp.DeclaringType.IsInstanceOfType(tipParent))
+            {
+                var tipCtrl = _cardTooltipControllerProp.GetValue(tipParent);
+                if (tipCtrl != null && !(tipCtrl is UnityEngine.Object tcuo && tcuo == null))
                 {
-                    _setDisplayModeMethod ??= tipCtrl.GetType().GetMethod("SetDisplayMode", BindingFlags.Public | BindingFlags.Instance);
-                    if (_setDisplayModeMethod != null)
+                    var mode = (_getDisplayModeMethod != null && _getDisplayModeMethod.DeclaringType.IsInstanceOfType(tipCtrl))
+                        ? _getDisplayModeMethod.Invoke(tipCtrl, null)
+                        : null;
+                    if (mode != null && string.Equals(mode.ToString(), "PedestalUpgradeTooltip", StringComparison.Ordinal))
                     {
-                        var modeType = _setDisplayModeMethod.GetParameters()[0].ParameterType;
-                        _setDisplayModeMethod.Invoke(tipCtrl, new[] { Enum.Parse(modeType, "Default") });
+                        if (_setDisplayModeMethod != null && _cachedDefaultTooltipModeEnum != null
+                            && _setDisplayModeMethod.DeclaringType.IsInstanceOfType(tipCtrl))
+                        {
+                            _setDisplayModeMethod.Invoke(tipCtrl, new[] { _cachedDefaultTooltipModeEnum });
+                        }
                     }
                 }
             }
@@ -1030,8 +1087,10 @@ internal static partial class CompatAuditPatch
                 if (ctrl == null || (ctrl is UnityEngine.Object uo && uo == null)) continue;
                 if (GameInspector.GetMember(ctrl, "_isInUpgradePreview") is bool inPrev && inPrev)
                 {
-                    _exitUpgradePreviewCardMethod ??= ctrl.GetType().GetMethod("ExitUpgradePreview", BindingFlags.Public | BindingFlags.Instance);
-                    _exitUpgradePreviewCardMethod?.Invoke(ctrl, null);
+                    if (_exitUpgradePreviewCardMethod != null && _exitUpgradePreviewCardMethod.DeclaringType.IsInstanceOfType(ctrl))
+                    {
+                        _exitUpgradePreviewCardMethod.Invoke(ctrl, null);
+                    }
                 }
             }
         }
@@ -1198,20 +1257,78 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    // ── 11. 悬停高亮与目标筛选对齐（#11：TTargetCardXMost / HintService / PreviewMove）──
+    // ── 11. 悬停高亮与目标筛选对齐（#11 + 拖拽 Top 1 根治：帧级去重、零装箱、零每帧全表反射）──
 
-    private static FieldInfo _hintCardField;
-    private static PropertyInfo _hintCardProp;
+    private struct CardTagSyncStamp
+    {
+        public long GameSimVersion;
+        public Guid TemplateId;
+        public int EnchantmentCode;
+    }
+
     private static PropertyInfo _cardTagsProp;
     private static PropertyInfo _itemEnchantmentProp;
     private static MethodInfo _itemGetEnchantmentsMethod;
-    private static MethodInfo _itemCheckForSellZoneMethod;
     private static PropertyInfo _cardCtrlCardDataProp;
     private static FieldInfo _cardCtrlBoardSectionField;
     private static MethodInfo _cardCtrlShowCardHintMethod;
     private static Type _clientCardType;
-    private static readonly Dictionary<string, (HashSet<ECardTag> Tags, HashSet<EHiddenTag> Hidden)> _enchDynamicSyncedTags =
-        new(StringComparer.OrdinalIgnoreCase);
+
+    // 预编译热路径强类型委托（彻底消除 Activator.CreateInstance、非泛型 IDictionary 装箱与逐卡反射 GetValue）
+    private static Func<object, HashSet<ECardTag>> _cardGetTagsDelegate;
+    private static Func<object, EEnchantmentType?> _itemGetEnchantmentDelegate;
+    private static Func<object, ICard> _cardCtrlGetCardDataDelegate;
+    private static Func<object, object> _cardCtrlGetBoardSectionDelegate;
+    private static Func<object, bool> _itemGetIsDraggingDelegate;
+    private static Func<bool> _dataGetIsStorageOpenDelegate;
+    private static Func<object, object> _hintGetCardDelegate;
+    private static Func<object, int> _hintGetTypeCodeDelegate;
+    private static Func<IEnumerable, object, IEnumerable> _filterHintCardsFast;
+    private static Func<IEnumerable, ICard, IEnumerable> _dedupeHintsFast;
+    private static Action<object, object, bool, bool, HashSet<ECardState>, HashSet<InstanceId>, List<ICard>> _collectEntitiesFast;
+    private static Type _itemCardRuntimeType;
+
+    private static readonly Dictionary<InstanceId, (HashSet<ECardTag> Tags, HashSet<EHiddenTag> Hidden)> _enchDynamicSyncedTags = new();
+    private static readonly Dictionary<InstanceId, CardTagSyncStamp> _cardTagSyncStamps = new();
+
+    // 拖拽 Top 1：CardController.ShowCardHint 帧级/状态级去重缓存（主线程访问）
+    private static bool _hasActiveHintCache;
+    private static int _lastHintCardCtrlId;
+    private static InstanceId _lastHintCardInstanceId;
+    private static bool _lastHintHasSocket;
+    private static int _lastHintSocketVal;
+    private static int _lastHintSectionVal;
+    private static bool _lastHintSellZone;
+    private static long _lastHintGameSimVer;
+
+    // 拖拽 Top 1：ItemController.PreviewMove 微位移短路 + BoardManager.SetSellZoneHovered 边沿触发（消灭二次 CheckForSellZone）
+    private static WeakReference<Component> _activeDraggingItemRef;
+    private static int _lastPreviewItemId;
+    private static Vector3 _lastPreviewWorldPos;
+    private static bool _lastPreviewStorageOpen;
+    private static int _lastPreviewFrame = -100;
+    private static bool _currentSellZoneHovered;
+
+    internal static void ResetShowCardHintDedupeCache()
+    {
+        _hasActiveHintCache = false;
+        _lastHintCardCtrlId = 0;
+        _lastHintCardInstanceId = default;
+        _lastHintHasSocket = false;
+        _lastHintSocketVal = int.MinValue;
+        _lastHintSectionVal = int.MinValue;
+        _lastHintSellZone = false;
+        _lastHintGameSimVer = -1;
+    }
+
+    private static void ResetDragPreviewDedupeCache()
+    {
+        _activeDraggingItemRef = null;
+        _lastPreviewItemId = 0;
+        _lastPreviewFrame = -100;
+        _currentSellZoneHovered = false;
+        ResetShowCardHintDedupeCache();
+    }
 
     private static void PatchTargetingAndHints(Harmony harmony)
     {
@@ -1234,7 +1351,7 @@ internal static partial class CompatAuditPatch
                 _patchedCount++;
             }
 
-            var hintServiceType = AccessTools.TypeByName("BazaarGameClient.Domain.Hints.HintService");
+            var hintServiceType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Hints.HintService");
             var listHints = hintServiceType == null ? null : AccessTools.Method(hintServiceType, "ListHints");
             if (listHints != null)
             {
@@ -1245,44 +1362,242 @@ internal static partial class CompatAuditPatch
                 _patchedCount++;
             }
 
-            var hintType = AccessTools.TypeByName("BazaarGameClient.Domain.Hints.Hint");
+            var hintType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Hints.Hint");
             if (hintType != null)
             {
-                _hintCardProp = hintType.GetProperty("Card", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                _hintCardField = hintType.GetField("Card", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                CompileHintAccessors(hintType);
             }
 
-            _clientCardType = AccessTools.TypeByName("BazaarGameClient.Domain.Models.Cards.Card");
+            _clientCardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.Card");
             if (_clientCardType != null)
             {
                 _cardTagsProp = _clientCardType.GetProperty("Tags", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                _cardGetTagsDelegate = CompilePropertyGetter<HashSet<ECardTag>>(_clientCardType, _cardTagsProp);
+                BuildTypedCardHelpers(_clientCardType);
             }
 
-            var itemCardType = AccessTools.TypeByName("BazaarGameClient.Domain.Models.Cards.ItemCard");
-            if (itemCardType != null)
+            _itemCardRuntimeType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.ItemCard");
+            if (_itemCardRuntimeType != null)
             {
-                _itemEnchantmentProp = itemCardType.GetProperty("Enchantment", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                _itemGetEnchantmentsMethod = itemCardType.GetMethod("GetEnchantments", BindingFlags.Public | BindingFlags.Instance);
+                _itemEnchantmentProp = _itemCardRuntimeType.GetProperty("Enchantment", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                _itemGetEnchantmentsMethod = _itemCardRuntimeType.GetMethod("GetEnchantments", BindingFlags.Public | BindingFlags.Instance);
+                _itemGetEnchantmentDelegate = CompilePropertyGetter<EEnchantmentType?>(_itemCardRuntimeType, _itemEnchantmentProp);
             }
 
+            var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
+            if (dataType != null)
+            {
+                var storageProp = dataType.GetProperty("IsStorageOpen", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (storageProp != null)
+                {
+                    try
+                    {
+                        _dataGetIsStorageOpenDelegate = Expression.Lambda<Func<bool>>(Expression.Property(null, storageProp)).Compile();
+                    }
+                    catch
+                    {
+                        _dataGetIsStorageOpenDelegate = () => storageProp.GetValue(null) is bool b && b;
+                    }
+                }
+            }
+
+            // CardController.ShowCardHint / HideCardHints：帧级状态去重 + 清除时自动复位
+            var cardCtrlType = GameInspector.FindTypeSafe("CardController", "TheBazaar.CardController");
+            if (cardCtrlType != null)
+            {
+                _cardCtrlCardDataProp = cardCtrlType.GetProperty("CardData", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                _cardCtrlBoardSectionField = FindFieldInHierarchy(cardCtrlType, "boardSection");
+                _cardCtrlShowCardHintMethod = AccessTools.Method(cardCtrlType, "ShowCardHint");
+
+                _cardCtrlGetCardDataDelegate = CompilePropertyGetter<ICard>(cardCtrlType, _cardCtrlCardDataProp);
+                if (_cardCtrlBoardSectionField != null)
+                {
+                    try
+                    {
+                        var p = Expression.Parameter(typeof(object), "ctrl");
+                        var fieldAcc = Expression.Field(Expression.Convert(p, cardCtrlType), _cardCtrlBoardSectionField);
+                        _cardCtrlGetBoardSectionDelegate = Expression.Lambda<Func<object, object>>(Expression.Convert(fieldAcc, typeof(object)), p).Compile();
+                    }
+                    catch
+                    {
+                        _cardCtrlGetBoardSectionDelegate = obj => _cardCtrlBoardSectionField.GetValue(obj);
+                    }
+                }
+
+                if (_cardCtrlShowCardHintMethod != null)
+                {
+                    harmony.Patch(
+                        _cardCtrlShowCardHintMethod,
+                        prefix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(CardControllerShowCardHintPrefix))));
+                    _patchedCount++;
+                }
+
+                var hideHints = AccessTools.Method(cardCtrlType, "HideCardHints", Type.EmptyTypes);
+                if (hideHints != null)
+                {
+                    harmony.Patch(
+                        hideHints,
+                        postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(ResetHintDedupePostfix))));
+                    _patchedCount++;
+                }
+            }
+
+            // ItemController.PreviewMove Prefix 微位移短路 & FinishMove 复位（彻底删除旧 PreviewMovePostfix 的二次 CheckForSellZone！）
             var itemCtrlType = GameInspector.FindTypeSafe("ItemController", "TheBazaar.ItemController");
-            var previewMove = itemCtrlType == null ? null : AccessTools.Method(itemCtrlType, "PreviewMove", new[] { typeof(Vector3) });
-            if (previewMove != null)
+            if (itemCtrlType != null)
             {
-                _itemCheckForSellZoneMethod = itemCtrlType.GetMethod("CheckForSellZone", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                _cardCtrlCardDataProp = itemCtrlType.GetProperty("CardData", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
-                _cardCtrlBoardSectionField = FindFieldInHierarchy(itemCtrlType, "boardSection");
-                _cardCtrlShowCardHintMethod = itemCtrlType.GetMethod("ShowCardHint", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                var isDraggingProp = itemCtrlType.GetProperty("IsDragging", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (isDraggingProp != null)
+                {
+                    _itemGetIsDraggingDelegate = CompilePropertyGetter<bool>(itemCtrlType, isDraggingProp);
+                }
 
-                harmony.Patch(previewMove, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(ItemControllerPreviewMovePostfix))));
-                _patchedCount++;
+                var previewMove = AccessTools.Method(itemCtrlType, "PreviewMove", new[] { typeof(Vector3) });
+                if (previewMove != null)
+                {
+                    harmony.Patch(
+                        previewMove,
+                        prefix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(ItemControllerPreviewMovePrefix))));
+                    _patchedCount++;
+                }
+
+                var finishMove = AccessTools.Method(itemCtrlType, "FinishMove", new[] { typeof(bool) })
+                    ?? AccessTools.Method(itemCtrlType, "FinishMove");
+                if (finishMove != null)
+                {
+                    harmony.Patch(
+                        finishMove,
+                        postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(ItemControllerFinishMovePostfix))));
+                    _patchedCount++;
+                }
+            }
+
+            // BoardManager.SetSellZoneHovered 边沿触发售卖区提示刷新 + ClearCardHighlights 复位去重缓存
+            var bmType = GameInspector.FindTypeSafe("BoardManager");
+            if (bmType != null)
+            {
+                var setSellZoneHovered = AccessTools.Method(bmType, "SetSellZoneHovered", new[] { typeof(bool) });
+                if (setSellZoneHovered != null)
+                {
+                    harmony.Patch(
+                        setSellZoneHovered,
+                        postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(BoardSetSellZoneHoveredPostfix))));
+                    _patchedCount++;
+                }
+
+                var clearHighlights = AccessTools.Method(bmType, "ClearCardHighlights", Type.EmptyTypes);
+                if (clearHighlights != null)
+                {
+                    harmony.Patch(
+                        clearHighlights,
+                        postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(ResetHintDedupePostfix))));
+                    _patchedCount++;
+                }
             }
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.PatchTargetingAndHints: " + ex.Message);
         }
+    }
+
+    private static Func<object, T> CompilePropertyGetter<T>(Type declaringType, PropertyInfo prop)
+    {
+        if (declaringType == null || prop == null) return null;
+        try
+        {
+            var p = Expression.Parameter(typeof(object), "inst");
+            var access = Expression.Property(Expression.Convert(p, declaringType), prop);
+            Expression body = typeof(T) == prop.PropertyType ? access : Expression.Convert(access, typeof(T));
+            return Expression.Lambda<Func<object, T>>(body, p).Compile();
+        }
+        catch
+        {
+            return obj =>
+            {
+                object v = prop.GetValue(obj);
+                return v is T tv ? tv : default;
+            };
+        }
+    }
+
+    private static void CompileHintAccessors(Type hintType)
+    {
+        var cardProp = hintType.GetProperty("Card", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var cardField = hintType.GetField("Card", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var typeProp = hintType.GetProperty("Type", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var typeField = hintType.GetField("Type", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+        if (cardProp != null)
+        {
+            _hintGetCardDelegate = CompilePropertyGetter<object>(hintType, cardProp);
+        }
+        else if (cardField != null)
+        {
+            try
+            {
+                var p = Expression.Parameter(typeof(object), "h");
+                var acc = Expression.Field(Expression.Convert(p, hintType), cardField);
+                _hintGetCardDelegate = Expression.Lambda<Func<object, object>>(Expression.Convert(acc, typeof(object)), p).Compile();
+            }
+            catch { _hintGetCardDelegate = h => cardField.GetValue(h); }
+        }
+
+        if (typeProp != null)
+        {
+            try
+            {
+                var p = Expression.Parameter(typeof(object), "h");
+                var acc = Expression.Property(Expression.Convert(p, hintType), typeProp);
+                _hintGetTypeCodeDelegate = Expression.Lambda<Func<object, int>>(Expression.Convert(acc, typeof(int)), p).Compile();
+            }
+            catch { _hintGetTypeCodeDelegate = h => Convert.ToInt32(typeProp.GetValue(h) ?? 0); }
+        }
+        else if (typeField != null)
+        {
+            try
+            {
+                var p = Expression.Parameter(typeof(object), "h");
+                var acc = Expression.Field(Expression.Convert(p, hintType), typeField);
+                _hintGetTypeCodeDelegate = Expression.Lambda<Func<object, int>>(Expression.Convert(acc, typeof(int)), p).Compile();
+            }
+            catch { _hintGetTypeCodeDelegate = h => Convert.ToInt32(typeField.GetValue(h) ?? 0); }
+        }
+
+        try
+        {
+            var dedupeOpen = typeof(CompatAuditPatch).GetMethod(nameof(DedupeHintsTyped), BindingFlags.NonPublic | BindingFlags.Static);
+            if (dedupeOpen != null)
+            {
+                var closed = dedupeOpen.MakeGenericMethod(hintType);
+                _dedupeHintsFast = (Func<IEnumerable, ICard, IEnumerable>)Delegate.CreateDelegate(
+                    typeof(Func<IEnumerable, ICard, IEnumerable>), closed);
+            }
+        }
+        catch { }
+    }
+
+    private static void BuildTypedCardHelpers(Type clientCardType)
+    {
+        try
+        {
+            var filterOpen = typeof(CompatAuditPatch).GetMethod(nameof(FilterHintCardsTyped), BindingFlags.NonPublic | BindingFlags.Static);
+            if (filterOpen != null)
+            {
+                var closed = filterOpen.MakeGenericMethod(clientCardType);
+                _filterHintCardsFast = (Func<IEnumerable, object, IEnumerable>)Delegate.CreateDelegate(
+                    typeof(Func<IEnumerable, object, IEnumerable>), closed);
+            }
+
+            var collectOpen = typeof(CompatAuditPatch).GetMethod(nameof(CollectEntitiesTyped), BindingFlags.NonPublic | BindingFlags.Static);
+            if (collectOpen != null)
+            {
+                var closed = collectOpen.MakeGenericMethod(clientCardType);
+                _collectEntitiesFast = (Action<object, object, bool, bool, HashSet<ECardState>, HashSet<InstanceId>, List<ICard>>)Delegate.CreateDelegate(
+                    typeof(Action<object, object, bool, bool, HashSet<ECardState>, HashSet<InstanceId>, List<ICard>>), closed);
+            }
+        }
+        catch { }
     }
 
     private static FieldInfo FindFieldInHierarchy(Type type, string fieldName)
@@ -1295,9 +1610,43 @@ internal static partial class CompatAuditPatch
         return null;
     }
 
+    // ── 零分配强类型槽位比较器（彻底替换 6 处 LINQ OrderBy/ThenBy/ToList） ──
+
+    private static readonly Comparison<ICard> XMostCardSlotComparison = static (a, b) =>
+    {
+        int secA = a.Section == EInventorySection.Stash ? 1 : 0;
+        int secB = b.Section == EInventorySection.Stash ? 1 : 0;
+        int cmp = secA.CompareTo(secB);
+        if (cmp != 0) return cmp;
+        int sockA = a.LeftSocketId.HasValue ? (int)a.LeftSocketId.Value : int.MaxValue;
+        int sockB = b.LeftSocketId.HasValue ? (int)b.LeftSocketId.Value : int.MaxValue;
+        return sockA.CompareTo(sockB);
+    };
+
+    private static void PruneNullSocketAndSortInPlace(List<ICard> list)
+    {
+        int write = 0;
+        for (int i = 0; i < list.Count; i++)
+        {
+            var c = list[i];
+            if (c != null && c.LeftSocketId.HasValue)
+            {
+                list[write++] = c;
+            }
+        }
+        if (write < list.Count)
+        {
+            list.RemoveRange(write, list.Count - write);
+        }
+        if (list.Count > 1)
+        {
+            list.Sort(XMostCardSlotComparison);
+        }
+    }
+
     /// <summary>
-    /// 修复 #11：严格对齐服务端 TargetResolver（Collect -> 同步附魔标签 -> ExcludeSelf(引用+InstanceId) -> 按槽位升序 -> Conditions 过滤 -> 重排 -> Priority -> LeftMost/RightMost）。
-    /// 避免客户端因 Container 槽位顺序滞后、HashSet 打乱、HiddenTags 缺失附魔标签或 null 槽位混入导致悬停高亮偏差。
+    /// 修复 #11 + 拖拽 Top 1 零 LINQ/零装箱重构：
+    /// 严格对齐服务端 TargetResolver（Collect -> 按需版本同步附魔标签 -> ExcludeSelf(引用+InstanceId) -> 原位槽位排序 -> Conditions 过滤 -> Priority -> LeftMost/RightMost）。
     /// </summary>
     private static bool TargetCardXMostGetTargetsPrefix(
         TTargetCardXMost __instance,
@@ -1315,59 +1664,90 @@ internal static partial class CompatAuditPatch
             SyncClientCardTagsAndHiddenTags(ctx.TargetingCard);
 
             var candidates = CollectXMostCandidates(__instance.TargetSection, ctx, cardStateFilter);
-            foreach (var c in candidates)
+            for (int i = 0; i < candidates.Count; i++)
             {
-                SyncClientCardTagsAndHiddenTags(c);
+                SyncClientCardTagsAndHiddenTags(candidates[i]);
             }
 
             // 1. 先按引用与 InstanceId 双重严格排除自身（对齐服务端 ExcludeSelf 优先于条件筛选与极值选取）
             if (ctx.TargetingCard != null && __instance.ExcludeSelf)
             {
                 var selfId = ctx.TargetingCard.GetInstanceId();
-                candidates.RemoveAll(c => c == null || ReferenceEquals(c, ctx.TargetingCard) || c.GetInstanceId() == selfId);
+                for (int i = candidates.Count - 1; i >= 0; i--)
+                {
+                    var c = candidates[i];
+                    if (c == null || ReferenceEquals(c, ctx.TargetingCard) || c.GetInstanceId() == selfId)
+                    {
+                        candidates.RemoveAt(i);
+                    }
+                }
             }
 
-            // 2. 过滤未入格卡牌并按真实槽位升序稳定排序（Hand 优先于 Stash），消除 Container 未同步或 null 槽位抢占最左位置的问题
-            candidates = candidates
-                .Where(c => c != null && c.LeftSocketId.HasValue)
-                .OrderBy(c => c.Section == EInventorySection.Stash ? 1 : 0)
-                .ThenBy(c => (int)c.LeftSocketId.Value)
-                .ToList();
+            // 2. 原位过滤未入格卡牌并按真实槽位升序稳定排序（Hand 优先于 Stash），0 LINQ 分配
+            PruneNullSocketAndSortInPlace(candidates);
 
             // 3. 应用 Conditions 条件筛选后立即重新按槽位升序排列（防止 HashSet 破坏槽位顺序）
             if (__instance.Conditions != null && candidates.Count > 0)
             {
                 var condCtx = new CardConditionalContext(ctx.Run, candidates, ctx.TargetingCard, ctx.EventContext);
-                var set = new HashSet<ICard>(candidates);
+                var set = _tsCardSet ??= new HashSet<ICard>();
+                set.Clear();
+                for (int i = 0; i < candidates.Count; i++) set.Add(candidates[i]);
+
                 var filtered = __instance.Conditions.Filter(set, condCtx);
-                candidates = filtered == null
-                    ? new List<ICard>()
-                    : filtered
-                        .Where(c => c != null && c.LeftSocketId.HasValue)
-                        .OrderBy(c => c.Section == EInventorySection.Stash ? 1 : 0)
-                        .ThenBy(c => (int)c.LeftSocketId.Value)
-                        .ToList();
+                candidates.Clear();
+                if (filtered != null)
+                {
+                    foreach (var fc in filtered)
+                    {
+                        if (fc != null && fc.LeftSocketId.HasValue)
+                        {
+                            candidates.Add(fc);
+                        }
+                    }
+                    if (candidates.Count > 1)
+                    {
+                        candidates.Sort(XMostCardSlotComparison);
+                    }
+                }
             }
 
             // 4. 若指定了优先级条件列表且允许目标数 > 0，按优先级保留并在同级内继续维持槽位顺序
             if (candidates.Count > 0 && NumberOfAllowedTargets.GetValueOrDefault() > 0 && targetingPriorities != null && targetingPriorities.Count > 0)
             {
-                var prioritized = new List<ICard>();
-                var seenIds = new HashSet<InstanceId>();
-                var fullSet = new HashSet<ICard>(candidates);
+                var prioritized = new List<ICard>(candidates.Count);
+                var seenIds = _tsSeenInstanceIds ??= new HashSet<InstanceId>();
+                seenIds.Clear();
+                var fullSet = _tsCardSet ??= new HashSet<ICard>();
+                fullSet.Clear();
+                for (int i = 0; i < candidates.Count; i++) fullSet.Add(candidates[i]);
+
+                var priScratch = _tsPriScratch ??= new List<ICard>(16);
                 var priCtx = new CardConditionalContext(ctx.Run, candidates, ctx.TargetingCard, ctx.EventContext);
 
-                foreach (var priCond in targetingPriorities)
+                for (int pi = 0; pi < targetingPriorities.Count; pi++)
                 {
+                    var priCond = targetingPriorities[pi];
                     if (priCond == null) continue;
                     var matched = priCond.Filter(fullSet, priCtx);
                     if (matched == null || matched.Count == 0) continue;
 
-                    foreach (var mc in matched
-                        .Where(c => c != null && c.LeftSocketId.HasValue)
-                        .OrderBy(c => c.Section == EInventorySection.Stash ? 1 : 0)
-                        .ThenBy(c => (int)c.LeftSocketId.Value))
+                    priScratch.Clear();
+                    foreach (var mc in matched)
                     {
+                        if (mc != null && mc.LeftSocketId.HasValue)
+                        {
+                            priScratch.Add(mc);
+                        }
+                    }
+                    if (priScratch.Count > 1)
+                    {
+                        priScratch.Sort(XMostCardSlotComparison);
+                    }
+
+                    for (int mi = 0; mi < priScratch.Count; mi++)
+                    {
+                        var mc = priScratch[mi];
                         if (seenIds.Add(mc.GetInstanceId()))
                         {
                             prioritized.Add(mc);
@@ -1383,15 +1763,15 @@ internal static partial class CompatAuditPatch
 
             if (candidates.Count == 0)
             {
-                __result = new List<ICard>();
+                __result = new List<ICard>(0);
                 return false;
             }
 
             __result = __instance.TargetMode switch
             {
-                ETargetCardXMostTargetMode.LeftMostCard => new List<ICard> { candidates[0] },
-                ETargetCardXMostTargetMode.RightMostCard => new List<ICard> { candidates[candidates.Count - 1] },
-                _ => new List<ICard>(),
+                ETargetCardXMostTargetMode.LeftMostCard => new List<ICard>(1) { candidates[0] },
+                ETargetCardXMostTargetMode.RightMostCard => new List<ICard>(1) { candidates[candidates.Count - 1] },
+                _ => new List<ICard>(0),
             };
             return false;
         }
@@ -1399,6 +1779,66 @@ internal static partial class CompatAuditPatch
         {
             BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.TargetCardXMostGetTargetsPrefix: " + ex.Message);
             return true;
+        }
+    }
+
+    /// <summary>零装箱强类型 Data.Entities 枚举器（彻底消除非泛型 IDictionary 遍历时的 InstanceId + DictionaryEntry 装箱）。</summary>
+    private static void CollectEntitiesTyped<TCard>(
+        object entitiesObj,
+        object localPlayer,
+        bool wantHand,
+        bool wantStash,
+        HashSet<ECardState> cardStateFilter,
+        HashSet<InstanceId> seen,
+        List<ICard> list) where TCard : class, ICard
+    {
+        if (entitiesObj is Dictionary<InstanceId, TCard> typedDict)
+        {
+            foreach (var kv in typedDict)
+            {
+                var ent = kv.Value;
+                if (ent == null || ent.Type != ECardType.Item || !ReferenceEquals(ent.Owner, localPlayer)) continue;
+                if (!ent.LeftSocketId.HasValue) continue;
+                var sec = ent.Section;
+                if (sec == EInventorySection.Hand)
+                {
+                    if (!wantHand) continue;
+                }
+                else if (sec == EInventorySection.Stash)
+                {
+                    if (!wantStash) continue;
+                }
+                else
+                {
+                    continue;
+                }
+                bool stateOk = cardStateFilter != null ? cardStateFilter.Contains(ent.State) : ent.State == ECardState.Alive;
+                if (!stateOk) continue;
+                if (seen.Add(kv.Key))
+                {
+                    list.Add(ent);
+                }
+            }
+            return;
+        }
+
+        if (entitiesObj is IDictionary fallbackDict)
+        {
+            foreach (DictionaryEntry kv in fallbackDict)
+            {
+                if (kv.Value is not ICard ent) continue;
+                if (ent.Type != ECardType.Item || !ReferenceEquals(ent.Owner, localPlayer)) continue;
+                if (!ent.LeftSocketId.HasValue) continue;
+                if (ent.Section == EInventorySection.Hand && !wantHand) continue;
+                if (ent.Section == EInventorySection.Stash && !wantStash) continue;
+                if (ent.Section != EInventorySection.Hand && ent.Section != EInventorySection.Stash) continue;
+                bool stateOk = cardStateFilter != null ? cardStateFilter.Contains(ent.State) : ent.State == ECardState.Alive;
+                if (!stateOk) continue;
+                if (seen.Add(ent.GetInstanceId()))
+                {
+                    list.Add(ent);
+                }
+            }
         }
     }
 
@@ -1425,8 +1865,9 @@ internal static partial class CompatAuditPatch
             _ => Array.Empty<ICard>(),
         };
 
-        var list = new List<ICard>();
-        var seen = new HashSet<InstanceId>();
+        var list = new List<ICard>(16);
+        var seen = _tsCollectSeenIds ??= new HashSet<InstanceId>();
+        seen.Clear();
         if (raw != null)
         {
             foreach (var c in raw)
@@ -1461,31 +1902,45 @@ internal static partial class CompatAuditPatch
                 var entities = GameInspector.GetDataEntities();
                 if (entities != null)
                 {
-                    // 先踢掉已离场或已不属于该分区的旧 Container 残留项
-                    list.RemoveAll(c =>
-                        ReferenceEquals(c.Owner, localPlayer)
-                        && ((c.Section != EInventorySection.Hand && c.Section != EInventorySection.Stash)
-                            || (c.Section == EInventorySection.Hand && !wantHand)
-                            || (c.Section == EInventorySection.Stash && !wantStash)));
-                    seen.Clear();
-                    foreach (var c in list)
+                    // 先原位踢掉已离场或已不属于该分区的旧 Container 残留项
+                    for (int i = list.Count - 1; i >= 0; i--)
                     {
-                        seen.Add(c.GetInstanceId());
+                        var c = list[i];
+                        if (ReferenceEquals(c.Owner, localPlayer)
+                            && ((c.Section != EInventorySection.Hand && c.Section != EInventorySection.Stash)
+                                || (c.Section == EInventorySection.Hand && !wantHand)
+                                || (c.Section == EInventorySection.Stash && !wantStash)))
+                        {
+                            list.RemoveAt(i);
+                        }
                     }
 
-                    foreach (DictionaryEntry kv in entities)
+                    seen.Clear();
+                    for (int i = 0; i < list.Count; i++)
                     {
-                        if (kv.Value is not ICard ent) continue;
-                        if (ent.Type != ECardType.Item || !ReferenceEquals(ent.Owner, localPlayer)) continue;
-                        if (!ent.LeftSocketId.HasValue) continue;
-                        if (ent.Section == EInventorySection.Hand && !wantHand) continue;
-                        if (ent.Section == EInventorySection.Stash && !wantStash) continue;
-                        if (ent.Section != EInventorySection.Hand && ent.Section != EInventorySection.Stash) continue;
-                        bool stateOk = cardStateFilter != null ? cardStateFilter.Contains(ent.State) : ent.State == ECardState.Alive;
-                        if (!stateOk) continue;
-                        if (seen.Add(ent.GetInstanceId()))
+                        seen.Add(list[i].GetInstanceId());
+                    }
+
+                    if (_collectEntitiesFast != null)
+                    {
+                        _collectEntitiesFast(entities, localPlayer, wantHand, wantStash, cardStateFilter, seen, list);
+                    }
+                    else
+                    {
+                        foreach (DictionaryEntry kv in entities)
                         {
-                            list.Add(ent);
+                            if (kv.Value is not ICard ent) continue;
+                            if (ent.Type != ECardType.Item || !ReferenceEquals(ent.Owner, localPlayer)) continue;
+                            if (!ent.LeftSocketId.HasValue) continue;
+                            if (ent.Section == EInventorySection.Hand && !wantHand) continue;
+                            if (ent.Section == EInventorySection.Stash && !wantStash) continue;
+                            if (ent.Section != EInventorySection.Hand && ent.Section != EInventorySection.Stash) continue;
+                            bool stateOk = cardStateFilter != null ? cardStateFilter.Contains(ent.State) : ent.State == ECardState.Alive;
+                            if (!stateOk) continue;
+                            if (seen.Add(ent.GetInstanceId()))
+                            {
+                                list.Add(ent);
+                            }
                         }
                     }
                 }
@@ -1495,26 +1950,54 @@ internal static partial class CompatAuditPatch
         return list;
     }
 
-    // P1-3 修复：悬停/拖拽热路径 ThreadStatic 复用缓冲池与反射类型缓存，彻底消除每卡 4 个 HashSet 及 MakeGenericType GC 风暴
+    // 悬停/拖拽热路径 ThreadStatic 复用缓冲池（0 每帧 HashSet/List 分配）
     [ThreadStatic] private static HashSet<ECardTag> _tsDesiredTags;
     [ThreadStatic] private static HashSet<EHiddenTag> _tsDesiredHidden;
     [ThreadStatic] private static HashSet<ECardTag> _tsEnchAddedTags;
     [ThreadStatic] private static HashSet<EHiddenTag> _tsEnchAddedHidden;
-    [ThreadStatic] private static HashSet<string> _tsSeenHintKeys;
+    [ThreadStatic] private static HashSet<ICard> _tsCardSet;
+    [ThreadStatic] private static HashSet<InstanceId> _tsSeenInstanceIds;
+    [ThreadStatic] private static HashSet<InstanceId> _tsCollectSeenIds;
+    [ThreadStatic] private static List<ICard> _tsPriScratch;
+    [ThreadStatic] private static HashSet<(InstanceId, int)> _tsSeenHintPairs;
 
-    private static Type _cachedClientCardListType;
-    private static Type _cachedHintType;
-    private static Type _cachedHintListType;
-    private static PropertyInfo _cachedHintTypeProp;
-    private static FieldInfo _cachedHintTypeField;
-
+    /// <summary>
+    /// 拖拽 Top 1 根治：按 (GameSimVersion, TemplateId, Enchantment) 脏标按需同步，同版本同附魔 O(1) 零反射直接返回；
+    /// 附魔定义优先走强类型 TCardItem.Enchantments 避免 GetEnchantments() 分配 ReadOnlyDictionary，且未变化时不新建 HashSet！
+    /// </summary>
     private static void SyncClientCardTagsAndHiddenTags(ICard card)
     {
         if (card == null) return;
         try
         {
-            string iid = card.GetInstanceId().ToString();
+            InstanceId iid = card.GetInstanceId();
             var tpl = card.GetTemplate();
+            Guid tplId = tpl != null ? tpl.Id : Guid.Empty;
+
+            EEnchantmentType? enchNullable = null;
+            if (_itemCardRuntimeType != null && _itemCardRuntimeType.IsInstanceOfType(card))
+            {
+                if (_itemGetEnchantmentDelegate != null)
+                {
+                    enchNullable = _itemGetEnchantmentDelegate(card);
+                }
+                else if (_itemEnchantmentProp != null && _itemEnchantmentProp.DeclaringType.IsInstanceOfType(card))
+                {
+                    if (_itemEnchantmentProp.GetValue(card) is EEnchantmentType et) enchNullable = et;
+                }
+            }
+
+            int enchCode = enchNullable.HasValue ? (int)enchNullable.Value : -1;
+            long curVer = Volatile.Read(ref _gameSimVersion);
+
+            if (_cardTagSyncStamps.TryGetValue(iid, out var stamp)
+                && stamp.GameSimVersion == curVer
+                && stamp.EnchantmentCode == enchCode
+                && stamp.TemplateId == tplId)
+            {
+                return;
+            }
+
             var desiredTags = _tsDesiredTags ??= new HashSet<ECardTag>();
             var desiredHidden = _tsDesiredHidden ??= new HashSet<EHiddenTag>();
             var enchAddedTags = _tsEnchAddedTags ??= new HashSet<ECardTag>();
@@ -1536,45 +2019,49 @@ internal static partial class CompatAuditPatch
                 }
             }
 
-            if (_itemEnchantmentProp != null && _itemGetEnchantmentsMethod != null && _itemEnchantmentProp.DeclaringType != null && _itemEnchantmentProp.DeclaringType.IsInstanceOfType(card))
+            if (enchNullable.HasValue)
             {
-                var enchObj = _itemEnchantmentProp.GetValue(card);
-                if (enchObj is EEnchantmentType enchType)
+                EEnchantmentType enchType = enchNullable.Value;
+                TEnchantment enchDef = null;
+                if (tpl is TCardItem itemTpl && itemTpl.Enchantments != null)
                 {
-                    TEnchantment enchDef = null;
+                    itemTpl.Enchantments.TryGetValue(enchType, out enchDef);
+                }
+                else if (_itemGetEnchantmentsMethod != null && _itemGetEnchantmentsMethod.DeclaringType.IsInstanceOfType(card))
+                {
                     if (_itemGetEnchantmentsMethod.Invoke(card, null) is IReadOnlyDictionary<EEnchantmentType, TEnchantment> roDict)
                     {
                         roDict.TryGetValue(enchType, out enchDef);
                     }
-                    else if (tpl is TCardItem itemTpl && itemTpl.Enchantments != null)
-                    {
-                        itemTpl.Enchantments.TryGetValue(enchType, out enchDef);
-                    }
+                }
 
-                    if (enchDef != null)
+                if (enchDef != null)
+                {
+                    if (enchDef.HiddenTags != null)
                     {
-                        if (enchDef.HiddenTags != null)
+                        foreach (var ht in enchDef.HiddenTags)
                         {
-                            foreach (var ht in enchDef.HiddenTags)
-                            {
-                                if (!desiredHidden.Contains(ht)) enchAddedHidden.Add(ht);
-                                desiredHidden.Add(ht);
-                            }
+                            if (!desiredHidden.Contains(ht)) enchAddedHidden.Add(ht);
+                            desiredHidden.Add(ht);
                         }
-                        if (enchDef.Tags != null)
+                    }
+                    if (enchDef.Tags != null)
+                    {
+                        foreach (var tg in enchDef.Tags)
                         {
-                            foreach (var tg in enchDef.Tags)
-                            {
-                                if (!desiredTags.Contains(tg)) enchAddedTags.Add(tg);
-                                desiredTags.Add(tg);
-                            }
+                            if (!desiredTags.Contains(tg)) enchAddedTags.Add(tg);
+                            desiredTags.Add(tg);
                         }
                     }
                 }
             }
 
-            var cardTags = _cardTagsProp?.GetValue(card) as HashSet<ECardTag>;
-            if (_enchDynamicSyncedTags.TryGetValue(iid, out var prevSynced))
+            HashSet<ECardTag> cardTags = _cardGetTagsDelegate != null && _clientCardType != null && _clientCardType.IsInstanceOfType(card)
+                ? _cardGetTagsDelegate(card)
+                : (_cardTagsProp != null && _cardTagsProp.DeclaringType.IsInstanceOfType(card) ? _cardTagsProp.GetValue(card) as HashSet<ECardTag> : null);
+
+            bool hasPrev = _enchDynamicSyncedTags.TryGetValue(iid, out var prevSynced);
+            if (hasPrev)
             {
                 if (card.HiddenTags != null && prevSynced.Hidden.Count > 0)
                 {
@@ -1603,14 +2090,105 @@ internal static partial class CompatAuditPatch
 
             if (enchAddedTags.Count > 0 || enchAddedHidden.Count > 0)
             {
-                _enchDynamicSyncedTags[iid] = (new HashSet<ECardTag>(enchAddedTags), new HashSet<EHiddenTag>(enchAddedHidden));
+                // 仅当附魔动态标签集合真正变化时才替换缓存集合，彻底消灭无意义的 new HashSet×2 分配
+                bool unchanged = hasPrev
+                    && prevSynced.Tags.Count == enchAddedTags.Count
+                    && prevSynced.Hidden.Count == enchAddedHidden.Count
+                    && prevSynced.Tags.SetEquals(enchAddedTags)
+                    && prevSynced.Hidden.SetEquals(enchAddedHidden);
+                if (!unchanged)
+                {
+                    _enchDynamicSyncedTags[iid] = (new HashSet<ECardTag>(enchAddedTags), new HashSet<EHiddenTag>(enchAddedHidden));
+                }
             }
-            else
+            else if (hasPrev)
             {
                 _enchDynamicSyncedTags.Remove(iid);
             }
+
+            if (_cardTagSyncStamps.Count > 256)
+            {
+                _cardTagSyncStamps.Clear();
+            }
+            _cardTagSyncStamps[iid] = new CardTagSyncStamp
+            {
+                GameSimVersion = curVer,
+                TemplateId = tplId,
+                EnchantmentCode = enchCode,
+            };
         }
         catch { }
+    }
+
+    private static IEnumerable FilterHintCardsTyped<TCard>(IEnumerable allCards, object me) where TCard : class
+    {
+        var typedList = new List<TCard>(24);
+        ICard meCard = me as ICard;
+        InstanceId meId = meCard != null ? meCard.GetInstanceId() : default;
+
+        if (allCards is ICollection<TCard> typedCol)
+        {
+            foreach (var item in typedCol)
+            {
+                if (item == null) continue;
+                if (item is ICard card)
+                {
+                    SyncClientCardTagsAndHiddenTags(card);
+                    bool isSelf = ReferenceEquals(item, me) || (meCard != null && card.GetInstanceId() == meId);
+                    if (!isSelf)
+                    {
+                        if (card.Owner == null || card.State != ECardState.Alive) continue;
+                        if (card.Type == ECardType.Item && card.Section != EInventorySection.Hand && card.Section != EInventorySection.Stash) continue;
+                    }
+                }
+                typedList.Add(item);
+            }
+            return typedList;
+        }
+
+        foreach (var obj in allCards)
+        {
+            if (obj is not TCard item) continue;
+            if (item is ICard card)
+            {
+                SyncClientCardTagsAndHiddenTags(card);
+                bool isSelf = ReferenceEquals(item, me) || (meCard != null && card.GetInstanceId() == meId);
+                if (!isSelf)
+                {
+                    if (card.Owner == null || card.State != ECardState.Alive) continue;
+                    if (card.Type == ECardType.Item && card.Section != EInventorySection.Hand && card.Section != EInventorySection.Stash) continue;
+                }
+            }
+            typedList.Add(item);
+        }
+        return typedList;
+    }
+
+    private static IEnumerable DedupeHintsTyped<THint>(IEnumerable rawHints, ICard meCard) where THint : class
+    {
+        var filteredList = new List<THint>(8);
+        InstanceId selfId = meCard.GetInstanceId();
+        var seenPairs = _tsSeenHintPairs ??= new HashSet<(InstanceId, int)>();
+        seenPairs.Clear();
+
+        foreach (var obj in rawHints)
+        {
+            if (obj is not THint h) continue;
+            var targetObj = _hintGetCardDelegate?.Invoke(h);
+            if (targetObj is ICard targetCard)
+            {
+                InstanceId targetId = targetCard.GetInstanceId();
+                if (ReferenceEquals(targetObj, meCard) || targetId == selfId)
+                    continue;
+
+                int typeCode = _hintGetTypeCodeDelegate != null ? _hintGetTypeCodeDelegate(h) : 0;
+                if (!seenPairs.Add((targetId, typeCode)))
+                    continue;
+            }
+            filteredList.Add(h);
+        }
+
+        return filteredList;
     }
 
     private static void HintServiceListHintsPrefix(object me, ref IEnumerable allCards)
@@ -1622,44 +2200,8 @@ internal static partial class CompatAuditPatch
                 SyncClientCardTagsAndHiddenTags(meCard);
             }
 
-            if (allCards == null) return;
-
-            var filtered = new List<object>();
-            foreach (var obj in allCards)
-            {
-                if (obj == null) continue;
-                if (obj is ICard card)
-                {
-                    SyncClientCardTagsAndHiddenTags(card);
-                    bool isSelf = ReferenceEquals(obj, me) || (me is ICard mc && card.GetInstanceId() == mc.GetInstanceId());
-                    if (!isSelf)
-                    {
-                        if (card.Owner == null || card.State != ECardState.Alive)
-                            continue;
-                        if (card.Type == ECardType.Item && card.Section != EInventorySection.Hand && card.Section != EInventorySection.Stash)
-                            continue;
-                    }
-                }
-                filtered.Add(obj);
-            }
-
-            if (_clientCardType != null)
-            {
-                _cachedClientCardListType ??= typeof(List<>).MakeGenericType(_clientCardType);
-                var typedList = Activator.CreateInstance(_cachedClientCardListType) as IList;
-                if (typedList != null)
-                {
-                    for (int i = 0; i < filtered.Count; i++)
-                    {
-                        var item = filtered[i];
-                        if (_clientCardType.IsInstanceOfType(item))
-                        {
-                            typedList.Add(item);
-                        }
-                    }
-                    allCards = typedList;
-                }
-            }
+            if (allCards == null || _filterHintCardsFast == null) return;
+            allCards = _filterHintCardsFast(allCards, me);
         }
         catch (Exception ex)
         {
@@ -1671,45 +2213,8 @@ internal static partial class CompatAuditPatch
     {
         try
         {
-            if (__result == null || me is not ICard meCard) return;
-
-            if (_cachedHintType == null)
-            {
-                _cachedHintType = AccessTools.TypeByName("BazaarGameClient.Domain.Hints.Hint");
-                if (_cachedHintType != null)
-                {
-                    _cachedHintListType = typeof(List<>).MakeGenericType(_cachedHintType);
-                    _cachedHintTypeProp = _cachedHintType.GetProperty("Type", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    _cachedHintTypeField = _cachedHintType.GetField("Type", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                }
-            }
-            if (_cachedHintListType == null) return;
-
-            var filteredList = Activator.CreateInstance(_cachedHintListType) as IList;
-            if (filteredList == null) return;
-
-            var selfId = meCard.GetInstanceId();
-            var seenTargets = _tsSeenHintKeys ??= new HashSet<string>(StringComparer.Ordinal);
-            seenTargets.Clear();
-
-            foreach (var h in __result)
-            {
-                if (h == null) continue;
-                var targetObj = _hintCardProp?.GetValue(h) ?? _hintCardField?.GetValue(h);
-                if (targetObj is ICard targetCard)
-                {
-                    if (ReferenceEquals(targetObj, me) || targetCard.GetInstanceId() == selfId)
-                        continue;
-
-                    object hType = _cachedHintTypeProp?.GetValue(h) ?? _cachedHintTypeField?.GetValue(h);
-                    string key = targetCard.GetInstanceId() + "|" + (hType?.ToString() ?? string.Empty);
-                    if (!seenTargets.Add(key))
-                        continue;
-                }
-                filteredList.Add(h);
-            }
-
-            __result = filteredList;
+            if (__result == null || me is not ICard meCard || _dedupeHintsFast == null) return;
+            __result = _dedupeHintsFast(__result, meCard);
         }
         catch (Exception ex)
         {
@@ -1717,28 +2222,142 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    private static void ItemControllerPreviewMovePostfix(object __instance, bool __result)
+    /// <summary>
+    /// 拖拽 Top 1：CardController.ShowCardHint 帧级/状态级去重。
+    /// 当同一卡牌在同一槽位、同一分区、同一售卖区状态且 GameSim 版本未变化时直接短路，砍掉 95%+ 无效每帧高亮重算！
+    /// </summary>
+    private static bool CardControllerShowCardHintPrefix(object __instance, EContainerSocketId? socketId, object section)
     {
         try
         {
-            if (!__result || __instance == null || (__instance is UnityEngine.Object uo && uo == null))
-                return;
+            if (__instance is not UnityEngine.Object uo || uo == null) return true;
 
-            if (_itemCheckForSellZoneMethod?.Invoke(__instance, null) is not bool inSellZone || !inSellZone)
-                return;
+            int ctrlId = uo.GetInstanceID();
+            ICard cardData = _cardCtrlGetCardDataDelegate?.Invoke(__instance);
+            InstanceId cardId = cardData != null ? cardData.GetInstanceId() : default;
+            bool hasSocket = socketId.HasValue;
+            int sockVal = hasSocket ? (int)socketId.Value : -1;
+            int secVal = section != null ? Convert.ToInt32(section) : -1;
+            bool sellZone = _currentSellZoneHovered;
+            long simVer = Volatile.Read(ref _gameSimVersion);
 
-            var cardData = _cardCtrlCardDataProp?.GetValue(__instance) as ICard;
-            var boardSection = _cardCtrlBoardSectionField?.GetValue(__instance);
-            if (cardData == null || boardSection == null || _cardCtrlShowCardHintMethod == null)
-                return;
+            if (_hasActiveHintCache
+                && ctrlId == _lastHintCardCtrlId
+                && cardId == _lastHintCardInstanceId
+                && hasSocket == _lastHintHasSocket
+                && sockVal == _lastHintSocketVal
+                && secVal == _lastHintSectionVal
+                && sellZone == _lastHintSellZone
+                && simVer == _lastHintGameSimVer)
+            {
+                return false;
+            }
 
-            // 拖至出售区悬停时强制以卡牌实际 LeftSocketId 刷新高亮，避免使用相邻空槽位误算
-            _cardCtrlShowCardHintMethod.Invoke(__instance, new object[] { cardData.LeftSocketId, boardSection });
+            _hasActiveHintCache = true;
+            _lastHintCardCtrlId = ctrlId;
+            _lastHintCardInstanceId = cardId;
+            _lastHintHasSocket = hasSocket;
+            _lastHintSocketVal = sockVal;
+            _lastHintSectionVal = secVal;
+            _lastHintSellZone = sellZone;
+            _lastHintGameSimVer = simVer;
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.ItemControllerPreviewMovePostfix: " + ex.Message);
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.CardControllerShowCardHintPrefix: " + ex.Message);
         }
+        return true;
+    }
+
+    private static void ResetHintDedupePostfix()
+    {
+        try
+        {
+            ResetShowCardHintDedupeCache();
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// 拖拽 Top 1：ItemController.PreviewMove 微位移短路守卫。
+    /// 记录活跃拖拽卡；若连续拖拽帧内世界坐标变化 &lt; 0.002f 且储藏箱开关未变化，仅更新 transform.position 并跳过本帧重复 4 次物理检测与悬停重算。
+    /// </summary>
+    private static bool ItemControllerPreviewMovePrefix(Component __instance, Vector3 worldPosition, ref bool __result)
+    {
+        try
+        {
+            if (__instance == null) return true;
+            _activeDraggingItemRef = new WeakReference<Component>(__instance);
+
+            if (_itemGetIsDraggingDelegate != null && !_itemGetIsDraggingDelegate(__instance))
+            {
+                _lastPreviewItemId = 0;
+                return true;
+            }
+
+            int id = __instance.GetInstanceID();
+            int frame = Time.frameCount;
+            bool storageOpen = _dataGetIsStorageOpenDelegate != null && _dataGetIsStorageOpenDelegate();
+
+            if (id == _lastPreviewItemId
+                && storageOpen == _lastPreviewStorageOpen
+                && frame - _lastPreviewFrame <= 2
+                && (worldPosition - _lastPreviewWorldPos).sqrMagnitude < 0.000004f)
+            {
+                __instance.transform.position = worldPosition;
+                _lastPreviewFrame = frame;
+                __result = true;
+                return false;
+            }
+
+            _lastPreviewItemId = id;
+            _lastPreviewWorldPos = worldPosition;
+            _lastPreviewStorageOpen = storageOpen;
+            _lastPreviewFrame = frame;
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.ItemControllerPreviewMovePrefix: " + ex.Message);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// 拖拽 Top 1：取代旧 PreviewMovePostfix 的每帧二次 CheckForSellZone()！
+    /// 仅在 BoardManager.SetSellZoneHovered(bool) 状态真正发生跳变时触发一次，进入售卖区瞬间以真实 LeftSocketId 刷新高亮。
+    /// </summary>
+    private static void BoardSetSellZoneHoveredPostfix(bool isHovered)
+    {
+        try
+        {
+            if (isHovered == _currentSellZoneHovered) return;
+            _currentSellZoneHovered = isHovered;
+            ResetShowCardHintDedupeCache();
+
+            if (!isHovered || _cardCtrlShowCardHintMethod == null) return;
+            if (_activeDraggingItemRef == null || !_activeDraggingItemRef.TryGetTarget(out var draggingItem) || draggingItem == null)
+                return;
+
+            var cardData = _cardCtrlGetCardDataDelegate?.Invoke(draggingItem);
+            var boardSection = _cardCtrlGetBoardSectionDelegate?.Invoke(draggingItem);
+            if (cardData == null || boardSection == null) return;
+
+            _cardCtrlShowCardHintMethod.Invoke(draggingItem, new object[] { cardData.LeftSocketId, boardSection });
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.BoardSetSellZoneHoveredPostfix: " + ex.Message);
+        }
+    }
+
+    private static void ItemControllerFinishMovePostfix()
+    {
+        try
+        {
+            ResetDragPreviewDedupeCache();
+            BazaarLauncher.Modules.PerfOptimizerModule.ResetDragHoverCaches();
+        }
+        catch { }
     }
 
 }

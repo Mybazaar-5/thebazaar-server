@@ -2877,58 +2877,103 @@ internal static class Fuzz
             foreach (var kv in _cards)
                 knownTypes[kv.Key] = (kv.Value.Type, kv.Value.TemplateId);
 
+            var removedIds = new HashSet<string>(StringComparer.Ordinal);
+            bool hasFullCardListTransition = false;
             foreach (var ev in sim.Events)
             {
                 switch (ev)
                 {
                     case GameSimEventCardDealt dealt:
                         knownTypes[dealt.InstanceId] = (dealt.Type, dealt.TemplateId);
+                        hasFullCardListTransition = true;
                         break;
                     case GameSimEventCardSpawned sp:
                         knownTypes[sp.InstanceId] = (sp.Type, sp.TemplateId);
                         break;
-                    case GameSimEventCardTransformed tr when tr.TransformedCards != null:
-                        foreach (var nc in tr.TransformedCards)
-                            knownTypes[nc.InstanceId] = (nc.Type, nc.TemplateId);
+                    case GameSimEventCardTransformed tr:
+                        hasFullCardListTransition = true;
+                        if (tr.TransformedCards != null)
+                        {
+                            foreach (var nc in tr.TransformedCards)
+                                knownTypes[nc.InstanceId] = (nc.Type, nc.TemplateId);
+                        }
+                        break;
+                    case GameSimEventCardDisposed disp when !string.IsNullOrEmpty(disp.InstanceId):
+                        removedIds.Add(disp.InstanceId);
+                        break;
+                    case GameSimEventCardSold sold when !string.IsNullOrEmpty(sold.InstanceId):
+                        removedIds.Add(sold.InstanceId);
+                        break;
+                    case GameSimEventCardFused fused when !string.IsNullOrEmpty(fused.FusedInstanceId):
+                        removedIds.Add(fused.FusedInstanceId);
+                        break;
+                    case GameSimEventStateTransitioned:
+                    case GameSimEventInterruptStateEntered:
+                    case GameSimEventInterruptStateExited:
+                        hasFullCardListTransition = true;
                         break;
                     case GameSimEventSocketsUnlocked su:
                         _unlockedSlots = su.UnlockedSocketsBitmask;
-                        break;
-                    case GameSimEventInterruptStateEntered:
-                        Interlocked.Increment(ref _metrics.SuspendedInterruptsSeen);
                         break;
                     case GameSimEventEffectAuraExecuted:
                         Interlocked.Increment(ref _metrics.AuraRefreshEventsSeen);
                         break;
                 }
             }
+            if (sim.Events.OfType<GameSimEventInterruptStateEntered>().Any())
+                Interlocked.Increment(ref _metrics.SuspendedInterruptsSeen);
+
+            foreach (var rid in removedIds)
+                _cards.Remove(rid);
 
             if (sim.Cards != null && sim.Cards.Count > 0)
             {
+                // 对齐官方客户端 Data.UpdateCardAttributes 增量语义：
+                // 仅当收到含全量卡表的非拖拽增量包（发生状态切换/发牌/或完整覆盖全部 SelectionSet 且无纯粹 MoveItem 增量特征）时才清理旧卡；
+                // 对 V13.1 BuildDeltaGameSim 拖拽轻量增量包执行原位 Upsert 合并，保留未变动的手牌/储藏箱与桌面 SelectionSet 遭遇卡。
+                bool isDeltaOnlyMove = !hasFullCardListTransition
+                    && removedIds.Count == 0
+                    && (_selectionSet.Any(id => !sim.Cards.ContainsKey(id))
+                        || sim.Events.Any(e => e is GameSimEventCardMoved));
+
                 var next = new Dictionary<string, CardShadow>(StringComparer.Ordinal);
                 foreach (var (id, delta) in sim.Cards)
                 {
                     var meta = knownTypes.GetValueOrDefault(id, (Type: InferCardTypeFromId(id), Tpl: ""));
+                    var prev = _cards.GetValueOrDefault(id);
                     var sh = new CardShadow
                     {
                         InstanceId = id,
-                        TemplateId = meta.Tpl,
-                        Type = meta.Type,
-                        Size = delta.Size ?? ECardSize.Medium,
-                        Tier = delta.Tier ?? ETier.Bronze,
-                        Enchantment = delta.Enchantment,
-                        Owner = delta.Placement?.Owner,
-                        Socket = delta.Placement?.Socket,
-                        Section = delta.Placement?.Section,
+                        TemplateId = !string.IsNullOrEmpty(meta.Tpl) ? meta.Tpl : (prev?.TemplateId ?? ""),
+                        Type = !string.IsNullOrEmpty(meta.Tpl) ? meta.Type : (prev?.Type ?? meta.Type),
+                        Size = delta.Size ?? prev?.Size ?? ECardSize.Medium,
+                        Tier = delta.Tier ?? prev?.Tier ?? ETier.Bronze,
+                        Enchantment = delta.Enchantment ?? prev?.Enchantment,
+                        Owner = delta.Placement?.Owner ?? prev?.Owner,
+                        Socket = delta.Placement?.Socket ?? prev?.Socket,
+                        Section = delta.Placement?.Section ?? prev?.Section,
                     };
                     if (delta.Tags != null) foreach (var t in delta.Tags) sh.Tags.Add(t);
+                    else if (prev != null) foreach (var t in prev.Tags) sh.Tags.Add(t);
                     if (delta.HiddenTags != null) foreach (var ht in delta.HiddenTags) sh.HiddenTags.Add(ht);
+                    else if (prev != null) foreach (var ht in prev.HiddenTags) sh.HiddenTags.Add(ht);
                     if (delta.Heroes != null) foreach (var h in delta.Heroes) sh.Heroes.Add(h);
+                    else if (prev != null) foreach (var h in prev.Heroes) sh.Heroes.Add(h);
+                    if (prev != null)
+                        foreach (var akv in prev.Attributes) sh.Attributes[akv.Key] = akv.Value;
                     foreach (var akv in delta.Attributes) sh.Attributes[akv.Key] = akv.Value.Value;
                     next[id] = sh;
                 }
-                _cards.Clear();
-                foreach (var kv in next) _cards[kv.Key] = kv.Value;
+
+                if (isDeltaOnlyMove)
+                {
+                    foreach (var kv in next) _cards[kv.Key] = kv.Value;
+                }
+                else
+                {
+                    _cards.Clear();
+                    foreach (var kv in next) _cards[kv.Key] = kv.Value;
+                }
             }
         }
     }

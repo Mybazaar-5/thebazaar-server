@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>大巴扎零代码创意工坊 · Bazaar Workshop Studio V13.1</title>
+  <link rel="stylesheet" href="{{ASSET_PREFIX}}styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- 顶部深海鎏金导航栏 -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-emblem">◆</div>
+        <div class="brand-text">
+          <h1>大巴扎创意工坊 <span class="ver-tag">V13.1</span></h1>
+          <p>零代码改卡 · 10 道防 Bug 铁闸 · 50 场真实战斗压测 · 一键热重载</p>
+        </div>
+      </div>
+
+      <div class="topbar-center">
+        <div class="current-mod-pill" id="currentModPill">
+          <span class="dot" id="dirtyDot"></span>
+          <span id="currentModTitle">尚未选择 Mod</span>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <span class="access-badge" id="accessBadge">检测权限中...</span>
+        <div class="token-box" id="tokenBox" title="公网只读模式下填入服务端 BAZAAR_WORKSHOP_TOKEN 解锁写入权限">
+          <input type="password" id="workshopTokenInput" placeholder="公网管理口令 (可选)" />
+          <button class="btn btn-subtle btn-sm" id="btnApplyToken">解锁</button>
+        </div>
+        <button class="btn btn-outline" id="btnQuickSave">💾 保存草稿</button>
+        <button class="btn btn-gold" id="btnQuickValidate">🛡️ 10道体检</button>
+      </div>
+    </header>
+
+    <!-- 5 大工作流向导 Tab 栏 -->
+    <nav class="tabbar" role="tablist">
+      <button class="tab-btn active" data-tab="overview">
+        <span class="tab-num">1</span> Mod 总览与导入导出
+      </button>
+      <button class="tab-btn" data-tab="cards">
+        <span class="tab-num">2</span> 原版卡搜索 &amp; 克隆魔改 / 新建卡牌
+      </button>
+      <button class="tab-btn" data-tab="events">
+        <span class="tab-num">3</span> 奇遇事件链编辑器
+      </button>
+      <button class="tab-btn" data-tab="validate">
+        <span class="tab-num">4</span> 10 道防 Bug 铁闸 &amp; 50 场真战斗体检
+      </button>
+      <button class="tab-btn" data-tab="guide">
+        <span class="tab-num">5</span> 创作流程指南 &amp; AI Skill 速用
+      </button>
+    </nav>
+
+    <!-- 主内容区 -->
+    <main class="main-content">
+      <!-- ════════ TAB 1: MOD 总览与导入导出 ════════ -->
+      <section class="tab-panel active" id="tab-overview">
+        <div class="grid-two-col">
+          <div class="card-panel">
+            <div class="panel-header">
+              <div>
+                <h2>服务器 Mod 列表</h2>
+                <p class="muted" id="metaStatsText">正在加载服务器状态...</p>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-gold btn-sm" id="btnNewMod">+ 新建空白 Mod</button>
+                <button class="btn btn-subtle btn-sm" id="btnRefreshMods">↻ 刷新</button>
+              </div>
+            </div>
+
+            <div class="mod-list" id="modListContainer">
+              <div class="empty-hint">正在扫描 mods/ 目录...</div>
+            </div>
+
+            <!-- 拖拽导入 .bazaarmod.zip -->
+            <div class="dropzone" id="zipDropzone">
+              <div class="dropzone-icon">📦</div>
+              <div class="dropzone-title">拖拽社区分享的 <code>.bazaarmod.zip</code> 到此处安全检疫导入</div>
+              <div class="dropzone-sub">自动执行防 Zip Slip / 防 Zip Bomb / 禁可执行文件 + 10 道铁闸体检</div>
+              <input type="file" id="zipFileInput" accept=".zip,.bazaarmod.zip" hidden />
+              <button class="btn btn-outline btn-sm" id="btnSelectZip">选择 .bazaarmod.zip 文件</button>
+            </div>
+          </div>
+
+          <div class="card-panel">
+            <div class="panel-header">
+              <div>
+                <h2>当前 Mod 清单配置（<code>mod.json</code>）</h2>
+                <p class="muted">所有新建卡牌与奇遇将自动归属当前 Mod 命名空间，互不冲突</p>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-outline btn-sm" id="btnExportCurrentZip">⬇ 导出 .bazaarmod.zip</button>
+                <button class="btn btn-danger btn-sm" id="btnDeleteCurrentMod">🗑 删除草稿</button>
+              </div>
+            </div>
+
+            <div class="form-grid">
+              <label class="field">
+                <span>Mod 唯一标识（仅小写字母/数字/连字符）*</span>
+                <input type="text" id="mfId" placeholder="例如：starport-forge" />
+              </label>
+              <label class="field">
+                <span>中文名称 *</span>
+                <input type="text" id="mfName" placeholder="例如：星港锻炉扩展包" />
+              </label>
+              <label class="field">
+                <span>版本号（SemVer）</span>
+                <input type="text" id="mfVersion" placeholder="1.0.0" />
+              </label>
+              <label class="field">
+                <span>作者署名</span>
+                <input type="text" id="mfAuthor" placeholder="社区作者" />
+              </label>
+              <label class="field">
+                <span>启用范围（Scope）</span>
+                <select id="mfScope">
+                  <option value="multiplayer-safe">multiplayer-safe（联机与单机均可，自动隔离镜像池）</option>
+                  <option value="singleplayer-only">singleplayer-only（仅单机模式可用）</option>
+                  <option value="cosmetic-only">cosmetic-only（纯外观汉化，不含数值/新卡）</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>加载优先级权重（loadOrder，越小越先加载）</span>
+                <input type="number" id="mfLoadOrder" value="100" min="1" max="9999" />
+              </label>
+              <label class="field span-2">
+                <span>中文简介（展示于启动器与创意工坊列表）</span>
+                <textarea id="mfDesc" rows="3" placeholder="介绍本 Mod 新增了哪些流派、卡牌、平衡补丁或奇遇事件..."></textarea>
+              </label>
+            </div>
+
+            <div class="safety-banner">
+              <strong>🛡️ 标准幽灵池隔离保护已自动启用：</strong>
+              所有包含新卡、原位补丁或奇遇的玩法 Mod 强制设 <code>affectsGhostPool = false</code>，
+              对局镜像自动路由至独立 <code>mod:&lt;hash&gt;</code> 分区，绝不污染原版标准天梯池。
+            </div>
+
+            <div class="summary-strip" id="currentModCounts">
+              <div class="metric-chip"><span>自定义新卡</span><strong id="cntCards">0</strong></div>
+              <div class="metric-chip"><span>原位魔改补丁</span><strong id="cntPatches">0</strong></div>
+              <div class="metric-chip"><span>奇遇事件</span><strong id="cntEvents">0</strong></div>
+              <div class="metric-chip"><span>PNG 贴图资产</span><strong id="cntAssets">0</strong></div>
+            </div>
+
+            <div class="panel-footer-actions">
+              <button class="btn btn-outline" id="btnOverviewSave">💾 保存草稿到磁盘</button>
+              <button class="btn btn-gold" id="btnGoToCards">下一步：去搜原版卡 / 制作新卡 →</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ════════ TAB 2: 原版卡搜索 & 克隆魔改 / 新建卡牌 ════════ -->
+      <section class="tab-panel" id="tab-cards">
+        <div class="three-col-studio">
+          <!-- 左栏：原版白名单检索 + 本 Mod 已有卡/补丁 -->
+          <div class="card-panel studio-col-left">
+            <div class="subtab-row">
+              <button class="subtab active" data-sub="vanilla">🔍 原版白名单库 (3,368)</button>
+              <button class="subtab" data-sub="mine">📁 本 Mod 卡牌 &amp; 补丁</button>
+            </div>
+
+            <div class="subpanel active" id="sub-vanilla">
+              <div class="search-stack">
+                <input type="text" id="baseSearchInput" placeholder="搜索中文名 / 英文名 / GUID / 标签..." />
+                <div class="filter-row">
+                  <select id="baseFilterType">
+                    <option value="">全部类型</option>
+                    <option value="Item" selected>物品 (Item)</option>
+                    <option value="Skill">技能 (Skill)</option>
+                    <option value="EventEncounter">奇遇事件</option>
+                    <option value="EncounterStep">奇遇步骤</option>
+                    <option value="CombatEncounter">野怪战斗</option>
+                    <option value="PedestalEncounter">基座</option>
+                  </select>
+                  <select id="baseFilterSize">
+                    <option value="">全部尺寸</option>
+                    <option value="Small">Small (1格)</option>
+                    <option value="Medium">Medium (2格)</option>
+                    <option value="Large">Large (3格)</option>
+                  </select>
+                  <select id="baseFilterHero">
+                    <option value="">全部英雄</option>
+                  </select>
+                </div>
+              </div>
+              <div class="search-meta" id="baseSearchMeta">正在加载原版白名单索引...</div>
+              <div class="scroll-list" id="baseCardList"></div>
+            </div>
+
+            <div class="subpanel" id="sub-mine">
+              <div class="mine-section-head">
+                <span>✨ 自定义新卡 (<b id="mineCardNum">0</b>)</span>
+                <button class="btn btn-gold btn-xs" id="btnBlankCustomCard">+ 空白新卡</button>
+              </div>
+              <div class="scroll-list compact" id="mineCardList"></div>
+
+              <div class="mine-section-head" style="margin-top:12px;">
+                <span>🔧 原位魔改原版补丁 (<b id="minePatchNum">0</b>)</span>
+              </div>
+              <div class="scroll-list compact" id="minePatchList"></div>
+            </div>
+          </div>
+
+          <!-- 中栏：可视化属性、四阶数值与效果积木编辑区 -->
+          <div class="card-panel studio-col-mid" id="cardEditorContainer">
+            <div class="empty-hero" id="cardEditorEmpty">
+              <div class="empty-hero-icon">⚔️</div>
+              <h3>从左侧搜索并选择一张原版卡开始创作</h3>
+              <p>点 <strong>「📋 克隆为新卡」</strong> 自动继承合法 3D 白名单视觉载体并生成独立新卡；<br />
+                 点 <strong>「🔧 原位改数值」</strong> 直接创建轻量补丁调整原版卡数值、冷却或标签。</p>
+            </div>
+
+            <!-- 自定义新卡表单 -->
+            <div id="customCardEditor" class="hidden">
+              <div class="panel-header compact">
+                <div>
+                  <span class="mode-pill mode-new">自定义新卡</span>
+                  <h2 id="ceHeading" style="display:inline-block;margin-left:8px;">编辑卡牌</h2>
+                </div>
+                <div class="btn-row">
+                  <button class="btn btn-subtle btn-xs" id="btnAutoScaleTiers">⚡ 1x/2x/4x/8x 阶梯推算</button>
+                  <button class="btn btn-danger btn-xs" id="btnDeleteCard">删除此卡</button>
+                </div>
+              </div>
+
+              <div class="form-grid">
+                <label class="field">
+                  <span>自定义 ID（必须以 <code>modId:</code> 开头）*</span>
+                  <input type="text" id="ceCustomId" />
+                </label>
+                <label class="field">
+                  <span>合法白名单视觉载体 GUID（锁定防白块）*</span>
+                  <input type="text" id="ceBaseVisualId" />
+                </label>
+                <label class="field">
+                  <span>中文名称 *</span>
+                  <input type="text" id="ceTitleZh" />
+                </label>
+                <label class="field">
+                  <span>英文名（可选）</span>
+                  <input type="text" id="ceTitleEn" />
+                </label>
+                <label class="field">
+                  <span>卡牌类型</span>
+                  <select id="ceType">
+                    <option value="Item">Item（物品）</option>
+                    <option value="Skill">Skill（技能）</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>占位尺寸（必须与载体一致）</span>
+                  <select id="ceSize">
+                    <option value="Small">Small（1格 · 推荐 512×1024）</option>
+                    <option value="Medium">Medium（2格 · 推荐 512×512）</option>
+                    <option value="Large">Large（3格 · 推荐 512×1024）</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>起始品质</span>
+                  <select id="ceStartingTier">
+                    <option value="Bronze">Bronze（青铜）</option>
+                    <option value="Silver">Silver（白银）</option>
+                    <option value="Gold">Gold（黄金）</option>
+                    <option value="Diamond">Diamond（钻石）</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>所属英雄（逗号分隔，Common 为全英雄通用）</span>
+                  <input type="text" id="ceHeroes" placeholder="Common, Vanessa" />
+                </label>
+                <label class="field">
+                  <span>可见标签（Tags，逗号分隔）</span>
+                  <input type="text" id="ceTags" placeholder="Weapon, Tool" />
+                </label>
+                <label class="field">
+                  <span>隐藏标签（HiddenTags，逗号分隔）</span>
+                  <input type="text" id="ceHiddenTags" placeholder="Damage, Haste" />
+                </label>
+                <label class="field span-2">
+                  <span>中文风味/背景说明 *</span>
+                  <textarea id="ceDescZh" rows="2"></textarea>
+                </label>
+              </div>
+
+              <!-- Tooltip 编辑与占位符芯片 -->
+              <div class="sub-block">
+                <div class="sub-block-title">
+                  <span>卡牌效果文案（点击右侧变量芯片自动插入，实时渲染防 "?"）</span>
+                  <div class="chip-bar" id="placeholderChips">
+                    <button type="button" class="chip" data-ins="{attr.DamageAmount}">伤害</button>
+                    <button type="button" class="chip" data-ins="{attr.ShieldApplyAmount}">护盾</button>
+                    <button type="button" class="chip" data-ins="{attr.BurnApplyAmount}">灼烧</button>
+                    <button type="button" class="chip" data-ins="{attr.PoisonApplyAmount}">剧毒</button>
+                    <button type="button" class="chip" data-ins="{attr.HealAmount}">治疗</button>
+                    <button type="button" class="chip" data-ins="{attr.HasteAmount}">加速秒</button>
+                    <button type="button" class="chip" data-ins="{attr.ChargeAmount}">充能秒</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_0}">自定义0</button>
+                  </div>
+                </div>
+                <div class="form-grid">
+                  <label class="field">
+                    <span>主动效果文案（每行一条）</span>
+                    <textarea id="ceActiveTips" rows="2" placeholder="造成 {attr.DamageAmount} 点伤害"></textarea>
+                  </label>
+                  <label class="field">
+                    <span>被动效果文案（每行一条）</span>
+                    <textarea id="cePassiveTips" rows="2" placeholder="相邻物品使用时，本卡获得 +{attr.Custom_0} 伤害"></textarea>
+                  </label>
+                </div>
+              </div>
+
+              <!-- 四阶数值矩阵（冷却直接输秒，自动乘 1000 存毫秒！） -->
+              <div class="sub-block">
+                <div class="sub-block-title">
+                  <span>四阶数值矩阵（冷却与加速/充能直接填<strong>秒</strong>，底层自动 ×1000 存为毫秒 ms！）</span>
+                </div>
+                <div class="table-wrap">
+                  <table class="tier-table" id="ceTierTable">
+                    <thead>
+                      <tr>
+                        <th>属性名</th>
+                        <th>青铜 Bronze</th>
+                        <th>白银 Silver</th>
+                        <th>黄金 Gold</th>
+                        <th>钻石 Diamond</th>
+                      </tr>
+                    </thead>
+                    <tbody id="ceTierTableBody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- 零代码中文效果积木编辑器 -->
+              <div class="sub-block">
+                <div class="sub-block-title">
+                  <span>🧩 零代码中文效果积木（自动生成引擎权威 $type，杜绝手写报错）</span>
+                  <div class="btn-row">
+                    <select id="presetSelect" class="select-sm"></select>
+                    <button class="btn btn-gold btn-xs" id="btnAddPreset">+ 添加此效果积木</button>
+                  </div>
+                </div>
+                <div id="abilitiesSummaryList" class="ability-cards"></div>
+                <details class="advanced-json">
+                  <summary>高级 JSON 视图（供硬核作者直接微调 abilities / auras，保存自动校验）</summary>
+                  <textarea id="ceAdvancedRulesJson" rows="8" spellcheck="false"></textarea>
+                  <button class="btn btn-outline btn-xs" id="btnApplyAdvancedJson" style="margin-top:6px;">应用 JSON 修改到当前卡</button>
+                </details>
+              </div>
+            </div>
+
+            <!-- 原位魔改原版卡补丁编辑器 -->
+            <div id="patchCardEditor" class="hidden">
+              <div class="panel-header compact">
+                <div>
+                  <span class="mode-pill mode-patch">原位改原版卡 Patch</span>
+                  <h2 id="peHeading" style="display:inline-block;margin-left:8px;">编辑补丁</h2>
+                </div>
+                <button class="btn btn-danger btn-xs" id="btnDeletePatch">删除此补丁</button>
+              </div>
+
+              <div class="form-grid">
+                <label class="field">
+                  <span>目标原版卡 GUID *</span>
+                  <input type="text" id="peTargetId" readonly />
+                </label>
+                <label class="field">
+                  <span>改动备注说明</span>
+                  <input type="text" id="peNote" placeholder="例如：加强原版弯刀，冷却缩短 0.5 秒" />
+                </label>
+                <label class="field">
+                  <span>覆写起始品质（留空保持原版）</span>
+                  <select id="peStartingTier">
+                    <option value="">（保持原版）</option>
+                    <option value="Bronze">Bronze</option>
+                    <option value="Silver">Silver</option>
+                    <option value="Gold">Gold</option>
+                    <option value="Diamond">Diamond</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>覆写中文名称（留空保持原版）</span>
+                  <input type="text" id="peTitleZh" placeholder="留空沿用原版译名" />
+                </label>
+                <label class="field">
+                  <span>追加标签（逗号分隔）</span>
+                  <input type="text" id="peAddTags" placeholder="例如：Tool, Relic" />
+                </label>
+                <label class="field">
+                  <span>移除标签（逗号分隔）</span>
+                  <input type="text" id="peRemoveTags" placeholder="例如：Weapon" />
+                </label>
+                <label class="field span-2">
+                  <span>覆写中文描述（留空保持原版）</span>
+                  <textarea id="peDescZh" rows="2"></textarea>
+                </label>
+              </div>
+
+              <div class="sub-block">
+                <div class="sub-block-title">
+                  <span>四阶差量数值覆写（留空则保持原版，冷却填<strong>秒</strong>自动转 ms）</span>
+                </div>
+                <div class="table-wrap">
+                  <table class="tier-table">
+                    <thead>
+                      <tr>
+                        <th>属性名</th>
+                        <th>青铜 Bronze</th>
+                        <th>白银 Silver</th>
+                        <th>黄金 Gold</th>
+                        <th>钻石 Diamond</th>
+                      </tr>
+                    </thead>
+                    <tbody id="peTierTableBody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 右栏：大巴扎鎏金实时卡牌预览 + PNG 自动裁切上传工坊 -->
+          <div class="card-panel studio-col-right">
+            <div class="panel-header compact">
+              <h2>实时鎏金卡面预览</h2>
+              <div class="tier-switcher" id="previewTierSwitcher">
+                <button class="tier-dot active" data-tier="Bronze" title="青铜">铜</button>
+                <button class="tier-dot" data-tier="Silver" title="白银">银</button>
+                <button class="tier-dot" data-tier="Gold" title="黄金">金</button>
+                <button class="tier-dot" data-tier="Diamond" title="钻石">钻</button>
+              </div>
+            </div>
+
+            <div class="card-preview-stage">
+              <div class="bazaar-card tier-Bronze" id="liveCardFrame">
+                <div class="bc-top">
+                  <span class="bc-size" id="pvSize">Medium</span>
+                  <span class="bc-cd" id="pvCooldown">4.0s</span>
+                </div>
+                <div class="bc-art" id="pvArtBox">
+                  <img id="pvArtImg" alt="卡图预览" class="hidden" />
+                  <div class="bc-art-placeholder" id="pvArtPlaceholder">继承原版白名单 3D 卡面<br />或下方上传 PNG 替换</div>
+                </div>
+                <div class="bc-title" id="pvTitle">未选择卡牌</div>
+                <div class="bc-tags" id="pvTags"></div>
+                <div class="bc-tips" id="pvTooltips">点击左侧原版卡开始克隆或新建</div>
+                <div class="bc-footer">
+                  <span id="pvBuyPrice">买 2g</span>
+                  <span id="pvHero">Common</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- PNG 拖拽上传 & 自动裁切缩放转标准 PNG -->
+            <div class="sub-block">
+              <div class="sub-block-title"><span>🎨 卡图工坊（自动裁切转合规 PNG）</span></div>
+              <div class="art-uploader" id="artDropzone">
+                <p class="muted" id="artHintText">拖入任意 PNG/JPG，自动按当前卡牌尺寸裁切为标准 PNG（64~1024px，≤2MB），彻底杜绝 WebP 与白块。</p>
+                <input type="file" id="artFileInput" accept="image/png,image/jpeg,image/webp" hidden />
+                <div class="btn-row" style="justify-content:center;margin-top:8px;">
+                  <button class="btn btn-outline btn-xs" id="btnChooseArt">选择图片并自动转 PNG 上传</button>
+                  <button class="btn btn-subtle btn-xs" id="btnClearArt">恢复原版卡面</button>
+                </div>
+                <div class="art-status" id="artUploadStatus"></div>
+              </div>
+              <canvas id="artCropCanvas" class="hidden"></canvas>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ════════ TAB 3: 奇遇事件链编辑器 ════════ -->
+      <section class="tab-panel" id="tab-events">
+        <div class="card-panel" style="margin-bottom:14px;">
+          <div class="panel-header compact">
+            <div>
+              <h2>奇遇事件跳转有向无环图（DAG 实时防环检测）</h2>
+              <p class="muted" id="dagStatusText">实时三色 DFS 检测：暂无环路或悬空目标</p>
+            </div>
+            <button class="btn btn-gold btn-sm" id="btnNewEvent">+ 新建奇遇事件</button>
+          </div>
+          <svg id="eventDagSvg" class="dag-svg" viewBox="0 0 1000 180"></svg>
+        </div>
+
+        <div class="grid-two-col narrow-left">
+          <div class="card-panel">
+            <h3>本 Mod 奇遇事件列表</h3>
+            <div class="scroll-list" id="eventListContainer"></div>
+          </div>
+
+          <div class="card-panel" id="eventEditorBox">
+            <div class="empty-hero" id="eventEditorEmpty">
+              <div class="empty-hero-icon">🧭</div>
+              <h3>选择左侧奇遇事件或点击「+ 新建奇遇事件」</h3>
+              <p>所有子选项自动生成引擎真实可执行的 <code>TTriggerOnCardSelected</code> + 标准动作，杜绝手写无效字段。</p>
+            </div>
+
+            <div id="eventEditorForm" class="hidden">
+              <div class="panel-header compact">
+                <h2>编辑奇遇事件</h2>
+                <button class="btn btn-danger btn-xs" id="btnDeleteEvent">删除此事件</button>
+              </div>
+              <div class="form-grid">
+                <label class="field">
+                  <span>事件 ID（<code>modId:event_*</code>）*</span>
+                  <input type="text" id="evId" />
+                </label>
+                <label class="field">
+                  <span>原版 EventEncounter 载体 GUID *</span>
+                  <input type="text" id="evBaseVisualId" />
+                </label>
+                <label class="field">
+                  <span>奇遇中文名称 *</span>
+                  <input type="text" id="evTitleZh" />
+                </label>
+                <label class="field">
+                  <span>适用英雄（逗号分隔）</span>
+                  <input type="text" id="evHeroes" value="Common" />
+                </label>
+                <label class="field">
+                  <span>出现天数区间（minDay ~ maxDay）</span>
+                  <div class="inline-pair">
+                    <input type="number" id="evMinDay" min="1" max="99" value="2" />
+                    <span>至</span>
+                    <input type="number" id="evMaxDay" min="1" max="99" value="10" />
+                  </div>
+                </label>
+                <label class="field">
+                  <span>随机权重（纯链式子事件填 0）</span>
+                  <input type="number" id="evWeight" min="0" step="0.5" value="5" />
+                </label>
+                <label class="field span-2">
+                  <span>奇遇剧情描述 *</span>
+                  <textarea id="evDescZh" rows="2"></textarea>
+                </label>
+              </div>
+
+              <div class="sub-block">
+                <div class="sub-block-title">
+                  <span>奇遇子选项（EncounterStep，至少 1 项）</span>
+                  <button class="btn btn-gold btn-xs" id="btnAddEventStep">+ 新增选项</button>
+                </div>
+                <div id="eventStepsContainer" class="steps-stack"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ════════ TAB 4: 10 道防 Bug 铁闸 & 50 场真战斗试跑体检 ════════ -->
+      <section class="tab-panel" id="tab-validate">
+        <div class="card-panel">
+          <div class="panel-header">
+            <div>
+              <h2>10 道工业级防 Bug 铁闸 &amp; 50 场真实战斗体检</h2>
+              <p class="muted" id="valSummaryBanner">点击右侧按钮，在隔离内存沙盒上运行全量静态规则校验 + 50 场真实 CombatSimulator 压测。</p>
+            </div>
+            <div class="btn-row">
+              <button class="btn btn-subtle" id="btnAutoFixCommon">✨ 一键自动标准化</button>
+              <button class="btn btn-outline" id="btnRunValidateDraft">🧪 体检当前草稿（不写盘）</button>
+              <button class="btn btn-gold" id="btnPublishReload" disabled>🚀 全绿安全发布并热重载进游戏</button>
+            </div>
+          </div>
+
+          <!-- 50 场真实战斗压测仪表盘 -->
+          <div class="stress-dashboard hidden" id="stressDashboard">
+            <div class="stress-kpis">
+              <div class="kpi-box"><span>真实战斗场次</span><strong id="kpiMatches">0</strong></div>
+              <div class="kpi-box"><span>异常 / 崩溃数</span><strong id="kpiExceptions" class="ok">0</strong></div>
+              <div class="kpi-box"><span>平均 / 最大单场耗时</span><strong id="kpiTiming">0ms</strong></div>
+              <div class="kpi-box"><span>300s 僵局 / 超时数</span><strong id="kpiTimeouts">0</strong></div>
+              <div class="kpi-box"><span>Mod 方参考胜率</span><strong id="kpiWinRate">0%</strong></div>
+            </div>
+            <div class="winrate-bar-wrap">
+              <div class="winrate-label">
+                <span>平衡性甜点区间参考（15% ~ 85% 绿色健康带）</span>
+                <span id="kpiBalanceHint"></span>
+              </div>
+              <div class="winrate-track">
+                <div class="winrate-sweetspot"></div>
+                <div class="winrate-marker" id="winrateMarker" style="left:50%"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 10 张闸门红黄绿卡片 -->
+          <div class="gates-grid" id="gatesGrid">
+            <div class="empty-hint">尚未执行体检。点击右上角「🧪 体检当前草稿」或「🛡️ 10道体检」立即开始。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ════════ TAB 5: 创作流程指南 & AI Skill 速用 ════════ -->
+      <section class="tab-panel" id="tab-guide">
+        <div class="card-panel" style="margin-bottom:14px;">
+          <h2>一页看懂：从零做一张绝对不崩的大巴扎 Mod 卡</h2>
+          <div class="flow-steps">
+            <div class="flow-step"><b>Step 1</b><span>在 Tab 1 新建 Mod（设定唯一 ID 如 <code>my-forge</code>）</span></div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-step"><b>Step 2</b><span>在 Tab 2 搜原版卡，点「克隆为新卡」或「原位改数值」自动锁合法白名单 GUID</span></div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-step"><b>Step 3</b><span>表格填四阶数值（冷却填秒自动 ×1000）、点积木加效果、拖图自动转 PNG</span></div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-step"><b>Step 4</b><span>点「保存草稿」并跑 Tab 4 的 10 道铁闸 + 50 场真实战斗压测全绿</span></div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-step"><b>Step 5</b><span>点「安全发布并热重载」，玩家进游戏自动增量同步新卡图与汉化！</span></div>
+          </div>
+        </div>
+
+        <div class="grid-two-col">
+          <div class="card-panel">
+            <h3>🤖 让 AI 替你写 Mod（复制即用提示词）</h3>
+            <p class="muted">本仓库已内置专属工业级技能 <code>bazaar-mod-creator</code>（位于 <code>docs/skills/bazaar-mod-creator/SKILL.md</code> 与 <code>.agents/skills/bazaar-mod-creator/SKILL.md</code>），支持 Antigravity / Cursor / Claude Code 自动遵循 10 道防 Bug 铁闸。</p>
+
+            <div class="prompt-card">
+              <div class="prompt-head">
+                <strong>模板 1：一句话生成原创主题卡牌与奇遇包</strong>
+                <button class="btn btn-outline btn-xs copy-prompt-btn" data-prompt="prompt1">📋 复制提示词</button>
+              </div>
+              <pre id="prompt1">请激活 bazaar-mod-creator 技能，为《The Bazaar》自建服创建一个新 Mod（id: frost-alchemy，中文名：霜火炼金工坊）：
+1. 基于原版白名单克隆 2 件物品（1 件 Small 冰冻武器、1 件 Medium 灼烧提灯）与 1 个连携技能；
+2. 制作 1 个 2 步合法奇遇事件链（严格使用 TTriggerOnCardSelected 与标准动作，禁止虚构 effects 字段）；
+3. 必须跑完 python tools/mod_sdk_cli.py validate mods/frost-alchemy --strict --offline-sim 直到 10/10 铁闸全绿且 50 场真实战斗 0 异常后再交付！</pre>
+            </div>
+
+            <div class="prompt-card">
+              <div class="prompt-head">
+                <strong>模板 2：给原版热门卡做平衡性原位补丁</strong>
+                <button class="btn btn-outline btn-xs copy-prompt-btn" data-prompt="prompt2">📋 复制提示词</button>
+              </div>
+              <pre id="prompt2">请激活 bazaar-mod-creator 技能，创建一个原位平衡补丁 Mod（id: classic-rebalance）：
+1. 用 python tools/mod_sdk_cli.py clone-card --search 查出原版 Kukri 等 3 张武器 GUID，使用 --mode patch 写入 patches/vanilla_patches.json；
+2. 适度下调青铜/白银冷却 0.5 秒并追加 Tool 标签；
+3. 运行 validate 与 sim-test 跑 50 场真实战斗确认胜率健康、0 异常后打包成 .bazaarmod.zip。</pre>
+            </div>
+          </div>
+
+          <div class="card-panel">
+            <h3>⚡ 三种创作路径与命令行 SDK 速查</h3>
+            <table class="tier-table">
+              <thead>
+                <tr><th>路径</th><th>适合人群</th><th>优点</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><b>Web 零代码工坊</b></td><td>所有玩家 / 策划</td><td>浏览器直开、自动锁白名单、秒转 ms、拖图转 PNG</td></tr>
+                <tr><td><b>AI Skill 一句话生成</b></td><td>效率创作者</td><td>自动查 3,368 原版库、自动避坑、自动跑 50 场战斗自检</td></tr>
+                <tr><td><b>CLI + JSON / C# SDK</b></td><td>硬核开发者</td><td>可进 Git 协作、CI 自动化验证、支持自定义规则钩子</td></tr>
+              </tbody>
+            </table>
+
+            <h4 style="margin-top:16px;color:var(--gold-light);">常用 CLI 指令（<code>tools/mod_sdk_cli.py</code>）</h4>
+            <pre class="cli-box"># 1. 初始化标准 Mod 骨架
+python tools/mod_sdk_cli.py new my-forge --name "星港锻炉" --author "你的名字"
+
+# 2. 检索 3,368 原版白名单卡并一键克隆 / 生成原位补丁
+python tools/mod_sdk_cli.py clone-card --search "Kukri" --type Item --size Small
+python tools/mod_sdk_cli.py clone-card "Kukri" --mod my-forge --as storm_kukri --mode clone
+python tools/mod_sdk_cli.py clone-card "Kukri" --mod my-forge --mode patch
+
+# 3. 跑满 10 道防 Bug 铁闸 + 50 场真实战斗体检
+python tools/mod_sdk_cli.py validate mods/my-forge --strict --offline-sim
+python tools/mod_sdk_cli.py sim-test mods/my-forge --matches 50
+
+# 4. 打包分享 &amp; 安全检疫解包
+python tools/mod_sdk_cli.py pack mods/my-forge -o dist/mods/my-forge.bazaarmod.zip
+python tools/mod_sdk_cli.py unpack dist/mods/my-forge.bazaarmod.zip --into mods/</pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 全局 Toast 通知 -->
+    <div class="toast-container" id="toastContainer"></div>
+  </div>
+
+  <!-- 新建 Mod 模态框 -->
+  <div class="modal-backdrop hidden" id="newModModal">
+    <div class="modal-card">
+      <h3>新建标准化 Mod 项目</h3>
+      <div class="form-grid" style="margin-top:12px;">
+        <label class="field span-2">
+          <span>Mod ID（仅小写字母/数字/连字符，如 <code>starport-forge</code>）*</span>
+          <input type="text" id="newModIdInput" placeholder="my-awesome-mod" />
+        </label>
+        <label class="field span-2">
+          <span>Mod 中文名称 *</span>
+          <input type="text" id="newModNameInput" placeholder="我的奇幻工坊" />
+        </label>
+        <label class="field span-2">
+          <span>作者</span>
+          <input type="text" id="newModAuthorInput" value="社区创作者" />
+        </label>
+      </div>
+      <div class="btn-row" style="justify-content:flex-end;margin-top:16px;">
+        <button class="btn btn-subtle" id="btnCancelNewMod">取消</button>
+        <button class="btn btn-gold" id="btnConfirmNewMod">创建草稿</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ASSET_PREFIX}}app.js"></script>
+</body>
+</html>

@@ -311,7 +311,8 @@ public sealed class V6UserReportedBugsTests
             {
                 var e = run.Cards[id];
                 Assert.Equal(ECardType.EventEncounter, e.Type);
-                Assert.Equal(ETier.Bronze, e.Tier);
+                // V13.1 官方 Day 1 遭遇允许 Bronze 与 Silver（商店物品仍严守 100% Bronze），严禁 Gold/Diamond/Legendary
+                Assert.True(e.Tier is ETier.Bronze or ETier.Silver, $"Day 1 Hour 1 遭遇 {e.TemplateId} 品阶={e.Tier} 违规越阶");
             });
             Assert.DoesNotContain(run.Cards.Values, c => c.Owner == ECombatantId.Player && c.Type == ECardType.Skill);
 
@@ -387,7 +388,10 @@ public sealed class V6UserReportedBugsTests
                     foreach (string id in run.SelectionSet)
                     {
                         var e = run.Cards[id];
-                        Assert.Equal(ETier.Bronze, e.Tier);
+                        // V13.1 官方 Day 1 遭遇开放 Bronze/Silver（且 Hour 2/4/5 仅允许 B1&B2 基座），严禁 Gold/Diamond 越阶与 Salvage Yard 泄露
+                        Assert.True(e.Tier is ETier.Bronze or ETier.Silver, $"Day 1 Hour {hour} 遭遇 {e.TemplateId} 品阶={e.Tier} 越阶");
+                        if (e.Type == ECardType.PedestalEncounter)
+                            Assert.Equal(Guid.Parse(CardPool.PedestalB1B2Id), e.TemplateId);
                         Assert.NotEqual(Guid.Parse(SalvageYardEncounterId), e.TemplateId);
                     }
                 }

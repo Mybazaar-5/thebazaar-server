@@ -387,6 +387,82 @@ public static class CustomRuleEndpoints
             }
         });
 
+        // V13.1 消除 405：为 /custom-rules/me/lock-opening-tendency 增补只读 GET（复用 active-run-tendency 查询逻辑），
+        // 避免反代探测/旧客户端或重定向降级产生 405 Method Not Allowed 噪音。
+        app.MapGet("/custom-rules/me/lock-opening-tendency", async (HttpContext ctx) =>
+        {
+            string accountId = ResolveAccountId(ctx, accounts);
+            var session = FindSessionForAccount(sessions, accountId);
+            if (session == null)
+            {
+                return Results.Json(new
+                {
+                    hasActiveRun = false,
+                    allowTendencySelection = false,
+                    tendencyLocked = true,
+                    canLockNow = false,
+                    selectedArchetypeMask = 0UL,
+                    hint = "Use POST to lock opening tendency",
+                }, JsonOpts);
+            }
+
+            try
+            {
+                await session.Gate.WaitAsync(ctx.RequestAborted);
+            }
+            catch (ObjectDisposedException)
+            {
+                return Results.Json(new
+                {
+                    hasActiveRun = false,
+                    allowTendencySelection = false,
+                    tendencyLocked = true,
+                    canLockNow = false,
+                    selectedArchetypeMask = 0UL,
+                    hint = "Use POST to lock opening tendency",
+                }, JsonOpts);
+            }
+
+            try
+            {
+                var handle = SessionRegistry.Get(session.Sid);
+                if (handle == null || Persistence.IsTerminalState(handle.Run.State))
+                {
+                    return Results.Json(new
+                    {
+                        hasActiveRun = false,
+                        allowTendencySelection = false,
+                        tendencyLocked = true,
+                        canLockNow = false,
+                        selectedArchetypeMask = 0UL,
+                        hint = "Use POST to lock opening tendency",
+                    }, JsonOpts);
+                }
+
+                bool canLock = handle.Engine.CanLockOpeningTendency;
+                return Results.Json(new
+                {
+                    hasActiveRun = true,
+                    runId = handle.Run.RunId,
+                    playMode = handle.Run.PlayMode.ToString(),
+                    specialModeId = handle.Run.CustomRules.SpecialModeId.ToString(),
+                    hero = handle.Run.Hero.ToString(),
+                    day = handle.Run.Day,
+                    hour = handle.Run.Hour,
+                    state = handle.Run.State.ToString(),
+                    allowTendencySelection = handle.Run.CustomRules?.AllowTendencySelection ?? true,
+                    tendencyLocked = !canLock,
+                    canLockNow = canLock,
+                    selectedArchetypeMask = handle.Run.CustomRules?.SelectedArchetypeMask ?? 0UL,
+                    hint = "Use POST to lock opening tendency",
+                }, JsonOpts);
+            }
+            finally
+            {
+                try { session.Gate.Release(); } catch (ObjectDisposedException) { }
+            }
+        });
+
         app.MapPost("/custom-rules/me/lock-opening-tendency", async (HttpContext ctx) =>
         {
             LockOpeningTendencyDto? req;

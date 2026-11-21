@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -111,16 +112,27 @@ internal static partial class CompatAuditPatch
     private static MethodInfo _encStaticGetCardByIdMethod;
     private static FieldInfo _bmEncounterAssetSoField;
     private static MethodInfo _bmUpdateEncounterVisMethod;
-    private static MethodInfo _tooltipGetLocalizedTextMethod;
+    // 修复 P1 跨重载炸弹：按参数类型分桶缓存 TooltipExtensions.GetLocalizedText(TLocalizableText / LocalizableText)
+    private static readonly ConcurrentDictionary<Type, MethodInfo> _tooltipGetLocalizedTextByArgType = new();
     private static MethodInfo _tooltipCtrlRenderPassiveMethod;
     private static FieldInfo _tooltipCtrlQuestDataField;
+    private static int _hour6TransitionUnblockedCount;
+    private static int _hour6WatchdogRevealCount;
+    private static long _gameSimVersion;
 
     private struct PvpOpponentSnapshot
     {
         public bool HadOpponent;
         public string AccountId;
         public string Hero;
+        public int Day;
+        public int Hour;
+        public int MaxHealth;
+        public string Name;
     }
+
+    // 记录上次已成功触发 PvpOpponentChanged 时的跨天快照键，避免跨天同 accountId+hero 被误跳
+    private static PvpOpponentSnapshot _lastTriggeredPvpSnapshot;
 
     internal static int PatchedCount => _patchedCount;
 
@@ -137,6 +149,8 @@ internal static partial class CompatAuditPatch
         ["pedestalPresentationCleaned"] = Volatile.Read(ref _pedestalPresentationCleanedCount),
         ["encounterPortraitFallback"] = Volatile.Read(ref _encounterPortraitFallbackCount),
         ["encounterTooltipFallback"] = Volatile.Read(ref _encounterTooltipFallbackCount),
+        ["hour6TransitionUnblocked"] = Volatile.Read(ref _hour6TransitionUnblockedCount),
+        ["hour6WatchdogReveal"] = Volatile.Read(ref _hour6WatchdogRevealCount),
     };
 
     internal static void ResetAppliedFlag()
@@ -158,6 +172,10 @@ internal static partial class CompatAuditPatch
         try
         {
             _enchDynamicSyncedTags.Clear();
+            _cardTagSyncStamps.Clear();
+            ResetShowCardHintDedupeCache();
+            _lastTriggeredPvpSnapshot = default;
+            Interlocked.Increment(ref _gameSimVersion);
             ClearParentEncounterCache(reason);
         }
         catch { }
@@ -179,6 +197,7 @@ internal static partial class CompatAuditPatch
         PatchSoundEventListener(harmony);
         PatchCardRevealAnimationDriver(harmony);
         PatchDataApplySimPvpOpponent(harmony);
+        PatchTransitionInHour6Guard(harmony);
     }
 
     internal static void ApplyPedestalAndHintGroup(Harmony harmony)

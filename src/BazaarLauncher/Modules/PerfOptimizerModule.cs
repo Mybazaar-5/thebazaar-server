@@ -3,10 +3,12 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using BazaarGameShared.Domain.Core.Types;
 using BazaarLauncher.Core;
 using BazaarModSdk;
 using HarmonyLib;
@@ -61,6 +63,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
     internal static bool OptAssetLoaderCacheAndLru { get; set; } = true; // A-7
     internal static bool OptMainMenuNavThrottle { get; set; } = true;    // A-8
     internal static bool OptTooltipLayoutThrottle { get; set; } = true;  // A-9
+    internal static bool OptDragHoverGuard { get; set; } = true;         // 拖拽 Top 2 悬停去重与 DOTween 状态守卫
     internal static bool OptSceneIncrementalGc { get; set; } = true;     // A-10
     internal static bool OptMuteVerboseAppLogger { get; set; } = true;   // A-10
     internal static int OptTextureMipmapLimit { get; set; } = 0;         // A-10 (0=原画, 1=半分辨率省75%显存, 2=1/4)
@@ -78,6 +81,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
     private double _onePercentLowFps;
     private double _avgFrameTimeMs;
     private double _managedHeapMb;
+    private float _lastTelemetrySummaryTime = -10f;
     private long _currentPingMs = -1;
     private long _pingJitterMs;
     private long _prevPingMs = -1;
@@ -91,13 +95,45 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
     private float _nextPingProbeTime;
     private int _pingInFlight;
 
-    // A-7 / A-8 / A-9 运行时缓存
+    // A-7 / A-8 / A-9 / Top 2 运行时缓存
     private static readonly ConcurrentDictionary<string, bool> _addressExistsCache = new(StringComparer.Ordinal);
     private static readonly HashSet<int> _cameraSubscribedIds = new();
     private static int _lastMainMenuNavHash;
     private static int _lastMainMenuNavFrame = -1;
     private static int _lastTooltipRebuildFrame = -1;
     private static readonly ConcurrentDictionary<int, int> _tooltipInstanceLastFrame = new();
+    private static int _perfHookErrorCount;
+
+    // A-9 副 Tooltip 重复 Canvas.ForceUpdateCanvases 防抖缓存（主线程访问）
+    private static PropertyInfo _tooltipPositioningRectProp;
+    private static PropertyInfo _tooltipIsPositioningSecondaryProp;
+    private static int _lastSecTipCtrlId;
+    private static int _lastSecTipPrimaryId;
+    private static int _lastSecTipFrame = -100;
+    private static Vector2 _lastSecTipPrimarySize;
+    private static Vector2 _lastSecTipCtrlSize;
+    private static Vector2 _lastSecTipPrimaryAnchoredPos;
+
+    // 拖拽 Top 2：HandleCardHovers 槽位级去重 + ItemController HoveredMove/MoveBack DOTween 状态守卫（主线程访问）
+    private struct ItemHoverVisualState
+    {
+        public bool IsHovered;
+        public int Section;
+        public Vector3 SocketOffset;
+    }
+
+    private static readonly Dictionary<int, ItemHoverVisualState> _itemHoverVisualStates = new(32);
+    private static int _lastHoverDragCardId;
+    private static int _lastHoverSection = int.MinValue;
+    private static ulong _lastHoverSocketsMask;
+    private static int _lastHoverSocketsHash;
+    private static int _lastHoverSocketsLen = -1;
+    private static int _storageSectionValue = -1;
+    private static Func<object, bool> _cardGetMovementEnabled;
+    private static Func<object, int> _cardGetBoardSection;
+    private static Func<object, Vector3> _cardGetSocketOffset;
+    private static Func<object, object> _cardGetMoveSequence;
+    private static FieldInfo _tweenStringIdField;
 
     private IModContext _ctx;
     private PerfRuntimeBehaviour _behaviour;
@@ -140,6 +176,20 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         Patcher?.UnpatchAll();
         _addressExistsCache.Clear();
         _cameraSubscribedIds.Clear();
+        ResetDragHoverCaches();
+    }
+
+    internal static void ResetDragHoverCaches()
+    {
+        _lastHoverDragCardId = 0;
+        _lastHoverSection = int.MinValue;
+        _lastHoverSocketsMask = 0UL;
+        _lastHoverSocketsHash = 0;
+        _lastHoverSocketsLen = -1;
+        _itemHoverVisualStates.Clear();
+        _lastSecTipCtrlId = 0;
+        _lastSecTipPrimaryId = 0;
+        _lastSecTipFrame = -100;
     }
 
     public void OnUnload()
@@ -165,6 +215,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             OptAssetLoaderCacheAndLru = false;
             OptMainMenuNavThrottle = false;
             OptTooltipLayoutThrottle = false;
+            OptDragHoverGuard = false;
             OptSceneIncrementalGc = false;
             OptMuteVerboseAppLogger = false;
             OptTextureMipmapLimit = 0;
@@ -184,6 +235,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             OptAssetLoaderCacheAndLru = true;
             OptMainMenuNavThrottle = true;
             OptTooltipLayoutThrottle = true;
+            OptDragHoverGuard = true;
             OptSceneIncrementalGc = true;
             OptMuteVerboseAppLogger = true;
             OptTextureMipmapLimit = 1;
@@ -203,6 +255,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             OptAssetLoaderCacheAndLru = true;
             OptMainMenuNavThrottle = true;
             OptTooltipLayoutThrottle = true;
+            OptDragHoverGuard = true;
             OptSceneIncrementalGc = true;
             OptMuteVerboseAppLogger = true;
             OptTextureMipmapLimit = 0;
@@ -229,6 +282,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         c.SetBool("assetLoaderCacheAndLru", OptAssetLoaderCacheAndLru);
         c.SetBool("mainMenuNavThrottle", OptMainMenuNavThrottle);
         c.SetBool("tooltipLayoutThrottle", OptTooltipLayoutThrottle);
+        c.SetBool("dragHoverGuard", OptDragHoverGuard);
         c.SetBool("sceneIncrementalGc", OptSceneIncrementalGc);
         c.SetBool("muteVerboseAppLogger", OptMuteVerboseAppLogger);
         c.SetInt("textureMipmapLimit", OptTextureMipmapLimit);
@@ -252,6 +306,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         OptAssetLoaderCacheAndLru = c.GetBool("assetLoaderCacheAndLru", true);
         OptMainMenuNavThrottle = c.GetBool("mainMenuNavThrottle", true);
         OptTooltipLayoutThrottle = c.GetBool("tooltipLayoutThrottle", true);
+        OptDragHoverGuard = c.GetBool("dragHoverGuard", !string.Equals(ActiveProfileName, "Official", StringComparison.OrdinalIgnoreCase));
         OptSceneIncrementalGc = c.GetBool("sceneIncrementalGc", true);
         OptMuteVerboseAppLogger = c.GetBool("muteVerboseAppLogger", true);
         OptTextureMipmapLimit = Math.Clamp(c.GetInt("textureMipmapLimit", 0), 0, 2);
@@ -302,6 +357,11 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
 
     public PerformanceSnapshot GetLatestSnapshot()
     {
+        // 当 HUD 隐藏跳过定期排序时，外部查询快照（如打开性能页签）按需计算一次确保实时读数准确
+        if (_sampleCount > 0 && Time.unscaledTime - _lastTelemetrySummaryTime >= 0.45f)
+        {
+            RefreshTelemetrySummary();
+        }
         var texStats = CardTextureCache.Instance.GetStats();
         return new PerformanceSnapshot
         {
@@ -428,140 +488,601 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             optional: true,
             label: "Perf.A8.MainMenuBaseView.RefreshNavigation");
 
-        // A-9: CardTooltipController 同帧高频布局重建节流
-        patcher.TryPatch(
-            "TheBazaar.Tooltips.CardTooltipController",
-            "RebuildLayout",
-            prefix: AccessTools.Method(typeof(PerfOptimizerModule), nameof(TooltipRebuildLayoutPrefix)),
-            optional: true,
-            label: "Perf.A9.CardTooltipController.RebuildLayout");
+        // A-9: 修复真实类型/方法签名 TheBazaar.UI.Tooltips.CardTooltipController.RebuildLayoutForArrows（清零告警 #2，使 Tooltip 降载生效）
+        var cardTooltipType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.CardTooltipController");
+        if (cardTooltipType != null)
+        {
+            _tooltipPositioningRectProp = cardTooltipType.GetProperty("PositioningRectTransform", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            _tooltipIsPositioningSecondaryProp = cardTooltipType.GetProperty("IsPositioningSecondaryTooltip", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            patcher.TryPatch(
+                cardTooltipType,
+                "RebuildLayoutForArrows",
+                Type.EmptyTypes,
+                prefix: AccessTools.Method(typeof(PerfOptimizerModule), nameof(TooltipRebuildLayoutPrefix)),
+                optional: true,
+                label: "Perf.A9.CardTooltipController.RebuildLayoutForArrows");
+        }
 
-        // A-10: AppLogger 生产模式静音低级日志分配（保留 Error/Exception）
-        var appLogger = AccessTools.TypeByName("AppLogger") ?? AccessTools.TypeByName("TheBazaar.AppLogger");
+        // A-9 补充：拦截 DesktopTooltipPositioningStrategy.SecondaryPositioningCoroutine 消除重复全 Canvas 重建
+        var desktopTipPosType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.DesktopTooltipPositioningStrategy");
+        if (desktopTipPosType != null && cardTooltipType != null)
+        {
+            patcher.TryPatch(
+                desktopTipPosType,
+                "SecondaryPositioningCoroutine",
+                new[] { cardTooltipType, cardTooltipType },
+                prefix: AccessTools.Method(typeof(PerfOptimizerModule), nameof(SecondaryPositioningCoroutinePrefix)),
+                optional: true,
+                label: "Perf.A9.DesktopTooltipPositioningStrategy.SecondaryPositioningCoroutine");
+        }
+
+        // A-10: 单点拦截私有 TheBazaar.AppLogger.LogMessage，按 (int)logType == 0 (Debug) 零装箱静默（清零告警 #3/#4，完整保留 Warning/Error）
+        var appLogger = GameInspector.FindTypeSafe("TheBazaar.AppLogger", "AppLogger");
         if (appLogger != null)
         {
-            var muteHook = AccessTools.Method(typeof(PerfOptimizerModule), nameof(AppLoggerVerboseMutePrefix));
-            foreach (var mName in new[] { "LogVerbose", "LogDebug" })
+            MethodInfo logMsgMethod = null;
+            foreach (var m in appLogger.GetMethods(BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static))
             {
-                patcher.TryPatch(appLogger, mName, prefix: muteHook, optional: true, label: $"Perf.A10.AppLogger.{mName}");
+                if (m.Name == "LogMessage" && m.GetParameters().Length >= 3)
+                {
+                    logMsgMethod = m;
+                    break;
+                }
             }
+            if (logMsgMethod != null)
+            {
+                Type logTypeEnum = logMsgMethod.GetParameters()[2].ParameterType;
+                MethodInfo openPrefix = AccessTools.Method(typeof(PerfOptimizerModule), nameof(AppLoggerLogMessagePrefixGeneric));
+                MethodInfo closedPrefix = openPrefix?.MakeGenericMethod(logTypeEnum);
+                if (closedPrefix != null)
+                {
+                    patcher.TryPatchMethod(
+                        logMsgMethod,
+                        prefix: closedPrefix,
+                        optional: true,
+                        label: "Perf.A10.AppLogger.LogMessage");
+                }
+            }
+        }
+
+        // 拖拽 Top 2：BoardManager.HandleCardHovers 槽位级去重 + ItemController.HoveredMove/MoveBack DOTween 状态守卫
+        InstallDragHoverPerfPatches(patcher);
+    }
+
+    private static void InstallDragHoverPerfPatches(SafeHarmonyPatcher patcher)
+    {
+        try
+        {
+            var cardCtrlType = GameInspector.FindTypeSafe("CardController", "TheBazaar.CardController");
+            if (cardCtrlType != null)
+            {
+                var moveEnField = cardCtrlType.GetField("movementEnabled", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var sectionField = cardCtrlType.GetField("boardSection", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var offsetField = cardCtrlType.GetField("socketOffset", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var seqField = cardCtrlType.GetField("MoveSequence", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (moveEnField != null)
+                {
+                    _cardGetMovementEnabled = CompileInstanceFieldGetter<bool>(cardCtrlType, moveEnField);
+                }
+                if (sectionField != null)
+                {
+                    _cardGetBoardSection = CompileEnumFieldIntGetter(cardCtrlType, sectionField);
+                    try
+                    {
+                        _storageSectionValue = Convert.ToInt32(Enum.Parse(sectionField.FieldType, "Storage"));
+                    }
+                    catch { _storageSectionValue = -1; }
+                }
+                if (offsetField != null)
+                {
+                    _cardGetSocketOffset = CompileInstanceFieldGetter<Vector3>(cardCtrlType, offsetField);
+                }
+                if (seqField != null)
+                {
+                    _cardGetMoveSequence = CompileInstanceFieldGetter<object>(cardCtrlType, seqField);
+                    _tweenStringIdField = seqField.FieldType.GetField("stringId", BindingFlags.Public | BindingFlags.Instance)
+                        ?? seqField.FieldType.BaseType?.GetField("stringId", BindingFlags.Public | BindingFlags.Instance);
+                }
+            }
+
+            var bmType = GameInspector.FindTypeSafe("BoardManager");
+            var itemCtrlType = GameInspector.FindTypeSafe("ItemController", "TheBazaar.ItemController");
+            if (bmType != null)
+            {
+                patcher.TryPatch(
+                    bmType,
+                    "HandleCardHovers",
+                    prefix: AccessTools.Method(typeof(PerfOptimizerModule), nameof(BoardHandleCardHoversPrefix)),
+                    optional: true,
+                    label: "Perf.DragTop2.BoardManager.HandleCardHovers");
+
+                patcher.TryPatch(
+                    bmType,
+                    "ResetAllHovers",
+                    postfix: AccessTools.Method(typeof(PerfOptimizerModule), nameof(BoardResetAllHoversPostfix)),
+                    optional: true,
+                    label: "Perf.DragTop2.BoardManager.ResetAllHovers");
+            }
+
+            if (itemCtrlType != null)
+            {
+                patcher.TryPatch(
+                    itemCtrlType,
+                    "HoveredMove",
+                    Type.EmptyTypes,
+                    prefix: AccessTools.Method(typeof(PerfOptimizerModule), nameof(ItemHoveredMovePrefix)),
+                    optional: true,
+                    label: "Perf.DragTop2.ItemController.HoveredMove");
+
+                patcher.TryPatch(
+                    itemCtrlType,
+                    "MoveBack",
+                    Type.EmptyTypes,
+                    prefix: AccessTools.Method(typeof(PerfOptimizerModule), nameof(ItemMoveBackPrefix)),
+                    optional: true,
+                    label: "Perf.DragTop2.ItemController.MoveBack");
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("[PerfOptimizer] 安装拖拽悬停状态守卫异常: " + ex.Message);
         }
     }
 
-    // ── 各优化项 Harmony 补丁体 ──────────────────────────────────────────────
+    private static Func<object, T> CompileInstanceFieldGetter<T>(Type declaringType, FieldInfo field)
+    {
+        try
+        {
+            var p = Expression.Parameter(typeof(object), "inst");
+            var access = Expression.Field(Expression.Convert(p, declaringType), field);
+            Expression body = typeof(T) == field.FieldType ? access : Expression.Convert(access, typeof(T));
+            return Expression.Lambda<Func<object, T>>(body, p).Compile();
+        }
+        catch
+        {
+            return obj => (T)field.GetValue(obj);
+        }
+    }
+
+    private static Func<object, int> CompileEnumFieldIntGetter(Type declaringType, FieldInfo field)
+    {
+        try
+        {
+            var p = Expression.Parameter(typeof(object), "inst");
+            var access = Expression.Field(Expression.Convert(p, declaringType), field);
+            var cast = Expression.Convert(access, typeof(int));
+            return Expression.Lambda<Func<object, int>>(cast, p).Compile();
+        }
+        catch
+        {
+            return obj => Convert.ToInt32(field.GetValue(obj));
+        }
+    }
+
+    // ── 各优化项 Harmony 补丁体（全员顶层 try/catch 防异常穿透）──────────────
+
+    private static void LogPerfHookErrorThrottled(string hookName, Exception ex)
+    {
+        int cnt = Interlocked.Increment(ref _perfHookErrorCount);
+        if (cnt <= 5 || cnt % 50 == 0)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"[PerfOptimizer] {hookName} 异常已拦截 (count={cnt}): {ex.Message}");
+        }
+    }
 
     private static void CalculateTargetFrameRateInMSPostfix(int frameRate, ref float __result)
     {
-        if (!OptFixNegativeFpsBug) return;
-        if (frameRate <= 0 || __result <= 0f || float.IsNaN(__result) || float.IsInfinity(__result))
+        try
         {
-            double refresh = 60.0;
-            try
+            if (!OptFixNegativeFpsBug) return;
+            if (frameRate <= 0 || __result <= 0f || float.IsNaN(__result) || float.IsInfinity(__result))
             {
-                double r = Screen.currentResolution.refreshRateRatio.value;
-                if (r >= 30.0 && r <= 360.0) refresh = r;
-            }
-            catch { }
+                double refresh = 60.0;
+                try
+                {
+                    double r = Screen.currentResolution.refreshRateRatio.value;
+                    if (r >= 30.0 && r <= 360.0) refresh = r;
+                }
+                catch { }
 
-            int configuredFg = FrameRateGuard.GetConfiguredMaxForegroundFps();
-            double effectiveFps = configuredFg > 0 ? Math.Min(refresh, configuredFg) : refresh;
-            __result = (float)(1000.0 / Math.Max(30.0, effectiveFps));
+                int configuredFg = FrameRateGuard.GetConfiguredMaxForegroundFps();
+                double effectiveFps = configuredFg > 0 ? Math.Min(refresh, configuredFg) : refresh;
+                __result = (float)(1000.0 / Math.Max(30.0, effectiveFps));
+            }
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(CalculateTargetFrameRateInMSPostfix), ex);
         }
     }
 
     private static bool GaussianBlurExecutePrefix()
     {
-        // A-2：极致性能模式下跳过高填充率全屏高斯模糊 Pass（原版暗角遮罩仍保留）
-        return !OptBlurDownsampleOrSkip;
+        try
+        {
+            // A-2：极致性能模式下跳过高填充率全屏高斯模糊 Pass（原版暗角遮罩仍保留）
+            return !OptBlurDownsampleOrSkip;
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(GaussianBlurExecutePrefix), ex);
+            return true;
+        }
     }
 
     private static bool CameraQualitySubscribeGuardPrefix(object __instance)
     {
-        if (!OptFixCameraLeak || __instance is not UnityEngine.Object uo || uo == null) return true;
-        int id = uo.GetInstanceID();
-        lock (_cameraSubscribedIds)
+        try
         {
-            if (!_cameraSubscribedIds.Add(id))
+            if (!OptFixCameraLeak || __instance is not UnityEngine.Object uo || uo == null) return true;
+            int id = uo.GetInstanceID();
+            lock (_cameraSubscribedIds)
             {
-                return false; // 幂等防止 Start + OnSystemsInitialized 双倍注册
+                if (!_cameraSubscribedIds.Add(id))
+                {
+                    return false; // 幂等防止 Start + OnSystemsInitialized 双倍注册
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(CameraQualitySubscribeGuardPrefix), ex);
         }
         return true;
     }
 
     private static void CameraQualityOnDestroyPostfix(object __instance)
     {
-        if (__instance is not UnityEngine.Object uo) return;
-        int id = uo.GetInstanceID();
-        lock (_cameraSubscribedIds)
+        try
         {
-            _cameraSubscribedIds.Remove(id);
+            if (__instance is not UnityEngine.Object uo) return;
+            int id = uo.GetInstanceID();
+            lock (_cameraSubscribedIds)
+            {
+                _cameraSubscribedIds.Remove(id);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(CameraQualityOnDestroyPostfix), ex);
         }
     }
 
     private static void SoundManagerLoadGuardPrefix()
     {
-        // A-6 预留温和检查点：若开关关闭直接放行
-        if (!OptAudioHandleGuard) return;
+        try
+        {
+            // A-6 预留温和检查点：若开关关闭直接放行
+            if (!OptAudioHandleGuard) return;
+        }
+        catch { }
     }
 
     private static bool AssetLoaderDoesAddressExistPrefix(string address, ref bool __result)
     {
-        if (!OptAssetLoaderCacheAndLru || string.IsNullOrEmpty(address)) return true;
-        if (_addressExistsCache.TryGetValue(address, out bool cached))
+        try
         {
-            __result = cached;
-            return false;
+            if (!OptAssetLoaderCacheAndLru || string.IsNullOrEmpty(address)) return true;
+            if (_addressExistsCache.TryGetValue(address, out bool cached))
+            {
+                __result = cached;
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(AssetLoaderDoesAddressExistPrefix), ex);
         }
         return true;
     }
 
     private static void AssetLoaderDoesAddressExistPostfix(string address, bool __result)
     {
-        if (!OptAssetLoaderCacheAndLru || string.IsNullOrEmpty(address)) return;
-        if (_addressExistsCache.Count > 8192)
+        try
         {
-            _addressExistsCache.Clear();
+            if (!OptAssetLoaderCacheAndLru || string.IsNullOrEmpty(address)) return;
+            if (_addressExistsCache.Count > 8192)
+            {
+                _addressExistsCache.Clear();
+            }
+            _addressExistsCache[address] = __result;
         }
-        _addressExistsCache[address] = __result;
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(AssetLoaderDoesAddressExistPostfix), ex);
+        }
     }
 
     private static bool MainMenuRefreshNavPrefix(object __instance)
     {
-        if (!OptMainMenuNavThrottle || __instance == null) return true;
-
-        int frame = Time.frameCount;
-        int hash = (__instance.GetHashCode() * 397) ^ (Screen.width << 12) ^ Screen.height ^ (Application.isFocused ? 1 : 0);
-        // 至少每 15 帧允许同步一次（确保按钮状态变化能及时反映），其余连续同态帧零 LINQ 跳过
-        if (hash == _lastMainMenuNavHash && frame - _lastMainMenuNavFrame < 15)
+        try
         {
-            return false;
-        }
+            if (!OptMainMenuNavThrottle || __instance == null) return true;
 
-        _lastMainMenuNavHash = hash;
-        _lastMainMenuNavFrame = frame;
+            int frame = Time.frameCount;
+            int hash = (__instance.GetHashCode() * 397) ^ (Screen.width << 12) ^ Screen.height ^ (Application.isFocused ? 1 : 0);
+            // 至少每 15 帧允许同步一次（确保按钮状态变化能及时反映），其余连续同态帧零 LINQ 跳过
+            if (hash == _lastMainMenuNavHash && frame - _lastMainMenuNavFrame < 15)
+            {
+                return false;
+            }
+
+            _lastMainMenuNavHash = hash;
+            _lastMainMenuNavFrame = frame;
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(MainMenuRefreshNavPrefix), ex);
+        }
         return true;
     }
 
     private static bool TooltipRebuildLayoutPrefix(object __instance)
     {
-        if (!OptTooltipLayoutThrottle || __instance is not UnityEngine.Object uo || uo == null) return true;
-        int frame = Time.frameCount;
-        int id = uo.GetInstanceID();
-        if (_tooltipInstanceLastFrame.TryGetValue(id, out int prevFrame) && prevFrame == frame)
+        try
         {
-            return false;
+            if (!OptTooltipLayoutThrottle || __instance is not UnityEngine.Object uo || uo == null) return true;
+            int frame = Time.frameCount;
+            int id = uo.GetInstanceID();
+            if (_tooltipInstanceLastFrame.TryGetValue(id, out int prevFrame) && prevFrame == frame)
+            {
+                return false;
+            }
+            if (frame != _lastTooltipRebuildFrame)
+            {
+                _lastTooltipRebuildFrame = frame;
+                if (_tooltipInstanceLastFrame.Count > 32) _tooltipInstanceLastFrame.Clear();
+            }
+            _tooltipInstanceLastFrame[id] = frame;
         }
-        if (frame != _lastTooltipRebuildFrame)
+        catch (Exception ex)
         {
-            _lastTooltipRebuildFrame = frame;
-            if (_tooltipInstanceLastFrame.Count > 32) _tooltipInstanceLastFrame.Clear();
+            LogPerfHookErrorThrottled(nameof(TooltipRebuildLayoutPrefix), ex);
         }
-        _tooltipInstanceLastFrame[id] = frame;
         return true;
     }
 
-    private static bool AppLoggerVerboseMutePrefix() => !OptMuteVerboseAppLogger;
+    private static IEnumerator EmptyEnumerator()
+    {
+        yield break;
+    }
+
+    /// <summary>A-9 补充：短时间内对同一对主副升级 Tooltip 且尺寸与锚点未发生显著变化时，跳过重复的全局 Canvas.ForceUpdateCanvases。</summary>
+    private static bool SecondaryPositioningCoroutinePrefix(object controller, object primary, ref IEnumerator __result)
+    {
+        try
+        {
+            if (!OptTooltipLayoutThrottle || controller is not Component ctrlComp || primary is not Component priComp)
+                return true;
+            if (ctrlComp == null || priComp == null || _tooltipPositioningRectProp == null)
+                return true;
+
+            if (_tooltipIsPositioningSecondaryProp?.GetValue(controller) is bool busy && busy)
+            {
+                __result = EmptyEnumerator();
+                return false;
+            }
+
+            var ctrlRect = _tooltipPositioningRectProp.GetValue(controller) as RectTransform;
+            var priRect = _tooltipPositioningRectProp.GetValue(primary) as RectTransform;
+            if (ctrlRect == null || priRect == null) return true;
+
+            int frame = Time.frameCount;
+            int ctrlId = ctrlComp.GetInstanceID();
+            int priId = priComp.GetInstanceID();
+            Vector2 priSize = priRect.rect.size;
+            Vector2 ctrlSize = ctrlRect.rect.size;
+            Vector2 priPos = priRect.anchoredPosition;
+
+            if (ctrlId == _lastSecTipCtrlId && priId == _lastSecTipPrimaryId
+                && frame - _lastSecTipFrame <= 2
+                && ctrlComp.gameObject.activeInHierarchy
+                && priSize.x > 1f && priSize.y > 1f && ctrlSize.x > 1f && ctrlSize.y > 1f
+                && Mathf.Abs(priSize.x - _lastSecTipPrimarySize.x) < 0.5f
+                && Mathf.Abs(priSize.y - _lastSecTipPrimarySize.y) < 0.5f
+                && Mathf.Abs(ctrlSize.x - _lastSecTipCtrlSize.x) < 0.5f
+                && Mathf.Abs(ctrlSize.y - _lastSecTipCtrlSize.y) < 0.5f
+                && Mathf.Abs(priPos.x - _lastSecTipPrimaryAnchoredPos.x) < 0.5f
+                && Mathf.Abs(priPos.y - _lastSecTipPrimaryAnchoredPos.y) < 0.5f)
+            {
+                __result = EmptyEnumerator();
+                return false;
+            }
+
+            _lastSecTipCtrlId = ctrlId;
+            _lastSecTipPrimaryId = priId;
+            _lastSecTipFrame = frame;
+            _lastSecTipPrimarySize = priSize;
+            _lastSecTipCtrlSize = ctrlSize;
+            _lastSecTipPrimaryAnchoredPos = priPos;
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(SecondaryPositioningCoroutinePrefix), ex);
+        }
+        return true;
+    }
+
+    /// <summary>A-10：零装箱静默 TheBazaar.AppLogger.LogType.Debug (=0)，完整保留 Warning(1) / Error(2) 日志。</summary>
+    private static bool AppLoggerLogMessagePrefixGeneric<TLogType>(TLogType logType)
+    {
+        try
+        {
+            if (OptMuteVerboseAppLogger && EqualityComparer<TLogType>.Default.Equals(logType, default))
+            {
+                return false;
+            }
+        }
+        catch { }
+        return true;
+    }
+
+    /// <summary>拖拽 Top 2：BoardManager.HandleCardHovers 槽位级脏标去重，同槽位微移时 0 遍历直接跳过。</summary>
+    private static bool BoardHandleCardHoversPrefix(object draggingCard, EContainerSocketId[] sockets, object section)
+    {
+        try
+        {
+            if (!OptDragHoverGuard || draggingCard is not UnityEngine.Object dragUo || dragUo == null)
+                return true;
+
+            int dragId = dragUo.GetInstanceID();
+            int secInt = section != null ? Convert.ToInt32(section) : -1;
+            int len = sockets?.Length ?? 0;
+            ulong mask = 0UL;
+            int hash = 17;
+            if (sockets != null)
+            {
+                for (int i = 0; i < len; i++)
+                {
+                    int v = (int)sockets[i];
+                    if ((uint)v < 64u) mask |= 1UL << v;
+                    hash = unchecked((hash * 31) + v);
+                }
+            }
+
+            if (dragId == _lastHoverDragCardId
+                && secInt == _lastHoverSection
+                && len == _lastHoverSocketsLen
+                && mask == _lastHoverSocketsMask
+                && hash == _lastHoverSocketsHash)
+            {
+                return false;
+            }
+
+            _lastHoverDragCardId = dragId;
+            _lastHoverSection = secInt;
+            _lastHoverSocketsLen = len;
+            _lastHoverSocketsMask = mask;
+            _lastHoverSocketsHash = hash;
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(BoardHandleCardHoversPrefix), ex);
+        }
+        return true;
+    }
+
+    private static void BoardResetAllHoversPostfix()
+    {
+        try
+        {
+            ResetDragHoverCaches();
+        }
+        catch { }
+    }
+
+    /// <summary>拖拽 Top 2：ItemController.HoveredMove 状态守卫，防止重复 Kill(complete:true) 并重建同目标 DOTween 引发抖动与 GC。</summary>
+    private static bool ItemHoveredMovePrefix(Component __instance)
+    {
+        try
+        {
+            if (!OptDragHoverGuard || __instance == null || _cardGetMovementEnabled == null || _cardGetBoardSection == null || _cardGetSocketOffset == null)
+                return true;
+
+            if (!_cardGetMovementEnabled(__instance)) return true;
+
+            int id = __instance.GetInstanceID();
+            int curSection = _cardGetBoardSection(__instance);
+            Vector3 curOffset = _cardGetSocketOffset(__instance);
+            object moveSeq = _cardGetMoveSequence?.Invoke(__instance);
+            string seqId = moveSeq != null ? (_tweenStringIdField?.GetValue(moveSeq) as string) : null;
+
+            if (_itemHoverVisualStates.TryGetValue(id, out var prev)
+                && prev.IsHovered
+                && prev.Section == curSection
+                && (prev.SocketOffset - curOffset).sqrMagnitude < 1e-6f)
+            {
+                if (string.Equals(seqId, "HoveredMove", StringComparison.Ordinal))
+                {
+                    // 已经在向悬停偏置位置过渡，绝不重复强杀重建
+                    return false;
+                }
+                if (moveSeq == null)
+                {
+                    Vector3 baseBackPos = curSection == _storageSectionValue
+                        ? curOffset + new Vector3(0f, 0.08f, 0f)
+                        : curOffset;
+                    if ((__instance.transform.localPosition - baseBackPos).sqrMagnitude > 1e-5f)
+                    {
+                        // 已到位且仍处于悬停偏置态，跳过重建
+                        return false;
+                    }
+                }
+            }
+
+            if (_itemHoverVisualStates.Count > 128) _itemHoverVisualStates.Clear();
+            _itemHoverVisualStates[id] = new ItemHoverVisualState
+            {
+                IsHovered = true,
+                Section = curSection,
+                SocketOffset = curOffset,
+            };
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(ItemHoveredMovePrefix), ex);
+        }
+        return true;
+    }
+
+    /// <summary>拖拽 Top 2：ItemController.MoveBack 状态守卫，对本来就稳停原位或已在回位动画中的卡牌直接跳过，消除每帧全场 DOTween 重建。</summary>
+    private static bool ItemMoveBackPrefix(Component __instance)
+    {
+        try
+        {
+            if (!OptDragHoverGuard || __instance == null || _cardGetMovementEnabled == null || _cardGetBoardSection == null || _cardGetSocketOffset == null)
+                return true;
+
+            if (!_cardGetMovementEnabled(__instance)) return true;
+
+            int id = __instance.GetInstanceID();
+            int curSection = _cardGetBoardSection(__instance);
+            Vector3 curOffset = _cardGetSocketOffset(__instance);
+            object moveSeq = _cardGetMoveSequence?.Invoke(__instance);
+            string seqId = moveSeq != null ? (_tweenStringIdField?.GetValue(moveSeq) as string) : null;
+
+            Vector3 targetBackPos = curSection == _storageSectionValue
+                ? curOffset + new Vector3(0f, 0.08f, 0f)
+                : curOffset;
+
+            // 1. 若无活跃位移序列且本来就已在精确原位，无需无意义重建 MoveBack DOTween
+            if (moveSeq == null && (__instance.transform.localPosition - targetBackPos).sqrMagnitude < 1e-5f)
+            {
+                if (_itemHoverVisualStates.Count > 128) _itemHoverVisualStates.Clear();
+                _itemHoverVisualStates[id] = new ItemHoverVisualState
+                {
+                    IsHovered = false,
+                    Section = curSection,
+                    SocketOffset = curOffset,
+                };
+                return false;
+            }
+
+            // 2. 若已处于回位动画中且目标位置未变，直接放行当前动画继续平滑播放
+            if (_itemHoverVisualStates.TryGetValue(id, out var prev)
+                && !prev.IsHovered
+                && prev.Section == curSection
+                && (prev.SocketOffset - curOffset).sqrMagnitude < 1e-6f
+                && string.Equals(seqId, "MoveBack", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (_itemHoverVisualStates.Count > 128) _itemHoverVisualStates.Clear();
+            _itemHoverVisualStates[id] = new ItemHoverVisualState
+            {
+                IsHovered = false,
+                Section = curSection,
+                SocketOffset = curOffset,
+            };
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(ItemMoveBackPrefix), ex);
+        }
+        return true;
+    }
 
     // ── 战斗态与切场景安全调度（严禁战斗中触发 GC/卸载！） ──────────────────
 
@@ -574,6 +1095,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
     private void OnSceneChanged(SceneChangedModEvent evt)
     {
         _inCombat = false;
+        ResetDragHoverCaches();
         CompatAuditPatch.ClearRunScopedCaches("SceneChanged:" + evt.SceneName);
         MainThreadDispatcher.Enqueue(() =>
         {
@@ -668,6 +1190,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         _currentFps = avg > 0.01 ? 1000.0 / avg : 0.0;
         _onePercentLowFps = 1000.0 / p99Ms;
         _managedHeapMb = GC.GetTotalMemory(false) / (1024.0 * 1024.0);
+        _lastTelemetrySummaryTime = Time.unscaledTime;
     }
 
     internal void TriggerPingProbeBackground()
@@ -758,6 +1281,18 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             float now = Time.unscaledTime;
             if (now < _nextUiUpdate) return;
             _nextUiUpdate = now + 0.5f;
+
+            // 拖拽 Top 10：HUD 隐藏且性能页签未打开时跳过每 0.5s 的 Array.Sort 与 GC.GetTotalMemory
+            if (!ShowPerfHudOverlay)
+            {
+                if (_hudRoot != null && _hudRoot.activeSelf) _hudRoot.SetActive(false);
+                if (!CustomGameplayUI.IsPerformanceTabVisible)
+                {
+                    return;
+                }
+                _owner.RefreshTelemetrySummary();
+                return;
+            }
 
             _owner.RefreshTelemetrySummary();
             UpdatePerfHudOverlay();

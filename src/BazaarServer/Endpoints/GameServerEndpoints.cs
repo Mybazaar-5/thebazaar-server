@@ -115,6 +115,7 @@ public static class GameServerEndpoints
         var pvpCoordinator = app.Services.GetService<ITournamentPvpCoordinator>();
         var socialSink = app.Services.GetService<ISocialAndReplaySink>();
         var spectateRecorder = app.Services.GetService<ISpectateFrameRecorder>();
+        var sseHub = app.Services.GetService<BazaarServer.Tournament.SseEventHub>();
         var modHost = app.Services.GetService<ServerModHost>();
 
         // 自动协同注入 Persistence，在服务启动映射路由时先清理历史超血旧脏标准镜像，再热加载 SQLite 真人 PvP 幽灵镜像池
@@ -130,7 +131,7 @@ public static class GameServerEndpoints
             Console.WriteLine("[GameServerEndpoints] PvpGhostPool.LoadFromDb failed: " + ex.Message);
         }
 
-        // 进程优雅退出时冲刷所有待落盘的异步防抖写入任务，防止换位状态丢失
+        // 进程优雅退出时冲刷 Persistence 防抖队列，保证零状态丢失
         app.Lifetime.ApplicationStopping.Register(() =>
         {
             try
@@ -190,7 +191,7 @@ public static class GameServerEndpoints
                     var existingHandle = SessionRegistry.Get(existingSession.Sid);
                     if (existingHandle != null)
                     {
-                        // 新会话创建/恢复前先冲刷该局挂起的防抖写入任务，保证内存与 SQLite 完全同步
+                        // 新会话创建/恢复前先冲刷该局挂起防抖写入任务，保证内存与 SQLite 完全同步
                         try { db.FlushRunImmediate(existingHandle.Run.RunId); } catch { }
                         if (!Persistence.IsTerminalState(existingHandle.Run.State) &&
                             CanResumeRunForInit(existingHandle.Run, init, desiredRules))
@@ -428,22 +429,31 @@ public static class GameServerEndpoints
                     var acc = accounts.FindByAccountId(session.AccountId) ?? ResolveAccount(ctx, accounts);
                     bool isSandbox = handle.Run.IsSandboxRun || handle.Run.CustomRules.ShouldSkipGhostPool;
 
-                    // Hour 6 PvP 战斗发生时，按分区写入 SQLite pvp_ghosts 并热加载进对应分区池（严格执行沙盒三禁隔离，绝不污染标准池）
+                    // Hour 6 PvP 战斗发生时，按分区写入 SQLite pvp_ghosts 并热加载进对应分区池（严格执行沙盒三禁隔离与 Mod 幽灵池隔离，绝不污染标准池）
                     if (!isSandbox &&
                         outcome.CombatSpawnSim != null &&
                         outcome.CombatSpawnSim.CurrentState?.StateName == ERunState.PVPCombat)
                     {
+                        bool modForcesIsolation = (modHost?.ForcesGhostPoolIsolation == true)
+                            || handle.Run.Cards.Values.Any(c => !string.IsNullOrWhiteSpace(c.CustomCardId));
                         string partition = handle.Run.CustomRules.ResolveGhostPoolPartition();
+                        if (modForcesIsolation && partition != "none")
+                        {
+                            string modHash = modHost?.ModSetHash ?? string.Empty;
+                            string hashPrefix = modHash.Length > 0 ? modHash[..Math.Min(12, modHash.Length)] : "custom";
+                            partition = $"mod:{hashPrefix}";
+                        }
+
                         int curHpMax = handle.Run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, 250);
                         if (partition != "none" &&
-                            (handle.Run.IsCustomRuleRun || Persistence.IsSaneGhostForDay((int)handle.Run.Day, curHpMax)))
+                            (handle.Run.IsCustomRuleRun || modForcesIsolation || Persistence.IsSaneGhostForDay((int)handle.Run.Day, curHpMax)))
                         {
                             try
                             {
                                 ghosts.RecordPlayerGhost(
                                     handle.Run,
                                     db,
-                                    isCustomRule: handle.Run.IsCustomRuleRun,
+                                    isCustomRule: handle.Run.IsCustomRuleRun || modForcesIsolation,
                                     poolPartition: partition);
                             }
                             catch { }
@@ -466,6 +476,14 @@ public static class GameServerEndpoints
                     }
                 }
 
+                bool isPureBoardMove = (cmd is MoveItemCommand || isOwnedSelectMove) &&
+                    outcome.Error == null &&
+                    handle.Run.State == stateBefore &&
+                    !Persistence.IsTerminalState(handle.Run.State) &&
+                    outcome.CombatSpawnSim == null &&
+                    outcome.Combat == null &&
+                    !outcome.ForceStateSync;
+
                 INetMessage reply;
                 bool isCombatSequence = false;
                 if (outcome.Error != null)
@@ -482,6 +500,14 @@ public static class GameServerEndpoints
                         new NetMessageGameSim(outcome.CombatDespawnSim),
                     });
                 }
+                else if (isPureBoardMove)
+                {
+                    // V13.1 拖拽加速（Top 7）：MoveItem 返回增量 GameSim（仅打包被移动/挤位/光环变更卡），削减 80%+ 包体与客户端刷新开销
+                    reply = new NetMessageAggregate(new List<INetMessage>
+                    {
+                        new NetMessageGameSim(handle.Run.BuildDeltaGameSim(outcome.Events, outcome.DirtyCardIds)),
+                    });
+                }
                 else
                 {
                     var list = new List<INetMessage>();
@@ -495,18 +521,15 @@ public static class GameServerEndpoints
                     sid, rid, cmd.GetType().Name, outcome.Error == null,
                     handle.Run.State, handle.Run.Hour, handle.Run.Day);
 
-                bool isPureBoardMove = (cmd is MoveItemCommand || isOwnedSelectMove) &&
-                    outcome.Error == null &&
-                    handle.Run.State == stateBefore &&
-                    !Persistence.IsTerminalState(handle.Run.State) &&
-                    outcome.CombatSpawnSim == null;
-
                 if (isPureBoardMove)
                 {
+                    // 高频拖拽换位走 Persistence 1500ms 内存防抖合批，零磁盘写盘阻塞且完整兼容 PendingDebounceCount 与停服自动冲刷
+                    handle.Run.SnapshotDirty = true;
                     try { db.SaveRunSnapshotDebounced(handle.Run, session.AccountId, isCustomRule: handle.Run.IsCustomRuleRun); } catch { }
                 }
                 else
                 {
+                    handle.Run.SnapshotDirty = false;
                     try { SaveSnapshotImmediate(db, handle.Run, session, handle.Engine); } catch { }
                 }
 
@@ -540,24 +563,39 @@ public static class GameServerEndpoints
 
                 byte[] replyPayload = SerializeAndRecordResponse(session, reqRid, hasReqRid, commandSha256, reply);
 
-                // 录制观战增量帧（仅对成功命令记录，供观战 SSE/轮询拉取）
+                // 先将响应刷给客户端，再做（有观战者时的）异步观战录制，消除回包前观战序列化阻塞！
+                await WriteSerializedPayload(ctx, replyPayload, session.Sid, session.RequestId, handle.Run, modHost);
+
+                // V13.1 拖拽加速（Top 8）：0 观战者且非锦标赛局直接短路跳过 Base64+JSON 录制；有观战者时也在回包后后台异步录制
                 if (outcome.Error == null && spectateRecorder != null)
                 {
-                    try
+                    bool hasPotentialSpectators = handle.Run.TournamentSessionId.HasValue
+                        || (sseHub != null && sseHub.TotalConnections > 0);
+                    if (hasPotentialSpectators)
                     {
-                        spectateRecorder.RecordCommandDelta(
-                            session.AccountId,
-                            handle.Run.RunId,
-                            handle.Run.TournamentSessionId,
-                            hasReqRid ? reqRid : prevRid,
-                            session.RequestId,
-                            replyPayload,
-                            isCombatSequence);
+                        string recAccountId = session.AccountId;
+                        string recRunId = handle.Run.RunId;
+                        Guid? recTourneyId = handle.Run.TournamentSessionId;
+                        long recFromRid = hasReqRid ? reqRid : prevRid;
+                        long recRid = session.RequestId;
+                        bool recCombat = isCombatSequence;
+                        ThreadPool.UnsafeQueueUserWorkItem(_ =>
+                        {
+                            try
+                            {
+                                spectateRecorder.RecordCommandDelta(
+                                    recAccountId,
+                                    recRunId,
+                                    recTourneyId,
+                                    recFromRid,
+                                    recRid,
+                                    replyPayload,
+                                    recCombat);
+                            }
+                            catch { }
+                        }, state: null);
                     }
-                    catch { }
                 }
-
-                await WriteSerializedPayload(ctx, replyPayload, session.Sid, session.RequestId, handle.Run, modHost);
             }
             finally
             {
@@ -578,7 +616,7 @@ public static class GameServerEndpoints
                     var handle = SessionRegistry.Get(sid);
                     if (handle != null)
                     {
-                        try { SaveSnapshotImmediate(db, handle.Run, session, handle.Engine); } catch { }
+                        handle.Run.SnapshotDirty = false;
                         try { db.FlushRunImmediate(handle.Run.RunId); } catch { }
                     }
                     session.CommandLog.Clear();

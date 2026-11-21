@@ -271,7 +271,7 @@ public sealed class V9ScheduleXpPvpTests
         Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
         Assert.Equal(7, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
-        // 打完 Hour 6 PvP (+3 XP) 并跨入 Day 2 Hour 1 → 合计 10 XP 升至 Lv2（余 2/8 XP）！
+        // V13.1 官方经验总账：Hour 6 PvP 战斗本身 0 XP，跨入 Day 2 Hour 1 发放 +1 小时经验 → 全天合计 7 + 1 = 8 XP 升至 Lv2（余 0/8 XP）！
         var pvpCard = run.Cards[Assert.Single(run.SelectionSet)];
         Assert.Equal(ECardType.PvpEncounter, pvpCard.Type);
         var pvpOut = engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pvpCard.InstanceId) });
@@ -295,7 +295,7 @@ public sealed class V9ScheduleXpPvpTests
         Assert.Equal(2u, run.Day);
         Assert.Equal(1u, run.Hour);
         Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
         // 2b. P0-1 单份经验校验：Study (xp=2) 不再叠 +1 小时经验 = 2；Aldric (xp=1) + Exploit (xp=1 同小时去重) = 1
         var (studyRun, studyEngine) = CreateStartedEngine(fx.Pool, fx.Monsters, fx.LevelUps, fx.Mode, fx.Repo, fx.Ghosts);
@@ -541,7 +541,8 @@ public sealed class V9ScheduleXpPvpTests
                             merchantCount++;
                     }
 
-                    Assert.True(merchantCount <= 1, $"Day {day} Hour {hour} ({hero}) 商人数量={merchantCount}，超出 <= 1 上限");
+                    // V13.1 官方常规 3 槽布局支持 1 家或双商人（左+中不同商人），绝不为 0 也绝不 3 槽全商人
+                    Assert.InRange(merchantCount, 1, 2);
                 }
             }
         }
@@ -718,7 +719,7 @@ public sealed class V9ScheduleXpPvpTests
         var fx = RealFixture.Value;
         string[] devForbiddenNames = ["Big Bad Wolf", "Greenheart", "Test Subject Alpha", "Training Dummy", "QA Test", "Sparring Partner", "Monster_Battle_Player_Template"];
 
-        // Day 1：80 次抽取遵循左=Lv1(75~100HP)、中=Lv1~2(100~200HP)、右=Lv2(200~300HP) 递增三档，严禁 Lv3+/假怪/伏击怪
+        // Day 1（V13.1 官方表）：80 次抽取严格为 2 只不重复 Lv1 Bronze (75~100HP) + 1 只 Lv2 Silver (75~100HP，含 Viper 75HP)，严禁 Lv3+/假怪/伏击怪
         for (int i = 0; i < 80; i++)
         {
             var run = new RunState { RunId = $"d1_m_{i}", GameModeId = fx.Pool.DefaultGameModeId, Hero = EHero.Vanessa, Day = 1, Hour = 3, RngSeed = 1000 + i };
@@ -730,22 +731,24 @@ public sealed class V9ScheduleXpPvpTests
                 var tpl = fx.Pool.Get(run.Cards[id].TemplateId.ToString())!;
                 var mon = fx.Repo.MonstersById[tpl.MonsterTemplateId];
                 int hp = (int)Math.Round(mon.Player!.Attributes["HealthMax"]);
+                var tier = MonsterPool.GetMonsterTier(tpl);
                 foreach (string bad in devForbiddenNames)
                     Assert.DoesNotContain(bad, tpl.InternalName, StringComparison.OrdinalIgnoreCase);
-                return (tpl.MonsterLevel, hp, tpl.InternalName);
+                return (tpl.MonsterLevel, hp, tier, tpl.InternalName);
             }).ToList();
 
             Assert.Equal(1, slots[0].MonsterLevel);
+            Assert.Equal(CardTier.Bronze, slots[0].tier);
             Assert.InRange(slots[0].hp, 75, 100);
-            Assert.InRange(slots[1].MonsterLevel, 1, 2);
-            Assert.InRange(slots[1].hp, 100, 200);
+            Assert.Equal(1, slots[1].MonsterLevel);
+            Assert.Equal(CardTier.Bronze, slots[1].tier);
+            Assert.InRange(slots[1].hp, 75, 100);
             Assert.Equal(2, slots[2].MonsterLevel);
-            Assert.InRange(slots[2].hp, 200, 300);
-            Assert.True(slots[0].hp <= slots[1].hp && slots[1].hp <= slots[2].hp && slots[2].hp > slots[0].hp,
-                $"Day 1 野怪血量应呈递增梯度: [{slots[0].hp}, {slots[1].hp}, {slots[2].hp}]");
+            Assert.Equal(CardTier.Silver, slots[2].tier);
+            Assert.InRange(slots[2].hp, 75, 100);
         }
 
-        // Day 2：80 次抽取遵循左=Lv1~2(<=200HP)、中=Lv2~3(200~350HP)、右=Lv3~4(350~600HP) 递增三档，严禁 Lv5+/假怪
+        // Day 2（V13.1 官方公式 Lv(D)/Lv(D+1)/Lv(D+2)）：左=Lv2 Bronze (200~300HP)、中=Lv3 Silver (300~350HP)、右=Lv4 Gold+ (450~600HP)，严禁假怪
         for (int i = 0; i < 80; i++)
         {
             var run = new RunState { RunId = $"d2_m_{i}", GameModeId = fx.Pool.DefaultGameModeId, Hero = EHero.Vanessa, Day = 2, Hour = 3, RngSeed = 2000 + i };
@@ -757,22 +760,24 @@ public sealed class V9ScheduleXpPvpTests
                 var tpl = fx.Pool.Get(run.Cards[id].TemplateId.ToString())!;
                 var mon = fx.Repo.MonstersById[tpl.MonsterTemplateId];
                 int hp = (int)Math.Round(mon.Player!.Attributes["HealthMax"]);
+                var tier = MonsterPool.GetMonsterTier(tpl);
                 foreach (string bad in devForbiddenNames)
                     Assert.DoesNotContain(bad, tpl.InternalName, StringComparison.OrdinalIgnoreCase);
-                return (tpl.MonsterLevel, hp, tpl.InternalName);
+                return (tpl.MonsterLevel, hp, tier, tpl.InternalName);
             }).ToList();
 
-            Assert.InRange(slots[0].MonsterLevel, 1, 2);
-            Assert.True(slots[0].hp <= 200, $"Day 2 左槽不得超过 200HP: {slots[0].InternalName} ({slots[0].hp})");
-            Assert.InRange(slots[1].MonsterLevel, 2, 3);
-            Assert.InRange(slots[1].hp, 200, 350);
-            Assert.InRange(slots[2].MonsterLevel, 3, 4);
-            Assert.InRange(slots[2].hp, 350, 600);
-            Assert.True(slots[0].hp <= slots[1].hp && slots[1].hp <= slots[2].hp && slots[2].hp > slots[0].hp,
-                $"Day 2 野怪血量应呈递增梯度: [{slots[0].hp}, {slots[1].hp}, {slots[2].hp}]");
+            Assert.Equal(2, slots[0].MonsterLevel);
+            Assert.Equal(CardTier.Bronze, slots[0].tier);
+            Assert.InRange(slots[0].hp, 200, 300);
+            Assert.Equal(3, slots[1].MonsterLevel);
+            Assert.Equal(CardTier.Silver, slots[1].tier);
+            Assert.InRange(slots[1].hp, 300, 350);
+            Assert.Equal(4, slots[2].MonsterLevel);
+            Assert.True(slots[2].tier >= CardTier.Gold, $"Day 2 右槽应为 Gold+，实际 {slots[2].tier}");
+            Assert.InRange(slots[2].hp, 450, 600);
         }
 
-        // Day 4 / 7 / 10：严格命中 MonsterLevel == d（或最多 ±1 级，绝无 ±2 级）
+        // Day 4 / 7 / 10（V13.1 官方公式）：左=Lv(D) Bronze / 中=Lv(D+1) Silver / 右=Lv(D+2) Gold+
         foreach (int day in new[] { 4, 7, 10 })
         {
             for (int i = 0; i < 30; i++)
@@ -781,11 +786,10 @@ public sealed class V9ScheduleXpPvpTests
                 var shop = new ShopEngine(run, fx.Pool, fx.Repo);
                 shop.DealHourEncounters();
                 Assert.Equal(3, run.SelectionSet.Count);
-                foreach (string id in run.SelectionSet)
-                {
-                    var tpl = fx.Pool.Get(run.Cards[id].TemplateId.ToString())!;
-                    Assert.InRange(Math.Abs(tpl.MonsterLevel - day), 0, 1);
-                }
+                var lvs = run.SelectionSet.Select(id => fx.Pool.Get(run.Cards[id].TemplateId.ToString())!.MonsterLevel).ToList();
+                Assert.Equal(day, lvs[0]);
+                Assert.Equal(day + 1, lvs[1]);
+                Assert.Equal(day + 2, lvs[2]);
             }
         }
     }

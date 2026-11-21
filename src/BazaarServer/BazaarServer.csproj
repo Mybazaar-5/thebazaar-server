@@ -22,5 +22,11 @@
     <Reference Include="Nanoid"><HintPath>..\..\ext\Managed\Nanoid.dll</HintPath><Private>true</Private></Reference>
     <Reference Include="Gilzoide.SqliteNet"><HintPath>..\..\ext\Managed\Gilzoide.SqliteNet.dll</HintPath><Private>true</Private></Reference>
   </ItemGroup>
+  <ItemGroup>
+    <Content Update="wwwroot\workshop\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
 </Project>
 

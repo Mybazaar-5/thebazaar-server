@@ -668,7 +668,8 @@ public sealed class V10ScheduleLevelMonstersTests
                         if (CardArchetypeIndex.IsMerchantEncounterTemplate(tplId, name, tpl, core))
                             merchantCount++;
                     }
-                    Assert.Equal(1, merchantCount);
+                    // V13.1 官方常规 3 槽布局支持 1 家或双商人（左+中不同商人），绝不为 0 也绝不 3 槽全商人
+                    Assert.InRange(merchantCount, 1, 2);
                 }
 
                 // Hour 6：专属 PvP 对战槽
@@ -722,7 +723,7 @@ public sealed class V10ScheduleLevelMonstersTests
             }
         }
 
-        // 3c. Day 1 Hour 3（30 次抽样）：左=Lv1(75~100HP)，中=Lv1~2(100~200HP)，右=Lv2(200~300HP)
+        // 3c. Day 1 Hour 3（V13.1 官方表，30 次抽样）：2 只不重复 Lv1 Bronze (75~100HP) + 1 只 Lv2 Silver (75~100HP，含低血 Viper)
         for (int i = 0; i < 30; i++)
         {
             var run = new RunState { RunId = $"v10_d1_h3_{i}", GameModeId = fx.Pool.DefaultGameModeId, Hero = EHero.Vanessa, Day = 1, Hour = 3, RngSeed = 7000 + i };
@@ -740,14 +741,13 @@ public sealed class V10ScheduleLevelMonstersTests
 
             Assert.Equal(1, leftLv);
             Assert.InRange(leftHp, 75, 100);
-            Assert.InRange(midLv, 1, 2);
-            Assert.InRange(midHp, 100, 200);
+            Assert.Equal(1, midLv);
+            Assert.InRange(midHp, 75, 100);
             Assert.Equal(2, rightLv);
-            Assert.InRange(rightHp, 200, 300);
-            Assert.True(leftHp <= midHp && midHp <= rightHp && rightHp > leftHp, $"Day 1 血量梯度应递增: [{leftHp}, {midHp}, {rightHp}]");
+            Assert.InRange(rightHp, 75, 100);
         }
 
-        // 3d. Day 2 Hour 3（30 次抽样）：左=Lv1~2(<=200HP)，中=Lv2~3(200~350HP)，右=Lv3~4(350~600HP)
+        // 3d. Day 2 Hour 3（V13.1 官方公式，30 次抽样）：左=Lv2 Bronze (200~300HP)，中=Lv3 Silver (300~350HP)，右=Lv4 Gold+ (450~600HP)
         for (int i = 0; i < 30; i++)
         {
             var run = new RunState { RunId = $"v10_d2_h3_{i}", GameModeId = fx.Pool.DefaultGameModeId, Hero = EHero.Vanessa, Day = 2, Hour = 3, RngSeed = 8000 + i };
@@ -763,16 +763,15 @@ public sealed class V10ScheduleLevelMonstersTests
             int midHp = GetHp(run, run.SelectionSet[1]);
             int rightHp = GetHp(run, run.SelectionSet[2]);
 
-            Assert.InRange(leftLv, 1, 2);
-            Assert.True(leftHp <= 200, $"Day 2 左槽 HP={leftHp} 超出 <=200 上限");
-            Assert.InRange(midLv, 2, 3);
-            Assert.InRange(midHp, 200, 350);
-            Assert.InRange(rightLv, 3, 4);
-            Assert.InRange(rightHp, 350, 600);
-            Assert.True(leftHp <= midHp && midHp <= rightHp && rightHp > leftHp, $"Day 2 血量梯度应递增: [{leftHp}, {midHp}, {rightHp}]");
+            Assert.Equal(2, leftLv);
+            Assert.InRange(leftHp, 200, 300);
+            Assert.Equal(3, midLv);
+            Assert.InRange(midHp, 300, 350);
+            Assert.Equal(4, rightLv);
+            Assert.InRange(rightHp, 450, 600);
         }
 
-        // 3e. Day 3..15 Hour 3：左<=中<=右严格按天数递增（Day 13 右槽在无 Lv14 时顺延 Lv15），且跨天血量抬升
+        // 3e. Day 3..15 Hour 3（V13.1 官方公式）：Day 3..10 为 Lv(D)/Lv(D+1)/Lv(D+2)，Day 12+ 为 Lv12/Lv13/Lv15，且跨天中槽血量抬升
         double avgMidHpDay3 = 0, avgMidHpDay7 = 0, avgMidHpDay12 = 0;
         foreach (int day in new[] { 3, 5, 7, 10, 12, 13, 15 })
         {
@@ -789,11 +788,17 @@ public sealed class V10ScheduleLevelMonstersTests
                 int m = GetLv(run, run.SelectionSet[1]);
                 int r = GetLv(run, run.SelectionSet[2]);
                 Assert.True(l <= m && m <= r, $"Day {day} 野怪等级应递增: [{l}, {m}, {r}]");
-                if (day <= 12)
+                if (day <= 10)
                 {
-                    Assert.Equal(day - 1, l);
-                    Assert.Equal(day, m);
-                    Assert.Equal(day + 1, r);
+                    Assert.Equal(day, l);
+                    Assert.Equal(day + 1, m);
+                    Assert.Equal(day + 2, r);
+                }
+                else
+                {
+                    Assert.Equal(12, l);
+                    Assert.Equal(13, m);
+                    Assert.Equal(15, r);
                 }
                 midSum += GetHp(run, run.SelectionSet[1]);
             }

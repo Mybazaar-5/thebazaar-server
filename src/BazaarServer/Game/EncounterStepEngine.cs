@@ -235,6 +235,7 @@ public sealed class EncounterStepEngine
                 if (!isLevelUpStep)
                 {
                     _run.GainedHourXpThisHour = true;
+                    _run.GainedAdvanceHourXpThisHour = true;
                     _run.PendingEncounterExitXp = Math.Max(0, _run.PendingEncounterExitXp - xpAward);
                 }
                 result.ExperienceAwarded = xpAward;
@@ -540,8 +541,10 @@ public sealed class EncounterStepEngine
             }
             if (!allowDuplicates && !usedTemplates.Add(inst.Template.Id)) continue;
 
-            int width = ShopEngine.GetShelfSlotWidth(inst);
-            if (usedWidth + width > ShopEngine.MaxShelfSlotWidth)
+            bool isItemOption = string.Equals(inst.Template.Type, "Item", StringComparison.OrdinalIgnoreCase);
+            int width = isItemOption ? ShopEngine.GetShelfSlotWidth(inst) : 0;
+            // V13.1 问题 #6：MaxShelfSlotWidth(10 格) 仅对物品货架生效，不对 EncounterStep/EventEncounter/PedestalEncounter 选项截断
+            if (isItemOption && usedWidth + width > ShopEngine.MaxShelfSlotWidth)
                 continue;
 
             var entry = _shop.CreateEntryFromCoreInstance(inst, _run.SelectionRules.SelectionIsFree);
@@ -555,7 +558,8 @@ public sealed class EncounterStepEngine
             _run.SelectionSet.Add(entry.InstanceId);
             result.DealtCards.Add(entry);
             result.Events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), entry.Type));
-            usedWidth += width;
+            if (isItemOption)
+                usedWidth += width;
         }
 
         if (result.DealtCards.Count > 0)

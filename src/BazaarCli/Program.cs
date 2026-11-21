@@ -4,6 +4,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Reflection;
+using System.Runtime.Loader;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -91,6 +93,8 @@ internal static class Program
                 "events" => await CmdEvents(rest),
                 "wait" => await CmdWait(rest),
                 "health" => await CmdHealth(),
+                "mod-validate" => await CmdModValidateOrSim("mod-validate", rest),
+                "mod-sim-test" => await CmdModValidateOrSim("mod-sim-test", rest),
                 _ => Unknown(cmd),
             };
         }
@@ -134,6 +138,8 @@ internal static class Program
   bz events [--since N]           事件流
   bz wait --app ChoiceState       等条件
   bz health                       驱动健康检查
+  bz mod-validate <modDir> [--matches 50] [--seed 2026131] [--static-only] [--json] [--server URL]  10道铁闸+50场真战斗体检
+  bz mod-sim-test <modDir> [--matches 50] [--seed 2026131] [--json] [--server URL]                  50场真实CombatSimulator压测
 
 全局: --url http://127.0.0.1:27182");
     }
@@ -1022,5 +1028,237 @@ internal static class Program
         }
         if (!quiet) Console.WriteLine($"等待超时（{timeoutMs} ms）");
         return false;
+    }
+
+    // ── V13.1 Mod 10 闸门 & 50 场真实 CombatSimulator 体检子命令 ──────────────
+
+    private sealed class BazaarCoreLoadContext : AssemblyLoadContext
+    {
+        private readonly AssemblyDependencyResolver _resolver;
+        private readonly string _probeDir;
+
+        public BazaarCoreLoadContext(string coreDllPath) : base(isCollectible: false)
+        {
+            _probeDir = Path.GetDirectoryName(coreDllPath) ?? AppContext.BaseDirectory;
+            _resolver = new AssemblyDependencyResolver(coreDllPath);
+        }
+
+        protected override Assembly Load(AssemblyName assemblyName)
+        {
+            string resolved = _resolver.ResolveAssemblyToPath(assemblyName);
+            if (!string.IsNullOrEmpty(resolved) && File.Exists(resolved))
+                return LoadFromAssemblyPath(resolved);
+
+            string direct = Path.Combine(_probeDir, assemblyName.Name + ".dll");
+            if (File.Exists(direct))
+                return LoadFromAssemblyPath(direct);
+
+            return null;
+        }
+
+        protected override IntPtr LoadUnmanagedDll(string unmanagedDllName)
+        {
+            string resolved = _resolver.ResolveUnmanagedDllToPath(unmanagedDllName);
+            if (!string.IsNullOrEmpty(resolved) && File.Exists(resolved))
+                return LoadUnmanagedDllFromPath(resolved);
+
+            string[] nativeCandidates =
+            {
+                Path.Combine(_probeDir, unmanagedDllName + ".dll"),
+                Path.Combine(_probeDir, "runtimes", "win-x64", "native", unmanagedDllName + ".dll"),
+                Path.Combine(_probeDir, "runtimes", "linux-x64", "native", "lib" + unmanagedDllName + ".so"),
+            };
+            foreach (string c in nativeCandidates)
+            {
+                if (File.Exists(c)) return LoadUnmanagedDllFromPath(c);
+            }
+            return IntPtr.Zero;
+        }
+    }
+
+    private static async Task<int> CmdModValidateOrSim(string cmd, List<string> rest)
+    {
+        string modDir = null;
+        string dataRoot = null;
+        string serverUrl = null;
+        int matches = 50;
+        int seed = 2026131;
+        bool jsonOut = false;
+        bool staticOnly = false;
+
+        for (int i = 0; i < rest.Count; i++)
+        {
+            string arg = rest[i];
+            if (arg == "--matches" && i + 1 < rest.Count) matches = Math.Max(1, int.Parse(rest[++i]));
+            else if (arg == "--seed" && i + 1 < rest.Count) seed = int.Parse(rest[++i]);
+            else if (arg == "--data-root" && i + 1 < rest.Count) dataRoot = rest[++i];
+            else if (arg == "--server" && i + 1 < rest.Count) serverUrl = rest[++i].TrimEnd('/');
+            else if (arg == "--json") jsonOut = true;
+            else if (arg == "--static-only") staticOnly = true;
+            else if (!arg.StartsWith("--") && modDir == null) modDir = arg;
+        }
+
+        if (string.IsNullOrWhiteSpace(modDir))
+        {
+            Console.Error.WriteLine($"用法: bz {cmd} <modDir> [--matches 50] [--seed 2026131] [--data-root <dir>] [--static-only] [--json] [--server URL]");
+            return 1;
+        }
+
+        // 若指定 --server，则优先走运行中的服务端 /api/workshop/mods/{modId}/validate
+        if (!string.IsNullOrWhiteSpace(serverUrl))
+        {
+            string modId = Path.GetFileName(Path.GetFullPath(modDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            try
+            {
+                string manifestPath = Path.Combine(modDir, "mod.json");
+                if (File.Exists(manifestPath))
+                {
+                    var mj = JObject.Parse(File.ReadAllText(manifestPath, Encoding.UTF8));
+                    string declared = mj["id"]?.ToString();
+                    if (!string.IsNullOrWhiteSpace(declared)) modId = declared.Trim();
+                }
+            }
+            catch { }
+
+            string payload = JsonConvert.SerializeObject(new { matches, seed });
+            var resp = await Http.PostAsync($"{serverUrl}/api/workshop/mods/{Uri.EscapeDataString(modId)}/validate",
+                new StringContent(payload, Encoding.UTF8, "application/json"));
+            string body = await resp.Content.ReadAsStringAsync();
+            if (!resp.IsSuccessStatusCode)
+            {
+                Console.Error.WriteLine($"服务端校验返回 HTTP {(int)resp.StatusCode}：{Truncate(body, 400)}");
+                return 1;
+            }
+            return RenderModValidationResult(body, jsonOut);
+        }
+
+        // 离线模式：自动探测含完整依赖的 BazaarCore.dll 并调用真实 10 道铁闸 + 50 场 CombatSimulator 引擎
+        string coreDll = LocateBazaarCoreDll(modDir);
+        if (string.IsNullOrEmpty(coreDll))
+        {
+            Console.Error.WriteLine("未找到已编译的 BazaarCore.dll（请先运行 dotnet build src/BazaarServer/BazaarServer.csproj -c Release 或指定 --server URL）。");
+            return 1;
+        }
+
+        var loadCtx = new BazaarCoreLoadContext(coreDll);
+        var coreAsm = loadCtx.LoadFromAssemblyPath(coreDll);
+        var runnerType = coreAsm.GetType("BazaarCore.Mods.ModWorkshopOfflineRunner", throwOnError: true);
+        var execMethod = runnerType.GetMethod("ExecuteForReflection", BindingFlags.Public | BindingFlags.Static);
+        if (execMethod == null)
+        {
+            Console.Error.WriteLine("定位到的 BazaarCore.dll 版本过旧，不包含 ModWorkshopOfflineRunner.ExecuteForReflection。");
+            return 1;
+        }
+
+        string raw;
+        try
+        {
+            raw = (string)execMethod.Invoke(null, new object[] { cmd, Path.GetFullPath(modDir), dataRoot, matches, seed, staticOnly });
+        }
+        catch (TargetInvocationException tie) when (tie.InnerException != null)
+        {
+            throw tie.InnerException;
+        }
+        int nl = raw.IndexOf('\n');
+        int exitCode = nl > 0 && int.TryParse(raw[..nl], out int parsedCode) ? parsedCode : 1;
+        string jsonPayload = nl > 0 ? raw[(nl + 1)..] : raw;
+
+        int renderedCode = RenderModValidationResult(jsonPayload, jsonOut);
+        return exitCode != 0 ? exitCode : renderedCode;
+    }
+
+    private static int RenderModValidationResult(string jsonPayload, bool jsonOut)
+    {
+        if (jsonOut)
+        {
+            Console.WriteLine(jsonPayload);
+        }
+        else
+        {
+            var obj = JObject.Parse(jsonPayload);
+            bool passed = obj["passed"]?.Value<bool>() == true;
+            Console.WriteLine($"=== Mod 10道防 Bug 铁闸体检报告：{obj["modId"]} | {(passed ? "PASS 全绿通过" : "FAIL 存在阻断错误")} ===");
+            Console.WriteLine($"摘要：{obj["summaryZh"]}（总耗时 {obj["totalDurationMs"]}ms，错误 {obj["errorCount"]}，建议 {obj["warningCount"]}）");
+
+            if (obj["gates"] is JArray gates)
+            {
+                foreach (var g in gates)
+                {
+                    string st = g["status"]?.ToString() ?? "?";
+                    string mark = st == "PASS" ? "[PASS]" : (st == "WARN" ? "[WARN]" : (st == "SKIP" ? "[SKIP]" : "[FAIL]"));
+                    Console.WriteLine($"  {mark,-6} {g["nameZh"]} ({g["durationMs"]}ms)");
+                    if (g["issues"] is JArray iss)
+                    {
+                        foreach (var it in iss)
+                        {
+                            Console.WriteLine($"         - [{it["severity"]}] [{it["code"]}] {it["message"]}");
+                            string fix = it["fixHintZh"]?.ToString();
+                            if (!string.IsNullOrWhiteSpace(fix))
+                                Console.WriteLine($"           修复建议：{fix}");
+                        }
+                    }
+                }
+            }
+
+            if (obj["combatStressReport"] is JObject sr)
+            {
+                Console.WriteLine($"  战斗压测：{sr["matchesRun"]} 场 | 异常={sr["exceptions"]} | 300s僵局={sr["maxDurationHits"]} | >200ms={sr["slowMatchesOver200ms"]} | 平均={sr["avgMatchMs"]}ms P95={sr["p95MatchMs"]}ms 最大={sr["maxMatchMs"]}ms | 胜率={sr["modSideWinRatePct"]}%");
+                Console.WriteLine($"  平衡建议：{sr["balanceHintZh"]}");
+            }
+        }
+
+        try
+        {
+            var parsed = JObject.Parse(jsonPayload);
+            if (parsed["passed"]?.Value<bool>() == true) return 0;
+            if (parsed["gates"] is JArray gs && gs.Any(g => (g["gateId"]?.Value<int>() ?? 0) <= 8 && g["status"]?.ToString() == "FAIL"))
+                return 2;
+            return 3;
+        }
+        catch
+        {
+            return 1;
+        }
+    }
+
+    private static string LocateBazaarCoreDll(string modDir)
+    {
+        var candidates = new List<string>();
+        void AddFromRoot(string root)
+        {
+            if (string.IsNullOrWhiteSpace(root)) return;
+            // 优先选择包含完整 SQLite 原生依赖的 Server/Tests 输出目录
+            candidates.Add(Path.Combine(root, "src", "BazaarServer", "bin", "Release", "net8.0", "BazaarCore.dll"));
+            candidates.Add(Path.Combine(root, "src", "BazaarServer", "bin", "Debug", "net8.0", "BazaarCore.dll"));
+            candidates.Add(Path.Combine(root, "src", "BazaarCore.Tests", "bin", "Release", "net8.0", "BazaarCore.dll"));
+            candidates.Add(Path.Combine(root, "src", "BazaarCore.Tests", "bin", "Debug", "net8.0", "BazaarCore.dll"));
+            candidates.Add(Path.Combine(root, "dist", "server", "BazaarCore.dll"));
+            candidates.Add(Path.Combine(root, "src", "BazaarCore", "bin", "Release", "net8.0", "BazaarCore.dll"));
+            candidates.Add(Path.Combine(root, "src", "BazaarCore", "bin", "Debug", "net8.0", "BazaarCore.dll"));
+        }
+
+        void WalkAncestors(string start)
+        {
+            var cur = new DirectoryInfo(Path.GetFullPath(start));
+            for (int i = 0; i < 6 && cur != null; i++, cur = cur.Parent)
+                AddFromRoot(cur.FullName);
+        }
+
+        WalkAncestors(Environment.CurrentDirectory);
+        WalkAncestors(AppContext.BaseDirectory);
+        WalkAncestors(modDir);
+
+        foreach (string p in candidates)
+        {
+            if (!File.Exists(p)) continue;
+            string dir = Path.GetDirectoryName(p);
+            if (dir != null && File.Exists(Path.Combine(dir, "Microsoft.Data.Sqlite.dll")))
+                return Path.GetFullPath(p);
+        }
+        foreach (string p in candidates)
+        {
+            if (File.Exists(p)) return Path.GetFullPath(p);
+        }
+        return null;
     }
 }

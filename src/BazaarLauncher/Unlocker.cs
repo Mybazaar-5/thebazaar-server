@@ -82,7 +82,7 @@ internal static class Unlocker
             "TheBazaar.PlayerProfile",
         })
         {
-            var t = AccessTools.TypeByName(typeName);
+            var t = GameInspector.FindTypeSafe(typeName);
             if (t == null) continue;
             foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
             {
@@ -196,11 +196,19 @@ internal static class Unlocker
         CancellationToken token,
         ref Task __result)
     {
-        if (BazaarLauncherPlugin.LazyLoadCosmetics?.Value != true)
-            return true;
+        try
+        {
+            if (BazaarLauncherPlugin.LazyLoadCosmetics?.Value != true)
+                return true;
 
-        __result = CompleteLazyRemainingCollectionAsync(__instance, cardSkinTask, remaining?.Length ?? 0, token);
-        return false;
+            __result = CompleteLazyRemainingCollectionAsync(__instance, cardSkinTask, remaining?.Length ?? 0, token);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("[Unlocker] LoadRemainingCollectionPrefix 异常已拦截: " + ex.Message);
+            return true;
+        }
     }
 
     private static async Task CompleteLazyRemainingCollectionAsync(
@@ -264,11 +272,19 @@ internal static class Unlocker
 
     private static bool RetryMissingCollectionItemsPrefix(ref Task<bool> __result)
     {
-        if (BazaarLauncherPlugin.LazyLoadCosmetics?.Value != true)
-            return true;
+        try
+        {
+            if (BazaarLauncherPlugin.LazyLoadCosmetics?.Value != true)
+                return true;
 
-        __result = Task.FromResult(false);
-        return false;
+            __result = Task.FromResult(false);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("[Unlocker] RetryMissingCollectionItemsPrefix 异常已拦截: " + ex.Message);
+            return true;
+        }
     }
 
     private static void WaitForCollectionItemPrefix(object __instance, string id)

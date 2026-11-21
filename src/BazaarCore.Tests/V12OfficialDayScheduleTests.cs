@@ -349,19 +349,36 @@ public sealed class V12OfficialDayScheduleTests
                     return (Tpl: tpl, Hp: hp, Lv: lv, Tier: tier);
                 }).ToList();
 
-                // 左 <= 中 <= 右 品阶稀有度、等级与血量全部单调递增，右槽血量严格高于左槽
+                // V13.1 官方公式：左 <= 中 <= 右 品阶稀有度与等级单调递增（不再强制伪血量单调，保护 Viper 75HP / Drone Operator 850HP / Lich 1800HP 等官方低血高阶怪）
                 Assert.True(metas[0].Tier <= metas[1].Tier && metas[1].Tier <= metas[2].Tier,
                     $"Day {day} 品阶倒挂: {metas[0].Tpl.InternalName}({metas[0].Tier}), {metas[1].Tpl.InternalName}({metas[1].Tier}), {metas[2].Tpl.InternalName}({metas[2].Tier})");
                 Assert.True(metas[0].Lv <= metas[1].Lv && metas[1].Lv <= metas[2].Lv,
                     $"Day {day} Lv 倒挂: {metas[0].Lv}, {metas[1].Lv}, {metas[2].Lv}");
-                Assert.True(metas[0].Hp <= metas[1].Hp && metas[1].Hp <= metas[2].Hp && metas[2].Hp > metas[0].Hp,
-                    $"Day {day} HP 倒挂: {metas[0].Hp}, {metas[1].Hp}, {metas[2].Hp}");
+                Assert.All(metas, m => Assert.InRange(m.Hp, 75, 9999));
 
-                if (day is >= 4 and <= 12)
+                if (day == 1)
                 {
-                    Assert.Equal(day - 1, metas[0].Lv);
-                    Assert.Equal(day, metas[1].Lv);
-                    Assert.Equal(day + 1, metas[2].Lv);
+                    Assert.Equal(1, metas[0].Lv);
+                    Assert.Equal(1, metas[1].Lv);
+                    Assert.Equal(2, metas[2].Lv);
+                }
+                else if (day is >= 2 and <= 10)
+                {
+                    Assert.Equal(day, metas[0].Lv);
+                    Assert.Equal(day + 1, metas[1].Lv);
+                    Assert.Equal(day + 2, metas[2].Lv);
+                }
+                else if (day == 11)
+                {
+                    Assert.Equal(11, metas[0].Lv);
+                    Assert.Equal(12, metas[1].Lv);
+                    Assert.Equal(13, metas[2].Lv);
+                }
+                else
+                {
+                    Assert.Equal(12, metas[0].Lv);
+                    Assert.Equal(13, metas[1].Lv);
+                    Assert.Equal(15, metas[2].Lv);
                 }
             }
         }
@@ -513,10 +530,13 @@ public sealed class V12OfficialDayScheduleTests
                             Assert.DoesNotContain(tid, selectedNonMerchantsToday);
                     }
 
-                    // 验证天数阶级门槛（Day 1 无基座 & 无金/钻，Day 1 禁 The Travel Agent，Day 2..9 允许 The Travel Agent 入池）
+                    // 验证天数阶级门槛（V13.1：Day 1 Hour 1 无基座，Hour 2/4/5 仅允许 B1&B2 基座；严禁 Shrouded Figure / The Travel Agent 提前泄露）
                     if (day == 1)
                     {
-                        Assert.NotEqual(ECardType.PedestalEncounter, c.Type);
+                        if (hr == 1)
+                            Assert.NotEqual(ECardType.PedestalEncounter, c.Type);
+                        else if (c.Type == ECardType.PedestalEncounter)
+                            Assert.Equal(CardPool.PedestalB1B2Id, tid, StringComparer.OrdinalIgnoreCase);
                         Assert.NotEqual(ShroudedFigureId, tid, StringComparer.OrdinalIgnoreCase);
                         Assert.NotEqual(TravelAgentId, tid, StringComparer.OrdinalIgnoreCase);
                     }
@@ -551,8 +571,8 @@ public sealed class V12OfficialDayScheduleTests
                         tid => string.Equals(tid, TravelAgentId, StringComparison.OrdinalIgnoreCase));
                 }
 
-                // 官方对齐 + V10 铁律：严格 1 家商人 + 2 非商人发育（Event + Flex）
-                Assert.Equal(1, merchantCount);
+                // V13.1 官方常规 3 槽布局：1..2 家商人 + 1..2 非商人发育（支持双商人，至少保留 1 处非商人遭遇）
+                Assert.InRange(merchantCount, 1, 2);
                 Assert.NotNull(pickedEvent);
                 if (selectedNonMerchantsToday.Count < 3)
                     Assert.True(unvisitedNonMerchantInDeal >= 1, $"Day {day} Hour {hr} 未耗尽青铜池时不应跳过未访问非商人遭遇");

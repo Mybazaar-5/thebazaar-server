@@ -212,6 +212,21 @@ internal static class NameAuth
 
             using var resp = await HttpClientHub.SharedClient.SendAsync(req, linked.Token).ConfigureAwait(false);
             string body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var actualMethod = resp.RequestMessage?.Method ?? method;
+                var actualUri = resp.RequestMessage?.RequestUri?.ToString() ?? url;
+                if (actualMethod != method)
+                {
+                    BazaarLauncherPlugin.Log?.LogWarning(
+                        $"[NameAuth] 检测到 HTTP 重定向降级：{method} -> {actualMethod} ({actualUri})，状态码={(int)resp.StatusCode}");
+                }
+                else if ((int)resp.StatusCode == 405)
+                {
+                    BazaarLauncherPlugin.Log?.LogWarning(
+                        $"[NameAuth] HTTP 405 Method Not Allowed：{actualMethod} {actualUri}");
+                }
+            }
             return new HttpJsonResponse
             {
                 Ok = resp.IsSuccessStatusCode,

@@ -318,8 +318,8 @@ public sealed class ModRegistry : IModContentRegistry
             return report;
         }
 
-        // 汇总所有通过校验的 Mod 卡牌、野怪、模式、本地化与视觉绑定
-        var mergedCards = new List<CardTemplate>();
+        // 汇总所有通过校验的 Mod 卡牌、原位补丁、野怪、模式、本地化与视觉绑定
+        var mergedCardsById = new Dictionary<string, CardTemplate>(StringComparer.OrdinalIgnoreCase);
         var mergedMonsters = new List<MonsterTemplate>();
         var modLocDocs = new List<LocalizationOverlayDocument>();
         var modesMap = new Dictionary<string, CustomModeDefinition>(StringComparer.OrdinalIgnoreCase);
@@ -329,25 +329,44 @@ public sealed class ModRegistry : IModContentRegistry
 
         bool forcesIsolation = false;
         int totalEvents = 0;
+        int totalPatches = 0;
 
         foreach (var pkg in validOrdered)
         {
             string modId = pkg.Manifest.Id;
             report.LoadedModIdsInOrder.Add(modId);
 
-            if (pkg.Manifest.ForcesGhostPoolIsolation)
+            if (pkg.Manifest.ForcesGhostPoolIsolation || pkg.Cards.Count > 0 || pkg.Patches.Count > 0 || pkg.Events.Count > 0 || pkg.Monsters.Count > 0)
                 forcesIsolation = true;
 
             var synthesizedLoc = BuildSynthesizedModLocalization(pkg);
             if (synthesizedLoc != null)
                 modLocDocs.Add(synthesizedLoc);
 
-            // 卡牌转换
+            // 新建自定义卡牌转换
             foreach (var cardDef in pkg.Cards)
             {
                 var baseVisual = baseRepo.GetCard(cardDef.BaseVisualTemplateId);
                 if (baseVisual != null)
-                    mergedCards.Add(cardDef.ToCardTemplate(baseVisual, modId));
+                {
+                    var tpl = cardDef.ToCardTemplate(baseVisual, modId);
+                    mergedCardsById[tpl.Id] = tpl;
+                }
+            }
+
+            // 原位魔改原版卡补丁增量叠合（支持多 Mod 按拓扑顺序依次 Patch 同一原版卡）
+            foreach (var patch in pkg.Patches)
+            {
+                if (string.IsNullOrWhiteSpace(patch.TargetTemplateId)) continue;
+                string tid = patch.TargetTemplateId.Trim();
+                var sourceCard = mergedCardsById.TryGetValue(tid, out var alreadyPatched)
+                    ? alreadyPatched
+                    : baseRepo.GetCard(tid);
+                if (sourceCard != null)
+                {
+                    mergedCardsById[tid] = patch.ApplyToTemplate(sourceCard, modId);
+                    totalPatches++;
+                }
             }
 
             // 事件、子步骤与内联野怪转换
@@ -357,13 +376,19 @@ public sealed class ModRegistry : IModContentRegistry
                 var evCardDef = ev.ToCardDefinition();
                 var evBase = baseRepo.GetCard(evCardDef.BaseVisualTemplateId);
                 if (evBase != null)
-                    mergedCards.Add(evCardDef.ToCardTemplate(evBase, modId));
+                {
+                    var tpl = evCardDef.ToCardTemplate(evBase, modId);
+                    mergedCardsById[tpl.Id] = tpl;
+                }
 
                 foreach (var step in ev.Steps)
                 {
                     var stepBase = baseRepo.GetCard(step.BaseVisualTemplateId);
                     if (stepBase != null)
-                        mergedCards.Add(step.ToCardTemplate(stepBase, modId));
+                    {
+                        var tpl = step.ToCardTemplate(stepBase, modId);
+                        mergedCardsById[tpl.Id] = tpl;
+                    }
                 }
 
                 if (ev.CombatMonster != null)
@@ -382,9 +407,33 @@ public sealed class ModRegistry : IModContentRegistry
                     forcesIsolation = true;
             }
 
-            // 视觉绑定与资产索引
+            // 视觉绑定与资产索引（原位 Patch 若有视觉覆盖也一并补齐 CardType/Size）
             foreach (var (cid, binding) in pkg.VisualBindingsByCustomId)
-                visualBindingsMap[cid] = binding;
+            {
+                var resolved = binding;
+                if (baseRepo.GetCard(cid) is { } vanillaCard)
+                {
+                    resolved = new CustomCardVisualBinding
+                    {
+                        CustomTemplateId = binding.CustomTemplateId,
+                        ModId = binding.ModId,
+                        BaseVisualTemplateId = vanillaCard.Id,
+                        CardType = vanillaCard.Type,
+                        Size = vanillaCard.Size,
+                        TitleZh = binding.TitleZh,
+                        DescZh = binding.DescZh,
+                        ActiveTooltipsZh = binding.ActiveTooltipsZh,
+                        PassiveTooltipsZh = binding.PassiveTooltipsZh,
+                        EnchantTooltipsZh = binding.EnchantTooltipsZh,
+                        CustomArtFile = binding.CustomArtFile,
+                        CustomArtSha256 = binding.CustomArtSha256,
+                        ArtRect = binding.ArtRect,
+                        Tags = binding.Tags,
+                        AccentColor = binding.AccentColor
+                    };
+                }
+                visualBindingsMap[cid] = resolved;
+            }
 
             foreach (var (logicalPath, asset) in pkg.AssetsByLogicalPath)
             {
@@ -401,7 +450,7 @@ public sealed class ModRegistry : IModContentRegistry
             foreach (var provider in _cardProviders)
             {
                 foreach (var c in provider.GetCustomCards(baseRepo))
-                    if (c != null) mergedCards.Add(c);
+                    if (c != null && !string.IsNullOrWhiteSpace(c.Id)) mergedCardsById[c.Id] = c;
                 foreach (var m in provider.GetCustomMonsters(baseRepo))
                     if (m != null) mergedMonsters.Add(m);
 
@@ -416,6 +465,8 @@ public sealed class ModRegistry : IModContentRegistry
             }
         }
 
+        var mergedCards = mergedCardsById.Values.ToList();
+
         // 构建或派生四层外挂本地化存储
         OverlayLocalizationStore activeLoc = CreateDerivedLocalizationStore(baseRepo.Localization, modLocDocs);
 
@@ -428,6 +479,7 @@ public sealed class ModRegistry : IModContentRegistry
         var (visualJson, visualHash) = SerializeVisualCatalog(visualBindingsMap);
 
         report.TotalCustomCards = mergedCards.Count;
+        report.TotalCardPatches = totalPatches;
         report.TotalCustomEvents = totalEvents;
         report.TotalCustomMonsters = mergedMonsters.Count;
         report.TotalCustomModes = modesMap.Count;
@@ -525,7 +577,7 @@ public sealed class ModRegistry : IModContentRegistry
 
     private static LocalizationOverlayDocument? BuildSynthesizedModLocalization(ModPackage pkg)
     {
-        bool hasCards = pkg.Cards.Count > 0 || pkg.Events.Count > 0;
+        bool hasCards = pkg.Cards.Count > 0 || pkg.Events.Count > 0 || pkg.Patches.Any(p => p.HasVisualOrTextOverride);
         if (!hasCards && pkg.LocalizationOverlay == null)
             return null;
 
@@ -576,6 +628,34 @@ public sealed class ModRegistry : IModContentRegistry
         {
             AppendCardLoc(ev.ToCardDefinition());
             foreach (var st in ev.Steps) AppendCardLoc(st);
+        }
+        foreach (var p in pkg.Patches)
+        {
+            if (string.IsNullOrWhiteSpace(p.TargetTemplateId) || !p.HasVisualOrTextOverride)
+                continue;
+            var ov = new CardLocalizationOverride
+            {
+                Title = !string.IsNullOrWhiteSpace(p.TitleZh) ? p.TitleZh : null,
+                Description = !string.IsNullOrWhiteSpace(p.DescZh) ? p.DescZh : null
+            };
+            if (p.ActiveTooltipsZh is { Count: > 0 } || p.PassiveTooltipsZh is { Count: > 0 })
+            {
+                ov.Tooltips = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                int idx = 0;
+                if (p.ActiveTooltipsZh != null)
+                    foreach (var tip in p.ActiveTooltipsZh) ov.Tooltips[$"active_{idx++}"] = tip;
+                idx = 0;
+                if (p.PassiveTooltipsZh != null)
+                    foreach (var tip in p.PassiveTooltipsZh) ov.Tooltips[$"passive_{idx++}"] = tip;
+            }
+            if (p.EnchantTooltipsZh is { Count: > 0 })
+            {
+                ov.Enchantments = p.EnchantTooltipsZh.ToDictionary(
+                    kv => kv.Key,
+                    kv => new List<string>(kv.Value),
+                    StringComparer.OrdinalIgnoreCase);
+            }
+            doc.CardOverrides[p.TargetTemplateId.Trim()] = ov;
         }
 
         // 若 Mod 自带 localization/zh-CN.json，再叠加其显式条目（覆盖自动合成项）

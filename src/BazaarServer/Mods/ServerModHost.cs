@@ -29,7 +29,8 @@ public sealed record DiscoveredModStatus(
     int CustomMonsterCount,
     int CustomModeCount,
     int AssetCount,
-    IReadOnlyList<ModValidationIssue> Issues);
+    IReadOnlyList<ModValidationIssue> Issues,
+    int CardPatchCount = 0);
 
 /// <summary>
 /// 服务端 Mod 热加载主机：
@@ -104,6 +105,8 @@ public sealed class ServerModHost
     public bool ForcesGhostPoolIsolation => _registry.ForcesGhostPoolIsolation;
     public IReadOnlyDictionary<string, CustomCardVisualBinding> VisualBindingsByCustomId => _registry.VisualBindingsByCustomId;
     public IReadOnlyList<MutatorMetadata> ModCustomMutators => _modCustomMutators;
+    public IReadOnlySet<string> ValidVisualWhitelist => _validVisualWhitelist;
+    public IReadOnlyList<ModPackage> DiscoveredPackages => _discoveredPackages;
     public int EnabledModCount => _registry.LoadedPackages.Count;
 
     /// <summary>绑定运行期活动卡池与野怪池，每次 Mod 热重载/启停后自动无锁刷新。</summary>
@@ -194,6 +197,36 @@ public sealed class ServerModHost
         }
     }
 
+    /// <summary>设置指定 Mod 启用状态并立刻执行磁盘重载（适用于工坊刚落盘的新 Mod 发布或安全删除后的状态清理）。</summary>
+    public ModLoadReport SetModEnabledAndReload(string modId, bool enabled)
+    {
+        lock (_gate)
+        {
+            string clean = (modId ?? string.Empty).Trim();
+            if (!string.IsNullOrEmpty(clean))
+            {
+                _enabledOverrides[clean] = enabled;
+                SaveEnabledStateToDiskLocked();
+            }
+            return Reload();
+        }
+    }
+
+    /// <summary>移除指定 Mod 的启停覆写记录并执行热重载（删除草稿 Mod 时调用）。</summary>
+    public ModLoadReport RemoveModStateAndReload(string modId)
+    {
+        lock (_gate)
+        {
+            string clean = (modId ?? string.Empty).Trim();
+            if (!string.IsNullOrEmpty(clean))
+            {
+                _enabledOverrides.Remove(clean);
+                SaveEnabledStateToDiskLocked();
+            }
+            return Reload();
+        }
+    }
+
     /// <summary>获取全部已发现 Mod 的综合状态列表（含启用状态与告警）。</summary>
     public IReadOnlyList<DiscoveredModStatus> GetAllModStatuses()
     {
@@ -230,7 +263,8 @@ public sealed class ServerModHost
                     CustomMonsterCount: pkg.Monsters.Count,
                     CustomModeCount: pkg.Modes.Count,
                     AssetCount: pkg.AssetsByLogicalPath.Count,
-                    Issues: modIssues));
+                    Issues: modIssues,
+                    CardPatchCount: pkg.Patches.Count));
             }
             return list;
         }

@@ -92,6 +92,60 @@ public sealed class CardPool
     public const string CrashSiteExpeditionRoomId = "ead0a1ed-703e-445e-ba43-9a7df5d64f54";
     public const string TinyWorldExpeditionRoomId = "42db3205-58d5-4cfe-b537-14091b518ff6";
 
+    // 官方 4 座常规白昼地图基座 GUID（V13.1 问题 #2 天数门禁与单局唯一调度）
+    public const string PedestalB1B2Id = "2e1e5a86-3ace-4f78-8b73-6641ca59e834";
+    public const string PedestalSterlingId = "8b811b0f-15ba-4282-9732-6ddccb26da9f";
+    public const string PedestalForjaId = "693af45b-6d85-497f-ba32-b2f2d01b8aa3";
+    public const string PedestalTheArtistId = "49717d0f-71de-4291-8af6-d9c41ad3f438";
+
+    /// <summary>
+    /// 仅属 Lv10 / Lv19 升级里程碑或 Fates 复活选项的 12 座定向附魔祭坛（严禁在常规小时右槽随机刷出）。
+    /// </summary>
+    public static readonly IReadOnlySet<string> NonHourlyMilestoneEnchantPedestalIds =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "04f879e5-94fe-42ae-aa7a-273edbd6d410", // Yetarian Tomb
+            "099c544c-6833-407d-8d38-d4d1bb488f72", // Murkwood Bayou
+            "181c3701-c473-480a-b113-9befff77474b", // Gravity's Altar
+            "22b1eb02-1133-4120-afe3-85f6e9a5aba2", // Plains of Edin
+            "3b9b8d2d-37bf-4742-8d9f-4c05c6d2a000", // Celestial Conduit
+            "48462c74-567d-4e1e-a441-f0fa62617e47", // Bladeborn Badlands
+            "4874450b-1595-4bc2-b9e1-5b03e72a8cf6", // Arcane Abyss
+            "8e1fe6b3-d96d-4587-a09d-1bf656d9b364", // Sirocco Steppe
+            "943d17eb-e3d9-4349-97cd-b29d50be5197", // Sanguine Valley
+            "cce12722-7c66-4030-8a2d-b7b8260a847d", // Guardian's Gorge
+            "ce8b4112-39eb-419a-b65e-56f5b7c6aebd", // Mossy Ridge
+            "e36bfb52-5c63-4f59-815d-912af7917620", // Burning Caldera
+        };
+
+    private static readonly IReadOnlySet<string> NonHourlyMilestoneEnchantPedestalNames =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Bladeborn Badlands",
+            "Burning Caldera",
+            "Celestial Conduit",
+            "Gravity's Altar",
+            "Guardian's Gorge",
+            "Mossy Ridge",
+            "Murkwood Bayou",
+            "Plains of Edin",
+            "Sirocco Steppe",
+            "Arcane Abyss",
+            "Sanguine Valley",
+            "Yetarian Tomb",
+        };
+
+    /// <summary>
+    /// V13.1 问题 #6：内置白名单缺失官方子卡的安全同事件视觉载体回退表：
+    /// 服务端完整执行原卡规则与中文标题，下发客户端时借用同事件合法白名单 EncounterStep 视觉载体以实现 0 白块 0 崩溃。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> BuiltinVisualFallbackMap =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            // [Finn's Big Bite] Farm Fresh Ingredients -> 复用 [Finn's Big Bite] Compare Big Bites 合法视觉载体
+            ["4101c951-4439-4593-89c1-a01046ebbf8e"] = "68d8323d-acef-41fa-90ea-1771e5935b66",
+        };
+
     /// <summary>官方 Expedition 门票模板 ID -> 对应 Expedition 房间遭遇模板 ID 映射表。</summary>
     public static readonly IReadOnlyDictionary<string, string> ExpeditionTicketToRoomMap =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -275,7 +329,7 @@ public sealed class CardPool
         };
     }
 
-    /// <summary>解析自定义卡对应的合法原版视觉载体 GUID；若本身即为原版 GUID 则原样返回。</summary>
+    /// <summary>解析自定义卡或内置缺失白名单官方子卡对应的合法原版视觉载体 GUID；若本身即为原版 GUID 则原样返回。</summary>
     public string ResolveSafeWireTemplateId(string? templateId)
     {
         if (string.IsNullOrWhiteSpace(templateId)) return string.Empty;
@@ -284,15 +338,21 @@ public sealed class CardPool
             return baseId;
         if (snap.ById.TryGetValue(templateId, out var tpl) && !string.IsNullOrWhiteSpace(tpl.BaseVisualTemplateId))
             return tpl.BaseVisualTemplateId!;
+        if (WhitelistEnabled && !_validCardIds.Contains(templateId) &&
+            BuiltinVisualFallbackMap.TryGetValue(templateId, out var builtinFallback) &&
+            _validCardIds.Contains(builtinFallback))
+        {
+            return builtinFallback;
+        }
         return templateId;
     }
 
-    /// <summary>构建包含当前白名单与全部已启用 Mod 自定义卡 ID 的合并有效资产集（供 SpawnQueryEngine 放行 Mod 卡）。</summary>
+    /// <summary>构建包含当前白名单、内置视觉回退子卡与全部已启用 Mod 自定义卡 ID 的合并有效资产集（供 SpawnQueryEngine 放行）。</summary>
     public IReadOnlySet<string>? GetEffectiveValidAssetIds()
     {
         if (!WhitelistEnabled) return null;
         var snap = _snap;
-        if (snap.CustomToBaseVisualId.Count == 0)
+        if (snap.CustomToBaseVisualId.Count == 0 && BuiltinVisualFallbackMap.Count == 0)
             return _validCardIds;
 
         var merged = new HashSet<string>(_validCardIds, StringComparer.OrdinalIgnoreCase);
@@ -300,6 +360,11 @@ public sealed class CardPool
         {
             if (_validCardIds.Contains(baseId))
                 merged.Add(customId);
+        }
+        foreach (var (missingId, fallbackId) in BuiltinVisualFallbackMap)
+        {
+            if (_validCardIds.Contains(fallbackId))
+                merged.Add(missingId);
         }
         return merged;
     }
@@ -545,7 +610,7 @@ public sealed class CardPool
         return candidates.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p) && File.Exists(p));
     }
 
-    /// <summary>判断卡牌 ID 是否具备客户端 Addressables 本地资产（Mod 自定义卡校验其 BaseVisualTemplateId 是否位于白名单）。</summary>
+    /// <summary>判断卡牌 ID 是否具备客户端 Addressables 本地资产（Mod 自定义卡校验其视觉载体是否位于白名单；内置回退子卡仅通过 GetEffectiveValidAssetIds/ResolveSafeWireTemplateId 处理以保持原生白名单纯净）。</summary>
     public bool IsAssetValid(string? id)
     {
         if (string.IsNullOrWhiteSpace(id)) return false;
@@ -958,18 +1023,41 @@ public sealed class CardPool
             return true;
 
         string name = t.InternalName ?? "";
-        return name.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase)
+        if (name.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase)
             || name.Contains("(Level Up)", StringComparison.OrdinalIgnoreCase)
             || name.Contains("(Start Run", StringComparison.OrdinalIgnoreCase)
             || name.Contains("(Start Skill", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase);
+            || name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // V13.1 问题 #2：彻底剔除 8 个 Partner Portal - Forja 子基座与 12 座 Lv10/Lv19/Fates 定向附魔祭坛，
+        // 使常规白昼小时 PedestalEncounter 仅保留官方 4 座地图基座（B1&B2 / Sterling / Forja / The Artist）。
+        if (string.Equals(t.Type, "PedestalEncounter", StringComparison.OrdinalIgnoreCase))
+        {
+            if (name.StartsWith("Partner Portal - Forja", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!string.IsNullOrWhiteSpace(t.Id) && NonHourlyMilestoneEnchantPedestalIds.Contains(t.Id))
+                return true;
+            if (NonHourlyMilestoneEnchantPedestalNames.Contains(name))
+                return true;
+        }
+
+        return false;
     }
 
-    /// <summary>技能池：Type=Skill（通过资产白名单与中文词库校验）。</summary>
-    public List<CardTemplate> Skills(string hero)
+    /// <summary>
+    /// 技能池：Type=Skill（通过资产白名单与中文词库校验）。
+    /// V13.1 问题 #5：官方全职业通用技能已在 Heroes 中显式列全全部 8 英雄，
+    /// 而 Heroes==["Common"] 的 124 张活跃技能中 123 张为野怪专属技能；
+    /// 因此默认仅返回匹配当前英雄的干净技能池，仅当 <paramref name="includeMonsterCommon"/> 为 true 时才放行 Common。
+    /// </summary>
+    public List<CardTemplate> Skills(string hero, bool includeMonsterCommon = false)
         => OfType("Skill")
             .Where(t => IsPlayerSpawnable(t, allowGuidOnly: false))
-            .Where(t => t.Heroes.Contains(hero, StringComparer.OrdinalIgnoreCase) || t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase))
+            .Where(t => t.Heroes.Contains(hero, StringComparer.OrdinalIgnoreCase)
+                     || (includeMonsterCommon && t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase)))
             .ToList();
 
     // ── 抽样 ────────────────────────────────────────────────────────────────

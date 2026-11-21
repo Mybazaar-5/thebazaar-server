@@ -1,0 +1,109 @@
+{
+  "example_cloned_card_file": {
+    "schemaVersion": 1,
+    "modId": "demo-forge",
+    "cards": [
+      {
+        "customId": "demo-forge:storm_kukri",
+        "baseVisualTemplateId": "03b1fd16-6b0d-4847-a76f-6c586f7c5958",
+        "type": "Item",
+        "size": "Small",
+        "startingTier": "Bronze",
+        "spawningEligibility": "Always",
+        "heroes": ["Vanessa", "Common"],
+        "tags": ["Weapon", "Tool"],
+        "hiddenTags": ["Damage", "Haste"],
+        "titleZh": "风暴弯刀",
+        "titleEn": "Storm Kukri",
+        "descZh": "基于原版弯刀改造的高频短刃，命中时额外为右侧物品提速。",
+        "activeTooltipsZh": [
+          "造成 {attr.DamageAmount} 点伤害，并使右侧相邻物品加速 {attr.HasteAmount} 秒"
+        ],
+        "passiveTooltipsZh": [
+          "当你拥有至少 15 金币时，此物品伤害提高 50%"
+        ],
+        "tiers": {
+          "Bronze": {
+            "attributes": { "BuyPrice": 2, "SellPrice": 1, "CooldownMax": 3500, "DamageAmount": 14, "HasteAmount": 1000, "HasteTargets": 1 },
+            "abilityIds": ["0", "1"],
+            "auraIds": ["0"]
+          },
+          "Silver": {
+            "attributes": { "BuyPrice": 4, "SellPrice": 2, "CooldownMax": 3500, "DamageAmount": 28, "HasteAmount": 1200, "HasteTargets": 1 },
+            "abilityIds": ["0", "1"],
+            "auraIds": ["0"]
+          },
+          "Gold": {
+            "attributes": { "BuyPrice": 8, "SellPrice": 4, "CooldownMax": 3000, "DamageAmount": 56, "HasteAmount": 1500, "HasteTargets": 1 },
+            "abilityIds": ["0", "1"],
+            "auraIds": ["0"]
+          },
+          "Diamond": {
+            "attributes": { "BuyPrice": 16, "SellPrice": 8, "CooldownMax": 3000, "DamageAmount": 112, "HasteAmount": 2000, "HasteTargets": 1 },
+            "abilityIds": ["0", "1"],
+            "auraIds": ["0"]
+          }
+        },
+        "abilities": {
+          "0": {
+            "id": "0",
+            "trigger": { "$type": "TTriggerOnCardFired" },
+            "activeIn": "HandOnly",
+            "action": { "$type": "TActionPlayerDamage", "target": { "$type": "TTargetPlayerRelative", "targetMode": "Opponent" } }
+          },
+          "1": {
+            "id": "1",
+            "trigger": { "$type": "TTriggerOnCardFired" },
+            "activeIn": "HandOnly",
+            "action": { "$type": "TActionCardHaste", "target": { "$type": "TTargetCardPositional", "origin": "Self", "targetMode": "Right" } }
+          }
+        },
+        "auras": {
+          "0": {
+            "id": "0",
+            "activeIn": "HandOnly",
+            "prerequisites": [
+              {
+                "$type": "TPrerequisitePlayer",
+                "subject": {
+                  "$type": "TTargetPlayerAbsolute",
+                  "targetMode": "Player",
+                  "conditions": {
+                    "$type": "TPlayerConditionalAttribute",
+                    "attributeType": "Gold",
+                    "comparisonOperator": "GreaterThanOrEqual",
+                    "comparisonValue": { "$type": "TFixedValue", "value": 15.0 }
+                  }
+                }
+              }
+            ],
+            "action": {
+              "$type": "TAuraActionCardModifyAttribute",
+              "attributeType": "DamageAmount",
+              "operation": "Multiply",
+              "value": { "$type": "TFixedValue", "value": 1.5 },
+              "target": { "$type": "TTargetCardSelf" }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "example_vanilla_patch_file": {
+    "schemaVersion": 1,
+    "modId": "demo-forge",
+    "patches": [
+      {
+        "targetTemplateId": "03b1fd16-6b0d-4847-a76f-6c586f7c5958",
+        "note": "原位调整原版弯刀：缩短冷却并追加 Tool 标签",
+        "addTags": ["Tool"],
+        "tierAttributeOverrides": {
+          "Bronze": { "CooldownMax": 3500, "DamageAmount": 16 },
+          "Silver": { "CooldownMax": 3500, "DamageAmount": 32 },
+          "Gold": { "CooldownMax": 3000, "DamageAmount": 64 },
+          "Diamond": { "CooldownMax": 3000, "DamageAmount": 128 }
+        }
+      }
+    ]
+  }
+}
