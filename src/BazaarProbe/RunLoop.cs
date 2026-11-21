@@ -134,7 +134,7 @@ internal static class RunLoop
             _ => ECardType.Item,
         };
 
-        void SyncFromSim(GameSim? sim)
+        void SyncFromSim(GameSim sim)
         {
             if (sim == null) return;
             if (sim.Run != null)

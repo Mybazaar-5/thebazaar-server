@@ -1,15 +1,16 @@
 using System;
-using System.Reflection;
+using BazaarLauncher.Core;
 using HarmonyLib;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace BazaarLauncher;
 
 /// <summary>
-/// GPU 稳帧与后台失焦降频守护（V12.1 性能优化）：
-///   1. 解决原版 PlayerPreferences.Apply 硬编码 QualitySettings.vSyncCount = 0 导致高刷屏/3D 棋盘无休止吃满 GPU 的问题；
-///   2. 默认前台稳帧 60 FPS（可在 F8 面板或配置文件实时切换 60 / 90 / 120 / 0=跟随原版）；
-///   3. 窗口切换至后台（!Application.isFocused）自动降频至 20 FPS 释放显卡占用，切回前台毫秒级恢复。
+/// 增强型 GPU 分场景稳帧、后台失焦降频与 VSync 还原守护（修复 P1-8，协同 PerfOptimizerModule A-1）：
+///   1. 失焦降频（默认 20 FPS）前记录原始 QualitySettings.vSyncCount，回前台时完整还原（杜绝垂直同步永久失效撕裂）；
+///   2. 支持分场景稳帧（主大厅省电稳帧 / 局内战斗顺滑帧率 / 后台失焦降频）；
+///   3. 卸载或停用时完整销毁宿主 GameObject 并注销事件，零残留。
 /// </summary>
 internal sealed class FrameRateGuard : MonoBehaviour
 {
@@ -17,38 +18,62 @@ internal sealed class FrameRateGuard : MonoBehaviour
     private static bool _applied;
 
     private static int _lastObservedUnityTargetFps = -1;
+    private static int _savedVSyncBeforeBg = -1;
     private static bool _hasCapturedInitialFps;
     private static bool _wasBackgroundCapped;
+
+    internal static bool IsBackgroundCapped => _wasBackgroundCapped;
+
+    internal static void ResetAppliedFlag() => _applied = false;
+
+    internal static void EnsureInstalled(SafeHarmonyPatcher patcher)
+    {
+        if (!_applied && patcher != null)
+        {
+            _applied = true;
+            var postfix = AccessTools.Method(typeof(FrameRateGuard), nameof(AfterNativeFrameRateAppliedPostfix));
+            patcher.TryPatch("PlayerPreferences", "Apply", postfix: postfix, optional: true, label: "PlayerPreferences.Apply");
+            patcher.TryPatch(
+                "TheBazaar.QualityFramework.PerformanceFrameCappingScaler",
+                "SetFrameRate",
+                new[] { typeof(bool) },
+                postfix: postfix,
+                optional: true,
+                label: "PerformanceFrameCappingScaler.SetFrameRate");
+        }
+
+        InstallBehaviour();
+    }
 
     internal static void EnsureInstalled(Harmony harmony)
     {
         if (!_applied && harmony != null)
         {
-            _applied = true;
-            try
-            {
-                var prefsType = AccessTools.TypeByName("PlayerPreferences");
-                var applyMethod = prefsType == null ? null : AccessTools.Method(prefsType, "Apply");
-                if (applyMethod != null)
-                {
-                    harmony.Patch(applyMethod, postfix: new HarmonyMethod(
-                        typeof(FrameRateGuard), nameof(AfterNativeFrameRateAppliedPostfix)));
-                }
-
-                var scalerType = AccessTools.TypeByName("TheBazaar.QualityFramework.PerformanceFrameCappingScaler");
-                var setFpsMethod = scalerType == null ? null : AccessTools.Method(scalerType, "SetFrameRate", new[] { typeof(bool) });
-                if (setFpsMethod != null)
-                {
-                    harmony.Patch(setFpsMethod, postfix: new HarmonyMethod(
-                        typeof(FrameRateGuard), nameof(AfterNativeFrameRateAppliedPostfix)));
-                }
-            }
-            catch (Exception ex)
-            {
-                BazaarLauncherPlugin.Log?.LogWarning("FrameRateGuard patch failed: " + ex.Message);
-            }
+            EnsureInstalled(new SafeHarmonyPatcher("framerate.legacy"));
+            return;
         }
+        InstallBehaviour();
+    }
 
+    internal static void Shutdown()
+    {
+        if (_wasBackgroundCapped && _savedVSyncBeforeBg >= 0)
+        {
+            try { QualitySettings.vSyncCount = _savedVSyncBeforeBg; } catch { }
+        }
+        _wasBackgroundCapped = false;
+        _savedVSyncBeforeBg = -1;
+
+        if (_instance != null)
+        {
+            var go = _instance.gameObject;
+            _instance = null;
+            if (go != null) Destroy(go);
+        }
+    }
+
+    private static void InstallBehaviour()
+    {
         if (!_hasCapturedInitialFps)
         {
             _hasCapturedInitialFps = true;
@@ -81,19 +106,20 @@ internal sealed class FrameRateGuard : MonoBehaviour
     {
         _instance = this;
         Application.focusChanged += OnFocusChanged;
+        SceneManager.activeSceneChanged += OnSceneChanged;
         EnforceNow();
     }
 
     private void OnDestroy()
     {
         Application.focusChanged -= OnFocusChanged;
+        SceneManager.activeSceneChanged -= OnSceneChanged;
         if (_instance == this) _instance = null;
     }
 
-    private void OnFocusChanged(bool hasFocus)
-    {
-        EnforceNow(focusOverride: hasFocus);
-    }
+    private void OnFocusChanged(bool hasFocus) => EnforceNow(focusOverride: hasFocus);
+
+    private void OnSceneChanged(Scene prev, Scene next) => EnforceNow(focusOverride: null, forceApplyForeground: true);
 
     private static void AfterNativeFrameRateAppliedPostfix()
     {
@@ -113,10 +139,15 @@ internal sealed class FrameRateGuard : MonoBehaviour
             bool focused = focusOverride ?? Application.isFocused;
             int bgFps = BazaarLauncherPlugin.BackgroundFps?.Value ?? 20;
             int fgMax = BazaarLauncherPlugin.MaxForegroundFps?.Value ?? 60;
+            int menuFps = BazaarLauncherPlugin.MenuFpsLimit?.Value ?? 60;
 
             if (!focused && bgFps > 0)
             {
                 int targetBg = Math.Clamp(bgFps, 10, 60);
+                if (!_wasBackgroundCapped)
+                {
+                    _savedVSyncBeforeBg = QualitySettings.vSyncCount;
+                }
                 QualitySettings.vSyncCount = 0;
                 _wasBackgroundCapped = true;
                 if (Application.targetFrameRate != targetBg)
@@ -129,10 +160,24 @@ internal sealed class FrameRateGuard : MonoBehaviour
             bool returningFromBg = _wasBackgroundCapped;
             _wasBackgroundCapped = false;
 
-            if (fgMax > 0)
+            // P1-8 修复：切回前台时精确恢复失焦前保存的 vSyncCount，杜绝垂直同步永久丢失
+            if (returningFromBg && _savedVSyncBeforeBg >= 0)
             {
-                int clampedFg = Math.Clamp(fgMax, 30, 240);
-                // 原版 PlayerPreferences.Apply 硬编码 vSyncCount = 0，切回前台/用户主动切换挡位/原版超限时均精确恢复至 clampedFg
+                QualitySettings.vSyncCount = _savedVSyncBeforeBg;
+                _savedVSyncBeforeBg = -1;
+            }
+
+            // 分场景稳帧：在主大厅时允许单独限制较省电的帧率（不超过前台总上限）
+            int effectiveFg = fgMax;
+            string sceneName = SceneManager.GetActiveScene().name ?? string.Empty;
+            if (GameInspector.IsMainMenuSceneName(sceneName) && menuFps > 0)
+            {
+                effectiveFg = fgMax > 0 ? Math.Min(fgMax, menuFps) : menuFps;
+            }
+
+            if (effectiveFg > 0)
+            {
+                int clampedFg = Math.Clamp(effectiveFg, 30, 240);
                 if (returningFromBg
                     || forceApplyForeground
                     || Application.targetFrameRate <= 0
@@ -146,7 +191,6 @@ internal sealed class FrameRateGuard : MonoBehaviour
             }
             else if (returningFromBg || forceApplyForeground)
             {
-                // 用户选择了 0（跟随原版），恢复原版此前记录的帧率（包括 -1 无限制）
                 Application.targetFrameRate = _lastObservedUnityTargetFps;
             }
         }

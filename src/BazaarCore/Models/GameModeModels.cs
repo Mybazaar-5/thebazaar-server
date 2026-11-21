@@ -172,6 +172,7 @@ public sealed class MonsterPlayerData
 {
     public Dictionary<string, double> Attributes { get; set; } = new();
     public MonsterHandData Hand { get; set; } = new();
+    public MonsterHandData? Stash { get; set; }
     public List<MonsterCardEntry> Skills { get; set; } = new();
     public List<MonsterCardEntry> SocketEffects { get; set; } = new();
 }

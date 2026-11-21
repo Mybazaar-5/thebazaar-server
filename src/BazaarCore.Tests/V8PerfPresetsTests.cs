@@ -147,10 +147,16 @@ public sealed class V8PerfPresetsTests
         Assert.Equal(64, sNew.CommandLog.Count);
         Assert.Equal("cmd_36", sNew.CommandLog[0]);
         Assert.Equal("cmd_99", sNew.CommandLog[^1]);
+        Session? evictedSession = null;
+        store.SessionEvicted += s => evictedSession = s;
         Assert.Equal(1, store.EvictIdleSessions(TimeSpan.FromHours(2)));
         Assert.Null(store.Get(sOld.Sid));
+        Assert.Null(store.GetByAccount("acc1"));
+        Assert.Same(sOld, evictedSession);
         Assert.NotNull(store.Get(sNew.Sid));
-        Assert.Throws<ObjectDisposedException>(() => sOld.Gate.Wait(0));
+        // Wave 3B (P1-1)：驱逐不再强制 Dispose SemaphoreSlim Gate，避免并发 /commands 等待者触发 ObjectDisposedException，改为由 SessionEvicted 回调释放外围缓存并交 GC 回收
+        Assert.True(sOld.Gate.Wait(0));
+        sOld.Gate.Release();
     }
 
     [Fact]

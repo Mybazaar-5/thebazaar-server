@@ -98,7 +98,7 @@ public sealed class EncounterStepEngine
         Func<int, List<IGameSimEvent>>? grantExperience = null)
     {
         if (string.IsNullOrWhiteSpace(instanceId) || !_run.Cards.TryGetValue(instanceId, out var stepEntry))
-            return EncounterStepResult.Fail("encounter step not found: " + instanceId);
+            return EncounterStepResult.Fail($"未找到奇遇选项：{instanceId}");
 
         return ExecuteStep(stepEntry, grantExperience);
     }
@@ -107,7 +107,7 @@ public sealed class EncounterStepEngine
         RunState.CardEntry stepEntry,
         Func<int, List<IGameSimEvent>>? grantExperience = null)
     {
-        string stepTplId = stepEntry.TemplateId.ToString();
+        string stepTplId = RunState.ResolveCoreTemplateId(stepEntry);
         var coreTpl = _repo.GetCard(stepTplId);
         var poolTpl = _pool.Get(stepTplId);
 
@@ -117,7 +117,7 @@ public sealed class EncounterStepEngine
             : stepEntry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0);
         int currentGold = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0);
         if (buyPrice > 0 && currentGold < buyPrice)
-            return EncounterStepResult.Fail($"not enough gold: need {buyPrice}, have {currentGold}");
+            return EncounterStepResult.Fail($"金币不足：需要 {buyPrice} 金币，当前仅有 {currentGold} 金币");
 
         // 2. 构建权威 PlayerState 与 ExecutionContext，并校验 SelectionRequirements
         var (playerState, ownedByCore, initialHandSet, initialStashSet, initialSkillSet, initialSocketSet) = BuildSyncedPlayerState();
@@ -164,7 +164,7 @@ public sealed class EncounterStepEngine
         };
 
         if (!ValidateSelectionRequirements(poolTpl, coreTpl, ctx, out string? reqErr))
-            return EncounterStepResult.Fail(reqErr ?? "selection requirements not met");
+            return EncounterStepResult.Fail(reqErr ?? "未满足该选项的触发前提条件");
 
         // 记录执行前快照用于精准生成变更日志与事件（扣费前记快照以便 ChangeLogs 统一记录净变化）
         var prevPlayerAttrs = new Dictionary<string, double>(playerState.Attributes, StringComparer.OrdinalIgnoreCase);
@@ -468,15 +468,16 @@ public sealed class EncounterStepEngine
         }
         else if (defaultSingleFreeForReplace)
         {
+            // 修复 #4 残留：rulesNode 为空时清空旧上下文的 RerollRules / WillAutoSellOnExit / NextEncounterOnExit，绝不误继承
             _shop.SetCurrentMaxSelections(1);
             _run.SelectionRules = new TSelectionContextRules
             {
                 CanSelectMultiple = false,
                 SelectionIsFree = true,
                 CanExit = true,
-                RerollRules = _run.SelectionRules.RerollRules,
-                WillAutoSellOnExit = _run.SelectionRules.WillAutoSellOnExit,
-                NextEncounterOnExit = _run.SelectionRules.NextEncounterOnExit,
+                RerollRules = null,
+                WillAutoSellOnExit = false,
+                NextEncounterOnExit = null,
             };
         }
 
@@ -616,9 +617,9 @@ public sealed class EncounterStepEngine
                     CanSelectMultiple = false,
                     SelectionIsFree = true,
                     CanExit = true,
-                    RerollRules = _run.SelectionRules.RerollRules,
-                    WillAutoSellOnExit = _run.SelectionRules.WillAutoSellOnExit,
-                    NextEncounterOnExit = _run.SelectionRules.NextEncounterOnExit,
+                    RerollRules = null,
+                    WillAutoSellOnExit = false,
+                    NextEncounterOnExit = null,
                 };
             }
             return;
@@ -1470,7 +1471,7 @@ public sealed class EncounterStepEngine
     {
         var plan = BuildDayStartExpeditionPlan(maxChoices);
         if (!plan.ShouldTrigger)
-            return EncounterStepResult.Fail("no held expedition ticket available");
+            return EncounterStepResult.Fail("当前未持有可用的探险门票");
 
         var events = _shop.DealExpeditionRoomChoices(plan.CandidateRoomEncounterIds);
         var result = new EncounterStepResult
@@ -1496,9 +1497,9 @@ public sealed class EncounterStepEngine
     public EncounterStepResult EnterExpeditionRoom(string roomEncounterId, bool consumeMatchingTicket = true)
     {
         if (string.IsNullOrWhiteSpace(roomEncounterId) || !CardPool.IsExpeditionRoomTemplate(roomEncounterId))
-            return EncounterStepResult.Fail("unknown expedition room: " + roomEncounterId);
+            return EncounterStepResult.Fail($"未知的探险房间：{roomEncounterId}");
         if (!_pool.IsAssetValid(roomEncounterId) || (_pool.Get(roomEncounterId) == null && _repo.GetCard(roomEncounterId) == null))
-            return EncounterStepResult.Fail("expedition room missing or invalid asset: " + roomEncounterId);
+            return EncounterStepResult.Fail($"探险房间资源缺失或无效：{roomEncounterId}");
 
         var result = new EncounterStepResult
         {
@@ -1537,7 +1538,7 @@ public sealed class EncounterStepEngine
     {
         var plan = BuildDayStartExpeditionPlan();
         if (!plan.ShouldTrigger)
-            return EncounterStepResult.Fail("no held expedition ticket");
+            return EncounterStepResult.Fail("当前未持有可用的探险门票");
 
         if (!plan.RequiresChoice && !string.IsNullOrEmpty(plan.DirectRoomEncounterId))
             return EnterExpeditionRoom(plan.DirectRoomEncounterId, consumeMatchingTicket);

@@ -115,7 +115,7 @@ internal static class E2E
         var curRules = new TSelectionContextRules();
         var cardTypes = new Dictionary<string, ECardType>(StringComparer.Ordinal);
 
-        void TrackMessage(INetMessage? m)
+        void TrackMessage(INetMessage m)
         {
             if (m is NetMessageGameStateSync sync && sync.Data != null)
             {

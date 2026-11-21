@@ -5,7 +5,8 @@ using BazaarCore.Runtime;
 namespace BazaarCore.Engine;
 
 /// <summary>
-/// 光环引擎：支持全部 4 种 TAuraAction*，每当棋盘位置或属性变化时动态重算光环效果。
+/// 光环引擎：支持全部 4 种 TAuraAction*，每当棋盘位置或属性变化时动态重算光环效果；
+/// 内置线程局部缓冲复用与迭代收敛早停机制，并支持 SelectionSet 货架光环与飞行跃迁事件派发。
 /// </summary>
 public static class AuraEngine
 {
@@ -17,8 +18,42 @@ public static class AuraEngine
         CardInstance TargetCard,
         bool StartedFlying);
 
+    private sealed class ThreadScratch
+    {
+        public bool InUse;
+        public readonly AuraStagingBuffer StagingA = new();
+        public readonly AuraStagingBuffer StagingB = new();
+        public readonly Dictionary<CardInstance, bool> WasFlying = new(ReferenceEqualityComparer.Instance);
+        public readonly Dictionary<CardInstance, CardInstance> FlyingGranters = new(ReferenceEqualityComparer.Instance);
+    }
+
+    [ThreadStatic]
+    private static ThreadScratch? t_scratch;
+
+    private static ThreadScratch AcquireScratch(out bool pooled)
+    {
+        var s = t_scratch ??= new ThreadScratch();
+        if (!s.InUse)
+        {
+            s.InUse = true;
+            pooled = true;
+            return s;
+        }
+        pooled = false;
+        return new ThreadScratch();
+    }
+
+    private static void ReleaseScratch(ThreadScratch s, bool pooled)
+    {
+        s.StagingA.Clear();
+        s.StagingB.Clear();
+        s.WasFlying.Clear();
+        s.FlyingGranters.Clear();
+        if (pooled) s.InUse = false;
+    }
+
     public static void RecalculateAuras(PlayerState p1, PlayerState? p2, RuleScope scope, int day, int hour)
-        => RecalculateAuras(p1, p2, scope, day, hour, null);
+        => RecalculateAuras(p1, p2, scope, day, hour, repo: null, selectionCards: null, onFlyingTransition: null);
 
     /// <summary>
     /// 重算双方光环属性与附加标签（支持传入 <paramref name="repo"/> 以完整支持条件求值）。
@@ -26,24 +61,58 @@ public static class AuraEngine
     /// 在非战斗（OutOfCombat）作用域下同步补满所有持有卡牌弹药并联动刷新弹药依赖光环。
     /// </summary>
     public static void RecalculateAuras(PlayerState p1, PlayerState? p2, RuleScope scope, int day, int hour, GameDataRepository? repo)
+        => RecalculateAuras(p1, p2, scope, day, hour, repo, selectionCards: null, onFlyingTransition: null);
+
+    /// <summary>
+    /// 重算双方及可选货架（<paramref name="selectionCards"/>）的光环属性与附加标签；
+    /// 当提供 <paramref name="onFlyingTransition"/> 回调时，将全部飞行状态跃迁（起飞与降落）派发给调用方（如 CombatSimulator）。
+    /// </summary>
+    public static void RecalculateAuras(
+        PlayerState p1,
+        PlayerState? p2,
+        RuleScope scope,
+        int day,
+        int hour,
+        GameDataRepository? repo,
+        IReadOnlyList<CardInstance>? selectionCards,
+        Action<AuraFlyingTransition>? onFlyingTransition = null)
     {
-        var transitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo);
+        var transitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards);
 
         if (scope == RuleScope.OutOfCombat)
         {
             bool anyAmmoChanged = RefillSideAmmoIfOutOfCombat(p1)
                                 | (p2 != null && RefillSideAmmoIfOutOfCombat(p2));
             if (anyAmmoChanged)
-                RecalculateAurasInternal(p1, p2, scope, day, hour, repo);
+            {
+                var secondTransitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards);
+                if (secondTransitions.Count > 0)
+                {
+                    if (transitions.Count == 0)
+                        transitions = secondTransitions;
+                    else
+                        transitions.AddRange(secondTransitions);
+                }
+            }
         }
 
         if (transitions.Count == 0) return;
 
-        foreach (var tr in transitions)
+        if (onFlyingTransition != null)
         {
+            for (int i = 0; i < transitions.Count; i++)
+                onFlyingTransition(transitions[i]);
+            return;
+        }
+
+        if (repo == null) return;
+
+        for (int i = 0; i < transitions.Count; i++)
+        {
+            var tr = transitions[i];
             if (!tr.StartedFlying) continue;
             var opp = ReferenceEquals(tr.Owner, p1) ? p2 : p1;
-            var qCtx = new RuleExecutionContext(repo!, scope, tr.Owner, opp, new Random(0))
+            var qCtx = new RuleExecutionContext(repo, scope, tr.Owner, opp, new Random(0))
             {
                 LocalPlayerId = p1.PlayerId,
                 CurrentDay = day,
@@ -51,12 +120,55 @@ public static class AuraEngine
                 SelfCard = null,
                 TriggerSourceCard = tr.SourceCard,
                 TriggerTargetCard = tr.TargetCard,
+                SelectionCards = selectionCards,
                 LastAttributeChangeDelta = 1
             };
             AbilityExecutor.TryAdvanceQuests("TTriggerOnCardStartedFlying", tr.Owner, tr.SourceCard, tr.TargetCard, tr.Owner, "Flying", 0, 1, "PVP", "", qCtx);
             AbilityExecutor.TryAdvanceQuests("TTriggerOnCardStartsFlying", tr.Owner, tr.SourceCard, tr.TargetCard, tr.Owner, "Flying", 0, 1, "PVP", "", qCtx);
             AbilityExecutor.TryAdvanceQuests("TTriggerOnCardAttributeChanged", tr.Owner, tr.SourceCard, tr.TargetCard, tr.Owner, "Flying", 0, 1, "PVP", "", qCtx);
         }
+    }
+
+    /// <summary>快速检查双方是否持有任意未禁用/未销毁的光环源（供战斗热路径 O(1)/O(N) 跳过空光环重算）。</summary>
+    public static bool HasAnyAuraSource(PlayerState p1, PlayerState? p2 = null)
+        => HasAnyActiveAura(p1) || (p2 != null && HasAnyActiveAura(p2));
+
+    /// <summary>检查双方或货架是否存在已挂载的残留光环修饰（用于刚摧毁/卖掉最后一张光环卡时的清理判定）。</summary>
+    public static bool HasAnyAppliedAuraModifiers(PlayerState p1, PlayerState? p2 = null, IReadOnlyList<CardInstance>? selectionCards = null)
+    {
+        if (SideHasAppliedAuraModifiers(p1)) return true;
+        if (p2 != null && SideHasAppliedAuraModifiers(p2)) return true;
+        if (selectionCards != null)
+        {
+            for (int i = 0; i < selectionCards.Count; i++)
+            {
+                var c = selectionCards[i];
+                if (c.AuraAdd.Count > 0 || c.AuraMult.Count > 0 || c.AuraTags.Count > 0)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool SideHasAppliedAuraModifiers(PlayerState player)
+    {
+        if (player.AuraAdd.Count > 0 || player.AuraMult.Count > 0) return true;
+        return ListHasAppliedAura(player.Hand.Cards)
+            || ListHasAppliedAura(player.Stash.Cards)
+            || ListHasAppliedAura(player.Skills)
+            || ListHasAppliedAura(player.SocketEffects)
+            || ListHasAppliedAura(player.PlayerEffects);
+    }
+
+    private static bool ListHasAppliedAura(List<CardInstance> cards)
+    {
+        for (int i = 0; i < cards.Count; i++)
+        {
+            var c = cards[i];
+            if (c.AuraAdd.Count > 0 || c.AuraMult.Count > 0 || c.AuraTags.Count > 0)
+                return true;
+        }
+        return false;
     }
 
     private static bool RefillSideAmmoIfOutOfCombat(PlayerState side)
@@ -77,57 +189,92 @@ public static class AuraEngine
         RuleScope scope,
         int day,
         int hour,
-        GameDataRepository? repo)
+        GameDataRepository? repo,
+        IReadOnlyList<CardInstance>? selectionCards = null)
     {
-        bool trackFlying = NeedsFlyingAuraTracking(p1, scope) || (p2 != null && NeedsFlyingAuraTracking(p2, scope));
-        Dictionary<CardInstance, bool>? wasFlying = null;
-        Dictionary<CardInstance, CardInstance>? flyingGranters = null;
-        if (trackFlying)
-        {
-            wasFlying = new Dictionary<CardInstance, bool>();
-            CaptureFlyingState(p1, wasFlying);
-            if (p2 != null) CaptureFlyingState(p2, wasFlying);
-            flyingGranters = new Dictionary<CardInstance, CardInstance>();
-        }
-
-        ClearSide(p1);
-        if (p2 != null) ClearSide(p2);
-
         bool hasP1Aura = HasAnyActiveAura(p1);
         bool hasP2Aura = p2 != null && HasAnyActiveAura(p2);
 
-        if (hasP1Aura || hasP2Aura)
-        {
-            // Pass 1：直接写入 1 跳活态属性与标签
-            if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, flyingGranters: null, staging: null);
-            if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, flyingGranters: null, staging: null);
-
-            // Pass 2：基于 Pass 1 活态收敛 2 跳依赖（如 Golden Custom_2 += 1 -> SellPrice *= Custom_2）
-            var staging = new AuraStagingBuffer();
-            if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, flyingGranters: null, staging);
-            if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, flyingGranters: null, staging);
-
-            ClearSide(p1);
-            if (p2 != null) ClearSide(p2);
-            staging.Commit();
-            staging.Clear();
-
-            // Pass 3：基于已收敛的 Pass 2 状态收尾 3 跳聚合光环（如 Shield/Damage 聚合 SellPrice）及飞行跃迁追踪
-            if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, flyingGranters, staging);
-            if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, flyingGranters, staging);
-
-            ClearSide(p1);
-            if (p2 != null) ClearSide(p2);
-            staging.Commit();
-        }
-
-        if (!trackFlying || wasFlying == null || flyingGranters == null)
+        // 零光环且零残留修饰时直接早停，零分配
+        if (!hasP1Aura && !hasP2Aura && !HasAnyAppliedAuraModifiers(p1, p2, selectionCards))
             return EmptyFlyingTransitions;
 
-        var transitions = new List<AuraFlyingTransition>();
-        CollectFlyingTransitions(p1, wasFlying, flyingGranters, transitions);
-        if (p2 != null) CollectFlyingTransitions(p2, wasFlying, flyingGranters, transitions);
-        return transitions;
+        var scratch = AcquireScratch(out bool pooled);
+        try
+        {
+            bool trackFlying = NeedsFlyingAuraTracking(p1, scope) || (p2 != null && NeedsFlyingAuraTracking(p2, scope));
+            Dictionary<CardInstance, bool>? wasFlying = null;
+            Dictionary<CardInstance, CardInstance>? flyingGranters = null;
+            if (trackFlying)
+            {
+                wasFlying = scratch.WasFlying;
+                wasFlying.Clear();
+                CaptureFlyingState(p1, wasFlying);
+                if (p2 != null) CaptureFlyingState(p2, wasFlying);
+                flyingGranters = scratch.FlyingGranters;
+                flyingGranters.Clear();
+            }
+
+            ClearSide(p1);
+            if (p2 != null) ClearSide(p2);
+            ClearSelectionCards(selectionCards);
+
+            if (hasP1Aura || hasP2Aura)
+            {
+                var stagingA = scratch.StagingA;
+                var stagingB = scratch.StagingB;
+                stagingA.Clear();
+                stagingB.Clear();
+
+                // Pass 1：收集 1 跳光环输出并提交
+                if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, selectionCards, flyingGranters, stagingA);
+                if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, selectionCards, flyingGranters, stagingA);
+                stagingA.Commit();
+
+                // 若 Pass 1 产生有效光环输出，尝试 Pass 2 并做迭代收敛早停检测
+                if (!stagingA.IsEmpty)
+                {
+                    flyingGranters?.Clear();
+                    if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, selectionCards, flyingGranters, stagingB);
+                    if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, selectionCards, flyingGranters, stagingB);
+
+                    // 早停条件：Pass 2 与 Pass 1 输出完全一致说明已 1 跳收敛，无需重复 Clear/Commit 与 Pass 3
+                    if (!stagingB.EqualsBuffer(stagingA))
+                    {
+                        ClearSide(p1);
+                        if (p2 != null) ClearSide(p2);
+                        ClearSelectionCards(selectionCards);
+                        stagingB.Commit();
+
+                        // Pass 3：收敛 3 跳聚合依赖（如 Shield/Damage 聚合 SellPrice）并采集最终飞行授予者
+                        stagingA.Clear();
+                        flyingGranters?.Clear();
+                        if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, selectionCards, flyingGranters, stagingA);
+                        if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, selectionCards, flyingGranters, stagingA);
+
+                        if (!stagingA.EqualsBuffer(stagingB))
+                        {
+                            ClearSide(p1);
+                            if (p2 != null) ClearSide(p2);
+                            ClearSelectionCards(selectionCards);
+                            stagingA.Commit();
+                        }
+                    }
+                }
+            }
+
+            if (!trackFlying || wasFlying == null || flyingGranters == null)
+                return EmptyFlyingTransitions;
+
+            var transitions = new List<AuraFlyingTransition>();
+            CollectFlyingTransitions(p1, wasFlying, flyingGranters, transitions);
+            if (p2 != null) CollectFlyingTransitions(p2, wasFlying, flyingGranters, transitions);
+            return transitions.Count == 0 ? EmptyFlyingTransitions : transitions;
+        }
+        finally
+        {
+            ReleaseScratch(scratch, pooled);
+        }
     }
 
     private static bool NeedsFlyingAuraTracking(PlayerState owner, RuleScope scope)
@@ -161,8 +308,19 @@ public static class AuraEngine
 
     private static void CaptureFlyingState(PlayerState player, Dictionary<CardInstance, bool> state)
     {
-        foreach (var c in player.EnumerateAllOwnedCards())
+        CaptureListFlyingState(player.Hand.Cards, state);
+        CaptureListFlyingState(player.Stash.Cards, state);
+        CaptureListFlyingState(player.Skills, state);
+        CaptureListFlyingState(player.SocketEffects, state);
+    }
+
+    private static void CaptureListFlyingState(List<CardInstance> cards, Dictionary<CardInstance, bool> state)
+    {
+        for (int i = 0; i < cards.Count; i++)
+        {
+            var c = cards[i];
             state[c] = c.GetAttribute("Flying") > 0;
+        }
     }
 
     private static void CollectFlyingTransitions(
@@ -171,8 +329,22 @@ public static class AuraEngine
         Dictionary<CardInstance, CardInstance> flyingGranters,
         List<AuraFlyingTransition> transitions)
     {
-        foreach (var c in owner.EnumerateAllOwnedCards())
+        CollectListFlyingTransitions(owner, owner.Hand.Cards, beforeState, flyingGranters, transitions);
+        CollectListFlyingTransitions(owner, owner.Stash.Cards, beforeState, flyingGranters, transitions);
+        CollectListFlyingTransitions(owner, owner.Skills, beforeState, flyingGranters, transitions);
+        CollectListFlyingTransitions(owner, owner.SocketEffects, beforeState, flyingGranters, transitions);
+    }
+
+    private static void CollectListFlyingTransitions(
+        PlayerState owner,
+        List<CardInstance> cards,
+        Dictionary<CardInstance, bool> beforeState,
+        Dictionary<CardInstance, CardInstance> flyingGranters,
+        List<AuraFlyingTransition> transitions)
+    {
+        for (int i = 0; i < cards.Count; i++)
         {
+            var c = cards[i];
             bool prev = beforeState.GetValueOrDefault(c, false);
             bool now = c.GetAttribute("Flying") > 0;
             if (prev == now) continue;
@@ -193,6 +365,17 @@ public static class AuraEngine
         ClearCards(player.PlayerEffects);
     }
 
+    private static void ClearSelectionCards(IReadOnlyList<CardInstance>? selectionCards)
+    {
+        if (selectionCards == null) return;
+        for (int i = 0; i < selectionCards.Count; i++)
+        {
+            var c = selectionCards[i];
+            if (c.AuraAdd.Count > 0 || c.AuraMult.Count > 0 || c.AuraTags.Count > 0)
+                c.ClearAuraModifiers();
+        }
+    }
+
     private static void ClearCards(List<CardInstance> cards)
     {
         for (int i = 0; i < cards.Count; i++)
@@ -205,30 +388,75 @@ public static class AuraEngine
 
     private static bool HasAnyActiveAura(PlayerState owner)
     {
-        foreach (var c in owner.Hand.Cards)
-            if (!c.IsDestroyed && !c.IsDisabled && c.ActiveAuras.Count > 0) return true;
-        foreach (var s in owner.Skills)
-            if (!s.IsDestroyed && !s.IsDisabled && s.ActiveAuras.Count > 0) return true;
-        foreach (var se in owner.SocketEffects)
-            if (!se.IsDestroyed && !se.IsDisabled && se.ActiveAuras.Count > 0) return true;
-        foreach (var pe in owner.PlayerEffects)
-            if (!pe.IsDestroyed && !pe.IsDisabled && pe.ActiveAuras.Count > 0) return true;
-        foreach (var c in owner.Stash.Cards)
-            if (!c.IsDestroyed && !c.IsDisabled && c.ActiveAuras.Count > 0) return true;
+        return ListHasActiveAura(owner.Hand.Cards)
+            || ListHasActiveAura(owner.Skills)
+            || ListHasActiveAura(owner.SocketEffects)
+            || ListHasActiveAura(owner.PlayerEffects)
+            || ListHasActiveAura(owner.Stash.Cards);
+    }
+
+    private static bool ListHasActiveAura(List<CardInstance> cards)
+    {
+        for (int i = 0; i < cards.Count; i++)
+        {
+            var c = cards[i];
+            if (!c.IsDestroyed && !c.IsDisabled && c.ActiveAuras.Count > 0)
+                return true;
+        }
         return false;
     }
 
     private sealed class AuraStagingBuffer
     {
-        public readonly List<(CardInstance Target, string Attr, string Op, double Value)> CardAttrs = new();
-        public readonly List<(PlayerState Target, string Attr, string Op, double Value)> PlayerAttrs = new();
-        public readonly List<(CardInstance Target, string Tag)> CardTags = new();
+        public readonly List<(CardInstance Target, string Attr, string Op, double Value)> CardAttrs = new(32);
+        public readonly List<(PlayerState Target, string Attr, string Op, double Value)> PlayerAttrs = new(8);
+        public readonly List<(CardInstance Target, string Tag)> CardTags = new(16);
+
+        public bool IsEmpty => CardAttrs.Count == 0 && PlayerAttrs.Count == 0 && CardTags.Count == 0;
 
         public void Clear()
         {
             CardAttrs.Clear();
             PlayerAttrs.Clear();
             CardTags.Clear();
+        }
+
+        public bool EqualsBuffer(AuraStagingBuffer other)
+        {
+            if (CardAttrs.Count != other.CardAttrs.Count
+                || PlayerAttrs.Count != other.PlayerAttrs.Count
+                || CardTags.Count != other.CardTags.Count)
+                return false;
+
+            for (int i = 0; i < CardAttrs.Count; i++)
+            {
+                var a = CardAttrs[i];
+                var b = other.CardAttrs[i];
+                if (!ReferenceEquals(a.Target, b.Target)
+                    || !string.Equals(a.Attr, b.Attr, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(a.Op, b.Op, StringComparison.Ordinal)
+                    || Math.Abs(a.Value - b.Value) > 1e-9)
+                    return false;
+            }
+            for (int i = 0; i < PlayerAttrs.Count; i++)
+            {
+                var a = PlayerAttrs[i];
+                var b = other.PlayerAttrs[i];
+                if (!ReferenceEquals(a.Target, b.Target)
+                    || !string.Equals(a.Attr, b.Attr, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(a.Op, b.Op, StringComparison.Ordinal)
+                    || Math.Abs(a.Value - b.Value) > 1e-9)
+                    return false;
+            }
+            for (int i = 0; i < CardTags.Count; i++)
+            {
+                var a = CardTags[i];
+                var b = other.CardTags[i];
+                if (!ReferenceEquals(a.Target, b.Target)
+                    || !string.Equals(a.Tag, b.Tag, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+            return true;
         }
 
         public void Commit()
@@ -246,7 +474,8 @@ public static class AuraEngine
             for (int i = 0; i < CardTags.Count; i++)
             {
                 var (t, tag) = CardTags[i];
-                t.AuraTags.Add(tag);
+                if (t.AuraTags.Add(tag))
+                    t.MarkAttributeDirty();
             }
         }
     }
@@ -275,7 +504,25 @@ public static class AuraEngine
             IncludeCommon = valNode.IncludeCommon,
             Target = SelfTargetNode
         };
-        double raw = ValueAndConditionEvaluator.EvaluateValue(baseNode, sourceCtx.WithCards(target, sourceCard, target), valNode.DefaultValue ?? 0);
+
+        var prevSelf = sourceCtx.SelfCard;
+        var prevSrc = sourceCtx.TriggerSourceCard;
+        var prevTgt = sourceCtx.TriggerTargetCard;
+        double raw;
+        try
+        {
+            sourceCtx.SelfCard = target;
+            sourceCtx.TriggerSourceCard = sourceCard;
+            sourceCtx.TriggerTargetCard = target;
+            raw = ValueAndConditionEvaluator.EvaluateValue(baseNode, sourceCtx, valNode.DefaultValue ?? 0);
+        }
+        finally
+        {
+            sourceCtx.SelfCard = prevSelf;
+            sourceCtx.TriggerSourceCard = prevSrc;
+            sourceCtx.TriggerTargetCard = prevTgt;
+        }
+
         var modifier = valNode.Modifier;
         if (modifier?.Value == null) return raw;
 
@@ -301,8 +548,9 @@ public static class AuraEngine
         int hour,
         GameDataRepository? repo,
         string localPlayerId,
+        IReadOnlyList<CardInstance>? selectionCards,
         Dictionary<CardInstance, CardInstance>? flyingGranters,
-        AuraStagingBuffer? staging)
+        AuraStagingBuffer staging)
     {
         if (!HasAnyActiveAura(owner)) return;
 
@@ -311,7 +559,8 @@ public static class AuraEngine
         {
             LocalPlayerId = localPlayerId,
             CurrentDay = day,
-            CurrentHour = hour
+            CurrentHour = hour,
+            SelectionCards = selectionCards
         };
 
         ApplyCardListAuras(owner.Hand.Cards, inHand: true, scope, baseCtx, flyingGranters, staging);
@@ -326,9 +575,9 @@ public static class AuraEngine
         List<CardInstance> cards,
         bool inHand,
         RuleScope scope,
-        RuleExecutionContext baseCtx,
+        RuleExecutionContext ctx,
         Dictionary<CardInstance, CardInstance>? flyingGranters,
-        AuraStagingBuffer? staging)
+        AuraStagingBuffer staging)
     {
         for (int i = 0; i < cards.Count; i++)
         {
@@ -341,7 +590,10 @@ public static class AuraEngine
                 if (!IsWorksInMatch(aura.WorksIn, scope)) continue;
                 if (!IsActiveInMatch(aura.ActiveIn, inHand, scope)) continue;
 
-                var ctx = baseCtx.WithCards(card, card);
+                // 复用单实例上下文，消除每张卡每条光环的 RuleExecutionContext 堆分配
+                ctx.SelfCard = card;
+                ctx.TriggerSourceCard = card;
+                ctx.TriggerTargetCard = null;
                 if (!ValueAndConditionEvaluator.EvaluatePrerequisites(aura.Prerequisites, ctx))
                     continue;
 
@@ -351,6 +603,9 @@ public static class AuraEngine
                 ApplyAuraAction(action, card, ctx, flyingGranters, staging);
             }
         }
+        ctx.SelfCard = null;
+        ctx.TriggerSourceCard = null;
+        ctx.TriggerTargetCard = null;
     }
 
     /// <summary>判断给定的光环动作 $type 是否已被光环引擎显式支持。</summary>
@@ -365,7 +620,7 @@ public static class AuraEngine
         CardInstance sourceCard,
         RuleExecutionContext ctx,
         Dictionary<CardInstance, CardInstance>? flyingGranters,
-        AuraStagingBuffer? staging)
+        AuraStagingBuffer staging)
     {
         switch (action.Type)
         {
@@ -379,16 +634,15 @@ public static class AuraEngine
                 if (double.IsNaN(sharedVal) || double.IsInfinity(sharedVal)) sharedVal = 0;
                 var attr = action.AttributeType ?? "Custom_0";
                 var op = action.Operation ?? "Add";
-                foreach (var target in TargetResolver.ResolveCards(action.Target, ctx))
+                var targets = TargetResolver.ResolveCards(action.Target, ctx);
+                for (int i = 0; i < targets.Count; i++)
                 {
+                    var target = targets[i];
                     double val = perTargetEval
                         ? EvaluateAuraCardValueForTarget(valNode!, target, sourceCard, ctx)
                         : sharedVal;
                     if (double.IsNaN(val) || double.IsInfinity(val)) val = 0;
-                    if (staging != null)
-                        staging.CardAttrs.Add((target, attr, op, val));
-                    else
-                        target.ApplyAuraAttribute(attr, op, val);
+                    staging.CardAttrs.Add((target, attr, op, val));
 
                     bool grantsFlying = flyingGranters != null
                         && attr.Equals("Flying", StringComparison.OrdinalIgnoreCase)
@@ -405,39 +659,43 @@ public static class AuraEngine
                 if (double.IsNaN(val) || double.IsInfinity(val)) val = 0;
                 var attr = action.AttributeType ?? "HealthMax";
                 var op = action.Operation ?? "Add";
-                foreach (var targetPlayer in TargetResolver.ResolvePlayers(action.Target, ctx))
-                {
-                    if (staging != null)
-                        staging.PlayerAttrs.Add((targetPlayer, attr, op, val));
-                    else
-                        targetPlayer.ApplyAuraAttribute(attr, op, val);
-                }
+                var targets = TargetResolver.ResolvePlayers(action.Target, ctx);
+                for (int i = 0; i < targets.Count; i++)
+                    staging.PlayerAttrs.Add((targets[i], attr, op, val));
                 break;
             }
             case "TAuraActionCardAddTagsList":
             {
-                if (action.Tags == null) break;
-                foreach (var target in TargetResolver.ResolveCards(action.Target, ctx))
+                if (action.Tags == null || action.Tags.Count == 0) break;
+                var targets = TargetResolver.ResolveCards(action.Target, ctx);
+                for (int i = 0; i < targets.Count; i++)
                 {
-                    foreach (var tag in action.Tags)
-                    {
-                        if (staging != null) staging.CardTags.Add((target, tag));
-                        else target.AuraTags.Add(tag);
-                    }
+                    var target = targets[i];
+                    for (int t = 0; t < action.Tags.Count; t++)
+                        staging.CardTags.Add((target, action.Tags[t]));
                 }
                 break;
             }
             case "TAuraActionCardAddTagsBySource":
             {
                 var sources = action.Source != null ? TargetResolver.ResolveCards(action.Source, ctx) : [sourceCard];
-                var tags = sources.SelectMany(s => s.GetAllTags()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                foreach (var target in TargetResolver.ResolveCards(action.Target, ctx))
+                var seenTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var tags = new List<string>(8);
+                for (int s = 0; s < sources.Count; s++)
                 {
-                    foreach (var tag in tags)
+                    foreach (var tag in sources[s].GetAllTags())
                     {
-                        if (staging != null) staging.CardTags.Add((target, tag));
-                        else target.AuraTags.Add(tag);
+                        if (seenTags.Add(tag))
+                            tags.Add(tag);
                     }
+                }
+                if (tags.Count == 0) break;
+                var targets = TargetResolver.ResolveCards(action.Target, ctx);
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    var target = targets[i];
+                    for (int t = 0; t < tags.Count; t++)
+                        staging.CardTags.Add((target, tags[t]));
                 }
                 break;
             }

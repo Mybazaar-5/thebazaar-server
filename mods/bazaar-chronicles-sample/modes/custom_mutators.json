@@ -1,0 +1,39 @@
+{
+  "$schema": "https://bazaar-local.schema/mod-custom-mutators/v1",
+  "schemaVersion": 1,
+  "modId": "bazaar-chronicles-sample",
+  "mutators": [
+    {
+      "id": "bazaar-chronicles-sample:mutator_starport_boom",
+      "nameZh": "星港商潮",
+      "nameEn": "Starport Trade Boom",
+      "category": "Economy",
+      "difficultyDelta": 1,
+      "enabledByDefault": false,
+      "descriptionZh": "星港进入贸易黄金季：开局额外获得 +8 金币与 +2 每日收入，每个商店首次刷新免费；但所有野怪最大生命值提高 15%，鼓励高经济发育与星港奇物联动。",
+      "rules": {
+        "startingGoldDelta": 8,
+        "startingIncomeDelta": 2,
+        "freeFirstShopReroll": true,
+        "monsterHealthMultiplier": 1.15,
+        "boostModCardWeight": 1.5
+      }
+    },
+    {
+      "id": "bazaar-chronicles-sample:mutator_ember_tempest",
+      "nameZh": "余烬风暴",
+      "nameEn": "Ember Tempest",
+      "category": "Combat",
+      "difficultyDelta": 2,
+      "enabledByDefault": false,
+      "descriptionZh": "战斗进入高能白热化：每场战斗经过 12 秒后，双方同步受到 4 层灼烧且每秒为全场所有物品充能 0.25 秒；沙暴提前 5 秒降临，强化灼烧与护盾对轰体验。",
+      "rules": {
+        "combatPeriodicTriggerAfterMs": 12000,
+        "combatPeriodicIntervalMs": 1000,
+        "combatBothApplyBurn": 4,
+        "combatAllItemsChargeMsPerTick": 250,
+        "sandstormCountdownDeltaMs": -5000
+      }
+    }
+  ]
+}

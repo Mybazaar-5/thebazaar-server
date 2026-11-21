@@ -10,6 +10,9 @@ namespace BazaarCore.Engine;
 /// </summary>
 public static class SpawnQueryEngine
 {
+    private static readonly CardTier[] AllCardTiers = Enum.GetValues<CardTier>();
+    private static readonly HashSet<string> PlayableHeroSet = new(HeroNames.PlayableHeroes, StringComparer.OrdinalIgnoreCase);
+
     /// <summary>
     /// 经由 GameData.db + valid_card_ids.json + zh-CN.bytes 核验的重点 GuidOnly 模板显式白名单：
     /// 涵盖 Fates (Futura) 及其 Crossroads 基座、The Travel Agent、Surprise Me、Expedition 房间/门票与衍生设备。
@@ -332,16 +335,41 @@ public static class SpawnQueryEngine
         IReadOnlyList<CardTemplate> candidates,
         Random rng,
         Func<string, ulong>? archetypeResolver,
-        CustomRunRuleSet? rules)
+        CustomRunRuleSet? rules,
+        string? playerHero = null)
     {
+        if (candidates.Count <= 1)
+            return candidates[0];
+
+        // 跨英雄混池模式（CrossHeroMayhem）：按 OwnHeroWeightBias（默认 40%）保护本英雄核心组件抽中率，其余 60% 分布于跨英雄池
+        IReadOnlyList<CardTemplate> effectivePool = candidates;
+        if (rules?.SpecialModeId == ESpecialModeId.CrossHeroMayhem && !string.IsNullOrEmpty(playerHero))
+        {
+            var ownHeroCards = new List<CardTemplate>();
+            var otherHeroCards = new List<CardTemplate>();
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                var c = candidates[i];
+                if (c.Heroes.Contains(playerHero, StringComparer.OrdinalIgnoreCase))
+                    ownHeroCards.Add(c);
+                else
+                    otherHeroCards.Add(c);
+            }
+            if (ownHeroCards.Count > 0 && otherHeroCards.Count > 0)
+            {
+                double bias = Math.Clamp(rules.CrossHeroOwnHeroBias, 0.0, 1.0);
+                effectivePool = rng.NextDouble() < bias ? ownHeroCards : otherHeroCards;
+            }
+        }
+
         ulong selectedMask = rules?.SelectedArchetypeMask ?? 0UL;
-        if (candidates.Count <= 1 || selectedMask == 0UL || archetypeResolver == null)
-            return candidates[rng.Next(candidates.Count)];
+        if (effectivePool.Count <= 1 || selectedMask == 0UL || archetypeResolver == null)
+            return effectivePool[rng.Next(effectivePool.Count)];
 
         double weight = rules!.ArchetypeWeightMultiplier;
         double cap = rules.ArchetypeMultiMatchCap;
         return PickWeighted(
-            candidates,
+            effectivePool,
             tpl => tpl.Type is "Item" or "Skill"
                 ? WeightMultiplierForMask(archetypeResolver(tpl.Id), selectedMask, weight, cap)
                 : 1.0,
@@ -502,12 +530,24 @@ public static class SpawnQueryEngine
                 // - Skill / 遭遇卡：允许当前玩家英雄（或 ExcludePlayerHero 下的其他英雄）及 Common 归属卡。
                 if (!ignoreHero && !hasPositiveHeroConstraint)
                 {
-                    bool matchesAllowedHero = excludePlayerHero
-                        ? (tpl.Heroes.Count == 0
+                    bool isCrossHeroMayhem = rules?.SpecialModeId == ESpecialModeId.CrossHeroMayhem;
+                    bool matchesAllowedHero;
+                    if (excludePlayerHero)
+                    {
+                        matchesAllowedHero = tpl.Heroes.Count == 0
                             || tpl.Heroes.Any(h => !string.Equals(h, HeroNames.Common, StringComparison.OrdinalIgnoreCase)
-                                                && !string.Equals(h, ctx.SelfPlayer.Hero, StringComparison.OrdinalIgnoreCase)))
-                        : (tpl.Heroes.Count == 0
-                            || tpl.Heroes.Contains(ctx.SelfPlayer.Hero, StringComparer.OrdinalIgnoreCase));
+                                                && !string.Equals(h, ctx.SelfPlayer.Hero, StringComparison.OrdinalIgnoreCase));
+                    }
+                    else if (isCrossHeroMayhem && tpl.Type is "Item" or "Skill")
+                    {
+                        matchesAllowedHero = tpl.Heroes.Count == 0
+                            || tpl.Heroes.Any(h => PlayableHeroSet.Contains(h));
+                    }
+                    else
+                    {
+                        matchesAllowedHero = tpl.Heroes.Count == 0
+                            || tpl.Heroes.Contains(ctx.SelfPlayer.Hero, StringComparer.OrdinalIgnoreCase);
+                    }
                     bool allowCommon = !string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)
                                     || idListFilter != null
                                     || includeCommonAndHero
@@ -532,9 +572,18 @@ public static class SpawnQueryEngine
                 var constrained = ParseConstrainedTiers(tierConstraint);
                 if (constrained.Count > 0)
                 {
-                    bool hasValidTier = Enum.GetValues<CardTier>()
-                        .Where(t => tierConstraint.IsNot == true ? !constrained.Contains(t) : constrained.Contains(t))
-                        .Any(t => t >= tpl.DefaultTier && SupportsTier(tpl, t));
+                    bool isNot = tierConstraint.IsNot == true;
+                    bool hasValidTier = false;
+                    for (int ti = 0; ti < AllCardTiers.Length; ti++)
+                    {
+                        var t = AllCardTiers[ti];
+                        bool matchesConstraint = isNot ? !constrained.Contains(t) : constrained.Contains(t);
+                        if (matchesConstraint && t >= tpl.DefaultTier && SupportsTier(tpl, t))
+                        {
+                            hasValidTier = true;
+                            break;
+                        }
+                    }
                     if (!hasValidTier)
                         return false;
                 }
@@ -563,7 +612,7 @@ public static class SpawnQueryEngine
             if (ownedPool.Count > 0)
             {
                 var pickedOwned = ownedPool[ctx.Rng.Next(ownedPool.Count)];
-                string? upgEnch = BuildSpawnEnchantment(pickedOwned.Template, behaviors, filters, inheritEnch ? ctx.SelfCard : null, ctx.Rng);
+                string? upgEnch = BuildSpawnEnchantment(pickedOwned.Template, behaviors, filters, inheritEnch ? ctx.SelfCard : null, ctx.Rng, rules);
                 return new CardInstance(pickedOwned.Template, pickedOwned.Tier, upgEnch)
                 {
                     AttachedStandardPrices = ctx.Repo?.GameMode.StandardPrices
@@ -586,12 +635,12 @@ public static class SpawnQueryEngine
         }
         else if (HasExplicitCardTypeConstraint(filters))
         {
-            // 若查询过滤器显式约束了 CardType（例如 Street Festival 抽 EventEncounter 商人），不硬编码限定为 Item||Skill
-            pool = ctx.Repo.CardsById.Values.Where(c => c.SpawningEligibility == "Always");
+            // 若查询过滤器显式约束了 CardType（例如 Street Festival 抽 EventEncounter 商人），直接复用预建冻结索引
+            pool = ctx.Repo.AlwaysSpawnableAll;
         }
         else
         {
-            pool = ctx.Repo.CardsById.Values.Where(c => c.SpawningEligibility == "Always" && (c.Type == "Item" || c.Type == "Skill"));
+            pool = ctx.Repo.AlwaysSpawnableItemsAndSkills;
         }
 
         bool isOwnedPool = targetTemplateIds != null;
@@ -675,7 +724,7 @@ public static class SpawnQueryEngine
             var excludedTiers = (tierConstraint != null && tierConstraint.IsNot == true)
                 ? ParseConstrainedTiers(tierConstraint)
                 : null;
-            if (!TryPickByDayTierFirst(candidates, ctx.CurrentDay, downShiftTier, ctx.Rng, ctx.Repo?.GameMode, excludedTiers, ownedLookup, archetypeResolver, rules, out chosen!, out tier))
+            if (!TryPickByDayTierFirst(candidates, ctx.CurrentDay, downShiftTier, ctx.Rng, ctx.Repo?.GameMode, excludedTiers, ownedLookup, archetypeResolver, rules, ctx.SelfPlayer.Hero, out chosen!, out tier))
                 return null;
         }
         else if (forcedTiers.Count > 0 && idListFilter == null && targetTemplateIds == null)
@@ -685,7 +734,7 @@ public static class SpawnQueryEngine
                 : candidates.Where(c => c.Type != "Item" || GetValidForcedTiersForCandidate(c, forcedTiers, ownedLookup).Count > 0).ToList();
             if (forcedPool.Count == 0) return null;
 
-            chosen = PickCandidateWithArchetypeWeight(forcedPool, ctx.Rng, archetypeResolver, rules);
+            chosen = PickCandidateWithArchetypeWeight(forcedPool, ctx.Rng, archetypeResolver, rules, ctx.SelfPlayer.Hero);
             if (chosen.Type is "Item" or "Skill")
             {
                 var validForced = GetValidForcedTiersForCandidate(chosen, forcedTiers, ownedLookup);
@@ -748,12 +797,12 @@ public static class SpawnQueryEngine
                 if (matchedTierPool == null || matchedTierPool.Count == 0)
                     return null;
 
-                chosen = PickCandidateWithArchetypeWeight(matchedTierPool, ctx.Rng, archetypeResolver, rules);
+                chosen = PickCandidateWithArchetypeWeight(matchedTierPool, ctx.Rng, archetypeResolver, rules, ctx.SelfPlayer.Hero);
                 tier = ClampToSupportedTier(chosen, resolvedTier);
             }
             else
             {
-                chosen = PickCandidateWithArchetypeWeight(candidates, ctx.Rng, archetypeResolver, rules);
+                chosen = PickCandidateWithArchetypeWeight(candidates, ctx.Rng, archetypeResolver, rules, ctx.SelfPlayer.Hero);
                 tier = ClampToSupportedTier(chosen, chosen.DefaultTier);
             }
         }
@@ -775,7 +824,7 @@ public static class SpawnQueryEngine
                 candidates = eligibleForOwned;
             }
 
-            chosen = PickCandidateWithArchetypeWeight(candidates, ctx.Rng, archetypeResolver, rules);
+            chosen = PickCandidateWithArchetypeWeight(candidates, ctx.Rng, archetypeResolver, rules, ctx.SelfPlayer.Hero);
             if (forcedTiers.Count > 0 && chosen.Type is "Item" or "Skill")
             {
                 var validForced = GetValidForcedTiersForCandidate(chosen, forcedTiers, ownedLookup);
@@ -791,7 +840,7 @@ public static class SpawnQueryEngine
             }
         }
 
-        string? enchant = BuildSpawnEnchantment(chosen, behaviors, filters, inheritEnch ? ctx.SelfCard : null, ctx.Rng);
+        string? enchant = BuildSpawnEnchantment(chosen, behaviors, filters, inheritEnch ? ctx.SelfCard : null, ctx.Rng, rules);
 
         return new CardInstance(chosen, tier, enchant)
         {
@@ -804,7 +853,8 @@ public static class SpawnQueryEngine
         List<RuleNode> behaviors,
         List<RuleNode> filters,
         CardInstance? inheritSource,
-        Random rng)
+        Random rng,
+        CustomRunRuleSet? rules = null)
     {
         bool disableInherit = behaviors.Any(b => b.Type == "TSpawnBehaviorInheritEnchantment" && b.Inherits == false);
         string? rawInherited = disableInherit ? null : inheritSource?.Enchantment;
@@ -862,6 +912,23 @@ public static class SpawnQueryEngine
                     enchant = PickWeightedEnchantmentName(valid, rng);
             }
         }
+
+        // 肉鸽突变词条：all_enchanted（万物附魔）保证生成的所有物品 100% 附带合法随机附魔
+        if (string.IsNullOrEmpty(enchant)
+            && rules?.HasMutator(MutatorCatalog.AllEnchanted) == true
+            && string.Equals(chosen.Type, "Item", StringComparison.OrdinalIgnoreCase)
+            && chosen.Enchantments is { Count: > 0 } allEnchSupported)
+        {
+            var allEligible = new List<string>(allEnchSupported.Count);
+            for (int i = 0; i < EnchantmentNames.All.Length; i++)
+            {
+                var e = EnchantmentNames.All[i];
+                if (allEnchSupported.ContainsKey(e)) allEligible.Add(e);
+            }
+            if (allEligible.Count > 0)
+                enchant = allEligible[rng.Next(allEligible.Count)];
+        }
+
         return enchant;
     }
 
@@ -1194,6 +1261,7 @@ public static class SpawnQueryEngine
         Dictionary<string, CardTier>? ownedLookup,
         Func<string, ulong>? archetypeResolver,
         CustomRunRuleSet? rules,
+        string? playerHero,
         out CardTemplate? chosen,
         out CardTier chosenTier)
     {
@@ -1201,6 +1269,28 @@ public static class SpawnQueryEngine
         chosenTier = CardTier.Bronze;
 
         var (bronze, silver, gold, diamond) = GetEffectiveDayTierWeights(gameMode, day);
+        // 预设档位高阶概率加成（EnhancedFun: Silver+ +15%；ExtremeRoguelike: Gold+ +20%）
+        if (rules != null && rules.ShopHighTierBonusPct > 1e-6)
+        {
+            double bonus = Math.Clamp(rules.ShopHighTierBonusPct, 0.0, 60.0);
+            if (rules.PresetId == EGameModePreset.ExtremeRoguelike)
+            {
+                double take = Math.Min(bronze + silver, bonus);
+                double fromBronze = Math.Min(bronze, take);
+                bronze -= fromBronze;
+                silver -= (take - fromBronze);
+                gold += take * 0.75;
+                diamond += take * 0.25;
+            }
+            else
+            {
+                double fromBronze = Math.Min(bronze, bonus);
+                bronze -= fromBronze;
+                silver += fromBronze * 0.80;
+                gold += fromBronze * 0.20;
+            }
+        }
+
         double[] weights = [bronze, silver, gold, diamond];
         if (excludedTiers != null)
         {
@@ -1220,10 +1310,6 @@ public static class SpawnQueryEngine
                             : roll < weights[0] + weights[1] + weights[2] ? CardTier.Gold
                             : CardTier.Diamond;
 
-        // 先按当日掷出的目标品阶过滤（保证 DefaultTier <= targetTier 且支持 targetTier，且不低于玩家已拥有品阶）；
-        // 若该档位候选池为空：
-        // - downShift == true（TSpawnBehaviorDownShiftTier）：优先从 targetTier - 1 逐阶向下尝试至 Bronze（允许越过当日权重为 0 的低阶，如 Day 6+ Bronze=0% 时纯青铜卡池仍可回退命中），若仍空再尝试其余权重 > 0 的邻阶；
-        // - downShift == false：仅在当日权重 > 0 的允许品阶间回退（绝不向权重为 0 的高阶/低阶泄露，如 Day 1 的 Gold/Diamond）。
         var tryOrder = new List<CardTier>(4);
         if (weights[(int)targetTier] > 0)
             tryOrder.Add(targetTier);
@@ -1255,7 +1341,7 @@ public static class SpawnQueryEngine
                 .ToList();
             if (matching.Count > 0)
             {
-                chosen = PickCandidateWithArchetypeWeight(matching, rng, archetypeResolver, rules);
+                chosen = PickCandidateWithArchetypeWeight(matching, rng, archetypeResolver, rules, playerHero);
                 chosenTier = chosen.Type is "Item" or "Skill"
                     ? ClampToSupportedTier(chosen, tier)
                     : ClampToSupportedTier(chosen, chosen.DefaultTier);
@@ -1267,7 +1353,7 @@ public static class SpawnQueryEngine
         var nonItemSkill = candidates.Where(c => c.Type is not ("Item" or "Skill")).ToList();
         if (nonItemSkill.Count > 0)
         {
-            chosen = PickCandidateWithArchetypeWeight(nonItemSkill, rng, archetypeResolver, rules);
+            chosen = PickCandidateWithArchetypeWeight(nonItemSkill, rng, archetypeResolver, rules, playerHero);
             chosenTier = ClampToSupportedTier(chosen, chosen.DefaultTier);
             return true;
         }

@@ -70,6 +70,7 @@ public sealed class GameDatabaseLoader
                 var card = JsonSerializer.Deserialize<CardTemplate>(json, JsonOptions)
                     ?? throw new InvalidDataException($"反序列化卡牌失败: {id}");
                 if (string.IsNullOrEmpty(card.Id)) card.Id = id;
+                PrecompileCardTemplateRules(card);
                 cards[card.Id] = card;
             }
         }
@@ -106,6 +107,8 @@ public sealed class GameDatabaseLoader
                 var lu = JsonSerializer.Deserialize<LevelUpTemplate>(json, JsonOptions)
                     ?? throw new InvalidDataException($"反序列化等级奖励失败: {id}");
                 if (lu.Level == 0) lu.Level = id;
+                PrecompileRuleNode(lu.Rewards);
+                PrecompileRuleNode(lu.TutorialRewards);
                 levelUps[lu.Level] = lu;
             }
         }
@@ -149,9 +152,7 @@ public sealed class GameDatabaseLoader
             }
         }
 
-        // 6. 兼容补齐 GameData.db 缺失的白名单卡（例如仅存于同目录 cards.json 或 dist/data/cards.json 的 13 张有效卡），绝不覆盖 db 已有模板
-        SupplementMissingCardsFromJson(sourcePath, dbPath, cards, observedTypes, unknownTypes);
-
+        // 6. 单一权威信源：严格以 GameData.db 为准，不再回读过期 21.5 MB cards.json（消除 60MB 临时堆与旧卡污染）
         var localization = LocalizationLoader.Load(customTranslationPath);
         var primaryMode = gameModes.FirstOrDefault() ?? new GameModeData();
         return new GameDataRepository(
@@ -167,103 +168,132 @@ public sealed class GameDatabaseLoader
             sourcePath);
     }
 
-    private static void SupplementMissingCardsFromJson(
-        string sourcePath,
-        string dbPath,
-        Dictionary<string, CardTemplate> cards,
-        HashSet<string> observedTypes,
-        HashSet<string> unknownTypes)
+    /// <summary>
+    /// 加载期一次性预编译卡牌模板下所有 RuleNode 的延迟反序列化字段（Value/Conditions/Constraints/ComparisonValue/Enchantments），
+    /// 彻底消除战斗和抽卡热路径上的 JsonElement.Deserialize 与 GC 分配（Top #13）。
+    /// </summary>
+    internal static void PrecompileCardTemplateRules(CardTemplate card)
     {
-        var cardsJsonPath = ResolveCompanionFilePath(sourcePath, dbPath, "cards.json");
-        if (string.IsNullOrEmpty(cardsJsonPath) || !File.Exists(cardsJsonPath))
-            return;
-
-        HashSet<string>? validIds = null;
-        var validIdsPath = Path.Combine(Path.GetDirectoryName(cardsJsonPath)!, "valid_card_ids.json");
-        if (File.Exists(validIdsPath))
+        if (card == null) return;
+        foreach (var ab in card.Abilities.Values) PrecompileAbility(ab);
+        foreach (var au in card.Auras.Values) PrecompileAura(au);
+        if (card.Enchantments != null)
         {
-            try
+            foreach (var ench in card.Enchantments.Values)
             {
-                using var validDoc = JsonDocument.Parse(File.ReadAllText(validIdsPath));
-                if (validDoc.RootElement.TryGetProperty("valid_ids", out var arr) && arr.ValueKind == JsonValueKind.Array)
-                {
-                    validIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var el in arr.EnumerateArray())
-                    {
-                        var id = el.GetString();
-                        if (!string.IsNullOrWhiteSpace(id)) validIds.Add(id);
-                    }
-                }
-            }
-            catch
-            {
-                validIds = null;
+                foreach (var ab in ench.Abilities.Values) PrecompileAbility(ab);
+                foreach (var au in ench.Auras.Values) PrecompileAura(au);
             }
         }
-
-        try
+        if (card.Quests != null)
         {
-            using var doc = JsonDocument.Parse(File.ReadAllText(cardsJsonPath));
-            IEnumerable<JsonElement> EnumerateCardElements(JsonElement root)
+            for (int i = 0; i < card.Quests.Count; i++)
             {
-                if (root.ValueKind == JsonValueKind.Array)
+                var q = card.Quests[i];
+                PrecompileRuleList(q.Prerequisites);
+                PrecompileRuleList(q.Repeatable?.Prerequisites);
+                for (int j = 0; j < q.Entries.Count; j++)
                 {
-                    foreach (var el in root.EnumerateArray()) yield return el;
+                    var entry = q.Entries[j];
+                    PrecompileRuleList(entry.Prerequisites);
+                    PrecompileRuleNode(entry.Trigger);
+                    PrecompileRuleNode(entry.Update?.Value);
+                    PrecompileRuleNode(entry.Update?.Duration);
+                    if (entry.Reward?.Abilities != null)
+                        foreach (var ab in entry.Reward.Abilities.Values) PrecompileAbility(ab);
+                    if (entry.Reward?.Auras != null)
+                        foreach (var au in entry.Reward.Auras.Values) PrecompileAura(au);
+                    if (entry.CompletionEffects != null)
+                        foreach (var eff in entry.CompletionEffects.Values) PrecompileAbility(eff);
                 }
-                else if (root.ValueKind == JsonValueKind.Object)
-                {
-                    foreach (var prop in root.EnumerateObject())
-                    {
-                        if (prop.Value.ValueKind == JsonValueKind.Array)
-                        {
-                            foreach (var el in prop.Value.EnumerateArray()) yield return el;
-                        }
-                    }
-                }
-            }
-
-            foreach (var el in EnumerateCardElements(doc.RootElement))
-            {
-                if (el.ValueKind != JsonValueKind.Object) continue;
-                var id = el.TryGetProperty("Id", out var idEl) ? idEl.GetString() : null;
-                if (string.IsNullOrWhiteSpace(id) || cards.ContainsKey(id))
-                    continue;
-                if (validIds != null && !validIds.Contains(id))
-                    continue;
-
-                var card = el.Deserialize<CardTemplate>(JsonOptions);
-                if (card == null) continue;
-                if (string.IsNullOrEmpty(card.Id)) card.Id = id;
-                if (cards.ContainsKey(card.Id)) continue;
-
-                WalkJsonTypes(el, observedTypes, unknownTypes);
-                cards[card.Id] = card;
             }
         }
-        catch
+        if (card.Transform != null)
         {
-            // 若外部 cards.json 解析异常则静默跳过，保障 GameData.db 主库正常加载
+            PrecompileRuleNode(card.Transform.SpawnContext);
+            if (card.Transform.Abilities != null)
+                foreach (var ab in card.Transform.Abilities.Values) PrecompileAbility(ab);
+            if (card.Transform.Auras != null)
+                foreach (var au in card.Transform.Auras.Values) PrecompileAura(au);
+        }
+        PrecompileRuleNode(card.SelectionContext?.SpawnContext);
+        PrecompileRuleNode(card.SelectionRequirements);
+        PrecompileRuleNode(card.SelectionCriteria);
+        PrecompileRuleNode(card.CombatantType);
+        PrecompileRuleNode(card.RewardVictory?.SpawnContext);
+        PrecompileRuleNode(card.RewardDefeat?.SpawnContext);
+        PrecompileRuleNode(card.Behavior);
+        if (card.NextEncounterOnSelection != null)
+        {
+            for (int i = 0; i < card.NextEncounterOnSelection.Count; i++)
+                PrecompileRuleList(card.NextEncounterOnSelection[i].Prerequisites);
         }
     }
 
-    private static string? ResolveCompanionFilePath(string sourcePath, string dbPath, string fileName)
+    private static void PrecompileAbility(AbilityDefinition? ab)
     {
-        var candidateDirs = new List<string>();
-        var srcDir = Path.GetDirectoryName(sourcePath);
-        if (!string.IsNullOrWhiteSpace(srcDir)) candidateDirs.Add(srcDir);
-        var dbDir = Path.GetDirectoryName(dbPath);
-        if (!string.IsNullOrWhiteSpace(dbDir) && !string.Equals(dbDir, srcDir, StringComparison.OrdinalIgnoreCase))
-            candidateDirs.Add(dbDir);
-        candidateDirs.Add(Path.Combine(Environment.CurrentDirectory, "dist", "data"));
-        candidateDirs.Add(@"e:\thebazaar\dist\data");
+        if (ab == null) return;
+        PrecompileRuleNode(ab.Trigger);
+        PrecompileRuleNode(ab.Action);
+        PrecompileRuleList(ab.Prerequisites);
+    }
 
-        foreach (var dir in candidateDirs)
-        {
-            var candidate = Path.Combine(dir, fileName);
-            if (File.Exists(candidate))
-                return candidate;
-        }
-        return null;
+    private static void PrecompileAura(AuraDefinition? au)
+    {
+        if (au == null) return;
+        PrecompileRuleNode(au.Action);
+        PrecompileRuleList(au.Prerequisites);
+    }
+
+    private static void PrecompileRuleList(List<RuleNode>? list)
+    {
+        if (list == null) return;
+        for (int i = 0; i < list.Count; i++)
+            PrecompileRuleNode(list[i]);
+    }
+
+    internal static void PrecompileRuleNode(RuleNode? node, int depth = 0)
+    {
+        if (node == null || depth > 24) return;
+
+        // 触发并缓存全部延迟解析字段
+        PrecompileRuleNode(node.GetValueNode(JsonOptions), depth + 1);
+        PrecompileRuleNode(node.GetComparisonValueNode(JsonOptions), depth + 1);
+        PrecompileRuleNode(node.GetSingleCondition(JsonOptions), depth + 1);
+        var condList = node.GetConditionList(JsonOptions);
+        for (int i = 0; i < condList.Count; i++)
+            PrecompileRuleNode(condList[i], depth + 1);
+        PrecompileRuleNode(node.GetSingleConstraint(JsonOptions), depth + 1);
+        var consList = node.GetConstraintList(JsonOptions);
+        for (int i = 0; i < consList.Count; i++)
+            PrecompileRuleNode(consList[i], depth + 1);
+        _ = node.GetWeightedEnchantments();
+
+        PrecompileRuleNode(node.ReferenceValue, depth + 1);
+        PrecompileRuleNode(node.Target, depth + 1);
+        PrecompileRuleNode(node.TargetPlayer, depth + 1);
+        PrecompileRuleNode(node.TargetCount, depth + 1);
+        PrecompileRuleNode(node.Source, depth + 1);
+        PrecompileRuleNode(node.Subject, depth + 1);
+        PrecompileRuleNode(node.SubjectOther, depth + 1);
+        PrecompileRuleNode(node.Duration, depth + 1);
+        PrecompileRuleNode(node.Cost, depth + 1);
+        PrecompileRuleNode(node.Limit, depth + 1);
+        PrecompileRuleNode(node.SpawnContext, depth + 1);
+        PrecompileRuleNode(node.SelectionContextRules, depth + 1);
+        PrecompileRuleNode(node.Modifier?.Value, depth + 1);
+
+        PrecompileRuleList(node.Actions);
+        PrecompileRuleList(node.Triggers);
+        PrecompileRuleList(node.Groups);
+        PrecompileRuleList(node.Filters);
+        PrecompileRuleList(node.Behaviors);
+        PrecompileRuleList(node.Prerequisites);
+
+        if (node.Abilities != null)
+            foreach (var ab in node.Abilities.Values) PrecompileAbility(ab);
+        if (node.Attributes != null)
+            foreach (var attrNode in node.Attributes.Values) PrecompileRuleNode(attrNode, depth + 1);
     }
 
     private static string ExtractToTempCacheIfNeeded(string zipPath)

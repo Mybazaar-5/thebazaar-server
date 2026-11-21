@@ -207,8 +207,13 @@ internal static class TournamentPresetStore
     {
         if (_cached != null) return;
 
-        StoreData loaded = null;
-        string path = FilePath;
+        StoreData loaded = TryReadStoreFile(FilePath) ?? TryReadStoreFile(FilePath + ".bak");
+        _cached = loaded ?? new StoreData();
+        NormalizeStore(_cached);
+    }
+
+    private static StoreData TryReadStoreFile(string path)
+    {
         try
         {
             if (File.Exists(path))
@@ -216,17 +221,15 @@ internal static class TournamentPresetStore
                 string raw = File.ReadAllText(path, Encoding.UTF8);
                 if (!string.IsNullOrWhiteSpace(raw))
                 {
-                    loaded = JsonConvert.DeserializeObject<StoreData>(raw);
+                    return JsonConvert.DeserializeObject<StoreData>(raw);
                 }
             }
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log?.LogWarning("TournamentPresetStore load failed, using fresh store: " + ex.Message);
+            BazaarLauncherPlugin.Log?.LogWarning($"TournamentPresetStore 读取 '{path}' 失败，将尝试备份或新建: " + ex.Message);
         }
-
-        _cached = loaded ?? new StoreData();
-        NormalizeStore(_cached);
+        return null;
     }
 
     private static void NormalizeStore(StoreData data)
@@ -291,11 +294,20 @@ internal static class TournamentPresetStore
 
             string json = JsonConvert.SerializeObject(_cached, Formatting.Indented);
             string tmpPath = path + ".tmp";
-            File.WriteAllText(tmpPath, json, Encoding.UTF8);
+            string bakPath = path + ".bak";
+            File.WriteAllText(tmpPath, json, new UTF8Encoding(false));
             if (File.Exists(path))
             {
-                File.Copy(tmpPath, path, overwrite: true);
-                File.Delete(tmpPath);
+                try
+                {
+                    File.Replace(tmpPath, path, bakPath, ignoreMetadataErrors: true);
+                }
+                catch
+                {
+                    try { File.Copy(path, bakPath, overwrite: true); } catch { }
+                    File.Copy(tmpPath, path, overwrite: true);
+                    try { File.Delete(tmpPath); } catch { }
+                }
             }
             else
             {

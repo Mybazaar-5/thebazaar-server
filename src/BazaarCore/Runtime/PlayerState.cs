@@ -354,31 +354,31 @@ public sealed class PlayerState
         var sourceMap = new Dictionary<string, CardInstance>(StringComparer.Ordinal);
         foreach (var c in Hand.Cards)
         {
-            var cc = c.CloneForCombat();
+            var cc = c.CloneForCombatInternal(resetImmediately: false);
             sourceMap[c.InstanceId] = c;
             clone.Hand.Cards.Add(cc);
         }
         foreach (var c in Stash.Cards)
         {
-            var cc = c.CloneForCombat();
+            var cc = c.CloneForCombatInternal(resetImmediately: false);
             sourceMap[c.InstanceId] = c;
             clone.Stash.Cards.Add(cc);
         }
         foreach (var s in Skills)
         {
-            var sc = s.CloneForCombat();
+            var sc = s.CloneForCombatInternal(resetImmediately: false);
             sourceMap[s.InstanceId] = s;
             clone.Skills.Add(sc);
         }
         foreach (var se in SocketEffects)
         {
-            var sec = se.CloneForCombat();
+            var sec = se.CloneForCombatInternal(resetImmediately: false);
             sourceMap[se.InstanceId] = se;
             clone.SocketEffects.Add(sec);
         }
         foreach (var pe in PlayerEffects)
         {
-            var pec = pe.CloneForCombat();
+            var pec = pe.CloneForCombatInternal(resetImmediately: false);
             sourceMap[pe.InstanceId] = pe;
             clone.PlayerEffects.Add(pec);
         }

@@ -2,20 +2,22 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
+using System.Net.WebSockets;
 using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using BazaarLauncher.Core;
 using HarmonyLib;
 
 namespace BazaarLauncher;
 
 /// <summary>
-/// 100% 云端隔离防火墙：
-/// 1. 禁用 Unity CrashReportHandler 崩溃上报与 AnalyticsManager 外部遥测；
-/// 2. 在 HttpClient.SendAsync 与 UnityWebRequest.SendWebRequest 底层校验目标 Host，
-///    仅允许访问自有服务器（127.0.0.1 / localhost / 配置中的 ServerBase Host），
-///    任何发往官方云/CDN/第三方遥测的出站请求全部拦截并记录统计。
+/// 100% 云端隔离防火墙（修复 P0-5）：
+/// 1. 禁用 Unity CrashReportHandler 崩溃上报、Sentry 与 AnalyticsManager 外部遥测；
+/// 2. 同时拦截 HttpClient.SendAsync 的 2 参和底层核心 3 参重载 (HttpRequestMessage, HttpCompletionOption, CancellationToken)；
+/// 3. 拦截 ClientWebSocket.ConnectAsync 防止外部 WS 外联泄漏；
+/// 4. 缓存 UnityWebRequest.url 反射属性，并将拦截到的外部遥测直接短路（不向自建服转发无效垃圾流量）。
 /// </summary>
 internal static class CloudGuard
 {
@@ -24,7 +26,11 @@ internal static class CloudGuard
     private static long _blockedExternalCount;
     private static readonly object _lock = new();
     private static readonly List<string> _blockedUrls = new();
-    private const int MaxRecordedBlockedUrls = 20;
+    private const int MaxRecordedBlockedUrls = 30;
+
+    private static PropertyInfo _cachedUwrUrlProp;
+    private static MethodInfo _cachedUwrAbortMethod;
+    private static PropertyInfo _cachedUwrDisposeMethod;
 
     internal static long AllowedCount => Interlocked.Read(ref _allowedCount);
     internal static long BlockedExternalCount => Interlocked.Read(ref _blockedExternalCount);
@@ -44,16 +50,26 @@ internal static class CloudGuard
         blockedUrls = GetBlockedUrlsSnapshot(),
     };
 
-    internal static void Apply(Harmony harmony)
+    internal static void ResetAppliedFlag() => _applied = false;
+
+    internal static void Apply(SafeHarmonyPatcher patcher)
     {
-        if (_applied) return;
+        if (_applied || patcher == null) return;
         _applied = true;
 
         DisableCrashReporting();
-        DisableAnalytics(harmony);
-        PatchHttpClient(harmony);
-        PatchUnityWebRequest(harmony);
-        DisableSentryIfPresent(harmony);
+        DisableAnalytics(patcher);
+        PatchHttpClient(patcher);
+        PatchClientWebSocket(patcher);
+        PatchUnityWebRequest(patcher);
+        DisableSentryIfPresent(patcher);
+    }
+
+    internal static void Apply(Harmony harmony)
+    {
+        if (_applied || harmony == null) return;
+        var patcher = new SafeHarmonyPatcher("cloudguard.legacy");
+        Apply(patcher);
     }
 
     private static void DisableCrashReporting()
@@ -61,112 +77,91 @@ internal static class CloudGuard
         try
         {
             var crType = AccessTools.TypeByName("UnityEngine.CrashReportHandler.CrashReportHandler");
-            if (crType != null)
+            var prop = crType?.GetProperty("enableCaptureExceptions", BindingFlags.Public | BindingFlags.Static);
+            if (prop != null && prop.CanWrite)
             {
-                var prop = crType.GetProperty("enableCaptureExceptions",
-                    BindingFlags.Public | BindingFlags.Static);
-                if (prop != null && prop.CanWrite)
-                {
-                    prop.SetValue(null, false);
-                    BazaarLauncherPlugin.Log.LogInfo("CloudGuard: CrashReportHandler.enableCaptureExceptions = false");
-                }
+                prop.SetValue(null, false);
+                BazaarLauncherPlugin.Log?.LogInfo("CloudGuard: 已关闭 CrashReportHandler 崩溃上报");
             }
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log.LogWarning("CloudGuard CrashReportHandler: " + ex.Message);
+            BazaarLauncherPlugin.Log?.LogWarning("CloudGuard CrashReportHandler: " + ex.Message);
         }
     }
 
-    private static void DisableAnalytics(Harmony harmony)
+    private static void DisableAnalytics(SafeHarmonyPatcher patcher)
     {
-        try
-        {
-            var amType = AccessTools.TypeByName("AnalyticsManager");
-            if (amType == null) return;
+        patcher.TryPatch(
+            "AnalyticsManager",
+            "Initialize",
+            prefix: AccessTools.Method(typeof(CloudGuard), nameof(SkipVoid)),
+            optional: true);
+    }
 
-            var init = AccessTools.Method(amType, "Initialize");
-            if (init != null)
-            {
-                harmony.Patch(init, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CloudGuard), nameof(SkipVoid))));
-                BazaarLauncherPlugin.Log.LogInfo("CloudGuard: AnalyticsManager.Initialize disabled");
-            }
-        }
-        catch (Exception ex)
+    private static void DisableSentryIfPresent(SafeHarmonyPatcher patcher)
+    {
+        foreach (var typeName in new[] { "Sentry.SentrySdk", "Sentry.Unity.SentryUnity" })
         {
-            BazaarLauncherPlugin.Log.LogWarning("CloudGuard Analytics: " + ex.Message);
+            patcher.TryPatch(
+                typeName,
+                "Init",
+                prefix: AccessTools.Method(typeof(CloudGuard), nameof(SkipVoid)),
+                optional: true);
         }
     }
 
-    private static void DisableSentryIfPresent(Harmony harmony)
+    private static void PatchHttpClient(SafeHarmonyPatcher patcher)
     {
-        try
-        {
-            foreach (var typeName in new[] { "Sentry.SentrySdk", "Sentry.Unity.SentryUnity" })
-            {
-                var t = AccessTools.TypeByName(typeName);
-                if (t == null) continue;
-                var init = AccessTools.Method(t, "Init");
-                if (init != null)
-                {
-                    harmony.Patch(init, prefix: new HarmonyMethod(
-                        AccessTools.Method(typeof(CloudGuard), nameof(SkipVoid))));
-                    BazaarLauncherPlugin.Log.LogInfo($"CloudGuard: {typeName}.Init disabled");
-                }
-            }
-        }
-        catch { }
+        var prefix = AccessTools.Method(typeof(CloudGuard), nameof(HttpClientPrefix));
+
+        // 2 参重载
+        patcher.TryPatch(
+            typeof(HttpClient),
+            "SendAsync",
+            new[] { typeof(HttpRequestMessage), typeof(CancellationToken) },
+            prefix: prefix,
+            prefixPriority: Priority.First,
+            label: "HttpClient.SendAsync(2)");
+
+        // 3 参底层核心重载（GetAsync/PostAsync 最终均走此重载，彻底杜绝 P0-5 绕过缺口）
+        patcher.TryPatch(
+            typeof(HttpClient),
+            "SendAsync",
+            new[] { typeof(HttpRequestMessage), typeof(HttpCompletionOption), typeof(CancellationToken) },
+            prefix: prefix,
+            prefixPriority: Priority.First,
+            label: "HttpClient.SendAsync(3)");
     }
 
-    private static void PatchHttpClient(Harmony harmony)
+    private static void PatchClientWebSocket(SafeHarmonyPatcher patcher)
     {
-        try
-        {
-            var sendAsync = AccessTools.Method(typeof(HttpClient), "SendAsync",
-                new[] { typeof(HttpRequestMessage), typeof(CancellationToken) });
-            if (sendAsync != null)
-            {
-                var prefix = new HarmonyMethod(AccessTools.Method(typeof(CloudGuard), nameof(HttpClientPrefix)))
-                {
-                    priority = Priority.First,
-                };
-                harmony.Patch(sendAsync, prefix: prefix);
-                BazaarLauncherPlugin.Log.LogInfo("CloudGuard: HttpClient.SendAsync whitelist active");
-            }
-        }
-        catch (Exception ex)
-        {
-            BazaarLauncherPlugin.Log.LogWarning("CloudGuard HttpClient patch failed: " + ex.Message);
-        }
+        patcher.TryPatch(
+            typeof(ClientWebSocket),
+            "ConnectAsync",
+            new[] { typeof(Uri), typeof(CancellationToken) },
+            prefix: AccessTools.Method(typeof(CloudGuard), nameof(WebSocketConnectPrefix)),
+            prefixPriority: Priority.First,
+            optional: true,
+            label: "ClientWebSocket.ConnectAsync");
     }
 
-    private static void PatchUnityWebRequest(Harmony harmony)
+    private static void PatchUnityWebRequest(SafeHarmonyPatcher patcher)
     {
-        try
-        {
-            var uwrType = AccessTools.TypeByName("UnityEngine.Networking.UnityWebRequest");
-            if (uwrType == null)
-            {
-                BazaarLauncherPlugin.Log.LogWarning("CloudGuard: UnityWebRequest type not found");
-                return;
-            }
+        var uwrType = AccessTools.TypeByName("UnityEngine.Networking.UnityWebRequest");
+        if (uwrType == null) return;
 
-            var send = AccessTools.Method(uwrType, "SendWebRequest");
-            if (send != null)
-            {
-                var prefix = new HarmonyMethod(AccessTools.Method(typeof(CloudGuard), nameof(UnityWebRequestPrefix)))
-                {
-                    priority = Priority.First,
-                };
-                harmony.Patch(send, prefix: prefix);
-                BazaarLauncherPlugin.Log.LogInfo("CloudGuard: UnityWebRequest.SendWebRequest whitelist active");
-            }
-        }
-        catch (Exception ex)
-        {
-            BazaarLauncherPlugin.Log.LogWarning("CloudGuard UnityWebRequest patch failed: " + ex.Message);
-        }
+        _cachedUwrUrlProp = uwrType.GetProperty("url", BindingFlags.Public | BindingFlags.Instance);
+        _cachedUwrAbortMethod = uwrType.GetMethod("Abort", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+        _cachedUwrDisposeMethod = uwrType.GetProperty("isDone", BindingFlags.Public | BindingFlags.Instance);
+
+        patcher.TryPatch(
+            uwrType,
+            "SendWebRequest",
+            Type.EmptyTypes,
+            prefix: AccessTools.Method(typeof(CloudGuard), nameof(UnityWebRequestPrefix)),
+            prefixPriority: Priority.First,
+            label: "UnityWebRequest.SendWebRequest");
     }
 
     private static bool SkipVoid() => false;
@@ -200,29 +195,51 @@ internal static class CloudGuard
         }
     }
 
-    private static void UnityWebRequestPrefix(object __instance)
+    private static bool WebSocketConnectPrefix(Uri __0, ref Task __result)
     {
         try
         {
-            if (__instance == null) return;
-            var urlProp = __instance.GetType().GetProperty("url", BindingFlags.Public | BindingFlags.Instance);
-            string url = urlProp?.GetValue(__instance) as string;
-            if (string.IsNullOrWhiteSpace(url)) return;
+            if (__0 == null || IsAllowedHost(__0))
+            {
+                Interlocked.Increment(ref _allowedCount);
+                return true;
+            }
 
-            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return;
+            RecordBlocked(__0.ToString());
+            __result = Task.FromException(new WebSocketException("已由 CloudGuard 拦截外部 WebSocket 连接"));
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private static bool UnityWebRequestPrefix(object __instance, ref object __result)
+    {
+        try
+        {
+            if (__instance == null || _cachedUwrUrlProp == null) return true;
+            string url = _cachedUwrUrlProp.GetValue(__instance) as string;
+            if (string.IsNullOrWhiteSpace(url)) return true;
+
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return true;
             if (IsAllowedHost(uri))
             {
                 Interlocked.Increment(ref _allowedCount);
-                return;
+                return true;
             }
 
             RecordBlocked(url);
-            string fallback = BazaarLauncherPlugin.ServerBase.Value.TrimEnd('/') + "/api/telemetry";
-            urlProp?.SetValue(__instance, fallback);
+            // 直接短路外部遥测，不向自建服转发垃圾请求，避免污染自建服日志与连接池
+            _cachedUwrUrlProp.SetValue(__instance, "http://127.0.0.1:1/blocked-telemetry");
+            try { _cachedUwrAbortMethod?.Invoke(__instance, null); } catch { }
+            return true;
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("CloudGuard UnityWebRequestPrefix: " + ex.Message);
+            return true;
         }
     }
 
@@ -231,7 +248,7 @@ internal static class CloudGuard
         if (uri == null || !uri.IsAbsoluteUri) return true;
         string scheme = uri.Scheme.ToLowerInvariant();
         if (scheme == "file") return true;
-        if (scheme != "http" && scheme != "https") return false;
+        if (scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss") return false;
 
         string host = uri.Host;
         if (string.Equals(host, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
@@ -261,6 +278,6 @@ internal static class CloudGuard
                 _blockedUrls.Add(url);
             }
         }
-        BazaarLauncherPlugin.Log?.LogWarning($"[CloudGuard] BLOCKED external request -> {url}");
+        BazaarLauncherPlugin.Log?.LogDebug($"[CloudGuard] 已拦截外部出站请求 -> {url}");
     }
 }

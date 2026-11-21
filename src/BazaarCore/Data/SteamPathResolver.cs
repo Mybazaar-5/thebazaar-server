@@ -10,8 +10,6 @@ namespace BazaarCore.Data;
 public static partial class SteamPathResolver
 {
     public const string RelativeGameDataZip = @"The Bazaar\TheBazaar_Data\StreamingAssets\GameData.db.zip";
-    private const string DistDataDbPath = @"e:\thebazaar\dist\data\GameData.db";
-    private const string DistZhCnPath = @"e:\thebazaar\dist\data\translations\zh-CN.bytes";
 
     [GeneratedRegex("\"path\"\\s+\"([^\"]+)\"", RegexOptions.IgnoreCase)]
     private static partial Regex LibraryPathRegex();
@@ -20,7 +18,7 @@ public static partial class SteamPathResolver
     /// 按优先级定位游戏数据库（热更新直出 .db 优先于旧版 .db.zip）：
     /// 1) 显式传入路径；2) 环境变量 BAZAAR_GAME_DATA_DB；
     /// 3) %USERPROFILE%\AppData\LocalLow\Tempo Storm\The Bazaar\prod\cache\GameData.db；
-    /// 4) e:\thebazaar\dist\data\GameData.db；5) ResolveGameDataZipPath(customPath)。
+    /// 4) 当前目录与程序基目录向上探测到的 dist/data/GameData.db；5) ResolveGameDataZipPath(customPath)。
     /// </summary>
     public static string? ResolveGameDataSourcePath(string? customPath = null)
     {
@@ -47,9 +45,11 @@ public static partial class SteamPathResolver
             if (File.Exists(prodDb)) return Path.GetFullPath(prodDb);
         }
 
-        var cwdDistDb = Path.Combine(Environment.CurrentDirectory, "dist", "data", "GameData.db");
-        if (File.Exists(cwdDistDb)) return Path.GetFullPath(cwdDistDb);
-        if (File.Exists(DistDataDbPath)) return Path.GetFullPath(DistDataDbPath);
+        foreach (var distDataDir in DiscoverRelativeDistDataDirs())
+        {
+            var distDb = Path.Combine(distDataDir, "GameData.db");
+            if (File.Exists(distDb)) return Path.GetFullPath(distDb);
+        }
 
         return ResolveGameDataZipPath(customPath);
     }
@@ -58,7 +58,7 @@ public static partial class SteamPathResolver
     /// 按优先级定位官方简体中文词库 zh-CN.bytes：
     /// 1) 显式传入路径；2) 环境变量 BAZAAR_ZH_CN_PATH；
     /// 3) %USERPROFILE%\AppData\LocalLow\Tempo Storm\The Bazaar\prod\cache\translations\zh-CN.bytes；
-    /// 4) e:\thebazaar\dist\data\translations\zh-CN.bytes。
+    /// 4) 当前目录与程序基目录向上探测到的 dist/data/translations/zh-CN.bytes。
     /// </summary>
     public static string? ResolveZhCnTranslationPath(string? customPath = null)
     {
@@ -85,11 +85,72 @@ public static partial class SteamPathResolver
             if (File.Exists(prodZh)) return Path.GetFullPath(prodZh);
         }
 
-        var cwdDistZh = Path.Combine(Environment.CurrentDirectory, "dist", "data", "translations", "zh-CN.bytes");
-        if (File.Exists(cwdDistZh)) return Path.GetFullPath(cwdDistZh);
-        if (File.Exists(DistZhCnPath)) return Path.GetFullPath(DistZhCnPath);
+        foreach (var distDataDir in DiscoverRelativeDistDataDirs())
+        {
+            var distZh = Path.Combine(distDataDir, "translations", "zh-CN.bytes");
+            if (File.Exists(distZh)) return Path.GetFullPath(distZh);
+        }
 
         return null;
+    }
+
+    /// <summary>
+    /// 按优先级定位外挂中文词典 custom_zh_overlay.json。
+    /// </summary>
+    public static string? ResolveCustomZhOverlayPath(string? customPath = null)
+    {
+        if (!string.IsNullOrWhiteSpace(customPath))
+        {
+            if (File.Exists(customPath)) return Path.GetFullPath(customPath);
+            if (Directory.Exists(customPath))
+            {
+                var direct = Path.Combine(customPath, "custom_zh_overlay.json");
+                if (File.Exists(direct)) return Path.GetFullPath(direct);
+                var nested = Path.Combine(customPath, "translations", "custom_zh_overlay.json");
+                if (File.Exists(nested)) return Path.GetFullPath(nested);
+            }
+        }
+
+        var envPath = Environment.GetEnvironmentVariable("BAZAAR_ZH_OVERLAY_PATH");
+        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
+            return Path.GetFullPath(envPath);
+
+        foreach (var distDataDir in DiscoverRelativeDistDataDirs())
+        {
+            var nested = Path.Combine(distDataDir, "translations", "custom_zh_overlay.json");
+            if (File.Exists(nested)) return Path.GetFullPath(nested);
+            var direct = Path.Combine(distDataDir, "custom_zh_overlay.json");
+            if (File.Exists(direct)) return Path.GetFullPath(direct);
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> DiscoverRelativeDistDataDirs()
+    {
+        var yielded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        IEnumerable<string> WalkUp(string? startDir)
+        {
+            if (string.IsNullOrWhiteSpace(startDir)) yield break;
+            DirectoryInfo? dir;
+            try { dir = new DirectoryInfo(startDir); }
+            catch { yield break; }
+
+            for (int depth = 0; depth < 7 && dir != null; depth++, dir = dir.Parent)
+            {
+                var candidate = Path.Combine(dir.FullName, "dist", "data");
+                if (Directory.Exists(candidate) && yielded.Add(candidate))
+                    yield return candidate;
+
+                var dataOnly = Path.Combine(dir.FullName, "data");
+                if (Directory.Exists(dataOnly) && yielded.Add(dataOnly))
+                    yield return dataOnly;
+            }
+        }
+
+        foreach (var d in WalkUp(Environment.CurrentDirectory)) yield return d;
+        foreach (var d in WalkUp(AppContext.BaseDirectory)) yield return d;
     }
 
     private static IEnumerable<string> DiscoverProdCacheDirs()

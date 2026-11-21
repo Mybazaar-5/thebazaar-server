@@ -5,7 +5,8 @@ using Newtonsoft.Json;
 namespace BazaarLauncher;
 
 /// <summary>
-/// CustomGameplayUI 数据模型与规则状态摘要工具（与服务端 /custom-rules/* 及 /lobbies/* 契约严格对齐）。
+/// CustomGameplayUI 数据模型、规则摘要与零序列化手写深拷贝工具（修复 P1-1 每 0.15s 全量 JSON 克隆 GC 风暴，
+/// 并完整对齐 Wave 2/3 的 3 套预设档位 + 7 大玩法模式 + 14 条肉鸽突变词条）。
 /// </summary>
 internal sealed partial class CustomGameplayUI
 {
@@ -13,14 +14,17 @@ internal sealed partial class CustomGameplayUI
     {
         Normal = 0,
         Tournament = 1,
+        Workshop = 2,
+        Social = 3,
+        Performance = 4,
     }
 
     internal sealed class ArchetypeCatalogEntry
     {
         [JsonProperty("bit")] public int Bit { get; set; }
-        [JsonProperty("key")] public string Key { get; set; } = "";
-        [JsonProperty("nameZh")] public string NameZh { get; set; } = "";
-        [JsonProperty("descZh")] public string DescZh { get; set; } = "";
+        [JsonProperty("key")] public string Key { get; set; } = string.Empty;
+        [JsonProperty("nameZh")] public string NameZh { get; set; } = string.Empty;
+        [JsonProperty("descZh")] public string DescZh { get; set; } = string.Empty;
         [JsonProperty("heroCounts")] public Dictionary<string, int> HeroCounts { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         public int GetHeroCount(string hero)
@@ -37,20 +41,29 @@ internal sealed partial class CustomGameplayUI
 
     internal sealed class EncounterCategoryEntry
     {
-        [JsonProperty("key")] public string Key { get; set; } = "";
-        [JsonProperty("groupZh")] public string GroupZh { get; set; } = "";
-        [JsonProperty("nameZh")] public string NameZh { get; set; } = "";
+        [JsonProperty("key")] public string Key { get; set; } = string.Empty;
+        [JsonProperty("groupZh")] public string GroupZh { get; set; } = string.Empty;
+        [JsonProperty("nameZh")] public string NameZh { get; set; } = string.Empty;
         [JsonProperty("defaultMult")] public double DefaultMult { get; set; } = 1.0;
     }
 
     internal sealed class CatalogCardEntry
     {
-        [JsonProperty("id")] public string Id { get; set; } = "";
-        [JsonProperty("nameZh")] public string NameZh { get; set; } = "";
-        [JsonProperty("hero")] public string Hero { get; set; } = "";
-        [JsonProperty("size")] public string Size { get; set; } = "";
+        [JsonProperty("id")] public string Id { get; set; } = string.Empty;
+        [JsonProperty("nameZh")] public string NameZh { get; set; } = string.Empty;
+        [JsonProperty("hero")] public string Hero { get; set; } = string.Empty;
+        [JsonProperty("size")] public string Size { get; set; } = string.Empty;
         [JsonProperty("startingTier")] public string StartingTier { get; set; } = "Bronze";
         [JsonProperty("archetypeMask")] public ulong ArchetypeMask { get; set; }
+    }
+
+    internal sealed class MutatorCatalogItem
+    {
+        [JsonProperty("id")] public string Id { get; set; } = string.Empty;
+        [JsonProperty("nameZh")] public string NameZh { get; set; } = string.Empty;
+        [JsonProperty("descZh")] public string DescZh { get; set; } = string.Empty;
+        [JsonProperty("conflictGroup")] public string ConflictGroup { get; set; }
+        [JsonProperty("scoreMultiplierDelta")] public double ScoreMultiplierDelta { get; set; }
     }
 
     internal sealed class CustomRulesCatalog
@@ -59,18 +72,19 @@ internal sealed partial class CustomGameplayUI
         [JsonProperty("encounterCategories")] public List<EncounterCategoryEntry> EncounterCategories { get; set; } = new();
         [JsonProperty("items")] public List<CatalogCardEntry> Items { get; set; } = new();
         [JsonProperty("skills")] public List<CatalogCardEntry> Skills { get; set; } = new();
+        [JsonProperty("mutators")] public List<MutatorCatalogItem> Mutators { get; set; } = new();
     }
 
     internal sealed class StartingItemRule
     {
-        [JsonProperty("templateId")] public string TemplateId { get; set; } = "";
+        [JsonProperty("templateId")] public string TemplateId { get; set; } = string.Empty;
         [JsonProperty("tier")] public string Tier { get; set; } = "Bronze";
         [JsonProperty("enchantment")] public string Enchantment { get; set; }
     }
 
     internal sealed class StartingSkillRule
     {
-        [JsonProperty("templateId")] public string TemplateId { get; set; } = "";
+        [JsonProperty("templateId")] public string TemplateId { get; set; } = string.Empty;
         [JsonProperty("tier")] public string Tier { get; set; } = "Bronze";
     }
 
@@ -86,7 +100,7 @@ internal sealed partial class CustomGameplayUI
         [JsonProperty("startingHealth")] public int StartingHealth { get; set; } = 250;
         [JsonProperty("startingItems")] public List<StartingItemRule> StartingItems { get; set; } = new();
         [JsonProperty("startingSkills")] public List<StartingSkillRule> StartingSkills { get; set; } = new();
-        [JsonProperty("monsterLootChooseOne")] public bool MonsterLootChooseOne { get; set; } = true; // 默认开启野怪多选一
+        [JsonProperty("monsterLootChooseOne")] public bool MonsterLootChooseOne { get; set; } = true;
         [JsonProperty("encounterCategoryMultipliers")] public Dictionary<string, double> EncounterCategoryMultipliers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         [JsonProperty("bannedEncounterIds")] public List<string> BannedEncounterIds { get; set; } = new();
         [JsonProperty("playerCap")] public int PlayerCap { get; set; } = 8;
@@ -95,12 +109,27 @@ internal sealed partial class CustomGameplayUI
         [JsonProperty("lastHumanStandingMode")] public bool LastHumanStandingMode { get; set; } = true;
         [JsonProperty("isCustomPowerModified")] public bool IsCustomPowerModified { get; set; }
 
+        // Wave 2/3 新增：预设档位 + 7 大模式 + 14 突变词条向后兼容字段
+        [JsonProperty("presetId")] public string PresetId { get; set; } = "PureOfficial";
+        [JsonProperty("specialModeId")] public string SpecialModeId { get; set; } = "Standard";
+        [JsonProperty("mutatorIds")] public List<string> MutatorIds { get; set; } = new();
+        [JsonProperty("dailyChallengeDate")] public string DailyChallengeDate { get; set; }
+        [JsonProperty("endlessMaxDay")] public int EndlessMaxDay { get; set; } = 99;
+        [JsonProperty("crossHeroOwnHeroBias")] public double CrossHeroOwnHeroBias { get; set; } = 0.40;
+        [JsonProperty("bossRushTotalWaves")] public int BossRushTotalWaves { get; set; } = 10;
+        [JsonProperty("bossRushIncludeMilestonePvp")] public bool BossRushIncludeMilestonePvp { get; set; } = true;
+        [JsonProperty("sandboxFreeInfiniteReroll")] public bool SandboxFreeInfiniteReroll { get; set; } = true;
+        [JsonProperty("sandboxZeroShopPrice")] public bool SandboxZeroShopPrice { get; set; } = false;
+
         public void EnsureCollections()
         {
             StartingItems ??= new List<StartingItemRule>();
             StartingSkills ??= new List<StartingSkillRule>();
             EncounterCategoryMultipliers ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
             BannedEncounterIds ??= new List<string>();
+            MutatorIds ??= new List<string>();
+            if (string.IsNullOrWhiteSpace(PresetId)) PresetId = "PureOfficial";
+            if (string.IsNullOrWhiteSpace(SpecialModeId)) SpecialModeId = "Standard";
         }
 
         public void ResetToStandardValues(bool preserveArchetypeAndLobbyFlags = false)
@@ -130,12 +159,28 @@ internal sealed partial class CustomGameplayUI
             BotNonLethalPrestigeLock = botLock;
             HumanMatchEvery4Rounds = match4;
             LastHumanStandingMode = lastHuman;
+            PresetId = "PureOfficial";
+            SpecialModeId = "Standard";
+            MutatorIds = new List<string>();
+            DailyChallengeDate = null;
+            EndlessMaxDay = 99;
+            CrossHeroOwnHeroBias = 0.40;
+            BossRushTotalWaves = 10;
+            BossRushIncludeMilestonePvp = true;
+            SandboxFreeInfiniteReroll = true;
+            SandboxZeroShopPrice = false;
             IsCustomPowerModified = false;
         }
 
         public bool ComputeCustomPowerModified()
         {
             EnsureCollections();
+            if (!string.Equals(SpecialModeId, "Standard", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(PresetId, "PureOfficial", StringComparison.OrdinalIgnoreCase)
+                || MutatorIds.Count > 0)
+            {
+                return true;
+            }
             if (StartingGold != 15 || StartingIncome != 5 || StartingExperience != 3
                 || StartingPrestige != 20 || StartingHealth != 250)
             {
@@ -152,11 +197,70 @@ internal sealed partial class CustomGameplayUI
 
         public void RefreshPowerFlag() => IsCustomPowerModified = ComputeCustomPowerModified();
 
+        /// <summary>
+        /// 高性能手写成员深拷贝（彻底替代 JsonConvert.SerializeObject/DeserializeObject，根治 P1-1 托管 GC 尖峰）。
+        /// </summary>
         public CustomRunRuleSet Clone()
         {
-            var json = JsonConvert.SerializeObject(this);
-            var copy = JsonConvert.DeserializeObject<CustomRunRuleSet>(json) ?? new CustomRunRuleSet();
-            copy.EnsureCollections();
+            EnsureCollections();
+            var copy = new CustomRunRuleSet
+            {
+                SelectedArchetypeMask = SelectedArchetypeMask,
+                AllowTendencySelection = AllowTendencySelection,
+                PromptTendencyBeforeRun = PromptTendencyBeforeRun,
+                StartingGold = StartingGold,
+                StartingIncome = StartingIncome,
+                StartingExperience = StartingExperience,
+                StartingPrestige = StartingPrestige,
+                StartingHealth = StartingHealth,
+                StartingItems = new List<StartingItemRule>(StartingItems.Count),
+                StartingSkills = new List<StartingSkillRule>(StartingSkills.Count),
+                MonsterLootChooseOne = MonsterLootChooseOne,
+                EncounterCategoryMultipliers = new Dictionary<string, double>(EncounterCategoryMultipliers, StringComparer.OrdinalIgnoreCase),
+                BannedEncounterIds = new List<string>(BannedEncounterIds),
+                PlayerCap = PlayerCap,
+                BotNonLethalPrestigeLock = BotNonLethalPrestigeLock,
+                HumanMatchEvery4Rounds = HumanMatchEvery4Rounds,
+                LastHumanStandingMode = LastHumanStandingMode,
+                PresetId = PresetId,
+                SpecialModeId = SpecialModeId,
+                MutatorIds = new List<string>(MutatorIds),
+                DailyChallengeDate = DailyChallengeDate,
+                EndlessMaxDay = EndlessMaxDay,
+                CrossHeroOwnHeroBias = CrossHeroOwnHeroBias,
+                BossRushTotalWaves = BossRushTotalWaves,
+                BossRushIncludeMilestonePvp = BossRushIncludeMilestonePvp,
+                SandboxFreeInfiniteReroll = SandboxFreeInfiniteReroll,
+                SandboxZeroShopPrice = SandboxZeroShopPrice,
+            };
+
+            for (int i = 0; i < StartingItems.Count; i++)
+            {
+                var it = StartingItems[i];
+                if (it != null)
+                {
+                    copy.StartingItems.Add(new StartingItemRule
+                    {
+                        TemplateId = it.TemplateId,
+                        Tier = it.Tier,
+                        Enchantment = it.Enchantment,
+                    });
+                }
+            }
+
+            for (int i = 0; i < StartingSkills.Count; i++)
+            {
+                var sk = StartingSkills[i];
+                if (sk != null)
+                {
+                    copy.StartingSkills.Add(new StartingSkillRule
+                    {
+                        TemplateId = sk.TemplateId,
+                        Tier = sk.Tier,
+                    });
+                }
+            }
+
             copy.RefreshPowerFlag();
             return copy;
         }
@@ -164,19 +268,19 @@ internal sealed partial class CustomGameplayUI
 
     internal sealed class LobbyMemberSummary
     {
-        public string AccountId { get; set; } = "";
-        public string Username { get; set; } = "";
-        public string Hero { get; set; } = "";
-        public string State { get; set; } = "";
+        public string AccountId { get; set; } = string.Empty;
+        public string Username { get; set; } = string.Empty;
+        public string Hero { get; set; } = string.Empty;
+        public string State { get; set; } = string.Empty;
         public bool IsAi { get; set; }
     }
 
     internal sealed class LobbyDetailSnapshot
     {
-        public string LobbyId { get; set; } = "";
-        public string Code { get; set; } = "";
-        public string Name { get; set; } = "";
-        public string HostAccountId { get; set; } = "";
+        public string LobbyId { get; set; } = string.Empty;
+        public string Code { get; set; } = string.Empty;
+        public string Name { get; set; } = string.Empty;
+        public string HostAccountId { get; set; } = string.Empty;
         public int PlayerCap { get; set; } = 8;
         public List<LobbyMemberSummary> Members { get; set; } = new();
         public CustomRunRuleSet Rules { get; set; }
@@ -190,12 +294,12 @@ internal sealed partial class CustomGameplayUI
         public string PrestigeText = "20";
         public string HealthText = "250";
 
-        public string ItemSearch = "";
+        public string ItemSearch = string.Empty;
         public bool ItemHeroFilterOnly = true;
         public int ItemTierIdx;
         public int ItemEnchantIdx;
 
-        public string SkillSearch = "";
+        public string SkillSearch = string.Empty;
         public bool SkillHeroFilterOnly = true;
         public int SkillTierIdx;
 
@@ -226,15 +330,50 @@ internal sealed partial class CustomGameplayUI
         }
     }
 
+    internal static string GetModeDisplayZh(string modeId, string presetId)
+    {
+        if (string.Equals(modeId, "EndlessTower", StringComparison.OrdinalIgnoreCase)) return "无尽爬塔";
+        if (string.Equals(modeId, "CrossHeroMayhem", StringComparison.OrdinalIgnoreCase)) return "跨职业混池";
+        if (string.Equals(modeId, "DailyChallenge", StringComparison.OrdinalIgnoreCase)) return "每日同种子挑战";
+        if (string.Equals(modeId, "MutatorChallenge", StringComparison.OrdinalIgnoreCase)) return "肉鸽突变词条";
+        if (string.Equals(modeId, "BossRush", StringComparison.OrdinalIgnoreCase)) return "Boss车轮战";
+        if (string.Equals(modeId, "SandboxLab", StringComparison.OrdinalIgnoreCase)) return "沙盒实验室";
+        if (string.Equals(presetId, "EnhancedFun", StringComparison.OrdinalIgnoreCase)) return "爽玩增强";
+        if (string.Equals(presetId, "ExtremeRoguelike", StringComparison.OrdinalIgnoreCase)) return "极限肉鸽";
+        return "经典官方";
+    }
+
+    internal static string TranslateTierZh(string tier)
+    {
+        if (string.IsNullOrWhiteSpace(tier)) return "青铜";
+        if (string.Equals(tier, "Bronze", StringComparison.OrdinalIgnoreCase)) return "青铜";
+        if (string.Equals(tier, "Silver", StringComparison.OrdinalIgnoreCase)) return "白银";
+        if (string.Equals(tier, "Gold", StringComparison.OrdinalIgnoreCase)) return "黄金";
+        if (string.Equals(tier, "Diamond", StringComparison.OrdinalIgnoreCase)) return "钻石";
+        if (string.Equals(tier, "Legendary", StringComparison.OrdinalIgnoreCase)) return "传奇";
+        return tier;
+    }
+
     internal static RuleActivationSummary SummarizeRules(CustomRunRuleSet rules, bool isTournament)
     {
         if (rules == null)
         {
-            return new RuleActivationSummary(false, false, 0, "官方默认");
+            return new RuleActivationSummary(false, false, 0, "经典官方");
         }
         rules.EnsureCollections();
 
-        var tags = new List<string>(6);
+        var tags = new List<string>(8);
+
+        string modeLabel = GetModeDisplayZh(rules.SpecialModeId, rules.PresetId);
+        if (!string.Equals(modeLabel, "经典官方", StringComparison.Ordinal))
+        {
+            tags.Add(modeLabel);
+        }
+
+        if (rules.MutatorIds.Count > 0)
+        {
+            tags.Add($"词条×{rules.MutatorIds.Count}");
+        }
 
         int archCount = CountBits(rules.SelectedArchetypeMask);
         if (archCount > 0)
@@ -282,32 +421,32 @@ internal sealed partial class CustomGameplayUI
 
         bool powerMod = rules.ComputeCustomPowerModified();
         bool customActive = tags.Count > 0;
-        string summary = customActive ? string.Join(" / ", tags) : "官方默认";
+        string summary = customActive ? string.Join(" / ", tags) : "经典官方";
         return new RuleActivationSummary(customActive, powerMod, tags.Count, summary);
     }
 
     private static readonly string[] Tiers = { "Bronze", "Silver", "Gold", "Diamond" };
-    private static readonly string[] TierLabelsZh = { "铜 Bronze", "银 Silver", "金 Gold", "钻 Diamond" };
+    private static readonly string[] TierLabelsZh = { "青铜", "白银", "黄金", "钻石" };
 
     private static readonly (string Key, string LabelZh)[] Enchantments =
     {
         ("", "无附魔"),
-        ("Fiery", "炽焰 Fiery"),
-        ("Toxic", "剧毒 Toxic"),
-        ("Shielded", "护盾 Shielded"),
-        ("Heavy", "沉重 Heavy"),
-        ("Icy", "冰霜 Icy"),
-        ("Turbo", "极速 Turbo"),
-        ("Restorative", "治愈 Restorative"),
-        ("Deadly", "致命 Deadly"),
-        ("Golden", "黄金 Golden"),
-        ("Radiant", "辉光 Radiant"),
-        ("Obsidian", "黑曜 Obsidian"),
-        ("Shiny", "闪耀 Shiny"),
-        ("Mossy", "青苔 Mossy"),
-        ("Mystical", "秘法 Mystical"),
-        ("Ethereal", "虚灵 Ethereal"),
-        ("Tiny", "微型 Tiny"),
+        ("Fiery", "炽焰"),
+        ("Toxic", "剧毒"),
+        ("Shielded", "护盾"),
+        ("Heavy", "沉重"),
+        ("Icy", "冰霜"),
+        ("Turbo", "极速"),
+        ("Restorative", "治愈"),
+        ("Deadly", "致命"),
+        ("Golden", "黄金"),
+        ("Radiant", "辉光"),
+        ("Obsidian", "黑曜"),
+        ("Shiny", "闪耀"),
+        ("Mossy", "青苔"),
+        ("Mystical", "秘法"),
+        ("Ethereal", "虚灵"),
+        ("Tiny", "微型"),
     };
 
     private static readonly (string Key, string ShortZh)[] QuickSwitchHeroes =
@@ -324,15 +463,15 @@ internal sealed partial class CustomGameplayUI
 
     private static readonly Dictionary<string, string> HeroNameZh = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["Vanessa"] = "瓦内莎 Vanessa",
-        ["Pygmalien"] = "皮格马利翁 Pygmalien",
-        ["Dooley"] = "杜利 Dooley",
-        ["Mak"] = "马克 Mak",
-        ["Stelle"] = "斯黛拉 Stelle",
-        ["Jules"] = "朱尔斯 Jules",
-        ["Karnok"] = "卡诺克 Karnok",
-        ["Hero8"] = "双龙 The Dragons",
-        ["Common"] = "通用 Common",
+        ["Vanessa"] = "瓦内莎",
+        ["Pygmalien"] = "皮格马利翁",
+        ["Dooley"] = "杜利",
+        ["Mak"] = "马克",
+        ["Stelle"] = "斯黛拉",
+        ["Jules"] = "朱尔斯",
+        ["Karnok"] = "卡诺克",
+        ["Hero8"] = "双龙",
+        ["Common"] = "通用",
     };
 
     private static readonly List<EncounterCategoryEntry> FallbackEncounterCategories = new()

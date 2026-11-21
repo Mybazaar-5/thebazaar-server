@@ -53,6 +53,41 @@ internal sealed class GameDriver : MonoBehaviour
     private static readonly ConcurrentQueue<string> _logRing = new();
     private static HttpListener _listener;
     private static bool _started;
+    private static string _activeToken = string.Empty;
+
+    internal static bool IsRunning => _started && _listener != null && _listener.IsListening;
+    internal static string ActiveToken => _activeToken;
+
+    internal static bool ShouldAutoEnable()
+    {
+        try
+        {
+            if (BazaarLauncherPlugin.EnableGameDriver?.Value == true) return true;
+            string envEnable = Environment.GetEnvironmentVariable("BAZAAR_DRIVER_ENABLE");
+            if (string.Equals(envEnable, "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(envEnable, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            string envPort = Environment.GetEnvironmentVariable("BAZAAR_DRIVER_PORT");
+            if (!string.IsNullOrWhiteSpace(envPort)) return true;
+        }
+        catch { }
+        return false;
+    }
+
+    internal static void Shutdown()
+    {
+        try { _listener?.Stop(); _listener?.Close(); } catch { }
+        _listener = null;
+        _started = false;
+        if (Instance != null)
+        {
+            var go = Instance.gameObject;
+            Instance = null;
+            if (go != null) Destroy(go);
+        }
+    }
 
     private sealed class IdleWaiter
     {
@@ -153,27 +188,35 @@ internal sealed class GameDriver : MonoBehaviour
         int port = DefaultPort;
         try
         {
+            if (BazaarLauncherPlugin.GameDriverPort?.Value > 1024 && BazaarLauncherPlugin.GameDriverPort.Value <= 65535)
+            {
+                port = BazaarLauncherPlugin.GameDriverPort.Value;
+            }
             string env = Environment.GetEnvironmentVariable("BAZAAR_DRIVER_PORT");
             if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int p)) port = p;
         }
         catch { }
+
+        InitSecurityToken();
 
         try
         {
             _listener = new HttpListener();
             _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
             _listener.Start();
-            BazaarLauncherPlugin.Log.LogInfo($"GameDriver listening on http://127.0.0.1:{port}/");
+            BazaarLauncherPlugin.Log.LogInfo(
+                $"GameDriver 本地诊断服务已监听 http://127.0.0.1:{port}/ (Token鉴权={(string.IsNullOrEmpty(_activeToken) ? "可选关闭(防CSRF开启)" : "已启用")})");
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log.LogError($"GameDriver listen failed on {port}: {ex.Message}");
+            _started = false;
+            BazaarLauncherPlugin.Log.LogError($"GameDriver 监听端口 {port} 失败: {ex.Message}");
             return;
         }
 
         Task.Run(async () =>
         {
-            while (true)
+            while (_started && _listener != null && _listener.IsListening)
             {
                 HttpListenerContext ctx;
                 try { ctx = await _listener.GetContextAsync().ConfigureAwait(false); }
@@ -183,10 +226,95 @@ internal sealed class GameDriver : MonoBehaviour
         });
     }
 
+    private static void InitSecurityToken()
+    {
+        _activeToken = string.Empty;
+        try
+        {
+            string configured = BazaarLauncherPlugin.GameDriverToken?.Value?.Trim();
+            if (!string.IsNullOrEmpty(configured))
+            {
+                _activeToken = configured;
+                return;
+            }
+
+            if (BazaarLauncherPlugin.RequireGameDriverToken?.Value == true)
+            {
+                _activeToken = Guid.NewGuid().ToString("N");
+                string tokenPath = Path.Combine(Paths.ConfigPath ?? AppDomain.CurrentDomain.BaseDirectory, "bazaar_driver.token");
+                File.WriteAllText(tokenPath, _activeToken, new UTF8Encoding(false));
+            }
+        }
+        catch { }
+    }
+
+    private static bool ValidateRequestSecurity(HttpListenerContext ctx, out string rejectReason)
+    {
+        rejectReason = string.Empty;
+
+        // 1. 仅允许环回客户端
+        var remote = ctx.Request.RemoteEndPoint?.Address;
+        if (remote != null && !IPAddress.IsLoopback(remote))
+        {
+            rejectReason = "forbidden non-loopback client";
+            return false;
+        }
+
+        // 2. Host 校验，防止 DNS Rebinding
+        string host = ctx.Request.UserHostName ?? string.Empty;
+        int colon = host.IndexOf(':');
+        string hostOnly = colon > 0 ? host.Substring(0, colon) : host;
+        if (!string.IsNullOrEmpty(hostOnly)
+            && !string.Equals(hostOnly, "127.0.0.1", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(hostOnly, "localhost", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(hostOnly, "[::1]", StringComparison.OrdinalIgnoreCase))
+        {
+            rejectReason = "invalid host header";
+            return false;
+        }
+
+        // 3. 拦截来自浏览器网页的跨站 CSRF 请求（带 Origin 头一律拒绝，unless 携带合法 Token）
+        string origin = ctx.Request.Headers["Origin"];
+        bool hasValidToken = IsTokenMatched(ctx);
+        if (!string.IsNullOrEmpty(origin) && !hasValidToken)
+        {
+            rejectReason = "cross-origin browser request blocked";
+            return false;
+        }
+
+        // 4. 若配置了 Token 或开启强制 Token，则必须校验 X-Bazaar-Token 或 Authorization: Bearer
+        if (!string.IsNullOrEmpty(_activeToken) && !hasValidToken)
+        {
+            rejectReason = "missing or invalid X-Bazaar-Token";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsTokenMatched(HttpListenerContext ctx)
+    {
+        if (string.IsNullOrEmpty(_activeToken)) return false;
+        string hdr = ctx.Request.Headers["X-Bazaar-Token"];
+        if (string.Equals(hdr, _activeToken, StringComparison.Ordinal)) return true;
+        string auth = ctx.Request.Headers["Authorization"];
+        if (!string.IsNullOrEmpty(auth) && auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            return string.Equals(auth.Substring(7).Trim(), _activeToken, StringComparison.Ordinal);
+        }
+        return false;
+    }
+
     private static async Task HandleRequestAsync(HttpListenerContext ctx)
     {
         try
         {
+            if (!ValidateRequestSecurity(ctx, out string reject))
+            {
+                Respond(ctx, 403, Err(reject));
+                return;
+            }
+
             string path = (ctx.Request.Url?.AbsolutePath?.TrimEnd('/') ?? "").ToLowerInvariant();
             string method = ctx.Request.HttpMethod.ToUpperInvariant();
 
@@ -294,6 +422,32 @@ internal sealed class GameDriver : MonoBehaviour
                 if (opLower == "concede")
                 {
                     var res = await DoConcedeAsync(req).ConfigureAwait(false);
+                    Respond(ctx, 200, JsonConvert.SerializeObject(res, Formatting.Indented));
+                    return;
+                }
+                if (opLower == "batch")
+                {
+                    var res = await DriverOps.RunBatchAsync(req, BazaarLauncher.Core.HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                    Respond(ctx, 200, JsonConvert.SerializeObject(res, Formatting.Indented));
+                    return;
+                }
+                if (opLower == "wait")
+                {
+                    var spec = req["condition"] as JObject ?? req["wait"] as JObject ?? new JObject();
+                    int timeout = Math.Clamp((int?)req["timeoutMs"] ?? 10000, 100, 60000);
+                    var r = await DriverOps.WaitForAsync(spec, timeout, BazaarLauncher.Core.HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                    Respond(ctx, 200, JsonConvert.SerializeObject(new { ok = r.ok, elapsedMs = r.elapsedMs, error = r.error }, Formatting.Indented));
+                    return;
+                }
+                if (opLower == "sync")
+                {
+                    var res = await DoSyncAsync(req, BazaarLauncher.Core.HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                    Respond(ctx, 200, JsonConvert.SerializeObject(res, Formatting.Indented));
+                    return;
+                }
+                if (opLower is "forcestate" or "force_state")
+                {
+                    var res = await DoForceStateAsync(req, BazaarLauncher.Core.HttpClientHub.ShutdownToken).ConfigureAwait(false);
                     Respond(ctx, 200, JsonConvert.SerializeObject(res, Formatting.Indented));
                     return;
                 }
@@ -900,12 +1054,12 @@ internal sealed class GameDriver : MonoBehaviour
                     return GameInspector.InspectAll((bool?)req["compact"] ?? false, (bool?)req["ui"] ?? true);
                 case "cheat": return DoCheat(req);
                 case "startrun": return DoStartRun(req);
-                case "forcestate": return DoForceState(req);
+                case "forcestate": return new { ok = false, error = "forceState must run via async route" };
                 case "resync": return DoResync(req);
-                case "sync": return DoSync(req);
+                case "sync": return new { ok = false, error = "sync must run via async route" };
                 case "state": return new { ok = true, state = ReadState() };
-                case "batch": return DriverOps.RunBatch(req);
-                case "wait": return DoWait(req);
+                case "batch": return new { ok = false, error = "batch must run via async route" };
+                case "wait": return new { ok = false, error = "wait must run via async route" };
                 case "events": return new { ok = true, events = DriverOps.Snapshot((int?)req["since"] ?? 0) };
                 case "cosmeticsstate": return GetCosmeticsQaSnapshot();
                 case "switchhero": return SwitchHeroInMainMenu((string)req["hero"]);
@@ -922,14 +1076,6 @@ internal sealed class GameDriver : MonoBehaviour
         }
     }
 
-    private static object DoWait(JObject req)
-    {
-        var spec = req["condition"] as JObject ?? new JObject();
-        int timeout = (int?)req["timeoutMs"] ?? 10000;
-        var r = DriverOps.WaitFor(spec, timeout);
-        return new { ok = r.ok, elapsedMs = r.elapsedMs, error = r.error };
-    }
-
     // ── 给 DriverOps 用的公开包装 ───────────────────────────────────────────
     internal static object DoBuyPublic(JObject req) => DoBuy(req);
     internal static object DoSellPublic(JObject req) => DoSell(req);
@@ -941,8 +1087,6 @@ internal sealed class GameDriver : MonoBehaviour
     internal static object DoCheatPublic(JObject req) => DoCheat(req);
     internal static object DoStartRunPublic(JObject req) => DoStartRun(req);
     internal static object DoInspectPublic() => GameInspector.InspectAll();
-    internal static object DoResumeSyncFromMain(JObject req) => DoResumeAsync(req).GetAwaiter().GetResult();
-    internal static object DoConcedeSyncFromMain(JObject req) => DoConcedeAsync(req).GetAwaiter().GetResult();
     internal static object ReadStatePublic() => ReadState();
 
     private static object GetCurrentAppState() => GameInspector.GetCurrentAppState();
@@ -1470,7 +1614,7 @@ internal sealed class GameDriver : MonoBehaviour
 
     // ── Resume / Concede（先在工作线程与服务端 HTTP 交互，再切主线程操作客户端）──
 
-    private static async Task<object> DoResumeAsync(JObject req)
+    internal static async Task<object> DoResumeAsync(JObject req)
     {
         bool force = (bool?)req["force"] ?? false;
         bool clickButton = (bool?)req["clickButton"] ?? false;
@@ -1860,38 +2004,45 @@ internal sealed class GameDriver : MonoBehaviour
         try { return UnityEngine.Object.FindFirstObjectByType(t); } catch { return null; }
     }
 
-    private static object DoSync(JObject req)
+    /// <summary>异步状态同步（无主线程 Thread.Sleep 阻塞，修复 P0-1）。</summary>
+    internal static async Task<object> DoSyncAsync(JObject req, CancellationToken ct = default)
     {
         try
         {
-            var cmd = GetCmd();
-            if (cmd == null) return new { ok = false, error = "Cmd not available" };
-
-            var exitM = cmd.GetType().GetMethod("SendExitCurrentState");
-            exitM?.Invoke(cmd, null);
-
-            Thread.Sleep(400);
-
-            var dataType = AccessTools.TypeByName("TheBazaar.Data");
-            var runStateObj = dataType?.GetProperty("CurrentState", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-            if (runStateObj == null) return new { ok = true, op = "sync", note = "no current state" };
-
-            var stateField = runStateObj.GetType().GetField("StateName", BindingFlags.Public | BindingFlags.Instance);
-            object targetState = stateField?.GetValue(runStateObj);
-            if (targetState == null) return new { ok = true, op = "sync", note = "no state name" };
-
-            var appStateType = AccessTools.TypeByName("TheBazaar.AppState");
-            var setState = appStateType?.GetMethod("SetState",
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
-                null, new[] { targetState.GetType() }, null);
-
-            if (setState != null)
+            bool sent = RunOnMain(() =>
             {
-                object task = setState.Invoke(null, new[] { targetState });
-                _ = (task as Task);
-            }
+                var cmd = GetCmd();
+                if (cmd == null) return false;
+                var exitM = cmd.GetType().GetMethod("SendExitCurrentState");
+                exitM?.Invoke(cmd, null);
+                return true;
+            });
+            if (!sent) return new { ok = false, error = "Cmd not available" };
 
-            return new { ok = true, op = "sync", targetState = targetState.ToString() };
+            await Task.Delay(400, ct).ConfigureAwait(false);
+
+            return RunOnMain<object>(() =>
+            {
+                var dataType = AccessTools.TypeByName("TheBazaar.Data");
+                var runStateObj = dataType?.GetProperty("CurrentState", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                if (runStateObj == null) return new { ok = true, op = "sync", note = "no current state" };
+
+                var stateField = runStateObj.GetType().GetField("StateName", BindingFlags.Public | BindingFlags.Instance);
+                object targetState = stateField?.GetValue(runStateObj);
+                if (targetState == null) return new { ok = true, op = "sync", note = "no state name" };
+
+                var appStateType = AccessTools.TypeByName("TheBazaar.AppState");
+                var setState = appStateType?.GetMethod("SetState",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                    null, new[] { targetState.GetType() }, null);
+
+                if (setState != null)
+                {
+                    _ = setState.Invoke(null, new[] { targetState }) as Task;
+                }
+
+                return new { ok = true, op = "sync", targetState = targetState.ToString() };
+            });
         }
         catch (Exception ex)
         {
@@ -1899,42 +2050,62 @@ internal sealed class GameDriver : MonoBehaviour
         }
     }
 
-    private static object DoForceState(JObject req)
+    /// <summary>异步强制状态切换（移除主线程 Task.Wait 死锁，修复 P0-1）。</summary>
+    internal static async Task<object> DoForceStateAsync(JObject req, CancellationToken ct = default)
     {
-        string target = (string)req["state"];
+        string target = (string)req?["state"];
         if (string.IsNullOrEmpty(target)) return new { ok = false, error = "state required" };
 
         try
         {
-            var erunState = AccessTools.TypeByName("BazaarGameShared.Domain.Runs.ERunState");
-            if (erunState == null) return new { ok = false, error = "ERunState not found" };
-            object value = Enum.Parse(erunState, target, ignoreCase: true);
+            Task pendingTask = null;
+            string error = null;
 
-            var dataType = AccessTools.TypeByName("TheBazaar.Data");
-            var currentState = dataType?.GetProperty("CurrentState", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-            if (currentState != null)
+            RunOnMain(() =>
             {
-                var st = currentState.GetType();
-                var stateNameField = st.GetField("StateName", BindingFlags.Public | BindingFlags.Instance);
-                if (stateNameField != null)
+                try
                 {
-                    stateNameField.SetValue(currentState, value);
-                }
-                else
-                {
-                    var prop = st.GetProperty("StateName", BindingFlags.Public | BindingFlags.Instance);
-                    if (prop != null && prop.CanWrite) prop.SetValue(currentState, value);
-                }
-            }
+                    var erunState = AccessTools.TypeByName("BazaarGameShared.Domain.Runs.ERunState");
+                    if (erunState == null) { error = "ERunState not found"; return true; }
+                    object value = Enum.Parse(erunState, target, ignoreCase: true);
 
-            var appStateType = AccessTools.TypeByName("TheBazaar.AppState");
-            var setState = appStateType?.GetMethod("SetState",
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
-                null, new[] { erunState }, null);
-            if (setState != null)
+                    var dataType = AccessTools.TypeByName("TheBazaar.Data");
+                    var currentState = dataType?.GetProperty("CurrentState", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                    if (currentState != null)
+                    {
+                        var st = currentState.GetType();
+                        var stateNameField = st.GetField("StateName", BindingFlags.Public | BindingFlags.Instance);
+                        if (stateNameField != null)
+                        {
+                            stateNameField.SetValue(currentState, value);
+                        }
+                        else
+                        {
+                            var prop = st.GetProperty("StateName", BindingFlags.Public | BindingFlags.Instance);
+                            if (prop != null && prop.CanWrite) prop.SetValue(currentState, value);
+                        }
+                    }
+
+                    var appStateType = AccessTools.TypeByName("TheBazaar.AppState");
+                    var setState = appStateType?.GetMethod("SetState",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                        null, new[] { erunState }, null);
+                    if (setState != null)
+                    {
+                        pendingTask = setState.Invoke(null, new[] { value }) as Task;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    error = ex.GetType().Name + ": " + ex.Message;
+                }
+                return true;
+            });
+
+            if (error != null) return new { ok = false, error };
+            if (pendingTask != null)
             {
-                object task = setState.Invoke(null, new[] { value });
-                (task as Task)?.Wait(5000);
+                await Task.WhenAny(pendingTask, Task.Delay(5000, ct)).ConfigureAwait(false);
             }
 
             return new { ok = true, op = "forceState", state = target };

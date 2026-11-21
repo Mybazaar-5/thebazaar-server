@@ -1,4 +1,5 @@
 using System.Text.Json;
+using BazaarCore.Data;
 using Microsoft.Data.Sqlite;
 
 namespace BazaarServer.Data;
@@ -71,6 +72,60 @@ public sealed class GameModeConfig
     public int SandstormAdditiveScalar { get; init; } = 2;
     public int SandstormCountdownStartTime { get; init; } = 20000;
     public int SandstormCountdownDuration { get; init; } = 10000;
+
+    /// <summary>
+    /// 直接从已单次加载的 <see cref="GameDataRepository"/> 构建只读模式配置，彻底消除启动期重复打开 GameData.db。
+    /// </summary>
+    public static GameModeConfig FromRepository(GameDataRepository repo)
+    {
+        ArgumentNullException.ThrowIfNull(repo);
+        var gm = repo.GameMode;
+        var cfg = new GameModeConfig
+        {
+            Id = Guid.TryParse(gm.Id, out var g) ? g : Guid.Empty,
+            InternalName = string.IsNullOrWhiteSpace(gm.InternalName) ? "Base GameMode" : gm.InternalName,
+
+            VictoriesToWin = gm.VictoriesToWin > 0 ? gm.VictoriesToWin : 10,
+            NumberOfDays = gm.NumberOfDays > 0 ? gm.NumberOfDays : 10,
+            HoursInADay = gm.HoursInADay > 0 ? gm.HoursInADay : 6,
+            NumCarpetSocketsUnlockPerLevel = gm.NumCarpetSocketsUnlockPerLevel > 0 ? gm.NumCarpetSocketsUnlockPerLevel : 2,
+            ExperiencePerLevel = gm.ExperiencePerLevel > 0 ? gm.ExperiencePerLevel : 8,
+            ExperiencePerHour = gm.ExperiencePerHour >= 0 ? gm.ExperiencePerHour : 1,
+            MaxLevel = gm.MaxLevel > 0 ? gm.MaxLevel : 999,
+
+            PrestigeInitial = gm.Prestige?.PrestigeInitial > 0 ? gm.Prestige.PrestigeInitial : 20,
+            PrestigeMax = gm.Prestige?.PrestigeMax > 0 ? gm.Prestige.PrestigeMax : 20,
+            PrestigeLossFromMonsters = gm.Prestige?.PrestigeLossFromMonsters ?? 0,
+
+            StartingGold = 15,
+            StartingIncome = 5,
+            StartingExperience = Math.Max(0, gm.StartingExperience),
+            StartingHealth = 250,
+
+            FatesTemplateId = !string.IsNullOrWhiteSpace(gm.Fates?.TemplateId)
+                ? gm.Fates.TemplateId!
+                : "aef5e7d8-ea0b-4e7e-8f3d-6e7ba492fa10",
+            FatesSpawnAtOrBelowPrestige = gm.Fates?.SpawnAtOrBelowPrestigeValue ?? 0,
+            FatesAfterPrestige = gm.Fates?.AfterFatesPrestigeValue > 0 ? gm.Fates.AfterFatesPrestigeValue : 1,
+
+            CombatSimEffectDelay = gm.CombatSimEffectDelay > 0 ? gm.CombatSimEffectDelay : 250,
+            CritPercentMultiplier = gm.CritPercentMultiplier > 0 ? gm.CritPercentMultiplier : 200,
+            BurnDecrementByAsPercentage = gm.BurnDecrementByAsPercentage > 0 ? gm.BurnDecrementByAsPercentage : 3,
+
+            SandstormBaseTickRate = gm.Sandstorm?.BaseTickRate > 0 ? gm.Sandstorm.BaseTickRate : 250,
+            SandstormTickRateDecrement = gm.Sandstorm?.TickRateDecrement ?? 10,
+            SandstormTickRateFloor = gm.Sandstorm?.TickRateFloor > 0 ? gm.Sandstorm.TickRateFloor : 150,
+            SandstormBaseDamage = gm.Sandstorm?.BaseDamage > 0 ? gm.Sandstorm.BaseDamage : 1,
+            SandstormAdditiveScalar = gm.Sandstorm?.AdditiveScalar ?? 2,
+            SandstormCountdownStartTime = gm.Sandstorm?.CountdownStartTime > 0 ? gm.Sandstorm.CountdownStartTime : 20000,
+            SandstormCountdownDuration = gm.Sandstorm?.CountdownDuration > 0 ? gm.Sandstorm.CountdownDuration : 10000,
+        };
+        Console.WriteLine(
+            $"[GameMode] (shared repo) {cfg.InternalName}: win={cfg.VictoriesToWin} days={cfg.NumberOfDays} " +
+            $"hours/day={cfg.HoursInADay} prestige={cfg.PrestigeInitial} " +
+            $"start(gold={cfg.StartingGold}, inc={cfg.StartingIncome}, exp={cfg.StartingExperience}, hp={cfg.StartingHealth})");
+        return cfg;
+    }
 
     public static GameModeConfig Load(string dbPath)
     {

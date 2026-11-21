@@ -369,12 +369,13 @@ public sealed class V9CoreParityStageBTests
         Assert.DoesNotContain("Burn", fieryTalisman.GetAllHiddenTags(), StringComparer.OrdinalIgnoreCase);
         Assert.Contains("BurnReference", fieryTalisman.GetAllHiddenTags(), StringComparer.OrdinalIgnoreCase);
 
-        // 2. 真正的 Fiery Cannon（模板自身含 Burn 隐藏标签与 TActionPlayerBurnApply）依然保持 Burn 标签
+        // 2. 真正的 Fiery Cannon（模板自身含 Burn 隐藏标签与 TActionPlayerBurnApply）：
+        //    严格对齐官方规则（P0-5）：动态效果标签属于 HiddenTags，不污染可见 Tags（HasTag）
         var fieryCannon = new CardInstance(cannonTpl, CardTier.Bronze, "Fiery");
-        Assert.True(fieryCannon.HasTag("Burn"));
+        Assert.False(fieryCannon.HasTag("Burn"), "P0-5：Burn 为隐藏效果标签，不应污染可见 HasTag");
         Assert.True(fieryCannon.HasHiddenTag("Burn"));
 
-        // 3. 当某附魔未在 Template.Enchantments 中定义时，仍保留 MapEnchantmentToEffectBit 兜底
+        // 3. 当某附魔未在 Template.Enchantments 中定义时，仍保留 MapEnchantmentToEffectBit 兜底至 HiddenTags
         var bareTpl = new CardTemplate
         {
             Id = "bare_fallback_ench_item",
@@ -384,7 +385,7 @@ public sealed class V9CoreParityStageBTests
             StartingTier = "Bronze",
         };
         var fallbackFiery = new CardInstance(bareTpl, CardTier.Bronze, "Fiery");
-        Assert.True(fallbackFiery.HasTag("Burn"));
+        Assert.False(fallbackFiery.HasTag("Burn"), "P0-5：附魔兜底效果标签应仅归入 HiddenTags");
         Assert.True(fallbackFiery.HasHiddenTag("Burn"));
     }
 

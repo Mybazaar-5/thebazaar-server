@@ -2,47 +2,68 @@ using System;
 using System.IO;
 using System.Net.Http;
 using System.Text;
-using BepInEx;
+using System.Threading;
+using System.Threading.Tasks;
+using BazaarLauncher.Core;
 using HarmonyLib;
 
 namespace BazaarLauncher;
 
 /// <summary>
-/// 从最底层抓 HTTP 流量：patch HttpClient.SendAsync。
-///
-/// 为什么不 patch HttpGameClient.SendCommand：它是泛型方法，Harmony 无法生成
-/// 非泛型 trampoline，会报 "IL Compile Error"。
-/// HttpClient.SendAsync 是非泛型，稳定可 patch，且能同时抓到 JSON 与 msgpack。
+/// HTTP 流量诊断抓包模块（修复 P0-3）：
+///   1. 请求侧严禁同步调用 ReadAsByteArrayAsync().GetAwaiter().GetResult()，避免死锁与消耗不可重读 StreamContent；
+///   2. 响应侧正确识别 Task&lt;HttpResponseMessage&gt; 并使用 ContinueWith 异步落盘响应头与正文，彻底修复死代码问题；
+///   3. 同时覆盖 2 参数与底层 3 参数 HttpClient.SendAsync。
 /// </summary>
 internal static class TrafficDump
 {
     private static long _seq;
+    private static bool _applied;
 
-    internal static void Apply(Harmony harmony)
+    internal static void ResetAppliedFlag() => _applied = false;
+
+    internal static void Apply(SafeHarmonyPatcher patcher)
     {
+        if (_applied || patcher == null) return;
+        _applied = true;
+
         try
         {
             string dir = ResolveDir();
             Directory.CreateDirectory(dir);
-            BazaarLauncherPlugin.Log.LogInfo("Traffic dump (HttpClient level) -> " + dir);
+            BazaarLauncherPlugin.Log?.LogInfo("TrafficDump 已启用，抓包目录 -> " + dir);
 
-            var sendAsync = AccessTools.Method(typeof(HttpClient), "SendAsync",
-                new[] { typeof(HttpRequestMessage), typeof(System.Threading.CancellationToken) });
-            if (sendAsync == null)
-            {
-                BazaarLauncherPlugin.Log.LogWarning("HttpClient.SendAsync not found");
-                return;
-            }
+            var prefix = AccessTools.Method(typeof(TrafficDump), nameof(Prefix));
+            var postfix = AccessTools.Method(typeof(TrafficDump), nameof(Postfix));
 
-            harmony.Patch(sendAsync,
-                prefix: new HarmonyMethod(AccessTools.Method(typeof(TrafficDump), nameof(Prefix))),
-                postfix: new HarmonyMethod(AccessTools.Method(typeof(TrafficDump), nameof(Postfix))));
-            BazaarLauncherPlugin.Log.LogInfo("Patched HttpClient.SendAsync for dumping");
+            patcher.TryPatch(
+                typeof(HttpClient),
+                "SendAsync",
+                new[] { typeof(HttpRequestMessage), typeof(CancellationToken) },
+                prefix: prefix,
+                postfix: postfix,
+                optional: true,
+                label: "TrafficDump.SendAsync(2)");
+
+            patcher.TryPatch(
+                typeof(HttpClient),
+                "SendAsync",
+                new[] { typeof(HttpRequestMessage), typeof(HttpCompletionOption), typeof(CancellationToken) },
+                prefix: prefix,
+                postfix: postfix,
+                optional: true,
+                label: "TrafficDump.SendAsync(3)");
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log.LogWarning("traffic dump patch failed: " + ex.Message);
+            BazaarLauncherPlugin.Log?.LogWarning("TrafficDump 挂载失败: " + ex.Message);
         }
+    }
+
+    internal static void Apply(Harmony harmony)
+    {
+        if (_applied || harmony == null) return;
+        Apply(new SafeHarmonyPatcher("trafficdump.legacy"));
     }
 
     private static string ResolveDir()
@@ -55,107 +76,137 @@ internal static class TrafficDump
         return Environment.ExpandEnvironmentVariables(dir);
     }
 
-    /// <summary>请求侧：记录 method / uri / headers / body。</summary>
-    internal static void Prefix(ref HttpRequestMessage __0, out DumpCtx __state)
+    internal static void Prefix(HttpRequestMessage __0, out DumpCtx __state)
     {
         __state = null;
         try
         {
             if (__0 == null) return;
-            string uri = __0.RequestUri?.ToString() ?? "";
-            // 只关心自建服与对局端点
+            string uri = __0.RequestUri?.ToString() ?? string.Empty;
             if (!uri.Contains("/sessions") && !uri.Contains("/commands") && !uri.Contains("/api/"))
-                return;
-
-            string body = "";
-            if (__0.Content != null)
             {
-                try
-                {
-                    var bytes = __0.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-                    body = $"[{bytes.Length} bytes] {ToHexOrText(bytes)}";
-                }
-                catch (Exception e) { body = "<unreadable: " + e.Message + ">"; }
+                return;
             }
 
             var headers = new StringBuilder();
             foreach (var h in __0.Headers)
                 headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
             if (__0.Content != null)
+            {
                 foreach (var h in __0.Content.Headers)
                     headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
+            }
 
-            long n = System.Threading.Interlocked.Increment(ref _seq);
+            // 仅安全判断可重读类型，绝不在 Prefix 同步阻塞或消耗流式请求体（修复 P0-3）
+            string bodyNote = "<empty>";
+            bool safeBufferable = false;
+            if (__0.Content != null)
+            {
+                if (__0.Content is StringContent || __0.Content is ByteArrayContent)
+                {
+                    safeBufferable = true;
+                    bodyNote = $"<{__0.Content.GetType().Name}, 异步记录中>";
+                }
+                else
+                {
+                    bodyNote = $"<{__0.Content.GetType().Name}, 流式体不同步读取以防破坏请求>";
+                }
+            }
+
+            long n = Interlocked.Increment(ref _seq);
             string stem = $"{DateTime.UtcNow:yyyyMMdd-HHmmss-fff}-{n:D4}-{Sanitize(uri)}";
             string dir = ResolveDir();
-            Directory.CreateDirectory(dir);
-            File.WriteAllText(Path.Combine(dir, stem + "-req.txt"),
-                $"{__0.Method} {uri}\nHEADERS: {headers}\nBODY: {body}", Encoding.UTF8);
+
+            string reqLine = $"{__0.Method} {uri}\nHEADERS: {headers}\nBODY: {bodyNote}";
+            string reqPath = Path.Combine(dir, stem + "-req.txt");
+            var contentRef = safeBufferable ? __0.Content : null;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    Directory.CreateDirectory(dir);
+                    string finalText = reqLine;
+                    if (contentRef != null)
+                    {
+                        byte[] bytes = await contentRef.ReadAsByteArrayAsync().ConfigureAwait(false);
+                        finalText = $"{__0.Method} {uri}\nHEADERS: {headers}\nBODY: [{bytes.Length} bytes] {ToHexOrText(bytes)}";
+                    }
+                    await File.WriteAllTextAsync(reqPath, finalText, Encoding.UTF8).ConfigureAwait(false);
+                }
+                catch { }
+            });
 
             __state = new DumpCtx { Dir = dir, Stem = stem, Uri = uri, Method = __0.Method.Method };
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log?.LogWarning("dump prefix: " + ex.Message);
+            BazaarLauncherPlugin.Log?.LogWarning("TrafficDump Prefix 异常: " + ex.Message);
         }
     }
 
-    /// <summary>响应侧：记录 status / headers / body。</summary>
-    internal static void Postfix(object __result, DumpCtx __state)
+    internal static void Postfix(Task<HttpResponseMessage> __result, DumpCtx __state)
     {
-        if (__state == null) return;
+        if (__state == null || __result == null) return;
         try
         {
-            if (!(__result is HttpResponseMessage resp)) return;
-            var headers = new StringBuilder();
-            foreach (var h in resp.Headers)
-                headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
-            foreach (var h in resp.Content.Headers)
-                headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
-
-            string stem = __state.Stem + "-res.txt";
-            string path = Path.Combine(__state.Dir, stem);
-
-            // 先写头部，保证即使 body 读不到也有记录
-            File.WriteAllText(path,
-                $"{(int)resp.StatusCode} {resp.StatusCode}\nHEADERS: {headers}\nBODY: <streaming, see .bin>",
-                Encoding.UTF8);
-
-            // 后台异步读 body（对 ResponseHeadersRead 也有效）
-            string binPath = Path.Combine(__state.Dir, __state.Stem + "-res.bin");
-            string uri = __state.Uri;
-            var respCopy = resp;
-            System.Threading.Tasks.Task.Run(async () =>
+            _ = __result.ContinueWith(async t =>
             {
+                if (t.IsCanceled || t.IsFaulted || t.Result == null) return;
+                HttpResponseMessage resp = t.Result;
                 try
                 {
-                    byte[] bytes = await respCopy.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                    if (bytes.Length == 0) return;
-                    await File.WriteAllBytesAsync(binPath, bytes).ConfigureAwait(false);
-
-                    string text = $"{(int)respCopy.StatusCode} {respCopy.StatusCode}\nHEADERS: {headers}\nBODY: [{bytes.Length} bytes]\n{Preview(bytes)}";
-                    await File.WriteAllTextAsync(path, text, Encoding.UTF8).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    try
+                    var headers = new StringBuilder();
+                    foreach (var h in resp.Headers)
+                        headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
+                    if (resp.Content != null)
                     {
-                        await File.AppendAllTextAsync(path, "\n<body read failed: " + ex.Message + ">").ConfigureAwait(false);
+                        foreach (var h in resp.Content.Headers)
+                            headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
                     }
-                    catch { }
+
+                    Directory.CreateDirectory(__state.Dir);
+                    string resPath = Path.Combine(__state.Dir, __state.Stem + "-res.txt");
+                    string binPath = Path.Combine(__state.Dir, __state.Stem + "-res.bin");
+
+                    string contentType = resp.Content?.Headers?.ContentType?.MediaType ?? string.Empty;
+                    if (contentType.IndexOf("event-stream", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        await File.WriteAllTextAsync(
+                            resPath,
+                            $"{(int)resp.StatusCode} {resp.StatusCode}\nHEADERS: {headers}\nBODY: <SSE 流式响应已跳过全量读取>",
+                            Encoding.UTF8).ConfigureAwait(false);
+                        return;
+                    }
+
+                    if (resp.Content != null)
+                    {
+                        await resp.Content.LoadIntoBufferAsync().ConfigureAwait(false);
+                        byte[] bytes = await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+                        if (bytes.Length > 0)
+                        {
+                            await File.WriteAllBytesAsync(binPath, bytes).ConfigureAwait(false);
+                        }
+                        string text = $"{(int)resp.StatusCode} {resp.StatusCode}\nHEADERS: {headers}\nBODY: [{bytes.Length} bytes]\n{Preview(bytes)}";
+                        await File.WriteAllTextAsync(resPath, text, Encoding.UTF8).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await File.WriteAllTextAsync(resPath, $"{(int)resp.StatusCode} {resp.StatusCode}\nHEADERS: {headers}\nBODY: <empty>", Encoding.UTF8).ConfigureAwait(false);
+                    }
                 }
-            });
+                catch { }
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log?.LogWarning("dump postfix: " + ex.Message);
+            BazaarLauncherPlugin.Log?.LogWarning("TrafficDump Postfix 异常: " + ex.Message);
         }
     }
 
     private static string Preview(byte[] bytes)
     {
-        if (bytes.Length == 0) return "<empty>";
-        // 看起来像 JSON 就给文本
+        if (bytes == null || bytes.Length == 0) return "<empty>";
         byte b0 = bytes[0];
         if (b0 == (byte)'{' || b0 == (byte)'[')
         {
@@ -166,14 +217,13 @@ internal static class TrafficDump
         int limit = Math.Min(bytes.Length, 1024);
         for (int i = 0; i < limit; i++) sb.Append(bytes[i].ToString("X2")).Append(' ');
         if (bytes.Length > limit) sb.Append($"… ({bytes.Length - limit} more)");
-        return "HEX: " + sb.ToString();
+        return "HEX: " + sb;
     }
 
     private static string ToHexOrText(byte[] bytes)
     {
         if (bytes == null || bytes.Length == 0) return "<empty>";
-        // msgpack 以二进制为主，直接给 hex；JSON 给文本
-        if (bytes.Length > 2 && bytes[0] == (byte)'{' || (bytes.Length > 0 && bytes[0] == (byte)'['))
+        if ((bytes.Length > 2 && bytes[0] == (byte)'{') || (bytes.Length > 0 && bytes[0] == (byte)'['))
         {
             return Encoding.UTF8.GetString(bytes);
         }

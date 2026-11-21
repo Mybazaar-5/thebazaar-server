@@ -1,117 +1,81 @@
 using System;
 using System.Reflection;
 using System.Threading.Tasks;
-using BepInEx;
+using BazaarLauncher.Core;
 using HarmonyLib;
 
 namespace BazaarLauncher;
 
 /// <summary>
-/// 摘掉 Steam 依赖。
-///
-/// 原版启动链：
-///   AppLoader → GameInstance.InitializeSteam() → SteamModule.Initialize()
-///                → SteamAPI.Init() → GetAuthTicketForWebApi() → 票据
-///   AppLoader → InitializeAuthService() → SteamAuthService.TryAutoLoginAsync()
-///                → GetSteamTicket() → POST /api/auth/login/silent
-///
-/// 这里：
-///   · SteamModule.Initialize 整体短路，直接置 Initialized / IsAuthenticated = true
-///   · GetSteamTicket 返回按玩家名派生的稳定伪票据
-///   · 其余 Steam API 调用全部安全桩
-///
-/// 注意：所有 prefix 补丁都必须返回一个「已完成的任务」，否则 AppLoader 的
-/// DependsOn 链会把 Auth Service 判为 "Skipped due to failed dependency"。
+/// 摘掉 Steam 依赖（修复 P1-6 值类型 CSteamID 拆箱 NRE 风险与热重载状态清理）。
 /// </summary>
 internal static class NoSteam
 {
     private static bool _applied;
+    private static Type _cachedCSteamIdType;
+    private static object _cachedDefaultCSteamId;
+    private static Type _cachedSteamTicketType;
 
-    internal static void Apply(Harmony harmony)
+    internal static void ResetAppliedFlag() => _applied = false;
+
+    internal static void Apply(SafeHarmonyPatcher patcher)
     {
-        if (_applied) return;
+        if (_applied || patcher == null) return;
         _applied = true;
 
         var steamModule = AccessTools.TypeByName("TheBazaar.Steam.SteamModule");
         if (steamModule == null)
         {
-            BazaarLauncherPlugin.Log.LogError("TheBazaar.Steam.SteamModule not found — cannot bypass Steam.");
+            BazaarLauncherPlugin.Log?.LogError("NoSteam: 未找到 TheBazaar.Steam.SteamModule，无法绕过 Steam");
             return;
         }
 
-        PatchTaskMethod(harmony, steamModule, "Initialize", nameof(SkipInitialize));
-        PatchTaskMethod(harmony, steamModule, "RegisterWithUpdater", nameof(NoOpTask));
-
-        var shutdown = AccessTools.Method(steamModule, "Shutdown");
-        if (shutdown != null)
+        _cachedSteamTicketType = AccessTools.TypeByName("TheBazaar.Steam.SteamModule+SteamTicket");
+        _cachedCSteamIdType = AccessTools.TypeByName("Steamworks.CSteamID");
+        if (_cachedCSteamIdType != null && _cachedCSteamIdType.IsValueType)
         {
-            harmony.Patch(shutdown, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(NoSteam), nameof(SkipShutdown))));
+            try
+            {
+                _cachedDefaultCSteamId = Activator.CreateInstance(_cachedCSteamIdType, new object[] { PlayerIdentity.StableSteamId() })
+                    ?? Activator.CreateInstance(_cachedCSteamIdType);
+            }
+            catch
+            {
+                try { _cachedDefaultCSteamId = Activator.CreateInstance(_cachedCSteamIdType); } catch { }
+            }
         }
 
-        var tick = AccessTools.Method(steamModule, "Tick");
-        if (tick != null)
-        {
-            harmony.Patch(tick, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(NoSteam), nameof(NoOpVoid))));
-        }
+        patcher.TryPatch(steamModule, "Initialize", prefix: AccessTools.Method(typeof(NoSteam), nameof(SkipInitialize)));
+        patcher.TryPatch(steamModule, "RegisterWithUpdater", prefix: AccessTools.Method(typeof(NoSteam), nameof(NoOpTask)));
+        patcher.TryPatch(steamModule, "Shutdown", prefix: AccessTools.Method(typeof(NoSteam), nameof(SkipShutdown)));
+        patcher.TryPatch(steamModule, "Tick", prefix: AccessTools.Method(typeof(NoSteam), nameof(NoOpVoid)));
+        patcher.TryPatch(steamModule, "GetSteamTicket", prefix: AccessTools.Method(typeof(NoSteam), nameof(FakeTicket)));
 
-        var getTicket = AccessTools.Method(steamModule, "GetSteamTicket");
-        if (getTicket != null)
-        {
-            harmony.Patch(getTicket, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(NoSteam), nameof(FakeTicket))));
-            BazaarLauncherPlugin.Log.LogInfo("Patched SteamModule.GetSteamTicket (fake ticket)");
-        }
-
-        // DLC 服务：不再轮询 SteamApps
         var dlc = AccessTools.TypeByName("TheBazaar.Steam.SteamDLCService");
         if (dlc != null)
         {
-            var dlcInit = AccessTools.Method(dlc, "Initialize");
-            if (dlcInit != null)
-            {
-                harmony.Patch(dlcInit, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(NoSteam), nameof(NoOpVoid))));
-                BazaarLauncherPlugin.Log.LogInfo("Patched SteamDLCService.Initialize (no-op)");
-            }
-
-            var isInstalled = AccessTools.Method(dlc, "IsInstalled");
-            if (isInstalled != null)
-            {
-                harmony.Patch(isInstalled, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(NoSteam), nameof(ReturnTrue))));
-            }
+            patcher.TryPatch(dlc, "Initialize", prefix: AccessTools.Method(typeof(NoSteam), nameof(NoOpVoid)), optional: true);
+            patcher.TryPatch(dlc, "IsInstalled", prefix: AccessTools.Method(typeof(NoSteam), nameof(ReturnTrue)), optional: true);
         }
 
-        PatchSteamStatics(harmony);
+        PatchSteamStatics(patcher);
     }
 
-    private static void PatchTaskMethod(Harmony harmony, Type type, string methodName, string patchName)
+    internal static void Apply(Harmony harmony)
     {
-        var m = AccessTools.Method(type, methodName);
-        if (m == null)
-        {
-            BazaarLauncherPlugin.Log.LogWarning($"{type.Name}.{methodName} not found");
-            return;
-        }
-        harmony.Patch(m, prefix: new HarmonyMethod(
-            AccessTools.Method(typeof(NoSteam), patchName)));
-        BazaarLauncherPlugin.Log.LogInfo($"Patched {type.Name}.{methodName}");
+        if (_applied || harmony == null) return;
+        Apply(new SafeHarmonyPatcher("nosteam.legacy"));
     }
 
-    private static void PatchSteamStatics(Harmony harmony)
+    private static void PatchSteamStatics(SafeHarmonyPatcher patcher)
     {
         var utils = AccessTools.TypeByName("Steamworks.SteamUtils");
         if (utils != null)
         {
             foreach (var name in new[] { "IsSteamRunningOnSteamDeck", "IsOverlayEnabled", "IsSteamInBigPictureMode" })
             {
-                var m = AccessTools.Method(utils, name);
-                if (m != null) harmony.Patch(m, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(NoSteam), nameof(ReturnFalse))));
+                patcher.TryPatch(utils, name, prefix: AccessTools.Method(typeof(NoSteam), nameof(ReturnFalse)), optional: true);
             }
-            BazaarLauncherPlugin.Log.LogInfo("Patched SteamUtils queries");
         }
 
         var apps = AccessTools.TypeByName("Steamworks.SteamApps");
@@ -119,60 +83,53 @@ internal static class NoSteam
         {
             foreach (var name in new[] { "BIsDlcInstalled", "BIsSubscribedApp" })
             {
-                var m = AccessTools.Method(apps, name);
-                if (m != null) harmony.Patch(m, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(NoSteam), nameof(ReturnTrue))));
+                patcher.TryPatch(apps, name, prefix: AccessTools.Method(typeof(NoSteam), nameof(ReturnTrue)), optional: true);
             }
-            var dlcCount = AccessTools.Method(apps, "GetDLCCount");
-            if (dlcCount != null) harmony.Patch(dlcCount, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(NoSteam), nameof(ZeroInt))));
+            patcher.TryPatch(apps, "GetDLCCount", prefix: AccessTools.Method(typeof(NoSteam), nameof(ZeroInt)), optional: true);
         }
 
         var friends = AccessTools.TypeByName("Steamworks.SteamFriends");
         if (friends != null)
         {
-            foreach (var name in new[] { "ActivateGameOverlay", "ActivateGameOverlayToStore",
-                                          "ActivateGameOverlayToWebPage", "ActivateGameOverlayToUser" })
+            foreach (var name in new[]
             {
-                var m = AccessTools.Method(friends, name);
-                if (m != null) harmony.Patch(m, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(NoSteam), nameof(NoOpVoid))));
+                "ActivateGameOverlay",
+                "ActivateGameOverlayToStore",
+                "ActivateGameOverlayToWebPage",
+                "ActivateGameOverlayToUser",
+            })
+            {
+                patcher.TryPatch(friends, name, prefix: AccessTools.Method(typeof(NoSteam), nameof(NoOpVoid)), optional: true);
             }
         }
 
         var client = AccessTools.TypeByName("Steamworks.SteamClient");
         if (client != null)
         {
-            var hook = AccessTools.Method(client, "SetWarningMessageHook");
-            if (hook != null) harmony.Patch(hook, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(NoSteam), nameof(NoOpVoid))));
+            patcher.TryPatch(client, "SetWarningMessageHook", prefix: AccessTools.Method(typeof(NoSteam), nameof(NoOpVoid)), optional: true);
         }
 
+        // 仅在能够确保产出合法值类型 CSteamID 时才挂载 GetSteamID 补丁，杜绝 P1-6 拆箱 NRE
         var steamUser = AccessTools.TypeByName("Steamworks.SteamUser");
-        if (steamUser != null)
+        if (steamUser != null && _cachedDefaultCSteamId != null)
         {
-            var getSteamId = AccessTools.Method(steamUser, "GetSteamID");
-            if (getSteamId != null) harmony.Patch(getSteamId, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(NoSteam), nameof(FakeSteamId))));
+            patcher.TryPatch(steamUser, "GetSteamID", Type.EmptyTypes, prefix: AccessTools.Method(typeof(NoSteam), nameof(FakeSteamId)), optional: true);
         }
     }
 
-    // ── 补丁体 ──────────────────────────────────────────────────────────────
-
-    /// <summary>SteamModule.Initialize：不碰 SteamAPI，直接置状态并返回已完成任务。</summary>
     private static bool SkipInitialize(object __instance, ref Task __result)
     {
         try
         {
             SetBacking(__instance.GetType(), __instance, "Initialized", true);
             SetBacking(__instance.GetType(), __instance, "IsAuthenticated", true);
-            BazaarLauncherPlugin.Log.LogInfo("Steam bypassed: Initialized=true, IsAuthenticated=true");
+            BazaarLauncherPlugin.Log?.LogInfo("NoSteam: 已完成 Steam 离线旁路初始化");
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log.LogError("SkipInitialize: " + ex);
+            BazaarLauncherPlugin.Log?.LogError("NoSteam SkipInitialize 失败: " + ex);
         }
-        __result = Task.CompletedTask;   // 关键：必须给一个已完成的 Task
+        __result = Task.CompletedTask;
         return false;
     }
 
@@ -189,23 +146,20 @@ internal static class NoSteam
         return false;
     }
 
-    /// <summary>返回按玩家名派生的稳定伪票据。</summary>
     private static bool FakeTicket(ref object __result)
     {
         try
         {
             string name = PlayerIdentity.ResolveName();
             string ticket = PlayerIdentity.FakeSteamTicket(name);
-            var ticketType = AccessTools.TypeByName("TheBazaar.Steam.SteamModule+SteamTicket");
-            __result = ticketType != null
-                ? Activator.CreateInstance(ticketType, new object[] { ticket })
+            _cachedSteamTicketType ??= AccessTools.TypeByName("TheBazaar.Steam.SteamModule+SteamTicket");
+            __result = _cachedSteamTicketType != null
+                ? Activator.CreateInstance(_cachedSteamTicketType, new object[] { ticket })
                 : null;
-            BazaarLauncherPlugin.Log.LogInfo(
-                $"Fake Steam ticket for '{name}': {ticket.Substring(0, Math.Min(24, ticket.Length))}…");
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log.LogError("FakeTicket: " + ex);
+            BazaarLauncherPlugin.Log?.LogError("NoSteam FakeTicket 失败: " + ex);
         }
         return false;
     }
@@ -214,14 +168,20 @@ internal static class NoSteam
     {
         try
         {
-            var csteamId = AccessTools.TypeByName("Steamworks.CSteamID");
-            if (csteamId != null)
+            if (_cachedCSteamIdType != null)
             {
-                __result = Activator.CreateInstance(csteamId,
-                    new object[] { PlayerIdentity.StableSteamId() });
+                object instance = Activator.CreateInstance(_cachedCSteamIdType, new object[] { PlayerIdentity.StableSteamId() });
+                if (instance != null)
+                {
+                    __result = instance;
+                    return false;
+                }
             }
         }
         catch { }
+
+        // 绝不将 null 写回值类型 __result，回退到预检缓存的合法值类型实例
+        __result = _cachedDefaultCSteamId;
         return false;
     }
 

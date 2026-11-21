@@ -55,6 +55,25 @@ public static class CombatSimulator
         public double Value { get; init; }
     }
 
+    private sealed class CachedCardSnapshotAttrs
+    {
+        public int Version = -1;
+        public int AmmoMax;
+        public int CooldownMaxMs;
+        public int DamageAmount;
+        public int ShieldApplyAmount;
+        public int BurnApplyAmount;
+        public int PoisonApplyAmount;
+        public int HealAmount;
+        public int RegenApplyAmount;
+        public int CritChance;
+        public int Multicast;
+        public int Lifesteal;
+        public int SellPrice;
+        public bool AuraHeated;
+        public bool AuraChilled;
+    }
+
     /// <summary>
     /// 模拟双方完整战斗；设置 <paramref name="recordTimeline"/> 或 <paramref name="recordEvents"/> 为 false 可显著降低无头批量压测开销。
     /// 将 <paramref name="syncPermanentChanges"/> 设为 true 可在战后自动把永久成长/附魔/升阶/任务/变形/衍生卡及永久玩家属性无损回写至 <paramref name="originalP1"/>。
@@ -68,6 +87,34 @@ public static class CombatSimulator
         bool recordTimeline = true,
         bool recordEvents = true,
         bool syncPermanentChanges = false)
+        => Simulate(
+            repo,
+            originalP1,
+            originalP2,
+            seed,
+            combatType,
+            recordTimeline,
+            recordEvents,
+            syncPermanentChanges,
+            modifiers: null,
+            sandstormEnabled: true,
+            timelineSampleIntervalMs: TickMs);
+
+    /// <summary>
+    /// 扩展战斗模拟重载：支持注入突变词条/无尽/Boss 车轮战 <see cref="CombatModifiers"/>、显式沙暴开关以及自定义时间轴快照采样间隔（如 50ms 对齐 CombatSimConverter）。
+    /// </summary>
+    public static CombatResult Simulate(
+        GameDataRepository repo,
+        PlayerState originalP1,
+        PlayerState originalP2,
+        int seed,
+        string combatType,
+        bool recordTimeline,
+        bool recordEvents,
+        bool syncPermanentChanges,
+        CombatModifiers? modifiers,
+        bool sandstormEnabled = true,
+        int timelineSampleIntervalMs = TickMs)
     {
         var rng = new Random(seed);
         var p1 = originalP1.CloneForCombat();
@@ -77,27 +124,49 @@ public static class CombatSimulator
         p2.EnsureExclusionSetInitialized(gm);
         EnsureCombatBasePlayerEffect(repo, p1);
         EnsureCombatBasePlayerEffect(repo, p2);
+
+        var mod = modifiers ?? CombatModifiers.None;
+        bool effectiveSandstormEnabled = sandstormEnabled && mod.SandstormEnabled;
+        int effectiveSampleInterval = Math.Max(TickMs, mod.TimelineSampleIntervalMs ?? timelineSampleIntervalMs);
+
+        // 应用开战前双方生命上限修正（含玻璃大炮/泰坦巨躯/无尽高层/Boss 车轮战缩放，防 Int32 溢出）
+        if (Math.Abs(mod.HealthMultiplierP1 - 1.0) > 1e-6)
+        {
+            int scaledHp1 = (int)Math.Clamp(Math.Round(p1.HealthMax * mod.HealthMultiplierP1), 1, EndlessTowerScaler.MaxEnemyHealthCap);
+            p1.Attributes["HealthMax"] = scaledHp1;
+            p1.CurrentHealth = scaledHp1;
+        }
+        if (Math.Abs(mod.HealthMultiplierP2 - 1.0) > 1e-6)
+        {
+            int cap = Math.Max(1, mod.EnemyHealthCap);
+            int scaledHp2 = (int)Math.Clamp(Math.Round(p2.HealthMax * mod.HealthMultiplierP2), 1, cap);
+            p2.Attributes["HealthMax"] = scaledHp2;
+            p2.CurrentHealth = scaledHp2;
+        }
+
         int icdMs = Math.Max(100, gm.CombatSimEffectDelay);
         int effectDelayMs = Math.Max(TickMs, gm.CombatSimEffectDelay > 0 ? gm.CombatSimEffectDelay : 250);
 
         var events = recordEvents ? new List<CombatEvent>() : new List<CombatEvent>(0);
         var timeline = recordTimeline ? new List<CombatTickState>() : new List<CombatTickState>(0);
+        var snapshotAttrCache = recordTimeline ? new Dictionary<CardInstance, CachedCardSnapshotAttrs>(ReferenceEqualityComparer.Instance) : null;
         double p1DmgTotal = 0, p2DmgTotal = 0;
         double p1ShieldTotal = 0, p2ShieldTotal = 0;
 
         var icdReadyTime = new Dictionary<TriggerQueueKey, int>();
         var triggerQueues = new Dictionary<TriggerQueueKey, Queue<QueuedTrigger>>();
         var readyBatch = new List<(TriggerQueueKey Key, QueuedTrigger Item)>();
+        // 修复 P0-6：跨卡牌同步触发必须先按 Ability.Priority（Immediate > Highest > High > Medium > Low > Lowest）排序，再按 StartSlot / InstanceId 稳定决胜
         Comparison<(TriggerQueueKey Key, QueuedTrigger Item)> readyBatchComparison = (a, b) =>
         {
             int sideCmp = (a.Item.Owner == p1 ? 0 : 1).CompareTo(b.Item.Owner == p1 ? 0 : 1);
             if (sideCmp != 0) return sideCmp;
+            int prioCmp = GetAbilityPriorityRank(a.Item.Ability.Priority).CompareTo(GetAbilityPriorityRank(b.Item.Ability.Priority));
+            if (prioCmp != 0) return prioCmp;
             int slotCmp = a.Item.OwnerCard.StartSlot.CompareTo(b.Item.OwnerCard.StartSlot);
             if (slotCmp != 0) return slotCmp;
             int instCmp = string.CompareOrdinal(a.Item.OwnerCard.InstanceId, b.Item.OwnerCard.InstanceId);
             if (instCmp != 0) return instCmp;
-            int prioCmp = GetAbilityPriorityRank(a.Item.Ability.Priority).CompareTo(GetAbilityPriorityRank(b.Item.Ability.Priority));
-            if (prioCmp != 0) return prioCmp;
             return string.CompareOrdinal(a.Item.Ability.Id, b.Item.Ability.Id);
         };
         var pendingMulticasts = new List<PendingMulticastBatch>();
@@ -115,6 +184,7 @@ public static class CombatSimulator
         int forceUseDepth = 0;
         int dispatchDepth = 0;
         int tickCascadeFires = 0;
+        int auraRecalcDepth = 0;
         var activeFiringCards = new HashSet<CardInstance>(ReferenceEqualityComparer.Instance);
         var tickCardFireCounts = new Dictionary<CardInstance, int>(ReferenceEqualityComparer.Instance);
         var lastCooldownFireMs = new Dictionary<CardInstance, int>(ReferenceEqualityComparer.Instance);
@@ -124,7 +194,8 @@ public static class CombatSimulator
         bool sandstormWarned = false;
         bool sandstormActive = false;
         bool sandstormForceStarted = false;
-        int sandstormStartMs = gm.Sandstorm.CountdownStartTime + gm.Sandstorm.CountdownDuration; // 默认 30,000ms
+        int sandstormWarnMs = Math.Max(0, gm.Sandstorm.CountdownStartTime + mod.SandstormStartOffsetMs);
+        int sandstormStartMs = Math.Max(0, gm.Sandstorm.CountdownStartTime + gm.Sandstorm.CountdownDuration + mod.SandstormStartOffsetMs); // 默认 30,000ms
         int sandstormNextTickMs = sandstormStartMs;
         int sandstormCurrentRate = gm.Sandstorm.BaseTickRate; // 250ms
         int sandstormNextDmg = gm.Sandstorm.BaseDamage;       // 1
@@ -132,6 +203,10 @@ public static class CombatSimulator
         int nextBurnTickMs = 500;
         int nextPoisonTickMs = 1000;
         int nextRegenTickMs = 1000;
+        int nextPeriodicFreezeMs = (mod.PeriodicFreezeIntervalMs > 0 && mod.PeriodicFreezeDurationMs > 0)
+            ? mod.PeriodicFreezeIntervalMs
+            : int.MaxValue;
+        int nextSnapshotWindowEndMs = effectiveSampleInterval;
         int p1TempoElapsedMs = 0;
         int p2TempoElapsedMs = 0;
         int timeMs = 0;
@@ -143,14 +218,16 @@ public static class CombatSimulator
 
         static void ClampSideAmmo(PlayerState side)
         {
-            foreach (var c in side.Hand.Cards)
+            for (int i = 0; i < side.Hand.Cards.Count; i++)
             {
-                int maxAmmo = Math.Max(0, (int)Math.Round(c.GetAttribute("AmmoMax")));
+                var c = side.Hand.Cards[i];
+                int maxAmmo = c.EffectiveAmmoMax;
                 c.CurrentAmmo = Math.Clamp(c.CurrentAmmo, 0, maxAmmo);
             }
-            foreach (var c in side.Stash.Cards)
+            for (int i = 0; i < side.Stash.Cards.Count; i++)
             {
-                int maxAmmo = Math.Max(0, (int)Math.Round(c.GetAttribute("AmmoMax")));
+                var c = side.Stash.Cards[i];
+                int maxAmmo = c.EffectiveAmmoMax;
                 c.CurrentAmmo = Math.Clamp(c.CurrentAmmo, 0, maxAmmo);
             }
         }
@@ -161,7 +238,71 @@ public static class CombatSimulator
             side.Attributes["EnragedDuration"] = side.EnragedRemainingMs;
         }
 
-        AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+        int GetEffectiveCardCooldownMaxMs(CardInstance card, PlayerState owner)
+        {
+            double effCd = card.EffectiveCooldownMs;
+            if (double.IsNaN(effCd) || double.IsInfinity(effCd)) effCd = 1000;
+            double totalModCdr = mod.CooldownReductionPct + (owner == p2 ? mod.CooldownReductionP2Pct : 0.0);
+            if (totalModCdr > 1e-6)
+                effCd *= Math.Max(0.1, 1.0 - Math.Min(0.85, totalModCdr));
+            int floorMs = Math.Clamp(mod.MinCooldownFloorMs, 200, 1000);
+            return Math.Max(floorMs, (int)Math.Round(effCd));
+        }
+
+        void HandleAuraFlyingTransition(AuraEngine.AuraFlyingTransition tr)
+        {
+            if (recordEvents)
+            {
+                Emit(new CombatEvent
+                {
+                    TimeMs = timeMs,
+                    Type = CombatEventType.FlyingChanged,
+                    SourcePlayerId = tr.Owner.PlayerId,
+                    TargetPlayerId = tr.Owner.PlayerId,
+                    SourceCardInstanceId = tr.SourceCard?.InstanceId,
+                    TargetCardInstanceId = tr.TargetCard.InstanceId,
+                    Value = tr.StartedFlying ? 1 : 0,
+                    ActionType = "TAuraActionCardModifyAttribute"
+                });
+            }
+            if (tr.StartedFlying)
+            {
+                DispatchEvent("TTriggerOnCardStartedFlying", tr.Owner, tr.SourceCard, tr.TargetCard, tr.Owner);
+                DispatchEvent("TTriggerOnCardStartsFlying", tr.Owner, tr.SourceCard, tr.TargetCard, tr.Owner);
+                DispatchEvent("TTriggerOnCardAttributeChanged", tr.Owner, tr.SourceCard, tr.TargetCard, tr.Owner, "Flying", 0, 1);
+            }
+            else
+            {
+                DispatchEvent("TTriggerOnCardStoppedFlying", tr.Owner, tr.SourceCard, tr.TargetCard, tr.Owner);
+                DispatchEvent("TTriggerOnCardAttributeChanged", tr.Owner, tr.SourceCard, tr.TargetCard, tr.Owner, "Flying", 1, 0);
+            }
+        }
+
+        void RecalculateCombatAuras(bool emitFlyingTriggers = true)
+        {
+            if (auraRecalcDepth >= 4) return;
+            if (!AuraEngine.HasAnyAuraSource(p1, p2) && !AuraEngine.HasAnyAppliedAuraModifiers(p1, p2))
+                return;
+            auraRecalcDepth++;
+            try
+            {
+                AuraEngine.RecalculateAuras(
+                    p1,
+                    p2,
+                    RuleScope.InCombat,
+                    p1.Day,
+                    p1.Hour,
+                    repo,
+                    selectionCards: null,
+                    onFlyingTransition: emitFlyingTriggers ? HandleAuraFlyingTransition : null);
+            }
+            finally
+            {
+                auraRecalcDepth--;
+            }
+        }
+
+        RecalculateCombatAuras(emitFlyingTriggers: false);
         ClampSideAmmo(p1);
         ClampSideAmmo(p2);
         SyncEnragedState(p1);
@@ -307,9 +448,9 @@ public static class CombatSimulator
             if (lastCooldownFireMs.TryGetValue(targetCard, out int prevCdFireMs) && timeMs - prevCdFireMs < icdMs)
                 return;
 
-            int ammoMax = (int)Math.Round(targetCard.GetAttribute("AmmoMax"));
+            int ammoMax = targetCard.EffectiveAmmoMax;
             if (ammoMax > 0 && targetCard.CurrentAmmo <= 0) return;
-            int cdMax = GetCardCooldownMaxMs(targetCard);
+            int cdMax = GetEffectiveCardCooldownMaxMs(targetCard, cardOwner);
             if (targetCard.CooldownProgressMs < cdMax) return;
 
             targetCard.CooldownProgressMs -= cdMax;
@@ -333,7 +474,7 @@ public static class CombatSimulator
             }
 
             // 对齐 BazaarCardDealer.cs:4156-4172：耗尽弹药后立即清零剩余溢出冷却进度
-            int postAmmoMax = (int)Math.Round(targetCard.GetAttribute("AmmoMax"));
+            int postAmmoMax = targetCard.EffectiveAmmoMax;
             if (postAmmoMax > 0 && targetCard.CurrentAmmo <= 0)
                 targetCard.CooldownProgressMs = 0;
         }
@@ -346,6 +487,8 @@ public static class CombatSimulator
                 CurrentDay = self.Day,
                 CurrentHour = self.Hour,
                 CombatType = combatType,
+                CombatBonusCritChance = mod.BonusCritChance,
+                CombatCritPercentMultiplierOverride = mod.CritPercentMultiplierOverride,
                 ActiveExecution = activeExec,
                 EmitCombatEvent = recordEvents ? Emit : null,
                 OnTimedCardAttributeModifierApplied = (targetCard, attr, op, val, durationMs) =>
@@ -375,12 +518,13 @@ public static class CombatSimulator
                 OnDamageApplied = (targetPlayer, dmg, isCrit, srcCard) =>
                 {
                     if (dmg <= 0) return;
+                    var attacker = targetPlayer == p1 ? p2 : p1;
+                    double scaledDmg = dmg * mod.DamageAndDotMultiplier * (attacker == p2 ? mod.OffenseMultiplierP2 : 1.0);
                     // 对齐官方 PercentDamageReduction（0..100%，含 Memento Mori/Invulnerability Potion 100% 免伤）
                     var red = Math.Clamp(targetPlayer.GetAttribute("PercentDamageReduction"), 0, 100);
-                    int actual = Math.Max(0, (int)Math.Round(dmg * (1.0 - red / 100.0)));
+                    int actual = Math.Max(0, (int)Math.Clamp(Math.Round(scaledDmg * (1.0 - red / 100.0)), 0, 1_000_000_000));
                     ApplyDirectDamage(targetPlayer, actual, bypassShield: false);
 
-                    var attacker = targetPlayer == p1 ? p2 : p1;
                     if (actual > 0 && srcCard != null && srcCard.GetAttribute("Lifesteal") > 0)
                     {
                         int prevAttackerHp = attacker.CurrentHealth;
@@ -405,24 +549,30 @@ public static class CombatSimulator
                 OnShieldApplied = (targetPlayer, amt, srcCard) =>
                 {
                     if (amt <= 0) return;
+                    double mult = mod.ShieldAndRegenMultiplier * (targetPlayer == p2 ? mod.OffenseMultiplierP2 : 1.0);
+                    int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
+                    if (finalAmt <= 0) return;
                     int prevShield = targetPlayer.Shield;
-                    targetPlayer.Shield += amt;
-                    if (targetPlayer == p1) p1ShieldTotal += amt; else p2ShieldTotal += amt;
+                    targetPlayer.Shield += finalAmt;
+                    if (targetPlayer == p1) p1ShieldTotal += finalAmt; else p2ShieldTotal += finalAmt;
                     if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.ShieldApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = amt });
+                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.ShieldApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt });
                     DispatchEvent("TTriggerOnCardPerformedShield", targetPlayer, srcCard, srcCard, targetPlayer);
-                    DispatchEvent("TTriggerOnPlayerShielded", targetPlayer, srcCard, srcCard, targetPlayer, "Shield", prevShield, amt);
+                    DispatchEvent("TTriggerOnPlayerShielded", targetPlayer, srcCard, srcCard, targetPlayer, "Shield", prevShield, finalAmt);
                     if (targetPlayer.Shield != prevShield)
                         DispatchEvent("TTriggerOnPlayerAttributeChanged", targetPlayer, srcCard, srcCard, targetPlayer, "Shield", prevShield, targetPlayer.Shield);
                 },
                 OnBurnApplied = (targetPlayer, amt, srcCard) =>
                 {
                     if (amt <= 0) return;
-                    int prevBurn = targetPlayer.Burn;
-                    targetPlayer.Burn += amt;
                     var actor = targetPlayer == p1 ? p2 : p1;
+                    double mult = mod.DamageAndDotMultiplier * (actor == p2 ? mod.OffenseMultiplierP2 : 1.0);
+                    int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
+                    if (finalAmt <= 0) return;
+                    int prevBurn = targetPlayer.Burn;
+                    targetPlayer.Burn += finalAmt;
                     if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.BurnApplied, SourcePlayerId = actor.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = amt });
+                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.BurnApplied, SourcePlayerId = actor.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt });
                     DispatchEvent("TTriggerOnCardPerformedBurn", actor, srcCard, srcCard, targetPlayer);
                     if (targetPlayer.Burn != prevBurn)
                         DispatchEvent("TTriggerOnPlayerAttributeChanged", actor, srcCard, srcCard, targetPlayer, "Burn", prevBurn, targetPlayer.Burn);
@@ -430,11 +580,14 @@ public static class CombatSimulator
                 OnPoisonApplied = (targetPlayer, amt, srcCard) =>
                 {
                     if (amt <= 0) return;
-                    int prevPoison = targetPlayer.Poison;
-                    targetPlayer.Poison += amt;
                     var actor = targetPlayer == p1 ? p2 : p1;
+                    double mult = mod.DamageAndDotMultiplier * (actor == p2 ? mod.OffenseMultiplierP2 : 1.0);
+                    int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
+                    if (finalAmt <= 0) return;
+                    int prevPoison = targetPlayer.Poison;
+                    targetPlayer.Poison += finalAmt;
                     if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.PoisonApplied, SourcePlayerId = actor.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = amt });
+                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.PoisonApplied, SourcePlayerId = actor.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt });
                     DispatchEvent("TTriggerOnCardPerformedPoison", actor, srcCard, srcCard, targetPlayer);
                     if (targetPlayer.Poison != prevPoison)
                         DispatchEvent("TTriggerOnPlayerAttributeChanged", actor, srcCard, srcCard, targetPlayer, "Poison", prevPoison, targetPlayer.Poison);
@@ -442,21 +595,25 @@ public static class CombatSimulator
                 OnHealApplied = (targetPlayer, amt, srcCard) =>
                 {
                     if (amt <= 0) return;
+                    int finalAmt = targetPlayer == p2 && Math.Abs(mod.OffenseMultiplierP2 - 1.0) > 1e-6
+                        ? Math.Max(0, (int)Math.Clamp(Math.Round(amt * mod.OffenseMultiplierP2), 0, 1_000_000_000))
+                        : amt;
+                    if (finalAmt <= 0) return;
                     int prevHp = targetPlayer.CurrentHealth;
                     int overkill = targetPlayer == p1 ? p1Overkill : p2Overkill;
                     int missing = Math.Max(0, targetPlayer.HealthMax - targetPlayer.CurrentHealth) + overkill;
                     // 对齐官方 OverHeal：在满血状态下治疗或本次治疗恰好达到/溢出 HealthMax 均触发 OverHeal
-                    bool overheal = amt >= missing;
-                    ApplyHealthGain(targetPlayer, amt);
+                    bool overheal = finalAmt >= missing;
+                    ApplyHealthGain(targetPlayer, finalAmt);
                     // 8.4 官方规则：普通/小额治疗按治疗量的 5%（向下取整，至少 1 点）各自净化 Burn 与 Poison
-                    int cleanse = Math.Max(1, (int)Math.Floor(amt * 0.05));
+                    int cleanse = Math.Max(1, (int)Math.Floor(finalAmt * 0.05));
                     if (targetPlayer.Burn > 0)
                         targetPlayer.Burn = Math.Max(0, targetPlayer.Burn - cleanse);
                     if (targetPlayer.Poison > 0)
                         targetPlayer.Poison = Math.Max(0, targetPlayer.Poison - cleanse);
 
                     if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.HealApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = amt });
+                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.HealApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt });
                     DispatchEvent("TTriggerOnCardPerformedHeal", targetPlayer, srcCard, srcCard, targetPlayer);
                     if (overheal)
                         DispatchEvent("TTriggerOnCardPerformedOverHeal", targetPlayer, srcCard, srcCard, targetPlayer);
@@ -466,9 +623,12 @@ public static class CombatSimulator
                 OnRegenApplied = (targetPlayer, amt, srcCard) =>
                 {
                     if (amt <= 0) return;
-                    targetPlayer.ModifyAttribute("HealthRegen", "Add", amt);
+                    double mult = mod.ShieldAndRegenMultiplier * (targetPlayer == p2 ? mod.OffenseMultiplierP2 : 1.0);
+                    int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
+                    if (finalAmt <= 0) return;
+                    targetPlayer.ModifyAttribute("HealthRegen", "Add", finalAmt);
                     if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.HealApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = amt, Detail = "RegenGain" });
+                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.HealApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt, Detail = "RegenGain" });
                     DispatchEvent("TTriggerOnCardPerformedRegen", targetPlayer, srcCard, srcCard, targetPlayer);
                 },
                 OnHasteApplied = (targetCard, ms, srcCard) =>
@@ -483,7 +643,9 @@ public static class CombatSimulator
                     var pctRed = Math.Clamp(targetCard.GetAttribute("PercentChargeReduction"), 0, 90);
                     int actual = Math.Max(0, (int)Math.Round(ms * (1.0 - pctRed / 100.0)));
                     if (actual <= 0) return;
-                    int cdMax = GetCardCooldownMaxMs(targetCard);
+                    var cardOwner = (p1.Hand.Cards.Contains(targetCard) || p1.Skills.Contains(targetCard)) ? p1
+                                  : ((p2.Hand.Cards.Contains(targetCard) || p2.Skills.Contains(targetCard)) ? p2 : null);
+                    int cdMax = cardOwner != null ? GetEffectiveCardCooldownMaxMs(targetCard, cardOwner) : GetCardCooldownMaxMs(targetCard);
                     if (lastCooldownFireMs.TryGetValue(targetCard, out int prevCdMs) && timeMs - prevCdMs < icdMs)
                     {
                         targetCard.CooldownProgressMs = Math.Min(cdMax, targetCard.CooldownProgressMs + actual);
@@ -499,8 +661,6 @@ public static class CombatSimulator
                     DispatchEvent("TTriggerOnCardPerformedCharge", self, srcCard, targetCard, self);
 
                     // 7.5：Charge 满冷却时保留溢出并在当前 20ms tick 立即开火（受单卡内置冷却与防死循环帧预算约束）
-                    var cardOwner = (p1.Hand.Cards.Contains(targetCard) || p1.Skills.Contains(targetCard)) ? p1
-                                  : ((p2.Hand.Cards.Contains(targetCard) || p2.Skills.Contains(targetCard)) ? p2 : null);
                     if (cardOwner == null) return;
                     CompleteReadyCooldowns(cardOwner, cardOwner == p1 ? p2 : p1, targetCard, countFirstAsDepth: true);
                 },
@@ -528,7 +688,7 @@ public static class CombatSimulator
                     // 对齐 BazaarCardDealer.cs:1099：被冻结、无有效冷却或空弹药时禁止强制触发
                     if (targetCard.FreezeMs > 0 || !targetCard.HasActiveCooldown)
                         return;
-                    int targetAmmoMax = (int)Math.Round(targetCard.GetAttribute("AmmoMax"));
+                    int targetAmmoMax = targetCard.EffectiveAmmoMax;
                     if (targetAmmoMax > 0 && targetCard.CurrentAmmo <= 0)
                         return;
                     var owner = (p1.Hand.Cards.Contains(targetCard) || p1.Skills.Contains(targetCard)) ? p1
@@ -572,7 +732,7 @@ public static class CombatSimulator
                     {
                         SyncEnragedState(p1);
                         SyncEnragedState(p2);
-                        AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+                        RecalculateCombatAuras();
                     }
                     DispatchEvent(evName, subjOwner, srcCard, srcCard, subjOwner);
                 },
@@ -584,7 +744,7 @@ public static class CombatSimulator
                     {
                         SyncEnragedState(p1);
                         SyncEnragedState(p2);
-                        AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+                        RecalculateCombatAuras();
                     }
                     DispatchEvent(evName, actor, src, tgt, subj, attr, prev, cur);
                 },
@@ -791,7 +951,7 @@ public static class CombatSimulator
                 }
                 if (ranStatGain)
                 {
-                    AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+                    RecalculateCombatAuras();
                     ClampSideAmmo(p1);
                     ClampSideAmmo(p2);
                 }
@@ -821,7 +981,7 @@ public static class CombatSimulator
 
             if (executeAllImmediate && (localImmediate != null || localImmediateTransforms != null))
             {
-                AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+                RecalculateCombatAuras();
                 ClampSideAmmo(p1);
                 ClampSideAmmo(p2);
             }
@@ -948,7 +1108,7 @@ public static class CombatSimulator
                     }
                     SyncEnragedState(p1);
                     SyncEnragedState(p2);
-                    AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+                    RecalculateCombatAuras();
                     ClampSideAmmo(p1);
                     ClampSideAmmo(p2);
                 }
@@ -970,6 +1130,7 @@ public static class CombatSimulator
                 {
                     double prev = exp.Card.GetAttribute(exp.Attribute);
                     RevertCombatModifier(exp.Card.CombatAdd, exp.Card.CombatMult, exp.Attribute, exp.Operation, exp.Value);
+                    exp.Card.MarkAttributeDirty();
                     double cur = exp.Card.GetAttribute(exp.Attribute);
                     if (Math.Abs(cur - prev) > 1e-6)
                     {
@@ -1005,7 +1166,7 @@ public static class CombatSimulator
             }
             if (anyExpired)
             {
-                AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+                RecalculateCombatAuras();
                 ClampSideAmmo(p1);
                 ClampSideAmmo(p2);
             }
@@ -1045,8 +1206,9 @@ public static class CombatSimulator
                               + card.AuraAdd.GetValueOrDefault("Custom_8", 0);
                 if (Math.Abs(baseC8) > 1e-9)
                     card.CombatAdd["Custom_8"] = -baseC8;
+                card.MarkAttributeDirty();
             }
-            AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+            RecalculateCombatAuras();
             ClampSideAmmo(p1);
             ClampSideAmmo(p2);
         }
@@ -1095,8 +1257,14 @@ public static class CombatSimulator
             if (!activeFiringCards.Add(card)) return;
             try
             {
-                // 检查 Ammo（每次冷却或强制激活固定消耗 1 弹药；特殊牌如 Shuriken 由自身 Ability JSON 额外清弹药）
-                int ammoMax = (int)Math.Round(card.GetAttribute("AmmoMax"));
+                // 修复 P1-9 & P1-11：先验基础可用性与弹药余量，再派发 TTriggerOnBeforeItemUsed，确认未被前置回调销毁/禁用后再扣弹药
+                int preAmmoMax = card.EffectiveAmmoMax;
+                if (preAmmoMax > 0 && card.CurrentAmmo <= 0) return;
+
+                DispatchEvent("TTriggerOnBeforeItemUsed", owner, card, card, owner);
+                if (card.IsDestroyed || card.IsDisabled) return;
+
+                int ammoMax = card.EffectiveAmmoMax;
                 if (ammoMax > 0)
                 {
                     if (card.CurrentAmmo <= 0) return;
@@ -1105,11 +1273,11 @@ public static class CombatSimulator
                     DispatchEvent("TTriggerOnCardAttributeChanged", owner, card, card, owner, "Ammo", prevAmmo, card.CurrentAmmo);
                 }
 
-                int multicast = Math.Clamp((int)Math.Round(card.GetAttribute("Multicast")), 1, 10);
-                if (multicast < 1) multicast = 1;
-
-                DispatchEvent("TTriggerOnBeforeItemUsed", owner, card, card, owner);
-                if (card.IsDestroyed || card.IsDisabled) return;
+                int baseMulticast = Math.Max(1, (int)Math.Round(card.GetAttribute("Multicast")));
+                int bonusMulticast = (mod.BonusMulticastAll > 0 && card.HasActiveCooldown)
+                    ? Math.Min(mod.BonusMulticastAll, mod.MaxBonusMulticastCap)
+                    : 0;
+                int multicast = Math.Clamp(baseMulticast + bonusMulticast, 1, 10);
 
                 var primaryFiredAb = ResolvePrimaryFiredAbility(card);
 
@@ -1225,34 +1393,55 @@ public static class CombatSimulator
                 TickRegen(p2, p2AliveAtTickStart);
             }
 
-            // 6. Sandstorm (20s 预警, 30s 爆发, 伤害1起每跳+2, 间隔250ms递减10ms至150ms)
-            if (!sandstormWarned && !sandstormForceStarted && timeMs >= gm.Sandstorm.CountdownStartTime)
+            // 5b. 突变词条：冰霜荒原（每 PeriodicFreezeIntervalMs 随机冻结双方各 1 件未冻结物品）
+            if (timeMs >= nextPeriodicFreezeMs && nextPeriodicFreezeMs != int.MaxValue)
             {
-                sandstormWarned = true;
-                if (recordEvents)
-                    Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.SandstormWarning });
+                nextPeriodicFreezeMs += mod.PeriodicFreezeIntervalMs;
+                ApplyPeriodicEnvironmentalFreeze(p1);
+                ApplyPeriodicEnvironmentalFreeze(p2);
             }
-            if (!sandstormActive && timeMs >= sandstormStartMs)
+
+            // 6. Sandstorm（严格对齐官方 BazaarCardDealer.cs:4243-4274：先按 TickRateDecrement 递减至 TickRateFloor，触底后再每跳 +AdditiveScalar）
+            if (effectiveSandstormEnabled || sandstormForceStarted)
             {
-                sandstormActive = true;
-                sandstormNextTickMs = timeMs;
-                // 自然启动瞬间仅派发一次 TTriggerOnSandstorm，并在首跳沙暴伤害前先结算对应被动/光环
-                DispatchEvent("TTriggerOnSandstorm", p1, null, null, p1);
-                ProcessIcdQueues();
-            }
-            if (sandstormActive && timeMs >= sandstormNextTickMs)
-            {
-                double red1 = Math.Clamp(p1.GetAttribute("PercentDamageReduction"), 0, 100);
-                double red2 = Math.Clamp(p2.GetAttribute("PercentDamageReduction"), 0, 100);
-                int sandDmg1 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red1 / 100.0)));
-                int sandDmg2 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red2 / 100.0)));
-                ApplyDirectDamage(p1, sandDmg1, bypassShield: false);
-                ApplyDirectDamage(p2, sandDmg2, bypassShield: false);
-                if (recordEvents)
-                    Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.SandstormTick, Value = sandstormNextDmg });
-                sandstormNextDmg += gm.Sandstorm.AdditiveScalar;
-                sandstormNextTickMs += sandstormCurrentRate;
-                sandstormCurrentRate = Math.Max(gm.Sandstorm.TickRateFloor, sandstormCurrentRate - gm.Sandstorm.TickRateDecrement);
+                if (!sandstormWarned && !sandstormForceStarted && timeMs >= sandstormWarnMs)
+                {
+                    sandstormWarned = true;
+                    if (recordEvents)
+                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.SandstormWarning });
+                }
+                if (!sandstormActive && timeMs >= sandstormStartMs)
+                {
+                    sandstormActive = true;
+                    sandstormNextTickMs = timeMs;
+                    // 自然启动瞬间仅派发一次 TTriggerOnSandstorm，并在首跳沙暴伤害前先结算对应被动/光环
+                    DispatchEvent("TTriggerOnSandstorm", p1, null, null, p1);
+                    ProcessIcdQueues();
+                }
+                if (sandstormActive && timeMs >= sandstormNextTickMs)
+                {
+                    double red1 = Math.Clamp(p1.GetAttribute("PercentDamageReduction"), 0, 100);
+                    double red2 = Math.Clamp(p2.GetAttribute("PercentDamageReduction"), 0, 100);
+                    int sandDmg1 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red1 / 100.0)));
+                    int sandDmg2 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red2 / 100.0)));
+                    ApplyDirectDamage(p1, sandDmg1, bypassShield: false);
+                    ApplyDirectDamage(p2, sandDmg2, bypassShield: false);
+                    if (recordEvents)
+                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.SandstormTick, Value = sandstormNextDmg });
+
+                    bool hadReachedFloor = sandstormCurrentRate <= gm.Sandstorm.TickRateFloor;
+                    if (sandstormCurrentRate > gm.Sandstorm.TickRateFloor)
+                    {
+                        sandstormCurrentRate = Math.Max(gm.Sandstorm.TickRateFloor, sandstormCurrentRate - gm.Sandstorm.TickRateDecrement);
+                        if (sandstormCurrentRate <= gm.Sandstorm.TickRateFloor)
+                            sandstormNextDmg += gm.Sandstorm.AdditiveScalar;
+                    }
+                    else if (hadReachedFloor)
+                    {
+                        sandstormNextDmg += gm.Sandstorm.AdditiveScalar;
+                    }
+                    sandstormNextTickMs += Math.Max(TickMs, sandstormCurrentRate);
+                }
             }
 
             // 7. 帧末完整死亡与复活/遗言检查：先处理每方至多一次 TTriggerOnPlayerDied 并推进队列，再决定是否结束战斗
@@ -1260,7 +1449,16 @@ public static class CombatSimulator
 
             if (recordTimeline)
             {
-                timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices));
+                bool shouldCapture = effectiveSampleInterval <= TickMs
+                    || timeMs == 0
+                    || anyDeadAfterOnDeath
+                    || (timeMs + TickMs) > nextSnapshotWindowEndMs;
+                if (shouldCapture)
+                {
+                    timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache));
+                    while (nextSnapshotWindowEndMs <= timeMs + TickMs)
+                        nextSnapshotWindowEndMs += effectiveSampleInterval;
+                }
             }
 
             timeMs += TickMs;
@@ -1292,7 +1490,7 @@ public static class CombatSimulator
         }
 
         if (recordTimeline)
-            timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices));
+            timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache));
 
         if (recordEvents)
         {
@@ -1355,7 +1553,7 @@ public static class CombatSimulator
                 var card = handSnapshot[i];
                 if (card.IsDestroyed || card.IsDisabled || !card.HasActiveCooldown) continue;
 
-                int ammoMax = (int)Math.Round(card.GetAttribute("AmmoMax"));
+                int ammoMax = card.EffectiveAmmoMax;
                 bool outOfAmmo = ammoMax > 0 && card.CurrentAmmo <= 0;
 
                 // 对齐 BazaarCardDealer.cs:4110-4151 & 4401-4406：Freeze/Haste/Slow 三计时器每帧独立递减，再检查冻结与缺弹阻断
@@ -1383,7 +1581,7 @@ public static class CombatSimulator
                     continue;
                 }
 
-                int cdMax = GetCardCooldownMaxMs(card);
+                int cdMax = GetEffectiveCardCooldownMaxMs(card, owner);
                 double rawStep = TickMs * speed;
                 double minCycleCapStep = TickMs * (cdMax / 1000.0);
                 card.CooldownProgressMs += Math.Max(1, (int)Math.Round(Math.Min(rawStep, minCycleCapStep)));
@@ -1395,6 +1593,21 @@ public static class CombatSimulator
                 if (card.CooldownProgressMs < cdMax) continue;
                 CompleteReadyCooldowns(owner, opp, card, countFirstAsDepth: false);
             }
+        }
+
+        void ApplyPeriodicEnvironmentalFreeze(PlayerState side)
+        {
+            if (side.Hand.Cards.Count == 0) return;
+            var eligible = new List<CardInstance>(side.Hand.Cards.Count);
+            for (int i = 0; i < side.Hand.Cards.Count; i++)
+            {
+                var c = side.Hand.Cards[i];
+                if (!c.IsDestroyed && !c.IsDisabled && c.FreezeMs <= 0 && c.HasActiveCooldown)
+                    eligible.Add(c);
+            }
+            if (eligible.Count == 0) return;
+            var picked = eligible[rng.Next(eligible.Count)];
+            ApplyCardStatusDuration(side, picked, mod.PeriodicFreezeDurationMs, null, "PercentFreezeReduction", checkRadiantAndFlying: true, CombatEventType.FreezeApplied, "TTriggerOnCardPerformedFreeze", "Freeze", static c => c.FreezeMs, static (c, v) => c.FreezeMs = v);
         }
 
         void TickEnraged(PlayerState p)
@@ -1409,7 +1622,7 @@ public static class CombatSimulator
             SyncEnragedState(p);
             if (p.EnragedRemainingMs == 0)
             {
-                AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+                RecalculateCombatAuras();
                 if (recordEvents)
                     Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.PlayerEnrageEnded, TargetPlayerId = p.PlayerId });
                 DispatchEvent("TTriggerOnPlayerEnrageEnded", p, null, null, p);
@@ -1559,7 +1772,8 @@ public static class CombatSimulator
             origCardsById[oc.InstanceId] = oc;
 
         var simCardsById = new Dictionary<string, CardInstance>(StringComparer.Ordinal);
-        var simReplacementsByOrigId = new Dictionary<string, CardInstance>(StringComparer.Ordinal);
+        // 修复 P1-3：支持单卡战斗内永久变形出多产物（1:N 列表），避免后产物覆写吞卡
+        var simReplacementsByOrigId = new Dictionary<string, List<(CardInstance Card, bool IsStash, bool IsSkill, bool IsSocketEffect)>>(StringComparer.Ordinal);
         var simNewNonTempCards = new List<(CardInstance Card, bool IsStash, bool IsSkill, bool IsSocketEffect)>();
 
         void ScanSimList(List<CardInstance> cards, bool isStash, bool isSkill, bool isSocketEffect)
@@ -1571,7 +1785,12 @@ public static class CombatSimulator
 
                 if (!string.IsNullOrEmpty(sc.TransformedFromInstanceId) && !sc.IsCombatTemporary)
                 {
-                    simReplacementsByOrigId[sc.TransformedFromInstanceId] = sc;
+                    if (!simReplacementsByOrigId.TryGetValue(sc.TransformedFromInstanceId, out var repList))
+                    {
+                        repList = new List<(CardInstance, bool, bool, bool)>(2);
+                        simReplacementsByOrigId[sc.TransformedFromInstanceId] = repList;
+                    }
+                    repList.Add((sc, isStash, isSkill, isSocketEffect));
                     continue;
                 }
 
@@ -1587,28 +1806,67 @@ public static class CombatSimulator
         ScanSimList(simP1.Skills, isStash: false, isSkill: true, isSocketEffect: false);
         ScanSimList(simP1.SocketEffects, isStash: false, isSkill: false, isSocketEffect: true);
 
-        // 1. 回写所有源卡牌的永久变化（含永久变形）
+        // 1. 回写所有源卡牌的永久变化（含单/多产物永久变形）
         foreach (var (origId, origCard) in origCardsById.ToList())
         {
-            if (simReplacementsByOrigId.TryGetValue(origId, out var simRep))
+            if (simReplacementsByOrigId.TryGetValue(origId, out var simReps) && simReps.Count > 0)
             {
-                var cleanRep = ClonePermanentCardSnapshot(simRep);
-                cleanRep.StartSlot = origCard.StartSlot;
-                cleanRep.TransformedFromInstanceId = origId;
+                var firstRep = simReps[0].Card;
+                var cleanFirst = ClonePermanentCardSnapshot(firstRep);
+                cleanFirst.StartSlot = origCard.StartSlot;
+                cleanFirst.TransformedFromInstanceId = origId;
+
+                var allCleanReps = new List<CardInstance>(simReps.Count) { cleanFirst };
+                var additionalReps = new List<CardInstance>(Math.Max(0, simReps.Count - 1));
+                for (int r = 1; r < simReps.Count; r++)
+                {
+                    var extraClean = ClonePermanentCardSnapshot(simReps[r].Card);
+                    extraClean.TransformedFromInstanceId = origId;
+                    allCleanReps.Add(extraClean);
+                    additionalReps.Add(extraClean);
+                }
+
+                sync.PermanentReplacements[origId] = allCleanReps;
 
                 var delta = new CardPermanentSyncDelta
                 {
                     InstanceId = origId,
                     SourceCard = origCard,
-                    TransformReplacementTemplateId = simRep.Template.Id,
-                    TransformedReplacementCard = cleanRep
+                    TransformReplacementTemplateId = firstRep.Template.Id,
+                    TransformedReplacementCard = cleanFirst,
+                    AdditionalTransformedReplacements = additionalReps
                 };
                 sync.UpdatedCards.Add(delta);
 
                 if (applyToOriginal)
                 {
-                    origCard.TransformReplacementTemplateId = simRep.Template.Id;
-                    ReplaceCardInOriginalOwner(originalP1, origCard, cleanRep);
+                    bool origWasInStash = originalP1.Stash.Cards.Contains(origCard);
+                    origCard.TransformReplacementTemplateId = firstRep.Template.Id;
+                    ReplaceCardInOriginalOwner(originalP1, origCard, cleanFirst);
+
+                    for (int r = 1; r < simReps.Count; r++)
+                    {
+                        var extraClean = allCleanReps[r];
+                        var (_, repStash, repSkill, repSocket) = simReps[r];
+                        if (repSkill || extraClean.Template.Type == "Skill")
+                        {
+                            originalP1.Skills.Add(extraClean);
+                        }
+                        else if (repSocket)
+                        {
+                            originalP1.SocketEffects.Add(extraClean);
+                        }
+                        else if (repStash || origWasInStash)
+                        {
+                            if (!originalP1.Stash.TryAddAuto(extraClean))
+                                originalP1.Hand.TryAddAuto(extraClean);
+                        }
+                        else
+                        {
+                            if (!originalP1.Hand.TryAddAuto(extraClean))
+                                originalP1.Stash.TryAddAuto(extraClean);
+                        }
+                    }
                 }
                 continue;
             }
@@ -1822,8 +2080,9 @@ public static class CombatSimulator
             }
             else
             {
-                if (!originalP1.Hand.TryAddAuto(cleanCard))
-                    originalP1.Stash.TryAddAuto(cleanCard);
+                // 修复 P1-3：在 Stash 产生的非临时衍生卡优先回写至 Stash，再兜底 Hand
+                if (!originalP1.Stash.TryAddAuto(cleanCard))
+                    originalP1.Hand.TryAddAuto(cleanCard);
             }
         }
 
@@ -2038,14 +2297,15 @@ public static class CombatSimulator
         {
             if (list.Count > 1)
             {
+                // 修复 P0-6：优先按 Ability.Priority 排定全盘跨卡结算先后，再按 StartSlot / InstanceId / ActiveOrder 稳定排序
                 list.Sort(static (a, b) =>
                 {
+                    int prioCmp = GetAbilityPriorityRank(a.Ability.Priority).CompareTo(GetAbilityPriorityRank(b.Ability.Priority));
+                    if (prioCmp != 0) return prioCmp;
                     int slotCmp = a.Card.StartSlot.CompareTo(b.Card.StartSlot);
                     if (slotCmp != 0) return slotCmp;
                     int instCmp = string.CompareOrdinal(a.Card.InstanceId, b.Card.InstanceId);
                     if (instCmp != 0) return instCmp;
-                    int prioCmp = GetAbilityPriorityRank(a.Ability.Priority).CompareTo(GetAbilityPriorityRank(b.Ability.Priority));
-                    if (prioCmp != 0) return prioCmp;
                     return a.ActiveOrder.CompareTo(b.ActiveOrder);
                 });
             }
@@ -2250,7 +2510,14 @@ public static class CombatSimulator
         return false;
     }
 
-    private static CombatTickState CaptureSnapshot(int timeMs, PlayerState p1, PlayerState p2, bool sandstormActive, int nextSandstormDmg, StandardPricesSettings prices)
+    private static CombatTickState CaptureSnapshot(
+        int timeMs,
+        PlayerState p1,
+        PlayerState p2,
+        bool sandstormActive,
+        int nextSandstormDmg,
+        StandardPricesSettings prices,
+        Dictionary<CardInstance, CachedCardSnapshotAttrs>? attrCache = null)
     {
         static int ReadIntAttr(CardInstance c, string attr)
         {
@@ -2260,39 +2527,97 @@ public static class CombatSimulator
         }
 
         var cards = new List<CardCooldownFrame>(p1.Hand.Cards.Count + p2.Hand.Cards.Count);
-        foreach (var c in p1.Hand.Cards.Concat(p2.Hand.Cards))
+
+        void AppendHandFrames(List<CardInstance> handCards)
         {
-            double cd = Math.Max(1000, c.EffectiveCooldownMs);
-            cards.Add(new CardCooldownFrame
+            for (int i = 0; i < handCards.Count; i++)
             {
-                InstanceId = c.InstanceId,
-                Progress01 = c.HasActiveCooldown ? (float)Math.Clamp(c.CooldownProgressMs / cd, 0, 1) : 0f,
-                IsHasted = c.HasteMs > 0,
-                IsSlowed = c.SlowMs > 0,
-                IsFrozen = c.FreezeMs > 0,
-                IsFlying = c.IsFlying,
-                IsDestroyed = c.IsDestroyed,
-                Ammo = c.CurrentAmmo,
-                HasteMs = c.HasteMs,
-                SlowMs = c.SlowMs,
-                FreezeMs = c.FreezeMs,
-                Heated = c.Heated || c.GetAttribute("Heated") > 0,
-                Chilled = c.Chilled || c.GetAttribute("Chilled") > 0,
-                AmmoMax = Math.Max(0, ReadIntAttr(c, "AmmoMax")),
-                CooldownMaxMs = Math.Max(0, ReadIntAttr(c, "CooldownMax")),
-                DamageAmount = ReadIntAttr(c, "DamageAmount"),
-                ShieldApplyAmount = ReadIntAttr(c, "ShieldApplyAmount"),
-                BurnApplyAmount = ReadIntAttr(c, "BurnApplyAmount"),
-                PoisonApplyAmount = ReadIntAttr(c, "PoisonApplyAmount"),
-                HealAmount = ReadIntAttr(c, "HealAmount"),
-                RegenApplyAmount = ReadIntAttr(c, "RegenApplyAmount"),
-                CritChance = ReadIntAttr(c, "CritChance"),
-                Multicast = Math.Max(0, ReadIntAttr(c, "Multicast")),
-                Lifesteal = ReadIntAttr(c, "Lifesteal"),
-                SellPrice = c.GetSellPrice(prices),
-                Counter = c.TimesFiredThisFight
-            });
+                var c = handCards[i];
+                CachedCardSnapshotAttrs cached;
+                if (attrCache != null)
+                {
+                    if (!attrCache.TryGetValue(c, out cached!))
+                    {
+                        cached = new CachedCardSnapshotAttrs();
+                        attrCache[c] = cached;
+                    }
+                    if (cached.Version != c.AttributeVersion)
+                    {
+                        cached.Version = c.AttributeVersion;
+                        cached.AmmoMax = c.EffectiveAmmoMax;
+                        cached.CooldownMaxMs = Math.Max(0, ReadIntAttr(c, "CooldownMax"));
+                        cached.DamageAmount = ReadIntAttr(c, "DamageAmount");
+                        cached.ShieldApplyAmount = ReadIntAttr(c, "ShieldApplyAmount");
+                        cached.BurnApplyAmount = ReadIntAttr(c, "BurnApplyAmount");
+                        cached.PoisonApplyAmount = ReadIntAttr(c, "PoisonApplyAmount");
+                        cached.HealAmount = ReadIntAttr(c, "HealAmount");
+                        cached.RegenApplyAmount = ReadIntAttr(c, "RegenApplyAmount");
+                        cached.CritChance = ReadIntAttr(c, "CritChance");
+                        cached.Multicast = Math.Max(0, ReadIntAttr(c, "Multicast"));
+                        cached.Lifesteal = ReadIntAttr(c, "Lifesteal");
+                        cached.SellPrice = c.GetSellPrice(prices);
+                        cached.AuraHeated = c.GetAttribute("Heated") > 0;
+                        cached.AuraChilled = c.GetAttribute("Chilled") > 0;
+                    }
+                }
+                else
+                {
+                    cached = new CachedCardSnapshotAttrs
+                    {
+                        AmmoMax = c.EffectiveAmmoMax,
+                        CooldownMaxMs = Math.Max(0, ReadIntAttr(c, "CooldownMax")),
+                        DamageAmount = ReadIntAttr(c, "DamageAmount"),
+                        ShieldApplyAmount = ReadIntAttr(c, "ShieldApplyAmount"),
+                        BurnApplyAmount = ReadIntAttr(c, "BurnApplyAmount"),
+                        PoisonApplyAmount = ReadIntAttr(c, "PoisonApplyAmount"),
+                        HealAmount = ReadIntAttr(c, "HealAmount"),
+                        RegenApplyAmount = ReadIntAttr(c, "RegenApplyAmount"),
+                        CritChance = ReadIntAttr(c, "CritChance"),
+                        Multicast = Math.Max(0, ReadIntAttr(c, "Multicast")),
+                        Lifesteal = ReadIntAttr(c, "Lifesteal"),
+                        SellPrice = c.GetSellPrice(prices),
+                        AuraHeated = c.GetAttribute("Heated") > 0,
+                        AuraChilled = c.GetAttribute("Chilled") > 0
+                    };
+                }
+
+                double cd = Math.Max(1000, cached.CooldownMaxMs > 0 ? cached.CooldownMaxMs : c.EffectiveCooldownMs);
+                cards.Add(new CardCooldownFrame
+                {
+                    InstanceId = c.InstanceId,
+                    Progress01 = c.HasActiveCooldown ? (float)Math.Clamp(c.CooldownProgressMs / cd, 0, 1) : 0f,
+                    IsHasted = c.HasteMs > 0,
+                    IsSlowed = c.SlowMs > 0,
+                    IsFrozen = c.FreezeMs > 0,
+                    // 修复 P1-6：使用 IsCardFlying 覆盖光环赋予的飞行态
+                    IsFlying = IsCardFlying(c),
+                    IsDestroyed = c.IsDestroyed,
+                    Ammo = c.CurrentAmmo,
+                    HasteMs = c.HasteMs,
+                    SlowMs = c.SlowMs,
+                    FreezeMs = c.FreezeMs,
+                    Heated = c.Heated || cached.AuraHeated,
+                    Chilled = c.Chilled || cached.AuraChilled,
+                    AmmoMax = cached.AmmoMax,
+                    CooldownMaxMs = cached.CooldownMaxMs,
+                    DamageAmount = cached.DamageAmount,
+                    ShieldApplyAmount = cached.ShieldApplyAmount,
+                    BurnApplyAmount = cached.BurnApplyAmount,
+                    PoisonApplyAmount = cached.PoisonApplyAmount,
+                    HealAmount = cached.HealAmount,
+                    RegenApplyAmount = cached.RegenApplyAmount,
+                    CritChance = cached.CritChance,
+                    Multicast = cached.Multicast,
+                    Lifesteal = cached.Lifesteal,
+                    SellPrice = cached.SellPrice,
+                    Counter = c.TimesFiredThisFight
+                });
+            }
         }
+
+        AppendHandFrames(p1.Hand.Cards);
+        AppendHandFrames(p2.Hand.Cards);
+
         return new CombatTickState
         {
             TimeMs = timeMs,
@@ -2321,7 +2646,7 @@ public static class CombatSimulator
     }
 
     /// <summary>
-    /// 依据 GameData.db 中的 MonsterTemplate 构建野怪战斗状态（精准还原槽位掩码、站位、品质与附魔）。
+    /// 依据 GameData.db 中的 MonsterTemplate 构建野怪战斗状态（精准还原 0-based 槽位掩码、Hand/Stash 站位、品质与附魔）。
     /// </summary>
     public static PlayerState BuildMonsterPlayerState(GameDataRepository repo, MonsterTemplate monster)
     {
@@ -2352,6 +2677,27 @@ public static class CombatSimulator
             state.Hand.TryAddAuto(card);
         }
 
+        // 修复 P1-11：解析野怪 Stash 物品（如 PVE_Karnok_D6_001 等带 Stash 装备的野怪，保障依赖 Stash 的技能/光环准确生效）
+        if (monster.Player.Stash != null && monster.Player.Stash.Items.Count > 0)
+        {
+            state.Stash.UnlockedMask = monster.Player.Stash.UnlockedSlots > 0 ? monster.Player.Stash.UnlockedSlots : 1023;
+            foreach (var stashEntry in monster.Player.Stash.Items)
+            {
+                var tpl = repo.GetCard(stashEntry.TemplateId);
+                if (tpl == null) continue;
+                var card = new CardInstance(tpl, TierHelper.ParseTier(stashEntry.Tier), stashEntry.EnchantmentType, stashEntry.InstanceId);
+                if (stashEntry.Attributes != null)
+                {
+                    foreach (var (ak, av) in stashEntry.Attributes)
+                        card.PermanentAdd[ak] = av - card.BaseAttributes.GetValueOrDefault(ak, 0);
+                }
+                int desiredSlot = ParseSocketIndex(stashEntry.SocketId);
+                if (desiredSlot >= 0 && state.Stash.TryPlaceOrShift(card, desiredSlot))
+                    continue;
+                state.Stash.TryAddAuto(card);
+            }
+        }
+
         foreach (var skillEntry in monster.Player.Skills)
         {
             var tpl = repo.GetCard(skillEntry.TemplateId);
@@ -2376,8 +2722,9 @@ public static class CombatSimulator
     {
         if (string.IsNullOrEmpty(socketId)) return -1;
         var parts = socketId.Split('_');
+        // 修复 P0-2：GameData.db monsters 表 SocketId 为 0-based（Socket_0..Socket_9），直接返回 idx 而非 idx - 1，根治全 179 只野怪左移撞车
         if (parts.Length >= 2 && int.TryParse(parts[^1], out int idx))
-            return Math.Clamp(idx - 1, 0, 9);
+            return Math.Clamp(idx, 0, 9);
         return -1;
     }
 }

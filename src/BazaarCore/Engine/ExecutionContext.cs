@@ -60,6 +60,10 @@ public sealed class RuleExecutionContext
     public bool IsFusionUpgrade { get; set; }
     public IReadOnlyList<CardInstance>? SelectionCards { get; set; }
     internal IReadOnlyList<CardInstance>? ExtremeCandidatePool { get; set; }
+    /// <summary>可选战斗突变全局暴击率加成（如 crit_overload +50%）。</summary>
+    public int CombatBonusCritChance { get; set; }
+    /// <summary>可选战斗突变暴击倍率覆盖百分比（如 crit_overload 275%）。</summary>
+    public int? CombatCritPercentMultiplierOverride { get; set; }
     public ActiveExecutionState ActiveExecution { get; set; } = new();
 
     // 供局外商店/发牌动作回调钩子
@@ -169,6 +173,8 @@ public sealed class RuleExecutionContext
             IsFusionUpgrade = IsFusionUpgrade,
             SelectionCards = SelectionCards,
             ExtremeCandidatePool = ExtremeCandidatePool,
+            CombatBonusCritChance = CombatBonusCritChance,
+            CombatCritPercentMultiplierOverride = CombatCritPercentMultiplierOverride,
             ActiveExecution = ActiveExecution,
             OnDealCardsToSelection = OnDealCardsToSelection,
             OnRerollEncounter = OnRerollEncounter,

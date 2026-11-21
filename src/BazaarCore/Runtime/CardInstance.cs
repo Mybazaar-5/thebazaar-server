@@ -125,16 +125,31 @@ public sealed class CardInstance
     public int TimesFiredThisFight { get; set; }
     public bool HasFiredOnce => TimesFiredThisFight > 0;
 
+    private static readonly CardTier[] AllCardTiers = Enum.GetValues<CardTier>();
+
+    /// <summary>单调递增的属性与光环变更版本号，供战斗快照复用无变动属性以消除热路径重复查表。</summary>
+    internal int AttributeVersion { get; private set; }
+
+    internal void MarkAttributeDirty() => AttributeVersion++;
+
     public CardInstance(CardTemplate template, CardTier? tierOverride = null, string? enchantment = null, string? instanceId = null)
+        : this(template, tierOverride, enchantment, instanceId, skipInitialRebuild: false)
+    {
+    }
+
+    private CardInstance(CardTemplate template, CardTier? tierOverride, string? enchantment, string? instanceId, bool skipInitialRebuild)
     {
         Template = template;
-        Tier = tierOverride ?? template.DefaultTier;
+        Tier = SpawnQueryEngine.ClampToSupportedTier(template, tierOverride ?? template.DefaultTier);
         Enchantment = enchantment;
         PermanentTier = Tier;
         PermanentEnchantment = Enchantment;
         InstanceId = instanceId ?? Guid.NewGuid().ToString("N");
-        RebuildTierAndEnchantmentData();
-        ResetForCombat(null);
+        if (!skipInitialRebuild)
+        {
+            RebuildTierAndEnchantmentData();
+            ResetForCombat(null);
+        }
     }
 
     private static readonly string[] TrackedDynamicEffectTags =
@@ -250,6 +265,7 @@ public sealed class CardInstance
 
     public bool HasTag(string tag)
     {
+        if (string.IsNullOrEmpty(tag)) return false;
         if (ListContainsIgnoreCase(Template.Tags, tag)) return true;
         if ((ExtraTags.Count > 0 && ExtraTags.Contains(tag))
             || (CombatTags.Count > 0 && CombatTags.Contains(tag))
@@ -263,14 +279,12 @@ public sealed class CardInstance
             return true;
         if (tag.Equals("Tiny", StringComparison.OrdinalIgnoreCase) && IsTiny)
             return true;
-        int bit = GetDynamicEffectTagBit(tag);
-        if (bit != 0 && (GetDynamicEffectMask() & bit) != 0)
-            return true;
         return false;
     }
 
     public bool HasHiddenTag(string tag)
     {
+        if (string.IsNullOrEmpty(tag)) return false;
         if (ListContainsIgnoreCase(Template.HiddenTags, tag)) return true;
         if (_questRewardHiddenTags.Count > 0 && _questRewardHiddenTags.Contains(tag)) return true;
         if (!string.IsNullOrEmpty(Enchantment) &&
@@ -332,18 +346,6 @@ public sealed class CardInstance
         }
         if (IsTiny && !HasBaseOrStaticTag("Tiny", ench))
             yield return "Tiny";
-
-        int mask = GetDynamicEffectMask();
-        if (mask != 0)
-        {
-            for (int i = 0; i < TrackedDynamicEffectTags.Length; i++)
-            {
-                if ((mask & (1 << i)) == 0) continue;
-                var dt = TrackedDynamicEffectTags[i];
-                if (!HasBaseOrStaticTag(dt, ench))
-                    yield return dt;
-            }
-        }
     }
 
     /// <summary>返回包含模板、附魔与动态生效能力衍生的全部隐藏标签。</summary>
@@ -392,6 +394,7 @@ public sealed class CardInstance
 
     public void SetTier(CardTier newTier, bool isTemporary)
     {
+        newTier = SpawnQueryEngine.ClampToSupportedTier(Template, newTier);
         if (!isTemporary) PermanentTier = newTier;
         if (newTier == Tier)
         {
@@ -426,7 +429,7 @@ public sealed class CardInstance
     public void ApplyEnchantment(string? enchantment, bool preventOverride, bool isTemporary)
         => ApplyEnchantment(enchantment, preventOverride, isTemporary ? DurationTarget.Combat : DurationTarget.Permanent);
 
-    /// <summary>按持续时间层级施加附魔（支持 Permanent / Day / Hour / Combat 临时附魔）。</summary>
+    /// <summary>按持续时间层级施加附魔（支持 Permanent / Day / Hour / Combat 临时附魔；更高持久层覆盖时自动清理已被顶替的旧短时附魔）。</summary>
     public void ApplyEnchantment(string? enchantment, bool preventOverride, DurationTarget duration)
     {
         if (string.IsNullOrEmpty(enchantment)) return;
@@ -436,9 +439,13 @@ public sealed class CardInstance
         {
             case DurationTarget.Permanent:
                 PermanentEnchantment = enchantment;
+                // 永久附魔生效时清除已被覆盖的旧 Hour/Day 附魔，防止后续过小时/过天时旧临时附魔顶掉新永久附魔
+                DayEnchantment = null;
+                HourEnchantment = null;
                 break;
             case DurationTarget.Day:
                 DayEnchantment = enchantment;
+                HourEnchantment = null;
                 break;
             case DurationTarget.Hour:
                 HourEnchantment = enchantment;
@@ -480,6 +487,7 @@ public sealed class CardInstance
 
     public void RebuildTierAndEnchantmentData()
     {
+        AttributeVersion++;
         _cachedDynamicEffectMask = -1;
         BaseAttributes.Clear();
         ActiveAbilities.Clear();
@@ -494,13 +502,14 @@ public sealed class CardInstance
         }
 
         // 从 Bronze 依次向上合并到当前 Tier（高阶增量覆盖低阶）
-        List<string> activeAbilityIds = new();
-        List<string> activeAuraIds = new();
+        List<string>? activeAbilityIds = null;
+        List<string>? activeAuraIds = null;
 
         if (Template.Tiers != null && Template.Tiers.Count > 0)
         {
-            foreach (CardTier t in Enum.GetValues<CardTier>())
+            for (int i = 0; i < AllCardTiers.Length; i++)
             {
+                var t = AllCardTiers[i];
                 if (t > Tier) break;
                 if (!Template.Tiers.TryGetValue(t.ToString(), out var td)) continue;
                 foreach (var (k, v) in td.Attributes)
@@ -511,19 +520,27 @@ public sealed class CardInstance
         }
         else
         {
-            activeAbilityIds = Template.Abilities.Keys.ToList();
-            activeAuraIds = Template.Auras.Keys.ToList();
+            foreach (var ab in Template.Abilities.Values)
+                ActiveAbilities.Add(ab);
+            foreach (var au in Template.Auras.Values)
+                ActiveAuras.Add(au);
         }
 
-        foreach (var aid in activeAbilityIds)
+        if (activeAbilityIds != null)
         {
-            if (Template.Abilities.TryGetValue(aid, out var ab))
-                ActiveAbilities.Add(ab);
+            for (int i = 0; i < activeAbilityIds.Count; i++)
+            {
+                if (Template.Abilities.TryGetValue(activeAbilityIds[i], out var ab))
+                    ActiveAbilities.Add(ab);
+            }
         }
-        foreach (var auid in activeAuraIds)
+        if (activeAuraIds != null)
         {
-            if (Template.Auras.TryGetValue(auid, out var au))
-                ActiveAuras.Add(au);
+            for (int i = 0; i < activeAuraIds.Count; i++)
+            {
+                if (Template.Auras.TryGetValue(activeAuraIds[i], out var au))
+                    ActiveAuras.Add(au);
+            }
         }
 
         // 叠加附魔
@@ -540,18 +557,21 @@ public sealed class CardInstance
         }
 
         // 叠加已完成 Quest 奖励（兼容直接 Attributes 与按 Tier 缩放的 Reward.Tiers）
-        if (Template.Quests != null)
+        if (Template.Quests != null && CompletedQuests.Count > 0)
         {
-            foreach (var q in Template.Quests)
+            for (int qi = 0; qi < Template.Quests.Count; qi++)
             {
-                foreach (var entry in q.Entries)
+                var q = Template.Quests[qi];
+                for (int ei = 0; ei < q.Entries.Count; ei++)
                 {
+                    var entry = q.Entries[ei];
                     if (!CompletedQuests.Contains(entry.AttributeType) || entry.Reward == null) continue;
                     if (entry.Reward.Tiers != null && entry.Reward.Tiers.Count > 0)
                     {
                         Dictionary<string, double>? mergedTierAttrs = null;
-                        foreach (CardTier t in Enum.GetValues<CardTier>())
+                        for (int ti = 0; ti < AllCardTiers.Length; ti++)
                         {
+                            var t = AllCardTiers[ti];
                             if (t > Tier) break;
                             if (!entry.Reward.Tiers.TryGetValue(t.ToString(), out var rtd)) continue;
                             mergedTierAttrs ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
@@ -570,18 +590,30 @@ public sealed class CardInstance
                             BaseAttributes[k] = BaseAttributes.GetValueOrDefault(k, 0) + v;
                     }
                     if (entry.Reward.Abilities != null)
-                        ActiveAbilities.AddRange(entry.Reward.Abilities.Values);
+                    {
+                        foreach (var ab in entry.Reward.Abilities.Values)
+                            ActiveAbilities.Add(ab);
+                    }
                     if (entry.Reward.Auras != null)
-                        ActiveAuras.AddRange(entry.Reward.Auras.Values);
+                    {
+                        foreach (var au in entry.Reward.Auras.Values)
+                            ActiveAuras.Add(au);
+                    }
                     if (entry.Reward.Tags != null)
                     {
-                        foreach (var rt in entry.Reward.Tags)
+                        for (int k = 0; k < entry.Reward.Tags.Count; k++)
+                        {
+                            var rt = entry.Reward.Tags[k];
                             if (!string.IsNullOrWhiteSpace(rt)) _questRewardTags.Add(rt);
+                        }
                     }
                     if (entry.Reward.HiddenTags != null)
                     {
-                        foreach (var rht in entry.Reward.HiddenTags)
+                        for (int k = 0; k < entry.Reward.HiddenTags.Count; k++)
+                        {
+                            var rht = entry.Reward.HiddenTags[k];
                             if (!string.IsNullOrWhiteSpace(rht)) _questRewardHiddenTags.Add(rht);
+                        }
                     }
                 }
             }
@@ -610,29 +642,57 @@ public sealed class CardInstance
 
     public double GetAttribute(string attr, StandardPricesSettings? prices)
     {
-        if (attr.Equals("Ammo", StringComparison.OrdinalIgnoreCase))
-            return CurrentAmmo;
-        if (attr.Equals("Counter", StringComparison.OrdinalIgnoreCase))
-            return TimesFiredThisFight;
-        if (attr.Equals("Tiny", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrEmpty(attr)) return 0;
+
+        // 按首字符快速分派高频实时属性，跳过常规属性（Damage/Shield/Burn/Poison 等）的多余字符串比较
+        char c0 = attr[0];
+        if (c0 is 'A' or 'a')
         {
-            var scalar = Math.Max(0, GetRawScalar("Tiny"));
-            if (scalar > 0) return scalar;
-            return (ExtraTags.Contains("Tiny") || CombatTags.Contains("Tiny") || AuraTags.Contains("Tiny"))
-                ? 1.0
-                : 0.0;
+            if (attr.Equals("Ammo", StringComparison.OrdinalIgnoreCase))
+                return CurrentAmmo;
         }
-        if (attr.Equals("Flying", StringComparison.OrdinalIgnoreCase))
-            return IsFlying ? 1.0 : Math.Max(0, GetRawScalar("Flying"));
-        if (attr.Equals("Haste", StringComparison.OrdinalIgnoreCase))
-            return HasteMs > 0 ? HasteMs : Math.Max(0, GetRawScalar("Haste"));
-        if (attr.Equals("Slow", StringComparison.OrdinalIgnoreCase))
-            return SlowMs > 0 ? SlowMs : Math.Max(0, GetRawScalar("Slow"));
-        if (attr.Equals("Freeze", StringComparison.OrdinalIgnoreCase))
-            return FreezeMs > 0 ? FreezeMs : Math.Max(0, GetRawScalar("Freeze"));
+        else if (c0 is 'C' or 'c')
+        {
+            if (attr.Equals("Counter", StringComparison.OrdinalIgnoreCase))
+                return TimesFiredThisFight;
+        }
+        else if (c0 is 'T' or 't')
+        {
+            if (attr.Equals("Tiny", StringComparison.OrdinalIgnoreCase))
+            {
+                var scalar = Math.Max(0, GetRawScalar("Tiny"));
+                if (scalar > 0) return scalar;
+                return (ExtraTags.Contains("Tiny") || CombatTags.Contains("Tiny") || AuraTags.Contains("Tiny"))
+                    ? 1.0
+                    : 0.0;
+            }
+        }
+        else if (c0 is 'F' or 'f')
+        {
+            if (attr.Equals("Flying", StringComparison.OrdinalIgnoreCase))
+            {
+                double rawFly = GetRawScalar("Flying");
+                if (IsFlying)
+                    return Math.Max(1.0, 1.0 + rawFly);
+                return Math.Max(0, rawFly);
+            }
+            if (attr.Equals("Freeze", StringComparison.OrdinalIgnoreCase))
+                return FreezeMs > 0 ? FreezeMs : Math.Max(0, GetRawScalar("Freeze"));
+        }
+        else if (c0 is 'H' or 'h')
+        {
+            if (attr.Equals("Haste", StringComparison.OrdinalIgnoreCase))
+                return HasteMs > 0 ? HasteMs : Math.Max(0, GetRawScalar("Haste"));
+        }
+        else if (c0 is 'S' or 's')
+        {
+            if (attr.Equals("Slow", StringComparison.OrdinalIgnoreCase))
+                return SlowMs > 0 ? SlowMs : Math.Max(0, GetRawScalar("Slow"));
+        }
 
         double baseVal;
-        if (attr.Equals("SellPrice", StringComparison.OrdinalIgnoreCase)
+        if (c0 is 'S' or 's'
+            && attr.Equals("SellPrice", StringComparison.OrdinalIgnoreCase)
             && !BaseAttributes.ContainsKey("SellPrice")
             && Template.Type is "Item" or "Skill")
         {
@@ -643,7 +703,7 @@ public sealed class CardInstance
         }
         else
         {
-            baseVal = BaseAttributes.GetValueOrDefault(attr, 0);
+            baseVal = BaseAttributes.Count > 0 && BaseAttributes.TryGetValue(attr, out var bv) ? bv : 0;
         }
 
         var sum = baseVal;
@@ -663,18 +723,20 @@ public sealed class CardInstance
 
         var value = sum * totalMult;
 
-        if (attr.Equals("Heated", StringComparison.OrdinalIgnoreCase) && Heated && value <= 0)
+        if (c0 is 'H' or 'h' && Heated && value <= 0 && attr.Equals("Heated", StringComparison.OrdinalIgnoreCase))
             return 1;
-        if (attr.Equals("Chilled", StringComparison.OrdinalIgnoreCase) && Chilled && value <= 0)
-            return 1;
-
-        if (attr.Equals("CooldownMax", StringComparison.OrdinalIgnoreCase) && value > 0)
+        if (c0 is 'C' or 'c')
         {
-            var flatRed = GetAttributeRaw("FlatCooldownReduction");
-            var pctRed = Math.Clamp(GetAttributeRaw("PercentCooldownReduction"), -200, 90);
-            value = Math.Max(1000, (value - flatRed) * (1.0 - pctRed / 100.0));
+            if (Chilled && value <= 0 && attr.Equals("Chilled", StringComparison.OrdinalIgnoreCase))
+                return 1;
+            if (value > 0 && attr.Equals("CooldownMax", StringComparison.OrdinalIgnoreCase))
+            {
+                var flatRed = GetAttributeRaw("FlatCooldownReduction");
+                var pctRed = Math.Clamp(GetAttributeRaw("PercentCooldownReduction"), -200, 90);
+                value = Math.Max(1000, (value - flatRed) * (1.0 - pctRed / 100.0));
+            }
         }
-        else if (attr.Equals("TempoCost", StringComparison.OrdinalIgnoreCase) && value > 0)
+        else if (c0 is 'T' or 't' && value > 0 && attr.Equals("TempoCost", StringComparison.OrdinalIgnoreCase))
         {
             // 对齐 CooldownMax 减免公式，应用平摊与百分比节奏消耗减免（如 Death Metal Drum Kit 的闪亮附魔）
             var flatRed = GetAttributeRaw("FlatTempoCostReduction");
@@ -703,9 +765,10 @@ public sealed class CardInstance
 
     public void ModifyAttribute(string attr, string operation, double value, DurationTarget target)
     {
+        AttributeVersion++;
         if (attr.Equals("Ammo", StringComparison.OrdinalIgnoreCase))
         {
-            var ammoMax = Math.Max(0, (int)Math.Round(GetAttribute("AmmoMax")));
+            var ammoMax = EffectiveAmmoMax;
             CurrentAmmo = Math.Clamp((int)Math.Round(ApplyScalar(CurrentAmmo, operation, value)), 0, ammoMax);
             return;
         }
@@ -748,6 +811,14 @@ public sealed class CardInstance
                 CombatAdd.Remove(attr); CombatMult.Remove(attr);
                 HourAdd.Remove(attr); HourMult.Remove(attr);
                 DayAdd.Remove(attr); DayMult.Remove(attr);
+                // 若存在光环赋予的 Flying，则通过 CombatAdd 压制抵消，确保 FlyingStop/Set 0 立即落地生效
+                double auraFly = AuraAdd.GetValueOrDefault(attr, 0);
+                if (auraFly > 0)
+                    CombatAdd[attr] = -auraFly;
+            }
+            else if (CombatAdd.TryGetValue(attr, out var negSuppress) && negSuppress < 0)
+            {
+                CombatAdd.Remove(attr);
             }
             return;
         }
@@ -794,8 +865,27 @@ public sealed class CardInstance
             case "Set":
             {
                 multDict.Remove(attr);
+                // 计算其余有效乘区并在赋值时精确抵消，避免 PermanentMult / AuraMult 等放大或歪曲 Set 目标值
+                double otherMult = 1.0;
+                if (!ReferenceEquals(multDict, PermanentMult) && PermanentMult.TryGetValue(attr, out var pm)) otherMult *= pm;
+                if (!ReferenceEquals(multDict, HourMult) && HourMult.TryGetValue(attr, out var hm)) otherMult *= hm;
+                if (!ReferenceEquals(multDict, DayMult) && DayMult.TryGetValue(attr, out var dm)) otherMult *= dm;
+                if (!ReferenceEquals(multDict, CombatMult) && CombatMult.TryGetValue(attr, out var cm)) otherMult *= cm;
+                if (AuraMult.TryGetValue(attr, out var am)) otherMult *= am;
+
+                if (Math.Abs(otherMult) < 1e-9)
+                {
+                    // 若其他层存在乘 0 锁死导致无法通过加法还原目标值，清理对应零乘区
+                    if (PermanentMult.TryGetValue(attr, out var pm0) && Math.Abs(pm0) < 1e-9) PermanentMult.Remove(attr);
+                    if (HourMult.TryGetValue(attr, out var hm0) && Math.Abs(hm0) < 1e-9) HourMult.Remove(attr);
+                    if (DayMult.TryGetValue(attr, out var dm0) && Math.Abs(dm0) < 1e-9) DayMult.Remove(attr);
+                    if (CombatMult.TryGetValue(attr, out var cm0) && Math.Abs(cm0) < 1e-9) CombatMult.Remove(attr);
+                    if (AuraMult.TryGetValue(attr, out var am0) && Math.Abs(am0) < 1e-9) AuraMult.Remove(attr);
+                    otherMult = 1.0;
+                }
+
                 double otherLayers = GetAttributeRaw(attr) - addDict.GetValueOrDefault(attr, 0);
-                addDict[attr] = value - otherLayers;
+                addDict[attr] = (value / otherMult) - otherLayers;
                 break;
             }
             default: // Add
@@ -844,6 +934,7 @@ public sealed class CardInstance
 
     public void ApplyAuraAttribute(string attr, string operation, double value)
     {
+        AttributeVersion++;
         switch (operation)
         {
             case "Subtract":
@@ -869,6 +960,8 @@ public sealed class CardInstance
 
     public void ClearAuraModifiers()
     {
+        if (AuraAdd.Count > 0 || AuraMult.Count > 0 || AuraTags.Count > 0)
+            AttributeVersion++;
         AuraAdd.Clear();
         AuraMult.Clear();
         AuraTags.Clear();
@@ -876,6 +969,8 @@ public sealed class CardInstance
 
     public void ClearEndOfHourModifiers()
     {
+        if (HourAdd.Count > 0 || HourMult.Count > 0)
+            AttributeVersion++;
         HourAdd.Clear();
         HourMult.Clear();
         if (HourEnchantment != null)
@@ -894,6 +989,8 @@ public sealed class CardInstance
 
     public void ClearEndOfDayModifiers()
     {
+        if (DayAdd.Count > 0 || DayMult.Count > 0)
+            AttributeVersion++;
         DayAdd.Clear();
         DayMult.Clear();
         if (DayEnchantment != null || HourEnchantment != null)
@@ -987,32 +1084,45 @@ public sealed class CardInstance
         _ => cur + val
     };
 
-    public CardInstance CloneForCombat()
+    public CardInstance CloneForCombat() => CloneForCombatInternal(resetImmediately: true);
+
+    internal CardInstance CloneForCombatInternal(bool resetImmediately)
     {
-        var copy = new CardInstance(Template, PermanentTier, PermanentEnchantment, InstanceId)
+        var effectiveEnch = HourEnchantment ?? DayEnchantment ?? PermanentEnchantment;
+        var copy = new CardInstance(Template, PermanentTier, effectiveEnch, InstanceId, skipInitialRebuild: true)
         {
             StartSlot = StartSlot,
+            PermanentEnchantment = PermanentEnchantment,
             DayEnchantment = DayEnchantment,
             HourEnchantment = HourEnchantment,
-            IsFlying = IsFlying,
-            Heated = Heated,
-            Chilled = Chilled,
             TransformReplacementTemplateId = TransformReplacementTemplateId,
             TransformedFromInstanceId = TransformedFromInstanceId,
             CombatSourceCard = this,
             AttachedStandardPrices = AttachedStandardPrices
         };
-        foreach (var (k, v) in PermanentAdd) copy.PermanentAdd[k] = v;
-        foreach (var (k, v) in PermanentMult) copy.PermanentMult[k] = v;
-        foreach (var (k, v) in HourAdd) copy.HourAdd[k] = v;
-        foreach (var (k, v) in HourMult) copy.HourMult[k] = v;
-        foreach (var (k, v) in DayAdd) copy.DayAdd[k] = v;
-        foreach (var (k, v) in DayMult) copy.DayMult[k] = v;
-        foreach (var t in ExtraTags) copy.ExtraTags.Add(t);
-        foreach (var (k, v) in QuestProgress) copy.QuestProgress[k] = v;
-        foreach (var c in CompletedQuests) copy.CompletedQuests.Add(c);
+        if (PermanentAdd.Count > 0)
+            foreach (var (k, v) in PermanentAdd) copy.PermanentAdd[k] = v;
+        if (PermanentMult.Count > 0)
+            foreach (var (k, v) in PermanentMult) copy.PermanentMult[k] = v;
+        if (HourAdd.Count > 0)
+            foreach (var (k, v) in HourAdd) copy.HourAdd[k] = v;
+        if (HourMult.Count > 0)
+            foreach (var (k, v) in HourMult) copy.HourMult[k] = v;
+        if (DayAdd.Count > 0)
+            foreach (var (k, v) in DayAdd) copy.DayAdd[k] = v;
+        if (DayMult.Count > 0)
+            foreach (var (k, v) in DayMult) copy.DayMult[k] = v;
+        if (ExtraTags.Count > 0)
+            foreach (var t in ExtraTags) copy.ExtraTags.Add(t);
+        if (QuestProgress.Count > 0)
+            foreach (var (k, v) in QuestProgress) copy.QuestProgress[k] = v;
+        if (CompletedQuests.Count > 0)
+            foreach (var c in CompletedQuests) copy.CompletedQuests.Add(c);
+
+        // 跳过构造期重复重建，仅在此处一次性 Rebuild（并按需执行 ResetForCombat）
         copy.RebuildTierAndEnchantmentData();
-        copy.ResetForCombat(null);
+        if (resetImmediately)
+            copy.ResetForCombat(null);
         return copy;
     }
 }

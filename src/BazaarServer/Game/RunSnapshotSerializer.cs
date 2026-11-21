@@ -70,6 +70,9 @@ public static class RunSnapshotSerializer
         public bool GainedAdvanceHourXpThisHour { get; set; }
         public int SelectionsMadeInCurrentContext { get; set; }
         public int RngSeed { get; set; }
+        public int BossRushWavesCleared { get; set; }
+        public bool EndlessTenWinCelebrated { get; set; }
+        public int DailyRerollSequence { get; set; }
 
         public Dictionary<string, int> PlayerAttributes { get; set; } = new();
         public Dictionary<string, double> PlayerHourAdd { get; set; } = new();
@@ -152,6 +155,7 @@ public static class RunSnapshotSerializer
     {
         public string InstanceId { get; set; } = "";
         public Guid TemplateId { get; set; }
+        public string? CustomCardId { get; set; }
         public ECardType Type { get; set; } = ECardType.Item;
         public ECardSize Size { get; set; } = ECardSize.Medium;
         public ETier Tier { get; set; } = ETier.Bronze;
@@ -241,6 +245,9 @@ public static class RunSnapshotSerializer
             GainedAdvanceHourXpThisHour = run.GainedAdvanceHourXpThisHour,
             SelectionsMadeInCurrentContext = run.SelectionsMadeInCurrentContext,
             RngSeed = run.RngSeed,
+            BossRushWavesCleared = run.BossRushWavesCleared,
+            EndlessTenWinCelebrated = run.EndlessTenWinCelebrated,
+            DailyRerollSequence = run.DailyRerollSequence,
             PendingPvpGhost = run.PendingPvpGhost,
         };
 
@@ -419,6 +426,9 @@ public static class RunSnapshotSerializer
             GainedAdvanceHourXpThisHour = dto.GainedAdvanceHourXpThisHour,
             SelectionsMadeInCurrentContext = Math.Max(0, dto.SelectionsMadeInCurrentContext),
             RngSeed = dto.RngSeed,
+            BossRushWavesCleared = Math.Max(0, dto.BossRushWavesCleared),
+            EndlessTenWinCelebrated = dto.EndlessTenWinCelebrated,
+            DailyRerollSequence = Math.Max(0, dto.DailyRerollSequence),
             PendingPvpGhost = dto.PendingPvpGhost,
         };
 
@@ -632,6 +642,7 @@ public static class RunSnapshotSerializer
         {
             InstanceId = card.InstanceId,
             TemplateId = card.TemplateId,
+            CustomCardId = card.CustomCardId,
             Type = card.Type,
             Size = card.Size,
             Tier = card.Tier,
@@ -683,6 +694,7 @@ public static class RunSnapshotSerializer
         {
             InstanceId = cDto.InstanceId,
             TemplateId = cDto.TemplateId,
+            CustomCardId = cDto.CustomCardId,
             Type = cDto.Type,
             Size = cDto.Size,
             Tier = cDto.Tier,
@@ -879,12 +891,13 @@ public static class RunSnapshotSerializer
 
     private static CardInstance RebuildCoreCard(CardSnapshotEntryDto cDto, GameDataRepository? repo)
     {
-        var coreTpl = repo?.GetCard(cDto.TemplateId.ToString());
+        var coreTpl = (!string.IsNullOrWhiteSpace(cDto.CustomCardId) ? repo?.GetCard(cDto.CustomCardId) : null)
+                   ?? repo?.GetCard(cDto.TemplateId.ToString());
         if (coreTpl == null)
         {
             coreTpl = new BazaarCore.Models.CardTemplate
             {
-                Id = cDto.TemplateId.ToString(),
+                Id = !string.IsNullOrWhiteSpace(cDto.CustomCardId) ? cDto.CustomCardId! : cDto.TemplateId.ToString(),
                 Type = MapCoreType(cDto.Type),
                 Size = cDto.Size.ToString(),
                 StartingTier = cDto.Tier.ToString(),

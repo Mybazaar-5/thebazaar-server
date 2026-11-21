@@ -8,9 +8,14 @@
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
     <RestorePackages>false</RestorePackages>
     <NoWarn>$(NoWarn);CS0168;CS0219;MSB3277</NoWarn>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(BAZAAR_MANAGED_DIR)'!=''">$(BAZAAR_MANAGED_DIR)</ManagedDir>
     <ManagedDir Condition="'$(ManagedDir)'==''">$(MSBuildThisFileDirectory)..\..\ext\Managed</ManagedDir>
+    <BepInExCore Condition="'$(BepInExCore)'=='' And '$(BAZAAR_BEPINEX_CORE)'!=''">$(BAZAAR_BEPINEX_CORE)</BepInExCore>
     <BepInExCore Condition="'$(BepInExCore)'==''">$(MSBuildThisFileDirectory)..\..\ext\bepinex\extracted\BepInEx\core</BepInExCore>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\BazaarModSdk\BazaarModSdk.csproj" />
+  </ItemGroup>
   <ItemGroup>
     <Reference Include="BepInEx"><HintPath>$(BepInExCore)\BepInEx.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="0Harmony"><HintPath>$(BepInExCore)\0Harmony.dll</HintPath><Private>false</Private></Reference>

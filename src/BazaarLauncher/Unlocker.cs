@@ -4,39 +4,73 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
-using BepInEx;
+using BazaarLauncher.Core;
 using HarmonyLib;
 using UnityEngine;
 
 namespace BazaarLauncher;
 
 /// <summary>
-/// 全解锁：英雄、皮肤、藏品、赛季奖励、箱子全部视为已拥有。
-///
-/// 服务端已经返回全英雄（BootstrapHeroesDto.owned）与 catalog.bin 白名单藏品，
-/// 这里再补一层客户端真实命名空间下的兜底，保证所有「已拥有/已解锁」判定返回 true。
+/// 全解锁与 396 套藏品按需懒加载模块（修复 P1-7 与 Wave 1 审计 2 处死补丁 + 1 处多重载未锁签名）：
+///   1. 彻底消除 CollectionManager.Awake / Start 2 处现存死补丁与不存在的 TheBazaar.ProfileData.PlayerProfile；
+///   2. 精确按参数类型锁定 HeroManager.TryGetHeroSO(EHero, out HeroSO) 与 TryGetHeroSO(string, out HeroSO) 两个重载；
+///   3. 去除与 NoSteam 重复的 SteamDLCService / SteamApps 补丁；
+///   4. 扫描所有权方法时严格跳过含 out/ref 参数的方法，避免下游 NRE；
+///   5. 后台回调统一通过 MainThreadDispatcher 派发至主线程，并对加载的 Addressables 句柄进行托管释放。
 /// </summary>
 internal static class Unlocker
 {
     private static bool _applied;
-    private static int _mainThreadId;
-    private static SynchronizationContext _unitySyncContext;
 
-    internal static void Apply(Harmony harmony)
+    private static readonly object _lazySync = new();
+    private static readonly HashSet<string> _lazyOnDemandLoading = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly List<object> _trackedAddressableHandles = new();
+    private static FieldInfo _cmIsLoadingField;
+    private static FieldInfo _cmLoadCtsField;
+    private static FieldInfo _cmSaleMapField;
+    private static FieldInfo _cmUnavailableField;
+    private static MethodInfo _cmRebuildEquippedMethod;
+    private static MethodInfo _cmLoadItemAsyncMethod;
+    private static FieldInfo _eventsCollectionUpdatedField;
+    private static FieldInfo _eventsCollectionsPopulatedField;
+
+    private static readonly string[] Hero8SoAddressablesKeys =
     {
-        if (_applied) return;
+        "Hero_DRA",
+        "Hero_DRA.asset",
+    };
+
+    private static readonly string[] Hero8SkinAddressablesKeys =
+    {
+        "5fa7632e55d2f6349876e52f931cf6d9",
+        "Skin_DRA_01/A",
+        "Skin_DRA_01/Skin_DRA_01a_SkinData.asset",
+        "Skin_DRA_01a_SkinData.asset",
+        "b91b7e1e7c7c4494388b4d1d9a1a9606",
+    };
+
+    private static bool _hero8SoLogged;
+    private static bool _hero8SkinLogged;
+
+    internal static void ResetAppliedFlag()
+    {
+        _applied = false;
+        _hero8SoLogged = false;
+        _hero8SkinLogged = false;
+        ReleaseTrackedAddressableHandles();
+    }
+
+    internal static void Apply(SafeHarmonyPatcher patcher)
+    {
+        if (_applied || patcher == null) return;
         _applied = true;
-        _mainThreadId = Thread.CurrentThread.ManagedThreadId;
-        _unitySyncContext ??= SynchronizationContext.Current;
 
         int patched = 0;
 
-        // 1) Steam DLC 放行
-        patched += PatchReturnTrue(harmony, "TheBazaar.Steam.SteamDLCService", "IsInstalled");
-        patched += PatchReturnTrue(harmony, "Steamworks.SteamApps", "BIsDlcInstalled");
-        patched += PatchReturnTrue(harmony, "Steamworks.SteamApps", "BIsSubscribedApp");
+        // 藏品 / 皮肤 / 装扮 / 英雄所有权白名单判定（去除与 NoSteam 重复项和已不存在类型，严格跳过 out/ref 参数方法）
+        var returnTrueHook = AccessTools.Method(typeof(Unlocker), nameof(ReturnTrue));
+        var ownsHeroHook = AccessTools.Method(typeof(Unlocker), nameof(OwnsPlayableHeroPrefix));
 
-        // 2) 藏品 / 皮肤 / 装扮 / 英雄：修正为客户端真实命名空间，仅拦截所有权判定（不拦截 IsEquipped）
         foreach (var typeName in new[]
         {
             "TheBazaar.CollectionManager",
@@ -46,25 +80,24 @@ internal static class Unlocker
             "TheBazaar.CosmeticsDataManager",
             "TheBazaar.HeroManager",
             "TheBazaar.PlayerProfile",
-            "TheBazaar.ProfileData.PlayerProfile",
         })
         {
             var t = AccessTools.TypeByName(typeName);
             if (t == null) continue;
             foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
             {
-                if (m.ReturnType != typeof(bool) || m.IsGenericMethodDefinition) continue;
-                string n = m.Name;
+                if (m.ReturnType != typeof(bool) || m.IsGenericMethodDefinition || m.IsAbstract) continue;
 
+                // 严格禁止对包含 out/ref 参数的方法挂载 ReturnTrue，防止未初始化 out 参数导致下游 NRE（P1-7）
+                if (HasOutOrRefParameter(m)) continue;
+
+                string n = m.Name;
                 if (typeName == "TheBazaar.HeroManager" && n == "OwnsHero")
                 {
-                    try
+                    if (patcher.TryPatchMethod(m, prefix: ownsHeroHook, label: "HeroManager.OwnsHero"))
                     {
-                        harmony.Patch(m, prefix: new HarmonyMethod(
-                            AccessTools.Method(typeof(Unlocker), nameof(OwnsPlayableHeroPrefix))));
                         patched++;
                     }
-                    catch { }
                     continue;
                 }
 
@@ -80,36 +113,38 @@ internal static class Unlocker
 
                 if (!isOwnershipCheck) continue;
 
-                try
+                if (patcher.TryPatchMethod(m, prefix: returnTrueHook, optional: true, label: $"{t.Name}.{n}"))
                 {
-                    harmony.Patch(m, prefix: new HarmonyMethod(
-                        AccessTools.Method(typeof(Unlocker), nameof(ReturnTrue))));
                     patched++;
                 }
-                catch { }
             }
         }
 
-        patched += PatchHero8RuntimeFallbacks(harmony);
-        patched += PatchLazyCollectionLoading(harmony);
+        patched += PatchHero8RuntimeFallbacks(patcher);
+        patched += PatchLazyCollectionLoading(patcher);
 
-        BazaarLauncherPlugin.Log.LogInfo($"Unlocker applied {patched} patches");
+        BazaarLauncherPlugin.Log?.LogInfo($"Unlocker: 已安全安装 {patched} 个全解锁与懒加载补丁");
     }
 
-    // ── 396 套全解锁藏品按需懒加载（砍掉启动 26,669 个闲置 3D 资产显存常驻）──
+    internal static void Apply(Harmony harmony)
+    {
+        if (_applied || harmony == null) return;
+        Apply(new SafeHarmonyPatcher("unlocker.legacy"));
+    }
 
-    private static readonly object _lazySync = new();
-    private static readonly HashSet<string> _lazyOnDemandLoading = new(StringComparer.OrdinalIgnoreCase);
-    private static FieldInfo _cmIsLoadingField;
-    private static FieldInfo _cmLoadCtsField;
-    private static FieldInfo _cmSaleMapField;
-    private static FieldInfo _cmUnavailableField;
-    private static MethodInfo _cmRebuildEquippedMethod;
-    private static MethodInfo _cmLoadItemAsyncMethod;
-    private static FieldInfo _eventsCollectionUpdatedField;
-    private static FieldInfo _eventsCollectionsPopulatedField;
+    private static bool HasOutOrRefParameter(MethodInfo m)
+    {
+        foreach (var p in m.GetParameters())
+        {
+            if (p.IsOut || p.ParameterType.IsByRef)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
-    private static int PatchLazyCollectionLoading(Harmony harmony)
+    private static int PatchLazyCollectionLoading(SafeHarmonyPatcher patcher)
     {
         int count = 0;
         var cmType = AccessTools.TypeByName("TheBazaar.CollectionManager");
@@ -122,40 +157,33 @@ internal static class Unlocker
         _cmRebuildEquippedMethod = AccessTools.Method(cmType, "RebuildEquippedCards");
         _cmLoadItemAsyncMethod = AccessTools.Method(cmType, "LoadCollectionItemAsync", new[] { typeof(string), typeof(CancellationToken) });
 
-        var loadRem = AccessTools.Method(cmType, "LoadRemainingCollectionAsync");
-        if (loadRem != null)
+        if (patcher.TryPatch(
+                cmType,
+                "LoadRemainingCollectionAsync",
+                new[] { typeof(Task), typeof(string[]), typeof(CancellationToken) },
+                prefix: AccessTools.Method(typeof(Unlocker), nameof(LoadRemainingCollectionPrefix)),
+                label: "CollectionManager.LoadRemainingCollectionAsync"))
         {
-            try
-            {
-                harmony.Patch(loadRem, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(Unlocker), nameof(LoadRemainingCollectionPrefix))));
-                count++;
-            }
-            catch { }
+            count++;
         }
 
-        var retryMissing = AccessTools.Method(cmType, "RetryMissingCollectionItemsAsync");
-        if (retryMissing != null)
+        if (patcher.TryPatch(
+                cmType,
+                "RetryMissingCollectionItemsAsync",
+                prefix: AccessTools.Method(typeof(Unlocker), nameof(RetryMissingCollectionItemsPrefix)),
+                label: "CollectionManager.RetryMissingCollectionItemsAsync"))
         {
-            try
-            {
-                harmony.Patch(retryMissing, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(Unlocker), nameof(RetryMissingCollectionItemsPrefix))));
-                count++;
-            }
-            catch { }
+            count++;
         }
 
-        var waitItem = AccessTools.Method(cmType, "WaitForCollectionItemAsync", new[] { typeof(string), typeof(CancellationToken) });
-        if (waitItem != null)
+        if (patcher.TryPatch(
+                cmType,
+                "WaitForCollectionItemAsync",
+                new[] { typeof(string), typeof(CancellationToken) },
+                prefix: AccessTools.Method(typeof(Unlocker), nameof(WaitForCollectionItemPrefix)),
+                label: "CollectionManager.WaitForCollectionItemAsync"))
         {
-            try
-            {
-                harmony.Patch(waitItem, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(Unlocker), nameof(WaitForCollectionItemPrefix))));
-                count++;
-            }
-            catch { }
+            count++;
         }
 
         return count;
@@ -199,7 +227,7 @@ internal static class Unlocker
             TriggerCollectionStaticEvent("CollectionsPopulated", ref _eventsCollectionsPopulatedField);
 
             BazaarLauncherPlugin.Log?.LogInfo(
-                $"LazyLoadCosmetics active: skipped background preloading of {skippedCount} unequipped collectibles (on-demand load enabled).");
+                $"Unlocker 藏品懒加载生效：跳过 {skippedCount} 项未穿戴藏品后台全量预加载，改为打开藏品柜按需加载。");
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex)
@@ -284,125 +312,85 @@ internal static class Unlocker
         }
     }
 
-    private static readonly string[] Hero8SoAddressablesKeys =
-    {
-        "Hero_DRA",
-        "Hero_DRA.asset",
-    };
-
-    // Skin_DRA_01a_SkinData.asset（基础皮肤）优先，缺失时回退 Skin_DRA_02a_SkinData.asset
-    private static readonly string[] Hero8SkinAddressablesKeys =
-    {
-        "5fa7632e55d2f6349876e52f931cf6d9",
-        "Skin_DRA_01/A",
-        "Skin_DRA_01/Skin_DRA_01a_SkinData.asset",
-        "Skin_DRA_01a_SkinData.asset",
-        "b91b7e1e7c7c4494388b4d1d9a1a9606",
-    };
-
-    private static bool _hero8SoLogged;
-    private static bool _hero8SkinLogged;
-
-    private static int PatchHero8RuntimeFallbacks(Harmony harmony)
+    private static int PatchHero8RuntimeFallbacks(SafeHarmonyPatcher patcher)
     {
         int count = 0;
 
         var hmType = AccessTools.TypeByName("TheBazaar.HeroManager");
+        var heroEnumType = AccessTools.TypeByName("BazaarGameShared.Domain.Core.Types.EHero");
+        var heroSoType = AccessTools.TypeByName("TheBazaar.HeroSO");
+
         if (hmType != null)
         {
-            foreach (var m in hmType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+            // 精确锁定 HeroManager.TryGetHeroSO 的两个重载签名：(EHero, out HeroSO) 与 (string, out HeroSO)
+            var tryGetPrefix = AccessTools.Method(typeof(Unlocker), nameof(HeroManagerTryGetHeroSOPrefix));
+            if (heroEnumType != null && heroSoType != null)
             {
-                if (m.Name == "TryGetHeroSO")
+                Type heroSoByRef = heroSoType.MakeByRefType();
+                if (patcher.TryPatch(
+                        hmType,
+                        "TryGetHeroSO",
+                        new[] { heroEnumType, heroSoByRef },
+                        prefix: tryGetPrefix,
+                        label: "HeroManager.TryGetHeroSO(EHero, out HeroSO)"))
                 {
-                    try
-                    {
-                        harmony.Patch(m, prefix: new HarmonyMethod(
-                            AccessTools.Method(typeof(Unlocker), nameof(HeroManagerTryGetHeroSOPrefix))));
-                        count++;
-                    }
-                    catch { }
+                    count++;
                 }
-                else if (m.Name == "InitializeAsync")
+
+                if (patcher.TryPatch(
+                        hmType,
+                        "TryGetHeroSO",
+                        new[] { typeof(string), heroSoByRef },
+                        prefix: tryGetPrefix,
+                        label: "HeroManager.TryGetHeroSO(string, out HeroSO)"))
                 {
-                    try
-                    {
-                        harmony.Patch(m, postfix: new HarmonyMethod(
-                            AccessTools.Method(typeof(Unlocker), nameof(HeroManagerInitializeAsyncPostfix))));
-                        count++;
-                    }
-                    catch { }
+                    count++;
                 }
-                else if (m.Name == "OnOwnedHeroesChanged")
-                {
-                    try
-                    {
-                        harmony.Patch(m, postfix: new HarmonyMethod(
-                            AccessTools.Method(typeof(Unlocker), nameof(HeroManagerEnsureFallbackPostfix))));
-                        count++;
-                    }
-                    catch { }
-                }
+            }
+
+            if (patcher.TryPatch(
+                    hmType,
+                    "InitializeAsync",
+                    postfix: AccessTools.Method(typeof(Unlocker), nameof(HeroManagerInitializeAsyncPostfix)),
+                    label: "HeroManager.InitializeAsync"))
+            {
+                count++;
+            }
+
+            if (patcher.TryPatch(
+                    hmType,
+                    "OnOwnedHeroesChanged",
+                    postfix: AccessTools.Method(typeof(Unlocker), nameof(HeroManagerEnsureFallbackPostfix)),
+                    label: "HeroManager.OnOwnedHeroesChanged"))
+            {
+                count++;
             }
         }
 
+        // CollectionManager：彻底移除历史上不存在的 Awake / Start 2 处死补丁，仅精确挂钩实际存在的两个默认皮肤入口
         var cmType = AccessTools.TypeByName("TheBazaar.CollectionManager");
         if (cmType != null)
         {
-            var getDefaultSkin = AccessTools.Method(cmType, "GetDefaultHeroSkin");
-            if (getDefaultSkin != null)
+            if (patcher.TryPatch(
+                    cmType,
+                    "GetDefaultHeroSkin",
+                    prefix: AccessTools.Method(typeof(Unlocker), nameof(CollectionManagerGetDefaultHeroSkinPrefix)),
+                    label: "CollectionManager.GetDefaultHeroSkin"))
             {
-                try
-                {
-                    harmony.Patch(getDefaultSkin, prefix: new HarmonyMethod(
-                        AccessTools.Method(typeof(Unlocker), nameof(CollectionManagerGetDefaultHeroSkinPrefix))));
-                    count++;
-                }
-                catch { }
+                count++;
             }
 
-            var getDefaultSale = AccessTools.Method(cmType, "GetDefaultCollectibleSaleItem");
-            if (getDefaultSale != null)
+            if (patcher.TryPatch(
+                    cmType,
+                    "GetDefaultCollectibleSaleItem",
+                    prefix: AccessTools.Method(typeof(Unlocker), nameof(CollectionManagerGetDefaultSaleItemPrefix)),
+                    label: "CollectionManager.GetDefaultCollectibleSaleItem"))
             {
-                try
-                {
-                    harmony.Patch(getDefaultSale, prefix: new HarmonyMethod(
-                        AccessTools.Method(typeof(Unlocker), nameof(CollectionManagerGetDefaultSaleItemPrefix))));
-                    count++;
-                }
-                catch { }
-            }
-
-            foreach (var initName in new[] { "Awake", "Start" })
-            {
-                var mInit = AccessTools.Method(cmType, initName);
-                if (mInit == null) continue;
-                try
-                {
-                    harmony.Patch(mInit, postfix: new HarmonyMethod(
-                        AccessTools.Method(typeof(Unlocker), nameof(CollectionManagerEnsureFallbackPostfix))));
-                    count++;
-                }
-                catch { }
+                count++;
             }
         }
 
         return count;
-    }
-
-    private static void PostToMainThread(Action action)
-    {
-        if (action == null) return;
-        if (Thread.CurrentThread.ManagedThreadId == _mainThreadId)
-        {
-            action();
-            return;
-        }
-        if (_unitySyncContext != null)
-        {
-            _unitySyncContext.Post(_ => action(), null);
-            return;
-        }
-        action();
     }
 
     private static bool IsDeadUnityObj(object obj)
@@ -431,7 +419,7 @@ internal static class Unlocker
             {
                 __result.ContinueWith(_ =>
                 {
-                    PostToMainThread(() =>
+                    MainThreadDispatcher.Enqueue(() =>
                     {
                         try
                         {
@@ -455,18 +443,6 @@ internal static class Unlocker
             if (!IsDeadUnityObj(__instance))
             {
                 EnsureHero8InHeroManager(__instance);
-            }
-        }
-        catch { }
-    }
-
-    private static void CollectionManagerEnsureFallbackPostfix(object __instance)
-    {
-        try
-        {
-            if (!IsDeadUnityObj(__instance))
-            {
-                EnsureHero8DefaultSkin(__instance);
             }
         }
         catch { }
@@ -498,16 +474,12 @@ internal static class Unlocker
         catch { }
     }
 
-    /// <summary>
-    /// 确保 HeroManager 中已注入 EHero.Hero8 对应的 HeroSO（通过 catalog.bin 核实的 Hero_DRA 键同步加载）并纳入随机池。
-    /// </summary>
     private static void EnsureHero8InHeroManager(object hm)
     {
         try
         {
             var heroEnumType = AccessTools.TypeByName("BazaarGameShared.Domain.Core.Types.EHero");
-            if (heroEnumType == null) return;
-            if (!Enum.IsDefined(heroEnumType, "Hero8")) return;
+            if (heroEnumType == null || !Enum.IsDefined(heroEnumType, "Hero8")) return;
             object hero8Enum = Enum.Parse(heroEnumType, "Hero8", ignoreCase: false);
 
             var hmType = hm.GetType();
@@ -522,7 +494,7 @@ internal static class Unlocker
                 var heroSoType = arr?.GetType().GetElementType() ?? AccessTools.TypeByName("TheBazaar.HeroSO");
                 if (heroSoType == null) return;
 
-                existingHeroSo = TryLoadAddressableAssetSync(heroSoType, Hero8SoAddressablesKeys, out string usedKey);
+                existingHeroSo = TryLoadAddressableAssetTracked(heroSoType, Hero8SoAddressablesKeys, out string usedKey);
                 if (existingHeroSo == null) return;
 
                 if (lookup != null)
@@ -555,11 +527,10 @@ internal static class Unlocker
                 if (!_hero8SoLogged)
                 {
                     _hero8SoLogged = true;
-                    BazaarLauncherPlugin.Log.LogInfo($"Injected Hero8 HeroSO into HeroManager via key '{usedKey}'");
+                    BazaarLauncherPlugin.Log?.LogInfo($"Unlocker: 已通过 '{usedKey}' 注入双龙 (Hero8) HeroSO");
                 }
             }
 
-            // 同步玩家随机英雄偏好：若尚未记录 Hero8，默认纳入随机池（对齐 HeroManager.InitializeAsync）
             var prefsType = AccessTools.TypeByName("PlayerPreferences");
             var prefsData = prefsType?.GetProperty("Data", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
             if (prefsData != null)
@@ -575,9 +546,6 @@ internal static class Unlocker
         catch { }
     }
 
-    /// <summary>
-    /// 确保 CollectionManager.defaultHeroSkins 包含 EHero.Hero8 默认皮肤（优先加载 Skin_DRA_01a，回退 Skin_DRA_02a）。
-    /// </summary>
     private static void EnsureHero8DefaultSkin(object cm)
     {
         try
@@ -605,8 +573,7 @@ internal static class Unlocker
                     var entry = arr.GetValue(i);
                     if (entry != null && Equals(entryHeroField.GetValue(entry), hero8Enum))
                     {
-                        if (entrySkinField.GetValue(entry) != null)
-                            return; // 已完整配置 Hero8 默认皮肤
+                        if (entrySkinField.GetValue(entry) != null) return;
                         replaceIdx = i;
                         break;
                     }
@@ -614,7 +581,7 @@ internal static class Unlocker
             }
 
             Type skinAssetType = entrySkinField.FieldType;
-            object loadedSkin = TryLoadAddressableAssetSync(skinAssetType, Hero8SkinAddressablesKeys, out string usedKey);
+            object loadedSkin = TryLoadAddressableAssetTracked(skinAssetType, Hero8SkinAddressablesKeys, out string usedKey);
             if (loadedSkin == null) return;
 
             object newEntry = Activator.CreateInstance(entryType);
@@ -639,15 +606,15 @@ internal static class Unlocker
             if (!_hero8SkinLogged)
             {
                 _hero8SkinLogged = true;
-                BazaarLauncherPlugin.Log.LogInfo($"Injected Hero8 default skin into CollectionManager via key '{usedKey}'");
+                BazaarLauncherPlugin.Log?.LogInfo($"Unlocker: 已通过 '{usedKey}' 注入双龙 (Hero8) 默认皮肤");
             }
         }
         catch { }
     }
 
-    private static object TryLoadAddressableAssetSync(Type assetType, string[] candidateKeys, out string matchedKey)
+    private static object TryLoadAddressableAssetTracked(Type assetType, string[] candidateKeys, out string matchedKey)
     {
-        matchedKey = "";
+        matchedKey = string.Empty;
         var addrType = AccessTools.TypeByName("UnityEngine.AddressableAssets.Addressables");
         if (addrType == null) return null;
 
@@ -659,7 +626,7 @@ internal static class Unlocker
         {
             if (loc != null) locatorList.Add(loc);
         }
-        if (locatorList.Count == 0) return null; // Addressables 尚未初始化完成
+        if (locatorList.Count == 0) return null;
 
         var iLocatorType = AccessTools.TypeByName("UnityEngine.AddressableAssets.ResourceLocators.IResourceLocator");
         var locateMethod = iLocatorType?.GetMethod("Locate", BindingFlags.Public | BindingFlags.Instance);
@@ -712,9 +679,15 @@ internal static class Unlocker
                 object asset = waitMethod?.Invoke(handle, null);
                 if (asset != null)
                 {
+                    // 托管记录 AsyncOperationHandle 以便卸载时配对释放，杜绝永久引用泄漏（P1-7）
+                    lock (_lazySync)
+                    {
+                        _trackedAddressableHandles.Add(handle);
+                    }
                     matchedKey = key;
                     return asset;
                 }
+                TryReleaseHandle(addrType, handle);
             }
             catch { }
         }
@@ -722,27 +695,51 @@ internal static class Unlocker
         return null;
     }
 
-    private static int PatchReturnTrue(Harmony harmony, string typeName, string methodName)
+    internal static void ReleaseTrackedAddressableHandles()
     {
-        var t = AccessTools.TypeByName(typeName);
-        if (t == null) return 0;
-        var m = AccessTools.Method(t, methodName);
-        if (m == null || m.ReturnType != typeof(bool)) return 0;
+        List<object> handles;
+        lock (_lazySync)
+        {
+            if (_trackedAddressableHandles.Count == 0) return;
+            handles = new List<object>(_trackedAddressableHandles);
+            _trackedAddressableHandles.Clear();
+        }
+
+        var addrType = AccessTools.TypeByName("UnityEngine.AddressableAssets.Addressables");
+        if (addrType == null) return;
+        foreach (var h in handles)
+        {
+            TryReleaseHandle(addrType, h);
+        }
+    }
+
+    private static void TryReleaseHandle(Type addrType, object handle)
+    {
+        if (addrType == null || handle == null) return;
         try
         {
-            harmony.Patch(m, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(Unlocker), nameof(ReturnTrue))));
-            return 1;
+            var isValidProp = handle.GetType().GetMethod("IsValid", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+            if (isValidProp != null && isValidProp.Invoke(handle, null) is bool valid && !valid) return;
+
+            foreach (var m in addrType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+            {
+                if (m.Name != "Release" || m.IsGenericMethodDefinition) continue;
+                var ps = m.GetParameters();
+                if (ps.Length == 1 && ps[0].ParameterType.IsInstanceOfType(handle))
+                {
+                    m.Invoke(null, new[] { handle });
+                    return;
+                }
+            }
         }
-        catch { return 0; }
+        catch { }
     }
 
     private static bool OwnsPlayableHeroPrefix(object[] __args, ref bool __result)
     {
         try
         {
-            // 仅排除空值与占位 Common，彻底放行包括 Hero8（双龙）在内的所有正式可玩英雄
-            string heroName = __args != null && __args.Length > 0 ? __args[0]?.ToString() ?? "" : "";
+            string heroName = __args != null && __args.Length > 0 ? __args[0]?.ToString() ?? string.Empty : string.Empty;
             if (string.IsNullOrEmpty(heroName) ||
                 string.Equals(heroName, "Common", StringComparison.OrdinalIgnoreCase))
             {
@@ -759,14 +756,7 @@ internal static class Unlocker
 
     private static bool ReturnTrue(ref bool __result)
     {
-        try
-        {
-            __result = true;
-            return false;
-        }
-        catch
-        {
-            return true;
-        }
+        __result = true;
+        return false;
     }
 }

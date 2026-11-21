@@ -1,0 +1,148 @@
+{
+  "$schema": "https://bazaar-local.schema/mod-custom-events/v1",
+  "schemaVersion": 1,
+  "modId": "bazaar-chronicles-sample",
+  "events": [
+    {
+      "customId": "bazaar-chronicles-sample:event_smuggler_vessel",
+      "internalName": "Starport Blackmarket Smuggler Vessel",
+      "type": "EventEncounter",
+      "size": "Medium",
+      "tier": "Silver",
+      "baseVisualTemplateId": "11287697-dd45-4edc-9539-780a26001043",
+      "baseVisualNote": "载体：The Docks (EventEncounter, valid_card_ids.json 白名单校验通过)",
+      "schedule": {
+        "minDay": 3,
+        "maxDay": 10,
+        "hours": [1, 2, 4, 5],
+        "weight": 8,
+        "oncePerRun": true
+      },
+      "titleZh": "星港黑市走私船",
+      "descZh": "一艘熄灯停泊在星港外锚地的改装走私船向你发出暗语：船舱里藏有未登记的星港奇物与违禁改装台。",
+      "steps": [
+        {
+          "customId": "bazaar-chronicles-sample:step_inspect_cargo",
+          "type": "EncounterStep",
+          "size": "Medium",
+          "baseVisualTemplateId": "0659ca31-9f4d-412e-84b2-d535b502afa6",
+          "baseVisualNote": "载体：Play it Some Music (EncounterStep, valid_card_ids.json 白名单校验通过)",
+          "titleZh": "支付入场费登船验货",
+          "descZh": "花费 6 金币进入黑市船舱密室，进一步选择走私奇物、强化改装或截留账本。",
+          "costGold": 6,
+          "nextEventId": "bazaar-chronicles-sample:event_smuggler_vault",
+          "effects": [
+            { "type": "SpendGold", "amount": 6 },
+            { "type": "ChainEvent", "targetEventId": "bazaar-chronicles-sample:event_smuggler_vault" }
+          ]
+        },
+        {
+          "customId": "bazaar-chronicles-sample:step_barter_salvage",
+          "type": "EncounterStep",
+          "size": "Medium",
+          "baseVisualTemplateId": "0d275fc2-b4de-42d6-a0c4-ba7c76c950b2",
+          "baseVisualNote": "载体：Sell the Rights (Dabora) (EncounterStep, valid_card_ids.json 白名单校验通过)",
+          "titleZh": "码头快速倒卖",
+          "descZh": "不涉深水，仅在甲板交换情报与零件：获得 4 金币、1 点经验值，并使你最左侧物品获得 +10 伤害或护盾。",
+          "costGold": 0,
+          "effects": [
+            { "type": "GainGold", "amount": 4 },
+            { "type": "GainXp", "amount": 1 },
+            { "type": "BuffLeftmostItem", "damageOrShield": 10 }
+          ]
+        },
+        {
+          "customId": "bazaar-chronicles-sample:step_tip_off_guards",
+          "type": "EncounterStep",
+          "size": "Medium",
+          "baseVisualTemplateId": "01982309-095f-4d37-b550-634ab6d983f0",
+          "baseVisualNote": "载体：Return It (EncounterStep, valid_card_ids.json 白名单校验通过)",
+          "titleZh": "向港务局密报",
+          "descZh": "将走私船坐标通报星港守卫：恢复 2 点声望，并免费习得 1 项星港专属技能。",
+          "costGold": 0,
+          "effects": [
+            { "type": "GainPrestige", "amount": 2 },
+            {
+              "type": "GrantRandomCustomCard",
+              "pool": [
+                "bazaar-chronicles-sample:starport_trade_charter",
+                "bazaar-chronicles-sample:ember_tide_resonance"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "customId": "bazaar-chronicles-sample:event_smuggler_vault",
+      "internalName": "Starport Blackmarket Smuggler Vault",
+      "type": "EventEncounter",
+      "size": "Medium",
+      "tier": "Gold",
+      "baseVisualTemplateId": "04ac552f-c292-455e-bf5f-438119dfa196",
+      "baseVisualNote": "载体：Apothecary (EventEncounter, valid_card_ids.json 白名单校验通过)",
+      "schedule": {
+        "chainOnly": true
+      },
+      "titleZh": "黑市船舱密室",
+      "descZh": "穿过两道气密舱门后，灯光照亮了三箱罕见的走私货物与一台滋滋作响的非法改装炉。",
+      "steps": [
+        {
+          "customId": "bazaar-chronicles-sample:step_claim_curio",
+          "type": "EncounterStep",
+          "size": "Medium",
+          "baseVisualTemplateId": "0c71aef1-c049-483a-b9a0-19c5005b4fc7",
+          "baseVisualNote": "载体：Inspired by Karnok (EncounterStep, valid_card_ids.json 白名单校验通过)",
+          "titleZh": "提走星港奇物箱",
+          "descZh": "从本扩展包 4 件星港专属自定义奇物中展示 3 件，免费选取 1 件收入囊中。",
+          "costGold": 0,
+          "effects": [
+            {
+              "type": "OfferCustomCardChoices",
+              "choiceCount": 3,
+              "maxSelections": 1,
+              "free": true,
+              "pool": [
+                "bazaar-chronicles-sample:starport_compass_blade",
+                "bazaar-chronicles-sample:aether_bulwark_lantern",
+                "bazaar-chronicles-sample:solar_kiln_furnace",
+                "bazaar-chronicles-sample:starport_dreadnought_vault"
+              ]
+            }
+          ]
+        },
+        {
+          "customId": "bazaar-chronicles-sample:step_overclock_weapon",
+          "type": "EncounterStep",
+          "size": "Medium",
+          "baseVisualTemplateId": "05a904b2-056f-4de5-be12-5274de680ad1",
+          "baseVisualNote": "载体：Help the Fishermen (EncounterStep, valid_card_ids.json 白名单校验通过)",
+          "titleZh": "黑市走私超频改装",
+          "descZh": "升级你最左侧的物品 1 个品阶；若其已是钻石级，则改为使其冷却缩短 15% 并附加炽焰附魔。",
+          "costGold": 0,
+          "effects": [
+            {
+              "type": "UpgradeLeftmostItemOrFallback",
+              "fallbackCooldownReductionPct": 15,
+              "fallbackEnchantment": "Fiery"
+            }
+          ]
+        },
+        {
+          "customId": "bazaar-chronicles-sample:step_take_manifest_gold",
+          "type": "EncounterStep",
+          "size": "Medium",
+          "baseVisualTemplateId": "0b9d5868-5ea5-4507-8faf-1654dda11c08",
+          "baseVisualNote": "载体：Watch Your Step! (EncounterStep, valid_card_ids.json 白名单校验通过)",
+          "titleZh": "截留走私账本与金砖",
+          "descZh": "立刻获取 14 金币，并使你的每日收入永久提高 +2。",
+          "costGold": 0,
+          "effects": [
+            { "type": "GainGold", "amount": 14 },
+            { "type": "GainIncome", "amount": 2 }
+          ]
+        }
+      ]
+    }
+  ]
+}

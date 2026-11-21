@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using BazaarGameShared.Domain.Core.Types;
 using BazaarServer.Accounts;
@@ -15,97 +16,176 @@ public static class TempoNetEndpoints
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.Never,
     };
 
+    private static readonly ConcurrentDictionary<Guid, Queue<long>> ChestGrantRateMap = new();
+
+    private static readonly string[] ReservedExtendedPrefixes =
+    [
+        "social/", "replays/", "leaderboards/", "sandbox/", "spectate/",
+        "lobbies/", "daily-challenge/", "ping"
+    ];
+
     public static void Map(WebApplication app)
     {
         // ── 时间 ─────────────────────────────────────────────────────────────
-        // 客户端把响应体当裸字符串喂给 DateTime.Parse()，所以这里必须返回
-        // 不带引号、不带 JSON 包装的纯文本 ISO-8601。
+        // 客户端把响应体当裸字符串喂给 DateTime.Parse()，这里必须返回纯文本 ISO-8601。
         app.MapGet("/api/time", () =>
-        {
-            return Results.Text(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ"));
-        });
+            Results.Text(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")));
 
-        // ── 登录（无 Steam 版：直接给名字）─────────────────────────────────
+        // ── 登录（无 Steam 版：支持 Steam 票据、用户名 + 可选口令/设备密钥与多端并存）──
         app.MapPost("/api/auth/login/silent", async (HttpContext ctx, AccountStore accounts, ILogger<Program> log) =>
         {
-            string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+            string raw = await ReadBoundedBodyAsync(ctx, 16 * 1024);
             string ticket = ExtractTicket(raw);
+            string clientKind = ExtractStringProperty(raw, "clientKind", "client_kind")
+                ?? ctx.Request.Headers["X-Client-Kind"].ToString();
+            string deviceId = ExtractStringProperty(raw, "deviceId", "device_id")
+                ?? ctx.Request.Headers["X-Device-Id"].ToString();
+            string? secret = ExtractStringProperty(raw, "password", "passphrase", "deviceSecret", "secret");
 
             AccountStore.Account acc;
+            AccountStore.IssuedTokenPair? issued = null;
             if (!string.IsNullOrEmpty(ticket))
             {
-                acc = accounts.GetOrCreateBySteamTicket(ticket);
+                acc = accounts.GetOrCreateBySteamTicket(ticket, clientKind, deviceId);
                 log.LogInformation("login/silent: steam ticket -> {user}", acc.Username);
             }
             else
             {
                 string name = ctx.Request.Headers["uid"].ToString();
                 if (string.IsNullOrWhiteSpace(name)) name = ExtractName(raw);
-                acc = accounts.GetOrCreateByName(name);
+                var login = accounts.LoginByNameWithSecret(name, secret, clientKind, deviceId);
+                if (!login.Ok || login.Account == null)
+                    return Results.Json(new { error = login.ErrorZh ?? "登录失败，请检查用户名或口令。", code = "LOGIN_FAILED" }, Json, statusCode: 401);
+                acc = login.Account;
+                issued = login.Tokens;
                 log.LogInformation("login/silent: name '{name}' -> {user}", name, acc.Username);
             }
 
             return Results.Json(new LoginResponseDto
             {
-                AccessToken = acc.AccessToken,
-                RefreshToken = acc.RefreshToken,
-                AlternateRefreshToken = acc.RefreshToken,
-                AccessTokenExpiresAt = acc.AccessExpiresAt,
+                AccessToken = issued?.AccessToken ?? acc.AccessToken,
+                RefreshToken = issued?.RefreshToken ?? acc.RefreshToken,
+                AlternateRefreshToken = issued?.RefreshToken ?? acc.RefreshToken,
+                AccessTokenExpiresAt = issued?.AccessExpiresAt ?? acc.AccessExpiresAt,
                 CurrentTime = DateTime.UtcNow,
             }, Json);
         });
 
-        // ── 直接按名字登录（插件首选用这个）────────────────────────────────
+        // ── 直接按名字登录（插件与启动器首选，多端并发不互踢）─────────────────
         app.MapPost("/api/auth/login/user", async (HttpContext ctx, AccountStore accounts, ILogger<Program> log) =>
         {
-            string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+            string raw = await ReadBoundedBodyAsync(ctx, 16 * 1024);
             string name = ExtractName(raw);
             if (string.IsNullOrWhiteSpace(name)) name = ctx.Request.Headers["uid"].ToString();
-            var acc = accounts.GetOrCreateByName(name);
-            log.LogInformation("login/user: '{name}' -> {user}", name, acc.Username);
+            string clientKind = ExtractStringProperty(raw, "clientKind", "client_kind")
+                ?? ctx.Request.Headers["X-Client-Kind"].ToString();
+            string deviceId = ExtractStringProperty(raw, "deviceId", "device_id")
+                ?? ctx.Request.Headers["X-Device-Id"].ToString();
+            string? secret = ExtractStringProperty(raw, "password", "passphrase", "deviceSecret", "secret");
 
+            var login = accounts.LoginByNameWithSecret(name, secret, clientKind, deviceId);
+            if (!login.Ok || login.Account == null || login.Tokens == null)
+                return Results.Json(new { error = login.ErrorZh ?? "账号登录失败。", code = "LOGIN_FAILED" }, Json, statusCode: 401);
+
+            log.LogInformation("login/user: '{name}' -> {user} ({kind})", name, login.Account.Username, login.Tokens.ClientKind);
             return Results.Json(new LoginResponseDto
             {
-                AccessToken = acc.AccessToken,
-                RefreshToken = acc.RefreshToken,
-                AlternateRefreshToken = acc.RefreshToken,
-                AccessTokenExpiresAt = acc.AccessExpiresAt,
+                AccessToken = login.Tokens.AccessToken,
+                RefreshToken = login.Tokens.RefreshToken,
+                AlternateRefreshToken = login.Tokens.RefreshToken,
+                AccessTokenExpiresAt = login.Tokens.AccessExpiresAt,
                 CurrentTime = DateTime.UtcNow,
             }, Json);
         });
 
-        // ── 注册（名字可用性检查 + 注册即登录）─────────────────────────────
+        // ── 注册（名字可用性检查 + 注册即登录，可选绑定口令保护）───────────────
         app.MapPost("/api/auth/register", async (HttpContext ctx, AccountStore accounts) =>
         {
-            string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+            string raw = await ReadBoundedBodyAsync(ctx, 16 * 1024);
             string name = ExtractName(raw);
-            var acc = accounts.GetOrCreateByName(name);
+            string clientKind = ExtractStringProperty(raw, "clientKind", "client_kind")
+                ?? ctx.Request.Headers["X-Client-Kind"].ToString();
+            string deviceId = ExtractStringProperty(raw, "deviceId", "device_id")
+                ?? ctx.Request.Headers["X-Device-Id"].ToString();
+            string? secret = ExtractStringProperty(raw, "password", "passphrase", "deviceSecret", "secret");
+
+            var login = accounts.LoginByNameWithSecret(name, secret, clientKind, deviceId);
+            if (!login.Ok || login.Account == null || login.Tokens == null)
+                return Results.Json(new { error = login.ErrorZh ?? "注册失败。", code = "REGISTER_FAILED" }, Json, statusCode: 401);
+
             return Results.Json(new LoginResponseDto
             {
-                AccessToken = acc.AccessToken,
-                RefreshToken = acc.RefreshToken,
-                AlternateRefreshToken = acc.RefreshToken,
-                AccessTokenExpiresAt = acc.AccessExpiresAt,
+                AccessToken = login.Tokens.AccessToken,
+                RefreshToken = login.Tokens.RefreshToken,
+                AlternateRefreshToken = login.Tokens.RefreshToken,
+                AccessTokenExpiresAt = login.Tokens.AccessExpiresAt,
                 CurrentTime = DateTime.UtcNow,
             }, Json);
+        });
+
+        // ── 设置/修改账号登录口令（需已认证身份）─────────────────────────────
+        app.MapPost("/api/auth/password", async (HttpContext ctx, AccountStore accounts) =>
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string raw = await ReadBoundedBodyAsync(ctx, 8 * 1024);
+            string? currentSecret = ExtractStringProperty(raw, "currentPassword", "oldPassword", "currentSecret");
+            string? newSecret = ExtractStringProperty(raw, "newPassword", "password", "passphrase", "newSecret");
+            if (string.IsNullOrWhiteSpace(newSecret))
+                return Results.Json(new { error = "请提供新的账号口令。", code = "INVALID_PASSWORD" }, Json, statusCode: 400);
+
+            var (ok, err) = accounts.SetOrUpdateSecret(auth.Account!, currentSecret, newSecret);
+            if (!ok)
+                return Results.Json(new { error = err ?? "口令设置失败。", code = "PASSWORD_UPDATE_FAILED" }, Json, statusCode: 400);
+
+            return Results.Json(new { ok = true, message = "账号口令保护已更新。" }, Json);
+        });
+
+        // ── 登出并吊销当前令牌 ───────────────────────────────────────────────
+        app.MapPost("/api/auth/logout", (HttpContext ctx, AccountStore accounts) =>
+        {
+            string token = ctx.Request.Headers["Authorization"].ToString();
+            accounts.RevokeToken(token);
+            return Results.Json(new { ok = true, message = "当前会话已退出登录。" }, Json);
         });
 
         app.MapGet("/api/accounts/check-username", (HttpContext ctx, AccountStore accounts) =>
         {
             string name = ctx.Request.Query["username"].ToString();
-            bool taken = accounts.FindByUsername(name) != null;
-            return Results.Json(new { available = !taken, username = name }, Json);
+            var existing = accounts.FindByUsername(name);
+            return Results.Json(new
+            {
+                available = existing == null,
+                username = name,
+                hasPassword = existing?.HasSecretProtection ?? false,
+            }, Json);
         });
 
-        app.MapPost("/api/auth/refreshtokens", (HttpContext ctx, AccountStore accounts) =>
+        // ── 令牌刷新（支持 Body 或 Authorization Header，真正轮换新令牌并落盘）──
+        app.MapPost("/api/auth/refreshtokens", async (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = accounts.FindByAccessToken(ctx.Request.Headers["Authorization"].ToString());
-            if (acc == null) return Results.Json(new { error = "invalid token" }, Json, statusCode: 401);
+            string raw = await ReadBoundedBodyAsync(ctx, 8 * 1024);
+            string? tokenFromBody = ExtractStringProperty(raw, "refreshToken", "RefreshToken", "token", "Token");
+            string token = !string.IsNullOrWhiteSpace(tokenFromBody)
+                ? tokenFromBody
+                : ctx.Request.Headers["Authorization"].ToString();
+            string clientKind = ExtractStringProperty(raw, "clientKind", "client_kind")
+                ?? ctx.Request.Headers["X-Client-Kind"].ToString();
+            string deviceId = ExtractStringProperty(raw, "deviceId", "device_id")
+                ?? ctx.Request.Headers["X-Device-Id"].ToString();
+
+            var refreshed = accounts.TryRefreshTokens(token, clientKind, deviceId);
+            if (!refreshed.Ok || refreshed.Tokens == null)
+            {
+                return Results.Json(new { error = refreshed.ErrorZh ?? "刷新令牌无效或已过期。", code = "INVALID_TOKEN" }, Json, statusCode: 401);
+            }
+
             return Results.Json(new RefreshTokenResponseDto
             {
-                AccessToken = acc.AccessToken,
-                RefreshToken = acc.RefreshToken,
-                AccessTokenExpiresAt = acc.AccessExpiresAt,
+                AccessToken = refreshed.Tokens.AccessToken,
+                RefreshToken = refreshed.Tokens.RefreshToken,
+                AccessTokenExpiresAt = refreshed.Tokens.AccessExpiresAt,
                 CurrentTime = DateTime.UtcNow,
             }, Json);
         });
@@ -115,35 +195,35 @@ public static class TempoNetEndpoints
         // ── Bootstrap ────────────────────────────────────────────────────────
         app.MapGet("/api/Bootstrap/app", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db, ILogger<Program> log) =>
         {
-            var acc = Resolve(ctx, accounts);
-            log.LogInformation("Bootstrap/app (GET) for {user}", acc.Username);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            log.LogInformation("Bootstrap/app (GET) for {user}", acc!.Username);
             return Results.Json(BuildBootstrap(acc, sessions, db, accounts), Json);
         });
         app.MapPost("/api/Bootstrap/app", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db, ILogger<Program> log) =>
         {
-            var acc = Resolve(ctx, accounts);
-            log.LogInformation("Bootstrap/app (POST) for {user}", acc.Username);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            log.LogInformation("Bootstrap/app (POST) for {user}", acc!.Username);
             return Results.Json(BuildBootstrap(acc, sessions, db, accounts), Json);
         });
 
         app.MapGet("/api/Bootstrap/post-run", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(BuildPostRunBootstrap(acc, sessions, db, accounts), Json);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(BuildPostRunBootstrap(acc!, sessions, db, accounts), Json);
         });
         app.MapPost("/api/Bootstrap/post-run", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(BuildPostRunBootstrap(acc, sessions, db, accounts), Json);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(BuildPostRunBootstrap(acc!, sessions, db, accounts), Json);
         });
 
         // ── 账号 ─────────────────────────────────────────────────────────────
         app.MapGet("/api/Accounts/me/summary", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
             return Results.Json(new AccountSummaryDto
             {
-                UserName = acc.Username,
+                UserName = acc!.Username,
                 Username = acc.Username,
                 Email = acc.Username + "@local",
                 IsEmailVerified = true,
@@ -153,16 +233,19 @@ public static class TempoNetEndpoints
         });
 
         app.MapGet("/api/Accounts/feature-access", (HttpContext ctx, AccountStore accounts) =>
-            Results.Json(AllAccess(Resolve(ctx, accounts)), Json));
+        {
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(AllAccess(acc!), Json);
+        });
         app.MapGet("/api/accounts/me/email-verification-status", () => Results.Json(true, Json));
 
         // ── 档案 / 排名 / 钱包 ───────────────────────────────────────────────
         app.MapGet("/api/PlayerProfiles/me", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
         {
-            var acc = Resolve(ctx, accounts);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
             return Results.Json(new PlayerProfileDto
             {
-                AccountId = acc.AccountId,
+                AccountId = acc!.AccountId,
                 Username = acc.Username,
                 TitlePrefix = "",
                 TitleSuffix = "",
@@ -173,10 +256,10 @@ public static class TempoNetEndpoints
 
         app.MapGet("/api/PlayerProfiles/me/career", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
             return Results.Json(new PlayerProfileCareerDto
             {
-                AccountId = acc.AccountId,
+                AccountId = acc!.AccountId,
                 HasCompletedTutorial = true,
                 Heroes = BuildCareerHeroArray(acc, accounts),
             }, Json);
@@ -205,9 +288,17 @@ public static class TempoNetEndpoints
         app.MapGet("/api/PlayerProfiles/career", (HttpContext ctx, AccountStore accounts) =>
         {
             string queryName = ctx.Request.Query["userName"].ToString();
-            var acc = !string.IsNullOrWhiteSpace(queryName)
-                ? accounts.FindByUsername(queryName)
-                : Resolve(ctx, accounts);
+            AccountStore.Account? acc;
+            if (!string.IsNullOrWhiteSpace(queryName))
+            {
+                acc = accounts.FindByUsername(queryName);
+            }
+            else
+            {
+                var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: false);
+                if (auth.HasExplicitFailure) return AccountAuthResolver.ErrorResult(auth, Json);
+                acc = auth.Account;
+            }
 
             if (acc == null)
                 return Results.Json(new { accountId = Guid.Empty.ToString("D"), heroes = Array.Empty<object>(), seasonRanks = new Dictionary<string, int>() }, Json);
@@ -227,14 +318,14 @@ public static class TempoNetEndpoints
 
         app.MapGet("/api/PlayerRanks/me", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(new PlayerRankDto { AccountId = acc.AccountId }, Json);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(new PlayerRankDto { AccountId = acc!.AccountId }, Json);
         });
 
         app.MapGet("/api/Wallets/me", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(BuildWallet(acc, accounts), Json);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(BuildWallet(acc!, accounts), Json);
         });
 
         // ── 赛季 ─────────────────────────────────────────────────────────────
@@ -244,11 +335,11 @@ public static class TempoNetEndpoints
         app.MapGet("/api/SeasonTracks/{id:int}", (int id) => Results.Json(BuildSeasonTrack(id), Json));
         app.MapGet("/api/SeasonTrackProgressions/me", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
             int seasonId = int.TryParse(ctx.Request.Query["seasonId"], out int qid) ? qid : 2;
             return Results.Json(new SeasonTrackProgressionDto
             {
-                accountId = acc.AccountId,
+                accountId = acc!.AccountId,
                 seasonId = seasonId,
                 isPaid = true,
                 experience = 1000,
@@ -260,7 +351,7 @@ public static class TempoNetEndpoints
         });
         app.MapGet("/api/SeasonRankRewards", () => Results.Json(Array.Empty<object>(), Json));
 
-        // ── 挑战（全开：直接给已完成的）─────────────────────────────────────
+        // ── 挑战 ─────────────────────────────────────────────────────────────
         app.MapGet("/api/Challenges/me", () => Results.Json(new ChallengesDto(), Json));
         app.MapPost("/api/Challenges/acknowledge/{id}", () => Results.Json(new { ok = true }, Json));
         app.MapPost("/api/Challenges/daily/reroll", () => Results.Json(new ChallengesDto(), Json));
@@ -269,15 +360,18 @@ public static class TempoNetEndpoints
         // ── 英雄（全部拥有）─────────────────────────────────────────────────
         app.MapGet("/api/Heroes/owned", () => Results.Json(AllHeroes(), Json));
         app.MapGet("/api/Heroes/listings", (HttpContext ctx, AccountStore accounts) =>
-            Results.Json(BuildHeroListings(Resolve(ctx, accounts)), Json));
+        {
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(BuildHeroListings(acc!), Json);
+        });
         app.MapGet("/api/Heroes/purchase", () => Results.Json(new PurchaseHeroListingsDto(), Json));
         app.MapGet("/api/purchase/listings/Hero", () => Results.Json(new PurchaseHeroListingsDto(), Json));
 
-        // ── 藏品 / 装备（catalog.bin 白名单 + 持久化配装）──────────────────
+        // ── 藏品 / 装备（写操作强制鉴权，防止伪造 X-Account-Id 篡改他人配装）──
         app.MapGet("/api/CollectionItems", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(GetOwnedCollectionGuids(acc, accounts), Json);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(GetOwnedCollectionGuids(acc!, accounts), Json);
         });
         app.MapGet("/api/collectionitems/duplicate-rates", () => Results.Json(new Dictionary<string, int>
         {
@@ -290,37 +384,40 @@ public static class TempoNetEndpoints
 
         app.MapGet("/api/Loadouts/me", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(BuildHeroLoadoutsResponse(acc, accounts), Json);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(BuildHeroLoadoutsResponse(acc!, accounts), Json);
         });
         app.MapGet("/api/Loadouts/me/{heroId}", (string heroId, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            var state = accounts.GetHeroLoadout(acc, heroId);
-            return Results.Json(ToHeroLoadoutDto(acc, state), Json);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            var state = accounts.GetHeroLoadout(acc!, heroId);
+            return Results.Json(ToHeroLoadoutDto(acc!, state), Json);
         });
         app.MapPost("/api/Loadouts/hero/{heroId}/equip/{collectibleId}", (string heroId, string collectibleId, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
             var entry = FindCollectible(collectibleId);
             if (entry == null)
             {
-                return Results.NotFound(new { error = "collectible not found in catalog whitelist", collectibleId });
+                return Results.Json(new { error = "藏品不在有效资产白名单中。", collectibleId }, Json, statusCode: 404);
             }
-            var state = accounts.EquipCollectible(acc, heroId, entry.Id, entry.Type);
-            return Results.Json(ToHeroLoadoutDto(acc, state), Json);
+            var state = accounts.EquipCollectible(auth.Account!, heroId, entry.Id, entry.Type);
+            return Results.Json(ToHeroLoadoutDto(auth.Account!, state), Json);
         });
         app.MapPost("/api/Loadouts/hero/{heroId}/unequip/{collectibleId}", (string heroId, string collectibleId, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            var state = accounts.UnequipCollectible(acc, heroId, collectibleId);
-            return Results.Json(ToHeroLoadoutDto(acc, state), Json);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            var state = accounts.UnequipCollectible(auth.Account!, heroId, collectibleId);
+            return Results.Json(ToHeroLoadoutDto(auth.Account!, state), Json);
         });
         app.MapPost("/api/Loadouts/hero/{heroId}/equip-loadout", async (string heroId, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
-            EquipLoadoutRequestDto req = null;
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            string raw = await ReadBoundedBodyAsync(ctx, 16 * 1024);
+            EquipLoadoutRequestDto? req = null;
             if (!string.IsNullOrWhiteSpace(raw))
             {
                 try { req = JsonSerializer.Deserialize<EquipLoadoutRequestDto>(raw, CaseInsensitiveJson); }
@@ -328,42 +425,58 @@ public static class TempoNetEndpoints
             }
             req ??= new EquipLoadoutRequestDto();
             var state = accounts.ApplyEquipLoadout(
-                acc, heroId,
+                auth.Account!, heroId,
                 req.boardId, req.carpetId, req.cardBackId, req.toyId,
                 req.stashId, req.bankId, req.albumId, req.heroSkinId);
-            return Results.Json(ToHeroLoadoutDto(acc, state), Json);
+            return Results.Json(ToHeroLoadoutDto(auth.Account!, state), Json);
         });
 
-        // ── 箱子 / 商店 / 待领奖励 ───────────────────────────────────────────
+        // ── 箱子 / 商店 / 待领奖励（加固 MP-P1-10：鉴权 + 频率与开关限制）────────
         app.MapGet("/api/Chests/unopened", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(BuildUnopenedChests(acc, accounts), Json);
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(BuildUnopenedChests(acc!, accounts), Json);
         });
         app.MapGet("/api/Chests/drop-rates/{seasonId:int}", (int seasonId) =>
             Results.Json(BuildDropRates(seasonId), Json));
         app.MapGet("/api/Chests/store-prices", () => Results.Json(Array.Empty<object>(), Json));
         app.MapPost("/api/Chests/grant", async (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
-            int count = ExtractIntProperty(raw, 30, "count", "Count", "quantity", "Quantity");
-            int total = accounts.AddUnopenedChests(acc, Math.Clamp(count, 1, 200));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string? allowGrant = Environment.GetEnvironmentVariable("BAZAAR_ALLOW_FREE_CHEST_GRANT");
+            if (string.Equals(allowGrant, "0", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(allowGrant, "false", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.Json(new { error = "服务器已关闭自由发放宝箱功能。", code = "CHEST_GRANT_DISABLED" }, Json, statusCode: 403);
+            }
+
+            if (!CheckChestGrantRateLimit(auth.Account!.AccountId))
+            {
+                return Results.Json(new { error = "领取宝箱过于频繁，请稍后再试。", code = "RATE_LIMITED" }, Json, statusCode: 429);
+            }
+
+            string raw = await ReadBoundedBodyAsync(ctx, 4 * 1024);
+            int count = ExtractIntProperty(raw, 10, "count", "Count", "quantity", "Quantity");
+            accounts.AddUnopenedChests(auth.Account, Math.Clamp(count, 1, 50));
             return Results.Json(Array.Empty<ChestResponseDto>(), Json);
         });
         app.MapPost("/api/app/chests/store-purchase", async (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
-            int qty = Math.Clamp(ExtractIntProperty(raw, 1, "quantity", "Quantity", "count", "Count"), 1, 200);
-            accounts.AddUnopenedChests(acc, qty);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string raw = await ReadBoundedBodyAsync(ctx, 4 * 1024);
+            int qty = Math.Clamp(ExtractIntProperty(raw, 1, "quantity", "Quantity", "count", "Count"), 1, 50);
+            accounts.AddUnopenedChests(auth.Account!, qty);
             return Results.Json(new AppStorePurchaseChestsResponseDto
             {
-                accountId = acc.AccountId,
+                accountId = auth.Account!.AccountId,
                 cost = new ClientChestCurrencyDto { CurrencyType = "Gem", Amount = 0 },
                 State = new StateDeltaResponseDto
                 {
-                    Wallet = BuildWallet(acc, accounts),
+                    Wallet = BuildWallet(auth.Account, accounts),
                     BundledChestsGranted = new BundledChestsGrantDto { count = qty, seasonId = 2 },
                 },
             }, Json);
@@ -378,26 +491,58 @@ public static class TempoNetEndpoints
         app.MapGet("/api/CurrencyListings/{type}", () => Results.Json(new CurrencyListingsDto(), Json));
         app.MapGet("/api/Leaderboards/position/me", () => Results.Json(new LeaderboardPositionDto(), Json));
 
-        // ── 好友 / 联机用的简易玩家列表（自定义 PvP 的基础）──────────────────
-        app.MapGet("/api/Players", (AccountStore accounts) =>
-            Results.Json(accounts.All.Select(a => new
-            {
-                accountId = a.AccountId,
-                username = a.Username,
-                online = false,
-                victories = a.Victories,
-                defeats = a.Defeats,
-            }).ToArray(), Json));
+        // ── 好友 / 玩家列表（修复 MP-P1-10：分页 + 关键字搜索 + 真实在线态）──
+        app.MapGet("/api/Players", (HttpContext ctx, AccountStore accounts, SessionStore sessions) =>
+        {
+            int page = int.TryParse(ctx.Request.Query["page"], out int p) ? Math.Max(1, p) : 1;
+            int limit = int.TryParse(ctx.Request.Query["limit"], out int l) ? Math.Clamp(l, 1, 100) : 50;
+            string q = ctx.Request.Query["q"].ToString().Trim();
+            bool onlineOnly = string.Equals(ctx.Request.Query["onlineOnly"], "true", StringComparison.OrdinalIgnoreCase);
 
-        // ── 遥测 / 存档兼容 / 兜底路由（防止任何外部接口 404）────────────────
+            var query = accounts.All.Select(a =>
+            {
+                bool hasSession = sessions.GetByAccount(a.AccountId.ToString("N")) != null;
+                bool isOnline = hasSession || accounts.IsRecentlyOnline(a);
+                return new
+                {
+                    accountId = a.AccountId,
+                    username = a.Username,
+                    online = isOnline,
+                    inRun = hasSession,
+                    victories = a.Victories,
+                    defeats = a.Defeats,
+                    bestDay = a.BestDay,
+                    lastPingMs = a.LastPingMs,
+                };
+            });
+
+            if (!string.IsNullOrEmpty(q))
+                query = query.Where(x => x.username.Contains(q, StringComparison.OrdinalIgnoreCase));
+            if (onlineOnly)
+                query = query.Where(x => x.online);
+
+            var list = query
+                .OrderByDescending(x => x.online)
+                .ThenByDescending(x => x.victories)
+                .Skip((page - 1) * limit)
+                .Take(limit)
+                .ToArray();
+
+            return Results.Json(list, Json);
+        });
+
+        // ── 遥测 / 存档兼容 / 受控兜底路由 ──────────────────────────────────
         app.MapPost("/api/telemetry", () => Results.Json(new { ok = true }, Json));
         app.MapPost("/api/game/feedback", () => Results.Json(new { ok = true }, Json));
         app.MapPost("/api/app/challenges/progress", () => Results.Json(new { ok = true }, Json));
-        app.MapGet("/api/game/loadgame", () => Results.Json(new { ok = true, save = (object)null }, Json));
+        app.MapGet("/api/game/loadgame", () => Results.Json(new { ok = true, save = (object?)null }, Json));
         app.MapPost("/api/game/savegame", () => Results.Json(new { ok = true }, Json));
         app.MapDelete("/api/game/deleteactivesave", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
         {
-            var acc = Resolve(ctx, accounts);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            var acc = auth.Account!;
             string key = acc.AccountId.ToString("N");
             var mem = sessions.GetByAccount(key);
             if (mem != null)
@@ -409,10 +554,22 @@ public static class TempoNetEndpoints
             return Results.Json(new { ok = true }, Json);
         });
         app.MapPost("/api/game/addghost", () => Results.Json(new { ok = true }, Json));
-        app.MapGet("/api/game/getghost", () => Results.Json(new { ok = true, ghost = (object)null }, Json));
+        app.MapGet("/api/game/getghost", () => Results.Json(new { ok = true, ghost = (object?)null }, Json));
 
         app.Map("/api/{**unmatched}", (HttpContext ctx, string unmatched, ILogger<Program> log) =>
         {
+            string normalized = (unmatched ?? "").TrimStart('/');
+            foreach (string prefix in ReservedExtendedPrefixes)
+            {
+                if (normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    return Results.Json(
+                        new { error = $"接口 /api/{normalized} 不存在或请求方法不受支持。", code = "NOT_FOUND" },
+                        Json,
+                        statusCode: StatusCodes.Status404NotFound);
+                }
+            }
+
             log.LogDebug("Fallback /api/{path} ({method})", unmatched, ctx.Request.Method);
             return Results.Json(new { ok = true }, Json);
         });
@@ -420,7 +577,66 @@ public static class TempoNetEndpoints
 
     // ── helpers ─────────────────────────────────────────────────────────────
 
-    private static object BuildActiveRunDto(AccountStore.Account acc, SessionStore sessions, Persistence db)
+    private static bool TryResolveForRead(
+        HttpContext ctx,
+        AccountStore accounts,
+        out AccountStore.Account? account,
+        out IResult? errorResult)
+    {
+        var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: AccountAuthResolver.IsStrictAuthEnabled());
+        if (auth.HasExplicitFailure)
+        {
+            account = null;
+            errorResult = AccountAuthResolver.ErrorResult(auth, Json);
+            return false;
+        }
+        if (auth.Account != null)
+        {
+            account = auth.Account;
+            errorResult = null;
+            return true;
+        }
+
+        // 仅在非严格模式的兼容读取接口中允许本地无头探针退回到只读默认游客档案，写操作绝不调用此路径
+        account = accounts.GetOrCreateByName("guest");
+        errorResult = null;
+        return true;
+    }
+
+    private static bool CheckChestGrantRateLimit(Guid accountId)
+    {
+        long nowMs = Environment.TickCount64;
+        var queue = ChestGrantRateMap.GetOrAdd(accountId, _ => new Queue<long>());
+        lock (queue)
+        {
+            while (queue.Count > 0 && nowMs - queue.Peek() > 60_000)
+                queue.Dequeue();
+            if (queue.Count >= 5)
+                return false;
+            queue.Enqueue(nowMs);
+            return true;
+        }
+    }
+
+    private static async Task<string> ReadBoundedBodyAsync(HttpContext ctx, int maxBytes)
+    {
+        if (ctx.Request.Body == null) return string.Empty;
+        using var ms = new MemoryStream();
+        byte[] buffer = new byte[4096];
+        int total = 0;
+        while (true)
+        {
+            int read = await ctx.Request.Body.ReadAsync(buffer, 0, Math.Min(buffer.Length, maxBytes - total + 1));
+            if (read <= 0) break;
+            total += read;
+            if (total > maxBytes)
+                return string.Empty;
+            ms.Write(buffer, 0, read);
+        }
+        return System.Text.Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private static object? BuildActiveRunDto(AccountStore.Account acc, SessionStore sessions, Persistence db)
     {
         var memSession = sessions.GetByAccount(acc.AccountId.ToString("N"));
         if (memSession != null)
@@ -452,11 +668,12 @@ public static class TempoNetEndpoints
         var row = db.LoadLatestActiveRun(acc.AccountId);
         if (row != null)
         {
+            Guid? tsid = Guid.TryParse(row.TournamentSessionId, out var g) && g != Guid.Empty ? g : null;
             return new
             {
                 AccountId = acc.AccountId,
                 PlayMode = row.PlayMode,
-                TournamentSessionId = (Guid?)null,
+                TournamentSessionId = tsid,
                 HeroID = (row.Hero == EHero.Common ? EHero.Vanessa : row.Hero).ToString(),
                 PlayerVictories = (int)row.Victories,
                 RunId = row.RunId,
@@ -508,22 +725,7 @@ public static class TempoNetEndpoints
         }).ToArray();
     }
 
-    private static AccountStore.Account Resolve(HttpContext ctx, AccountStore accounts)
-    {
-        var acc = accounts.FindByAccessToken(ctx.Request.Headers["Authorization"].ToString());
-        if (acc != null) return acc;
-
-        string aid = ctx.Request.Headers["aid"].ToString();
-        if (string.IsNullOrWhiteSpace(aid)) aid = ctx.Request.Headers["X-Account-Id"].ToString();
-        acc = accounts.FindByAccountId(aid);
-        if (acc != null) return acc;
-
-        string uid = ctx.Request.Headers["uid"].ToString();
-        if (string.IsNullOrWhiteSpace(uid)) uid = ctx.Request.Headers["X-Username"].ToString();
-        return accounts.GetOrCreateByName(string.IsNullOrWhiteSpace(uid) ? "guest" : uid);
-    }
-
-    private static string ExtractTicket(string raw)
+    private static string? ExtractTicket(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return null;
         try
@@ -549,14 +751,17 @@ public static class TempoNetEndpoints
         return null;
     }
 
-    private static string ExtractName(string raw)
+    private static string? ExtractName(string raw)
+        => ExtractStringProperty(raw, "username", "Username", "userName", "UserName", "name", "Name");
+
+    private static string? ExtractStringProperty(string raw, params string[] keys)
     {
         if (string.IsNullOrWhiteSpace(raw)) return null;
         try
         {
             using var doc = JsonDocument.Parse(raw);
             if (doc.RootElement.ValueKind != JsonValueKind.Object) return null;
-            foreach (var key in new[] { "username", "Username", "userName", "UserName", "name", "Name" })
+            foreach (var key in keys)
             {
                 if (doc.RootElement.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String)
                 {
@@ -625,7 +830,6 @@ public static class TempoNetEndpoints
         tierSkipPrice = new CurrencyDto(),
     };
 
-    // 真实可用英雄（对齐客户端 8 位可玩英雄，包含第 8 英雄双龙 Hero8）
     private static readonly (string Id, DateTime ReleaseDate)[] PlayableHeroes =
     [
         ("Pygmalien", new DateTime(2024, 10, 30, 0, 0, 0, DateTimeKind.Utc)),
@@ -659,8 +863,6 @@ public static class TempoNetEndpoints
             isPurchasable = false,
         }).ToArray(),
     };
-
-    // ── catalog.bin 校验藏品白名单懒加载与映射 ───────────────────────────────
 
     private static readonly JsonSerializerOptions CaseInsensitiveJson = new()
     {
@@ -757,7 +959,7 @@ public static class TempoNetEndpoints
                 }
             }
 
-            Console.WriteLine($"[CollectibleCatalog] loaded {list.Count} entries ({nonCardGuids.Count} non-card, {cardSkins.Count} card_skin) from {path}");
+            Console.WriteLine($"[CollectibleCatalog] 已加载 {list.Count} 条藏品白名单（非皮肤 {nonCardGuids.Count}，卡牌皮肤 {cardSkins.Count}）");
             return new CollectibleCatalogSnapshot
             {
                 All = list,
@@ -769,7 +971,7 @@ public static class TempoNetEndpoints
         }
         catch (Exception ex)
         {
-            Console.WriteLine("[CollectibleCatalog] failed to load whitelist: " + ex.Message);
+            Console.WriteLine("[CollectibleCatalog] 加载藏品白名单失败: " + ex.Message);
             return new CollectibleCatalogSnapshot();
         }
     }
@@ -874,20 +1076,22 @@ public static class TempoNetEndpoints
 
     private static async Task<IResult> HandleOpenChestsAsync(HttpContext ctx, AccountStore accounts)
     {
-        var acc = Resolve(ctx, accounts);
-        string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+        var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+        if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+        var acc = auth.Account!;
+
+        string raw = await ReadBoundedBodyAsync(ctx, 8 * 1024);
         int requested = ExtractOpenChestCount(raw);
 
         var snap = CatalogLazy.Value;
         var pool = snap.CardSkinEntries.Count > 0 ? snap.CardSkinEntries : snap.AllGuidEntries;
         if (pool.Count == 0)
         {
-            return Results.BadRequest(new { error = "collectible whitelist unavailable" });
+            return Results.Json(new { error = "藏品白名单暂不可用，请稍后重试。" }, Json, statusCode: 400);
         }
 
         var (ok, draws, _, _) = accounts.TryOpenChests(acc, requested, ownedCardSkins =>
         {
-            // 优先从尚未开启的动态卡牌皮肤中抽取，全部集齐后触发重复宝石返还（+50 宝石）
             var unowned = new List<(ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)>();
             foreach (var item in pool)
             {
@@ -909,7 +1113,7 @@ public static class TempoNetEndpoints
 
         if (!ok || draws.Count == 0)
         {
-            return Results.BadRequest(new { error = "no unopened chests remaining" });
+            return Results.Json(new { error = "当前没有可开启的宝箱。" }, Json, statusCode: 400);
         }
 
         var now = DateTime.UtcNow;

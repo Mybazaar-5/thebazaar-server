@@ -51,12 +51,9 @@ public static class OfficialDaySchedule
                 [
                     "bd0711a6-d9d9-4a47-8a18-8f991057f7dd", // Kyver Drone (Lv1, 75HP, Bronze)
                     "1d24717f-7bfb-48e9-9320-6a69d72e233e", // Banannibal (Lv1, 100HP, Bronze)
-                    "bb1e3506-3735-4669-be90-915a55a7ee05", // Fanged Inglet (Lv1, 100HP, Bronze)
-                    "45c473f5-25bd-4c1c-8357-cfe460c58f69", // Pyro (Lv1, 100HP, Bronze)
                 ],
                 MidIds:
                 [
-                    "1d24717f-7bfb-48e9-9320-6a69d72e233e", // Banannibal (Lv1, 100HP, Bronze)
                     "bb1e3506-3735-4669-be90-915a55a7ee05", // Fanged Inglet (Lv1, 100HP, Bronze)
                     "45c473f5-25bd-4c1c-8357-cfe460c58f69", // Pyro (Lv1, 100HP, Bronze)
                 ],
@@ -78,13 +75,11 @@ public static class OfficialDaySchedule
                 [
                     "66245d12-d5eb-4c08-9185-6ddaf626bbd3", // Covetous Thief (Silver, Lv3, 300HP)
                     "8cac11e0-0550-42be-bbfc-b18697e3369f", // Soda Swiller (Lv3, 300HP, Silver)
-                    "b93f5b44-ba9f-4196-a94e-c5de17ab5c5d", // Boarrior (Lv3, 350HP, Silver)
                 ],
                 RightIds:
                 [
                     "dbf8eefa-99bd-475b-ad4d-91a9734518cf", // Calico (Lv4, 450HP, Gold)
                     "41c5f103-2d76-4a51-ae28-ee294490b071", // Ventriloquist (Lv4, 450HP, Gold)
-                    "325c88c3-9496-44bf-b900-4adf1f84bf2f", // Eccentric Etherwright (Lv4, 600HP, Gold)
                 ]),
 
             [3] = new(
@@ -97,15 +92,15 @@ public static class OfficialDaySchedule
                 ],
                 MidIds:
                 [
-                    "66245d12-d5eb-4c08-9185-6ddaf626bbd3", // Covetous Thief (Silver, Lv3, 300HP)
-                    "8cac11e0-0550-42be-bbfc-b18697e3369f", // Soda Swiller (Lv3, 300HP, Silver)
                     "b93f5b44-ba9f-4196-a94e-c5de17ab5c5d", // Boarrior (Lv3, 350HP, Silver)
+                    "6547a38e-d27f-4443-84bb-db8e04bae467", // Overwhelmed Student (Lv3, 300HP)
+                    "04b60df4-91d9-4065-94e0-f9f462a3b104", // Tempest Bravo (Lv3, 300HP)
                 ],
                 RightIds:
                 [
-                    "dbf8eefa-99bd-475b-ad4d-91a9734518cf", // Calico (Lv4, 450HP, Gold)
-                    "41c5f103-2d76-4a51-ae28-ee294490b071", // Ventriloquist (Lv4, 450HP, Gold)
                     "325c88c3-9496-44bf-b900-4adf1f84bf2f", // Eccentric Etherwright (Lv4, 600HP, Gold)
+                    "55046a2f-f81e-4720-aefa-e74b14a06dad", // Frost Street Challenger (Lv4, 450HP)
+                    "35d68424-87ba-4d8a-8776-8d8302a425f9", // Product Demonstrator (Lv4, 600HP)
                 ]),
 
             [4] = new(
@@ -460,10 +455,16 @@ public static class OfficialDaySchedule
         int effDay = Math.Max(1, day);
         var roster = GetRosterForDay(effDay);
 
-        // 全库可实战 PvE 野怪回退池（已剔除调试/占位/空板/禁用）
-        var fallbackAll = MonsterPool.CollectPlayableCombatEncounters(pool, repo, bannedIds);
-        if (fallbackAll.Count == 0 && bannedIds is { Count: > 0 })
-            fallbackAll = MonsterPool.CollectPlayableCombatEncounters(pool, repo, bannedIds: null);
+        // 懒加载全库可实战 PvE 野怪回退池：当精选三槽均命中时实现零全表扫描（Top #14 性能优化）
+        List<CardPool.CardTemplate>? fallbackCache = null;
+        List<CardPool.CardTemplate> GetFallbackAll()
+        {
+            if (fallbackCache != null) return fallbackCache;
+            fallbackCache = MonsterPool.CollectPlayableCombatEncounters(pool, repo, bannedIds);
+            if (fallbackCache.Count == 0 && bannedIds is { Count: > 0 })
+                fallbackCache = MonsterPool.CollectPlayableCombatEncounters(pool, repo, bannedIds: null);
+            return fallbackCache;
+        }
 
         var leftCurated = ResolveValidSlotCandidates(roster.LeftIds, effDay, EMonsterSlotTier.LeftBronze, pool, repo, bannedIds);
         var midCurated = ResolveValidSlotCandidates(roster.MidIds, effDay, EMonsterSlotTier.MidSilver, pool, repo, bannedIds);
@@ -474,7 +475,7 @@ public static class OfficialDaySchedule
 
         // 槽位 1：左青铜（最易）
         var left = PickCuratedWithVisitedPref(leftCurated, used, visitedTodayIds, rng)
-                ?? MonsterPool.SelectSlotFallback(effDay, EMonsterSlotTier.LeftBronze, fallbackAll, used, repo, rng, visitedTodayIds, minLevel: 0, minHp: 0, preferStrictlyHigherHp: false);
+                ?? MonsterPool.SelectSlotFallback(effDay, EMonsterSlotTier.LeftBronze, GetFallbackAll(), used, repo, rng, visitedTodayIds, minLevel: 0, minHp: 0, preferStrictlyHigherHp: false);
         int leftLv = left != null ? MonsterPool.GetEffectiveMonsterLevel(left, repo) : 1;
         int leftHp = left != null ? MonsterPool.GetMonsterHealthMax(left, repo) : 75;
         var leftTier = left != null ? MonsterPool.GetMonsterTier(left) : BazaarCore.Models.CardTier.Bronze;
@@ -495,7 +496,7 @@ public static class OfficialDaySchedule
                 .ToList();
             var mid = PickCuratedWithVisitedPref(midMonotonic, used, visitedTodayIds, rng)
                    ?? PickCuratedWithVisitedPref(midCurated.Where(c => !used.Contains(c.Id) && MonsterPool.GetMonsterTier(c) >= leftTier).ToList(), used, visitedTodayIds, rng)
-                   ?? MonsterPool.SelectSlotFallback(effDay, EMonsterSlotTier.MidSilver, fallbackAll, used, repo, rng, visitedTodayIds, minLevel: leftLv, minHp: leftHp, preferStrictlyHigherHp: false, minTier: leftTier)
+                   ?? MonsterPool.SelectSlotFallback(effDay, EMonsterSlotTier.MidSilver, GetFallbackAll(), used, repo, rng, visitedTodayIds, minLevel: leftLv, minHp: leftHp, preferStrictlyHigherHp: false, minTier: leftTier)
                    ?? PickCuratedWithVisitedPref(midCurated, used, visitedTodayIds, rng);
             int midLv = mid != null ? MonsterPool.GetEffectiveMonsterLevel(mid, repo) : leftLv;
             int midHp = mid != null ? MonsterPool.GetMonsterHealthMax(mid, repo) : leftHp;
@@ -525,7 +526,7 @@ public static class OfficialDaySchedule
 
                 var right = PickCuratedWithVisitedPref(rightGe, used, visitedTodayIds, rng)
                          ?? PickCuratedWithVisitedPref(rightCurated.Where(c => !used.Contains(c.Id) && MonsterPool.GetMonsterTier(c) >= midTier).ToList(), used, visitedTodayIds, rng)
-                         ?? MonsterPool.SelectSlotFallback(effDay, EMonsterSlotTier.RightGold, fallbackAll, used, repo, rng, visitedTodayIds, minLevel: midLv, minHp: midHp, preferStrictlyHigherHp: true, minTier: midTier)
+                         ?? MonsterPool.SelectSlotFallback(effDay, EMonsterSlotTier.RightGold, GetFallbackAll(), used, repo, rng, visitedTodayIds, minLevel: midLv, minHp: midHp, preferStrictlyHigherHp: true, minTier: midTier)
                          ?? PickCuratedWithVisitedPref(rightCurated, used, visitedTodayIds, rng);
                 if (right != null)
                 {
@@ -538,7 +539,7 @@ public static class OfficialDaySchedule
         // 兜底补足至 count 只（不重复，按接近当天等级补齐）
         if (slots.Count < count)
         {
-            MonsterPool.FillMissingSlotsNearestDay(effDay, count, slots, used, fallbackAll, repo);
+            MonsterPool.FillMissingSlotsNearestDay(effDay, count, slots, used, GetFallbackAll(), repo);
         }
 
         return slots

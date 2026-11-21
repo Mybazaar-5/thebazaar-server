@@ -60,6 +60,22 @@ public sealed class LocalizationLoader : ILocalizationStore
         return new LocalizationLoader(resolvedPath, dict);
     }
 
+    /// <summary>
+    /// 在官方 zh-CN.bytes 基础上叠加外挂 custom_zh_overlay.json，返回支持四层查词、热刷新与合并导出的 <see cref="OverlayLocalizationStore"/>。
+    /// </summary>
+    public static OverlayLocalizationStore LoadWithOverlay(
+        string? customTranslationPath = null,
+        string? customOverlayJsonPath = null,
+        IEnumerable<LocalizationOverlayDocument>? modOverlays = null)
+    {
+        var official = Load(customTranslationPath);
+        var overlayPath = SteamPathResolver.ResolveCustomZhOverlayPath(customOverlayJsonPath);
+        return new OverlayLocalizationStore(official, overlayPath, initialFileOverlay: null, initialModOverlays: modOverlays);
+    }
+
+    /// <summary>导出官方词库只读键值视图（供合并与体检对比使用）。</summary>
+    public IReadOnlyDictionary<string, string> ExportAllEntries() => _translations;
+
     /// <inheritdoc />
     public bool TryGetText(string? hashKey, out string text)
     {

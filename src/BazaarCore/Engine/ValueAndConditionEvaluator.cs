@@ -156,7 +156,12 @@ public static class ValueAndConditionEvaluator
         if (cards.Count == 0) return node.DefaultValue ?? 0;
 
         if (aggregate)
-            return cards.Sum(c => GetCardAttr(c, attr, ctx, unscaled));
+        {
+            double sum = 0;
+            for (int i = 0; i < cards.Count; i++)
+                sum += GetCardAttr(cards[i], attr, ctx, unscaled);
+            return sum;
+        }
 
         return GetCardAttr(cards[0], attr, ctx, unscaled);
     }
@@ -441,58 +446,69 @@ public static class ValueAndConditionEvaluator
 
             case "TCardConditionalAttributeHighest":
             {
+                // 严格对齐官方反编译 TCardConditionalAttributeHighest.cs:20-29（int num = 0; val > num；全员 <= 0 返回空集）
                 string attr = cond.AttributeType ?? "Ammo";
-                CardInstance? best = null;
+                int bestIdx = -1;
                 double bestVal = 0;
-                foreach (var (c, _) in pairs)
+                for (int i = 0; i < pairs.Count; i++)
                 {
-                    double v = GetCardAttr(c, attr, ctx);
+                    double v = GetCardAttr(pairs[i].Card, attr, ctx);
                     if (v > bestVal)
                     {
                         bestVal = v;
-                        best = c;
+                        bestIdx = i;
                     }
                 }
-                return best == null ? [] : pairs.Where(p => ReferenceEquals(p.Card, best)).Take(1).ToList();
+                return bestIdx < 0 ? [] : [pairs[bestIdx]];
             }
 
             case "TCardConditionalAttributeLowest":
             {
                 string attr = cond.AttributeType ?? "Ammo";
-                CardInstance? best = null;
+                int bestIdx = -1;
                 double bestVal = 0;
-                foreach (var (c, _) in pairs)
+                for (int i = 0; i < pairs.Count; i++)
                 {
-                    double v = GetCardAttr(c, attr, ctx);
-                    if (best == null || v < bestVal)
+                    double v = GetCardAttr(pairs[i].Card, attr, ctx);
+                    if (bestIdx < 0 || v < bestVal)
                     {
                         bestVal = v;
-                        best = c;
+                        bestIdx = i;
                     }
                 }
-                return best == null ? [] : pairs.Where(p => ReferenceEquals(p.Card, best)).Take(1).ToList();
+                return bestIdx < 0 ? [] : [pairs[bestIdx]];
             }
 
             case "TCardConditionalSizeLargest":
             {
                 int maxSize = (int)CardSize.Small;
-                foreach (var (c, _) in pairs)
+                for (int i = 0; i < pairs.Count; i++)
                 {
-                    int sz = (int)c.EffectiveSize;
+                    int sz = (int)pairs[i].Card.EffectiveSize;
                     if (sz > maxSize) maxSize = sz;
                 }
-                return pairs.Where(p => (int)p.Card.EffectiveSize == maxSize).ToList();
+                var res = new List<(CardInstance, PlayerState)>(pairs.Count);
+                for (int i = 0; i < pairs.Count; i++)
+                {
+                    if ((int)pairs[i].Card.EffectiveSize == maxSize) res.Add(pairs[i]);
+                }
+                return res;
             }
 
             case "TCardConditionalSizeSmallest":
             {
                 int minSize = (int)CardSize.Large;
-                foreach (var (c, _) in pairs)
+                for (int i = 0; i < pairs.Count; i++)
                 {
-                    int sz = (int)c.EffectiveSize;
+                    int sz = (int)pairs[i].Card.EffectiveSize;
                     if (sz < minSize) minSize = sz;
                 }
-                return pairs.Where(p => (int)p.Card.EffectiveSize == minSize).ToList();
+                var res = new List<(CardInstance, PlayerState)>(pairs.Count);
+                for (int i = 0; i < pairs.Count; i++)
+                {
+                    if ((int)pairs[i].Card.EffectiveSize == minSize) res.Add(pairs[i]);
+                }
+                return res;
             }
 
             default:
@@ -513,8 +529,8 @@ public static class ValueAndConditionEvaluator
         if (cond == null) return true;
         return cond.Type switch
         {
-            "TCardConditionalAnd" => cond.GetConditionList(GameDatabaseLoader.JsonOptions).All(c => EvaluateCardCondition(c, card, owner, ctx)),
-            "TCardConditionalOr" => cond.GetConditionList(GameDatabaseLoader.JsonOptions).Any(c => EvaluateCardCondition(c, card, owner, ctx)),
+            "TCardConditionalAnd" => EvaluateCardConditionList(cond.GetConditionList(GameDatabaseLoader.JsonOptions), card, owner, ctx, requireAll: true),
+            "TCardConditionalOr" => EvaluateCardConditionList(cond.GetConditionList(GameDatabaseLoader.JsonOptions), card, owner, ctx, requireAll: false),
             "TCardConditionalTag" => MatchListOperator(cond.Tags, cond.Operator, t => OfficialVisibleCardTags.Contains(t) && card.HasTag(t)),
             "TCardConditionalHiddenTag" => MatchListOperator(cond.Tags ?? cond.HiddenTags, cond.Operator, t => card.HasHiddenTag(t)),
             "TCardConditionalId" => EvaluateCardIdCondition(cond, card),
@@ -554,6 +570,19 @@ public static class ValueAndConditionEvaluator
             "TCardConditionalSizeSmallest" => IsExtremeSize(card, owner, largest: false, ctx),
             _ => true
         };
+    }
+
+    private static bool EvaluateCardConditionList(List<RuleNode> list, CardInstance card, PlayerState owner, RuleExecutionContext ctx, bool requireAll)
+    {
+        if (requireAll)
+        {
+            for (int i = 0; i < list.Count; i++)
+                if (!EvaluateCardCondition(list[i], card, owner, ctx)) return false;
+            return true;
+        }
+        for (int i = 0; i < list.Count; i++)
+            if (EvaluateCardCondition(list[i], card, owner, ctx)) return true;
+        return false;
     }
 
     private static bool ApplyNegation(bool raw, bool? isNot) => isNot == true ? !raw : raw;
@@ -745,11 +774,13 @@ public static class ValueAndConditionEvaluator
 
             case "TPlayerConditionalAttributeHighest":
             {
+                // 严格对齐官方反编译 TPlayerConditionalAttributeHighest.cs:51-60（int num = 0; val > num）
                 string attr = cond.AttributeType ?? "HealthMax";
                 PlayerState? best = null;
                 double bestVal = 0;
-                foreach (var p in players)
+                for (int i = 0; i < players.Count; i++)
                 {
+                    var p = players[i];
                     double v = Math.Round(p.GetAttribute(attr), MidpointRounding.AwayFromZero);
                     if (v > bestVal)
                     {
@@ -765,8 +796,9 @@ public static class ValueAndConditionEvaluator
                 string attr = cond.AttributeType ?? "HealthMax";
                 PlayerState? best = null;
                 double bestVal = 0;
-                foreach (var p in players)
+                for (int i = 0; i < players.Count; i++)
                 {
+                    var p = players[i];
                     double v = Math.Round(p.GetAttribute(attr), MidpointRounding.AwayFromZero);
                     if (best == null || v < bestVal)
                     {
@@ -778,7 +810,15 @@ public static class ValueAndConditionEvaluator
             }
 
             default:
-                return players.Where(p => EvaluatePlayerCondition(cond, p, ctx)).ToList();
+            {
+                var res = new List<PlayerState>(players.Count);
+                for (int i = 0; i < players.Count; i++)
+                {
+                    if (EvaluatePlayerCondition(cond, players[i], ctx))
+                        res.Add(players[i]);
+                }
+                return res;
+            }
         }
     }
 
@@ -805,10 +845,12 @@ public static class ValueAndConditionEvaluator
         if (pool.Count == 0) return false;
         if (highest)
         {
+            // 严格对齐官方反编译 TPlayerConditionalAttributeHighest.cs:30-38（int num = 0; val > num）
             PlayerState? best = null;
             double bestVal = 0;
-            foreach (var p in pool)
+            for (int i = 0; i < pool.Count; i++)
             {
+                var p = pool[i];
                 double v = Math.Round(p.GetAttribute(attr), MidpointRounding.AwayFromZero);
                 if (v > bestVal)
                 {
@@ -822,8 +864,9 @@ public static class ValueAndConditionEvaluator
         {
             PlayerState? best = null;
             double bestVal = 0;
-            foreach (var p in pool)
+            for (int i = 0; i < pool.Count; i++)
             {
+                var p = pool[i];
                 double v = Math.Round(p.GetAttribute(attr), MidpointRounding.AwayFromZero);
                 if (best == null || v < bestVal)
                 {
@@ -971,30 +1014,40 @@ public static class ValueAndConditionEvaluator
         {
             return op is "All" or "None";
         }
-        return op switch
+        if (op == "All")
         {
-            "All" => items.All(predicate),
-            "None" => !items.Any(predicate),
-            _ => items.Any(predicate) // Any
-        };
+            for (int i = 0; i < items.Count; i++)
+                if (!predicate(items[i])) return false;
+            return true;
+        }
+        if (op == "None")
+        {
+            for (int i = 0; i < items.Count; i++)
+                if (predicate(items[i])) return false;
+            return true;
+        }
+        for (int i = 0; i < items.Count; i++)
+            if (predicate(items[i])) return true;
+        return false;
     }
 
     private static IReadOnlyList<CardInstance> BuildDefaultExtremePool(CardInstance card, PlayerState owner, RuleExecutionContext ctx)
     {
         var soldCard = AbilityExecutor.GetActiveSoldCard(ctx);
-        var pool = new List<CardInstance>();
-        void AddRange(IEnumerable<CardInstance> cards)
+        var pool = new List<CardInstance>(owner.Hand.Cards.Count + owner.Stash.Cards.Count + owner.Skills.Count + owner.SocketEffects.Count);
+        void AddList(List<CardInstance> cards)
         {
-            foreach (var c in cards)
+            for (int i = 0; i < cards.Count; i++)
             {
+                var c = cards[i];
                 if (!c.IsDestroyed && !ReferenceEquals(c, soldCard))
                     pool.Add(c);
             }
         }
-        AddRange(owner.Hand.Cards);
-        AddRange(owner.Stash.Cards);
-        AddRange(owner.Skills);
-        AddRange(owner.SocketEffects);
+        AddList(owner.Hand.Cards);
+        AddList(owner.Stash.Cards);
+        AddList(owner.Skills);
+        AddList(owner.SocketEffects);
         if (!card.IsDestroyed && !pool.Contains(card))
             pool.Add(card);
         return pool;
@@ -1007,10 +1060,12 @@ public static class ValueAndConditionEvaluator
 
         if (highest)
         {
+            // 严格对齐官方反编译 TCardConditionalAttributeHighest.cs:54-65（int num = 0; val > num）
             CardInstance? best = null;
             double bestVal = 0;
-            foreach (var c in pool)
+            for (int i = 0; i < pool.Count; i++)
             {
+                var c = pool[i];
                 double v = GetCardAttr(c, attr, ctx);
                 if (v > bestVal)
                 {
@@ -1024,8 +1079,9 @@ public static class ValueAndConditionEvaluator
         {
             CardInstance? best = null;
             double bestVal = 0;
-            foreach (var c in pool)
+            for (int i = 0; i < pool.Count; i++)
             {
+                var c = pool[i];
                 double v = GetCardAttr(c, attr, ctx);
                 if (best == null || v < bestVal)
                 {

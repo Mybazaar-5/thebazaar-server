@@ -266,7 +266,8 @@ public sealed class V12CombatFrameParityTests
         var hunkerDownTpl = repo.GetCard(HunkerDownId)!;
         var bottledTornadoTpl = repo.GetCard(BottledTornadoId)!;
 
-        // 1. 自然沙暴（30,000ms 启动）：验证 20s 预警、30s 启动、间隔 250->150ms (-10ms/跳)、伤害 +2/跳，以及 Windmill/Hunker Down 仅触发一次
+        // 1. 自然沙暴（30,000ms 启动，P1-11 对齐官方 BazaarCardDealer.cs:4243-4274）：
+        // 验证 20s 预警、30s 启动、间隔 250->150ms (-10ms/跳，降频期间伤害维持 1)、触底 150ms 后每跳 +2 伤害，以及 Windmill/Hunker Down 仅触发一次
         var p1 = CreatePlayer("p1", HeroNames.Pygmalien, 1000);
         var p2 = CreatePlayer("p2", HeroNames.Vanessa, 1000);
         p1.Hand.TryAddAuto(new CardInstance(windmillTpl, CardTier.Gold)); // CD 35s，故在 30s 先被自然沙暴触发 TTriggerOnSandstorm（MaxHealth x2）
@@ -278,12 +279,14 @@ public sealed class V12CombatFrameParityTests
 
         Assert.Equal(20000, warning.TimeMs);
         Assert.Equal(30000, ticks[0].TimeMs);
-        Assert.Equal(1, (int)ticks[0].Value);
-        Assert.Equal(3, (int)ticks[1].Value);
-        Assert.Equal(5, (int)ticks[2].Value);
+        Assert.True(ticks.Count >= 13);
+        for (int i = 0; i <= 9; i++)
+            Assert.Equal(1, (int)ticks[i].Value);
+        Assert.Equal(3, (int)ticks[10].Value);
+        Assert.Equal(5, (int)ticks[11].Value);
+        Assert.Equal(7, (int)ticks[12].Value);
 
-        // 验证间隔递减至 150ms 下限（前两跳间距 ~250ms，第 11 跳以后收敛到 150ms 附近）
-        Assert.True(ticks.Count >= 12);
+        // 验证间隔递减至 150ms 下限（前两跳间距 ~240ms，第 11 跳以后收敛到 150ms 附近）
         Assert.InRange(ticks[1].TimeMs - ticks[0].TimeMs, 240, 260);
         int lateGap = ticks[11].TimeMs - ticks[10].TimeMs;
         Assert.InRange(lateGap, 140, 160);

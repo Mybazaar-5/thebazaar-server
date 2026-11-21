@@ -188,20 +188,21 @@ public static class OutOfCombatController
     ];
 
     /// <summary>
-    /// 仅重算局外光环并返回所有受影响卡牌的属性差分结果（支持传入当前活跃事件/遭遇卡的光环）。
+    /// 仅重算局外光环并返回所有受影响卡牌的属性差分结果（支持传入当前活跃事件/遭遇卡的光环及当前货架 selectionCards）。
     /// 当局外光环新赋予卡牌 Flying 时同步推进飞行 Quest 并记录日志。
     /// </summary>
     public static OutOfCombatBatchResult RecalculateOutOfCombatAuras(
         PlayerState player,
         GameDataRepository repo,
-        CardInstance? activeEncounterCard = null)
+        CardInstance? activeEncounterCard = null,
+        IReadOnlyList<CardInstance>? selectionCards = null)
     {
         var result = new OutOfCombatBatchResult();
         player.EnsureExclusionSetInitialized(repo.GameMode);
         var playerSnap = SnapshotPlayerAttributes(player);
         var cardsSnap = SnapshotOwnedCards(player);
 
-        var transitions = RecalculateAllOutOfCombatAuras(player, repo, activeEncounterCard, selectionCards: null);
+        var transitions = RecalculateAllOutOfCombatAuras(player, repo, activeEncounterCard, selectionCards);
         if (transitions.Count > 0)
         {
             var qCtx = new RuleExecutionContext(repo, RuleScope.OutOfCombat, player, null, new Random(0))
@@ -210,6 +211,7 @@ public static class OutOfCombatController
                 CurrentDay = player.Day,
                 CurrentHour = player.Hour,
                 CurrentEncounterId = activeEncounterCard?.Template.Id,
+                SelectionCards = selectionCards,
                 OnQuestUpdated = (card, questAttr, qPrev, qCur, qTarget) =>
                 {
                     result.QuestLogs.Add(new OutOfCombatQuestLogEntry
@@ -319,10 +321,11 @@ public static class OutOfCombatController
         string? currentEncounterId = null,
         CardInstance? activeEncounterCard = null,
         bool isFree = false,
-        bool isFusion = false)
+        bool isFusion = false,
+        IReadOnlyList<CardInstance>? selectionCards = null)
     {
         if (isFree)
-            return RecalculateOutOfCombatAuras(player, repo, activeEncounterCard);
+            return RecalculateOutOfCombatAuras(player, repo, activeEncounterCard, selectionCards);
 
         bool isOwned = player.Hand.Cards.Contains(boughtCard)
                     || player.Stash.Cards.Contains(boughtCard)
@@ -336,6 +339,7 @@ public static class OutOfCombatController
             sourceCard: boughtCard, targetCard: boughtCard, subjectPlayer: player,
             currentEncounterId: currentEncounterId,
             isFusionUpgrade: isFusion,
+            selectionCards: selectionCards,
             extraCardsForTrigger: extra,
             activeEncounterCard: activeEncounterCard);
     }
@@ -343,7 +347,7 @@ public static class OutOfCombatController
     /// <summary>
     /// 出售或使用消耗品时调用。
     /// 关键顺序：必须在将 <paramref name="card"/> 从 Hand/Stash 实际摘除之前携带其原始 StartSlot 触发 TTriggerOnCardSold，
-    /// 以确保针对左邻/右邻/相邻武器等位置条件精确命中；触发后再移除该卡并刷新局外光环。
+    /// 以确保针对左邻/右邻/相邻武器及 SelectionSet 货架（如 Dreampearl / Coupon）等位置条件精确命中；触发后再移除该卡并刷新局外光环。
     /// </summary>
     public static OutOfCombatBatchResult OnCardSoldOrConsumed(
         PlayerState player,
@@ -352,7 +356,8 @@ public static class OutOfCombatController
         Random? rng = null,
         bool removeAfterTrigger = true,
         string? currentEncounterId = null,
-        CardInstance? activeEncounterCard = null)
+        CardInstance? activeEncounterCard = null,
+        IReadOnlyList<CardInstance>? selectionCards = null)
     {
         if (card.HasHiddenTag("Unsellable") || card.HasTag("Unsellable") || card.GetAttribute("Unsellable") > 0)
             return new OutOfCombatBatchResult();
@@ -362,6 +367,7 @@ public static class OutOfCombatController
             eventType: "TTriggerOnCardSold",
             sourceCard: card, targetCard: card, subjectPlayer: player,
             currentEncounterId: currentEncounterId,
+            selectionCards: selectionCards,
             extraCardsForTrigger: [card],
             activeEncounterCard: activeEncounterCard,
             postDispatchAction: result =>
@@ -382,8 +388,9 @@ public static class OutOfCombatController
     public static OutOfCombatBatchResult OnCardMoved(
         PlayerState player,
         GameDataRepository repo,
-        CardInstance? activeEncounterCard = null)
-        => RecalculateOutOfCombatAuras(player, repo, activeEncounterCard);
+        CardInstance? activeEncounterCard = null,
+        IReadOnlyList<CardInstance>? selectionCards = null)
+        => RecalculateOutOfCombatAuras(player, repo, activeEncounterCard, selectionCards);
 
     /// <summary>
     /// 卡牌升阶（含二合一融合或外部升阶）后调用：触发 TTriggerOnCardUpgraded 并重算光环。
@@ -395,7 +402,8 @@ public static class OutOfCombatController
         Random? rng = null,
         bool isFusion = false,
         string? currentEncounterId = null,
-        CardInstance? activeEncounterCard = null)
+        CardInstance? activeEncounterCard = null,
+        IReadOnlyList<CardInstance>? selectionCards = null)
     {
         return ExecuteLifecycleEvent(
             player, repo, rng,
@@ -403,6 +411,7 @@ public static class OutOfCombatController
             sourceCard: upgradedCard, targetCard: upgradedCard, subjectPlayer: player,
             currentEncounterId: currentEncounterId,
             isFusionUpgrade: isFusion,
+            selectionCards: selectionCards,
             activeEncounterCard: activeEncounterCard);
     }
 
@@ -415,13 +424,15 @@ public static class OutOfCombatController
         GameDataRepository repo,
         Random? rng = null,
         string? currentEncounterId = null,
-        CardInstance? activeEncounterCard = null)
+        CardInstance? activeEncounterCard = null,
+        IReadOnlyList<CardInstance>? selectionCards = null)
     {
         return ExecuteLifecycleEvent(
             player, repo, rng,
             eventType: "TTriggerOnCardEnchanted",
             sourceCard: enchantedCard, targetCard: enchantedCard, subjectPlayer: player,
             currentEncounterId: currentEncounterId,
+            selectionCards: selectionCards,
             activeEncounterCard: activeEncounterCard);
     }
 
@@ -827,7 +838,7 @@ public static class OutOfCombatController
 
         preDispatchAction?.Invoke();
 
-        var effectiveRng = rng ?? new Random(Environment.TickCount);
+        var effectiveRng = rng ?? Random.Shared;
         int dispatchDepth = 0;
 
         RuleExecutionContext baseCtx = null!;
@@ -1061,16 +1072,21 @@ public static class OutOfCombatController
         CardInstance? activeEncounterCard,
         IReadOnlyList<CardInstance>? selectionCards)
     {
-        var transitions = AuraEngine.RecalculateAurasInternal(player, null, RuleScope.OutOfCombat, player.Day, player.Hour, repo);
-        if (AttachedPlayerEffects.TryGetValue(player, out var attachedEffects) && attachedEffects.Count > 0)
+        void ApplyExternalAuras()
         {
-            for (int e = 0; e < attachedEffects.Count; e++)
-                EvaluateExternalCardAuras(player, repo, attachedEffects[e], activeEncounterCard?.Template.Id, selectionCards);
+            if (AttachedPlayerEffects.TryGetValue(player, out var attachedEffects) && attachedEffects.Count > 0)
+            {
+                for (int e = 0; e < attachedEffects.Count; e++)
+                    EvaluateExternalCardAuras(player, repo, attachedEffects[e], activeEncounterCard?.Template.Id, selectionCards);
+            }
+            if (activeEncounterCard != null)
+                EvaluateExternalCardAuras(player, repo, activeEncounterCard, activeEncounterCard.Template.Id, selectionCards, clearBefore: true);
         }
-        if (activeEncounterCard != null)
-            EvaluateExternalCardAuras(player, repo, activeEncounterCard, activeEncounterCard.Template.Id, selectionCards, clearBefore: true);
 
-        // 非战斗光环重算后，将拥有弹药上限的卡牌当前弹药同步补满；若触发光环增弹引发 CurrentAmmo 变化，再刷新一次关联光环（如 Shuriken 的 Multicast）
+        var transitions = AuraEngine.RecalculateAurasInternal(player, null, RuleScope.OutOfCombat, player.Day, player.Hour, repo, selectionCards);
+        ApplyExternalAuras();
+
+        // 非战斗光环重算后，将拥有弹药上限的卡牌当前弹药同步补满；若触发光环增弹引发 CurrentAmmo 变化，再刷新一次关联光环并重新补施外部光环（修复 P1-4）
         bool anyAmmoChanged = false;
         foreach (var c in player.EnumerateAllOwnedCards())
         {
@@ -1079,7 +1095,17 @@ public static class OutOfCombatController
             if (c.CurrentAmmo != prevAmmo) anyAmmoChanged = true;
         }
         if (anyAmmoChanged)
-            AuraEngine.RecalculateAurasInternal(player, null, RuleScope.OutOfCombat, player.Day, player.Hour, repo);
+        {
+            var secondTransitions = AuraEngine.RecalculateAurasInternal(player, null, RuleScope.OutOfCombat, player.Day, player.Hour, repo, selectionCards);
+            ApplyExternalAuras();
+            if (secondTransitions.Count > 0)
+            {
+                if (transitions.Count == 0)
+                    transitions = secondTransitions;
+                else
+                    transitions.AddRange(secondTransitions);
+            }
+        }
 
         return transitions;
     }
@@ -1207,15 +1233,39 @@ public static class OutOfCombatController
         return list;
     }
 
-    private static List<AbilityDefinition> OrderAbilitiesByPriority(IReadOnlyList<AbilityDefinition> abilities)
+    private static IReadOnlyList<AbilityDefinition> OrderAbilitiesByPriority(IReadOnlyList<AbilityDefinition> abilities)
     {
-        if (abilities.Count <= 1) return [.. abilities];
-        return abilities
-            .Select((ab, idx) => (Ability: ab, Rank: GetAbilityPriorityRank(ab.Priority), Index: idx))
-            .OrderBy(x => x.Rank)
-            .ThenBy(x => x.Index)
-            .Select(x => x.Ability)
-            .ToList();
+        if (abilities.Count <= 1) return abilities;
+        bool alreadySorted = true;
+        int prevRank = GetAbilityPriorityRank(abilities[0].Priority);
+        for (int i = 1; i < abilities.Count; i++)
+        {
+            int curRank = GetAbilityPriorityRank(abilities[i].Priority);
+            if (curRank < prevRank)
+            {
+                alreadySorted = false;
+                break;
+            }
+            prevRank = curRank;
+        }
+        if (alreadySorted) return abilities;
+
+        var copy = new List<AbilityDefinition>(abilities.Count);
+        for (int i = 0; i < abilities.Count; i++) copy.Add(abilities[i]);
+        // 稳定插入排序，避免 LINQ 闭包与元组分配
+        for (int i = 1; i < copy.Count; i++)
+        {
+            var key = copy[i];
+            int keyRank = GetAbilityPriorityRank(key.Priority);
+            int j = i - 1;
+            while (j >= 0 && GetAbilityPriorityRank(copy[j].Priority) > keyRank)
+            {
+                copy[j + 1] = copy[j];
+                j--;
+            }
+            copy[j + 1] = key;
+        }
+        return copy;
     }
 
     private static int GetAbilityPriorityRank(string? priority) => priority switch

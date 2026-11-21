@@ -171,6 +171,331 @@ public static class EncounterWeightCategoryCatalog
 }
 
 /// <summary>
+/// 三套核心预设档位枚举（含 Custom 自定义档）。
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum EGameModePreset
+{
+    PureOfficial = 0,
+    EnhancedFun = 1,
+    ExtremeRoguelike = 2,
+    Custom = 3
+}
+
+/// <summary>
+/// 精细玩法模式枚举（标准模式 + 5 大新玩法模式，其中突变词条与每日同种子细分为两个独立模式 ID 以支持独立排行榜与持久化）。
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum ESpecialModeId
+{
+    Standard = 0,
+    EndlessTower = 1,
+    CrossHeroMayhem = 2,
+    MutatorChallenge = 3,
+    DailyChallenge = 4,
+    BossRush = 5,
+    SandboxLab = 6
+}
+
+/// <summary>
+/// 顶层玩法模式分组枚举（对齐客户端大厅 UI 6 大入口卡片）。
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum GamePlayMode
+{
+    Standard = 0,
+    EndlessTower = 1,
+    CrossHeroMayhem = 2,
+    MutatorAndDailyChallenge = 3,
+    BossRush = 4,
+    SandboxLab = 5
+}
+
+/// <summary>
+/// 预设档位元数据描述。
+/// </summary>
+public sealed record PresetMetadata(
+    EGameModePreset PresetId,
+    string Key,
+    string NameZh,
+    string DescZh,
+    double ScoreMultiplier,
+    bool AllowsStandardGhostPool);
+
+/// <summary>
+/// 三套预设档位目录与一键工厂（经典官方 / 爽玩增强 / 极限肉鸽）。
+/// </summary>
+public static class PresetCatalog
+{
+    public static IReadOnlyList<PresetMetadata> All { get; } =
+    [
+        new(
+            EGameModePreset.PureOfficial,
+            "PureOfficial",
+            "经典官方",
+            "1:1 对齐官方正式服数值与节奏，允许计入标准镜像池与常规榜单",
+            1.0,
+            AllowsStandardGhostPool: true),
+        new(
+            EGameModePreset.EnhancedFun,
+            "EnhancedFun",
+            "爽玩增强",
+            "初始资源更充裕（25金/7收/8经/25声/350血），祭坛奇遇 1.4x、白银+ 权重 +15%、野怪战利品选项 +1，严格隔离至娱乐镜像池",
+            0.8,
+            AllowsStandardGhostPool: false),
+        new(
+            EGameModePreset.ExtremeRoguelike,
+            "ExtremeRoguelike",
+            "极限肉鸽",
+            "高压高回报（12金/4收/3经/12声/220血），奇遇祭坛 1.6x、黄金+ 权重 +20%、物价 +10%、敌方数值 1.25x、掉落品阶 +1，积分倍率 2.0x",
+            2.0,
+            AllowsStandardGhostPool: false)
+    ];
+
+    public static IReadOnlyDictionary<EGameModePreset, PresetMetadata> ById { get; } =
+        All.ToDictionary(x => x.PresetId);
+
+    /// <summary>
+    /// 按预设档位与可选特殊玩法模式一键生成归一化规则集。
+    /// </summary>
+    public static CustomRunRuleSet Create(
+        EGameModePreset preset,
+        ESpecialModeId mode = ESpecialModeId.Standard)
+    {
+        var rules = new CustomRunRuleSet
+        {
+            PresetId = preset,
+            SpecialModeId = mode
+        };
+
+        switch (preset)
+        {
+            case EGameModePreset.EnhancedFun:
+                rules.StartingGold = 25;
+                rules.StartingIncome = 7;
+                rules.StartingExperience = 8;
+                rules.StartingPrestige = 25;
+                rules.StartingHealth = 350;
+                rules.MonsterLootChooseOne = true;
+                rules.MonsterLootBonusChoices = 1;
+                rules.ShopHighTierBonusPct = 15.0;
+                rules.EncounterCategoryMultipliers["PedestalEnchant"] = 1.4;
+                rules.EncounterCategoryMultipliers["PedestalEnchantRandom"] = 1.4;
+                rules.EncounterCategoryMultipliers["PedestalUpgrade"] = 1.4;
+                rules.EncounterCategoryMultipliers["EventCultAndMystery"] = 1.4;
+                rules.EncounterCategoryMultipliers["EventExpeditionAgent"] = 1.4;
+                rules.EncounterCategoryMultipliers["EventEconomyStats"] = 1.4;
+                rules.EncounterCategoryMultipliers["EventFreeDealTransform"] = 1.4;
+                break;
+
+            case EGameModePreset.ExtremeRoguelike:
+                rules.StartingGold = 12;
+                rules.StartingIncome = 4;
+                rules.StartingExperience = 3;
+                rules.StartingPrestige = 12;
+                rules.StartingHealth = 220;
+                rules.MonsterLootChooseOne = true;
+                rules.MonsterLootTierBonus = 1;
+                rules.ShopHighTierBonusPct = 20.0;
+                rules.ShopPriceMultiplier = 1.10;
+                rules.EnemyStatMultiplier = 1.25;
+                rules.EncounterCategoryMultipliers["PedestalEnchant"] = 1.6;
+                rules.EncounterCategoryMultipliers["PedestalEnchantRandom"] = 1.6;
+                rules.EncounterCategoryMultipliers["PedestalUpgrade"] = 1.6;
+                rules.EncounterCategoryMultipliers["EventCultAndMystery"] = 1.6;
+                rules.EncounterCategoryMultipliers["EventExpeditionAgent"] = 1.6;
+                rules.EncounterCategoryMultipliers["EventEconomyStats"] = 1.6;
+                rules.EncounterCategoryMultipliers["EventFreeDealTransform"] = 1.6;
+                rules.EncounterCategoryMultipliers["Monsters"] = 1.25;
+                break;
+
+            case EGameModePreset.PureOfficial:
+            default:
+                break;
+        }
+
+        // 针对特定特殊模式套用默认基础资源或参数
+        switch (mode)
+        {
+            case ESpecialModeId.EndlessTower:
+                rules.EndlessMaxDay = 99;
+                break;
+            case ESpecialModeId.CrossHeroMayhem:
+                rules.CrossHeroOwnHeroBias = 0.40;
+                break;
+            case ESpecialModeId.BossRush:
+                rules.BossRushTotalWaves = 10;
+                rules.BossRushIncludeMilestonePvp = true;
+                break;
+            case ESpecialModeId.SandboxLab:
+                rules.StartingGold = 999;
+                rules.StartingIncome = 100;
+                rules.StartingHealth = 1000;
+                rules.StartingPrestige = 99;
+                rules.SandboxFreeInfiniteReroll = true;
+                break;
+        }
+
+        return rules.CloneNormalized();
+    }
+
+    public static GamePlayMode ToGamePlayMode(ESpecialModeId mode) => mode switch
+    {
+        ESpecialModeId.EndlessTower => GamePlayMode.EndlessTower,
+        ESpecialModeId.CrossHeroMayhem => GamePlayMode.CrossHeroMayhem,
+        ESpecialModeId.MutatorChallenge or ESpecialModeId.DailyChallenge => GamePlayMode.MutatorAndDailyChallenge,
+        ESpecialModeId.BossRush => GamePlayMode.BossRush,
+        ESpecialModeId.SandboxLab => GamePlayMode.SandboxLab,
+        _ => GamePlayMode.Standard
+    };
+
+    public static ESpecialModeId FromGamePlayMode(GamePlayMode mode, bool isDailyChallenge = false) => mode switch
+    {
+        GamePlayMode.EndlessTower => ESpecialModeId.EndlessTower,
+        GamePlayMode.CrossHeroMayhem => ESpecialModeId.CrossHeroMayhem,
+        GamePlayMode.MutatorAndDailyChallenge => isDailyChallenge ? ESpecialModeId.DailyChallenge : ESpecialModeId.MutatorChallenge,
+        GamePlayMode.BossRush => ESpecialModeId.BossRush,
+        GamePlayMode.SandboxLab => ESpecialModeId.SandboxLab,
+        _ => ESpecialModeId.Standard
+    };
+}
+
+/// <summary>
+/// 单个肉鸽突变词条元数据定义（含中文名、量化描述、冲突组、积分倍率、生效钩子与数值参数）。
+/// </summary>
+public sealed record MutatorMetadata(
+    string Id,
+    string NameZh,
+    string DescZh,
+    string? ConflictGroup,
+    double ScoreMultiplierDelta,
+    bool IsPositive,
+    string TargetHook = "CombatSimulator",
+    IReadOnlyDictionary<string, double>? Parameters = null);
+
+/// <summary>
+/// 全局 14 条肉鸽突变词条权威目录与冲突消解工具。
+/// </summary>
+public static class MutatorCatalog
+{
+    public const string TurboFrenzy = "turbo_frenzy";
+    public const string AllEnchanted = "all_enchanted";
+    public const string DoubleEconomy = "double_economy";
+    public const string GlassCannon = "glass_cannon";
+    public const string GoldenStart = "golden_start";
+    public const string ShopHalfOff = "shop_half_off";
+    public const string DoubleTrigger = "double_trigger";
+    public const string BloodMarket = "blood_market";
+    public const string TitanVitality = "titan_vitality";
+    public const string CritOverload = "crit_overload";
+    public const string FrozenWasteland = "frozen_wasteland";
+    public const string EventCarnival = "event_carnival";
+    public const string IronmanNoFates = "ironman_no_fates";
+    public const string CrossHeroChaos = "cross_hero_chaos";
+
+    /// <summary>全部 14 条肉鸽突变词条定义。</summary>
+    public static IReadOnlyList<MutatorMetadata> All { get; } =
+    [
+        new(TurboFrenzy, "极速狂潮", "全员物品冷却 -35%（下限 500ms），沙暴提前 5 秒启动", "pace", +0.25, IsPositive: false,
+            TargetHook: "CombatSimulator",
+            Parameters: new Dictionary<string, double> { ["cooldownReductionPct"] = 0.35, ["minCooldownMs"] = 500, ["sandstormOffsetMs"] = -5000 }),
+        new(AllEnchanted, "万物附魔", "商店、战利品、奇遇生成的所有物品 100% 附带合法随机附魔", null, +0.15, IsPositive: true,
+            TargetHook: "ShopEngine/SpawnQuery",
+            Parameters: new Dictionary<string, double> { ["enchantChance"] = 1.0 }),
+        new(DoubleEconomy, "双倍经济", "初始金币、每日收入、战斗与卖卡金币全部 ×2，物价不变", "econ", -0.10, IsPositive: true,
+            TargetHook: "RunEngine/ShopEngine",
+            Parameters: new Dictionary<string, double> { ["economyMultiplier"] = 2.0 }),
+        new(GlassCannon, "玻璃大炮", "双方生命上限 -40%，所有伤害、灼烧与剧毒施加量 +80%", "vitality", +0.35, IsPositive: false,
+            TargetHook: "CombatSimulator",
+            Parameters: new Dictionary<string, double> { ["healthMultiplier"] = 0.60, ["damageAndDotMultiplier"] = 1.80 }),
+        new(GoldenStart, "全金开局", "Day 1 解锁 8 格手牌，自动发放 2 件随机 Gold 物品与 1 个 Gold 技能", "start", -0.15, IsPositive: true,
+            TargetHook: "RunEngine.StartRun",
+            Parameters: new Dictionary<string, double> { ["unlockedSlots"] = 8, ["goldItemCount"] = 2, ["goldSkillCount"] = 1 }),
+        new(ShopHalfOff, "商店全折", "商人买价统一 5 折（最低 1 金），刷新费用 -50%", "econ", -0.10, IsPositive: true,
+            TargetHook: "ShopEngine",
+            Parameters: new Dictionary<string, double> { ["buyPriceMultiplier"] = 0.50, ["rerollCostMultiplier"] = 0.50 }),
+        new(DoubleTrigger, "双倍触发", "全员所有主动物品默认 Multicast +1（单卡额外加成封顶 +2）", null, +0.30, IsPositive: true,
+            TargetHook: "CombatSimulator",
+            Parameters: new Dictionary<string, double> { ["bonusMulticast"] = 1, ["maxBonusMulticast"] = 2 }),
+        new(BloodMarket, "血色黑市", "商店刷新 0 金币，但每次刷新消耗 5% 当前生命上限（下限 50 HP）", "econ", +0.25, IsPositive: false,
+            TargetHook: "RunEngine.OnReroll",
+            Parameters: new Dictionary<string, double> { ["rerollGoldCost"] = 0, ["rerollHpCostPct"] = 0.05, ["minHpCost"] = 50 }),
+        new(TitanVitality, "泰坦巨躯", "双方生命上限 ×2.5，护盾与再生效能 +50%，沙暴延后 10 秒", "vitality", +0.20, IsPositive: true,
+            TargetHook: "CombatSimulator",
+            Parameters: new Dictionary<string, double> { ["healthMultiplier"] = 2.50, ["shieldAndRegenMultiplier"] = 1.50, ["sandstormOffsetMs"] = 10000 }),
+        new(CritOverload, "暴击过载", "全员基础暴击率 +50%，暴击倍率由 200% 提升至 275%", null, +0.25, IsPositive: true,
+            TargetHook: "CombatSimulator",
+            Parameters: new Dictionary<string, double> { ["bonusCritChance"] = 50, ["critPercentMultiplier"] = 275 }),
+        new(FrozenWasteland, "冰霜荒原", "战斗每 4 秒随机冻结双方各 1 件未冻结物品 1.0 秒", null, +0.30, IsPositive: false,
+            TargetHook: "CombatSimulator",
+            Parameters: new Dictionary<string, double> { ["freezeIntervalMs"] = 4000, ["freezeDurationMs"] = 1000 }),
+        new(EventCarnival, "奇遇狂欢", "白昼奇遇事件与附魔/升阶祭坛出现权重 ×2.5", null, +0.15, IsPositive: true,
+            TargetHook: "ShopEngine",
+            Parameters: new Dictionary<string, double> { ["eventAndPedestalMultiplier"] = 2.5 }),
+        new(IronmanNoFates, "铁人无悔", "禁用 Fates 濒死复活、初始声望降为 10", null, +0.60, IsPositive: false,
+            TargetHook: "RunEngine",
+            Parameters: new Dictionary<string, double> { ["disableFates"] = 1, ["startingPrestige"] = 10 }),
+        new(CrossHeroChaos, "跨界异变", "每家常规商店额外混入 1~2 件跨英雄高阶物品", null, +0.20, IsPositive: true,
+            TargetHook: "ShopEngine",
+            Parameters: new Dictionary<string, double> { ["minExtraCrossHeroItems"] = 1, ["maxExtraCrossHeroItems"] = 2 })
+    ];
+
+    /// <summary>按词条 ID 索引（大小写不敏感）。</summary>
+    public static IReadOnlyDictionary<string, MutatorMetadata> ById { get; } =
+        All.ToDictionary(x => x.Id, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 清洗、去重、过滤非法词条并按互斥组（ConflictGroup）消解冲突，最多保留 <paramref name="maxCount"/> 条。
+    /// </summary>
+    public static List<string> NormalizeAndResolveConflicts(IEnumerable<string>? ids, int maxCount = 4)
+    {
+        var result = new List<string>();
+        if (ids == null || maxCount <= 0)
+            return result;
+
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var usedGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var raw in ids)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+
+            var trimmed = raw.Trim();
+            if (!ById.TryGetValue(trimmed, out var meta))
+                continue;
+            if (!seenIds.Add(meta.Id))
+                continue;
+            if (!string.IsNullOrEmpty(meta.ConflictGroup) && !usedGroups.Add(meta.ConflictGroup))
+                continue;
+
+            result.Add(meta.Id);
+            if (result.Count >= maxCount)
+                break;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 计算给定预设档位与激活突变词条列表叠加后的最终积分结算倍率（最低钳底 0.25x）。
+    /// </summary>
+    public static double CalculateTotalScoreMultiplier(EGameModePreset preset, IEnumerable<string>? mutatorIds)
+    {
+        double baseMult = PresetCatalog.ById.TryGetValue(preset, out var p) ? p.ScoreMultiplier : 1.0;
+        if (mutatorIds != null)
+        {
+            foreach (var id in NormalizeAndResolveConflicts(mutatorIds, maxCount: 14))
+            {
+                if (ById.TryGetValue(id, out var m))
+                    baseMult += m.ScoreMultiplierDelta;
+            }
+        }
+        return Math.Max(0.25, Math.Round(baseMult, 2));
+    }
+}
+
+/// <summary>
 /// 开局预设卡牌（物品或技能）规格。
 /// </summary>
 public sealed class PresetCardSpec
@@ -190,7 +515,7 @@ public sealed class PresetCardSpec
 }
 
 /// <summary>
-/// 自定义对局与流派倾向规则配置。
+/// 自定义对局、预设档位、5 大新玩法模式与流派倾向规则配置（100% 向后兼容旧 JSON）。
 /// </summary>
 public sealed class CustomRunRuleSet
 {
@@ -251,23 +576,126 @@ public sealed class CustomRunRuleSet
     [JsonPropertyName("lastHumanStandingMode")]
     public bool LastHumanStandingMode { get; set; } = true;
 
+    // ===== Wave 2 新增：3 套预设档位 + 5 大新玩法模式 + 14 条突变词条扩展字段（全部带默认值，旧 JSON 100% 兼容） =====
+
+    [JsonPropertyName("presetId")]
+    public EGameModePreset PresetId { get; set; } = EGameModePreset.PureOfficial;
+
+    [JsonPropertyName("specialModeId")]
+    public ESpecialModeId SpecialModeId { get; set; } = ESpecialModeId.Standard;
+
+    [JsonPropertyName("mutatorIds")]
+    public List<string> MutatorIds { get; set; } = new();
+
+    [JsonPropertyName("dailyChallengeDate")]
+    public string? DailyChallengeDate { get; set; }
+
+    [JsonPropertyName("fixedRunSeed")]
+    public int? FixedRunSeed { get; set; }
+
+    [JsonPropertyName("endlessMaxDay")]
+    public int EndlessMaxDay { get; set; } = 99;
+
+    [JsonPropertyName("crossHeroOwnHeroBias")]
+    public double CrossHeroOwnHeroBias { get; set; } = 0.40;
+
+    [JsonPropertyName("bossRushTotalWaves")]
+    public int BossRushTotalWaves { get; set; } = 10;
+
+    [JsonPropertyName("bossRushIncludeMilestonePvp")]
+    public bool BossRushIncludeMilestonePvp { get; set; } = true;
+
+    [JsonPropertyName("sandboxFreeInfiniteReroll")]
+    public bool SandboxFreeInfiniteReroll { get; set; } = true;
+
+    [JsonPropertyName("sandboxZeroShopPrice")]
+    public bool SandboxZeroShopPrice { get; set; } = false;
+
+    [JsonPropertyName("shopHighTierBonusPct")]
+    public double ShopHighTierBonusPct { get; set; } = 0.0;
+
+    [JsonPropertyName("shopPriceMultiplier")]
+    public double ShopPriceMultiplier { get; set; } = 1.0;
+
+    [JsonPropertyName("monsterLootBonusChoices")]
+    public int MonsterLootBonusChoices { get; set; } = 0;
+
+    [JsonPropertyName("monsterLootTierBonus")]
+    public int MonsterLootTierBonus { get; set; } = 0;
+
+    [JsonPropertyName("enemyStatMultiplier")]
+    public double EnemyStatMultiplier { get; set; } = 1.0;
+
+    [JsonPropertyName("disableFatesRevive")]
+    public bool DisableFatesRevive { get; set; } = false;
+
+    [JsonIgnore]
+    public GamePlayMode PlayModeCategory => PresetCatalog.ToGamePlayMode(SpecialModeId);
+
+    [JsonIgnore]
+    public bool IsSandboxRun => SpecialModeId == ESpecialModeId.SandboxLab;
+
+    [JsonIgnore]
+    public bool IsNonStandardRun =>
+        SpecialModeId != ESpecialModeId.Standard
+        || PresetId != EGameModePreset.PureOfficial
+        || (MutatorIds != null && MutatorIds.Count > 0)
+        || IsCustomPowerModified();
+
+    [JsonIgnore]
+    public bool ShouldIsolateFromStandardGhostPool => IsNonStandardRun;
+
+    [JsonIgnore]
+    public bool ShouldSkipGhostPool => IsSandboxRun;
+
+    [JsonIgnore]
+    public bool ShouldSkipCareerAndLeaderboard => IsSandboxRun;
+
     /// <summary>
-    /// 序列化暴露的强力自定义判定属性：纯 0~3 个流派倾向微调不会脱离标准镜像池。
+    /// 序列化暴露的强力自定义判定属性：纯 0~3 个流派倾向微调不会脱离标准镜像池；
+    /// 任何非标准模式、非经典官方预设或突变词条均强制为 true。
     /// </summary>
     [JsonPropertyName("isCustomPowerModified")]
     public bool IsCustomPowerModifiedValue => IsCustomPowerModified();
 
+    /// <summary>判断是否激活指定突变词条（大小写不敏感）。</summary>
+    public bool HasMutator(string mutatorId)
+    {
+        if (string.IsNullOrWhiteSpace(mutatorId) || MutatorIds == null || MutatorIds.Count == 0)
+            return false;
+        for (int i = 0; i < MutatorIds.Count; i++)
+        {
+            if (string.Equals(MutatorIds[i], mutatorId, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>
-    /// 判断规则是否修改了局内数值强度（为 false 时允许保留在标准幽灵/镜像池）。
+    /// 判断规则是否修改了局内数值强度或启用了非标准玩法模式（为 false 时允许保留在标准幽灵/镜像池）。
     /// </summary>
     public bool IsCustomPowerModified()
     {
+        bool isStandardMode =
+            SpecialModeId == ESpecialModeId.Standard &&
+            PresetId == EGameModePreset.PureOfficial &&
+            (MutatorIds == null || MutatorIds.Count == 0);
+
+        if (!isStandardMode)
+            return true;
+
         bool isStandardStats =
             StartingGold == 15 &&
             StartingIncome == 5 &&
             StartingExperience == 3 &&
             StartingPrestige == 20 &&
-            StartingHealth == 250;
+            StartingHealth == 250 &&
+            Math.Abs(ShopHighTierBonusPct) < 1e-6 &&
+            Math.Abs(ShopPriceMultiplier - 1.0) < 1e-6 &&
+            MonsterLootBonusChoices == 0 &&
+            MonsterLootTierBonus == 0 &&
+            Math.Abs(EnemyStatMultiplier - 1.0) < 1e-6 &&
+            !DisableFatesRevive;
 
         bool noPresetCards =
             (StartingItems == null || StartingItems.Count == 0) &&
@@ -282,6 +710,36 @@ public sealed class CustomRunRuleSet
 
         return !(isStandardStats && noPresetCards && noLootOrBanMods && multipliersInStandardRange);
     }
+
+    /// <summary>
+    /// 解析该对局在 pvp_ghosts 表中的分区键，确保非标准模式与沙盒模式绝不污染标准镜像池。
+    /// </summary>
+    public string ResolveGhostPoolPartition()
+    {
+        if (IsSandboxRun)
+            return "none";
+
+        return SpecialModeId switch
+        {
+            ESpecialModeId.EndlessTower => "endless_tower",
+            ESpecialModeId.CrossHeroMayhem => "cross_hero",
+            ESpecialModeId.MutatorChallenge => "mutator",
+            ESpecialModeId.DailyChallenge => "daily",
+            ESpecialModeId.BossRush => "boss_rush",
+            _ => !IsCustomPowerModified()
+                ? "standard"
+                : PresetId switch
+                {
+                    EGameModePreset.EnhancedFun => "enhanced",
+                    EGameModePreset.ExtremeRoguelike => "extreme",
+                    _ => "custom"
+                }
+        };
+    }
+
+    /// <summary>一键创建指定预设档位与玩法模式的归一化规则集。</summary>
+    public static CustomRunRuleSet CreatePreset(EGameModePreset preset, ESpecialModeId mode = ESpecialModeId.Standard)
+        => PresetCatalog.Create(preset, mode);
 
     /// <summary>
     /// 返回经边界钳制与深拷贝归一化后的规则副本。
@@ -310,7 +768,24 @@ public sealed class CustomRunRuleSet
             PlayerCap = Math.Clamp(PlayerCap, 2, 16),
             BotNonLethalPrestigeLock = BotNonLethalPrestigeLock,
             HumanMatchEvery4Rounds = HumanMatchEvery4Rounds,
-            LastHumanStandingMode = LastHumanStandingMode
+            LastHumanStandingMode = LastHumanStandingMode,
+            PresetId = Enum.IsDefined(PresetId) ? PresetId : EGameModePreset.PureOfficial,
+            SpecialModeId = Enum.IsDefined(SpecialModeId) ? SpecialModeId : ESpecialModeId.Standard,
+            MutatorIds = MutatorCatalog.NormalizeAndResolveConflicts(MutatorIds, maxCount: 4),
+            DailyChallengeDate = string.IsNullOrWhiteSpace(DailyChallengeDate) ? null : DailyChallengeDate.Trim(),
+            FixedRunSeed = FixedRunSeed,
+            EndlessMaxDay = Math.Clamp(EndlessMaxDay, 11, 99),
+            CrossHeroOwnHeroBias = ClampFinite(CrossHeroOwnHeroBias, 0.0, 1.0, 0.40),
+            BossRushTotalWaves = Math.Clamp(BossRushTotalWaves, 1, 30),
+            BossRushIncludeMilestonePvp = BossRushIncludeMilestonePvp,
+            SandboxFreeInfiniteReroll = SandboxFreeInfiniteReroll,
+            SandboxZeroShopPrice = SandboxZeroShopPrice,
+            ShopHighTierBonusPct = ClampFinite(ShopHighTierBonusPct, 0.0, 100.0, 0.0),
+            ShopPriceMultiplier = ClampFinite(ShopPriceMultiplier, 0.1, 5.0, 1.0),
+            MonsterLootBonusChoices = Math.Clamp(MonsterLootBonusChoices, 0, 5),
+            MonsterLootTierBonus = Math.Clamp(MonsterLootTierBonus, 0, 3),
+            EnemyStatMultiplier = ClampFinite(EnemyStatMultiplier, 0.25, 10.0, 1.0),
+            DisableFatesRevive = DisableFatesRevive
         };
 
         return normalized;

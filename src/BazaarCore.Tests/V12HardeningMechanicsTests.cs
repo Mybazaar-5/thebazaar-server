@@ -445,7 +445,12 @@ public sealed class V12HardeningMechanicsTests
 
         var legErrOut = engine.Handle(new CommitToPedestalCommand { InstanceId = new InstanceId(legEntry.InstanceId) });
         Assert.NotNull(legErrOut.Error);
-        Assert.Contains("legendary", legErrOut.Error!.Message, StringComparison.OrdinalIgnoreCase);
+        // 服务端报错已全量中文化（“传奇品阶卡牌无法被变形”），兼容检查中文“传奇”或英文“legendary”
+        string legErrMsg = legErrOut.Error!.Message ?? "";
+        Assert.True(
+            legErrMsg.Contains("传奇", StringComparison.OrdinalIgnoreCase)
+            || legErrMsg.Contains("legendary", StringComparison.OrdinalIgnoreCase),
+            $"预期报错包含传奇不可变形提示，实际：{legErrMsg}");
         Assert.True(run.Cards.ContainsKey(legEntry.InstanceId));
         Assert.Equal(ETier.Legendary, run.Cards[legEntry.InstanceId].Tier);
 

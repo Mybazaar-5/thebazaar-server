@@ -224,19 +224,23 @@ public static class TargetResolver
             {
                 if (ctx.SelfCard == null) break;
                 var origin = target.Origin == "TriggerSource" ? ctx.TriggerSourceCard : ctx.SelfCard;
-                var candidates = new List<CardInstance>();
+                var candidates = new List<CardInstance>(4);
                 if (origin != null)
                 {
                     var originOwner = FindOwner(origin, ctx);
                     candidates.AddRange(ResolvePositionalNeighbors(originOwner, origin, target.TargetMode, includeDestroyed, includeDisabled));
                 }
 
+                // 严格对齐官方反编译 TTargetCardPositional.cs:33-36：
+                // if (IncludeOrigin && !list.Contains(ctx.TargetingCard)) list.Add(ctx.TargetingCard);
                 if (target.IncludeOrigin == true && !candidates.Contains(ctx.SelfCard))
+                {
                     candidates.Add(ctx.SelfCard);
+                }
 
                 var pairs = new List<(CardInstance Card, PlayerState Owner)>(candidates.Count);
-                foreach (var c in candidates)
-                    pairs.Add((c, FindOwner(c, ctx)));
+                for (int i = 0; i < candidates.Count; i++)
+                    pairs.Add((candidates[i], FindOwner(candidates[i], ctx)));
 
                 FilterCandidatePairs(pairs, cond, ctx, result);
                 break;
@@ -247,14 +251,30 @@ public static class TargetResolver
                 var pairs = CollectSectionPairs(target.TargetSection, ctx, excludeSelf, includeDestroyed, includeDisabled);
                 var activeSold = AbilityExecutor.GetActiveSoldCard(ctx);
                 // 过滤未入格卡（StartSlot < 0）及正在出售但尚未从分区摘除的卡牌，防止 -1 或已售卡抢占最左/最右目标
-                pairs.RemoveAll(p => p.Card.StartSlot < 0 || (activeSold != null && ReferenceEquals(p.Card, activeSold)));
+                for (int i = pairs.Count - 1; i >= 0; i--)
+                {
+                    var c = pairs[i].Card;
+                    if (c.StartSlot < 0 || (activeSold != null && ReferenceEquals(c, activeSold)))
+                        pairs.RemoveAt(i);
+                }
+                // 先滤后取最左/最右（经官方反编译 TTargetCardXMost.cs:42-53 核验）
                 FilterCandidatePairs(pairs, cond, ctx, result);
                 if (result.Count > 1)
                 {
                     bool leftMost = string.Equals(target.TargetMode, "LeftMostCard", StringComparison.Ordinal)
                         || string.Equals(target.TargetMode, "LeftMost", StringComparison.Ordinal);
-                    var ordered = result.OrderBy(c => c.StartSlot);
-                    var chosen = leftMost ? ordered.First() : ordered.Last();
+                    CardInstance chosen = result[0];
+                    int bestSlot = chosen.StartSlot;
+                    for (int i = 1; i < result.Count; i++)
+                    {
+                        var cand = result[i];
+                        // 稳定序：LeftMost 严格小于才替换（保留最先），RightMost 大于等于才替换（保留最后）
+                        if (leftMost ? cand.StartSlot < bestSlot : cand.StartSlot >= bestSlot)
+                        {
+                            bestSlot = cand.StartSlot;
+                            chosen = cand;
+                        }
+                    }
                     result.Clear();
                     result.Add(chosen);
                 }
@@ -300,6 +320,259 @@ public static class TargetResolver
             result.RemoveRange(maxCount.Value, result.Count - maxCount.Value);
 
         return result;
+    }
+
+    /// <summary>
+    /// 零分配快速目标判定路径（供高频触发过滤 MatchesCardSubject 调用）：
+    /// 对 Self / TriggerSource / TriggerTarget / 无极值条件的 Section / Random / Positional / Occupying 直接判定，避免每事件分配完整候选列表。
+    /// </summary>
+    public static bool MatchesCard(RuleNode? target, CardInstance candidate, RuleExecutionContext ctx)
+    {
+        if (target == null || candidate == null) return false;
+
+        var cond = target.GetSingleCondition(GameDatabaseLoader.JsonOptions);
+        if (cond != null && ValueAndConditionEvaluator.ContainsExtremeCondition(cond))
+            return ResolveCards(target, ctx).Contains(candidate);
+
+        bool excludeSelf = target.ExcludeSelf ?? false;
+        bool isRepairAction = string.Equals(ctx.ActiveExecution.ActionType, "TActionCardRepair", StringComparison.Ordinal);
+        bool isTransformDestroyedAction = string.Equals(ctx.ActiveExecution.ActionType, "TActionCardTransformDestroyed", StringComparison.Ordinal);
+        bool includeDestroyed = HasStateCondition(cond, "Destroyed") || HasStateCondition(cond, "Transformed")
+                                || isTransformDestroyedAction || isRepairAction;
+        bool includeDisabled = HasStateCondition(cond, "Disabled") || isRepairAction
+                               || isTransformDestroyedAction || ctx.ActiveExecution.IncludeDisabledTargets;
+
+        bool IsEligible(CardInstance c) => (includeDestroyed || !c.IsDestroyed) && (includeDisabled || !c.IsDisabled);
+
+        switch (target.Type)
+        {
+            case "TTargetCardSelf":
+                if (!ReferenceEquals(candidate, ctx.SelfCard) || !IsEligible(candidate))
+                    return false;
+                return cond == null || ValueAndConditionEvaluator.EvaluateCardCondition(cond, candidate, FindOwner(candidate, ctx), ctx);
+
+            case "TTargetCardTriggerSource":
+                if (!ReferenceEquals(candidate, ctx.TriggerSourceCard)) return false;
+                if (excludeSelf && ReferenceEquals(candidate, ctx.SelfCard)) return false;
+                if (ctx.ActiveExecution.ActionType != null && !IsEligible(candidate)) return false;
+                return cond == null || ValueAndConditionEvaluator.EvaluateCardCondition(cond, candidate, FindOwner(candidate, ctx), ctx);
+
+            case "TTargetCardTriggerTarget":
+                if (!ReferenceEquals(candidate, ctx.TriggerTargetCard)) return false;
+                if (excludeSelf && ReferenceEquals(candidate, ctx.SelfCard)) return false;
+                if (ctx.ActiveExecution.ActionType != null && !IsEligible(candidate)) return false;
+                return cond == null || ValueAndConditionEvaluator.EvaluateCardCondition(cond, candidate, FindOwner(candidate, ctx), ctx);
+
+            case "TTargetCardSection":
+            case "TTargetCardRandom":
+            {
+                if (target.Type == "TTargetCardRandom" && ctx.SelfCard == null && ctx.ActiveExecution.ActionType == null)
+                    return false;
+                if (excludeSelf && ReferenceEquals(candidate, ctx.SelfCard))
+                    return false;
+                if (!IsCardInSection(target.TargetSection, candidate, ctx, includeDestroyed, includeDisabled, out var matchedOwner))
+                    return false;
+                return cond == null || ValueAndConditionEvaluator.EvaluateCardCondition(cond, candidate, matchedOwner!, ctx);
+            }
+
+            case "TTargetCardPositional":
+            {
+                if (ctx.SelfCard == null) return false;
+                var origin = target.Origin == "TriggerSource" ? ctx.TriggerSourceCard : ctx.SelfCard;
+                if (origin == null) return false;
+                bool hit = false;
+                if (target.IncludeOrigin == true && ReferenceEquals(candidate, origin) && IsEligible(origin))
+                {
+                    hit = true;
+                }
+                else
+                {
+                    var originOwner = FindOwner(origin, ctx);
+                    foreach (var n in ResolvePositionalNeighbors(originOwner, origin, target.TargetMode, includeDestroyed, includeDisabled))
+                    {
+                        if (ReferenceEquals(n, candidate))
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+                if (!hit) return false;
+                return cond == null || ValueAndConditionEvaluator.EvaluateCardCondition(cond, candidate, FindOwner(candidate, ctx), ctx);
+            }
+
+            case "TTargetCardOccupying":
+            {
+                if (ctx.SelfCard == null || ctx.SelfCard.StartSlot < 0 || !IsEligible(ctx.SelfCard))
+                    return false;
+                if (ReferenceEquals(candidate, ctx.SelfCard) || candidate.StartSlot < 0)
+                    return false;
+                var owner = FindOwner(ctx.SelfCard, ctx);
+                int selfStart = ctx.SelfCard.StartSlot;
+                int selfEnd = selfStart + ctx.SelfCard.SlotWidth;
+                if (!(candidate.StartSlot < selfEnd && selfStart < candidate.StartSlot + candidate.SlotWidth))
+                    return false;
+                bool inContainer = IsSocketEffectCard(ctx.SelfCard)
+                    ? (!candidate.IsDestroyed && owner.Hand.Cards.Contains(candidate))
+                    : ((includeDestroyed || !candidate.IsDestroyed) && owner.SocketEffects.Contains(candidate));
+                if (!inContainer) return false;
+                return cond == null || ValueAndConditionEvaluator.EvaluateCardCondition(cond, candidate, owner, ctx);
+            }
+
+            default:
+                return ResolveCards(target, ctx).Contains(candidate);
+        }
+    }
+
+    private static bool IsCardInSection(
+        string? section,
+        CardInstance candidate,
+        RuleExecutionContext ctx,
+        bool includeDestroyed,
+        bool includeDisabled,
+        out PlayerState? matchedOwner)
+    {
+        matchedOwner = null;
+        bool eligible = (includeDestroyed || !candidate.IsDestroyed) && (includeDisabled || !candidate.IsDisabled);
+
+        bool InHand(PlayerState? p) => p != null && eligible && p.Hand.Cards.Contains(candidate);
+        bool InStash(PlayerState? p) => p != null && eligible && p.Stash.Cards.Contains(candidate);
+        bool InSkills(PlayerState? p) => p != null && eligible && p.Skills.Contains(candidate);
+        bool InSocketEffects(PlayerState? p) => p != null && eligible && p.SocketEffects.Contains(candidate);
+        bool InBoard(PlayerState? p) => InHand(p) || InStash(p) || InSkills(p);
+
+        var local = GetLocalPlayer(ctx);
+        var oppOfLocal = GetEncounterPlayer(ctx);
+        bool selfCardUnowned = ctx.SelfCard != null
+            && (IsUnownedSystemCard(ctx.SelfCard) || (!OwnsCard(ctx.SelfPlayer, ctx.SelfCard) && !OwnsCard(ctx.OpponentPlayer, ctx.SelfCard)));
+        var selfOwner = ctx.SelfCard != null
+            ? (selfCardUnowned ? ctx.SelfPlayer : FindOwner(ctx.SelfCard, ctx))
+            : (ctx.Scope == RuleScope.OutOfCombat ? ctx.SelfPlayer : local);
+        var relOpponent = ctx.SelfCard != null ? GetRelativeOpponent(ctx, selfOwner) : local;
+
+        switch (section)
+        {
+            case "SelfHand":
+                if (InHand(selfOwner)) { matchedOwner = selfOwner; return true; }
+                return false;
+            case "SelfBoard":
+                if (InBoard(selfOwner)) { matchedOwner = selfOwner; return true; }
+                return false;
+            case "SelfStash":
+                if (InStash(selfOwner)) { matchedOwner = selfOwner; return true; }
+                return false;
+            case "SelfHandAndStash":
+                if (InHand(selfOwner) || InStash(selfOwner)) { matchedOwner = selfOwner; return true; }
+                return false;
+            case "SelfSocketEffects":
+                if (InSocketEffects(selfOwner)) { matchedOwner = selfOwner; return true; }
+                return false;
+            case "SelfSkills":
+                if (InSkills(selfOwner)) { matchedOwner = selfOwner; return true; }
+                return false;
+            case "AbsolutePlayerHand":
+                if (InHand(local)) { matchedOwner = local; return true; }
+                return false;
+            case "AbsolutePlayerStash":
+                if (InStash(local)) { matchedOwner = local; return true; }
+                return false;
+            case "AbsolutePlayerHandAndStash":
+                if (InHand(local) || InStash(local)) { matchedOwner = local; return true; }
+                return false;
+            case "AbsolutePlayerSkills":
+                if (InSkills(local)) { matchedOwner = local; return true; }
+                return false;
+            case "AbsolutePlayerSocketEffects":
+                if (InSocketEffects(local)) { matchedOwner = local; return true; }
+                return false;
+            case "AbsoluteOpponentHand":
+                if (InHand(oppOfLocal)) { matchedOwner = oppOfLocal; return true; }
+                return false;
+            case "AbsoluteOpponentStash":
+                if (InStash(oppOfLocal)) { matchedOwner = oppOfLocal; return true; }
+                return false;
+            case "AbsoluteOpponentHandAndStash":
+                if (InHand(oppOfLocal) || InStash(oppOfLocal)) { matchedOwner = oppOfLocal; return true; }
+                return false;
+            case "SelfNeighbors":
+                if (ctx.SelfCard != null)
+                {
+                    var owner = FindOwner(ctx.SelfCard, ctx);
+                    foreach (var c in ResolvePositionalNeighbors(owner, ctx.SelfCard, "Neighbor", includeDestroyed, includeDisabled))
+                    {
+                        if (ReferenceEquals(c, candidate)) { matchedOwner = owner; return true; }
+                    }
+                }
+                return false;
+            case "TriggerSourceNeighbors":
+                if (ctx.TriggerSourceCard != null)
+                {
+                    var owner = FindOwner(ctx.TriggerSourceCard, ctx);
+                    foreach (var c in ResolvePositionalNeighbors(owner, ctx.TriggerSourceCard, "Neighbor", includeDestroyed, includeDisabled))
+                    {
+                        if (ReferenceEquals(c, candidate)) { matchedOwner = owner; return true; }
+                    }
+                }
+                return false;
+            case "OpponentHand":
+                if (InHand(relOpponent)) { matchedOwner = relOpponent; return true; }
+                return false;
+            case "OpponentStash":
+                if (InStash(relOpponent)) { matchedOwner = relOpponent; return true; }
+                return false;
+            case "OpponentHandAndStash":
+                if (InHand(relOpponent) || InStash(relOpponent)) { matchedOwner = relOpponent; return true; }
+                return false;
+            case "OpponentSocketEffects":
+                if (InSocketEffects(relOpponent)) { matchedOwner = relOpponent; return true; }
+                return false;
+            case "OpponentSkills":
+                if (InSkills(relOpponent)) { matchedOwner = relOpponent; return true; }
+                return false;
+            case "OpponentBoard":
+                if (InBoard(relOpponent)) { matchedOwner = relOpponent; return true; }
+                return false;
+            case "AllHands":
+                if (InHand(oppOfLocal)) { matchedOwner = oppOfLocal; return true; }
+                if (InHand(local)) { matchedOwner = local; return true; }
+                return false;
+            case "AllStashes":
+                if (InStash(oppOfLocal)) { matchedOwner = oppOfLocal; return true; }
+                if (InStash(local)) { matchedOwner = local; return true; }
+                return false;
+            case "AllHandsAndStashes":
+                if (InHand(oppOfLocal) || InStash(oppOfLocal)) { matchedOwner = oppOfLocal; return true; }
+                if (InHand(local) || InStash(local)) { matchedOwner = local; return true; }
+                return false;
+            case "AllHandsAndSkills":
+                if (InHand(local) || InSkills(local)) { matchedOwner = local; return true; }
+                if (InHand(oppOfLocal) || InSkills(oppOfLocal)) { matchedOwner = oppOfLocal; return true; }
+                return false;
+            case "AllSocketEffects":
+                if (InSocketEffects(oppOfLocal)) { matchedOwner = oppOfLocal; return true; }
+                if (InSocketEffects(local)) { matchedOwner = local; return true; }
+                return false;
+            case "AllBoards":
+                if (InBoard(local)) { matchedOwner = local; return true; }
+                if (InBoard(oppOfLocal)) { matchedOwner = oppOfLocal; return true; }
+                return false;
+            case "SelectionSet":
+                if (ctx.SelectionCards != null)
+                {
+                    for (int i = 0; i < ctx.SelectionCards.Count; i++)
+                    {
+                        if (ReferenceEquals(ctx.SelectionCards[i], candidate))
+                        {
+                            matchedOwner = FindOwner(candidate, ctx);
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            default:
+                if (InHand(selfOwner)) { matchedOwner = selfOwner; return true; }
+                return false;
+        }
     }
 
     private static bool IsSocketEffectCard(CardInstance card)
@@ -475,16 +748,35 @@ public static class TargetResolver
         if (pairs.Count == 0) return;
         if (cond == null)
         {
-            foreach (var (c, _) in pairs) result.Add(c);
+            for (int i = 0; i < pairs.Count; i++) result.Add(pairs[i].Card);
             return;
         }
 
         var filtered = ValueAndConditionEvaluator.FilterCardCandidatePairs(cond, pairs, ctx);
-        // 对齐官方 TTargetCardBase.FilterByConditions：经条件过滤后按 LeftSocketId（未入格/技能为 null 排最前）稳定升序输出
-        foreach (var p in filtered.OrderBy(x => x.Card.StartSlot >= 0 ? (int?)x.Card.StartSlot : null))
+        if (filtered.Count == 0) return;
+        if (filtered.Count == 1)
         {
-            result.Add(p.Card);
+            result.Add(filtered[0].Card);
+            return;
         }
+
+        // 对齐官方 TTargetCardBase.FilterByConditions：经条件过滤后按 LeftSocketId（未入格/技能为 null 排最前）稳定升序输出（插入排序保稳定且零额外分配）
+        for (int i = 1; i < filtered.Count; i++)
+        {
+            var key = filtered[i];
+            int keySlot = key.Card.StartSlot >= 0 ? key.Card.StartSlot : -1;
+            int j = i - 1;
+            while (j >= 0)
+            {
+                int prevSlot = filtered[j].Card.StartSlot >= 0 ? filtered[j].Card.StartSlot : -1;
+                if (prevSlot <= keySlot) break;
+                filtered[j + 1] = filtered[j];
+                j--;
+            }
+            filtered[j + 1] = key;
+        }
+        for (int i = 0; i < filtered.Count; i++)
+            result.Add(filtered[i].Card);
     }
 
     private static IEnumerable<(CardInstance Card, PlayerState Owner)> EnumerateSection(

@@ -406,6 +406,67 @@ public static class MonsterPool
         }
     }
 
+    /// <summary>
+    /// 直接从已单次加载的 <see cref="GameDataRepository"/> 映射全部野怪模板（零 SQLite IO 与零二次 JSON 反序列化）。
+    /// </summary>
+    public static List<MonsterTemplate> FromRepository(GameDataRepository repo)
+    {
+        ArgumentNullException.ThrowIfNull(repo);
+        var list = new List<MonsterTemplate>(repo.MonstersById.Count);
+        foreach (var core in repo.MonstersById.Values)
+        {
+            if (core == null || string.IsNullOrWhiteSpace(core.Id)) continue;
+            var allPlayerAttrs = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            if (core.Player?.Attributes != null)
+            {
+                foreach (var kv in core.Player.Attributes)
+                    allPlayerAttrs[kv.Key] = (int)Math.Round(kv.Value);
+            }
+
+            static List<MonsterTemplate.MonsterItem> MapEntries(IReadOnlyList<MonsterCardEntry>? src)
+            {
+                var res = new List<MonsterTemplate.MonsterItem>(src?.Count ?? 0);
+                if (src == null) return res;
+                for (int i = 0; i < src.Count; i++)
+                {
+                    var it = src[i];
+                    if (it == null || string.IsNullOrWhiteSpace(it.TemplateId)) continue;
+                    var itemAttrs = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    if (it.Attributes != null)
+                    {
+                        foreach (var kv in it.Attributes)
+                            itemAttrs[kv.Key] = (int)Math.Round(kv.Value);
+                    }
+                    res.Add(new MonsterTemplate.MonsterItem
+                    {
+                        SocketId = it.SocketId ?? string.Empty,
+                        TemplateId = it.TemplateId,
+                        Tier = it.Tier ?? "Bronze",
+                        EnchantmentType = it.EnchantmentType ?? string.Empty,
+                        Attributes = itemAttrs,
+                    });
+                }
+                return res;
+            }
+
+            list.Add(new MonsterTemplate
+            {
+                Id = core.Id,
+                InternalName = core.InternalName ?? string.Empty,
+                Prestige = allPlayerAttrs.GetValueOrDefault("Prestige", 20),
+                HealthMax = allPlayerAttrs.GetValueOrDefault("HealthMax", 100),
+                Level = allPlayerAttrs.GetValueOrDefault("Level", 1),
+                Attributes = allPlayerAttrs,
+                Items = MapEntries(core.Player?.Hand?.Items),
+                Skills = MapEntries(core.Player?.Skills),
+                StashItems = MapEntries(core.Player?.Stash?.Items),
+                SocketEffects = MapEntries(core.Player?.SocketEffects),
+            });
+        }
+        Console.WriteLine($"[MonsterPool] (shared repo) mapped {list.Count} monsters (withSkills={list.Count(m => m.Skills.Count > 0)})");
+        return list;
+    }
+
     public static List<MonsterTemplate> Load(string dbPath)
     {
         var list = new List<MonsterTemplate>();

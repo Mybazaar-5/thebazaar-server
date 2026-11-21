@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "engine": "Pillow (2x 超采样抗锯齿)",
+  "assets": [
+    {
+      "filename": "starport_compass_blade.png",
+      "width": 512,
+      "height": 1024,
+      "bytes": 223189,
+      "sha256": "3417aebb81f07bf8d4ec0c6a401ad21fa794e4e589855b0c44c23bb732e92d18",
+      "customArtHash": "sha256:3417aebb81f07bf8d4ec0c6a401ad21fa794e4e589855b0c44c23bb732e92d18",
+      "cardId": "bazaar-chronicles-sample:starport_compass_blade",
+      "titleZh": "星港罗盘短刃",
+      "logicalPath": "assets/starport_compass_blade.png"
+    },
+    {
+      "filename": "aether_bulwark_lantern.png",
+      "width": 512,
+      "height": 512,
+      "bytes": 143927,
+      "sha256": "613ad599a7fb7e051fd9a0a14e5a8aa4fa296bbd98b01d2ffa94fca673928ab0",
+      "customArtHash": "sha256:613ad599a7fb7e051fd9a0a14e5a8aa4fa296bbd98b01d2ffa94fca673928ab0",
+      "cardId": "bazaar-chronicles-sample:aether_bulwark_lantern",
+      "titleZh": "以太壁垒提灯",
+      "logicalPath": "assets/aether_bulwark_lantern.png"
+    },
+    {
+      "filename": "solar_kiln_furnace.png",
+      "width": 512,
+      "height": 512,
+      "bytes": 155255,
+      "sha256": "2bf06d807370b6ab8f39718c45ad8bf90f8dad5a5f0add62b617f7f6c7d6ba6f",
+      "customArtHash": "sha256:2bf06d807370b6ab8f39718c45ad8bf90f8dad5a5f0add62b617f7f6c7d6ba6f",
+      "cardId": "bazaar-chronicles-sample:solar_kiln_furnace",
+      "titleZh": "日耀熔炉",
+      "logicalPath": "assets/solar_kiln_furnace.png"
+    },
+    {
+      "filename": "starport_dreadnought_vault.png",
+      "width": 512,
+      "height": 1024,
+      "bytes": 186507,
+      "sha256": "7c28d634f7863288ed7c034555b67b7b52e278c83bb140e516db958df7380bd9",
+      "customArtHash": "sha256:7c28d634f7863288ed7c034555b67b7b52e278c83bb140e516db958df7380bd9",
+      "cardId": "bazaar-chronicles-sample:starport_dreadnought_vault",
+      "titleZh": "星港无畏宝库舰",
+      "logicalPath": "assets/starport_dreadnought_vault.png"
+    },
+    {
+      "filename": "starport_trade_charter.png",
+      "width": 512,
+      "height": 512,
+      "bytes": 143562,
+      "sha256": "ca0cde03d4018c23678ea6d7872b2a2aecf3eaf537ef6dda1e3dda7b6f2aabeb",
+      "customArtHash": "sha256:ca0cde03d4018c23678ea6d7872b2a2aecf3eaf537ef6dda1e3dda7b6f2aabeb",
+      "cardId": "bazaar-chronicles-sample:starport_trade_charter",
+      "titleZh": "星港贸易特许状",
+      "logicalPath": "assets/starport_trade_charter.png"
+    },
+    {
+      "filename": "ember_tide_resonance.png",
+      "width": 512,
+      "height": 512,
+      "bytes": 130538,
+      "sha256": "a97debb7ba32ffb98b3b6043843ad5c0bfda8688057c77283e727bfd250374e4",
+      "customArtHash": "sha256:a97debb7ba32ffb98b3b6043843ad5c0bfda8688057c77283e727bfd250374e4",
+      "cardId": "bazaar-chronicles-sample:ember_tide_resonance",
+      "titleZh": "余烬潮汐共鸣",
+      "logicalPath": "assets/ember_tide_resonance.png"
+    }
+  ]
+}

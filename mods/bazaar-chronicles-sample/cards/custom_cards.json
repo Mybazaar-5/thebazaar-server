@@ -1,0 +1,862 @@
+{
+  "$schema": "https://bazaar-local.schema/mod-custom-cards/v1",
+  "schemaVersion": 1,
+  "modId": "bazaar-chronicles-sample",
+  "cards": [
+    {
+      "customId": "bazaar-chronicles-sample:starport_compass_blade",
+      "internalName": "Starport Compass Blade",
+      "type": "Item",
+      "size": "Small",
+      "startingTier": "Bronze",
+      "spawningEligibility": "Always",
+      "heroes": [
+        "Common"
+      ],
+      "tags": [
+        "Weapon",
+        "Tool"
+      ],
+      "hiddenTags": [
+        "Damage",
+        "Economy"
+      ],
+      "baseVisualTemplateId": "03b1fd16-6b0d-4847-a76f-6c586f7c5958",
+      "baseVisualNote": "载体：Kukri (Item, Small, valid_card_ids.json 白名单校验通过)",
+      "customArt": {
+        "logicalPath": "assets/starport_compass_blade.png",
+        "sha256": "3417aebb81f07bf8d4ec0c6a401ad21fa794e4e589855b0c44c23bb732e92d18",
+        "customArtHash": "sha256:3417aebb81f07bf8d4ec0c6a401ad21fa794e4e589855b0c44c23bb732e92d18",
+        "width": 512,
+        "height": 1024,
+        "cropMode": "cover"
+      },
+      "accentColor": "#60D2FF",
+      "nameZh": "星港罗盘短刃",
+      "descZh": "星港领航员的防身短刃，每逢相邻工具运转便以星轨校准锋芒，并从战斗中敛财。",
+      "activeTooltipsZh": [
+        "造成 {attr.DamageAmount} 点伤害并获得 {attr.GoldGainAmount} 金币"
+      ],
+      "passiveTooltipsZh": [
+        "当你使用相邻工具时，此物品在本场战斗中获得 +{attr.Custom_0} 伤害"
+      ],
+      "enchantTooltipsZh": {
+        "Fiery": [
+          "额外施加等同于此物品伤害 10% 的灼烧"
+        ],
+        "Deadly": [
+          "获得 +50% 暴击率"
+        ],
+        "Turbo": [
+          "使相邻物品加速 1 秒"
+        ]
+      },
+      "tiers": {
+        "Bronze": {
+          "attributes": {
+            "BuyPrice": 2,
+            "SellPrice": 1,
+            "CooldownMax": 4000,
+            "DamageAmount": 12,
+            "GoldGainAmount": 1,
+            "Custom_0": 4,
+            "CritChance": 5
+          }
+        },
+        "Silver": {
+          "attributes": {
+            "BuyPrice": 4,
+            "SellPrice": 2,
+            "CooldownMax": 4000,
+            "DamageAmount": 24,
+            "GoldGainAmount": 1,
+            "Custom_0": 8,
+            "CritChance": 10
+          }
+        },
+        "Gold": {
+          "attributes": {
+            "BuyPrice": 8,
+            "SellPrice": 4,
+            "CooldownMax": 3500,
+            "DamageAmount": 48,
+            "GoldGainAmount": 2,
+            "Custom_0": 16,
+            "CritChance": 15
+          }
+        },
+        "Diamond": {
+          "attributes": {
+            "BuyPrice": 16,
+            "SellPrice": 8,
+            "CooldownMax": 3500,
+            "DamageAmount": 96,
+            "GoldGainAmount": 3,
+            "Custom_0": 32,
+            "CritChance": 20
+          }
+        }
+      },
+      "abilities": {
+        "0": {
+          "id": "0",
+          "trigger": {
+            "$type": "TTriggerOnCardFired"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionPlayerDamage",
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Opponent"
+            }
+          }
+        },
+        "1": {
+          "id": "1",
+          "trigger": {
+            "$type": "TTriggerOnCardFired"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionPlayerModifyAttribute",
+            "attributeType": "Gold",
+            "operation": "Add",
+            "value": {
+              "$type": "TReferenceValueCardAttribute",
+              "attributeType": "GoldGainAmount"
+            },
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Self"
+            }
+          }
+        },
+        "2": {
+          "id": "2",
+          "trigger": {
+            "$type": "TTriggerOnItemUsed",
+            "subject": {
+              "$type": "TTargetCardPositional",
+              "origin": "Self",
+              "targetMode": "Neighbor",
+              "conditions": {
+                "$type": "TCardConditionalTag",
+                "tags": [
+                  "Tool"
+                ],
+                "operator": "Any"
+              }
+            }
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionCardModifyAttribute",
+            "attributeType": "DamageAmount",
+            "operation": "Add",
+            "value": {
+              "$type": "TReferenceValueCardAttribute",
+              "attributeType": "Custom_0"
+            },
+            "target": {
+              "$type": "TTargetCardSelf"
+            }
+          }
+        }
+      },
+      "auras": {}
+    },
+    {
+      "customId": "bazaar-chronicles-sample:aether_bulwark_lantern",
+      "internalName": "Aether Bulwark Lantern",
+      "type": "Item",
+      "size": "Medium",
+      "startingTier": "Silver",
+      "spawningEligibility": "Always",
+      "heroes": [
+        "Common"
+      ],
+      "tags": [
+        "Tool",
+        "Relic"
+      ],
+      "hiddenTags": [
+        "Shield",
+        "Haste"
+      ],
+      "baseVisualTemplateId": "07df297d-e116-42a4-9596-4af674764d1b",
+      "baseVisualNote": "载体：Globe (Item, Medium, valid_card_ids.json 白名单校验通过)",
+      "customArt": {
+        "logicalPath": "assets/aether_bulwark_lantern.png",
+        "sha256": "613ad599a7fb7e051fd9a0a14e5a8aa4fa296bbd98b01d2ffa94fca673928ab0",
+        "customArtHash": "sha256:613ad599a7fb7e051fd9a0a14e5a8aa4fa296bbd98b01d2ffa94fca673928ab0",
+        "width": 512,
+        "height": 512,
+        "cropMode": "cover"
+      },
+      "accentColor": "#5EF5D6",
+      "nameZh": "以太壁垒提灯",
+      "descZh": "以精炼以太水晶驱动的星港护航提灯，资金充裕时展开双倍壁垒结界并催动邻近装备加速。",
+      "activeTooltipsZh": [
+        "获得 {attr.ShieldApplyAmount} 点护盾，并使相邻物品加速 {attr.HasteAmount} 秒"
+      ],
+      "passiveTooltipsZh": [
+        "当你拥有至少 20 金币时，此物品提供的护盾翻倍"
+      ],
+      "enchantTooltipsZh": {
+        "Shielded": [
+          "此物品的护盾值额外提高 50%"
+        ],
+        "Restorative": [
+          "同时治疗等同于此物品护盾值的生命值"
+        ],
+        "Icy": [
+          "同时冻结一件敌方小型或中型物品 1 秒"
+        ]
+      },
+      "tiers": {
+        "Silver": {
+          "attributes": {
+            "BuyPrice": 8,
+            "SellPrice": 4,
+            "CooldownMax": 5000,
+            "ShieldApplyAmount": 35,
+            "HasteAmount": 1000,
+            "HasteTargets": 2
+          }
+        },
+        "Gold": {
+          "attributes": {
+            "BuyPrice": 16,
+            "SellPrice": 8,
+            "CooldownMax": 5000,
+            "ShieldApplyAmount": 70,
+            "HasteAmount": 1500,
+            "HasteTargets": 2
+          }
+        },
+        "Diamond": {
+          "attributes": {
+            "BuyPrice": 32,
+            "SellPrice": 16,
+            "CooldownMax": 4500,
+            "ShieldApplyAmount": 140,
+            "HasteAmount": 2000,
+            "HasteTargets": 2
+          }
+        }
+      },
+      "abilities": {
+        "0": {
+          "id": "0",
+          "trigger": {
+            "$type": "TTriggerOnCardFired"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionPlayerShieldApply",
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Self"
+            }
+          }
+        },
+        "1": {
+          "id": "1",
+          "trigger": {
+            "$type": "TTriggerOnCardFired"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionCardHaste",
+            "target": {
+              "$type": "TTargetCardPositional",
+              "origin": "Self",
+              "targetMode": "Neighbor"
+            }
+          }
+        }
+      },
+      "auras": {
+        "0": {
+          "id": "0",
+          "activeIn": "HandOnly",
+          "prerequisites": [
+            {
+              "$type": "TPrerequisitePlayerAttribute",
+              "attributeType": "Gold",
+              "comparison": "GreaterThanOrEqual",
+              "value": {
+                "$type": "TFixedValue",
+                "value": 20.0
+              }
+            }
+          ],
+          "action": {
+            "$type": "TAuraActionCardModifyAttribute",
+            "attributeType": "ShieldApplyAmount",
+            "operation": "Multiply",
+            "value": {
+              "$type": "TFixedValue",
+              "value": 2.0
+            },
+            "target": {
+              "$type": "TTargetCardSelf"
+            }
+          }
+        }
+      }
+    },
+    {
+      "customId": "bazaar-chronicles-sample:solar_kiln_furnace",
+      "internalName": "Solar Kiln Furnace",
+      "type": "Item",
+      "size": "Medium",
+      "startingTier": "Bronze",
+      "spawningEligibility": "Always",
+      "heroes": [
+        "Common"
+      ],
+      "tags": [
+        "Tool",
+        "Core"
+      ],
+      "hiddenTags": [
+        "Burn",
+        "Charge"
+      ],
+      "baseVisualTemplateId": "08630fca-24b9-4d9b-9dbf-7da743a09dfa",
+      "baseVisualNote": "载体：Welding Helmet (Item, Medium, valid_card_ids.json 白名单校验通过)",
+      "customArt": {
+        "logicalPath": "assets/solar_kiln_furnace.png",
+        "sha256": "2bf06d807370b6ab8f39718c45ad8bf90f8dad5a5f0add62b617f7f6c7d6ba6f",
+        "customArtHash": "sha256:2bf06d807370b6ab8f39718c45ad8bf90f8dad5a5f0add62b617f7f6c7d6ba6f",
+        "width": 512,
+        "height": 512,
+        "cropMode": "cover"
+      },
+      "accentColor": "#FFA830",
+      "nameZh": "日耀熔炉",
+      "descZh": "从星港炼金船坞拆下的高热炉芯，能吸收相邻装置的余热急速蓄能并倾泻灼烧浪潮。",
+      "activeTooltipsZh": [
+        "对敌方施加 {attr.BurnApplyAmount} 层灼烧"
+      ],
+      "passiveTooltipsZh": [
+        "当你使用任意相邻物品时，使此物品充能 {attr.ChargeAmount} 秒"
+      ],
+      "enchantTooltipsZh": {
+        "Fiery": [
+          "此物品的灼烧层数翻倍"
+        ],
+        "Shielded": [
+          "同时获得等同于此物品灼烧层数 5 倍的护盾"
+        ],
+        "Obsidian": [
+          "同时造成等同于此物品灼烧层数 10 倍的伤害"
+        ]
+      },
+      "tiers": {
+        "Bronze": {
+          "attributes": {
+            "BuyPrice": 4,
+            "SellPrice": 2,
+            "CooldownMax": 6000,
+            "BurnApplyAmount": 4,
+            "ChargeAmount": 1000
+          }
+        },
+        "Silver": {
+          "attributes": {
+            "BuyPrice": 8,
+            "SellPrice": 4,
+            "CooldownMax": 6000,
+            "BurnApplyAmount": 8,
+            "ChargeAmount": 1000
+          }
+        },
+        "Gold": {
+          "attributes": {
+            "BuyPrice": 16,
+            "SellPrice": 8,
+            "CooldownMax": 5500,
+            "BurnApplyAmount": 14,
+            "ChargeAmount": 1200
+          }
+        },
+        "Diamond": {
+          "attributes": {
+            "BuyPrice": 32,
+            "SellPrice": 16,
+            "CooldownMax": 5000,
+            "BurnApplyAmount": 24,
+            "ChargeAmount": 1500
+          }
+        }
+      },
+      "abilities": {
+        "0": {
+          "id": "0",
+          "trigger": {
+            "$type": "TTriggerOnCardFired"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionPlayerBurnApply",
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Opponent"
+            }
+          }
+        },
+        "1": {
+          "id": "1",
+          "trigger": {
+            "$type": "TTriggerOnItemUsed",
+            "subject": {
+              "$type": "TTargetCardPositional",
+              "origin": "Self",
+              "targetMode": "Neighbor"
+            }
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionCardCharge",
+            "target": {
+              "$type": "TTargetCardSelf"
+            }
+          }
+        }
+      },
+      "auras": {}
+    },
+    {
+      "customId": "bazaar-chronicles-sample:starport_dreadnought_vault",
+      "internalName": "Starport Dreadnought Vault",
+      "type": "Item",
+      "size": "Large",
+      "startingTier": "Gold",
+      "spawningEligibility": "Always",
+      "heroes": [
+        "Common"
+      ],
+      "tags": [
+        "Vehicle",
+        "Property",
+        "Weapon"
+      ],
+      "hiddenTags": [
+        "Damage",
+        "Shield",
+        "Burn",
+        "Economy"
+      ],
+      "baseVisualTemplateId": "0930fbea-e3ae-45d4-a1c7-a26c5abb63aa",
+      "baseVisualNote": "载体：Lightning Rod (Item, Large, valid_card_ids.json 白名单校验通过)",
+      "customArt": {
+        "logicalPath": "assets/starport_dreadnought_vault.png",
+        "sha256": "7c28d634f7863288ed7c034555b67b7b52e278c83bb140e516db958df7380bd9",
+        "customArtHash": "sha256:7c28d634f7863288ed7c034555b67b7b52e278c83bb140e516db958df7380bd9",
+        "width": 512,
+        "height": 1024,
+        "cropMode": "cover"
+      },
+      "accentColor": "#FFC654",
+      "nameZh": "星港无畏宝库舰",
+      "descZh": "星港商会引以为傲的浮空武装金库旗舰，将金库储备直接转化为毁灭炮火与厚重护盾。",
+      "activeTooltipsZh": [
+        "造成 {attr.DamageAmount} 点伤害、获得 {attr.ShieldApplyAmount} 点护盾并施加 {attr.BurnApplyAmount} 层灼烧"
+      ],
+      "passiveTooltipsZh": [
+        "你每拥有 10 金币，此物品获得 +{attr.Custom_0} 伤害与 +{attr.Custom_0} 护盾；每天开始时获得 +{attr.Custom_1} 金币"
+      ],
+      "enchantTooltipsZh": {
+        "Shiny": [
+          "此物品获得 +1 多重施放"
+        ],
+        "Radiant": [
+          "免疫冻结、减速与摧毁"
+        ],
+        "Obsidian": [
+          "获得吸血"
+        ]
+      },
+      "tiers": {
+        "Gold": {
+          "attributes": {
+            "BuyPrice": 24,
+            "SellPrice": 12,
+            "CooldownMax": 7000,
+            "DamageAmount": 80,
+            "ShieldApplyAmount": 80,
+            "BurnApplyAmount": 8,
+            "Custom_0": 15,
+            "Custom_1": 3
+          }
+        },
+        "Diamond": {
+          "attributes": {
+            "BuyPrice": 48,
+            "SellPrice": 24,
+            "CooldownMax": 6500,
+            "DamageAmount": 160,
+            "ShieldApplyAmount": 160,
+            "BurnApplyAmount": 16,
+            "Custom_0": 30,
+            "Custom_1": 5
+          }
+        }
+      },
+      "abilities": {
+        "0": {
+          "id": "0",
+          "trigger": {
+            "$type": "TTriggerOnCardFired"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionPlayerDamage",
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Opponent"
+            }
+          }
+        },
+        "1": {
+          "id": "1",
+          "trigger": {
+            "$type": "TTriggerOnCardFired"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionPlayerShieldApply",
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Self"
+            }
+          }
+        },
+        "2": {
+          "id": "2",
+          "trigger": {
+            "$type": "TTriggerOnCardFired"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionPlayerBurnApply",
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Opponent"
+            }
+          }
+        },
+        "3": {
+          "id": "3",
+          "trigger": {
+            "$type": "TTriggerOnDayStarted"
+          },
+          "activeIn": "HandAndStash",
+          "action": {
+            "$type": "TActionPlayerModifyAttribute",
+            "attributeType": "Gold",
+            "operation": "Add",
+            "value": {
+              "$type": "TReferenceValueCardAttribute",
+              "attributeType": "Custom_1"
+            },
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Self"
+            }
+          }
+        }
+      },
+      "auras": {
+        "0": {
+          "id": "0",
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TAuraActionCardModifyAttribute",
+            "attributeType": "DamageAmount",
+            "operation": "Add",
+            "value": {
+              "$type": "TReferenceValuePlayerAttribute",
+              "attributeType": "Gold",
+              "modifier": {
+                "modifyMode": "Multiply",
+                "value": {
+                  "$type": "TFixedValue",
+                  "value": 1.5
+                }
+              }
+            },
+            "target": {
+              "$type": "TTargetCardSelf"
+            }
+          }
+        },
+        "1": {
+          "id": "1",
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TAuraActionCardModifyAttribute",
+            "attributeType": "ShieldApplyAmount",
+            "operation": "Add",
+            "value": {
+              "$type": "TReferenceValuePlayerAttribute",
+              "attributeType": "Gold",
+              "modifier": {
+                "modifyMode": "Multiply",
+                "value": {
+                  "$type": "TFixedValue",
+                  "value": 1.5
+                }
+              }
+            },
+            "target": {
+              "$type": "TTargetCardSelf"
+            }
+          }
+        }
+      }
+    },
+    {
+      "customId": "bazaar-chronicles-sample:starport_trade_charter",
+      "internalName": "Starport Trade Charter",
+      "type": "Skill",
+      "size": "Medium",
+      "startingTier": "Silver",
+      "spawningEligibility": "Always",
+      "heroes": [
+        "Common"
+      ],
+      "tags": [
+        "Merchant",
+        "Weapon"
+      ],
+      "hiddenTags": [
+        "Damage",
+        "Economy"
+      ],
+      "baseVisualTemplateId": "0045d15e-ac74-436f-a200-eeedab7baf90",
+      "baseVisualNote": "载体：Backroom Dealings (Skill, Medium, valid_card_ids.json 白名单校验通过)",
+      "customArt": {
+        "logicalPath": "assets/starport_trade_charter.png",
+        "sha256": "ca0cde03d4018c23678ea6d7872b2a2aecf3eaf537ef6dda1e3dda7b6f2aabeb",
+        "customArtHash": "sha256:ca0cde03d4018c23678ea6d7872b2a2aecf3eaf537ef6dda1e3dda7b6f2aabeb",
+        "width": 512,
+        "height": 512,
+        "cropMode": "contain"
+      },
+      "accentColor": "#FFE07A",
+      "nameZh": "星港贸易特许状",
+      "descZh": "星港议会签发的金色特许纹章，财力越雄厚则全员武器越具威慑力。",
+      "activeTooltipsZh": [],
+      "passiveTooltipsZh": [
+        "你每拥有 10 金币，你的所有武器获得 +{attr.Custom_0} 伤害；每次赢得战斗后额外获得 {attr.Custom_1} 金币"
+      ],
+      "tiers": {
+        "Silver": {
+          "attributes": {
+            "BuyPrice": 10,
+            "SellPrice": 5,
+            "Custom_0": 3,
+            "Custom_1": 3
+          }
+        },
+        "Gold": {
+          "attributes": {
+            "BuyPrice": 20,
+            "SellPrice": 10,
+            "Custom_0": 6,
+            "Custom_1": 5
+          }
+        },
+        "Diamond": {
+          "attributes": {
+            "BuyPrice": 40,
+            "SellPrice": 20,
+            "Custom_0": 12,
+            "Custom_1": 8
+          }
+        }
+      },
+      "abilities": {
+        "0": {
+          "id": "0",
+          "trigger": {
+            "$type": "TTriggerOnFightEnded",
+            "combatOutcome": "Win"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionPlayerModifyAttribute",
+            "attributeType": "Gold",
+            "operation": "Add",
+            "value": {
+              "$type": "TReferenceValueCardAttribute",
+              "attributeType": "Custom_1"
+            },
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Self"
+            }
+          }
+        }
+      },
+      "auras": {
+        "0": {
+          "id": "0",
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TAuraActionCardModifyAttribute",
+            "attributeType": "DamageAmount",
+            "operation": "Add",
+            "value": {
+              "$type": "TReferenceValuePlayerAttribute",
+              "attributeType": "Gold",
+              "modifier": {
+                "modifyMode": "Multiply",
+                "value": {
+                  "$type": "TFixedValue",
+                  "value": 0.3
+                }
+              }
+            },
+            "target": {
+              "$type": "TTargetCardSection",
+              "targetSection": "SelfHand",
+              "conditions": {
+                "$type": "TCardConditionalTag",
+                "tags": [
+                  "Weapon"
+                ],
+                "operator": "Any"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "customId": "bazaar-chronicles-sample:ember_tide_resonance",
+      "internalName": "Ember Tide Resonance",
+      "type": "Skill",
+      "size": "Medium",
+      "startingTier": "Bronze",
+      "spawningEligibility": "Always",
+      "heroes": [
+        "Common"
+      ],
+      "tags": [
+        "Tool"
+      ],
+      "hiddenTags": [
+        "Burn",
+        "Shield"
+      ],
+      "baseVisualTemplateId": "0283b102-e0ef-4df4-b447-c5208049bf02",
+      "baseVisualNote": "载体：Buffed and Polished (Skill, Medium, valid_card_ids.json 白名单校验通过)",
+      "customArt": {
+        "logicalPath": "assets/ember_tide_resonance.png",
+        "sha256": "a97debb7ba32ffb98b3b6043843ad5c0bfda8688057c77283e727bfd250374e4",
+        "customArtHash": "sha256:a97debb7ba32ffb98b3b6043843ad5c0bfda8688057c77283e727bfd250374e4",
+        "width": 512,
+        "height": 512,
+        "cropMode": "contain"
+      },
+      "accentColor": "#FF7A3A",
+      "nameZh": "余烬潮汐共鸣",
+      "descZh": "将烈焰余烬与壁垒潮汐交织共振，攻守流转生生不息。",
+      "activeTooltipsZh": [],
+      "passiveTooltipsZh": [
+        "当你施加灼烧时，获得 {attr.Custom_0} 点护盾；当你获得护盾时，你的灼烧物品在本场战斗中获得 +{attr.Custom_1} 灼烧"
+      ],
+      "tiers": {
+        "Bronze": {
+          "attributes": {
+            "BuyPrice": 5,
+            "SellPrice": 2,
+            "Custom_0": 6,
+            "Custom_1": 1
+          }
+        },
+        "Silver": {
+          "attributes": {
+            "BuyPrice": 10,
+            "SellPrice": 5,
+            "Custom_0": 12,
+            "Custom_1": 2
+          }
+        },
+        "Gold": {
+          "attributes": {
+            "BuyPrice": 20,
+            "SellPrice": 10,
+            "Custom_0": 24,
+            "Custom_1": 3
+          }
+        },
+        "Diamond": {
+          "attributes": {
+            "BuyPrice": 40,
+            "SellPrice": 20,
+            "Custom_0": 48,
+            "Custom_1": 5
+          }
+        }
+      },
+      "abilities": {
+        "0": {
+          "id": "0",
+          "trigger": {
+            "$type": "TTriggerOnPlayerAttributeChanged",
+            "attributeType": "Burn",
+            "changeType": "Gain"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionPlayerShieldApply",
+            "value": {
+              "$type": "TReferenceValueCardAttribute",
+              "attributeType": "Custom_0"
+            },
+            "target": {
+              "$type": "TTargetPlayerRelative",
+              "targetMode": "Self"
+            }
+          }
+        },
+        "1": {
+          "id": "1",
+          "trigger": {
+            "$type": "TTriggerOnPlayerAttributeChanged",
+            "attributeType": "Shield",
+            "changeType": "Gain"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionCardModifyAttribute",
+            "attributeType": "BurnApplyAmount",
+            "operation": "Add",
+            "value": {
+              "$type": "TReferenceValueCardAttribute",
+              "attributeType": "Custom_1"
+            },
+            "target": {
+              "$type": "TTargetCardSection",
+              "targetSection": "SelfHand",
+              "conditions": {
+                "$type": "TCardConditionalHiddenTag",
+                "tags": [
+                  "Burn"
+                ],
+                "operator": "Any"
+              }
+            }
+          }
+        }
+      },
+      "auras": {}
+    }
+  ]
+}

@@ -141,6 +141,8 @@ public sealed class CardPermanentSyncDelta
     public List<string> NewlyCompletedQuests { get; init; } = new();
     public string? TransformReplacementTemplateId { get; init; }
     public CardInstance? TransformedReplacementCard { get; init; }
+    /// <summary>多产物永久变形时产生的第 2..N 张附加替换卡（保留第 1 张在 TransformedReplacementCard 以 100% 兼容旧消费端）。</summary>
+    public List<CardInstance> AdditionalTransformedReplacements { get; init; } = new();
 }
 
 /// <summary>战后永久状态同步结果（供自动或显式 SyncPermanentChangesBack 消费）。</summary>
@@ -150,8 +152,10 @@ public sealed class PostCombatPermanentSyncResult
     public List<CardPermanentSyncDelta> UpdatedCards { get; init; } = new();
     public List<CardInstance> SpawnedCards { get; init; } = new();
     public Dictionary<string, double> PlayerAttributeDeltas { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>按原始卡牌 InstanceId 索引的完整永久变形产物列表（支持一对多永久变形，修复 P1-3）。</summary>
+    public Dictionary<string, List<CardInstance>> PermanentReplacements { get; init; } = new(StringComparer.Ordinal);
     public bool HasAnyChanges =>
-        UpdatedCards.Count > 0 || SpawnedCards.Count > 0 || PlayerAttributeDeltas.Count > 0;
+        UpdatedCards.Count > 0 || SpawnedCards.Count > 0 || PlayerAttributeDeltas.Count > 0 || PermanentReplacements.Count > 0;
 }
 
 public sealed class CombatResult

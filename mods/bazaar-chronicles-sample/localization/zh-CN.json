@@ -1,0 +1,61 @@
+{
+  "$schema": "https://bazaar-local.schema/mod-localization/v1",
+  "schemaVersion": 1,
+  "modId": "bazaar-chronicles-sample",
+  "locale": "zh-CN",
+  "entries": {
+    "mod.name": "大巴扎编年史：星港奇物志",
+    "mod.summary": "新增 4 件原创星港物品、2 项星港专属技能、2 步联动黑市走私船奇遇链与 2 条肉鸽词条。",
+
+    "card.bazaar-chronicles-sample:starport_compass_blade.title": "星港罗盘短刃",
+    "card.bazaar-chronicles-sample:starport_compass_blade.desc": "星港领航员的防身短刃，每逢相邻工具运转便以星轨校准锋芒，并从战斗中敛财。",
+    "card.bazaar-chronicles-sample:starport_compass_blade.active.0": "造成 {attr.DamageAmount} 点伤害并获得 {attr.GoldGainAmount} 金币",
+    "card.bazaar-chronicles-sample:starport_compass_blade.passive.0": "当你使用相邻工具时，此物品在本场战斗中获得 +{attr.Custom_0} 伤害",
+
+    "card.bazaar-chronicles-sample:aether_bulwark_lantern.title": "以太壁垒提灯",
+    "card.bazaar-chronicles-sample:aether_bulwark_lantern.desc": "以精炼以太水晶驱动的星港护航提灯，资金充裕时展开双倍壁垒结界并催动邻近装备加速。",
+    "card.bazaar-chronicles-sample:aether_bulwark_lantern.active.0": "获得 {attr.ShieldApplyAmount} 点护盾，并使相邻物品加速 {attr.HasteAmount} 秒",
+    "card.bazaar-chronicles-sample:aether_bulwark_lantern.passive.0": "当你拥有至少 20 金币时，此物品提供的护盾翻倍",
+
+    "card.bazaar-chronicles-sample:solar_kiln_furnace.title": "日耀熔炉",
+    "card.bazaar-chronicles-sample:solar_kiln_furnace.desc": "从星港炼金船坞拆下的高热炉芯，能吸收相邻装置的余热急速蓄能并倾泻灼烧浪潮。",
+    "card.bazaar-chronicles-sample:solar_kiln_furnace.active.0": "对敌方施加 {attr.BurnApplyAmount} 层灼烧",
+    "card.bazaar-chronicles-sample:solar_kiln_furnace.passive.0": "当你使用任意相邻物品时，使此物品充能 {attr.ChargeAmount} 秒",
+
+    "card.bazaar-chronicles-sample:starport_dreadnought_vault.title": "星港无畏宝库舰",
+    "card.bazaar-chronicles-sample:starport_dreadnought_vault.desc": "星港商会引以为傲的浮空武装金库旗舰，将金库储备直接转化为毁灭炮火与厚重护盾。",
+    "card.bazaar-chronicles-sample:starport_dreadnought_vault.active.0": "造成 {attr.DamageAmount} 点伤害、获得 {attr.ShieldApplyAmount} 点护盾并施加 {attr.BurnApplyAmount} 层灼烧",
+    "card.bazaar-chronicles-sample:starport_dreadnought_vault.passive.0": "你每拥有 10 金币，此物品获得 +{attr.Custom_0} 伤害与 +{attr.Custom_0} 护盾；每天开始时获得 +{attr.Custom_1} 金币",
+
+    "card.bazaar-chronicles-sample:starport_trade_charter.title": "星港贸易特许状",
+    "card.bazaar-chronicles-sample:starport_trade_charter.desc": "星港议会签发的金色特许纹章，财力越雄厚则全员武器越具威慑力。",
+    "card.bazaar-chronicles-sample:starport_trade_charter.passive.0": "你每拥有 10 金币，你的所有武器获得 +{attr.Custom_0} 伤害；每次赢得战斗后额外获得 {attr.Custom_1} 金币",
+
+    "card.bazaar-chronicles-sample:ember_tide_resonance.title": "余烬潮汐共鸣",
+    "card.bazaar-chronicles-sample:ember_tide_resonance.desc": "将烈焰余烬与壁垒潮汐交织共振，攻守流转生生不息。",
+    "card.bazaar-chronicles-sample:ember_tide_resonance.passive.0": "当你施加灼烧时，获得 {attr.Custom_0} 点护盾；当你获得护盾时，你的灼烧物品在本场战斗中获得 +{attr.Custom_1} 灼烧",
+
+    "event.bazaar-chronicles-sample:event_smuggler_vessel.title": "星港黑市走私船",
+    "event.bazaar-chronicles-sample:event_smuggler_vessel.desc": "一艘熄灯停泊在星港外锚地的改装走私船向你发出暗语：船舱里藏有未登记的星港奇物与违禁改装台。",
+    "step.bazaar-chronicles-sample:step_inspect_cargo.title": "支付入场费登船验货",
+    "step.bazaar-chronicles-sample:step_inspect_cargo.desc": "花费 6 金币进入黑市船舱密室，进一步选择走私奇物、强化改装或截留账本。",
+    "step.bazaar-chronicles-sample:step_barter_salvage.title": "码头快速倒卖",
+    "step.bazaar-chronicles-sample:step_barter_salvage.desc": "获得 4 金币、1 点经验值，并使你最左侧物品获得 +10 伤害或护盾。",
+    "step.bazaar-chronicles-sample:step_tip_off_guards.title": "向港务局密报",
+    "step.bazaar-chronicles-sample:step_tip_off_guards.desc": "恢复 2 点声望，并免费习得 1 项星港专属技能。",
+
+    "event.bazaar-chronicles-sample:event_smuggler_vault.title": "黑市船舱密室",
+    "event.bazaar-chronicles-sample:event_smuggler_vault.desc": "穿过两道气密舱门后，灯光照亮了三箱罕见的走私货物与一台滋滋作响的非法改装炉。",
+    "step.bazaar-chronicles-sample:step_claim_curio.title": "提走星港奇物箱",
+    "step.bazaar-chronicles-sample:step_claim_curio.desc": "从本扩展包 4 件星港专属自定义奇物中展示 3 件，免费选取 1 件收入囊中。",
+    "step.bazaar-chronicles-sample:step_overclock_weapon.title": "黑市走私超频改装",
+    "step.bazaar-chronicles-sample:step_overclock_weapon.desc": "升级你最左侧的物品 1 个品阶；若已是钻石级，则冷却缩短 15% 并附加炽焰附魔。",
+    "step.bazaar-chronicles-sample:step_take_manifest_gold.title": "截留走私账本与金砖",
+    "step.bazaar-chronicles-sample:step_take_manifest_gold.desc": "立刻获取 14 金币，并使你的每日收入永久提高 +2。",
+
+    "mutator.bazaar-chronicles-sample:mutator_starport_boom.name": "星港商潮",
+    "mutator.bazaar-chronicles-sample:mutator_starport_boom.desc": "开局 +8 金币、+2 每日收入且商店首次刷新免费；野怪生命值提高 15%。",
+    "mutator.bazaar-chronicles-sample:mutator_ember_tempest.name": "余烬风暴",
+    "mutator.bazaar-chronicles-sample:mutator_ember_tempest.desc": "战斗 12 秒后双方同步叠加灼烧并每秒为全场物品充能 0.25 秒，沙暴提前 5 秒降临。"
+  }
+}

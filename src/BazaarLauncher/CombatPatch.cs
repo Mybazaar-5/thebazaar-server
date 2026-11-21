@@ -63,18 +63,23 @@ internal static class CombatPatch
         get => _speedOverride;
         set
         {
-            _speedOverride = Math.Max(0f, value);
-            if (_inSimulateLoop)
+            float clamped = Math.Max(0f, value);
+            _speedOverride = clamped;
+            // 线程安全（修复 P1-5）：严禁在 HTTP 线程直接写 Unity Time.fixedDeltaTime 或调 CombatSimHandler.SetSpeed
+            BazaarLauncher.Core.MainThreadDispatcher.Enqueue(() =>
             {
-                float target = _speedOverride > 0.1f ? _speedOverride : GetEffectiveTargetSpeed();
-                SyncFixedDeltaTimeForSpeed(target);
-                ApplySpeedToActiveHandler(target);
-            }
-            else
-            {
-                SyncFixedDeltaTimeForSpeed(1f);
-            }
-            CustomGameplayUI.Instance?.NotifyCombatSpeedChangedOnMain();
+                if (_inSimulateLoop)
+                {
+                    float target = _speedOverride > 0.1f ? _speedOverride : GetEffectiveTargetSpeed();
+                    SyncFixedDeltaTimeForSpeed(target);
+                    ApplySpeedToActiveHandler(target);
+                }
+                else
+                {
+                    SyncFixedDeltaTimeForSpeed(1f);
+                }
+                CustomGameplayUI.Instance?.NotifyCombatSpeedChangedOnMain();
+            });
         }
     }
 
@@ -180,6 +185,18 @@ internal static class CombatPatch
         }
     }
 
+    internal static void ResetAppliedFlag()
+    {
+        _applied = false;
+        UnregisterStaticCombatEndedListeners();
+    }
+
+    internal static void Apply(BazaarLauncher.Core.SafeHarmonyPatcher patcher)
+    {
+        if (patcher == null) return;
+        Apply(patcher.RawHarmony);
+    }
+
     internal static void Apply(Harmony harmony)
     {
         if (_applied) return;
@@ -192,7 +209,7 @@ internal static class CombatPatch
         PatchOptionsFastForwardSync(harmony);
         PatchFinalBlowSlowDown(harmony);
         PatchGameServiceManagerTimeScale(harmony);
-        PatchCombatSimulateAudit(harmony);
+        // P1-5 修复：不再对 CombatSimHandler.Simulate 重复打第 2 个补丁，条件审计已合入 SimulateSpeedPrefix
         PatchReplayAutoExit(harmony);
         PatchPostCombatVisualCleanup(harmony);
         PatchDisableTutorials(harmony);
@@ -317,6 +334,16 @@ internal static class CombatPatch
     {
         try
         {
+            bool isReplay = GameInspector.GetAppStateName() == "ReplayState";
+            bool isPvp = GameInspector.GetAppStateName() == "PVPCombatState";
+            BazaarLauncherPlugin.Host?.EventBus.Publish(new BazaarModSdk.CombatLifecycleModEvent(true, isPvp, isReplay));
+
+            // P1-5 修复：生产环境默认关闭全帧审计以消除进战前数十毫秒停顿与堆分配；仅诊断/驱动启用时记录
+            if (!isReplay && message?.Data != null && (BazaarLauncherPlugin.EnableCombatAudit?.Value == true || GameDriver.IsRunning))
+            {
+                RecordCombatAudit(message);
+            }
+
             if (__instance != null && !(__instance is UnityEngine.Object uo && uo == null))
             {
                 _activeCombatHandlerRef = new WeakReference<object>(__instance);
@@ -1183,6 +1210,8 @@ internal static class CombatPatch
         }
     }
 
+    private static Action _registeredCombatEndCallback;
+
     private static void RegisterStaticCombatEndedListeners()
     {
         if (_combatEndedListenersAdded) return;
@@ -1191,7 +1220,11 @@ internal static class CombatPatch
             var eventsType = GameInspector.FindTypeSafe("TheBazaar.Events");
             if (eventsType == null) return;
 
-            Action onCombatEnd = () => CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: false);
+            _registeredCombatEndCallback = () =>
+            {
+                CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: false);
+                BazaarLauncherPlugin.Host?.EventBus.Publish(new BazaarModSdk.CombatLifecycleModEvent(false, false, false));
+            };
             var monoType = typeof(MonoBehaviour);
             foreach (var evtName in new[] { "CombatEnded", "ReplayEnded" })
             {
@@ -1212,13 +1245,43 @@ internal static class CombatPatch
                 if (addM != null)
                 {
                     var ps = addM.GetParameters();
-                    if (ps.Length == 2) addM.Invoke(evtObj, new object[] { onCombatEnd, null });
-                    else if (ps.Length == 1) addM.Invoke(evtObj, new object[] { onCombatEnd });
+                    if (ps.Length == 2) addM.Invoke(evtObj, new object[] { _registeredCombatEndCallback, null });
+                    else if (ps.Length == 1) addM.Invoke(evtObj, new object[] { _registeredCombatEndCallback });
                 }
             }
             _combatEndedListenersAdded = true;
         }
         catch { }
+    }
+
+    internal static void UnregisterStaticCombatEndedListeners()
+    {
+        if (!_combatEndedListenersAdded || _registeredCombatEndCallback == null) return;
+        try
+        {
+            var eventsType = GameInspector.FindTypeSafe("TheBazaar.Events");
+            if (eventsType != null)
+            {
+                foreach (var evtName in new[] { "CombatEnded", "ReplayEnded" })
+                {
+                    var evtObj = eventsType.GetField(evtName, BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                    if (evtObj == null) continue;
+                    var remM = evtObj.GetType().GetMethod(
+                        "RemoveListener",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                        null,
+                        new[] { typeof(Action) },
+                        null);
+                    remM?.Invoke(evtObj, new object[] { _registeredCombatEndCallback });
+                }
+            }
+        }
+        catch { }
+        finally
+        {
+            _combatEndedListenersAdded = false;
+            _registeredCombatEndCallback = null;
+        }
     }
 
     private static void PostCombatVisualCleanupPostfix()

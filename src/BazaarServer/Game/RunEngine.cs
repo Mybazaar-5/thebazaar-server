@@ -1,3 +1,4 @@
+using System.Text.Json;
 using BazaarCore.Combat;
 using BazaarCore.Data;
 using BazaarCore.Engine;
@@ -13,6 +14,8 @@ using BazaarGameShared.Infra.Messages.Shared;
 using BazaarGameShared.TempoNet.Responses;
 using BazaarServer.Accounts;
 using BazaarServer.Data;
+using BazaarServer.Endpoints;
+using BazaarServer.Protocol;
 using BazaarServer.Tournament;
 
 namespace BazaarServer.Game;
@@ -40,7 +43,9 @@ public sealed class RunEngine
     private readonly PlayerRuleStore? _playerRules;
     private readonly LobbyStore? _lobbies;
     private readonly SessionStore? _sessions;
-    private readonly Random _rng;
+    private readonly ITournamentPvpCoordinator? _pvpCoordinator;
+    private readonly ISocialAndReplaySink? _socialSink;
+    private Random _rng;
 
     // 玩家局外限时属性层（UntilEndOfHour / UntilEndOfDay），直接绑定 RunState 以便无损快照持久化
     private readonly Dictionary<string, double> _playerHourAdd;
@@ -54,6 +59,7 @@ public sealed class RunEngine
 
     public bool StartSelectionDone { get; private set; }
     public IReadOnlyList<string> BoardAuditLogs => _boardAuditLogs;
+    public RunState State => _run;
 
     public RunEngine(
         RunState run,
@@ -66,7 +72,9 @@ public sealed class RunEngine
         CardArchetypeIndex? archetypeIndex = null,
         PlayerRuleStore? playerRules = null,
         LobbyStore? lobbies = null,
-        SessionStore? sessions = null)
+        SessionStore? sessions = null,
+        ITournamentPvpCoordinator? pvpCoordinator = null,
+        ISocialAndReplaySink? socialSink = null)
     {
         _run = run;
         _pool = pool;
@@ -79,6 +87,8 @@ public sealed class RunEngine
         _playerRules = playerRules;
         _lobbies = lobbies;
         _sessions = sessions;
+        _pvpCoordinator = pvpCoordinator;
+        _socialSink = socialSink;
         if (_run.RngSeed == 0)
             _run.RngSeed = Random.Shared.Next(1, int.MaxValue);
         _rng = new Random(_run.RngSeed);
@@ -150,6 +160,27 @@ public sealed class RunEngine
     {
         var o = new Outcome();
         _run.CustomRules = ResolveEffectiveRulesForStart();
+        // 每日同种子挑战：强制对齐当日 UTC+8 确定性配方（主种子 + 词条集合）
+        if (_run.CustomRules.SpecialModeId == ESpecialModeId.DailyChallenge)
+        {
+            var dailySpec = DailyChallengeSeedGenerator.GenerateSpec(_run.CustomRules.DailyChallengeDate);
+            _run.CustomRules.DailyChallengeDate = dailySpec.DateKey;
+            _run.CustomRules.FixedRunSeed = dailySpec.MasterSeed;
+            _run.CustomRules.MutatorIds = new List<string>(dailySpec.MutatorIds);
+            if (_run.CustomRules.HasMutator(MutatorCatalog.IronmanNoFates))
+            {
+                _run.CustomRules.DisableFatesRevive = true;
+                _run.CustomRules.StartingPrestige = Math.Min(_run.CustomRules.StartingPrestige, 10);
+            }
+            _run.CustomRules = _run.CustomRules.CloneNormalized();
+        }
+
+        if (_run.CustomRules.FixedRunSeed is int fixedSeed && fixedSeed != 0)
+        {
+            _run.RngSeed = fixedSeed;
+            _rng = new Random(fixedSeed);
+        }
+
         _run.TendencyLocked = !_run.CustomRules.AllowTendencySelection;
         _shop.ActiveRules = _run.CustomRules;
         _shop.ArchetypeIndex = _archetypeIndex;
@@ -158,9 +189,18 @@ public sealed class RunEngine
         _run.Hour = 1;
         _run.Victories = 0;
         _run.Defeats = 0;
-        _run.FatesUsed = false;
+        _run.BossRushWavesCleared = 0;
+        _run.EndlessTenWinCelebrated = false;
+        _run.DailyRerollSequence = 0;
+        bool disableFates = _run.CustomRules.DisableFatesRevive
+            || _run.CustomRules.HasMutator(MutatorCatalog.IronmanNoFates);
+        _run.FatesUsed = disableFates;
         _run.State = ERunState.Encounter;
-        _run.UnlockedSlots = 0b00_0111_1000;
+
+        // 沙盒实验室解锁全 10 格，全金开局（golden_start）解锁 8 格，其余对齐官方 4 格
+        _run.UnlockedSlots = (ushort)(_run.IsSandboxRun
+            ? 0b11_1111_1111
+            : (_run.CustomRules.HasMutator(MutatorCatalog.GoldenStart) ? 0b01_1111_1110 : 0b00_0111_1000));
         _run.HandGrid.UnlockedMask = _run.UnlockedSlots;
         _run.HandGrid.Cards.Clear();
         _run.StashGrid.Cards.Clear();
@@ -332,6 +372,16 @@ public sealed class RunEngine
         int startPrestige = Math.Max(1, rules.StartingPrestige != 20 ? rules.StartingPrestige : _mode.PrestigeInitial);
         int startExp = Math.Max(0, rules.StartingExperience != 3 ? rules.StartingExperience : _mode.StartingExperience);
 
+        if (rules.HasMutator(MutatorCatalog.DoubleEconomy))
+        {
+            startGold = Math.Min(9999, startGold * 2);
+            startIncome = Math.Min(999, startIncome * 2);
+        }
+        if (rules.DisableFatesRevive || rules.HasMutator(MutatorCatalog.IronmanNoFates))
+        {
+            startPrestige = Math.Min(startPrestige, 10);
+        }
+
         _run.PlayerAttributes[EPlayerAttributeType.Health] = startHp;
         _run.PlayerAttributes[EPlayerAttributeType.HealthMax] = startHp;
         _run.PlayerAttributes[EPlayerAttributeType.Gold] = startGold;
@@ -395,6 +445,57 @@ public sealed class RunEngine
             }
         }
 
+        // 全金开局词条（golden_start）：自动发放 2 件随机 Gold 物品 + 1 个 Gold 技能
+        if (rules.HasMutator(MutatorCatalog.GoldenStart))
+        {
+            string heroName = _run.Hero == EHero.Common ? "Vanessa" : _run.Hero.ToString();
+            var startRng = rules.FixedRunSeed is int seed && seed != 0
+                ? DailyChallengeSeedGenerator.CreateStreamRng(seed, "golden_start", 1, 1, 0)
+                : _rng;
+            var itemPool = _pool.AllItems
+                .Where(c => _pool.IsPlayerSpawnable(c) &&
+                            (rules.SpecialModeId == ESpecialModeId.CrossHeroMayhem ||
+                             c.Heroes.Length == 0 ||
+                             c.Heroes.Contains(heroName, StringComparer.OrdinalIgnoreCase) ||
+                             c.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase)))
+                .ToList();
+            var usedItemIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < 2 && itemPool.Count > 0; i++)
+            {
+                var pick = itemPool[startRng.Next(itemPool.Count)];
+                if (!usedItemIds.Add(pick.Id) && itemPool.Count > 2)
+                {
+                    pick = itemPool.FirstOrDefault(x => usedItemIds.Add(x.Id)) ?? pick;
+                }
+                var coreTpl = _repo.GetCard(pick.Id);
+                if (coreTpl == null) continue;
+                var tier = SpawnQueryEngine.ClampToSupportedTier(coreTpl, CardTier.Gold);
+                var ci = new CardInstance(coreTpl, tier, null, null);
+                RegisterSpawnedCoreCard(ci, EInventorySection.Hand, preferredSlot: -1, emitSpawnEvent: true, events);
+                grantedAny = true;
+            }
+
+            var skillPool = _pool.AllSkills
+                .Where(c => _pool.IsPlayerSpawnable(c) &&
+                            (rules.SpecialModeId == ESpecialModeId.CrossHeroMayhem ||
+                             c.Heroes.Length == 0 ||
+                             c.Heroes.Contains(heroName, StringComparer.OrdinalIgnoreCase) ||
+                             c.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase)))
+                .ToList();
+            if (skillPool.Count > 0)
+            {
+                var skPick = skillPool[startRng.Next(skillPool.Count)];
+                var coreTpl = _repo.GetCard(skPick.Id);
+                if (coreTpl != null)
+                {
+                    var tier = SpawnQueryEngine.ClampToSupportedTier(coreTpl, CardTier.Gold);
+                    var ci = new CardInstance(coreTpl, tier, null, null);
+                    RegisterSpawnedCoreCard(ci, null, preferredSlot: -1, emitSpawnEvent: true, events);
+                    grantedAny = true;
+                }
+            }
+        }
+
         if (grantedAny)
         {
             RecalculateAurasAndSyncBoard(events);
@@ -415,7 +516,7 @@ public sealed class RunEngine
                     _run.RngSeed = _rng.Next(1, int.MaxValue);
                 return restartOutcome;
             }
-            return NotAllowed($"command {command.GetType().Name} not allowed after run ended ({_run.State})");
+            return NotAllowed($"对局已结束（{_run.State}），无法执行指令 {command.GetType().Name}");
         }
 
         var outcome = command switch
@@ -430,7 +531,7 @@ public sealed class RunEngine
             CommitToPedestalCommand c => OnCommitPedestal(c),
             CheatCommand c => OnCheat(c),
             AbandonRunCommand => OnAbandon(),
-            _ => Err("unsupported command " + command.GetType().Name),
+            _ => Err("暂不支持的指令类型：" + command.GetType().Name),
         };
         if (outcome.Error == null)
         {
@@ -464,13 +565,13 @@ public sealed class RunEngine
     private Outcome OnSelectItem(SelectItemCommand cmd)
     {
         string id = cmd.InstanceId.Value;
-        if (string.IsNullOrEmpty(id)) return NotFound("empty instance id");
-        if (!_run.Cards.TryGetValue(id, out var card)) return NotFound("card not found: " + id);
+        if (string.IsNullOrEmpty(id)) return NotFound("卡牌实例 ID 不能为空");
+        if (!_run.Cards.TryGetValue(id, out var card)) return NotFound("未找到对应卡牌：" + id);
 
         if (_runEnded || _run.State is ERunState.Combat or ERunState.PVPCombat
             or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown)
         {
-            return NotAllowed($"SelectItem not allowed in state {_run.State}");
+            return NotAllowed($"当前状态（{_run.State}）不允许操作卡牌");
         }
 
         // 已在玩家手上的卡 → 换位（并重算光环）
@@ -480,30 +581,30 @@ public sealed class RunEngine
         }
 
         if (_run.State == ERunState.Pedestal)
-            return NotAllowed($"cannot select non-owned card {id} in Pedestal state");
+            return NotAllowed($"祭坛状态下无法选择未持有的卡牌：{id}");
         if (!_run.SelectionSet.Contains(id))
-            return NotAllowed($"card {id} is not in current SelectionSet");
+            return NotAllowed($"卡牌 {id} 不在当前可选列表中");
 
         // 若命令行/脚本通过 SelectItemCommand 点选 EncounterStep 或遭遇卡，统一校验状态后交由对应处理器
         if (card.Type == ECardType.EncounterStep)
         {
             if (_run.State is not (ERunState.Encounter or ERunState.LevelUp or ERunState.Loot))
-                return NotAllowed($"EncounterStep {id} cannot be selected in state {_run.State}");
+                return NotAllowed($"当前状态（{_run.State}）无法选择奇遇分支 {id}");
             if (_shop.HasReachedMaxSelections(_run.SelectionsMadeInCurrentContext))
-                return NotAllowed("max selections reached in current context");
+                return NotAllowed("当前阶段已达到最大选择次数");
             return ExecuteEncounterStepSelection(card);
         }
         if (card.Type is ECardType.EventEncounter or ECardType.PedestalEncounter or ECardType.CombatEncounter or ECardType.PvpEncounter)
         {
             if (_run.State is not (ERunState.Choice or ERunState.LevelUp or ERunState.Encounter))
-                return NotAllowed($"encounter card {id} cannot be selected via SelectItem in state {_run.State}");
+                return NotAllowed($"当前状态（{_run.State}）无法直接选择遭遇卡 {id}");
             return ExecuteEncounterCardSelection(card);
         }
 
         if (_run.State is not (ERunState.Encounter or ERunState.Loot or ERunState.LevelUp))
-            return NotAllowed($"cannot select/buy card {id} in state {_run.State}");
+            return NotAllowed($"当前状态（{_run.State}）无法购买或选择卡牌 {id}");
         if (_shop.HasReachedMaxSelections(_run.SelectionsMadeInCurrentContext))
-            return NotAllowed("max selections reached in current context");
+            return NotAllowed("当前阶段已达到最大选择次数");
 
         // 候选区技能卡
         if (card.Type == ECardType.Skill)
@@ -522,7 +623,7 @@ public sealed class RunEngine
                     shelfDiscount.DiscountedPrice)
                 : card.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0));
         int gold = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0);
-        if (gold < buyPrice) return NotAllowed($"not enough gold: need {buyPrice}, have {gold}");
+        if (gold < buyPrice) return NotAllowed($"金币不足：需要 {buyPrice}，当前仅有 {gold}");
 
         // 检查是否可与玩家已有同名同阶物品二合一升阶
         var fuseTarget = FindFuseTarget(card);
@@ -563,25 +664,28 @@ public sealed class RunEngine
             }
             o.Events.Add(new GameSimEventCardDisposed(id, ECardDisposalReason.Cleared));
 
-            // 触发购买钩子 + 升阶钩子 + 附魔钩子 + 全局光环重算与全盘同步
+            // 触发购买钩子 + 升阶钩子 + 附魔钩子 + 全局光环重算与全盘同步（P0-3：传透货架卡激活商店光环）
             if (!_run.SelectionRules.SelectionIsFree)
                 _run.TrackItemPurchasedTags(card, card.CoreCard ?? fuseTarget.CoreCard);
             if (fuseTarget.CoreCard != null)
             {
                 bool suppressUpgradedBecausePurchased = !_run.SelectionRules.SelectionIsFree;
+                var selCards = CollectSelectionCoreCards();
                 var p1Buy = BuildCorePlayerFromRun();
                 var buyBatch = OutOfCombatController.OnItemPurchased(
                     p1Buy, fuseTarget.CoreCard, _repo, _rng, _run.CurrentEncounterId,
                     activeEncounterCard: _run.CurrentEncounterCoreCard,
                     isFree: _run.SelectionRules.SelectionIsFree,
-                    isFusion: true);
+                    isFusion: true,
+                    selectionCards: selCards);
                 ApplyOutOfCombatBatch(p1Buy, buyBatch, o.Events, syncBoardDiffs: false);
 
                 var p1Upg = BuildCorePlayerFromRun();
                 var upgBatch = OutOfCombatController.OnCardUpgraded(
                     p1Upg, fuseTarget.CoreCard, _repo, _rng, isFusion: suppressUpgradedBecausePurchased,
                     currentEncounterId: _run.CurrentEncounterId,
-                    activeEncounterCard: _run.CurrentEncounterCoreCard);
+                    activeEncounterCard: _run.CurrentEncounterCoreCard,
+                    selectionCards: selCards);
                 ApplyOutOfCombatBatch(p1Upg, upgBatch, o.Events, syncBoardDiffs: false);
 
                 if (enchantmentChanged)
@@ -590,7 +694,8 @@ public sealed class RunEngine
                     var enchBatch = OutOfCombatController.OnCardEnchanted(
                         p1Ench, fuseTarget.CoreCard, _repo, _rng,
                         currentEncounterId: _run.CurrentEncounterId,
-                        activeEncounterCard: _run.CurrentEncounterCoreCard);
+                        activeEncounterCard: _run.CurrentEncounterCoreCard,
+                        selectionCards: selCards);
                     ApplyOutOfCombatBatch(p1Ench, enchBatch, o.Events, syncBoardDiffs: false);
                 }
             }
@@ -616,8 +721,8 @@ public sealed class RunEngine
         if (!placed)
         {
             string rejectReason = targetSection == EInventorySection.Stash
-                ? "no free space in stash"
-                : "no free space in hand";
+                ? "储藏箱空间不足，无法放入该物品"
+                : "手牌区空间不足，无法放入该物品";
             LogBoardAudit("BuyCard", id, card.TemplateId.ToString(), "Shelf", $"{requestedSection}:{desiredSlot}", rejectReason);
             return NotAllowed(rejectReason);
         }
@@ -644,16 +749,20 @@ public sealed class RunEngine
             EmitMoveEventIfNotPresent(o.Events, mv.Entry.InstanceId, mv.Section, mv.NewSocket);
         }
 
-        // 购买完成后调用 OutOfCombatController.OnItemPurchased（含 activeEncounterCard、isFree、isFusion）+ 光环重算
+        // 购买完成后调用 OutOfCombatController.OnItemPurchased（含 activeEncounterCard、selectionCards、isFree、isFusion）+ 光环重算
         if (!_run.SelectionRules.SelectionIsFree)
             _run.TrackItemPurchasedTags(card, coreCard);
         var p1Core = BuildCorePlayerFromRun();
+        var selectionCardsAfterBuy = CollectSelectionCoreCards();
         var purchaseBatch = OutOfCombatController.OnItemPurchased(
             p1Core, coreCard, _repo, _rng, _run.CurrentEncounterId,
             activeEncounterCard: _run.CurrentEncounterCoreCard,
             isFree: _run.SelectionRules.SelectionIsFree,
-            isFusion: false);
+            isFusion: false,
+            selectionCards: selectionCardsAfterBuy);
         ApplyOutOfCombatBatch(p1Core, purchaseBatch, o.Events, syncBoardDiffs: true);
+        if (selectionCardsAfterBuy.Count > 0)
+            SyncShelfEntriesDiff(o.Events);
 
         if (_run.SelectionRules.SelectionIsFree &&
             coreCard.Template.Abilities.Values.Any(a => TriggerContainsType(a.Trigger, "TTriggerOnCardSelected")))
@@ -987,12 +1096,13 @@ public sealed class RunEngine
             return entry.CoreCard;
         }
 
-        var coreTpl = _repo.GetCard(entry.TemplateId.ToString());
+        string coreTplId = RunState.ResolveCoreTemplateId(entry);
+        var coreTpl = _repo.GetCard(coreTplId);
         if (coreTpl == null)
         {
             coreTpl = new BazaarCore.Models.CardTemplate
             {
-                Id = entry.TemplateId.ToString(),
+                Id = coreTplId,
                 Type = entry.Type == ECardType.Skill ? "Skill" : entry.Type.ToString(),
                 Size = entry.Size.ToString(),
                 StartingTier = entry.Tier.ToString(),
@@ -1034,13 +1144,13 @@ public sealed class RunEngine
         if (_runEnded || _run.State is ERunState.Combat or ERunState.PVPCombat
             or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown)
         {
-            return NotAllowed($"MoveItem not allowed in state {_run.State}");
+            return NotAllowed($"当前状态（{_run.State}）不允许移动物品");
         }
         string id = cmd.InstanceId.Value;
-        if (string.IsNullOrEmpty(id)) return NotFound("empty instance id");
-        if (!_run.Cards.TryGetValue(id, out var card)) return NotFound("card not found: " + id);
-        if (card.Owner != ECombatantId.Player) return NotAllowed("cannot move non-player card: " + id);
-        if (card.Type != ECardType.Item) return NotAllowed($"only Item cards can be moved, got {card.Type}");
+        if (string.IsNullOrEmpty(id)) return NotFound("卡牌实例 ID 不能为空");
+        if (!_run.Cards.TryGetValue(id, out var card)) return NotFound("未找到要移动的卡牌：" + id);
+        if (card.Owner != ECombatantId.Player) return NotAllowed("无法移动非玩家拥有的卡牌：" + id);
+        if (card.Type != ECardType.Item) return NotAllowed($"只能移动物品类型卡牌，当前类型为 {card.Type}");
         return MoveOwnedCard(card, cmd.TargetSockets, cmd.Section);
     }
 
@@ -1054,8 +1164,8 @@ public sealed class RunEngine
 
         if (!TryPlaceIntoSection(card, coreCard, targetSection, desiredSlot, moved))
         {
-            LogBoardAudit("MoveCard", card.InstanceId, card.TemplateId.ToString(), fromLoc, $"{targetSection}:{desiredSlot}", "cannot move card to target socket");
-            return NotAllowed("cannot move card to target socket");
+            LogBoardAudit("MoveCard", card.InstanceId, card.TemplateId.ToString(), fromLoc, $"{targetSection}:{desiredSlot}", "目标槽位空间不足，无法移动卡牌");
+            return NotAllowed("目标槽位空间不足，无法移动该卡牌");
         }
 
         var o = new Outcome();
@@ -1067,11 +1177,15 @@ public sealed class RunEngine
             EmitMoveEventIfNotPresent(o.Events, mv.Entry.InstanceId, mv.Section, mv.NewSocket);
         }
 
-        // 摆盘/挤位后立刻重算局外光环并全盘对比属性差分，向客户端推送最新卡面数值
+        // 摆盘/挤位后立刻重算局外光环（含货架商店折扣/门票光环）并全盘对比属性差分，向客户端推送最新卡面数值
         var p1Core = BuildCorePlayerFromRun();
+        var selectionCards = CollectSelectionCoreCards();
         var moveBatch = OutOfCombatController.OnCardMoved(
-            p1Core, _repo, activeEncounterCard: _run.CurrentEncounterCoreCard);
+            p1Core, _repo, activeEncounterCard: _run.CurrentEncounterCoreCard,
+            selectionCards: selectionCards);
         ApplyOutOfCombatBatch(p1Core, moveBatch, o.Events, syncBoardDiffs: true);
+        if (selectionCards.Count > 0)
+            SyncShelfEntriesDiff(o.Events);
 
         ReconcileAndVerifyBoardInvariants("MoveCard", o.DirtyCardIds, o.Events, preMoveSnapshot);
         SyncDisplacedCorePlacementsAndEmitDiffs(p1Core, preMoveSnapshot, o.DirtyCardIds, o.Events);
@@ -1082,27 +1196,27 @@ public sealed class RunEngine
     private Outcome OnSelectSkill(SelectSkillCommand cmd)
     {
         if (_runEnded || _run.State is not (ERunState.Encounter or ERunState.Loot or ERunState.LevelUp))
-            return NotAllowed($"SelectSkill not allowed in state {_run.State}");
+            return NotAllowed($"当前状态（{_run.State}）不允许选择技能");
 
         string id = cmd.InstanceId.Value;
-        if (string.IsNullOrEmpty(id)) return NotFound("empty skill instance id");
+        if (string.IsNullOrEmpty(id)) return NotFound("技能实例 ID 不能为空");
         if (!_run.Cards.TryGetValue(id, out var card))
-            return NotFound("skill not found: " + id);
+            return NotFound("未找到对应技能：" + id);
         if (card.Owner != null)
-            return NotAllowed("skill is already owned: " + id);
+            return NotAllowed("该技能已被持有：" + id);
         if (!_run.SelectionSet.Contains(id))
-            return NotAllowed("skill is not in current SelectionSet: " + id);
+            return NotAllowed("该技能不在当前可选列表中：" + id);
 
         if (card.Type == ECardType.EncounterStep)
         {
             if (_shop.HasReachedMaxSelections(_run.SelectionsMadeInCurrentContext))
-                return NotAllowed("max selections reached in current context");
+                return NotAllowed("当前阶段已达到最大选择次数");
             return ExecuteEncounterStepSelection(card);
         }
         if (card.Type != ECardType.Skill)
-            return NotAllowed($"card {id} is not a Skill ({card.Type})");
+            return NotAllowed($"卡牌 {id} 不是技能类型（当前为 {card.Type}）");
         if (_shop.HasReachedMaxSelections(_run.SelectionsMadeInCurrentContext))
-            return NotAllowed("max selections reached in current context");
+            return NotAllowed("当前阶段已达到最大选择次数");
 
         return EquipCandidateSkill(card, isStarterOrFree: !StartSelectionDone || _run.SelectionRules.SelectionIsFree);
     }
@@ -1113,7 +1227,7 @@ public sealed class RunEngine
         int fallbackPrice = _repo.GameMode.StandardPrices.GetSkillBuyPrice(ShopEngine.ToCoreTier(card.Tier));
         int buyPrice = isStarterOrFree ? 0 : card.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, fallbackPrice);
         int gold = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0);
-        if (gold < buyPrice) return NotAllowed($"not enough gold: need {buyPrice}, have {gold}");
+        if (gold < buyPrice) return NotAllowed($"金币不足：需要 {buyPrice}，当前仅有 {gold}");
 
         // Q38/Q39：技能严格去重与升阶规则：
         //   · 同阶且 < Diamond -> 二合一升至下一阶；
@@ -1130,7 +1244,7 @@ public sealed class RunEngine
             if (existingOwnedSkill != null)
             {
                 if (existingOwnedSkill.Tier >= card.Tier)
-                    return NotAllowed($"skill {card.TemplateId} already owned at tier {existingOwnedSkill.Tier}");
+                    return NotAllowed($"已持有更高或同品阶的同名技能（当前品阶 {existingOwnedSkill.Tier}）");
                 fuseTarget = existingOwnedSkill;
             }
         }
@@ -1177,19 +1291,22 @@ public sealed class RunEngine
             if (fuseTarget.CoreCard != null)
             {
                 bool suppressUpgradedBecausePurchased = !isStarterOrFree;
+                var selCards = CollectSelectionCoreCards();
                 var p1Buy = BuildCorePlayerFromRun();
                 var buyBatch = OutOfCombatController.OnItemPurchased(
                     p1Buy, fuseTarget.CoreCard, _repo, _rng, _run.CurrentEncounterId,
                     activeEncounterCard: _run.CurrentEncounterCoreCard,
                     isFree: isStarterOrFree,
-                    isFusion: true);
+                    isFusion: true,
+                    selectionCards: selCards);
                 ApplyOutOfCombatBatch(p1Buy, buyBatch, o.Events, syncBoardDiffs: false);
 
                 var p1Upg = BuildCorePlayerFromRun();
                 var upgBatch = OutOfCombatController.OnCardUpgraded(
                     p1Upg, fuseTarget.CoreCard, _repo, _rng, isFusion: suppressUpgradedBecausePurchased,
                     currentEncounterId: _run.CurrentEncounterId,
-                    activeEncounterCard: _run.CurrentEncounterCoreCard);
+                    activeEncounterCard: _run.CurrentEncounterCoreCard,
+                    selectionCards: selCards);
                 ApplyOutOfCombatBatch(p1Upg, upgBatch, o.Events, syncBoardDiffs: false);
 
                 if (enchantmentChanged && fusedEnchantment.HasValue)
@@ -1198,7 +1315,8 @@ public sealed class RunEngine
                     var enchBatch = OutOfCombatController.OnCardEnchanted(
                         p1Ench, fuseTarget.CoreCard, _repo, _rng,
                         currentEncounterId: _run.CurrentEncounterId,
-                        activeEncounterCard: _run.CurrentEncounterCoreCard);
+                        activeEncounterCard: _run.CurrentEncounterCoreCard,
+                        selectionCards: selCards);
                     ApplyOutOfCombatBatch(p1Ench, enchBatch, o.Events, syncBoardDiffs: false);
                 }
             }
@@ -1232,17 +1350,22 @@ public sealed class RunEngine
                 EContainerSocketId.Socket_0));
             o.Events.Add(new GameSimEventPlayerSkillEquipped(card.InstanceId, ECombatantId.Player));
 
-            // 装备技能后触发购买钩子（开局后，含 activeEncounterCard、isFree、isFusion）并重算局外光环
+            // 装备技能后触发购买钩子（开局后，含 activeEncounterCard、selectionCards、isFree、isFusion）并重算局外光环
             var p1Core = BuildCorePlayerFromRun();
+            var selCards = CollectSelectionCoreCards();
             var batch = StartSelectionDone
                 ? OutOfCombatController.OnItemPurchased(
                     p1Core, skCore, _repo, _rng, _run.CurrentEncounterId,
                     activeEncounterCard: _run.CurrentEncounterCoreCard,
                     isFree: isStarterOrFree,
-                    isFusion: false)
+                    isFusion: false,
+                    selectionCards: selCards)
                 : OutOfCombatController.RecalculateOutOfCombatAuras(
-                    p1Core, _repo, activeEncounterCard: _run.CurrentEncounterCoreCard);
+                    p1Core, _repo, activeEncounterCard: _run.CurrentEncounterCoreCard,
+                    selectionCards: selCards);
             ApplyOutOfCombatBatch(p1Core, batch, o.Events, syncBoardDiffs: true);
+            if (selCards.Count > 0)
+                SyncShelfEntriesDiff(o.Events);
         }
 
         _run.SelectionsMadeInCurrentContext++;
@@ -1305,27 +1428,27 @@ public sealed class RunEngine
         if (_runEnded || _run.State is ERunState.Combat or ERunState.PVPCombat or ERunState.Pedestal
             or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown)
         {
-            return NotAllowed($"SelectEncounter not allowed in state {_run.State}");
+            return NotAllowed($"当前状态（{_run.State}）不允许选择遭遇");
         }
 
         string id = cmd.InstanceId.Value;
-        if (string.IsNullOrEmpty(id)) return NotFound("empty encounter instance id");
-        if (!_run.Cards.TryGetValue(id, out var card)) return NotFound("encounter not found: " + id);
+        if (string.IsNullOrEmpty(id)) return NotFound("遭遇实例 ID 不能为空");
+        if (!_run.Cards.TryGetValue(id, out var card)) return NotFound("未找到对应遭遇：" + id);
         if (!_run.SelectionSet.Contains(id))
-            return NotAllowed($"encounter {id} is not in current SelectionSet");
+            return NotAllowed($"遭遇 {id} 不在当前可选列表中");
 
         if (card.Type == ECardType.EncounterStep)
         {
             if (_run.State is not (ERunState.Encounter or ERunState.LevelUp or ERunState.Loot))
-                return NotAllowed($"EncounterStep {id} cannot be selected in state {_run.State}");
+                return NotAllowed($"当前状态（{_run.State}）无法选择奇遇分支 {id}");
             return ExecuteEncounterStepSelection(card);
         }
 
         if (card.Type is not (ECardType.EventEncounter or ECardType.PedestalEncounter or ECardType.CombatEncounter or ECardType.PvpEncounter))
-            return NotAllowed($"card {id} is not an encounter ({card.Type})");
+            return NotAllowed($"卡牌 {id} 不是有效的遭遇卡（当前为 {card.Type}）");
 
         if (_run.State is not (ERunState.Choice or ERunState.LevelUp or ERunState.Encounter))
-            return NotAllowed($"encounter {id} cannot be selected in state {_run.State}");
+            return NotAllowed($"当前状态（{_run.State}）无法选择遭遇 {id}");
 
         return ExecuteEncounterCardSelection(card);
     }
@@ -1333,7 +1456,7 @@ public sealed class RunEngine
     private Outcome ExecuteEncounterCardSelection(RunState.CardEntry card)
     {
         var o = new Outcome();
-        string encId = card.TemplateId.ToString();
+        string encId = RunState.ResolveCoreTemplateId(card);
 
         // 若选中的是 PvP 战斗卡且处于多真人锦标赛同步屏障期，优先校验拦截，绝不破坏当前 Choice 与棋盘
         if (card.Type == ECardType.PvpEncounter)
@@ -1374,7 +1497,7 @@ public sealed class RunEngine
             var expRes = _stepEngine.EnterExpeditionRoom(encId, consumeMatchingTicket: true);
             RestoreActiveEncounterCardAfterShelfOp(activeProtected);
             if (!expRes.Success)
-                return NotAllowed(expRes.ErrorMessage ?? $"failed to enter expedition room {encId}");
+                return NotAllowed(expRes.ErrorMessage ?? $"进入探险房间 {encId} 失败");
 
             o.Events.AddRange(expRes.Events);
             _run.SelectionsMadeInCurrentContext = 0;
@@ -1667,12 +1790,12 @@ public sealed class RunEngine
     private Outcome OnReroll()
     {
         if (_runEnded)
-            return NotAllowed($"reroll not allowed in state {_run.State}");
+            return NotAllowed($"对局已结束（{_run.State}），无法刷新");
 
         if (_run.State == ERunState.Loot && _run.CustomRules.MonsterLootChooseOne)
         {
             if (!_shop.TryCycleMonsterLootPage(out var pageEvents))
-                return NotAllowed("monster loot has no additional pages to cycle");
+                return NotAllowed("当前野怪战利品没有更多可翻页的选项");
 
             var lootOutcome = new Outcome();
             lootOutcome.Events.AddRange(pageEvents);
@@ -1681,13 +1804,13 @@ public sealed class RunEngine
         }
 
         if (_run.State != ERunState.Encounter)
-            return NotAllowed($"reroll not allowed in state {_run.State}");
+            return NotAllowed($"当前状态（{_run.State}）不支持刷新商店");
         if (!StartSelectionDone)
-            return NotAllowed("reroll not allowed during starter selection");
+            return NotAllowed("开局选择阶段不允许刷新");
 
         string encId = _run.CurrentEncounterId ?? "";
         if (string.IsNullOrEmpty(encId))
-            return NotAllowed("no active encounter to reroll");
+            return NotAllowed("当前没有可刷新的活跃遭遇");
 
         var coreTpl = _repo.GetCard(encId);
         var poolTpl = _pool.Get(encId);
@@ -1698,26 +1821,59 @@ public sealed class RunEngine
             _run.Cards.TryGetValue(id, out var ce) && ce.Type is ECardType.Item or ECardType.Skill);
 
         if (!hasRerollRules && !isMerchant)
-            return NotAllowed("current encounter does not support reroll");
+            return NotAllowed("当前遭遇不支持刷新");
         if (!hasRerollRules && !hasShopGoods)
-            return NotAllowed("current encounter has no rerollable shop goods");
-        if (_run.RerollsRemaining == 0)
-            return NotAllowed("no rerolls remaining");
+            return NotAllowed("当前商店没有可刷新的商品");
 
-        int cost = (int)_run.RerollCost;
+        bool isSandboxFreeReroll = _run.IsSandboxRun && _run.CustomRules.SandboxFreeInfiniteReroll;
+        bool isBloodMarket = !isSandboxFreeReroll && _run.CustomRules.HasMutator(MutatorCatalog.BloodMarket);
+
+        if (!isSandboxFreeReroll && _run.RerollsRemaining == 0)
+            return NotAllowed("本商店剩余刷新次数已用尽");
+
+        int cost = (isSandboxFreeReroll || isBloodMarket) ? 0 : (int)_run.RerollCost;
         int gold = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0);
-        if (gold < cost) return NotAllowed($"not enough gold to reroll: need {cost}, have {gold}");
+        if (gold < cost) return NotAllowed($"金币不足以刷新商店：需要 {cost}，当前仅有 {gold}");
 
         var o = new Outcome();
-        _run.PlayerAttributes[EPlayerAttributeType.Gold] = gold - cost;
+        if (isBloodMarket)
+        {
+            int curMaxHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, 250);
+            int hpCost = Math.Max(50, (int)Math.Round(curMaxHp * 0.05));
+            if (curMaxHp <= 50 || curMaxHp - hpCost < 50)
+                return NotAllowed($"血色黑市：生命上限过低（当前 {curMaxHp}），无法继续献祭刷新");
+            int nextMaxHp = Math.Max(50, curMaxHp - hpCost);
+            _run.PlayerAttributes[EPlayerAttributeType.HealthMax] = nextMaxHp;
+            int curHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, nextMaxHp);
+            _run.PlayerAttributes[EPlayerAttributeType.Health] = Math.Min(curHp, nextMaxHp);
+        }
+        else if (cost > 0)
+        {
+            _run.PlayerAttributes[EPlayerAttributeType.Gold] = gold - cost;
+        }
 
-        int costIncrease = _run.SelectionRules.RerollRules?.CostIncrease ?? 1;
-        uint nextCost = (uint)Math.Max(0, (int)_run.RerollCost + costIncrease);
-        if (_run.SelectionRules.RerollRules?.CostMax is int costMax && costMax > 0)
-            nextCost = Math.Min(nextCost, (uint)costMax);
-        _run.RerollCost = nextCost;
+        if (isSandboxFreeReroll)
+        {
+            _run.RerollCost = 0;
+        }
+        else if (isBloodMarket)
+        {
+            _run.RerollCost = 0;
+            if (_run.RerollsRemaining > 0) _run.RerollsRemaining--;
+        }
+        else
+        {
+            int costIncrease = _run.SelectionRules.RerollRules?.CostIncrease ?? 1;
+            if (_run.CustomRules.HasMutator(MutatorCatalog.ShopHalfOff))
+                costIncrease = Math.Max(1, (int)Math.Floor(costIncrease * 0.5));
+            uint nextCost = (uint)Math.Max(0, (int)_run.RerollCost + costIncrease);
+            if (_run.SelectionRules.RerollRules?.CostMax is int costMax && costMax > 0)
+                nextCost = Math.Min(nextCost, (uint)costMax);
+            _run.RerollCost = nextCost;
+            if (_run.RerollsRemaining > 0) _run.RerollsRemaining--;
+        }
 
-        if (_run.RerollsRemaining > 0) _run.RerollsRemaining--;
+        _run.DailyRerollSequence++;
 
         var shelfEvents = DealEncounterShelfPreservingActiveEncounter(
             encId,
@@ -1745,7 +1901,7 @@ public sealed class RunEngine
         if (!StartSelectionDone)
         {
             if (!_run.SelectionRules.CanExit && _run.SelectionSet.Count > 0)
-                return NotAllowed("cannot exit starter selection without choosing");
+                return NotAllowed("开局选择阶段必须先做出选择，无法直接退出");
 
             FlushPendingEncounterExitXp(o.Events);
             _run.CurrentEncounterCoreCard = null;
@@ -1765,7 +1921,7 @@ public sealed class RunEngine
         if (_run.State == ERunState.Choice)
         {
             if (_run.SelectionSet.Count > 0)
-                return NotAllowed("cannot exit Choice state without selecting an encounter");
+                return NotAllowed("必须先选择一个遭遇，无法直接跳过当前时段");
 
             o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: false));
             if (_run.PendingLevelUp || _run.SuspendedStates.Count > 0)
@@ -1780,12 +1936,12 @@ public sealed class RunEngine
         }
 
         if (_run.State is ERunState.Combat or ERunState.PVPCombat)
-            return NotAllowed("cannot exit combat state");
+            return NotAllowed("战斗进行中无法退出当前状态");
 
         if (_run.State is ERunState.Loot or ERunState.LevelUp)
         {
             if (!_run.SelectionRules.CanExit && _run.SelectionSet.Count > 0)
-                return NotAllowed($"state {_run.State} cannot be exited (CanExit=false)");
+                return NotAllowed($"当前阶段（{_run.State}）必须先完成选择后方可退出");
 
             if (_run.State == ERunState.Loot)
                 ApplyWillAutoSellOnExitIfNeeded(o.Events);
@@ -1797,7 +1953,7 @@ public sealed class RunEngine
         if (_run.State is ERunState.Encounter or ERunState.Pedestal)
         {
             if (!_run.SelectionRules.CanExit && _run.SelectionSet.Count > 0)
-                return NotAllowed($"state {_run.State} cannot be exited (CanExit=false)");
+                return NotAllowed($"当前遭遇（{_run.State}）不允许直接退出");
         }
 
         // Encounter / Pedestal 退出 → 派发 TTriggerOnEncounterExited + WillAutoSellOnExit + 结算延迟经验，检查 NextEncounterOnExit
@@ -2025,10 +2181,25 @@ public sealed class RunEngine
         MatchupAssignment? tourneyAssignment = null;
         bool isRealHumanOpp = isPvp; // 非锦标赛单人幽灵战沿用标准 Fates 二次致死规则
         bool botPrestigeLock = false;
-        int combatSeed = _rng.Next(1, int.MaxValue);
+        int combatSeed = _run.CustomRules.FixedRunSeed is int dailyFixedSeed && dailyFixedSeed != 0
+            ? DailyChallengeSeedGenerator.DeriveSubSeed(
+                dailyFixedSeed,
+                DailyChallengeSeedGenerator.StreamCombat,
+                (int)_run.Day,
+                (int)_run.Hour)
+            : _rng.Next(1, int.MaxValue);
 
         if (isPvp && tourneyLobby != null && !string.IsNullOrWhiteSpace(_run.AccountId))
         {
+            // P0-4 并发安全：进入 PvP 前先将本方当前盘面不可变锁入 ITournamentPvpCoordinator
+            if (tourneyLobby.TournamentSessionId is Guid lockSid && lockSid != Guid.Empty)
+            {
+                _pvpCoordinator?.LockPlayerBoardForDay(
+                    lockSid,
+                    _run.Day,
+                    BuildLockedPvpBoardSnapshot());
+            }
+
             tourneyAssignment = _lobbies!.EnsureAndGetAssignment(tourneyLobby, _run.Day, _run.AccountId, _sessions);
             if (tourneyAssignment != null)
             {
@@ -2044,33 +2215,32 @@ public sealed class RunEngine
         var oppEntries = new List<RunState.CardEntry>();
         SimPvpOpponent? pvpInfo = null;
         Data.MonsterTemplate? monster = null;
+        LockedPvpBoard? lockedOppBoard = null;
         int oppGold = 0;
         int oppIncome = Math.Max(1, tourneyLobby?.Rules?.StartingIncome ?? _run.CustomRules?.StartingIncome ?? _mode.StartingIncome);
+        string ghostPartition = _run.CustomRules.ResolveGhostPoolPartition();
 
         if (isPvp)
         {
-            RunState? liveHumanOppRun = null;
-            if (tourneyAssignment != null && !tourneyAssignment.OpponentIsBot && _sessions != null)
+            // P0-4 根治：彻底禁止无锁跨会话直读对方 RunState；仅通过 ITournamentPvpCoordinator 读取同日不可变锁板快照
+            if (tourneyLobby != null &&
+                tourneyLobby.TournamentSessionId is Guid oppLockSid && oppLockSid != Guid.Empty &&
+                tourneyAssignment != null &&
+                !tourneyAssignment.OpponentIsBot &&
+                _pvpCoordinator != null)
             {
-                var oppMem = _sessions.GetByAccount(tourneyAssignment.OpponentAccountId);
-                var candidateRun = oppMem != null ? Endpoints.SessionRegistry.Get(oppMem.Sid)?.Run : null;
-                if (candidateRun != null &&
-                    candidateRun.Day >= _run.Day &&
-                    candidateRun.Cards.Values.Any(c =>
-                        c.Owner == ECombatantId.Player &&
-                        c.Type == ECardType.Item &&
-                        c.Section != EInventorySection.Stash))
-                {
-                    liveHumanOppRun = candidateRun;
-                }
+                lockedOppBoard = _pvpCoordinator.TryGetLockedBoard(
+                    oppLockSid,
+                    _run.Day,
+                    tourneyAssignment.OpponentAccountId);
             }
 
-            if (liveHumanOppRun != null && tourneyAssignment != null)
+            if (lockedOppBoard != null && tourneyAssignment != null)
             {
-                p2Core = BuildOpponentPlayerStateFromRun(liveHumanOppRun, tourneyAssignment.OpponentUsername);
-                oppGold = Math.Max(0, liveHumanOppRun.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0));
-                int liveInc = liveHumanOppRun.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Income, oppIncome);
-                oppIncome = liveInc > 0 ? liveInc : oppIncome;
+                p2Core = BuildOpponentPlayerStateFromLockedBoard(lockedOppBoard);
+                oppGold = Math.Max(0, lockedOppBoard.Gold);
+                oppIncome = lockedOppBoard.Income > 0 ? lockedOppBoard.Income : oppIncome;
+                EHero lockedHero = PvpGhostPool.ParseHero(lockedOppBoard.Hero);
                 pvpInfo = new SimPvpOpponent(
                     name: tourneyAssignment.OpponentUsername,
                     titlePrefix: "",
@@ -2078,22 +2248,29 @@ public sealed class RunEngine
                     rank: null,
                     rating: 1200,
                     division: 1,
-                    victories: liveHumanOppRun.Victories,
-                    prestige: Math.Max(1, liveHumanOppRun.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 20)),
-                    level: Math.Max(1, liveHumanOppRun.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Level, 1)),
-                    hero: liveHumanOppRun.Hero == EHero.Common ? EHero.Vanessa : liveHumanOppRun.Hero,
+                    victories: lockedOppBoard.Victories,
+                    prestige: Math.Max(1, lockedOppBoard.Prestige),
+                    level: Math.Max(1, lockedOppBoard.Level),
+                    hero: lockedHero,
                     playerLoadoutResponse: new BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout { accountId = tourneyAssignment.OpponentAccountId },
                     playerCollection: null);
-                Console.WriteLine($"[RunEngine] PVP Match Day={_run.Day}: vs LIVE HUMAN {tourneyAssignment.OpponentUsername} (HP={p2Core.HealthMax}, items={p2Core.Hand.Cards.Count})");
+                Console.WriteLine($"[RunEngine] PVP Match Day={_run.Day}: vs LOCKED HUMAN {tourneyAssignment.OpponentUsername} (HP={p2Core.HealthMax}, items={p2Core.Hand.Cards.Count})");
             }
             else
             {
-                int expectedBucketDay = Math.Clamp((int)_run.Day, 1, 15);
+                int expectedDay = _run.CustomRules.SpecialModeId == ESpecialModeId.EndlessTower
+                    ? (int)_run.Day
+                    : Math.Clamp((int)_run.Day, 1, 15);
                 var lockedGhost = _run.PendingPvpGhost;
                 bool canUseLockedGhost = lockedGhost != null
-                                      && lockedGhost.Day == expectedBucketDay
-                                      && (_run.IsCustomRuleRun || (!lockedGhost.IsCustomRule && Storage.Persistence.IsSaneGhostForDay(expectedBucketDay, lockedGhost.HealthMax)));
-                var ghostRng = tourneyAssignment != null ? new Random(combatSeed) : _rng;
+                                      && lockedGhost.Day == expectedDay
+                                      && string.Equals(lockedGhost.PoolPartition, ghostPartition, StringComparison.OrdinalIgnoreCase)
+                                      && (_run.IsCustomRuleRun || (!lockedGhost.IsCustomRule && Storage.Persistence.IsSaneGhostForDay(Math.Clamp(expectedDay, 1, 15), lockedGhost.HealthMax)));
+                var ghostRng = tourneyAssignment != null
+                    ? new Random(combatSeed)
+                    : (_run.CustomRules.FixedRunSeed is int dSeed && dSeed != 0
+                        ? DailyChallengeSeedGenerator.CreateStreamRng(dSeed, DailyChallengeSeedGenerator.StreamPvpOpponent, (int)_run.Day, (int)_run.Hour)
+                        : _rng);
                 var ghost = canUseLockedGhost
                     ? lockedGhost!
                     : _ghosts.PickOpponent(
@@ -2102,7 +2279,8 @@ public sealed class RunEngine
                         (int)_run.Defeats,
                         ghostRng,
                         _repo,
-                        includeCustomRuleGhosts: _run.IsCustomRuleRun);
+                        includeCustomRuleGhosts: _run.IsCustomRuleRun,
+                        poolPartition: ghostPartition);
                 _run.PendingPvpGhost = ghost;
                 p2Core = PvpGhostPool.ToPlayerState(ghost, _repo);
                 if (p2Core.Hand.Cards.Count == 0)
@@ -2140,7 +2318,7 @@ public sealed class RunEngine
                     playerLoadoutResponse: new BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout { accountId = oppAccountId },
                     playerCollection: null);
 
-                Console.WriteLine($"[RunEngine] PVP Match Day={_run.Day}: vs {oppDisplayName} [{ghost.BoardId}] (Bot={tourneyAssignment?.OpponentIsBot}, CustomPool={_run.IsCustomRuleRun}, HP={p2Core.HealthMax}, items={p2Core.Hand.Cards.Count})");
+                Console.WriteLine($"[RunEngine] PVP Match Day={_run.Day}: vs {oppDisplayName} [{ghost.BoardId}] (Bot={tourneyAssignment?.OpponentIsBot}, Partition={ghostPartition}, HP={p2Core.HealthMax}, items={p2Core.Hand.Cards.Count})");
             }
         }
         else
@@ -2155,7 +2333,13 @@ public sealed class RunEngine
                 p2Core = BuildFallbackMonsterPlayer();
             }
 
-            Console.WriteLine($"[RunEngine] PVE Match Day={_run.Day}: vs {p2Core.DisplayName} (HP={p2Core.HealthMax}, items={p2Core.Hand.Cards.Count})");
+            // Boss 车轮战：按波次强化首领装备最低品阶与额外强化技能
+            if (_run.CustomRules.SpecialModeId == ESpecialModeId.BossRush)
+            {
+                ApplyBossRushWaveReinforcements(p2Core, BossRushCatalog.GetWave((int)_run.Day), combatSeed);
+            }
+
+            Console.WriteLine($"[RunEngine] PVE Match Day={_run.Day}: vs {p2Core.DisplayName} (mode={_run.CustomRules.SpecialModeId}, HP={p2Core.HealthMax}, items={p2Core.Hand.Cards.Count})");
         }
 
         // 统一保障敌方（PvP 镜像与野怪）所有上阵物品/技能/槽位效果具备唯一 InstanceId，
@@ -2181,7 +2365,16 @@ public sealed class RunEngine
 
         _lastCombatMonster = monster;
 
-        // 4. 确定性执行 BazaarCore 完整规则战斗模拟
+        // 4. 构造模式/词条/无尽/BossRush 战斗修正器并执行 BazaarCore 完整规则战斗模拟（50ms 采样直降内存与包体积）
+        bool isBossRush = _run.CustomRules.SpecialModeId == ESpecialModeId.BossRush;
+        var combatModifiers = CombatModifiers.FromRulesAndDay(
+            _run.CustomRules,
+            (int)_run.Day,
+            isBossRush: isBossRush,
+            isPve: !isPvp,
+            bossRushWave: (int)_run.Day);
+        bool sandstormEnabled = (encTpl?.SandstormEnabled ?? true) && combatModifiers.SandstormEnabled;
+
         var result = CombatSimulator.Simulate(
             _repo,
             p1Core,
@@ -2189,13 +2382,83 @@ public sealed class RunEngine
             seed: combatSeed,
             combatType: isPvp ? "PVP" : "PVE",
             recordTimeline: true,
-            recordEvents: true);
+            recordEvents: true,
+            syncPermanentChanges: false,
+            modifiers: combatModifiers,
+            sandstormEnabled: sandstormEnabled,
+            timelineSampleIntervalMs: CombatSimConverter.FrameStepMs);
 
         bool win = string.Equals(result.WinnerPlayerId, "player", StringComparison.OrdinalIgnoreCase);
 
+        // P0-4 唯一对称裁决：真人 vs 真人同步 PvP 时，按规范对阵序唯一写入 ITournamentPvpCoordinator 确保 A 胜 <=> B 负
+        if (isPvp &&
+            tourneyLobby != null &&
+            tourneyLobby.TournamentSessionId is Guid resolveSid && resolveSid != Guid.Empty &&
+            tourneyAssignment != null &&
+            !tourneyAssignment.OpponentIsBot &&
+            lockedOppBoard != null &&
+            _pvpCoordinator != null &&
+            !string.IsNullOrWhiteSpace(_run.AccountId))
+        {
+            var resolved = _pvpCoordinator.TryGetResolvedMatch(
+                resolveSid,
+                _run.Day,
+                _run.AccountId,
+                tourneyAssignment.OpponentAccountId);
+
+            if (resolved == null)
+            {
+                bool selfIsCanonicalP1 = StringComparer.Ordinal.Compare(_run.AccountId, tourneyAssignment.OpponentAccountId) <= 0;
+                bool canonicalP1Won;
+                if (selfIsCanonicalP1)
+                {
+                    canonicalP1Won = win;
+                }
+                else
+                {
+                    var canonicalSim = CombatSimulator.Simulate(
+                        _repo,
+                        p2Core,
+                        p1Core,
+                        seed: combatSeed,
+                        combatType: "PVP",
+                        recordTimeline: false,
+                        recordEvents: false,
+                        syncPermanentChanges: false,
+                        modifiers: combatModifiers,
+                        sandstormEnabled: sandstormEnabled);
+                    canonicalP1Won = string.Equals(canonicalSim.WinnerPlayerId, "player", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(canonicalSim.WinnerPlayerId, p2Core.PlayerId, StringComparison.OrdinalIgnoreCase);
+                }
+
+                string canonicalP1Id = selfIsCanonicalP1 ? _run.AccountId : tourneyAssignment.OpponentAccountId;
+                string canonicalP2Id = selfIsCanonicalP1 ? tourneyAssignment.OpponentAccountId : _run.AccountId;
+                string winnerId = canonicalP1Won ? canonicalP1Id : canonicalP2Id;
+                string loserId = canonicalP1Won ? canonicalP2Id : canonicalP1Id;
+
+                var proposed = new SymmetricHumanPvpOutcome(
+                    WinnerAccountId: winnerId,
+                    LoserAccountId: loserId,
+                    BattleSeed: combatSeed,
+                    LoserPrestigeDamage: (int)_run.Day,
+                    ReplayId: $"pvp_{resolveSid:N}_d{_run.Day}_{combatSeed}",
+                    CachedCombatSimForP1: null,
+                    CachedCombatSimForP2: null);
+                resolved = _pvpCoordinator.RecordOrGetResolvedMatch(
+                    resolveSid,
+                    _run.Day,
+                    _run.AccountId,
+                    tourneyAssignment.OpponentAccountId,
+                    proposed);
+            }
+
+            win = string.Equals(resolved.WinnerAccountId, _run.AccountId, StringComparison.OrdinalIgnoreCase);
+        }
+
         // 4. 预先计算 PvE 胜负金币/经验，供 CombatSimConverter 生成血条刻度与跳币/飞经验事件
-        //    战斗小时（Hour 3 野怪与 Hour 6 PvP）经验仅源自 RewardCombatXp，绝不额外叠加 RewardVictory 或 ExperiencePerHour
+        //    P0-1 根治：战斗小时（Hour 3 野怪与 Hour 6 PvP）同步关闭小时双门控，绝不额外叠加 ExperiencePerHour
         _run.GainedHourXpThisHour = true;
+        _run.GainedAdvanceHourXpThisHour = true;
         int goldGain;
         int xpGain;
         int pveGoldForSim = 0;
@@ -2217,6 +2480,14 @@ public sealed class RunEngine
                 int victoryGold = encTpl?.RewardVictory?.GoldReward ?? encTpl?.RewardVictoryGold ?? 0;
                 goldGain = baseCombatGold + victoryGold;
                 xpGain = baseCombatXp;
+
+                if (isBossRush)
+                {
+                    var waveCfg = BossRushCatalog.GetWave((int)_run.Day);
+                    _run.BossRushWavesCleared++;
+                    goldGain += waveCfg.BonusGoldReward;
+                    xpGain += waveCfg.BonusXpReward;
+                }
             }
             else
             {
@@ -2224,8 +2495,16 @@ public sealed class RunEngine
                 goldGain = defeatRewards.GoldAwarded;
                 xpGain = defeatRewards.XpAwarded;
             }
+            if (_run.CustomRules.HasMutator(MutatorCatalog.DoubleEconomy))
+            {
+                goldGain *= 2;
+            }
             pveGoldForSim = goldGain;
             pveXpForSim = xpGain;
+        }
+        if (isPvp && _run.CustomRules.HasMutator(MutatorCatalog.DoubleEconomy))
+        {
+            goldGain *= 2;
         }
 
         // 5. 构造第 1 条消息：SpawnMessage（必须带 Combat/PVPCombat 状态 + 敌方初始血量 + 敌方盘面卡）
@@ -2271,6 +2550,18 @@ public sealed class RunEngine
             result, _repo, p1ByInst, p2ByInst, p1BoardEntries, oppEntries,
             pveGoldReceived: pveGoldForSim,
             pveXpReceived: pveXpForSim);
+
+        // 战报自动入库（沙盒对局除外）：持久化双方盘面摘要与压缩后 CombatSim MsgPack 载荷
+        SaveCombatReplayIfEligible(
+            isPvp: isPvp,
+            win: win,
+            combatSeed: combatSeed,
+            result: result,
+            p1Core: p1Core,
+            p2Core: p2Core,
+            pvpInfo: pvpInfo,
+            lobbyId: tourneyLobby?.LobbyId,
+            combatSim: o.Combat);
 
         Console.WriteLine(
             $"[RunEngine] CombatSim done: {(win ? "WIN" : "LOSE")} dur={result.DurationMs}ms " +
@@ -2505,7 +2796,7 @@ public sealed class RunEngine
             }
             else
             {
-                var tpl = _repo.GetCard(entry.TemplateId.ToString());
+                var tpl = _repo.GetCard(RunState.ResolveCoreTemplateId(entry));
                 if (tpl == null) continue;
                 clone = new CardInstance(tpl, ShopEngine.ToCoreTier(entry.Tier), entry.Enchantment?.ToString(), "opp_" + entry.InstanceId);
             }
@@ -2751,10 +3042,15 @@ public sealed class RunEngine
         }
 
         var tpl = _pool.Get(ci.Template.Id);
+        Guid wireGuid = ResolveSafeWireGuid(ci.Template.Id, type);
+        string? customCardId = !string.Equals(ci.Template.Id, wireGuid.ToString(), StringComparison.OrdinalIgnoreCase)
+            ? ci.Template.Id
+            : null;
         var entry = new RunState.CardEntry
         {
             InstanceId = instId,
-            TemplateId = Guid.Parse(ci.Template.Id),
+            TemplateId = wireGuid,
+            CustomCardId = customCardId,
             Type = type,
             Size = ShopEngine.ParseSize(ci.Template.Size),
             Tier = ShopEngine.ParseTier(ci.Tier.ToString()),
@@ -2854,14 +3150,32 @@ public sealed class RunEngine
 
     private void AdvanceHourToEvents(List<IGameSimEvent> events) => AdvanceHourOrDay(events);
 
+    private bool RequiresPvpOnDay(uint day)
+    {
+        if (_run.CustomRules.SpecialModeId == ESpecialModeId.BossRush)
+        {
+            if (!_run.CustomRules.BossRushIncludeMilestonePvp)
+                return false;
+            return BossRushCatalog.GetWave((int)day).IsMilestonePvpWave;
+        }
+        return true;
+    }
+
     private void AdvanceHourOrDay(List<IGameSimEvent> events)
     {
         // 1. 切小时前清理 UntilEndOfHour 临时层并回写同步事件
         ClearHourModifiersOnRun(events);
 
         uint nextHour = _run.Hour + 1;
+        // Boss 车轮战非里程碑波次（非第 5/10/... 波）跳过第 6 小时 PvP，在 Hour 5 结束后直接推进至下一波次
+        bool skipHour6PvpForBossRush = nextHour == (uint)_mode.HoursInADay && !RequiresPvpOnDay(_run.Day);
+        if (skipHour6PvpForBossRush)
+        {
+            nextHour = (uint)_mode.HoursInADay + 1;
+        }
+
         bool newDay = nextHour > (uint)_mode.HoursInADay;
-        if (newDay && _run.Victories + _run.Defeats < _run.Day)
+        if (newDay && RequiresPvpOnDay(_run.Day) && _run.Victories + _run.Defeats < _run.Day)
         {
             // 每日第 6 小时必打 PvP 硬性兜底保护：未结算本日 PvP 绝不允许跨天
             uint pvpHour = (uint)_mode.HoursInADay;
@@ -2880,14 +3194,14 @@ public sealed class RunEngine
             return;
         }
 
-        // 记录刚刚完成的旧小时是否尚未领取固定小时推进经验（独立于遭遇自身 ExperienceAwardUponSelection 与战斗 XP），
-        // 然后切往新小时并重置新小时双门控
-        bool needAdvanceHourXp = !_run.GainedAdvanceHourXpThisHour;
+        // P0-1 根治：仅当本小时尚未通过遭遇离场/战斗/推进获取过每小时经验时才补发 ExperiencePerHour，彻底消灭每小时双份经验
+        bool needAdvanceHourXp = !_run.GainedHourXpThisHour && !_run.GainedAdvanceHourXpThisHour;
         _run.Hour = nextHour;
-        _run.RerollCost = 2;
+        _run.RerollCost = _run.IsSandboxRun && _run.CustomRules.SandboxFreeInfiniteReroll ? 0u : 2u;
         _run.RerollsRemaining = 3;
         _run.GainedHourXpThisHour = false;
         _run.GainedAdvanceHourXpThisHour = false;
+        _run.DailyRerollSequence = 0;
 
         if (newDay)
         {
@@ -2903,12 +3217,47 @@ public sealed class RunEngine
             _run.Day++;
             events.Add(new GameSimEventRunDayChanged(_run.Day));
 
-            // 3) 先发放当日 Income 收入到 Gold，确保 OnDayStarted() 触发器读取到最新金币
+            // 3) 先发放当日 Income 收入到 Gold（双倍经济词条每日收入 ×2），确保 OnDayStarted() 触发器读取到最新金币
             int income = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Income, 0);
+            if (_run.CustomRules.HasMutator(MutatorCatalog.DoubleEconomy))
+                income *= 2;
             if (income > 0)
             {
                 _run.AddPlayerGold(income);
                 events.Add(new GameSimEventPlayerIncomeGained((uint)income));
+            }
+
+            // 无尽爬塔里程碑日（Day 15/20/25...）：自动回复声望并奖励额外金币与全服播报
+            if (_run.CustomRules.SpecialModeId == ESpecialModeId.EndlessTower)
+            {
+                var floorScaling = EndlessTowerScaler.Compute((int)_run.Day, _run.CustomRules.EndlessMaxDay);
+                if (floorScaling.IsMilestoneDay)
+                {
+                    if (floorScaling.MilestonePrestigeRestore > 0)
+                    {
+                        int curPrestige = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, _mode.PrestigeInitial);
+                        int maxPrestige = Math.Max(_mode.PrestigeMax, Math.Max(_run.CustomRules.StartingPrestige, curPrestige));
+                        int nextPrestige = Math.Min(maxPrestige, curPrestige + floorScaling.MilestonePrestigeRestore);
+                        if (nextPrestige > curPrestige)
+                        {
+                            _run.PlayerAttributes[EPlayerAttributeType.Prestige] = nextPrestige;
+                            events.Add(new GameSimEventPlayerPrestigeChanged(nextPrestige - curPrestige));
+                        }
+                    }
+                    if (floorScaling.MilestoneBonusGold > 0)
+                    {
+                        _run.AddPlayerGold(floorScaling.MilestoneBonusGold);
+                    }
+                    if (!_run.IsSandboxRun && _run.Day is 15 or 20 or 30 or 50 or 75 or 99)
+                    {
+                        string displayName = string.IsNullOrWhiteSpace(_run.Username) ? _run.AccountId : _run.Username;
+                        _socialSink?.PublishSystemBroadcast(
+                            lobbyId: null,
+                            msgType: "endless_milestone",
+                            contentZh: $"【无尽爬塔】玩家 {displayName}（{_run.Hero}）已成功挺进无尽第 {_run.Day} 层！",
+                            meta: new { accountId = _run.AccountId, day = _run.Day, victories = _run.Victories });
+                    }
+                }
             }
 
             // 4) 跨天派发 OnDayStarted（必须 syncBoardDiffs: true，确保奥秘之书 Book of Secrets 等跨天生成的技能与属性变更立即同步客户端）
@@ -2930,7 +3279,7 @@ public sealed class RunEngine
             activeEncounterCard: _run.CurrentEncounterCoreCard);
         ApplyOutOfCombatBatch(p1Hour, hourBatch, events, syncBoardDiffs: true, xpType: EExperienceType.Hour);
 
-        // 3. #4 只要推进了常规小时（1->2..6->次日1），基于独立小时推进门控发放固定 ExperiencePerHour（+1 XP），不被商店/野怪经验吞掉
+        // 3. 若刚结束的旧小时尚未获得过小时推进经验，则发放固定 ExperiencePerHour（+1 XP）
         if (needAdvanceHourXp && _mode.ExperiencePerHour > 0)
         {
             GrantExperienceToList(events, _mode.ExperiencePerHour, EExperienceType.Hour);
@@ -2938,7 +3287,6 @@ public sealed class RunEngine
 
         // 4. 若小时推进时升级经验足够，先把新小时的 Choice 现场压入 SuspendedStates 再进入 LevelUp，
         //    确保升级结束后恢复至新小时 Choice；Day 6/9/10 Hour 1 持对应探险门票时直接在 Choice 下发第 4 张探险入口卡。
-        //    确保选完升级奖励后恢复到本小时的 Choice，而不是再推进一小时！
         if (_run.PendingLevelUp)
         {
             PushChoiceAndEnterLevelUp(events);
@@ -2956,10 +3304,52 @@ public sealed class RunEngine
         int victories = (int)_run.Victories;
         int prestige = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, _mode.PrestigeInitial);
         int day = (int)_run.Day;
+        var specialMode = _run.CustomRules.SpecialModeId;
 
         if (prestige <= 0 && _run.FatesUsed)
         {
             return CrownDefeat(events, prestige, day);
+        }
+
+        // Boss 车轮战：完成目标波次（默认 10 波）且（无里程碑 PvP 或已完成该波次 PvP）即宣告胜利
+        if (specialMode == ESpecialModeId.BossRush)
+        {
+            int targetWaves = Math.Clamp(_run.CustomRules.BossRushTotalWaves, 1, 30);
+            bool needFinalPvp = RequiresPvpOnDay((uint)day);
+            if (_run.BossRushWavesCleared >= targetWaves && (!needFinalPvp || justFinishedPvp))
+            {
+                return CrownVictory(events, Math.Max(victories, _run.BossRushWavesCleared), day);
+            }
+            if (day > targetWaves + 5)
+            {
+                return CrownDefeat(events, prestige, day);
+            }
+            return false;
+        }
+
+        // 无尽爬塔模式：达到 10 胜时不强行终局，继续向 EndlessMaxDay（默认 99 层）攀登
+        if (specialMode == ESpecialModeId.EndlessTower)
+        {
+            if (victories >= _mode.VictoriesToWin && !_run.EndlessTenWinCelebrated)
+            {
+                _run.EndlessTenWinCelebrated = true;
+                if (!_run.IsSandboxRun)
+                {
+                    string displayName = string.IsNullOrWhiteSpace(_run.Username) ? _run.AccountId : _run.Username;
+                    _socialSink?.PublishSystemBroadcast(
+                        lobbyId: null,
+                        msgType: "endless_ten_win",
+                        contentZh: $"【无尽爬塔】玩家 {displayName}（{_run.Hero}）已达成 10 胜，正继续挑战无尽高层！",
+                        meta: new { accountId = _run.AccountId, day, victories });
+                }
+            }
+
+            int endlessMaxDay = Math.Clamp(_run.CustomRules.EndlessMaxDay, 11, EndlessTowerScaler.DefaultMaxDay);
+            if (day > endlessMaxDay || (justFinishedPvp && day >= endlessMaxDay))
+            {
+                return CrownVictory(events, victories, day);
+            }
+            return false;
         }
 
         var tourneyLobby = _lobbies?.FindLobbyForRun(_run.TournamentSessionId, _run.AccountId);
@@ -2984,8 +3374,9 @@ public sealed class RunEngine
             return CrownVictory(events, victories, day);
         }
 
-        // 安全上限防止异常无限挂起（打满第 25 天 Hour 6 PvP 即在当日终局，保证 V+L == Day）
-        if (day > 25 || (justFinishedPvp && day >= 25))
+        // 沙盒模式放宽最大天数至 99 天；标准模式打满第 25 天防异常无限挂起
+        int maxAllowedDay = _run.IsSandboxRun ? 99 : 25;
+        if (day > maxAllowedDay || (justFinishedPvp && day >= maxAllowedDay))
         {
             return CrownDefeat(events, prestige, day);
         }
@@ -3015,14 +3406,15 @@ public sealed class RunEngine
     {
         _run.State = ERunState.EndRunVictory;
         _runEnded = true;
-        int chests = ComputeRunChestCount(_run.PlayMode, victories, isConceded: false);
+        int chests = _run.IsSandboxRun ? 0 : ComputeRunChestCount(_run.PlayMode, victories, isConceded: false);
         events.Add(new GameSimEventStateTransitioned(ERunState.EndRunVictory, null));
         events.Add(new GameSimEventRunCompleted(new CompleteRunResult
         {
             XpEarned = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0),
             ChestCount = chests,
         }));
-        Console.WriteLine($"[RunEngine] RUN END: VICTORY (wins={victories}/{_mode.VictoriesToWin} day={day} chests={chests})");
+        PublishEndRunRecords(isVictory: true, isConceded: false);
+        Console.WriteLine($"[RunEngine] RUN END: VICTORY (mode={_run.CustomRules.SpecialModeId} wins={victories}/{_mode.VictoriesToWin} day={day} chests={chests})");
         return true;
     }
 
@@ -3030,15 +3422,142 @@ public sealed class RunEngine
     {
         _run.State = ERunState.EndRunDefeat;
         _runEnded = true;
-        int chests = ComputeRunChestCount(_run.PlayMode, (int)_run.Victories, isConceded: false);
+        int chests = _run.IsSandboxRun ? 0 : ComputeRunChestCount(_run.PlayMode, (int)_run.Victories, isConceded: false);
         events.Add(new GameSimEventStateTransitioned(ERunState.EndRunDefeat, null));
         events.Add(new GameSimEventRunCompleted(new CompleteRunResult
         {
             XpEarned = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0),
             ChestCount = chests,
         }));
-        Console.WriteLine($"[RunEngine] RUN END: DEFEAT (prestige={prestige} fatesUsed={_run.FatesUsed} day={day} wins={_run.Victories} chests={chests})");
+        PublishEndRunRecords(isVictory: false, isConceded: false);
+        Console.WriteLine($"[RunEngine] RUN END: DEFEAT (mode={_run.CustomRules.SpecialModeId} prestige={prestige} fatesUsed={_run.FatesUsed} day={day} wins={_run.Victories} chests={chests})");
         return true;
+    }
+
+    /// <summary>
+    /// 终局排行榜写入与全服荣耀播报（严格遵守沙盒三禁隔离：SandboxLab 绝不上榜、不播报）。
+    /// </summary>
+    private void PublishEndRunRecords(bool isVictory, bool isConceded)
+    {
+        if (_socialSink == null || _run.IsSandboxRun || _run.CustomRules.ShouldSkipCareerAndLeaderboard)
+            return;
+        if (string.IsNullOrWhiteSpace(_run.AccountId))
+            return;
+
+        try
+        {
+            var rules = _run.CustomRules;
+            double mult = MutatorCatalog.CalculateTotalScoreMultiplier(rules.PresetId, rules.MutatorIds);
+            int dayReached = (int)_run.Day;
+            int victories = (int)_run.Victories;
+            int defeats = (int)_run.Defeats;
+            int prestigeRem = Math.Max(0, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 0));
+
+            int rawScore = rules.SpecialModeId switch
+            {
+                ESpecialModeId.EndlessTower => dayReached * 150 + victories * 100 + prestigeRem * 10,
+                ESpecialModeId.BossRush => _run.BossRushWavesCleared * 220 + victories * 100 + prestigeRem * 15 + (isVictory ? 500 : 0),
+                ESpecialModeId.DailyChallenge => victories * 200 + prestigeRem * 25 + Math.Max(0, 15 - dayReached) * 20 + (isVictory ? 300 : 0),
+                _ => victories * 180 + dayReached * 30 + prestigeRem * 15 + (isVictory ? 250 : 0),
+            };
+            int finalScore = Math.Max(0, (int)Math.Round(rawScore * mult));
+
+            string modeKey = rules.SpecialModeId switch
+            {
+                ESpecialModeId.EndlessTower => "endless_tower",
+                ESpecialModeId.CrossHeroMayhem => "cross_hero",
+                ESpecialModeId.MutatorChallenge => "mutator",
+                ESpecialModeId.DailyChallenge => "daily",
+                ESpecialModeId.BossRush => "boss_rush",
+                _ => rules.PresetId == EGameModePreset.PureOfficial ? "standard" : rules.PresetId.ToString().ToLowerInvariant(),
+            };
+            string seasonOrDateKey = rules.SpecialModeId == ESpecialModeId.DailyChallenge
+                ? (!string.IsNullOrWhiteSpace(rules.DailyChallengeDate)
+                    ? rules.DailyChallengeDate!
+                    : DailyChallengeSeedGenerator.GetTodayDateKeyUtc8())
+                : "S1";
+
+            string displayName = string.IsNullOrWhiteSpace(_run.Username) ? _run.AccountId : _run.Username;
+            string? mutatorsJson = rules.MutatorIds is { Count: > 0 }
+                ? JsonSerializer.Serialize(rules.MutatorIds)
+                : null;
+            var boardSummary = _run.Cards.Values
+                .Where(c => c.Owner == ECombatantId.Player && c.Type == ECardType.Item && c.Section != EInventorySection.Stash)
+                .OrderBy(c => c.Socket.HasValue ? (int)c.Socket.Value : 99)
+                .Select(c => new
+                {
+                    templateId = RunState.ResolveCoreTemplateId(c),
+                    tier = c.Tier.ToString(),
+                    enchantment = c.Enchantment?.ToString(),
+                })
+                .ToList();
+            string boardJson = JsonSerializer.Serialize(boardSummary);
+
+            if (!isConceded || victories >= 4 || rules.SpecialModeId == ESpecialModeId.EndlessTower)
+            {
+                _socialSink.RecordRunLeaderboard(new RunLeaderboardSubmission(
+                    ModeKey: modeKey,
+                    SeasonOrDateKey: seasonOrDateKey,
+                    AccountId: _run.AccountId,
+                    Username: displayName,
+                    Hero: _run.Hero.ToString(),
+                    Score: finalScore,
+                    DayReached: dayReached,
+                    Victories: victories,
+                    Defeats: defeats,
+                    ScoreMultiplier: mult,
+                    MutatorsJson: mutatorsJson,
+                    FinalBoardSummaryJson: boardJson));
+            }
+
+            if (isConceded) return;
+
+            string? lobbyId = _lobbies?.FindLobbyForRun(_run.TournamentSessionId, _run.AccountId)?.LobbyId;
+            if (isVictory && IsTournamentRun())
+            {
+                _socialSink.PublishSystemBroadcast(
+                    lobbyId,
+                    "tournament_champion",
+                    $"【锦标赛夺冠】玩家 {displayName}（{_run.Hero}）以 {victories} 胜夺得本场锦标赛冠军！",
+                    new { accountId = _run.AccountId, victories, day = dayReached, score = finalScore });
+            }
+            else if (isVictory && rules.SpecialModeId == ESpecialModeId.BossRush)
+            {
+                _socialSink.PublishSystemBroadcast(
+                    lobbyId: null,
+                    "boss_rush_clear",
+                    $"【Boss 车轮战】玩家 {displayName}（{_run.Hero}）连克 {_run.BossRushWavesCleared} 波传奇首领通关，得分 {finalScore}！",
+                    new { accountId = _run.AccountId, waves = _run.BossRushWavesCleared, score = finalScore });
+            }
+            else if (isVictory && rules.SpecialModeId == ESpecialModeId.DailyChallenge)
+            {
+                _socialSink.PublishSystemBroadcast(
+                    lobbyId: null,
+                    "daily_victory",
+                    $"【每日挑战】玩家 {displayName}（{_run.Hero}）通关 {seasonOrDateKey} 每日挑战，斩获 {finalScore} 分（{mult:0.##}x）！",
+                    new { accountId = _run.AccountId, date = seasonOrDateKey, score = finalScore, mult });
+            }
+            else if (isVictory && victories >= 10)
+            {
+                _socialSink.PublishSystemBroadcast(
+                    lobbyId,
+                    "ten_win",
+                    $"【荣耀十胜】玩家 {displayName}（{_run.Hero}）在第 {dayReached} 天达成 {victories} 胜完美吃鸡！",
+                    new { accountId = _run.AccountId, victories, day = dayReached, mode = modeKey });
+            }
+            else if (rules.SpecialModeId == ESpecialModeId.EndlessTower && dayReached >= 15)
+            {
+                _socialSink.PublishSystemBroadcast(
+                    lobbyId: null,
+                    "endless_finish",
+                    $"【无尽爬塔】玩家 {displayName}（{_run.Hero}）止步第 {dayReached} 层（{victories} 胜），最终评分 {finalScore}！",
+                    new { accountId = _run.AccountId, day = dayReached, victories, score = finalScore });
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RunEngine] 终局榜单/播报上报异常（已忽略）: {ex.Message}");
+        }
     }
 
     // ── 卖 / 基座 / GM / 放弃 ───────────────────────────────────────────────
@@ -3049,23 +3568,23 @@ public sealed class RunEngine
             or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown)
         {
             LogBoardAudit("SellCard", cmd.InstanceId.Value, null, null, null, $"not allowed in state {_run.State}");
-            return NotAllowed($"SellCard not allowed in state {_run.State}");
+            return NotAllowed($"当前状态（{_run.State}）不允许出售卡牌");
         }
         string id = cmd.InstanceId.Value;
         if (!_run.Cards.TryGetValue(id, out var card))
         {
             LogBoardAudit("SellCard", id, null, null, null, "card not found");
-            return NotFound("card not found: " + id);
+            return NotFound("未找到要出售的卡牌：" + id);
         }
         if (card.Owner != ECombatantId.Player)
         {
             LogBoardAudit("SellCard", id, card.TemplateId.ToString(), $"{card.Section}:{card.Socket}", null, "not owned by player");
-            return NotAllowed("cannot sell non-player card: " + id);
+            return NotAllowed("无法出售非玩家拥有的卡牌：" + id);
         }
         if (IsCardUnsellable(card))
         {
             LogBoardAudit("SellCard", id, card.TemplateId.ToString(), $"{card.Section}:{card.Socket}", null, "unsellable");
-            var reject = NotAllowed($"card {id} is unsellable");
+            var reject = NotAllowed($"该卡牌不可出售：{id}");
             if (card.Type == ECardType.Item)
                 ReconcileAndVerifyBoardInvariants("SellUnsellableReject", reject.DirtyCardIds, reject.Events);
             reject.DirtyCardIds.Add(card.InstanceId);
@@ -3092,13 +3611,17 @@ public sealed class RunEngine
         int sell = Math.Max(0, coreCard.GetSellPrice(_repo.GameMode.StandardPrices));
         if (sell == 0 && card.Attributes.TryGetValue(ECardAttributeType.SellPrice, out int fallbackSell) && fallbackSell > 0)
             sell = fallbackSell;
+        if (_run.CustomRules.HasMutator(MutatorCatalog.DoubleEconomy))
+            sell *= 2;
 
-        // 关键顺序：必须在把 card 从 HandGrid/StashGrid 摘除前，携带原始 StartSlot 与卖前 Gold 调用 OutOfCombatController.OnCardSoldOrConsumed（含 activeEncounterCard）
+        // 关键顺序：必须在把 card 从 HandGrid/StashGrid 摘除前，携带原始 StartSlot、卖前 Gold 与货架卡调用 OutOfCombatController.OnCardSoldOrConsumed
         var p1Core = BuildCorePlayerFromRun();
+        var selCards = CollectSelectionCoreCards();
         var soldBatch = OutOfCombatController.OnCardSoldOrConsumed(
             p1Core, coreCard, _repo, _rng, removeAfterTrigger: true,
             currentEncounterId: _run.CurrentEncounterId,
-            activeEncounterCard: _run.CurrentEncounterCoreCard);
+            activeEncounterCard: _run.CurrentEncounterCoreCard,
+            selectionCards: selCards.Count > 0 ? selCards : null);
 
         // 先从权威网格与牌库摘除被卖卡（释放 Hand/Stash 槽位），再应用触发器产卡/属性变更并累加基础售价 sell
         RemoveOwnedEntryFromRun(card);
@@ -3134,15 +3657,15 @@ public sealed class RunEngine
     private Outcome OnCommitPedestal(CommitToPedestalCommand cmd)
     {
         if (_runEnded || _run.State != ERunState.Pedestal)
-            return NotAllowed($"CommitToPedestal not allowed in state {_run.State}");
+            return NotAllowed($"当前状态（{_run.State}）不允许提交祭坛");
 
         string id = cmd.InstanceId.Value;
         if (string.IsNullOrEmpty(id))
-            return NotFound("empty instance id for pedestal");
+            return NotFound("祭坛目标卡牌实例 ID 不能为空");
         if (!_run.Cards.TryGetValue(id, out var card) || card.Owner != ECombatantId.Player)
-            return NotFound("player card not found for pedestal: " + id);
+            return NotFound("未找到可提交祭坛的玩家卡牌：" + id);
         if (card.Type != ECardType.Item)
-            return NotAllowed($"only Item cards can be committed to pedestal, got {card.Type}");
+            return NotAllowed($"只有物品卡可提交至祭坛，当前类型为 {card.Type}");
 
         var o = new Outcome();
         var coreCard = EnsureCoreCard(card);
@@ -3162,7 +3685,7 @@ public sealed class RunEngine
                 CurrentEncounterId = encId,
             };
             if (!ValueAndConditionEvaluator.EvaluateCardCondition(criteria, coreCard, p1Check, checkCtx))
-                return NotAllowed("card does not meet pedestal selection criteria");
+                return NotAllowed("该卡牌不满足当前祭坛的选择条件");
         }
 
         string behType = behavior?.Type ?? "";
@@ -3175,9 +3698,9 @@ public sealed class RunEngine
         if (isTransformBehavior)
         {
             if (card.Tier == ETier.Legendary || coreCard.Template.DefaultTier == CardTier.Legendary)
-                return NotAllowed("legendary cards cannot be transformed");
+                return NotAllowed("传奇品阶卡牌无法被变形");
             if (!TryApplyTransformPedestal(card, coreCard, behavior, o))
-                return NotAllowed("card cannot be transformed at this pedestal");
+                return NotAllowed("该卡牌无法在此祭坛进行变形");
         }
         else
         {
@@ -3196,7 +3719,7 @@ public sealed class RunEngine
                     nextTier = targetTier;
                 }
                 if (card.Tier >= ETier.Diamond || nextTier > ETier.Diamond)
-                    return NotAllowed("card cannot be upgraded further");
+                    return NotAllowed("该卡牌已达最高品阶，无法继续升阶");
 
                 UpgradeCardEntryToTier(card, nextTier);
                 o.Events.Add(new GameSimEventPedestalActivated());
@@ -3211,7 +3734,7 @@ public sealed class RunEngine
             }
             else
             {
-                var coreTpl = _repo.GetCard(card.TemplateId.ToString());
+                var coreTpl = _repo.GetCard(RunState.ResolveCoreTemplateId(card));
                 EEnchantmentType chosen = PickPedestalEnchantment(behavior, coreTpl, card.Enchantment);
                 card.Enchantment = chosen;
                 coreCard.ApplyEnchantment(chosen.ToString(), preventOverride: false, isTemporary: false);
@@ -3399,22 +3922,22 @@ public sealed class RunEngine
         var o = new Outcome();
         var a = cmd.Args ?? new List<string>();
         if (a.Count == 0 || string.IsNullOrWhiteSpace(a[0]))
-            return NotAllowed("empty cheat command");
+            return NotAllowed("调试指令不能为空");
 
         string sub = a[0].ToLowerInvariant();
         if (sub != "restart" && (_runEnded || _run.State is ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown))
-            return NotAllowed($"cheat '{sub}' not allowed in terminal state {_run.State}");
+            return NotAllowed($"对局已结束（{_run.State}），无法执行调试指令 '{sub}'");
 
         switch (sub)
         {
             case "gold":
                 if (a.Count <= 1 || !int.TryParse(a[1], out int g) || g < 0)
-                    return NotAllowed("invalid gold cheat argument");
+                    return NotAllowed("gold 参数无效，请输入非负整数");
                 _run.PlayerAttributes[EPlayerAttributeType.Gold] = g;
                 break;
             case "day":
-                if (a.Count <= 1 || !uint.TryParse(a[1], out uint d) || d < 1 || d > 30)
-                    return NotAllowed("invalid day cheat argument");
+                if (a.Count <= 1 || !uint.TryParse(a[1], out uint d) || d < 1 || d > 99)
+                    return NotAllowed("day 参数无效，范围应为 1~99");
                 _run.Day = d;
                 _run.VisitedDayEncounterIds.Clear();
                 _run.PendingPvpGhost = null;
@@ -3423,7 +3946,7 @@ public sealed class RunEngine
                 break;
             case "hour":
                 if (a.Count <= 1 || !uint.TryParse(a[1], out uint h) || h < 1 || h > (uint)Math.Max(1, _mode.HoursInADay))
-                    return NotAllowed("invalid hour cheat argument");
+                    return NotAllowed($"hour 参数无效，范围应为 1~{Math.Max(1, _mode.HoursInADay)}");
                 _run.Hour = h;
                 _run.GainedHourXpThisHour = false;
                 _run.GainedAdvanceHourXpThisHour = false;
@@ -3437,7 +3960,7 @@ public sealed class RunEngine
             case "prestige":
             {
                 if (a.Count <= 1 || !int.TryParse(a[1], out int p) || p < 0 || p > 999)
-                    return NotAllowed("invalid prestige cheat argument");
+                    return NotAllowed("prestige 参数无效，范围应为 0~999");
                 int oldPrestige = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, _mode.PrestigeInitial);
                 _run.PlayerAttributes[EPlayerAttributeType.Prestige] = p;
                 o.Events.Add(new GameSimEventPlayerPrestigeChanged(p - oldPrestige));
@@ -3447,7 +3970,7 @@ public sealed class RunEngine
             {
                 int addWins = 1;
                 if (a.Count > 1 && (!int.TryParse(a[1], out addWins) || addWins < 1 || addWins > 20))
-                    return NotAllowed("invalid win cheat argument");
+                    return NotAllowed("win 参数无效，范围应为 1~20");
                 _run.Victories += (uint)addWins;
                 if (TryEndRunToEvents(o.Events))
                 {
@@ -3459,7 +3982,7 @@ public sealed class RunEngine
             }
             case "exp":
                 if (a.Count <= 1 || !uint.TryParse(a[1], out uint x) || x > 10000)
-                    return NotAllowed("invalid exp cheat argument");
+                    return NotAllowed("exp 参数无效，范围应为 0~10000");
                 GrantExperience(o, (int)x, EExperienceType.Cheat);
                 break;
             case "deal":
@@ -3550,7 +4073,7 @@ public sealed class RunEngine
                 break;
             }
             default:
-                return NotAllowed($"unknown cheat command: {sub}");
+                return NotAllowed($"未知的调试指令：{sub}");
         }
         return o;
     }
@@ -3559,7 +4082,7 @@ public sealed class RunEngine
     {
         if (_runEnded || _run.State is ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown)
         {
-            return NotAllowed($"AbandonRun not allowed in terminal state {_run.State}");
+            return NotAllowed($"对局已处于终局状态（{_run.State}），无法重复放弃");
         }
 
         var o = new Outcome();
@@ -3571,6 +4094,7 @@ public sealed class RunEngine
             XpEarned = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0),
             ChestCount = 0,
         }));
+        PublishEndRunRecords(isVictory: false, isConceded: true);
         var tLobby = _lobbies?.FindLobbyForRun(_run.TournamentSessionId, _run.AccountId);
         if (tLobby != null && !string.IsNullOrWhiteSpace(_run.AccountId))
         {
@@ -3581,21 +4105,87 @@ public sealed class RunEngine
 
     // ── 局外触发批量回写与状态压栈辅助 ─────────────────────────────────────
 
+    /// <summary>供沙盒实验室等外部合法入口变更盘面后，统一重算局外光环并校准单真值。</summary>
+    public void SyncAfterExternalMutation(List<IGameSimEvent>? events = null)
+    {
+        var ev = events ?? new List<IGameSimEvent>();
+        RecalculateAurasAndSyncBoard(ev);
+        ReconcileAndVerifyBoardInvariants("ExternalMutation", null, ev);
+    }
+
+    /// <summary>收集当前货架 SelectionSet 中全部非激活遭遇卡的核心实例，用于 P0-3 商店折扣/门票光环实时生效。</summary>
+    private List<CardInstance> CollectSelectionCoreCards()
+    {
+        var list = new List<CardInstance>(_run.SelectionSet.Count);
+        foreach (string selId in _run.SelectionSet)
+        {
+            if (string.Equals(selId, _run.ActiveEncounterCardInstanceId, StringComparison.Ordinal))
+                continue;
+            if (!_run.Cards.TryGetValue(selId, out var entry)) continue;
+            if (entry.Owner != null) continue;
+            if (entry.Type is not (ECardType.Item or ECardType.Skill)) continue;
+            list.Add(EnsureCoreCard(entry));
+        }
+        return list;
+    }
+
+    /// <summary>将原版卡 ID 或 Mod 自定义卡 ID 安全映射为客户端白名单内的合法 Guid。</summary>
+    private Guid ResolveSafeWireGuid(string? templateId, ECardType fallbackType)
+    {
+        string safe = _pool.ResolveSafeWireTemplateId(templateId);
+        if (Guid.TryParse(safe, out var g) && g != Guid.Empty)
+            return g;
+        var fallback = fallbackType == ECardType.Skill
+            ? _pool.AllSkills.FirstOrDefault()
+            : _pool.AllItems.FirstOrDefault();
+        if (fallback != null && Guid.TryParse(_pool.ResolveSafeWireTemplateId(fallback.Id), out var fg) && fg != Guid.Empty)
+            return fg;
+        return Guid.Empty;
+    }
+
     private void RecalculateAurasAndSyncBoard(List<IGameSimEvent> events)
     {
         var p1Core = BuildCorePlayerFromRun();
+        var selectionCards = CollectSelectionCoreCards();
         var batch = OutOfCombatController.RecalculateOutOfCombatAuras(
-            p1Core, _repo, activeEncounterCard: _run.CurrentEncounterCoreCard);
+            p1Core,
+            _repo,
+            activeEncounterCard: _run.CurrentEncounterCoreCard,
+            selectionCards: selectionCards.Count > 0 ? selectionCards : null);
         ApplyOutOfCombatBatch(p1Core, batch, events, syncBoardDiffs: true);
+        if (selectionCards.Count > 0)
+            SyncShelfEntriesDiff(events);
     }
 
     private void SyncShelfEntriesDiff(List<IGameSimEvent> events)
     {
-        var shelfEntries = _run.SelectionSet
-            .Select(id => _run.Cards.GetValueOrDefault(id))
-            .Where(e => e != null && e.CoreCard != null)!
-            .Cast<RunState.CardEntry>();
-        events.AddRange(_run.SyncAllEntriesFromCoreCardsAndDiff(_repo.GameMode.StandardPrices, shelfEntries));
+        bool allowZeroShopPrice = _run.SelectionRules.SelectionIsFree
+            || (_run.IsSandboxRun && _run.CustomRules.SandboxZeroShopPrice);
+        var shelfEntries = new List<RunState.CardEntry>(_run.SelectionSet.Count);
+        foreach (string id in _run.SelectionSet)
+        {
+            if (string.Equals(id, _run.ActiveEncounterCardInstanceId, StringComparison.Ordinal))
+                continue;
+            if (!_run.Cards.TryGetValue(id, out var entry) || entry.CoreCard == null)
+                continue;
+            shelfEntries.Add(entry);
+        }
+        if (shelfEntries.Count == 0) return;
+
+        var diffs = _run.SyncAllEntriesFromCoreCardsAndDiff(_repo.GameMode.StandardPrices, shelfEntries);
+        // 守住非免费商人货架底价：除非本上下文免费、沙盒 0 元商店或明确免单光环把值归零，否则保持非负合法售价
+        if (!allowZeroShopPrice)
+        {
+            foreach (var entry in shelfEntries)
+            {
+                if (entry.Type is not (ECardType.Item or ECardType.Skill)) continue;
+                if (entry.Attributes.TryGetValue(ECardAttributeType.BuyPrice, out int bp) && bp < 0)
+                {
+                    entry.Attributes[ECardAttributeType.BuyPrice] = 0;
+                }
+            }
+        }
+        events.AddRange(diffs);
     }
 
     private static bool TriggerContainsType(RuleNode? trigger, string expectedType)
@@ -3629,6 +4219,8 @@ public sealed class RunEngine
         if (xp <= 0) return;
         if (_run.GainedHourXpThisHour && xp <= _mode.ExperiencePerHour) return;
         _run.GainedHourXpThisHour = true;
+        // P0-1 根治：遭遇离场已发放本小时经验后，同步关闭推进小时重复发经验门控，彻底终结每小时双份经验
+        _run.GainedAdvanceHourXpThisHour = true;
         GrantExperienceToList(events, xp, EExperienceType.Hour);
     }
 
@@ -3755,6 +4347,7 @@ public sealed class RunEngine
     {
         var originalState = _run.State;
         _run.GainedHourXpThisHour = true;
+        _run.GainedAdvanceHourXpThisHour = true;
         _run.PendingPvpGhost = null;
         _run.CurrentPvpOpponent = null;
         _run.OpponentAttributes = RunState.CreateDefaultCombatantAttributes(100, 100, gold: 0, income: 5);
@@ -4333,10 +4926,18 @@ public sealed class RunEngine
             ench = parsedEnch;
         }
 
+        Guid wireGuid = ResolveSafeWireGuid(core.Template.Id, cardType);
+        string? customCardId = !string.Equals(core.Template.Id, wireGuid.ToString(), StringComparison.OrdinalIgnoreCase)
+            ? core.Template.Id
+            : null;
+        if (customCardId != null)
+            _run.VisualBindingsRevision++;
+
         var entry = new RunState.CardEntry
         {
             InstanceId = instId,
-            TemplateId = Guid.Parse(core.Template.Id),
+            TemplateId = wireGuid,
+            CustomCardId = customCardId,
             Type = cardType,
             Size = ShopEngine.ParseSize(core.Template.Size),
             Tier = ShopEngine.ParseTier(core.Tier.ToString()),
@@ -5252,13 +5853,13 @@ public sealed class RunEngine
 
     private bool IsCardUnsellable(RunState.CardEntry card)
     {
-        string tplId = card.TemplateId.ToString();
+        string tplId = RunState.ResolveCoreTemplateId(card);
         return HasFlagAttributeOrTag(card, _repo.GetCard(tplId), _pool.Get(tplId), "Unsellable");
     }
 
     private bool HasCardAutoSellOnExitFlag(RunState.CardEntry card)
     {
-        string tplId = card.TemplateId.ToString();
+        string tplId = RunState.ResolveCoreTemplateId(card);
         return HasFlagAttributeOrTag(card, _repo.GetCard(tplId), _pool.Get(tplId), "WillAutoSellOnExit");
     }
 
@@ -5302,13 +5903,25 @@ public sealed class RunEngine
 
         int autoSoldGold = 0;
         bool removedOwned = false;
+        var selCards = CollectSelectionCoreCards();
         foreach (var entry in candidates)
         {
-            int sell = entry.CoreCard != null
-                ? Math.Max(0, entry.CoreCard.GetSellPrice(_repo.GameMode.StandardPrices))
-                : 0;
+            var coreCard = EnsureCoreCard(entry);
+            int sell = Math.Max(0, coreCard.GetSellPrice(_repo.GameMode.StandardPrices));
             if (sell == 0 && entry.Attributes.TryGetValue(ECardAttributeType.SellPrice, out int attrSell) && attrSell > 0)
                 sell = attrSell;
+
+            // P1-14 修复：自动卖出离场前正式派发 TTriggerOnCardSold（让卖卡产衍生/加属性/减价等触发器生效）
+            var p1AutoSell = BuildCorePlayerFromRun();
+            var soldBatch = OutOfCombatController.OnCardSoldOrConsumed(
+                p1AutoSell,
+                coreCard,
+                _repo,
+                _rng,
+                removeAfterTrigger: entry.Owner == ECombatantId.Player,
+                currentEncounterId: _run.CurrentEncounterId,
+                activeEncounterCard: _run.CurrentEncounterCoreCard,
+                selectionCards: selCards.Count > 0 ? selCards : null);
 
             autoSoldGold += Math.Max(0, sell);
             if (entry.Owner == ECombatantId.Player)
@@ -5322,6 +5935,14 @@ public sealed class RunEngine
                 _run.Cards.Remove(entry.InstanceId);
             }
 
+            ApplyOutOfCombatBatch(
+                p1AutoSell,
+                soldBatch,
+                events,
+                excludeRemovedInstanceId: entry.InstanceId,
+                syncBoardDiffs: false,
+                xpType: EExperienceType.Item);
+
             events.Add(new GameSimEventCardSold(entry.InstanceId, (uint)Math.Max(0, sell)));
             events.Add(new GameSimEventCardDisposed(entry.InstanceId, ECardDisposalReason.Sold));
         }
@@ -5329,12 +5950,176 @@ public sealed class RunEngine
         if (autoSoldGold > 0)
         {
             _run.AddPlayerGold(autoSoldGold);
-            RecalculateAurasAndSyncBoard(events);
             LogBoardAudit("WillAutoSellOnExit", _run.CurrentEncounterId, _run.CurrentEncounterId, "Shelf", $"AutoSold(+{autoSoldGold}g)");
         }
+        RecalculateAurasAndSyncBoard(events);
         if (removedOwned)
         {
             ReconcileAndVerifyBoardInvariants("WillAutoSellOnExit", null, events);
+        }
+    }
+
+    private LockedPvpBoard BuildLockedPvpBoardSnapshot()
+    {
+        string displayName = string.IsNullOrWhiteSpace(_run.Username) ? _run.AccountId : _run.Username;
+        string heroName = (_run.Hero == EHero.Common ? EHero.Vanessa : _run.Hero).ToString();
+        return new LockedPvpBoard(
+            AccountId: _run.AccountId,
+            Username: displayName,
+            Hero: heroName,
+            Day: _run.Day,
+            HealthMax: Math.Max(100, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, 250)),
+            Prestige: Math.Max(1, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 20)),
+            Level: Math.Max(1, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Level, 1)),
+            Victories: _run.Victories,
+            Gold: Math.Max(0, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0)),
+            Income: Math.Max(1, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Income, 5)),
+            RunSnapshotJson: RunSnapshotSerializer.Serialize(_run));
+    }
+
+    private PlayerState BuildOpponentPlayerStateFromLockedBoard(LockedPvpBoard board)
+    {
+        try
+        {
+            if (RunSnapshotSerializer.TryDeserialize(board.RunSnapshotJson, _repo, out var restoredRun, out _) &&
+                restoredRun != null)
+            {
+                return BuildOpponentPlayerStateFromRun(restoredRun, board.Username);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RunEngine] 反序列化锁定盘面失败，降级为空白保底盘面: {ex.Message}");
+        }
+
+        var fallback = new PlayerState(
+            "pvp_" + board.AccountId,
+            board.Username,
+            string.IsNullOrWhiteSpace(board.Hero) ? "Vanessa" : board.Hero,
+            Math.Max(100, board.HealthMax),
+            Math.Max(1, board.Prestige),
+            Math.Max(0, board.Gold),
+            Math.Max(1, board.Income))
+        {
+            Level = Math.Max(1, board.Level),
+            Wins = (int)board.Victories,
+        };
+        fallback.Hand.UnlockedMask = 1023;
+        var fbItem = _repo.AlwaysSpawnableItems.FirstOrDefault() ?? _repo.CardsById.Values.FirstOrDefault(c => c.Type == "Item");
+        if (fbItem != null)
+            fallback.Hand.TryAddAuto(new CardInstance(fbItem, CardTier.Bronze, null, "pvp_locked_fb_0"));
+        fallback.PrepareForCombat();
+        return fallback;
+    }
+
+    private void ApplyBossRushWaveReinforcements(PlayerState bossPlayer, BossRushWaveConfig waveCfg, int seed)
+    {
+        bool mutated = false;
+        if (waveCfg.MinimumEquipmentTier > CardTier.Bronze)
+        {
+            foreach (var item in bossPlayer.Hand.Cards)
+            {
+                if (item.Tier < waveCfg.MinimumEquipmentTier)
+                {
+                    var clamped = SpawnQueryEngine.ClampToSupportedTier(item.Template, waveCfg.MinimumEquipmentTier);
+                    if (clamped > item.Tier)
+                    {
+                        item.SetTier(clamped, isTemporary: true);
+                        mutated = true;
+                    }
+                }
+            }
+        }
+
+        if (waveCfg.BonusReinforceSkills > 0)
+        {
+            var rng = new Random(seed ^ 0x51A7F3);
+            var existingIds = new HashSet<string>(bossPlayer.Skills.Select(s => s.Template.Id), StringComparer.OrdinalIgnoreCase);
+            var skillCandidates = _repo.CardsById.Values
+                .Where(c => string.Equals(c.Type, "Skill", StringComparison.OrdinalIgnoreCase) &&
+                            !existingIds.Contains(c.Id) &&
+                            !c.InternalName.Contains("TEST", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            for (int i = 0; i < waveCfg.BonusReinforceSkills && skillCandidates.Count > 0; i++)
+            {
+                int idx = rng.Next(skillCandidates.Count);
+                var skTpl = skillCandidates[idx];
+                skillCandidates.RemoveAt(idx);
+                var tier = SpawnQueryEngine.ClampToSupportedTier(skTpl, waveCfg.MinimumEquipmentTier);
+                bossPlayer.Skills.Add(new CardInstance(skTpl, tier, null, $"boss_sk_{waveCfg.Wave}_{i}"));
+                mutated = true;
+            }
+        }
+
+        if (mutated)
+        {
+            bossPlayer.PrepareForCombat();
+        }
+    }
+
+    private void SaveCombatReplayIfEligible(
+        bool isPvp,
+        bool win,
+        int combatSeed,
+        CombatResult result,
+        PlayerState p1Core,
+        PlayerState p2Core,
+        SimPvpOpponent? pvpInfo,
+        string? lobbyId,
+        CombatSim? combatSim)
+    {
+        if (_socialSink == null || _run.IsSandboxRun || string.IsNullOrWhiteSpace(_run.AccountId))
+            return;
+
+        try
+        {
+            string combatTypeTag = _run.CustomRules.SpecialModeId switch
+            {
+                ESpecialModeId.BossRush when !isPvp => "BOSS_RUSH",
+                ESpecialModeId.EndlessTower => isPvp ? "ENDLESS_PVP" : "ENDLESS_PVE",
+                ESpecialModeId.DailyChallenge => isPvp ? "DAILY_PVP" : "DAILY_PVE",
+                _ => isPvp ? "PVP" : "PVE",
+            };
+            string replayId = $"rep_{_run.RunId}_d{_run.Day}h{_run.Hour}_{Guid.NewGuid():N}"[..Math.Min(48, $"rep_{_run.RunId}_d{_run.Day}h{_run.Hour}_".Length + 12)];
+            string summaryJson = JsonSerializer.Serialize(new
+            {
+                mode = _run.CustomRules.SpecialModeId.ToString(),
+                preset = _run.CustomRules.PresetId.ToString(),
+                mutators = _run.CustomRules.MutatorIds,
+                day = _run.Day,
+                hour = _run.Hour,
+                playerMaxHp = p1Core.HealthMax,
+                playerRemHp = result.Player1RemainingHp,
+                opponentMaxHp = p2Core.HealthMax,
+                opponentRemHp = result.Player2RemainingHp,
+                playerItems = p1Core.Hand.Cards.Select(c => new { id = c.Template.Id, tier = c.Tier.ToString(), ench = c.Enchantment }).ToList(),
+                opponentItems = p2Core.Hand.Cards.Select(c => new { id = c.Template.Id, tier = c.Tier.ToString(), ench = c.Enchantment }).ToList(),
+            });
+            byte[]? simPayload = combatSim != null ? Codec.WriteMessage(new NetMessageCombatSim(combatSim)) : null;
+            string displayName = string.IsNullOrWhiteSpace(_run.Username) ? _run.AccountId : _run.Username;
+            string oppName = pvpInfo?.Name ?? p2Core.DisplayName ?? "未知对手";
+            string oppHero = (pvpInfo?.Hero ?? EHero.Common).ToString();
+
+            _socialSink.SaveCombatReplay(new CombatReplayRecord(
+                ReplayId: replayId,
+                RunId: _run.RunId,
+                LobbyId: lobbyId,
+                CombatType: combatTypeTag,
+                Day: _run.Day,
+                PlayerAccountId: _run.AccountId,
+                PlayerUsername: displayName,
+                PlayerHero: _run.Hero.ToString(),
+                OpponentName: oppName,
+                OpponentHero: oppHero,
+                PlayerWon: win,
+                DurationMs: result.DurationMs,
+                Seed: combatSeed,
+                SummaryJson: summaryJson,
+                CombatSimMsgPack: simPayload));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RunEngine] 保存战斗回放异常（已忽略）: {ex.Message}");
         }
     }
 
@@ -5347,27 +6132,37 @@ public sealed class RunEngine
         var tourneyLobby = _lobbies?.FindLobbyForRun(_run.TournamentSessionId, _run.AccountId);
         MatchupAssignment? tourneyAssignment = null;
         int fallbackIncome = Math.Max(1, tourneyLobby?.Rules?.StartingIncome ?? _run.CustomRules?.StartingIncome ?? _mode.StartingIncome);
+        string ghostPartition = _run.CustomRules.ResolveGhostPoolPartition();
 
         if (tourneyLobby != null && !string.IsNullOrWhiteSpace(_run.AccountId))
         {
-            tourneyAssignment = _lobbies!.EnsureAndGetAssignment(tourneyLobby, _run.Day, _run.AccountId, _sessions);
-            if (tourneyAssignment != null && !tourneyAssignment.OpponentIsBot && _sessions != null)
+            // P0-4 并发安全：进入 Day X Hour 6 时锁定本方快照，避免任何跨会话直接读取 RunState
+            if (tourneyLobby.TournamentSessionId is Guid previewSid && previewSid != Guid.Empty)
             {
-                var oppMem = _sessions.GetByAccount(tourneyAssignment.OpponentAccountId);
-                var liveRun = oppMem != null ? Endpoints.SessionRegistry.Get(oppMem.Sid)?.Run : null;
-                if (liveRun != null &&
-                    liveRun.Day >= _run.Day &&
-                    liveRun.Cards.Values.Any(c =>
-                        c.Owner == ECombatantId.Player &&
-                        c.Type == ECardType.Item &&
-                        c.Section != EInventorySection.Stash))
+                _pvpCoordinator?.LockPlayerBoardForDay(
+                    previewSid,
+                    _run.Day,
+                    BuildLockedPvpBoardSnapshot());
+            }
+
+            tourneyAssignment = _lobbies!.EnsureAndGetAssignment(tourneyLobby, _run.Day, _run.AccountId, _sessions);
+            if (tourneyLobby.TournamentSessionId is Guid oppPreviewSid && oppPreviewSid != Guid.Empty &&
+                tourneyAssignment != null &&
+                !tourneyAssignment.OpponentIsBot &&
+                _pvpCoordinator != null)
+            {
+                var lockedOpp = _pvpCoordinator.TryGetLockedBoard(
+                    oppPreviewSid,
+                    _run.Day,
+                    tourneyAssignment.OpponentAccountId);
+                if (lockedOpp != null)
                 {
-                    EHero liveHero = liveRun.Hero == EHero.Common ? EHero.Vanessa : liveRun.Hero;
-                    int liveHp = Math.Max(100, liveRun.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, 250));
-                    int livePrestige = Math.Max(1, liveRun.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 20));
-                    int liveLevel = Math.Max(1, liveRun.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Level, 1));
-                    int liveGold = Math.Max(0, liveRun.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0));
-                    int liveIncome = liveRun.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Income, fallbackIncome);
+                    EHero liveHero = PvpGhostPool.ParseHero(lockedOpp.Hero);
+                    int liveHp = Math.Max(100, lockedOpp.HealthMax);
+                    int livePrestige = Math.Max(1, lockedOpp.Prestige);
+                    int liveLevel = Math.Max(1, lockedOpp.Level);
+                    int liveGold = Math.Max(0, lockedOpp.Gold);
+                    int liveIncome = lockedOpp.Income > 0 ? lockedOpp.Income : fallbackIncome;
                     _run.CurrentPvpOpponent = new SimPvpOpponent(
                         name: tourneyAssignment.OpponentUsername,
                         titlePrefix: "",
@@ -5375,7 +6170,7 @@ public sealed class RunEngine
                         rank: null,
                         rating: 1200,
                         division: 1,
-                        victories: liveRun.Victories,
+                        victories: lockedOpp.Victories,
                         prestige: livePrestige,
                         level: liveLevel,
                         hero: liveHero,
@@ -5387,27 +6182,35 @@ public sealed class RunEngine
                         prestige: livePrestige,
                         level: liveLevel,
                         gold: liveGold,
-                        income: liveIncome > 0 ? liveIncome : fallbackIncome);
+                        income: liveIncome);
                     EmitHour6OpponentInitializedIfNeeded(events, liveHero);
                     return;
                 }
             }
         }
 
-        int expectedBucketDay = Math.Clamp(day, 1, 15);
+        int expectedDay = _run.CustomRules.SpecialModeId == ESpecialModeId.EndlessTower
+            ? day
+            : Math.Clamp(day, 1, 15);
         bool ghostValid = _run.PendingPvpGhost != null
-                       && _run.PendingPvpGhost.Day == expectedBucketDay
-                       && (_run.IsCustomRuleRun || (!_run.PendingPvpGhost.IsCustomRule && Storage.Persistence.IsSaneGhostForDay(expectedBucketDay, _run.PendingPvpGhost.HealthMax)));
+                       && _run.PendingPvpGhost.Day == expectedDay
+                       && string.Equals(_run.PendingPvpGhost.PoolPartition, ghostPartition, StringComparison.OrdinalIgnoreCase)
+                       && (_run.IsCustomRuleRun || (!_run.PendingPvpGhost.IsCustomRule && Storage.Persistence.IsSaneGhostForDay(Math.Clamp(expectedDay, 1, 15), _run.PendingPvpGhost.HealthMax)));
         if (!ghostValid)
         {
-            var ghostRng = tourneyAssignment != null ? new Random(tourneyAssignment.BattleSeed) : _rng;
+            var ghostRng = tourneyAssignment != null
+                ? new Random(tourneyAssignment.BattleSeed)
+                : (_run.CustomRules.FixedRunSeed is int dSeed && dSeed != 0
+                    ? DailyChallengeSeedGenerator.CreateStreamRng(dSeed, DailyChallengeSeedGenerator.StreamPvpOpponent, day, (int)_run.Hour)
+                    : _rng);
             _run.PendingPvpGhost = _ghosts.PickOpponent(
                 day,
                 (int)_run.Victories,
                 (int)_run.Defeats,
                 ghostRng,
                 _repo,
-                includeCustomRuleGhosts: _run.IsCustomRuleRun);
+                includeCustomRuleGhosts: _run.IsCustomRuleRun,
+                poolPartition: ghostPartition);
         }
 
         var ghost = _run.PendingPvpGhost!;

@@ -1128,9 +1128,9 @@ internal static class GameInspector
 
             if (tpl != null && criteria != null)
             {
-                var validateM = cur.GetType().GetMethod("ValidateCards", AnyInstance, null, Type.EmptyTypes, null);
-                validateM?.Invoke(cur, null);
-                var validCardsObj = cur.GetType().GetField("_validCards", AnyInstance)?.GetValue(cur) as IEnumerable;
+                // 严格只读观测（修复 P1-10）：绝不在 /inspect 观测路径调用会修改游戏状态机的 cur.ValidateCards()
+                var validField = cur.GetType().GetField("_validCards", AnyInstance);
+                var validCardsObj = validField?.GetValue(cur) as IEnumerable;
                 if (validCardsObj != null)
                 {
                     var validIds = new List<string>();

@@ -443,7 +443,7 @@ public sealed class V10ScheduleLevelMonstersTests
             CoreCard = wpnCore,
         };
 
-        // Day 1 Hour 1..4 推进至 Hour 5 时因每小时固定 +1 XP（#4）已达 9 XP，触发 Lv1 -> Lv2（+100 HP，弹出 Shiny! 与 Pip）
+        // P0-1 官方单份经验规则：H1 Pol(+1=1) -> H2 zeroEv(+1=2) -> H3 Fanged Inglet(+3=5) -> H4 Study(+2=7) -> H5 Pol(+1=8) 触发 Lv1 -> Lv2（+100 HP，弹出 Shiny! 与 Pip）
         var pol1 = InjectChoiceEncounter(run, ov.Pool, PolShopId);
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol1.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
@@ -456,12 +456,19 @@ public sealed class V10ScheduleLevelMonstersTests
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(mobOpt.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
 
-        var pol4 = InjectChoiceEncounter(run, ov.Pool, PolShopId);
-        Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol4.InstanceId) }).Error);
+        // Hour 4 选 Study (ce38f4a2, +2 XP -> 累计 7 XP)，Hour 5 选 Pol (+1 XP -> 累计 8 XP 触发 Lv2)
+        const string studyDefaultId = "ce38f4a2-f156-4082-b8ce-e8956c71fc0d";
+        var study4 = InjectChoiceEncounter(run, ov.Pool, studyDefaultId);
+        Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(study4.InstanceId) }).Error);
+        if (run.State != ERunState.Choice)
+            Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
+
+        var pol5 = InjectChoiceEncounter(run, ov.Pool, PolShopId);
+        Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol5.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
 
-        // 验证真实 Lv1 -> Lv2 升级（Hour 4 商店退出攒满 8 XP 立刻进入 LevelUp）：血量精确 +100（而非旧错位 +150），弹窗选项为 Shiny! 与 Pip
-        Assert.Equal(4u, run.Hour);
+        // 验证真实 Lv1 -> Lv2 升级（Hour 5 商店退出攒满 8 XP 立刻拦截进入 LevelUp，退出后再推进至 Hour 6）：血量精确 +100（而非旧错位 +150），弹窗选项为 Shiny! 与 Pip
+        Assert.Equal(5u, run.Hour);
         Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
         Assert.Equal(baseHp + 100, run.PlayerAttributes[EPlayerAttributeType.HealthMax]);
         Assert.Equal(ERunState.LevelUp, run.State);
@@ -470,16 +477,10 @@ public sealed class V10ScheduleLevelMonstersTests
         Assert.Contains(lvlChoiceTpls, id => id.StartsWith("e286d583", StringComparison.OrdinalIgnoreCase)); // Shiny!
         Assert.Contains(lvlChoiceTpls, id => id.StartsWith("e2fc8bd4", StringComparison.OrdinalIgnoreCase)); // Pip
 
-        // 完成 Lv2 升级弹层后推进至 Hour 5 Choice，再打完 Hour 5，稳停 Hour 6 Choice 进入 Day 1 PvP
+        // 完成 Lv2 升级弹层后推进至 Hour 6 Choice 进入 Day 1 PvP
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
         Assert.Equal(ERunState.Choice, run.State);
-        Assert.Equal(5u, run.Hour);
-
-        var pol5 = InjectChoiceEncounter(run, ov.Pool, PolShopId);
-        Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol5.InstanceId) }).Error);
-        Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
         Assert.Equal(6u, run.Hour);
-        Assert.Equal(ERunState.Choice, run.State);
 
         var pvpCard = run.Cards[Assert.Single(run.SelectionSet)];
         var pvpOut = engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pvpCard.InstanceId) });

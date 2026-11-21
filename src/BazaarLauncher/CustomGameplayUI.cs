@@ -69,6 +69,11 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     private bool _tendencySyncPending;
     private float _tendencySyncDueTime;
     private static bool _hooksApplied;
+    private static BazaarLauncher.Core.SafeHarmonyPatcher _hostPatcher;
+    private int _rulesVersion;
+    private bool _hudDirty = true;
+    private string _lastObservedAppState = "";
+    private float _nextPerfTabRefreshTime;
 
     // ── #16 锦标赛 PvP 等待状态与中文倒计时横幅缓存 ───────────────────────────
     private sealed class TourneyStatusSnapshot
@@ -104,14 +109,35 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     private Func<object, bool> _getKeyWasPressed;
     private bool _legacyInputDisabled;
 
-    internal static void EnsureInstalled()
+    internal static void EnsureInstalled(BazaarLauncher.Core.SafeHarmonyPatcher patcher = null)
     {
-        if (Instance != null) return;
+        _hostPatcher = patcher;
+        if (Instance != null)
+        {
+            InstallHarmonyHooksOnce();
+            return;
+        }
         var go = new GameObject("BazaarCustomGameplayUI");
         DontDestroyOnLoad(go);
         Instance = go.AddComponent<CustomGameplayUI>();
-        BazaarLauncherPlugin.Log?.LogInfo("CustomGameplayUI (native uGUI) installed");
+        BazaarLauncherPlugin.Log?.LogInfo("CustomGameplayUI（事件驱动原生级界面，F8 兼容兜底）已加载");
     }
+
+    internal static void Shutdown()
+    {
+        _hooksApplied = false;
+        _hostPatcher = null;
+        if (Instance != null)
+        {
+            var go = Instance.gameObject;
+            Instance = null;
+            if (go != null) Destroy(go);
+        }
+    }
+
+    internal void MarkHudDirty() => _hudDirty = true;
+
+    internal TMPro.TMP_FontAsset GetActiveUiFont() => _ui?.Font;
 
     private void Awake()
     {
@@ -119,7 +145,6 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         _normalRules.EnsureCollections();
         _lobbyRules.EnsureCollections();
 
-        // 若本地已有记忆的锦标赛规则，初始化草稿
         var lastTourney = TournamentPresetStore.GetLastTournamentRules();
         if (lastTourney != null)
         {
@@ -130,6 +155,22 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
 
         InstallHarmonyHooksOnce();
         SceneManager.activeSceneChanged += OnActiveSceneChanged;
+
+        // 订阅事件总线实现事件驱动按需刷新（彻底取代 0.15s 高频轮询，修复 P1-1）
+        BazaarLauncherPlugin.Host?.EventBus.Subscribe<BazaarModSdk.RunStateChangedModEvent>(_ => MarkHudDirty());
+        BazaarLauncherPlugin.Host?.EventBus.Subscribe<BazaarModSdk.CombatLifecycleModEvent>(_ => MarkHudDirty());
+        BazaarLauncherPlugin.Host?.EventBus.Subscribe<BazaarModSdk.ActiveRulesUpdatedModEvent>(_ =>
+        {
+            MarkHudDirty();
+            if (_isOpen) RefreshModalContentsIfOpen();
+        });
+        BazaarLauncherPlugin.Host?.EventBus.Subscribe<BazaarModSdk.ModAssetsSyncedModEvent>(_ =>
+        {
+            _pendingUpdates.Enqueue(() =>
+            {
+                if (_isOpen && _activeTab == UiTab.Workshop) RefreshWorkshopTabUi();
+            });
+        });
     }
 
     private void Start()
@@ -141,6 +182,8 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
 
     private void OnDestroy()
     {
+        try { _socialSseCts?.Cancel(); _socialSseCts?.Dispose(); } catch { }
+        _socialSseCts = null;
         if (Instance == this) Instance = null;
         SceneManager.activeSceneChanged -= OnActiveSceneChanged;
         if (_uiRootGo != null) Destroy(_uiRootGo);
@@ -214,15 +257,33 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             }
         }
 
-        if (now >= _nextHudSyncTime)
+        // 事件驱动按需刷新（修复 P1-1）：仅当脏标记置位、AppState 变更或低频保底 1.0s 时刷新，严禁战斗中 0.15s 高频刷新
+        string curAppState = GameInspector.GetAppStateName();
+        if (!string.Equals(curAppState, _lastObservedAppState, StringComparison.Ordinal))
         {
-            _nextHudSyncTime = now + (IsInActiveCombatPlayback() ? 0.15f : 0.35f);
+            _lastObservedAppState = curAppState;
+            _hudDirty = true;
+        }
+
+        if (_hudDirty || now >= _nextHudSyncTime)
+        {
+            _hudDirty = false;
+            _nextHudSyncTime = now + (IsInActiveCombatPlayback() ? 1.0f : 1.25f);
             RefreshHudOverlays(force: false);
             if (_isOpen && GameInspector.IsMainMenuSceneName(GameInspector.GetActiveSceneName()))
             {
                 RefreshMainMenuToolboxUi();
             }
         }
+
+        // 仅当玩家打开「性能与诊断」页签时每 0.5s 增量刷新性能仪表读数
+        if (_isOpen && _activeTab == UiTab.Performance && now >= _nextPerfTabRefreshTime)
+        {
+            _nextPerfTabRefreshTime = now + 0.5f;
+            RefreshPerformanceTabLiveMetrics();
+        }
+
+        TickToastBanner(now);
 
         if (_isOpen && !_catalogLoaded && !_isBusy && now - _lastAutoDetectTry > 4f)
         {
@@ -330,11 +391,16 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         DrainPendingUpdates();
         if (!string.IsNullOrWhiteSpace(tab))
         {
-            _activeTab = string.Equals(tab, "tournament", StringComparison.OrdinalIgnoreCase)
-                ? UiTab.Tournament
-                : UiTab.Normal;
+            _activeTab = tab.Trim().ToLowerInvariant() switch
+            {
+                "tournament" => UiTab.Tournament,
+                "workshop" or "mods" or "mod" => UiTab.Workshop,
+                "social" or "multiplayer" => UiTab.Social,
+                "performance" or "perf" => UiTab.Performance,
+                _ => UiTab.Normal,
+            };
         }
-        if (open) OpenPanel();
+        if (open) OpenPanelOnTab(_activeTab);
         else ClosePanel();
     }
 
@@ -362,7 +428,14 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             ok = true,
             uiBackend = "ugui",
             open = _isOpen,
-            tab = _activeTab == UiTab.Tournament ? "tournament" : "normal",
+            tab = _activeTab switch
+            {
+                UiTab.Tournament => "tournament",
+                UiTab.Workshop => "workshop",
+                UiTab.Social => "social",
+                UiTab.Performance => "performance",
+                _ => "normal",
+            },
             pillVisible = hudVis.menuRulePillVisible || (inMainMenu && !inCombat && !_isOpen && !_showPreRunPrompt),
             menuRulePillVisible = hudVis.menuRulePillVisible,
             inRunBadgeVisible = hudVis.inRunBadgeVisible,
@@ -414,7 +487,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     {
         if (rules == null)
         {
-            return (false, 400, "rules payload is null", null);
+            return (false, 400, "规则配置数据不能为空", null);
         }
         rules.EnsureCollections();
         rules.RefreshPowerFlag();
@@ -425,7 +498,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             string lobbyId = _currentLobby?.LobbyId;
             if (string.IsNullOrEmpty(lobbyId))
             {
-                return (false, 404, "not currently in a tournament lobby", null);
+                return (false, 404, "当前未处于任何锦标赛房间中", null);
             }
             var resp = await NameAuth.PutJsonAsync($"/lobbies/{Uri.EscapeDataString(lobbyId)}/rules", rules).ConfigureAwait(false);
             if (resp.Ok)
@@ -1142,7 +1215,8 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         _hooksApplied = true;
         try
         {
-            var h = new Harmony("local.thebazaar.bazaarlauncher.customuihooks");
+            // P0-6 修复：优先复用 ModuleHost 托管的 SafeHarmonyPatcher，确保禁用/卸载时 100% UnpatchAll 无僵尸补丁
+            var h = _hostPatcher?.RawHarmony ?? new Harmony("local.thebazaar.bazaarlauncher.customuihooks");
 
             // 监听锦标赛大厅进入：房主建房/入厅时自动加载并应用 lastTournamentRules
             var lobbyStateType = AccessTools.TypeByName("TheBazaar.UI.Tournaments.TournamentLobbyState");
@@ -1723,12 +1797,19 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         return appState is "CombatState" or "PVPCombatState" or "ReplayState";
     }
 
+    private static PropertyInfo _cachedDataSelectedPlayModeProp;
+    private static PropertyInfo _cachedDataSelectedHeroProp;
+
     private static bool IsTournamentUiContext()
     {
         try
         {
-            var dataType = AccessTools.TypeByName("TheBazaar.Data");
-            string playMode = dataType?.GetProperty("SelectedPlayMode", BindingFlags.Public | BindingFlags.Static)?.GetValue(null)?.ToString();
+            if (_cachedDataSelectedPlayModeProp == null)
+            {
+                var dataType = AccessTools.TypeByName("TheBazaar.Data");
+                _cachedDataSelectedPlayModeProp = dataType?.GetProperty("SelectedPlayMode", BindingFlags.Public | BindingFlags.Static);
+            }
+            string playMode = _cachedDataSelectedPlayModeProp?.GetValue(null)?.ToString();
             if (string.Equals(playMode, "Tournament", StringComparison.OrdinalIgnoreCase))
             {
                 return true;
@@ -1768,8 +1849,12 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 return runHero;
             }
 
-            var dataType = AccessTools.TypeByName("TheBazaar.Data");
-            string sel = dataType?.GetProperty("SelectedHero", BindingFlags.Public | BindingFlags.Static)?.GetValue(null)?.ToString();
+            if (_cachedDataSelectedHeroProp == null)
+            {
+                var dataType = AccessTools.TypeByName("TheBazaar.Data");
+                _cachedDataSelectedHeroProp = dataType?.GetProperty("SelectedHero", BindingFlags.Public | BindingFlags.Static);
+            }
+            string sel = _cachedDataSelectedHeroProp?.GetValue(null)?.ToString();
             if (!string.IsNullOrWhiteSpace(sel) && !string.Equals(sel, "Common", StringComparison.OrdinalIgnoreCase))
             {
                 return sel;

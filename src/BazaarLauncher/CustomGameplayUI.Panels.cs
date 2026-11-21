@@ -522,6 +522,8 @@ internal sealed partial class CustomGameplayUI
         _tournamentTabContainer = _ui.CreateVerticalGroup("TournamentTabContainer", _mainScroll.Content, spacing: 10f);
         BuildTournamentTabBody(_tournamentTabContainer.transform);
 
+        BuildExtendedTabs(_mainScroll.Content);
+
         BuildBottomStatusBar(win.transform);
 
         _modalPanelRoot.SetActive(false);
@@ -534,7 +536,7 @@ internal sealed partial class CustomGameplayUI
 
         var row = _ui.CreateHorizontalRow("HeaderRow", bar.transform, spacing: 10f);
 
-        var title = _ui.CreateText("Title", row.transform, "私服玩法规则与锦标赛控制台", 20f, NativeUguiFactory.ColGold, FontStyles.Bold, TextAlignmentOptions.MidlineLeft, wrap: false);
+        var title = _ui.CreateText("Title", row.transform, "大巴扎工坊 · 社交 · 性能控制中心", 19.5f, NativeUguiFactory.ColGold, FontStyles.Bold, TextAlignmentOptions.MidlineLeft, wrap: false);
         NativeUguiFactory.SetLayout(title.gameObject, minW: 310f, prefW: 330f, minH: 36f);
 
         // 显眼【总览状态灯】
@@ -603,34 +605,73 @@ internal sealed partial class CustomGameplayUI
 
     private void BuildModalTabBar(Transform parent)
     {
-        var row = _ui.CreateHorizontalRow("TabBar", parent, spacing: 8f);
+        var row = _ui.CreateHorizontalRow("TabBar", parent, spacing: 6f);
         NativeUguiFactory.SetLayout(row, minH: 36f);
 
         _tabNormalBtn = _ui.CreateButton(
             "TabNormal",
             row.transform,
-            "普通 / 排位模式配置",
-            15f,
+            "常规规则",
+            14f,
             NativeUguiFactory.ColGoldBtn,
             NativeUguiFactory.ColGoldBtnHover,
             Color.white,
             () => SwitchTab(UiTab.Normal),
             borderColor: NativeUguiFactory.ColGold,
             fontStyle: FontStyles.Bold);
-        NativeUguiFactory.SetLayout(_tabNormalBtn.Root, minW: 210f, prefW: 220f, minH: 36f, prefH: 36f);
+        NativeUguiFactory.SetLayout(_tabNormalBtn.Root, minW: 118f, prefW: 126f, minH: 36f, prefH: 36f);
 
         _tabTournamentBtn = _ui.CreateButton(
             "TabTournament",
             row.transform,
-            "锦标赛房间模式",
-            15f,
+            "锦标赛房规",
+            14f,
             NativeUguiFactory.ColBtnNormal,
             NativeUguiFactory.ColBtnHover,
             NativeUguiFactory.ColCream,
             () => SwitchTab(UiTab.Tournament),
             borderColor: NativeUguiFactory.ColGoldDim,
             fontStyle: FontStyles.Bold);
-        NativeUguiFactory.SetLayout(_tabTournamentBtn.Root, minW: 210f, prefW: 220f, minH: 36f, prefH: 36f);
+        NativeUguiFactory.SetLayout(_tabTournamentBtn.Root, minW: 118f, prefW: 126f, minH: 36f, prefH: 36f);
+
+        _tabWorkshopBtn = _ui.CreateButton(
+            "TabWorkshop",
+            row.transform,
+            "自建工坊 & Mod",
+            14f,
+            NativeUguiFactory.ColBtnNormal,
+            NativeUguiFactory.ColBtnHover,
+            NativeUguiFactory.ColCream,
+            () => SwitchTab(UiTab.Workshop),
+            borderColor: NativeUguiFactory.ColGoldDim,
+            fontStyle: FontStyles.Bold);
+        NativeUguiFactory.SetLayout(_tabWorkshopBtn.Root, minW: 146f, prefW: 158f, minH: 36f, prefH: 36f);
+
+        _tabSocialBtn = _ui.CreateButton(
+            "TabSocial",
+            row.transform,
+            "多人社交与观战",
+            14f,
+            NativeUguiFactory.ColBtnNormal,
+            NativeUguiFactory.ColBtnHover,
+            NativeUguiFactory.ColCream,
+            () => SwitchTab(UiTab.Social),
+            borderColor: NativeUguiFactory.ColGoldDim,
+            fontStyle: FontStyles.Bold);
+        NativeUguiFactory.SetLayout(_tabSocialBtn.Root, minW: 146f, prefW: 158f, minH: 36f, prefH: 36f);
+
+        _tabPerformanceBtn = _ui.CreateButton(
+            "TabPerformance",
+            row.transform,
+            "性能监控与诊断",
+            14f,
+            NativeUguiFactory.ColBtnNormal,
+            NativeUguiFactory.ColBtnHover,
+            NativeUguiFactory.ColCream,
+            () => SwitchTab(UiTab.Performance),
+            borderColor: NativeUguiFactory.ColGoldDim,
+            fontStyle: FontStyles.Bold);
+        NativeUguiFactory.SetLayout(_tabPerformanceBtn.Root, minW: 146f, prefW: 158f, minH: 36f, prefH: 36f);
 
         var spacer = new GameObject("Spacer", typeof(RectTransform));
         spacer.transform.SetParent(row.transform, worldPositionStays: false);
@@ -639,14 +680,14 @@ internal sealed partial class CustomGameplayUI
         _btnRefreshCatalog = _ui.CreateButton(
             "BtnRefresh",
             row.transform,
-            "刷新目录与规则",
-            14f,
+            "刷新",
+            13.5f,
             NativeUguiFactory.ColBtnNormal,
             NativeUguiFactory.ColBtnHover,
             NativeUguiFactory.ColCream,
             OnRefreshClicked,
             borderColor: NativeUguiFactory.ColGoldDim);
-        NativeUguiFactory.SetLayout(_btnRefreshCatalog.Root, minW: 158f, prefW: 164f, minH: 34f, prefH: 36f);
+        NativeUguiFactory.SetLayout(_btnRefreshCatalog.Root, minW: 72f, prefW: 78f, minH: 34f, prefH: 36f);
     }
 
     private void BuildMainMenuCosmeticsToolbox(Transform parent)
@@ -1140,7 +1181,7 @@ internal sealed partial class CustomGameplayUI
         var glg = gridGo.AddComponent<GridLayoutGroup>();
         glg.constraint = GridLayoutGroup.Constraint.FixedColumnCount;
         glg.constraintCount = 3;
-        glg.cellSize = new Vector2(382f, 48f);
+        glg.cellSize = new Vector2(isPreRunPrompt ? 364f : 382f, 48f);
         glg.spacing = new Vector2(8f, 6f);
         glg.childAlignment = TextAnchor.UpperLeft;
         w.GridContainer = gridGo.transform;
@@ -1498,7 +1539,7 @@ internal sealed partial class CustomGameplayUI
         crt.anchorMin = new Vector2(0.5f, 0.5f);
         crt.anchorMax = new Vector2(0.5f, 0.5f);
         crt.pivot = new Vector2(0.5f, 0.5f);
-        crt.sizeDelta = new Vector2(920f, 600f);
+        crt.sizeDelta = new Vector2(1220f, 620f);
 
         _openingPromptTitleText = _ui.CreateText("Title", card.transform, "开局流派倾向确认（本局仅此 1 次，确认后途中不可更改）", 18f, NativeUguiFactory.ColGold, FontStyles.Bold);
         _openingPromptSubText = _ui.CreateText("Sub", card.transform, "全模式统一规则：确认锁定或选第一个事件离开第 1 小时后，本局流派倾向将永久锁定。", 13f, NativeUguiFactory.ColMuted);
@@ -2183,6 +2224,7 @@ internal sealed partial class CustomGameplayUI
         _lastModalTab = _activeTab;
         _normalTabContainer.SetActive(_activeTab == UiTab.Normal);
         _tournamentTabContainer.SetActive(_activeTab == UiTab.Tournament);
+        UpdateExtendedTabsVisibility();
 
         bool layoutDirty = tabChanged;
         if (_activeTab == UiTab.Normal)
@@ -2191,9 +2233,13 @@ internal sealed partial class CustomGameplayUI
             layoutDirty |= SyncEditorWidgets(_normalWidgets, _normalRules, _normalBuf);
             if (_btnSaveNormal != null) _btnSaveNormal.Button.interactable = !_isBusy;
         }
-        else
+        else if (_activeTab == UiTab.Tournament)
         {
             RefreshTournamentTabUi();
+            layoutDirty = true;
+        }
+        else
+        {
             layoutDirty = true;
         }
 
@@ -2244,22 +2290,27 @@ internal sealed partial class CustomGameplayUI
         RefreshHudOverlays(force: true);
     }
 
+    private static void StyleTab(NativeUguiFactory.ButtonHandle btn, bool active)
+    {
+        if (btn == null) return;
+        NativeUguiFactory.ApplyButtonColors(
+            btn.Button,
+            active ? NativeUguiFactory.ColGoldBtn : NativeUguiFactory.ColBtnNormal,
+            active ? NativeUguiFactory.ColGoldBtnHover : NativeUguiFactory.ColBtnHover);
+        btn.Label.color = active ? Color.white : NativeUguiFactory.ColCream;
+        if (btn.Border != null)
+        {
+            btn.Border.color = active ? NativeUguiFactory.ColGold : NativeUguiFactory.ColGoldDim;
+        }
+    }
+
     private void RefreshTabButtonsVisual()
     {
-        void StyleTab(NativeUguiFactory.ButtonHandle btn, bool active)
-        {
-            NativeUguiFactory.ApplyButtonColors(
-                btn.Button,
-                active ? NativeUguiFactory.ColGoldBtn : NativeUguiFactory.ColBtnNormal,
-                active ? NativeUguiFactory.ColGoldBtnHover : NativeUguiFactory.ColBtnHover);
-            btn.Label.color = active ? Color.white : NativeUguiFactory.ColCream;
-            if (btn.Border != null)
-            {
-                btn.Border.color = active ? NativeUguiFactory.ColGold : NativeUguiFactory.ColGoldDim;
-            }
-        }
         StyleTab(_tabNormalBtn, _activeTab == UiTab.Normal);
         StyleTab(_tabTournamentBtn, _activeTab == UiTab.Tournament);
+        StyleTab(_tabWorkshopBtn, _activeTab == UiTab.Workshop);
+        StyleTab(_tabSocialBtn, _activeTab == UiTab.Social);
+        StyleTab(_tabPerformanceBtn, _activeTab == UiTab.Performance);
     }
 
     private void RefreshMainMenuToolboxUi()
@@ -2713,7 +2764,7 @@ internal sealed partial class CustomGameplayUI
                 int idx = i;
                 var sk = rules.StartingSkills[i];
                 var row = _ui.CreateHorizontalRow("SelSkill", container, spacing: 6f);
-                var lbl = _ui.CreateText("Name", row.transform, $"- {ResolveSkillName(sk.TemplateId)} ({sk.Tier})", 13f, NativeUguiFactory.ColGold, wrap: false);
+                var lbl = _ui.CreateText("Name", row.transform, $"- {ResolveSkillName(sk.TemplateId)}（{TranslateTierZh(sk.Tier)}）", 13f, NativeUguiFactory.ColGold, wrap: false);
                 NativeUguiFactory.SetLayout(lbl.gameObject, flexW: 1f, minH: 24f);
 
                 var rmBtn = _ui.CreateButton("Remove", row.transform, "移除", 12.5f,
@@ -2742,7 +2793,7 @@ internal sealed partial class CustomGameplayUI
                 var st = rules.StartingItems[i];
                 string enchTag = string.IsNullOrEmpty(st.Enchantment) ? "" : $" [{FindEnchantLabel(st.Enchantment)}]";
                 var row = _ui.CreateHorizontalRow("SelItem", container, spacing: 6f);
-                var lbl = _ui.CreateText("Name", row.transform, $"- {ResolveItemName(st.TemplateId)} ({st.Tier}){enchTag}", 13f, NativeUguiFactory.ColGold, wrap: false);
+                var lbl = _ui.CreateText("Name", row.transform, $"- {ResolveItemName(st.TemplateId)}（{TranslateTierZh(st.Tier)}）{enchTag}", 13f, NativeUguiFactory.ColGold, wrap: false);
                 NativeUguiFactory.SetLayout(lbl.gameObject, flexW: 1f, minH: 24f);
 
                 var rmBtn = _ui.CreateButton("Remove", row.transform, "移除", 12.5f,
@@ -2912,6 +2963,20 @@ internal sealed partial class CustomGameplayUI
         if (_activeTab == UiTab.Tournament)
         {
             RefreshTournamentLobbyAsync(forceOverwriteHostDraft: true);
+        }
+        else if (_activeTab == UiTab.Workshop)
+        {
+            BazaarLauncher.Core.ModContentSyncClient.Instance.TriggerFullSyncInBackground(forceDownload: false);
+            RefreshWorkshopTabUi();
+        }
+        else if (_activeTab == UiTab.Social)
+        {
+            RefreshSocialTabData();
+        }
+        else if (_activeTab == UiTab.Performance)
+        {
+            BazaarLauncher.Modules.PerfOptimizerModule.Instance?.TriggerPingProbeBackground();
+            RefreshPerformanceTabFull();
         }
         else
         {

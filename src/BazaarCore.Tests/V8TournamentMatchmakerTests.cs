@@ -131,7 +131,8 @@ public sealed class V8TournamentMatchmakerTests
         {
             using var sseResp = await hostHttp.GetAsync("/events", HttpCompletionOption.ResponseHeadersRead);
             using var sseReader = new StreamReader(await sseResp.Content.ReadAsStreamAsync());
-            Assert.Equal("data: connected", await sseReader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)));
+            // Wave 3A (MP-P1-02)：首帧改为标准 SSE 注释行 ": connected"，避免触发原版客户端 ReadServerSentEvents(notifyOnConnect:true) 双拉取风暴
+            Assert.Equal(": connected", await sseReader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)));
             await sseReader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5));
 
             var createResp = await hostHttp.PostAsJsonAsync("/lobbies", new
@@ -152,8 +153,9 @@ public sealed class V8TournamentMatchmakerTests
             Assert.Equal("data: update", await sseReader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)));
             await sseReader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5));
 
-            Assert.Equal(HttpStatusCode.Forbidden, (await guestHttp.PutAsJsonAsync($"/lobbies/{lobbyId}/rules", new CustomRunRuleSet { PlayerCap = 10 })).StatusCode);
-            Assert.Equal(HttpStatusCode.Forbidden, (await guestHttp.PostAsJsonAsync($"/lobbies/{lobbyId}/bots", new { action = "add" })).StatusCode);
+            // Wave 3A 安全红线：非房主越权修改规则或操作人机统一返回 409 Conflict (NOT_HOST)
+            Assert.Equal(HttpStatusCode.Conflict, (await guestHttp.PutAsJsonAsync($"/lobbies/{lobbyId}/rules", new CustomRunRuleSet { PlayerCap = 10 })).StatusCode);
+            Assert.Equal(HttpStatusCode.Conflict, (await guestHttp.PostAsJsonAsync($"/lobbies/{lobbyId}/bots", new { action = "add" })).StatusCode);
 
             var updResp = await hostHttp.PutAsJsonAsync($"/lobbies/{lobbyId}/rules", new CustomRunRuleSet { PlayerCap = 10 });
             updResp.EnsureSuccessStatusCode();

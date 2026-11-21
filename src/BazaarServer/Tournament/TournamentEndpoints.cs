@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using BazaarCore.Models;
 using BazaarGameShared.Domain.Core.Types;
@@ -11,28 +13,25 @@ using BazaarServer.Storage;
 namespace BazaarServer.Tournament;
 
 /// <summary>
-/// 锦标赛 / 房间 / 匹配 / 观战协调器（自建版，完整对齐客户端 TournamentHttpClient 协议）。
-///
-/// 支持端点：
-///   POST /lobbies                         建房（CoordinatorLobby）
-///   GET  /lobbies?limit=N                 公开房列表（TournamentPublicLobbyDto[]）
-///   GET  /lobbies/{id}                    房间详情（CoordinatorLobby）
-///   POST /lobbies/{code}/members          按码加入
-///   GET  /membership                      当前所在成员关系（CoordinatorMembership）
-///   DELETE /membership & /lobbies/{id}/membership         退房
-///   DELETE /members/{aid} & /lobbies/{id}/members/{aid}   踢人
-///   PUT  /lobbies/{id}/presence & /presence               心跳
-///   PUT  /lobbies/{id}/countdown & /countdown             开始倒计时并补齐 8 人 AI 选手
-///   PUT  /lobbies/{id}/acceptance & /acceptance           接受/拒绝指定房
-///   GET/PUT/DELETE /queue                 单人秒匹配 8 人 AI 锦标赛
-///   GET  /sessions/current/status
-///   GET  /sessions/current/gameplay-status
-///   GET  /tournament/status               实时同步玩家 RunState 进度的锦标赛状态
-///   GET  /events                          SSE（发送 data: update 驱动客户端实时刷新）
-///   GET  /spectate & /spectate/{code}     观战名单与数据
+/// 持久化锦标赛大厅、成员状态机、屏障看门狗核心与对称匹配协调存储：
+/// - 全部关键状态变更同步持久化至 SQLite (tournament_lobbies / tournament_lobby_members / tournament_matchups)，重启自动热恢复；
+/// - 修复 8 项多人联机 P0 缺陷：越权踢人/开赛、纯内存重启丢失、掉线卡死屏障、跨天脏对阵、观战缺失 Players、满房/已开赛假成功等；
+/// - 内置房间级隔离通知 + 可选挂载 SseEventHub 与 ISocialAndReplaySink。
 /// </summary>
 public sealed class LobbyStore
 {
+    public const int DisconnectGraceSeconds = 45;
+    public const int TakeoverBarrierGraceSeconds = 30;
+    public const int TakeoverTotalDisconnectSeconds = 90;
+    public const int MaxMissedTakeoverDays = 3;
+
+    private static readonly JsonSerializerOptions StorageJsonOpts = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+        WriteIndented = false,
+    };
+
     private static readonly string[] AiBotNames =
     {
         "CrimsonVanessa",
@@ -58,25 +57,51 @@ public sealed class LobbyStore
         "Vanessa", "Dooley", "Pygmalien", "Jules", "Mak", "Stelle", "Karnok", "Hero8",
     };
 
+    private readonly Persistence? _db;
     private readonly ConcurrentDictionary<string, Lobby> _byId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _codeToId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _memberToLobby = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, RemovalNotice> _pendingRemovals = new(StringComparer.OrdinalIgnoreCase);
+
+    // 房间级本地版本等待器（用于未装配 SseEventHub 的单元测试与回退场景）
+    private readonly ConcurrentDictionary<string, long> _lobbyVersions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, List<TaskCompletionSource<bool>>> _lobbyWaiters = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _waitersLock = new();
-    private List<TaskCompletionSource<bool>> _waiters = new();
+    private List<TaskCompletionSource<bool>> _globalWaiters = new();
     private long _changeVersion;
     private Func<DateTime> _utcNowProvider = static () => DateTime.UtcNow;
 
-    public long ChangeVersion => Volatile.Read(ref _changeVersion);
+    private SseEventHub? _sseHub;
+    private ISocialAndReplaySink? _socialSink;
 
-    /// <summary>当前 UTC 时间（支持测试注入可控时钟验证倒计时与超时解锁）。</summary>
+    public LobbyStore(Persistence? db = null)
+    {
+        _db = db;
+        if (_db != null)
+        {
+            LoadActiveFromDb();
+        }
+    }
+
+    /// <summary>挂载运行期 SSE 中枢与社交播报写入器（由 MultiplayerEndpointModule 在启动时绑定）。</summary>
+    public void AttachRuntimeHooks(SseEventHub? sseHub, ISocialAndReplaySink? socialSink)
+    {
+        _sseHub = sseHub;
+        _socialSink = socialSink;
+    }
+
+    public SseEventHub? SseHub => _sseHub;
+    public long ChangeVersion => Volatile.Read(ref _changeVersion);
     internal DateTime UtcNow => _utcNowProvider();
 
-    /// <summary>测试辅助：覆写锦标赛时钟源（传 null 恢复系统 UTC 时钟）。</summary>
     public void SetClockForTesting(Func<DateTime>? utcNowProvider)
         => _utcNowProvider = utcNowProvider ?? (static () => DateTime.UtcNow);
 
     public sealed record RemovalNotice(string LobbyId, string Code, string Reason);
+
+    public sealed record JoinLobbyResult(bool Ok, string? ErrorCode, string? MessageZh, Lobby? Lobby);
+
+    public sealed record OperationResult(bool Ok, int StatusCode, string? ErrorCode, string? MessageZh);
 
     public sealed class RoundBarrierState
     {
@@ -106,17 +131,26 @@ public sealed class LobbyStore
         public string Name { get; set; } = "";
         public string Kind { get; set; } = "custom"; // "custom" | "matchmaking" | "assigned"
         public string PlayMode { get; set; } = "Tournament";
-        public string HostAccountId { get; init; } = "";
-        public string HostUsername { get; init; } = "";
+        public string ModeId { get; set; } = "standard";
+        public string PresetId { get; set; } = "PureOfficial";
+        public string HostAccountId { get; set; } = "";
+        public string HostUsername { get; set; } = "";
         public int PlayerCap { get; set; } = 8;
-        public bool IsPublic { get; init; }
+        public bool IsPublic { get; set; } = true;
+        public bool HasPassword { get; set; }
+        public string PasswordHash { get; set; } = "";
+        public bool IsInviteOnly { get; set; }
+        public string InviteTokenHash { get; set; } = "";
+        public DateTime? InviteTokenExpiresAtUtc { get; set; }
         public bool ExcludeHostFromGameplay { get; init; }
         public bool HasStarted { get; set; }
         public bool IsCancelled { get; set; }
         public bool CountdownStarted { get; set; }
         public Guid? TournamentSessionId { get; set; }
         public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
+        public DateTime? StartedAt { get; set; }
         public DateTime ExpiresAt { get; set; } = DateTime.UtcNow.AddHours(6);
+        public DateTime? EndedAt { get; set; }
         public CustomRunRuleSet Rules { get; set; } = new();
         public int RoundCountdownSeconds { get; set; } = 120;
         public int AcceleratedRoundCountdownSeconds { get; set; } = 30;
@@ -124,6 +158,7 @@ public sealed class LobbyStore
         public TournamentMatchmaker Matchmaker { get; init; } = new();
         public Dictionary<uint, RoundBarrierState> RoundBarriers { get; } = new();
         public readonly List<Member> Members = new();
+        internal uint HighestAiSimulatedDay { get; set; }
     }
 
     public sealed class Member
@@ -135,45 +170,70 @@ public sealed class LobbyStore
         public DateTime JoinedAt { get; init; } = DateTime.UtcNow;
         public DateTime LastSeenAt { get; set; } = DateTime.UtcNow;
 
-        // 实时回合同步进度（用于多真人 Day D Hour 6 PvP 同步屏障）
+        // 掉线与 AI 托管状态机 ("online" | "disconnected" | "ai_takeover")
+        public string ConnectionState { get; set; } = "online";
+        public DateTime? AiTakeoverSinceUtc { get; set; }
+        public int MissedPvpDays { get; set; }
+
+        // 实时回合同步进度
         public uint CurrentDay { get; set; } = 1;
         public uint CurrentHour { get; set; } = 1;
         public bool IsReadyAtHour6Pvp { get; set; }
 
-        // 结束快照：一旦人类玩家完成/放弃当前锦标赛对局，保留终局榜单数据供 EndOfRun 展示，同时从 /membership 摘除防自动重开
+        // 终局与 AI 真实战绩状态
         public bool HasFinishedRun { get; set; }
         public bool FinalIsChampion { get; set; }
         public bool FinalIsEliminated { get; set; }
+        public bool FinalIsConceded { get; set; }
+        public int FinalPlace { get; set; }
         public int FinalVictories { get; set; }
         public int FinalDefeats { get; set; }
         public int FinalPrestige { get; set; } = 20;
         public uint FinalDay { get; set; } = 1;
+        public string RemovalReason { get; set; } = "";
     }
 
-    public void NotifyChanged()
+    // ── 通知与房间级隔离 SSE 唤醒 ──────────────────────────────────────────
+
+    public void NotifyChanged() => NotifyLobbyChanged(null, publicListChanged: true);
+
+    public void NotifyLobbyChanged(string? lobbyId, bool publicListChanged = false)
     {
         Interlocked.Increment(ref _changeVersion);
-        List<TaskCompletionSource<bool>>? toWake = null;
+
+        if (!string.IsNullOrWhiteSpace(lobbyId))
+        {
+            _lobbyVersions.AddOrUpdate(lobbyId, 1, (_, old) => old + 1);
+            _sseHub?.PublishLobbyUpdate(lobbyId, alsoPublicList: publicListChanged);
+        }
+        else if (publicListChanged)
+        {
+            _sseHub?.PublishLobbyUpdate("", alsoPublicList: true);
+        }
+
+        List<TaskCompletionSource<bool>>? toWakeGlobal = null;
+        List<TaskCompletionSource<bool>>? toWakeLobby = null;
         lock (_waitersLock)
         {
-            if (_waiters.Count > 0)
+            if (_globalWaiters.Count > 0)
             {
-                toWake = _waiters;
-                _waiters = new List<TaskCompletionSource<bool>>();
+                toWakeGlobal = _globalWaiters;
+                _globalWaiters = new List<TaskCompletionSource<bool>>();
+            }
+            if (!string.IsNullOrWhiteSpace(lobbyId) && _lobbyWaiters.TryRemove(lobbyId, out var lw) && lw.Count > 0)
+            {
+                toWakeLobby = lw;
             }
         }
-        if (toWake != null)
-        {
-            foreach (var tcs in toWake)
-            {
-                tcs.TrySetResult(true);
-            }
-        }
+        if (toWakeGlobal != null)
+            foreach (var tcs in toWakeGlobal) tcs.TrySetResult(true);
+        if (toWakeLobby != null)
+            foreach (var tcs in toWakeLobby) tcs.TrySetResult(true);
     }
 
-    /// <summary>
-    /// 异步挂起直到发生房间变更（NotifyChanged）或超过保活超时时间，避免轮询空耗 CPU。
-    /// </summary>
+    public long GetLobbyChangeVersion(string lobbyId)
+        => _lobbyVersions.TryGetValue(lobbyId, out long v) ? v : 0;
+
     public async Task<bool> WaitForChangeAsync(long seenVersion, TimeSpan timeout, CancellationToken ct)
     {
         if (Volatile.Read(ref _changeVersion) != seenVersion)
@@ -184,7 +244,7 @@ public sealed class LobbyStore
         {
             if (Volatile.Read(ref _changeVersion) != seenVersion)
                 return true;
-            _waiters.Add(tcs);
+            _globalWaiters.Add(tcs);
         }
 
         try
@@ -200,10 +260,347 @@ public sealed class LobbyStore
         {
             lock (_waitersLock)
             {
-                _waiters.Remove(tcs);
+                _globalWaiters.Remove(tcs);
             }
         }
     }
+
+    public async Task<bool> WaitForLobbyChangeAsync(string lobbyId, long seenLobbyVersion, TimeSpan timeout, CancellationToken ct)
+    {
+        if (GetLobbyChangeVersion(lobbyId) != seenLobbyVersion)
+            return true;
+
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_waitersLock)
+        {
+            if (GetLobbyChangeVersion(lobbyId) != seenLobbyVersion)
+                return true;
+            var list = _lobbyWaiters.GetOrAdd(lobbyId, _ => new List<TaskCompletionSource<bool>>());
+            list.Add(tcs);
+        }
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(timeout);
+            using var reg = timeoutCts.Token.Register(
+                static state => ((TaskCompletionSource<bool>)state!).TrySetResult(false),
+                tcs);
+            return await tcs.Task.ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_waitersLock)
+            {
+                if (_lobbyWaiters.TryGetValue(lobbyId, out var list))
+                {
+                    list.Remove(tcs);
+                    if (list.Count == 0) _lobbyWaiters.TryRemove(lobbyId, out _);
+                }
+            }
+        }
+    }
+
+    // ── SQLite 持久化与重启热恢复 ──────────────────────────────────────────
+
+    /// <summary>服务端启动时从 SQLite 热恢复所有活跃锦标赛大厅、成员、屏障与匹配器状态。</summary>
+    public int LoadActiveFromDb()
+    {
+        if (_db == null) return 0;
+        int restored = 0;
+        try
+        {
+            var records = _db.LoadActiveTournamentLobbies(UtcNow);
+            foreach (var (row, memberRows) in records)
+            {
+                if (_byId.ContainsKey(row.LobbyId)) continue;
+
+                CustomRunRuleSet rules;
+                try { rules = JsonSerializer.Deserialize<CustomRunRuleSet>(row.RulesJson, StorageJsonOpts)?.CloneNormalized() ?? new CustomRunRuleSet(); }
+                catch { rules = new CustomRunRuleSet(); }
+
+                List<string> banned;
+                try { banned = JsonSerializer.Deserialize<List<string>>(row.BannedEncounterIdsJson, StorageJsonOpts) ?? new List<string>(); }
+                catch { banned = new List<string>(); }
+
+                var matchmaker = new TournamentMatchmaker(row.LobbyId);
+                matchmaker.ImportStateJson(row.MatchmakerStateJson);
+
+                Guid? tsid = Guid.TryParse(row.TournamentSessionId, out var parsedGuid) && parsedGuid != Guid.Empty
+                    ? parsedGuid
+                    : null;
+
+                var lobby = new Lobby
+                {
+                    LobbyId = row.LobbyId,
+                    Code = row.Code,
+                    Name = row.Name,
+                    Kind = row.Kind,
+                    PlayMode = row.PlayMode,
+                    ModeId = string.IsNullOrWhiteSpace(row.ModeId) ? Persistence.ResolveModeKey(rules.SpecialModeId) : row.ModeId,
+                    PresetId = string.IsNullOrWhiteSpace(row.PresetId) ? rules.PresetId.ToString() : row.PresetId,
+                    HostAccountId = row.HostAccountId,
+                    HostUsername = row.HostUsername,
+                    PlayerCap = Math.Clamp(row.PlayerCap, 2, 16),
+                    IsPublic = row.IsPublic,
+                    HasPassword = row.HasPassword,
+                    PasswordHash = row.PasswordHash,
+                    IsInviteOnly = row.IsInviteOnly,
+                    InviteTokenHash = row.InviteTokenHash,
+                    ExcludeHostFromGameplay = row.ExcludeHostFromGameplay,
+                    HasStarted = row.State is "started" or "finished",
+                    CountdownStarted = row.State is "countdown" or "started" or "finished",
+                    IsCancelled = row.State == "cancelled",
+                    TournamentSessionId = tsid,
+                    CreatedAt = row.CreatedAt,
+                    StartedAt = row.StartedAt,
+                    ExpiresAt = row.ExpiresAt,
+                    EndedAt = row.EndedAt,
+                    Rules = rules,
+                    RoundCountdownSeconds = row.RoundCountdownSeconds,
+                    AcceleratedRoundCountdownSeconds = row.AccelRoundCountdownSeconds,
+                    BannedEncounterIds = banned,
+                    Matchmaker = matchmaker,
+                };
+
+                // 恢复 RoundBarriers
+                try
+                {
+                    var barriers = JsonSerializer.Deserialize<Dictionary<uint, RoundBarrierState>>(row.RoundBarriersJson, StorageJsonOpts);
+                    if (barriers != null)
+                    {
+                        foreach (var kv in barriers)
+                            lobby.RoundBarriers[kv.Key] = kv.Value;
+                    }
+                }
+                catch { }
+
+                // 恢复成员
+                foreach (var mr in memberRows)
+                {
+                    var m = new Member
+                    {
+                        AccountId = mr.AccountId,
+                        Username = mr.Username,
+                        Hero = mr.Hero,
+                        IsAi = mr.IsAi,
+                        JoinedAt = mr.JoinedAt,
+                        LastSeenAt = mr.LastSeenAt,
+                        ConnectionState = string.IsNullOrWhiteSpace(mr.ConnectionState) ? "online" : mr.ConnectionState,
+                        AiTakeoverSinceUtc = mr.AiTakeoverSince,
+                        MissedPvpDays = mr.MissedPvpDays,
+                        CurrentDay = mr.CurrentDay,
+                        CurrentHour = mr.CurrentHour,
+                        IsReadyAtHour6Pvp = mr.IsReadyH6Pvp,
+                        HasFinishedRun = mr.HasFinishedRun,
+                        FinalIsChampion = mr.IsChampion,
+                        FinalIsEliminated = mr.IsEliminated,
+                        FinalIsConceded = mr.IsConceded,
+                        FinalPlace = mr.FinalPlace,
+                        FinalVictories = mr.Victories,
+                        FinalDefeats = mr.Defeats,
+                        FinalPrestige = mr.Prestige,
+                        FinalDay = mr.FinalDay,
+                        RemovalReason = mr.RemovalReason,
+                    };
+                    lobby.Members.Add(m);
+                    if (!m.IsAi && !m.HasFinishedRun && !lobby.IsCancelled)
+                    {
+                        _memberToLobby[m.AccountId] = lobby.LobbyId;
+                    }
+                }
+
+                // 恢复历史日冻结对阵表
+                var matchups = _db.LoadTournamentMatchupsByLobby(lobby.LobbyId);
+                foreach (var dayGroup in matchups.GroupBy(x => x.Day))
+                {
+                    var dayAssignments = new List<MatchupAssignment>();
+                    var dayResolutions = new List<HumanMatchResolution>();
+                    bool nonLethal = lobby.Rules.BotNonLethalPrestigeLock;
+                    foreach (var mu in dayGroup)
+                    {
+                        dayAssignments.Add(new MatchupAssignment(
+                            mu.Day, mu.P1AccountId, mu.P2AccountId, mu.P2Username,
+                            mu.P2IsBot, mu.IsSyntheticSparring || (mu.P2IsBot && nonLethal), mu.IsSyntheticSparring, mu.BattleSeed));
+                        dayAssignments.Add(new MatchupAssignment(
+                            mu.Day, mu.P2AccountId, mu.P1AccountId, mu.P1Username,
+                            mu.P1IsBot, mu.IsSyntheticSparring || (mu.P1IsBot && nonLethal), mu.IsSyntheticSparring, mu.BattleSeed));
+                        if (!string.IsNullOrWhiteSpace(mu.WinnerAccountId))
+                        {
+                            dayResolutions.Add(new HumanMatchResolution(
+                                mu.Day, mu.PairKey, mu.WinnerAccountId, mu.LoserAccountId,
+                                mu.BattleSeed, mu.LoserPrestigeDamage, mu.ResolvedAt ?? DateTime.UtcNow));
+                        }
+                    }
+                    lobby.Matchmaker.RestoreDayAssignments(dayGroup.Key, dayAssignments, dayResolutions);
+                }
+
+                _byId[lobby.LobbyId] = lobby;
+                _codeToId[lobby.Code] = lobby.LobbyId;
+                restored++;
+            }
+
+            if (restored > 0)
+                Console.WriteLine($"[LobbyStore] 已从 SQLite 恢复 {restored} 个活跃锦标赛大厅");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[LobbyStore] 从 SQLite 恢复大厅失败: " + ex.Message);
+        }
+        return restored;
+    }
+
+    private void PersistLobby(Lobby lobby)
+    {
+        if (_db == null || lobby == null) return;
+        try
+        {
+            Persistence.TournamentLobbyRow lobbyRow;
+            List<Persistence.TournamentLobbyMemberRow> memberRows;
+            DateTime now = UtcNow;
+
+            lock (lobby.Members)
+            {
+                bool allHumansDone = lobby.HasStarted && lobby.Members.Where(m => !m.IsAi).All(m => m.HasFinishedRun);
+                string state = lobby.IsCancelled
+                    ? "cancelled"
+                    : allHumansDone ? "finished"
+                    : lobby.HasStarted ? "started"
+                    : lobby.CountdownStarted ? "countdown" : "waiting";
+
+                if (state is "finished" or "cancelled" && !lobby.EndedAt.HasValue)
+                    lobby.EndedAt = now;
+
+                string rulesJson = JsonSerializer.Serialize(lobby.Rules ?? new CustomRunRuleSet(), StorageJsonOpts);
+                string bannedJson = JsonSerializer.Serialize(lobby.BannedEncounterIds ?? new List<string>(), StorageJsonOpts);
+                string mutatorsJson = JsonSerializer.Serialize(lobby.Rules?.MutatorIds ?? new List<string>(), StorageJsonOpts);
+                string barriersJson = JsonSerializer.Serialize(lobby.RoundBarriers, StorageJsonOpts);
+                string mmJson = lobby.Matchmaker.ExportStateJson();
+
+                lobbyRow = new Persistence.TournamentLobbyRow(
+                    LobbyId: lobby.LobbyId,
+                    Code: lobby.Code,
+                    Name: lobby.Name,
+                    Kind: lobby.Kind,
+                    PlayMode: lobby.PlayMode,
+                    ModeId: lobby.ModeId,
+                    PresetId: lobby.PresetId,
+                    MutatorsJson: mutatorsJson,
+                    HostAccountId: lobby.HostAccountId,
+                    HostUsername: lobby.HostUsername,
+                    PlayerCap: lobby.PlayerCap,
+                    IsPublic: lobby.IsPublic,
+                    HasPassword: lobby.HasPassword,
+                    PasswordHash: lobby.PasswordHash,
+                    IsInviteOnly: lobby.IsInviteOnly,
+                    InviteTokenHash: lobby.InviteTokenHash,
+                    ExcludeHostFromGameplay: lobby.ExcludeHostFromGameplay,
+                    State: state,
+                    TournamentSessionId: lobby.TournamentSessionId?.ToString("D") ?? "",
+                    RoundCountdownSeconds: lobby.RoundCountdownSeconds,
+                    AccelRoundCountdownSeconds: lobby.AcceleratedRoundCountdownSeconds,
+                    RulesJson: rulesJson,
+                    BannedEncounterIdsJson: bannedJson,
+                    RoundBarriersJson: barriersJson,
+                    MatchmakerStateJson: mmJson,
+                    CreatedAt: lobby.CreatedAt,
+                    StartedAt: lobby.StartedAt,
+                    ExpiresAt: lobby.ExpiresAt,
+                    EndedAt: lobby.EndedAt,
+                    UpdatedAt: now);
+
+                memberRows = lobby.Members.Select(m => new Persistence.TournamentLobbyMemberRow(
+                    LobbyId: lobby.LobbyId,
+                    AccountId: m.AccountId,
+                    Username: m.Username,
+                    Hero: m.Hero,
+                    IsAi: m.IsAi,
+                    MemberState: "accepted",
+                    ConnectionState: m.ConnectionState,
+                    AiTakeoverSince: m.AiTakeoverSinceUtc,
+                    MissedPvpDays: m.MissedPvpDays,
+                    CurrentDay: m.CurrentDay,
+                    CurrentHour: m.CurrentHour,
+                    IsReadyH6Pvp: m.IsReadyAtHour6Pvp,
+                    HasFinishedRun: m.HasFinishedRun,
+                    IsChampion: m.FinalIsChampion,
+                    IsEliminated: m.FinalIsEliminated,
+                    IsConceded: m.FinalIsConceded,
+                    FinalPlace: m.FinalPlace,
+                    Victories: m.FinalVictories,
+                    Defeats: m.FinalDefeats,
+                    Prestige: m.FinalPrestige,
+                    FinalDay: m.FinalDay,
+                    RemovalReason: m.RemovalReason,
+                    JoinedAt: m.JoinedAt,
+                    LastSeenAt: m.LastSeenAt)).ToList();
+            }
+
+            _db.SaveTournamentLobbyWithMembers(lobbyRow, memberRows);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[LobbyStore] 持久化大厅 {lobby.LobbyId} 失败: {ex.Message}");
+        }
+    }
+
+    private void PersistFrozenDayMatchups(Lobby lobby, uint day)
+    {
+        if (_db == null) return;
+        var assigned = lobby.Matchmaker.TryGetAssignedDaySnapshot(day);
+        if (assigned == null || assigned.Count == 0) return;
+
+        var savedPairs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, Member> byId;
+        lock (lobby.Members)
+        {
+            byId = lobby.Members.ToDictionary(m => m.AccountId, StringComparer.OrdinalIgnoreCase);
+        }
+
+        foreach (var a in assigned.Values)
+        {
+            string pairKey = TournamentMatchmaker.CanonicalPairKey(a.AccountId, a.OpponentAccountId);
+            if (!savedPairs.Add(pairKey)) continue;
+
+            bool selfFirst = string.Compare(a.AccountId, a.OpponentAccountId, StringComparison.OrdinalIgnoreCase) <= 0;
+            string p1Id = selfFirst ? a.AccountId : a.OpponentAccountId;
+            string p2Id = selfFirst ? a.OpponentAccountId : a.AccountId;
+            byId.TryGetValue(p1Id, out var p1m);
+            byId.TryGetValue(p2Id, out var p2m);
+
+            string p1Name = p1m?.Username ?? (selfFirst ? p1Id : a.OpponentUsername);
+            string p2Name = p2m?.Username ?? (selfFirst ? a.OpponentUsername : p2Id);
+            bool p1Bot = p1m?.IsAi ?? (!selfFirst && a.OpponentIsBot);
+            bool p2Bot = p2m?.IsAi ?? (selfFirst && a.OpponentIsBot);
+
+            try
+            {
+                _db.UpsertTournamentMatchup(new Persistence.TournamentMatchupRow(
+                    LobbyId: lobby.LobbyId,
+                    Day: day,
+                    PairKey: pairKey,
+                    P1AccountId: p1Id,
+                    P1Username: p1Name,
+                    P1IsBot: p1Bot,
+                    P2AccountId: p2Id,
+                    P2Username: p2Name,
+                    P2IsBot: p2Bot,
+                    IsSyntheticSparring: a.OpponentIsSyntheticSparringBot,
+                    BattleSeed: a.BattleSeed,
+                    P1LockedBoardJson: "",
+                    P2LockedBoardJson: "",
+                    WinnerAccountId: "",
+                    LoserAccountId: "",
+                    LoserPrestigeDamage: 0,
+                    IsAutoResolved: false,
+                    ReplayId: "",
+                    ResolvedAt: null));
+            }
+            catch { }
+        }
+    }
+
+    // ── 大厅全生命周期操作 ───────────────────────────────────────────────────
 
     public Lobby Create(
         AccountStore.Account host,
@@ -214,23 +611,41 @@ public sealed class LobbyStore
         CustomRunRuleSet? rules = null,
         int? roundCountdownSeconds = null,
         int? acceleratedRoundCountdownSeconds = null,
-        IEnumerable<string>? bannedEncounterIds = null)
+        IEnumerable<string>? bannedEncounterIds = null,
+        string? password = null,
+        bool isInviteOnly = false,
+        string? modeId = null,
+        string? presetId = null)
     {
         string hostAid = host.AccountId.ToString("N");
         CleanupPreviousMembership(hostAid);
 
+        DateTime now = UtcNow;
         string lobbyId = Guid.NewGuid().ToString("N")[..12];
+        string cleanName = AccountStore.SanitizeDisplayText(name, 48);
+        if (string.IsNullOrWhiteSpace(cleanName))
+            cleanName = host.Username + "的锦标赛房间";
+
+        string trimmedPwd = (password ?? "").Trim();
+        bool hasPwd = trimmedPwd.Length > 0;
+        string pwdHash = hasPwd ? AccountStore.HashSecret(trimmedPwd) : "";
+
         var lobby = new Lobby
         {
             LobbyId = lobbyId,
             Code = NewCode(),
-            Name = string.IsNullOrWhiteSpace(name) ? host.Username + "'s Tournament" : name.Trim(),
+            Name = cleanName,
             Kind = "custom",
-            PlayMode = string.IsNullOrWhiteSpace(playMode) ? "Tournament" : playMode!,
+            PlayMode = string.IsNullOrWhiteSpace(playMode) ? "Tournament" : playMode.Trim(),
             HostAccountId = hostAid,
             HostUsername = host.Username,
             PlayerCap = Math.Clamp(playerCap <= 0 ? 8 : playerCap, 2, 16),
             IsPublic = isPublic,
+            HasPassword = hasPwd,
+            PasswordHash = pwdHash,
+            IsInviteOnly = isInviteOnly,
+            CreatedAt = now,
+            ExpiresAt = now.AddHours(6),
             Matchmaker = new TournamentMatchmaker(lobbyId),
         };
         lobby.Members.Add(new Member
@@ -238,6 +653,8 @@ public sealed class LobbyStore
             AccountId = hostAid,
             Username = host.Username,
             Hero = "Vanessa",
+            JoinedAt = now,
+            LastSeenAt = now,
         });
 
         ApplyNormalizedRulesLocked(
@@ -247,25 +664,28 @@ public sealed class LobbyStore
             roundCountdownSeconds: roundCountdownSeconds,
             acceleratedRoundCountdownSeconds: acceleratedRoundCountdownSeconds,
             bannedEncounterIds: bannedEncounterIds,
-            allowUpdatePlayerCap: true);
+            allowUpdatePlayerCap: true,
+            modeIdOverride: modeId,
+            presetIdOverride: presetId);
 
         _byId[lobby.LobbyId] = lobby;
         _codeToId[lobby.Code] = lobby.LobbyId;
         _memberToLobby[hostAid] = lobby.LobbyId;
         _pendingRemovals.TryRemove(hostAid, out _);
-        NotifyChanged();
+
+        PersistLobby(lobby);
+        NotifyLobbyChanged(lobby.LobbyId, publicListChanged: lobby.IsPublic);
         return lobby;
     }
 
-    /// <summary>
-    /// 仅房主更新房间规则，归一化并按需同步开赛前人数上限。
-    /// </summary>
     public void UpdateRules(
         Lobby lobby,
         CustomRunRuleSet incomingRules,
         int? roundCountdownSeconds = null,
         int? acceleratedRoundCountdownSeconds = null,
-        IEnumerable<string>? bannedEncounterIds = null)
+        IEnumerable<string>? bannedEncounterIds = null,
+        string? modeId = null,
+        string? presetId = null)
     {
         lock (lobby.Members)
         {
@@ -276,35 +696,35 @@ public sealed class LobbyStore
                 roundCountdownSeconds: roundCountdownSeconds,
                 acceleratedRoundCountdownSeconds: acceleratedRoundCountdownSeconds,
                 bannedEncounterIds: bannedEncounterIds,
-                allowUpdatePlayerCap: !lobby.HasStarted);
+                allowUpdatePlayerCap: !lobby.HasStarted,
+                modeIdOverride: modeId,
+                presetIdOverride: presetId);
         }
-        NotifyChanged();
+        PersistLobby(lobby);
+        NotifyLobbyChanged(lobby.LobbyId, publicListChanged: lobby.IsPublic);
     }
 
-    /// <summary>
-    /// 房主在开赛前管理房间内的 AI 陪练机器人（add / fill / remove / clear），不自动触发开赛倒计时。
-    /// </summary>
     public (bool Ok, string? Error) ManageBots(Lobby lobby, string action)
     {
         string act = (action ?? string.Empty).Trim().ToLowerInvariant();
         if (act is not ("add" or "fill" or "remove" or "clear"))
-            return (false, "invalid bot action");
+            return (false, "不支持的机器人操作指令（仅支持 add/fill/remove/clear）。");
 
         lock (lobby.Members)
         {
             if (lobby.HasStarted || lobby.CountdownStarted)
-                return (false, "lobby already started");
+                return (false, "房间已开赛，无法再增删 AI 选手。");
 
             switch (act)
             {
                 case "add":
                     if (lobby.Members.Count < lobby.PlayerCap)
-                        TryAddNextAiMember(lobby);
+                        TryAddNextAiMember(lobby, UtcNow);
                     break;
                 case "fill":
                     while (lobby.Members.Count < lobby.PlayerCap)
                     {
-                        if (!TryAddNextAiMember(lobby)) break;
+                        if (!TryAddNextAiMember(lobby, UtcNow)) break;
                     }
                     break;
                 case "remove":
@@ -317,13 +737,57 @@ public sealed class LobbyStore
             }
         }
 
-        NotifyChanged();
+        PersistLobby(lobby);
+        NotifyLobbyChanged(lobby.LobbyId, publicListChanged: lobby.IsPublic);
         return (true, null);
     }
 
-    /// <summary>
-    /// 单人/多人快速匹配队列：立即创建（或加入）含 7 名 AI 对手的 8 人锦标赛对局并启动。
-    /// </summary>
+    /// <summary>生成或刷新带时效的房间邀请令牌（仅房主可调用）。</summary>
+    public (string InviteToken, DateTime ExpiresAtUtc) GenerateInviteToken(Lobby lobby, TimeSpan? ttl = null)
+    {
+        DateTime expires = UtcNow.Add(ttl ?? TimeSpan.FromHours(2));
+        string token = "inv_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(12)).ToLowerInvariant();
+        string hash = AccountStore.Fingerprint(token);
+        lock (lobby.Members)
+        {
+            lobby.InviteTokenHash = hash;
+            lobby.InviteTokenExpiresAtUtc = expires;
+        }
+        PersistLobby(lobby);
+        return (token, expires);
+    }
+
+    /// <summary>手动移交房主权限给房间内其他真人成员。</summary>
+    public OperationResult TransferHost(Lobby lobby, string callerAccountId, string targetAccountId)
+    {
+        string normCaller = NormalizeAccountKey(callerAccountId);
+        string normTarget = NormalizeAccountKey(targetAccountId);
+        string newHostName;
+
+        lock (lobby.Members)
+        {
+            if (lobby.IsCancelled)
+                return new OperationResult(false, 404, "LOBBY_NOT_FOUND", "房间不存在或已解散。");
+            if (!lobby.HostAccountId.Equals(normCaller, StringComparison.OrdinalIgnoreCase))
+                return new OperationResult(false, 409, "NOT_HOST", "仅房主可以移交房主权限。");
+            if (normCaller.Equals(normTarget, StringComparison.OrdinalIgnoreCase))
+                return new OperationResult(false, 409, "ALREADY_HOST", "你当前已经是房主。");
+
+            var target = lobby.Members.Find(m => !m.IsAi && m.AccountId.Equals(normTarget, StringComparison.OrdinalIgnoreCase));
+            if (target == null)
+                return new OperationResult(false, 409, "TARGET_NOT_IN_LOBBY", "目标玩家不在房间中或为 AI 选手，无法移交房主。");
+
+            lobby.HostAccountId = target.AccountId;
+            lobby.HostUsername = target.Username;
+            newHostName = target.Username;
+        }
+
+        PersistLobby(lobby);
+        _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_host_transfer", $"👑 房主权限已移交给 {newHostName}。", new { lobbyId = lobby.LobbyId, newHost = newHostName });
+        NotifyLobbyChanged(lobby.LobbyId, publicListChanged: lobby.IsPublic);
+        return new OperationResult(true, 200, null, null);
+    }
+
     public Lobby EnqueueMatchmaking(AccountStore.Account player)
     {
         string aid = player.AccountId.ToString("N");
@@ -335,7 +799,7 @@ public sealed class LobbyStore
             {
                 if (!existing.HasStarted)
                 {
-                    FillAiCompetitors(existing, 8);
+                    lock (existing.Members) FillAiCompetitors(existing, 8, UtcNow);
                     StartCountdown(existing.LobbyId, Guid.NewGuid());
                 }
                 return existing;
@@ -343,14 +807,17 @@ public sealed class LobbyStore
             CleanupPreviousMembership(aid);
         }
 
+        DateTime now = UtcNow;
         string lobbyId = Guid.NewGuid().ToString("N")[..12];
         var lobby = new Lobby
         {
             LobbyId = lobbyId,
             Code = NewCode(),
-            Name = "Ranked Matchmaking Tournament",
+            Name = "快速匹配锦标赛",
             Kind = "matchmaking",
             PlayMode = "Tournament",
+            ModeId = "standard",
+            PresetId = "PureOfficial",
             HostAccountId = aid,
             HostUsername = player.Username,
             PlayerCap = 8,
@@ -358,6 +825,9 @@ public sealed class LobbyStore
             HasStarted = true,
             CountdownStarted = true,
             TournamentSessionId = Guid.NewGuid(),
+            CreatedAt = now,
+            StartedAt = now,
+            ExpiresAt = now.AddHours(6),
             Matchmaker = new TournamentMatchmaker(lobbyId),
         };
         lobby.Members.Add(new Member
@@ -365,15 +835,20 @@ public sealed class LobbyStore
             AccountId = aid,
             Username = player.Username,
             Hero = "Vanessa",
+            JoinedAt = now,
+            LastSeenAt = now,
         });
-        FillAiCompetitors(lobby, 8);
+        FillAiCompetitors(lobby, 8, now);
         EnsureDayMatchups(lobby, 1u, lobby.Members);
 
         _byId[lobby.LobbyId] = lobby;
         _codeToId[lobby.Code] = lobby.LobbyId;
         _memberToLobby[aid] = lobby.LobbyId;
         _pendingRemovals.TryRemove(aid, out _);
-        NotifyChanged();
+
+        PersistLobby(lobby);
+        PersistFrozenDayMatchups(lobby, 1u);
+        NotifyLobbyChanged(lobby.LobbyId, publicListChanged: false);
         return lobby;
     }
 
@@ -384,75 +859,262 @@ public sealed class LobbyStore
         => !string.IsNullOrWhiteSpace(code) && _codeToId.TryGetValue(code, out var id) ? Get(id) : null;
 
     public Lobby? GetByMember(string? accountId)
-        => !string.IsNullOrWhiteSpace(accountId) && _memberToLobby.TryGetValue(accountId, out var id) ? Get(id) : null;
+    {
+        if (string.IsNullOrWhiteSpace(accountId)) return null;
+        string norm = NormalizeAccountKey(accountId);
+        if (_memberToLobby.TryGetValue(accountId, out var id) || (!string.IsNullOrEmpty(norm) && _memberToLobby.TryGetValue(norm, out id)))
+            return Get(id);
+        return null;
+    }
 
     public RemovalNotice? PopRemovalNotice(string accountId)
-        => _pendingRemovals.TryRemove(accountId, out var notice) ? notice : null;
+        => _pendingRemovals.TryRemove(NormalizeAccountKey(accountId), out var notice) ? notice : null;
 
+    /// <summary>向后兼容的加房重载：仅在成功入房时返回 Lobby，满房/已开赛/密码错误一律返回 null。</summary>
     public Lobby? Join(string code, AccountStore.Account acc)
+        => JoinWithResult(code, acc).Lobby;
+
+    /// <summary>强类型加房：严格校验存在性、未开赛、密码/邀请码与满员（满员且开赛前存在 AI 占位时自动腾出 1 位给真人）。</summary>
+    public JoinLobbyResult JoinWithResult(string code, AccountStore.Account acc, string? password = null, string? inviteToken = null)
     {
         string aid = acc.AccountId.ToString("N");
         var lobby = GetByCode(code) ?? Get(code);
-        if (lobby == null || lobby.IsCancelled) return null;
+        if (lobby == null || lobby.IsCancelled)
+            return new JoinLobbyResult(false, "LOBBY_NOT_FOUND", "房间不存在或已解散。", null);
+
+        DateTime now = UtcNow;
+        bool alreadyMember;
+        lock (lobby.Members)
+        {
+            alreadyMember = lobby.Members.Exists(m => m.AccountId.Equals(aid, StringComparison.OrdinalIgnoreCase));
+            if (alreadyMember)
+            {
+                var self = lobby.Members.Find(m => m.AccountId.Equals(aid, StringComparison.OrdinalIgnoreCase))!;
+                self.LastSeenAt = now;
+                self.ConnectionState = "online";
+                self.AiTakeoverSinceUtc = null;
+            }
+            else
+            {
+                // 修复 MP-P0-08：严禁加入已开赛或倒计时已锁定的房间
+                if (lobby.HasStarted || lobby.CountdownStarted)
+                    return new JoinLobbyResult(false, "LOBBY_ALREADY_STARTED", "该房间已经开赛，无法中途加入，您可以通过观战进入查看。", null);
+
+                // 校验邀请令牌（有效邀请码可豁免仅邀请限制与密码限制）
+                bool validInvite = false;
+                if (!string.IsNullOrWhiteSpace(inviteToken) && !string.IsNullOrWhiteSpace(lobby.InviteTokenHash))
+                {
+                    bool notExpired = !lobby.InviteTokenExpiresAtUtc.HasValue || lobby.InviteTokenExpiresAtUtc.Value > now;
+                    if (notExpired && string.Equals(AccountStore.Fingerprint(inviteToken.Trim()), lobby.InviteTokenHash, StringComparison.OrdinalIgnoreCase))
+                        validInvite = true;
+                }
+
+                if (lobby.IsInviteOnly && !validInvite)
+                    return new JoinLobbyResult(false, "INVITE_ONLY", "该房间为仅限邀请房间，需要有效邀请链接或邀请码才能加入。", null);
+
+                if (lobby.HasPassword && !validInvite)
+                {
+                    if (string.IsNullOrWhiteSpace(password))
+                        return new JoinLobbyResult(false, "PASSWORD_REQUIRED", "该房间已设置密码，请输入房间密码后再加入。", null);
+                    if (!AccountStore.VerifySecretHash(password.Trim(), lobby.PasswordHash))
+                        return new JoinLobbyResult(false, "INVALID_PASSWORD", "房间密码不正确，请核对后重试。", null);
+                }
+
+                // 满员检查：开赛前若存在 AI 占位，自动移除最后 1 名 AI 为真人腾位；全真人满房则严拒
+                if (lobby.Members.Count >= lobby.PlayerCap)
+                {
+                    int lastAi = lobby.Members.FindLastIndex(m => m.IsAi);
+                    if (lastAi >= 0)
+                    {
+                        lobby.Members.RemoveAt(lastAi);
+                    }
+                    else
+                    {
+                        return new JoinLobbyResult(false, "LOBBY_FULL", "房间人数已满，无法加入。", null);
+                    }
+                }
+            }
+        }
 
         var prev = GetByMember(aid);
-        if (prev != null && prev.LobbyId != lobby.LobbyId)
+        if (prev != null && !prev.LobbyId.Equals(lobby.LobbyId, StringComparison.OrdinalIgnoreCase))
         {
             CleanupPreviousMembership(aid);
         }
 
-        lock (lobby.Members)
+        if (!alreadyMember)
         {
-            if (lobby.Members.Exists(m => m.AccountId.Equals(aid, StringComparison.OrdinalIgnoreCase)))
+            lock (lobby.Members)
             {
-                _memberToLobby[aid] = lobby.LobbyId;
-                return lobby;
+                if (lobby.HasStarted || lobby.CountdownStarted)
+                    return new JoinLobbyResult(false, "LOBBY_ALREADY_STARTED", "该房间已经开赛，无法加入。", null);
+
+                if (!lobby.Members.Exists(m => m.AccountId.Equals(aid, StringComparison.OrdinalIgnoreCase)))
+                {
+                    if (lobby.Members.Count >= lobby.PlayerCap)
+                    {
+                        int lastAi = lobby.Members.FindLastIndex(m => m.IsAi);
+                        if (lastAi >= 0) lobby.Members.RemoveAt(lastAi);
+                        else return new JoinLobbyResult(false, "LOBBY_FULL", "房间人数已满，无法加入。", null);
+                    }
+
+                    lobby.Members.Add(new Member
+                    {
+                        AccountId = aid,
+                        Username = acc.Username,
+                        Hero = HeroCycle[lobby.Members.Count % HeroCycle.Length],
+                        JoinedAt = now,
+                        LastSeenAt = now,
+                    });
+                }
             }
-            if (lobby.Members.Count >= lobby.PlayerCap) return lobby;
-            lobby.Members.Add(new Member
-            {
-                AccountId = aid,
-                Username = acc.Username,
-                Hero = HeroCycle[lobby.Members.Count % HeroCycle.Length],
-            });
         }
+
         _memberToLobby[aid] = lobby.LobbyId;
         _pendingRemovals.TryRemove(aid, out _);
-        NotifyChanged();
-        return lobby;
+        PersistLobby(lobby);
+        if (!alreadyMember)
+        {
+            _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_join", $"🎮 {acc.Username} 加入了房间。", new { lobbyId = lobby.LobbyId, username = acc.Username });
+        }
+        NotifyLobbyChanged(lobby.LobbyId, publicListChanged: lobby.IsPublic);
+        return new JoinLobbyResult(true, null, null, lobby);
     }
 
     public void Leave(string accountId, string? reason = null)
     {
-        var lobby = GetByMember(accountId);
+        string normAid = NormalizeAccountKey(accountId);
+        var lobby = GetByMember(normAid);
         if (lobby == null) return;
+
+        string? removedName = null;
+        string? newHostName = null;
+        bool wasPublic = lobby.IsPublic;
         lock (lobby.Members)
         {
-            lobby.Members.RemoveAll(m => m.AccountId.Equals(accountId, StringComparison.OrdinalIgnoreCase));
+            var removed = lobby.Members.Find(m => m.AccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase));
+            removedName = removed?.Username;
+            lobby.Members.RemoveAll(m => m.AccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase));
+
             int humanLeft = lobby.Members.Count(m => !m.IsAi);
             if (humanLeft == 0)
             {
                 lobby.IsCancelled = true;
+                lobby.EndedAt = UtcNow;
                 _byId.TryRemove(lobby.LobbyId, out _);
                 _codeToId.TryRemove(lobby.Code, out _);
             }
+            else if (lobby.HostAccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase))
+            {
+                // 修复 MP-P1-06：房主离开后自动顺延移交给最早加入的在线真人成员，避免无主僵尸房
+                var successor = lobby.Members
+                    .Where(m => !m.IsAi)
+                    .OrderBy(m => m.ConnectionState == "online" ? 0 : 1)
+                    .ThenBy(m => m.JoinedAt)
+                    .FirstOrDefault();
+                if (successor != null)
+                {
+                    lobby.HostAccountId = successor.AccountId;
+                    lobby.HostUsername = successor.Username;
+                    newHostName = successor.Username;
+                }
+            }
         }
-        _memberToLobby.TryRemove(accountId, out _);
+
+        _memberToLobby.TryRemove(normAid, out _);
         if (!string.IsNullOrEmpty(reason))
         {
-            _pendingRemovals[accountId] = new RemovalNotice(lobby.LobbyId, lobby.Code, reason);
+            _pendingRemovals[normAid] = new RemovalNotice(lobby.LobbyId, lobby.Code, reason);
         }
-        NotifyChanged();
+
+        PersistLobby(lobby);
+        if (!string.IsNullOrWhiteSpace(removedName) && !lobby.IsCancelled)
+        {
+            string msg = reason == "kicked" ? $"🚪 {removedName} 已被房主移出房间。" : $"👋 {removedName} 离开了房间。";
+            _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_leave", msg, new { lobbyId = lobby.LobbyId, username = removedName, reason = reason ?? "left" });
+        }
+        if (!string.IsNullOrWhiteSpace(newHostName))
+        {
+            _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_host_transfer", $"👑 原房主已离开，房主自动移交给 {newHostName}。", new { lobbyId = lobby.LobbyId, newHost = newHostName });
+        }
+        NotifyLobbyChanged(lobby.LobbyId, publicListChanged: wasPublic);
     }
 
-    public void Touch(string accountId)
+    /// <summary>带权限校验的踢人操作（修复 MP-P0-01 + MP-P1-11）。</summary>
+    public OperationResult KickMember(Lobby lobby, string callerAccountId, string targetAccountId)
     {
-        var lobby = GetByMember(accountId);
-        if (lobby == null) return;
+        string normCaller = NormalizeAccountKey(callerAccountId);
+        string normTarget = NormalizeAccountKey(targetAccountId);
+
+        bool targetIsAi;
+        string targetName;
         lock (lobby.Members)
         {
-            var m = lobby.Members.Find(x => x.AccountId.Equals(accountId, StringComparison.OrdinalIgnoreCase));
-            if (m != null) m.LastSeenAt = DateTime.UtcNow;
+            if (lobby.IsCancelled)
+                return new OperationResult(false, 404, "LOBBY_NOT_FOUND", "房间不存在或已解散。");
+            if (!lobby.HostAccountId.Equals(normCaller, StringComparison.OrdinalIgnoreCase))
+                return new OperationResult(false, 409, "NOT_HOST", "仅房主可以移出房间成员。");
+            if (normCaller.Equals(normTarget, StringComparison.OrdinalIgnoreCase))
+                return new OperationResult(false, 409, "CANNOT_KICK_SELF", "不能将自己移出房间，如需离开请点击退出房间。");
+
+            var target = lobby.Members.Find(m => m.AccountId.Equals(normTarget, StringComparison.OrdinalIgnoreCase));
+            if (target == null)
+                return new OperationResult(false, 404, "MEMBER_NOT_FOUND", "该成员不在当前房间中。");
+
+            if (lobby.HasStarted && !target.IsAi && target.ConnectionState == "online" && !target.HasFinishedRun)
+                return new OperationResult(false, 409, "CANNOT_KICK_ACTIVE_PLAYER", "对局进行中，无法踢出在线参赛玩家。");
+
+            targetIsAi = target.IsAi;
+            targetName = target.Username;
+
+            if (targetIsAi)
+            {
+                lobby.Members.Remove(target);
+            }
+        }
+
+        if (targetIsAi)
+        {
+            PersistLobby(lobby);
+            NotifyLobbyChanged(lobby.LobbyId, publicListChanged: lobby.IsPublic);
+            return new OperationResult(true, 200, null, $"已移出 AI 选手 {targetName}。");
+        }
+
+        Leave(normTarget, reason: "kicked");
+        return new OperationResult(true, 200, null, $"已将 {targetName} 移出房间。");
+    }
+
+    /// <summary>记录成员心跳；若成员先前处于掉线/AI 托管状态，立即无缝交还控制权并广播恢复。</summary>
+    public void Touch(string accountId)
+    {
+        string normAid = NormalizeAccountKey(accountId);
+        var lobby = GetByMember(normAid);
+        if (lobby == null) return;
+
+        bool restoredFromTakeover = false;
+        string restoredName = "";
+        lock (lobby.Members)
+        {
+            var m = lobby.Members.Find(x => x.AccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase));
+            if (m != null)
+            {
+                m.LastSeenAt = UtcNow;
+                if (m.ConnectionState != "online")
+                {
+                    restoredFromTakeover = m.ConnectionState == "ai_takeover";
+                    m.ConnectionState = "online";
+                    m.AiTakeoverSinceUtc = null;
+                    restoredName = m.Username;
+                }
+            }
+        }
+
+        if (restoredFromTakeover)
+        {
+            PersistLobby(lobby);
+            PublishTakeoverEvent(lobby.LobbyId, normAid, restoredName, "online", "reconnected");
+            _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_takeover", $"✅ 玩家 {restoredName} 已重连归队，解除 AI 托管。", new { lobbyId = lobby.LobbyId, accountId = normAid, state = "online" });
+            NotifyLobbyChanged(lobby.LobbyId);
         }
     }
 
@@ -460,18 +1122,34 @@ public sealed class LobbyStore
     {
         var lobby = Get(lobbyId);
         if (lobby == null) return;
+        DateTime now = UtcNow;
         List<Member> snapshot;
         lock (lobby.Members)
         {
+            if (lobby.IsCancelled) return;
             int targetCount = Math.Max(lobby.Members.Count, Math.Clamp(lobby.PlayerCap, 2, 16));
-            FillAiCompetitors(lobby, targetCount);
+            FillAiCompetitors(lobby, targetCount, now);
             lobby.CountdownStarted = true;
             lobby.HasStarted = true;
+            lobby.StartedAt ??= now;
             lobby.TournamentSessionId ??= sessionId;
+            foreach (var m in lobby.Members)
+            {
+                if (m.IsAi)
+                {
+                    m.FinalPrestige = Math.Max(1, lobby.Rules.StartingPrestige);
+                    m.FinalVictories = 0;
+                    m.FinalDefeats = 0;
+                    m.FinalIsEliminated = false;
+                    m.CurrentDay = 1;
+                }
+            }
             snapshot = lobby.Members.ToList();
         }
         EnsureDayMatchups(lobby, 1u, snapshot);
-        NotifyChanged();
+        PersistLobby(lobby);
+        PersistFrozenDayMatchups(lobby, 1u);
+        NotifyLobbyChanged(lobby.LobbyId, publicListChanged: lobby.IsPublic);
     }
 
     public Member? FindMember(Lobby lobby, string accountId)
@@ -513,6 +1191,125 @@ public sealed class LobbyStore
         return null;
     }
 
+    /// <summary>记录真人与 AI 交手的真实战果，保证 AI 榜单声望/胜负与真实对局完全同步（修复 MP-P0-05）。</summary>
+    public void RecordAiMatchResult(Lobby lobby, string aiAccountId, bool aiWon, uint day)
+    {
+        if (lobby == null || string.IsNullOrWhiteSpace(aiAccountId)) return;
+        string normAi = NormalizeAccountKey(aiAccountId);
+        bool updated = false;
+        lock (lobby.Members)
+        {
+            var ai = lobby.Members.Find(m => m.IsAi && m.AccountId.Equals(normAi, StringComparison.OrdinalIgnoreCase));
+            if (ai == null || ai.CurrentDay > day) return;
+
+            if (aiWon)
+            {
+                ai.FinalVictories++;
+            }
+            else
+            {
+                ai.FinalDefeats++;
+                int dmg = Math.Max(1, (int)day);
+                ai.FinalPrestige = lobby.Rules.BotNonLethalPrestigeLock
+                    ? Math.Max(1, ai.FinalPrestige - dmg)
+                    : Math.Max(0, ai.FinalPrestige - dmg);
+                if (!lobby.Rules.BotNonLethalPrestigeLock && ai.FinalPrestige <= 0)
+                {
+                    ai.FinalIsEliminated = true;
+                    ai.HasFinishedRun = true;
+                }
+            }
+            ai.CurrentDay = Math.Max(ai.CurrentDay, day + 1);
+            ai.FinalDay = Math.Max(ai.FinalDay, day);
+            updated = true;
+        }
+        if (updated)
+        {
+            PersistLobby(lobby);
+            NotifyLobbyChanged(lobby.LobbyId);
+        }
+    }
+
+    /// <summary>
+    /// 推进第 1..upToDay 天中尚未结算过战绩的 AI 成员内部互战结果（确定性且单调不回退）。
+    /// </summary>
+    internal void AdvanceAiStandingsUpToDayLocked(Lobby lobby, uint upToDay)
+    {
+        if (upToDay <= 1) return;
+        uint targetFinishedDay = upToDay - 1;
+        bool nonLethal = lobby.Rules.BotNonLethalPrestigeLock;
+
+        int aiIdx = 0;
+        foreach (var m in lobby.Members)
+        {
+            if (!m.IsAi) continue;
+            int idx = aiIdx++;
+            if (m.FinalIsEliminated) continue;
+
+            // 从该 AI 尚未结算的下一天推进到 targetFinishedDay
+            uint startDay = Math.Max(1u, m.FinalDay == 1 && m.FinalVictories == 0 && m.FinalDefeats == 0 ? 1u : m.FinalDay + 1u);
+            for (uint d = startDay; d <= targetFinishedDay; d++)
+            {
+                if (m.FinalIsEliminated) break;
+                bool wonRound = (((int)d * 3 + idx) % 5) < 3;
+                if (wonRound)
+                {
+                    m.FinalVictories++;
+                }
+                else
+                {
+                    m.FinalDefeats++;
+                    m.FinalPrestige = nonLethal
+                        ? Math.Max(1, m.FinalPrestige - (int)d)
+                        : Math.Max(0, m.FinalPrestige - (int)d);
+                    if (!nonLethal && m.FinalPrestige <= 0)
+                    {
+                        m.FinalIsEliminated = true;
+                        m.HasFinishedRun = true;
+                    }
+                }
+                m.FinalDay = d;
+                m.CurrentDay = d + 1;
+            }
+        }
+        if (targetFinishedDay > lobby.HighestAiSimulatedDay)
+            lobby.HighestAiSimulatedDay = targetFinishedDay;
+    }
+
+    /// <summary>
+    /// 判断第 <paramref name="day"/> 天是否已满足正式冻结对阵表的条件（修复 MP-P0-05 过早锁表）：
+    /// Day 1 随时可冻结；Day D (>1) 仅在所有存活非托管真人均已离开 Day D-1（进入 Day D），
+    /// 或该天已经冻结过时允许冻结。
+    /// </summary>
+    internal bool CanFreezeMatchupsForDayLocked(Lobby lobby, uint day, SessionStore? sessions)
+    {
+        if (day <= 1 || lobby.Matchmaker.HasAssignedDay(day))
+            return true;
+
+        foreach (var m in lobby.Members)
+        {
+            if (m.IsAi) continue;
+            if (m.HasFinishedRun || m.FinalIsEliminated || m.FinalIsChampion) continue;
+            if (m.ConnectionState == "ai_takeover") continue;
+
+            uint mDay = m.CurrentDay;
+            if (sessions != null)
+            {
+                var mem = sessions.GetByAccount(m.AccountId);
+                var run = mem != null ? SessionRegistry.Get(mem.Sid)?.Run : null;
+                if (run != null && (!lobby.TournamentSessionId.HasValue || mem!.TournamentSessionId == lobby.TournamentSessionId))
+                {
+                    if (Persistence.IsTerminalState(run.State)) continue;
+                    mDay = Math.Max(mDay, run.Day);
+                }
+            }
+
+            if (mDay < day)
+                return false;
+        }
+        return true;
+    }
+
     public MatchupAssignment? EnsureAndGetAssignment(
         Lobby lobby,
         uint day,
@@ -525,9 +1322,11 @@ public sealed class LobbyStore
         List<MatchupParticipant> participants;
         CustomRunRuleSet rules;
         string canonicalSelfId = accountId;
+        bool wasFrozenBefore = lobby.Matchmaker.HasAssignedDay(day);
 
         lock (lobby.Members)
         {
+            AdvanceAiStandingsUpToDayLocked(lobby, day);
             rules = lobby.Rules;
             string normalized = NormalizeAccountKey(accountId);
             var selfMember = lobby.Members.Find(m =>
@@ -537,7 +1336,6 @@ public sealed class LobbyStore
                 canonicalSelfId = selfMember.AccountId;
 
             participants = new List<MatchupParticipant>(lobby.Members.Count);
-            int aiIdx = 0;
             foreach (var m in lobby.Members)
             {
                 bool elim = m.FinalIsEliminated;
@@ -551,27 +1349,17 @@ public sealed class LobbyStore
                         elim = run.State is ERunState.EndRunDefeat or ERunState.Shutdown;
                     }
                 }
-                else if (m.IsAi)
-                {
-                    if (!rules.BotNonLethalPrestigeLock)
-                    {
-                        int roundsPlayed = Math.Max(0, (int)day - 1);
-                        int prestige = 20;
-                        for (int d = 1; d <= roundsPlayed; d++)
-                        {
-                            if (((d * 3 + aiIdx) % 5) >= 3)
-                                prestige = Math.Max(0, prestige - d);
-                        }
-                        elim = prestige <= 0;
-                    }
-                    aiIdx++;
-                }
-
                 participants.Add(new MatchupParticipant(m.AccountId, m.Username, m.IsAi, elim));
             }
         }
 
+        // 进入实际开战点（EnsureAndGetAssignment 由 RunEngine 在 Hour 6 开战时调用）必须正式冻结当日配对
         lobby.Matchmaker.AssignRoundMatchups(day, participants, rules);
+        if (!wasFrozenBefore)
+        {
+            PersistFrozenDayMatchups(lobby, day);
+            PersistLobby(lobby);
+        }
         return lobby.Matchmaker.GetAssignment(canonicalSelfId, day);
     }
 
@@ -628,6 +1416,12 @@ public sealed class LobbyStore
 
         string normalized = NormalizeAccountKey(accountId);
         bool changed = false;
+        bool restoredFromTakeover = false;
+        bool newlyChampion = false;
+        bool newlyEliminated = false;
+        string memberName = "";
+        int finalWins = 0;
+
         lock (lobby.Members)
         {
             var m = lobby.Members.Find(x =>
@@ -639,6 +1433,7 @@ public sealed class LobbyStore
                 bool isTerminal = Persistence.IsTerminalState(run.State);
                 bool readyH6 = !isTerminal && ComputeIsAtOrPastHour6Pvp(run);
                 int prestige = run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 0);
+                string heroName = (run.Hero == EHero.Common ? EHero.Vanessa : run.Hero).ToString();
 
                 if (m.CurrentDay != run.Day ||
                     m.CurrentHour != run.Hour ||
@@ -647,12 +1442,20 @@ public sealed class LobbyStore
                     m.FinalDefeats != (int)run.Defeats ||
                     m.FinalPrestige != prestige ||
                     m.FinalDay != run.Day ||
+                    m.Hero != heroName ||
+                    m.ConnectionState != "online" ||
                     (isTerminal && !m.HasFinishedRun))
                 {
                     changed = true;
                 }
 
+                if (m.ConnectionState == "ai_takeover")
+                    restoredFromTakeover = true;
+
                 m.LastSeenAt = now;
+                m.ConnectionState = "online";
+                m.AiTakeoverSinceUtc = null;
+                m.Hero = heroName;
                 m.CurrentDay = run.Day;
                 m.CurrentHour = run.Hour;
                 m.IsReadyAtHour6Pvp = readyH6;
@@ -660,19 +1463,40 @@ public sealed class LobbyStore
                 m.FinalDefeats = (int)run.Defeats;
                 m.FinalPrestige = prestige;
                 m.FinalDay = run.Day;
-                if (isTerminal)
+                memberName = m.Username;
+                finalWins = (int)run.Victories;
+
+                if (isTerminal && !m.HasFinishedRun)
                 {
                     m.HasFinishedRun = true;
                     m.FinalIsChampion = run.State == ERunState.EndRunVictory;
                     m.FinalIsEliminated = run.State is ERunState.EndRunDefeat or ERunState.Shutdown;
+                    newlyChampion = m.FinalIsChampion;
+                    newlyEliminated = m.FinalIsEliminated;
                 }
             }
         }
+
         if (changed)
-            NotifyChanged();
+        {
+            PersistLobby(lobby);
+            if (restoredFromTakeover)
+            {
+                PublishTakeoverEvent(lobby.LobbyId, normalized, memberName, "online", "reconnected");
+                _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_takeover", $"✅ 玩家 {memberName} 已重连并接回对局控制权。", new { lobbyId = lobby.LobbyId, accountId = normalized, state = "online" });
+            }
+            if (newlyChampion)
+            {
+                _socialSink?.PublishSystemBroadcast(null, "system_champion", $"🏆 {memberName} 在【{lobby.Name}】中以 {finalWins} 胜夺得最终冠军！", new { lobbyId = lobby.LobbyId, watchCode = lobby.Code, username = memberName, wins = finalWins, day = run.Day });
+            }
+            else if (newlyEliminated)
+            {
+                _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_eliminated", $"💀 {memberName} 在第 {run.Day} 天被淘汰出局。", new { lobbyId = lobby.LobbyId, username = memberName, day = run.Day });
+            }
+            NotifyLobbyChanged(lobby.LobbyId);
+        }
     }
 
-    /// <summary>判断对局是否已到达或正在结算当天 Hour 6 PvP。</summary>
     public static bool ComputeIsAtOrPastHour6Pvp(RunState run)
     {
         if (run == null || Persistence.IsTerminalState(run.State))
@@ -684,12 +1508,6 @@ public sealed class LobbyStore
             || (run.State == ERunState.Choice && run.Hour >= 6);
     }
 
-    /// <summary>
-    /// 检查多真人锦标赛第 <paramref name="day"/> 天 Hour 6 回合同步屏障：
-    ///   · 仅剩 1 名存活真人时立即可开战（CanStartPvp = true）；
-    ///   · 存活真人 >= 2 时，须全部存活真人到达 Day D Hour 6（或倒计时归零超时解锁）方可进 PvP；
-    ///   · 仅剩最后 1 名存活真人未就位时自动切换加速倒计时 AcceleratedRoundCountdownSeconds 并推送 SSE。
-    /// </summary>
     public PvpBarrierDecision CheckPvpBarrier(
         Guid? tournamentSessionId,
         string? accountId,
@@ -720,6 +1538,8 @@ public sealed class LobbyStore
         if (day == 0) day = 1;
         string normalizedSelf = NormalizeAccountKey(selfAccountId ?? "");
         bool shouldNotify = false;
+        bool shouldPersist = false;
+        List<string> waitingUsernames = new();
         PvpBarrierDecision decision;
 
         lock (lobby.Members)
@@ -771,12 +1591,21 @@ public sealed class LobbyStore
                 if (elimOrDone)
                     continue;
 
+                // 修复 MP-P0-03：已切换为 AI 托管接管的掉线玩家立即移出屏障阻塞人数，绝不卡死全房！
+                if (string.Equals(m.ConnectionState, "ai_takeover", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
                 survivingHumans++;
                 bool reachedDayHour6 = m.CurrentDay > day || (m.CurrentDay == day && m.IsReadyAtHour6Pvp);
                 if (reachedDayHour6)
+                {
                     readyHumans++;
+                }
                 else
+                {
                     notReadyHumans++;
+                    waitingUsernames.Add(m.Username);
+                }
             }
 
             if (survivingHumans <= 1)
@@ -789,6 +1618,7 @@ public sealed class LobbyStore
                 {
                     doneBarrier.TimedOutUnlocked = true;
                     shouldNotify = true;
+                    shouldPersist = true;
                 }
                 decision = new PvpBarrierDecision(true, false, null, survivingHumans, readyHumans, 0, false, false, 0, null);
             }
@@ -826,6 +1656,7 @@ public sealed class LobbyStore
                             barrier.FirstReadyAtUtc = now;
                             barrier.DeadlineAtUtc = now.AddSeconds(Math.Max(0, lobby.RoundCountdownSeconds));
                             shouldNotify = true;
+                            shouldPersist = true;
                         }
                         if (notReadyHumans == 1 && !barrier.IsAccelerated)
                         {
@@ -834,11 +1665,13 @@ public sealed class LobbyStore
                             if (!barrier.DeadlineAtUtc.HasValue || accelDeadline < barrier.DeadlineAtUtc.Value)
                                 barrier.DeadlineAtUtc = accelDeadline;
                             shouldNotify = true;
+                            shouldPersist = true;
                         }
                         if (barrier.DeadlineAtUtc.HasValue && now >= barrier.DeadlineAtUtc.Value)
                         {
                             barrier.TimedOutUnlocked = true;
                             shouldNotify = true;
+                            shouldPersist = true;
                         }
                     }
 
@@ -865,22 +1698,294 @@ public sealed class LobbyStore
             }
         }
 
+        if (shouldPersist)
+            PersistLobby(lobby);
         if (shouldNotify)
-            NotifyChanged();
+        {
+            PublishBarrierEvent(lobby.LobbyId, day, decision, waitingUsernames);
+            NotifyLobbyChanged(lobby.LobbyId);
+        }
 
         return decision;
     }
 
-    private static string NormalizeAccountKey(string? accountId)
+    // ── 后台看门狗（1s 屏障主动唤醒 + 掉线 AI 托管接管 + 过期房归档）──────────
+
+    /// <summary>
+    /// 1 秒级后台看门狗单次扫描（支持测试中手工触发）：
+    /// 1. 驱动掉线状态机 online -> disconnected (45s) -> ai_takeover (阻塞屏障30s或累计90s)；
+    /// 2. 为被托管玩家自动按末次快照代打推进滞后天数，连缺 3 天自动 AFK 淘汰；
+    /// 3. 主动扫描并解锁已达 DeadlineAtUtc 的所有 RoundBarriers，推送房间级 SSE 唤醒等待客户端。
+    /// </summary>
+    public void RunWatchdogTick(SessionStore? sessions = null, ITournamentPvpCoordinator? pvpCoordinator = null)
+    {
+        DateTime now = UtcNow;
+        foreach (var lobby in _byId.Values)
+        {
+            if (lobby.IsCancelled || !lobby.HasStarted)
+                continue;
+
+            bool lobbyDirty = false;
+            var takeoverEvents = new List<(string AccountId, string Username, string State, string Reason)>();
+            var afkEliminations = new List<(string AccountId, string Username, uint Day)>();
+            var daysToCheckBarrier = new HashSet<uint>();
+
+            lock (lobby.Members)
+            {
+                uint maxOnlineDay = 1;
+                foreach (var m in lobby.Members)
+                {
+                    if (!m.IsAi && !m.HasFinishedRun && !m.FinalIsEliminated && m.ConnectionState == "online")
+                    {
+                        if (m.CurrentDay > maxOnlineDay) maxOnlineDay = m.CurrentDay;
+                    }
+                }
+
+                // 收集当前尚未解锁的屏障天
+                foreach (var kv in lobby.RoundBarriers)
+                {
+                    if (!kv.Value.TimedOutUnlocked)
+                        daysToCheckBarrier.Add(kv.Key);
+                }
+                if (maxOnlineDay >= 1) daysToCheckBarrier.Add(maxOnlineDay);
+
+                foreach (var m in lobby.Members)
+                {
+                    if (m.IsAi || m.HasFinishedRun || m.FinalIsEliminated || m.FinalIsChampion)
+                        continue;
+
+                    DateTime lastAct = m.LastSeenAt;
+                    if (sessions != null)
+                    {
+                        var sess = sessions.GetByAccount(m.AccountId);
+                        if (sess != null && sess.LastCommandAt > lastAct)
+                            lastAct = sess.LastCommandAt;
+                    }
+
+                    double offlineSec = (now - lastAct).TotalSeconds;
+                    if (m.ConnectionState == "online" && offlineSec >= DisconnectGraceSeconds)
+                    {
+                        m.ConnectionState = "disconnected";
+                        lobbyDirty = true;
+                        takeoverEvents.Add((m.AccountId, m.Username, "disconnected", "heartbeat_timeout"));
+                    }
+
+                    if (m.ConnectionState == "disconnected")
+                    {
+                        bool blockingActiveBarrier = lobby.RoundBarriers.Values.Any(b =>
+                            !b.TimedOutUnlocked &&
+                            b.FirstReadyAtUtc.HasValue &&
+                            (now - b.FirstReadyAtUtc.Value).TotalSeconds >= TakeoverBarrierGraceSeconds &&
+                            (m.CurrentDay < b.Day || (m.CurrentDay == b.Day && !m.IsReadyAtHour6Pvp)));
+
+                        if (blockingActiveBarrier || offlineSec >= TakeoverTotalDisconnectSeconds)
+                        {
+                            m.ConnectionState = "ai_takeover";
+                            m.AiTakeoverSinceUtc = now;
+                            lobbyDirty = true;
+                            takeoverEvents.Add((m.AccountId, m.Username, "ai_takeover", blockingActiveBarrier ? "barrier_timeout" : "disconnect_timeout"));
+                        }
+                    }
+
+                    // 若处于 AI 托管状态且落后于全房在线进度，自动为其按末次快照代打推进滞后天数
+                    if (m.ConnectionState == "ai_takeover" && m.CurrentDay < maxOnlineDay)
+                    {
+                        while (m.CurrentDay < maxOnlineDay && !m.FinalIsEliminated && !m.HasFinishedRun)
+                        {
+                            uint simDay = m.CurrentDay;
+                            m.MissedPvpDays++;
+
+                            // 对称裁决保护：若当日已有真人对手结果则服从，否则托管代打按保守战果结算（不作弊强化）
+                            bool wonByTakeover = false;
+                            if (lobby.TournamentSessionId.HasValue && pvpCoordinator != null)
+                            {
+                                var assign = lobby.Matchmaker.GetAssignment(m.AccountId, simDay);
+                                if (assign != null && !assign.OpponentIsBot)
+                                {
+                                    var resolved = pvpCoordinator.TryGetResolvedMatch(lobby.TournamentSessionId.Value, simDay, m.AccountId, assign.OpponentAccountId);
+                                    if (resolved != null)
+                                    {
+                                        wonByTakeover = string.Equals(resolved.WinnerAccountId, m.AccountId, StringComparison.OrdinalIgnoreCase);
+                                    }
+                                    else
+                                    {
+                                        // 无人先结算时记录保守判负（避免掉线托管白嫖胜利）
+                                        pvpCoordinator.RecordOrGetResolvedMatch(
+                                            lobby.TournamentSessionId.Value,
+                                            simDay,
+                                            m.AccountId,
+                                            assign.OpponentAccountId,
+                                            new SymmetricHumanPvpOutcome(
+                                                WinnerAccountId: assign.OpponentAccountId,
+                                                LoserAccountId: m.AccountId,
+                                                BattleSeed: assign.BattleSeed,
+                                                LoserPrestigeDamage: Math.Max(1, (int)simDay),
+                                                ReplayId: "",
+                                                CachedCombatSimForP1: null,
+                                                CachedCombatSimForP2: null));
+                                    }
+                                }
+                                else
+                                {
+                                    // 对阵 AI 托管采用确定性中等胜率
+                                    wonByTakeover = ((simDay + m.MissedPvpDays) % 2) == 0;
+                                }
+                            }
+
+                            if (wonByTakeover)
+                            {
+                                m.FinalVictories++;
+                            }
+                            else
+                            {
+                                m.FinalDefeats++;
+                                m.FinalPrestige = Math.Max(0, m.FinalPrestige - Math.Max(1, (int)simDay));
+                            }
+
+                            m.CurrentDay = simDay + 1;
+                            m.CurrentHour = 1;
+                            m.IsReadyAtHour6Pvp = false;
+                            m.FinalDay = simDay;
+                            lobbyDirty = true;
+
+                            if (m.FinalPrestige <= 0 || m.MissedPvpDays >= MaxMissedTakeoverDays)
+                            {
+                                m.FinalIsEliminated = true;
+                                m.HasFinishedRun = true;
+                                m.RemovalReason = "afk";
+                                afkEliminations.Add((m.AccountId, m.Username, simDay));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (lobbyDirty)
+            {
+                PersistLobby(lobby);
+                foreach (var ev in takeoverEvents)
+                {
+                    PublishTakeoverEvent(lobby.LobbyId, ev.AccountId, ev.Username, ev.State, ev.Reason);
+                    if (ev.State == "ai_takeover")
+                    {
+                        _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_takeover", $"🤖 玩家 {ev.Username} 掉线超时，已由系统 AI 托管接管，不再阻塞全房回合。", new { lobbyId = lobby.LobbyId, accountId = ev.AccountId, state = "ai_takeover" });
+                    }
+                }
+                foreach (var elim in afkEliminations)
+                {
+                    _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_eliminated", $"⌛ 玩家 {elim.Username} 连续托管缺席或声望归零，已在第 {elim.Day} 天判定淘汰。", new { lobbyId = lobby.LobbyId, accountId = elim.AccountId, day = elim.Day, reason = "afk" });
+                }
+                NotifyLobbyChanged(lobby.LobbyId);
+            }
+
+            foreach (uint d in daysToCheckBarrier)
+            {
+                EvaluateRoundBarrier(lobby, d, null, null, sessions, startOrAdvanceCountdown: true);
+            }
+        }
+    }
+
+    /// <summary>归档并清理过期或全员人类完赛超 30 分钟的房间，根治内存泄漏（MP-P0-02）。</summary>
+    public int EvictExpiredAndFinishedLobbies(TournamentPvpCoordinator? pvpCoordinator = null)
+    {
+        DateTime now = UtcNow;
+        int evicted = 0;
+
+        foreach (var lobby in _byId.Values.ToArray())
+        {
+            bool shouldEvict = false;
+            lock (lobby.Members)
+            {
+                bool allHumansDone = lobby.HasStarted && lobby.Members.Where(m => !m.IsAi).All(m => m.HasFinishedRun);
+                if (allHumansDone && !lobby.EndedAt.HasValue)
+                    lobby.EndedAt = now;
+
+                if (lobby.IsCancelled || lobby.ExpiresAt <= now)
+                {
+                    shouldEvict = true;
+                    if (!lobby.HasStarted) lobby.IsCancelled = true;
+                    lobby.EndedAt ??= now;
+                }
+                else if (allHumansDone && lobby.EndedAt.HasValue && (now - lobby.EndedAt.Value) >= TimeSpan.FromMinutes(30))
+                {
+                    shouldEvict = true;
+                }
+            }
+
+            if (!shouldEvict) continue;
+
+            PersistLobby(lobby);
+            if (_byId.TryRemove(lobby.LobbyId, out _))
+            {
+                _codeToId.TryRemove(lobby.Code, out _);
+                lock (lobby.Members)
+                {
+                    foreach (var m in lobby.Members)
+                    {
+                        if (!m.IsAi)
+                            _memberToLobby.TryRemove(new KeyValuePair<string, string>(m.AccountId, lobby.LobbyId));
+                    }
+                }
+                if (lobby.TournamentSessionId.HasValue)
+                    pvpCoordinator?.PurgeForSession(lobby.TournamentSessionId.Value);
+                evicted++;
+            }
+        }
+
+        if (evicted > 0)
+            NotifyLobbyChanged(null, publicListChanged: true);
+        return evicted;
+    }
+
+    private void PublishBarrierEvent(string lobbyId, uint day, PvpBarrierDecision decision, List<string> waitingFor)
+    {
+        if (_sseHub == null) return;
+        string json = JsonSerializer.Serialize(new
+        {
+            lobbyId,
+            day,
+            survivingOnline = decision.SurvivingHumans,
+            readyHumans = decision.ReadyHumans,
+            waitingFor,
+            isAccelerated = decision.IsAccelerated,
+            remainingSeconds = decision.RemainingSeconds,
+            timedOutUnlocked = decision.TimedOutUnlocked,
+            deadlineAt = decision.DeadlineAt,
+        });
+        _sseHub.PublishSocialEvent(lobbyId, "barrier", json);
+    }
+
+    private void PublishTakeoverEvent(string lobbyId, string accountId, string username, string state, string reason)
+    {
+        if (_sseHub == null) return;
+        string json = JsonSerializer.Serialize(new
+        {
+            lobbyId,
+            accountId,
+            username,
+            state,
+            reason,
+            updatedAt = UtcNow,
+        });
+        _sseHub.PublishSocialEvent(lobbyId, "takeover", json);
+    }
+
+    public static string NormalizeAccountKey(string? accountId)
     {
         if (string.IsNullOrWhiteSpace(accountId)) return string.Empty;
         return Guid.TryParse(accountId, out var g) ? g.ToString("N") : accountId.Trim();
     }
 
-    public IEnumerable<Lobby> PublicLobbies()
-        => _byId.Values.Where(l => l.IsPublic && !l.HasStarted && !l.IsCancelled);
+    public IEnumerable<Lobby> PublicLobbies(bool includeStartedSpectatable = false)
+        => _byId.Values.Where(l =>
+            l.IsPublic &&
+            !l.IsCancelled &&
+            l.ExpiresAt > UtcNow &&
+            (!l.HasStarted || includeStartedSpectatable));
 
     public IEnumerable<Lobby> All => _byId.Values;
+
+    public int ActiveLobbyCount => _byId.Values.Count(l => !l.IsCancelled && l.ExpiresAt > UtcNow);
 
     private void CleanupPreviousMembership(string accountId)
     {
@@ -889,9 +1994,13 @@ public sealed class LobbyStore
             var old = Get(oldId);
             if (old != null)
             {
-                var mem = FindMember(old, accountId);
-                // 仅在不打断他人或已完结时直接退房
-                if (mem == null || mem.HasFinishedRun || !old.HasStarted || old.Members.Count(m => !m.IsAi) <= 1)
+                bool shouldLeave;
+                lock (old.Members)
+                {
+                    var mem = old.Members.Find(m => m.AccountId.Equals(accountId, StringComparison.OrdinalIgnoreCase));
+                    shouldLeave = mem == null || mem.HasFinishedRun || !old.HasStarted || old.Members.Count(m => !m.IsAi) <= 1;
+                }
+                if (shouldLeave)
                 {
                     Leave(accountId);
                     return;
@@ -908,9 +2017,21 @@ public sealed class LobbyStore
         int? roundCountdownSeconds,
         int? acceleratedRoundCountdownSeconds,
         IEnumerable<string>? bannedEncounterIds,
-        bool allowUpdatePlayerCap)
+        bool allowUpdatePlayerCap,
+        string? modeIdOverride = null,
+        string? presetIdOverride = null)
     {
         var normalized = (incomingRules ?? lobby.Rules ?? new CustomRunRuleSet()).CloneNormalized();
+
+        if (!string.IsNullOrWhiteSpace(presetIdOverride) &&
+            Enum.TryParse<EGameModePreset>(presetIdOverride.Trim(), ignoreCase: true, out var parsedPreset))
+        {
+            normalized.PresetId = parsedPreset;
+        }
+        if (!string.IsNullOrWhiteSpace(modeIdOverride))
+        {
+            normalized.SpecialModeId = ParseSpecialModeId(modeIdOverride.Trim(), normalized.SpecialModeId);
+        }
 
         if (allowUpdatePlayerCap)
         {
@@ -939,10 +2060,24 @@ public sealed class LobbyStore
         if (acceleratedRoundCountdownSeconds.HasValue)
             lobby.AcceleratedRoundCountdownSeconds = Math.Clamp(acceleratedRoundCountdownSeconds.Value, 0, 3600);
 
-        // 房主自身流派倾向不写入房间公共规则，开局后由全员在 Day 1 Hour 1 各自独立选定并锁定
         normalized.SelectedArchetypeMask = 0UL;
         lobby.Rules = normalized;
+        lobby.ModeId = Persistence.ResolveModeKey(normalized.SpecialModeId);
+        lobby.PresetId = normalized.PresetId.ToString();
     }
+
+    public static ESpecialModeId ParseSpecialModeId(string raw, ESpecialModeId fallback = ESpecialModeId.Standard)
+        => raw.Trim().ToLowerInvariant() switch
+        {
+            "standard" => ESpecialModeId.Standard,
+            "endless" or "endless_tower" or "endlesstower" => ESpecialModeId.EndlessTower,
+            "cross_hero" or "crossheromayhem" => ESpecialModeId.CrossHeroMayhem,
+            "mutator" or "mutator_challenge" or "mutatorchallenge" => ESpecialModeId.MutatorChallenge,
+            "daily" or "daily_challenge" or "dailychallenge" => ESpecialModeId.DailyChallenge,
+            "boss_rush" or "bossrush" => ESpecialModeId.BossRush,
+            "sandbox" or "sandbox_lab" or "sandboxlab" => ESpecialModeId.SandboxLab,
+            _ => Enum.TryParse<ESpecialModeId>(raw, ignoreCase: true, out var parsed) ? parsed : fallback,
+        };
 
     private static void EnsureDayMatchups(Lobby lobby, uint day, IEnumerable<Member> members)
     {
@@ -953,19 +2088,19 @@ public sealed class LobbyStore
         lobby.Matchmaker.AssignRoundMatchups(day, participants, lobby.Rules);
     }
 
-    private static void FillAiCompetitors(Lobby lobby, int targetCount)
+    private static void FillAiCompetitors(Lobby lobby, int targetCount, DateTime now)
     {
         while (lobby.Members.Count < targetCount)
         {
-            if (!TryAddNextAiMember(lobby)) break;
+            if (!TryAddNextAiMember(lobby, now)) break;
         }
     }
 
-    private static bool TryAddNextAiMember(Lobby lobby)
+    private static bool TryAddNextAiMember(Lobby lobby, DateTime now)
     {
         for (int idx = 0; idx < 64; idx++)
         {
-            var candidate = CreateAiMember(lobby, idx);
+            var candidate = CreateAiMember(lobby, idx, now);
             if (!lobby.Members.Exists(m =>
                     m.AccountId.Equals(candidate.AccountId, StringComparison.OrdinalIgnoreCase) ||
                     m.Username.Equals(candidate.Username, StringComparison.OrdinalIgnoreCase)))
@@ -977,7 +2112,7 @@ public sealed class LobbyStore
         return false;
     }
 
-    private static Member CreateAiMember(Lobby lobby, int idx)
+    private static Member CreateAiMember(Lobby lobby, int idx, DateTime now)
     {
         string baseName = AiBotNames[idx % AiBotNames.Length];
         string username = idx < AiBotNames.Length ? baseName : $"{baseName}-{idx + 1}";
@@ -988,20 +2123,23 @@ public sealed class LobbyStore
             Username = username,
             Hero = HeroCycle[(idx + 1) % HeroCycle.Length],
             IsAi = true,
+            JoinedAt = now,
+            LastSeenAt = now,
+            FinalPrestige = Math.Max(1, lobby.Rules?.StartingPrestige ?? 20),
         };
     }
 
     private static string DeterministicGuidHex(string seed)
     {
-        byte[] hash = System.Security.Cryptography.MD5.HashData(System.Text.Encoding.UTF8.GetBytes(seed));
+        byte[] hash = MD5.HashData(Encoding.UTF8.GetBytes(seed));
         return new Guid(hash).ToString("N");
     }
 
     private static string NewCode()
     {
         const string alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        var rng = System.Security.Cryptography.RandomNumberGenerator.GetBytes(6);
-        var sb = new System.Text.StringBuilder(6);
+        var rng = RandomNumberGenerator.GetBytes(6);
+        var sb = new StringBuilder(6);
         foreach (byte b in rng) sb.Append(alphabet[b % alphabet.Length]);
         return sb.ToString();
     }
@@ -1014,20 +2152,28 @@ public static class TournamentEndpoints
 
     public static void Map(WebApplication app, LobbyStore lobbies)
     {
-        // ── 建房 ─────────────────────────────────────────────────────────────
+        // ── 建房（支持密码房、仅限邀请、预设档位、新模式与突变词条）───────────
         app.MapPost("/lobbies", async (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            var acc = auth.Account!;
+
+            string raw = await ReadBoundedBodyAsync(ctx, 64 * 1024);
 
             string? name = null;
             string playMode = "Tournament";
             int? explicitCap = null;
             int? rulesPlayerCap = null;
             bool isPublic = true;
+            bool isInviteOnly = false;
+            string? password = null;
+            string? modeId = null;
+            string? presetId = null;
             int? roundCountdownSeconds = null;
             int? acceleratedRoundCountdownSeconds = null;
             List<string>? bannedEncounterIds = null;
+            List<string>? mutatorIds = null;
             CustomRunRuleSet? parsedRules = null;
             try
             {
@@ -1037,9 +2183,14 @@ public static class TournamentEndpoints
                 if (TryGetStringCaseInsensitive(r, "playMode", out var pm) && !string.IsNullOrWhiteSpace(pm)) playMode = pm!;
                 if (TryGetIntCaseInsensitive(r, "playerCap", out int c)) explicitCap = c;
                 if (TryGetBoolCaseInsensitive(r, "isPublic", out bool ip)) isPublic = ip;
+                if (TryGetBoolCaseInsensitive(r, "isInviteOnly", out bool inv)) isInviteOnly = inv;
+                if (TryGetStringCaseInsensitive(r, "password", out var pwd)) password = pwd;
+                if (TryGetStringCaseInsensitive(r, "modeId", out var mid)) modeId = mid;
+                if (TryGetStringCaseInsensitive(r, "presetId", out var pid)) presetId = pid;
                 if (TryGetIntCaseInsensitive(r, "roundCountdownSeconds", out int rcs)) roundCountdownSeconds = rcs;
                 if (TryGetIntCaseInsensitive(r, "acceleratedRoundCountdownSeconds", out int arcs)) acceleratedRoundCountdownSeconds = arcs;
                 if (TryGetStringArrayCaseInsensitive(r, "bannedEncounterIds", out var banned)) bannedEncounterIds = banned;
+                if (TryGetStringArrayCaseInsensitive(r, "mutatorIds", out var muts)) mutatorIds = muts;
                 if (TryGetPropertyCaseInsensitive(r, "rules", out var rulesEl) && rulesEl.ValueKind == JsonValueKind.Object)
                 {
                     parsedRules = JsonSerializer.Deserialize<CustomRunRuleSet>(rulesEl.GetRawText(), CaseInsensitiveJson);
@@ -1047,13 +2198,32 @@ public static class TournamentEndpoints
                         rulesPlayerCap = rc;
                 }
             }
-            catch { }
+            catch
+            {
+                return Results.Json(new { error = "建房请求体 JSON 格式不正确。", code = "INVALID_BODY" }, Json, statusCode: 400);
+            }
 
-            // #13 修复 16 人爆房：未携带房主自定义 rules.PlayerCap 时，无视原版客户端硬编码发来的 playerCap=16，统一默认 8 人
+            if (!string.IsNullOrEmpty(password) && (password.Trim().Length < 4 || password.Trim().Length > 32))
+                return Results.Json(new { error = "房间密码长度必须在 4 到 32 位之间。", code = "INVALID_PASSWORD_LENGTH" }, Json, statusCode: 400);
+
+            if (parsedRules == null && (!string.IsNullOrWhiteSpace(presetId) || !string.IsNullOrWhiteSpace(modeId) || mutatorIds is { Count: > 0 }))
+            {
+                var pEnum = !string.IsNullOrWhiteSpace(presetId) && Enum.TryParse<EGameModePreset>(presetId.Trim(), true, out var pe)
+                    ? pe : EGameModePreset.PureOfficial;
+                var mEnum = !string.IsNullOrWhiteSpace(modeId) ? LobbyStore.ParseSpecialModeId(modeId) : ESpecialModeId.Standard;
+                parsedRules = PresetCatalog.Create(pEnum, mEnum);
+            }
+            if (parsedRules != null && mutatorIds is { Count: > 0 })
+            {
+                parsedRules.MutatorIds = MutatorCatalog.NormalizeAndResolveConflicts(mutatorIds);
+            }
+
+            // 修复 16 人爆房：未携带房主自定义 rules.PlayerCap 时，无视原版客户端硬编码发来的 playerCap=16，统一默认 8 人
             int effectiveCap = rulesPlayerCap
                 ?? (parsedRules != null
                     ? (explicitCap.HasValue && explicitCap.Value != 16 ? explicitCap.Value : parsedRules.PlayerCap)
                     : 8);
+
             var lobby = lobbies.Create(
                 acc,
                 name,
@@ -1063,26 +2233,36 @@ public static class TournamentEndpoints
                 parsedRules,
                 roundCountdownSeconds,
                 acceleratedRoundCountdownSeconds,
-                bannedEncounterIds);
+                bannedEncounterIds,
+                password,
+                isInviteOnly,
+                modeId,
+                presetId);
             return Results.Json(CoordinatorLobbyDto(lobby), Json);
         });
 
-        // ── 房主修改房间规则（开赛前同步 PlayerCap）──────────────────────────
+        // ── 房主修改房间规则（非房主返回 409 中文提示，防原版误踢回主菜单）────
         app.MapPut("/lobbies/{id}/rules", async (string id, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            string aid = acc.AccountId.ToString("N");
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string aid = auth.Account!.AccountId.ToString("N");
             var lobby = lobbies.Get(id) ?? lobbies.GetByCode(id);
             if (lobby == null || lobby.IsCancelled)
-                return Results.Json(new { error = "lobby not found" }, Json, statusCode: 404);
+                return Results.Json(new { error = "房间不存在或已解散。", code = "LOBBY_NOT_FOUND" }, Json, statusCode: 404);
             if (!lobby.HostAccountId.Equals(aid, StringComparison.OrdinalIgnoreCase))
-                return Results.Json(new { error = "only host can update rules" }, Json, statusCode: 403);
+                return Results.Json(new { error = "仅房主可以修改房间规则。", code = "NOT_HOST" }, Json, statusCode: 409);
+            if (lobby.HasStarted)
+                return Results.Json(new { error = "对局已开始，无法再修改房间规则。", code = "LOBBY_ALREADY_STARTED" }, Json, statusCode: 409);
 
-            string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+            string raw = await ReadBoundedBodyAsync(ctx, 64 * 1024);
             CustomRunRuleSet? incoming = null;
             int? roundCountdownSeconds = null;
             int? acceleratedRoundCountdownSeconds = null;
             List<string>? bannedEncounterIds = null;
+            string? modeId = null;
+            string? presetId = null;
 
             try
             {
@@ -1091,6 +2271,8 @@ public static class TournamentEndpoints
                 if (TryGetIntCaseInsensitive(r, "roundCountdownSeconds", out int rcs)) roundCountdownSeconds = rcs;
                 if (TryGetIntCaseInsensitive(r, "acceleratedRoundCountdownSeconds", out int arcs)) acceleratedRoundCountdownSeconds = arcs;
                 if (TryGetStringArrayCaseInsensitive(r, "bannedEncounterIds", out var banned)) bannedEncounterIds = banned;
+                if (TryGetStringCaseInsensitive(r, "modeId", out var mid)) modeId = mid;
+                if (TryGetStringCaseInsensitive(r, "presetId", out var pid)) presetId = pid;
 
                 string rulesJson = TryGetPropertyCaseInsensitive(r, "rules", out var wrapped) && wrapped.ValueKind == JsonValueKind.Object
                     ? wrapped.GetRawText()
@@ -1099,7 +2281,7 @@ public static class TournamentEndpoints
             }
             catch
             {
-                return Results.Json(new { error = "invalid rules payload" }, Json, statusCode: 400);
+                return Results.Json(new { error = "规则配置 JSON 格式不正确。", code = "INVALID_RULES" }, Json, statusCode: 400);
             }
 
             lobbies.UpdateRules(
@@ -1107,22 +2289,26 @@ public static class TournamentEndpoints
                 incoming ?? new CustomRunRuleSet(),
                 roundCountdownSeconds,
                 acceleratedRoundCountdownSeconds,
-                bannedEncounterIds);
+                bannedEncounterIds,
+                modeId,
+                presetId);
             return Results.Json(CoordinatorLobbyDto(lobby), Json);
         });
 
-        // ── 房主在开赛前管理 AI 陪练（add / fill / remove / clear）───────────
+        // ── 房主在开赛前管理 AI 陪练（非房主返回 409 中文提示）────────────────
         app.MapPost("/lobbies/{id}/bots", async (string id, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            string aid = acc.AccountId.ToString("N");
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string aid = auth.Account!.AccountId.ToString("N");
             var lobby = lobbies.Get(id) ?? lobbies.GetByCode(id);
             if (lobby == null || lobby.IsCancelled)
-                return Results.Json(new { error = "lobby not found" }, Json, statusCode: 404);
+                return Results.Json(new { error = "房间不存在或已解散。", code = "LOBBY_NOT_FOUND" }, Json, statusCode: 404);
             if (!lobby.HostAccountId.Equals(aid, StringComparison.OrdinalIgnoreCase))
-                return Results.Json(new { error = "only host can manage bots" }, Json, statusCode: 403);
+                return Results.Json(new { error = "仅房主可以管理房间内的 AI 选手。", code = "NOT_HOST" }, Json, statusCode: 409);
 
-            string raw = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+            string raw = await ReadBoundedBodyAsync(ctx, 8 * 1024);
             string? action = null;
             try
             {
@@ -1134,43 +2320,153 @@ public static class TournamentEndpoints
             var (ok, error) = lobbies.ManageBots(lobby, action ?? string.Empty);
             if (!ok)
             {
-                int code = error == "lobby already started" ? 409 : 400;
-                return Results.Json(new { error }, Json, statusCode: code);
+                int code = error != null && error.Contains("已开赛") ? 409 : 400;
+                return Results.Json(new { error = error ?? "AI 操作失败。", code = code == 409 ? "LOBBY_ALREADY_STARTED" : "INVALID_ACTION" }, Json, statusCode: code);
             }
             return Results.Json(CoordinatorLobbyDto(lobby), Json);
         });
 
-        // ── 公开房列表 ───────────────────────────────────────────────────────
+        // ── 房主生成邀请码与移交房主 ─────────────────────────────────────────
+        app.MapPost("/lobbies/{id}/invite", (string id, HttpContext ctx, AccountStore accounts) =>
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            var lobby = lobbies.Get(id) ?? lobbies.GetByCode(id);
+            if (lobby == null || lobby.IsCancelled)
+                return Results.Json(new { error = "房间不存在或已解散。", code = "LOBBY_NOT_FOUND" }, Json, statusCode: 404);
+            if (!lobby.HostAccountId.Equals(auth.Account!.AccountId.ToString("N"), StringComparison.OrdinalIgnoreCase))
+                return Results.Json(new { error = "仅房主可以生成房间邀请链接。", code = "NOT_HOST" }, Json, statusCode: 409);
+
+            var (token, expiresAt) = lobbies.GenerateInviteToken(lobby);
+            return Results.Json(new
+            {
+                lobbyId = lobby.LobbyId,
+                code = lobby.Code,
+                inviteToken = token,
+                joinUrl = $"bazaar://join/{lobby.Code}?t={token}",
+                expiresAt,
+            }, Json);
+        });
+
+        app.MapPost("/lobbies/{id}/transfer-host", async (string id, HttpContext ctx, AccountStore accounts) =>
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            var lobby = lobbies.Get(id) ?? lobbies.GetByCode(id);
+            if (lobby == null || lobby.IsCancelled)
+                return Results.Json(new { error = "房间不存在或已解散。", code = "LOBBY_NOT_FOUND" }, Json, statusCode: 404);
+
+            string raw = await ReadBoundedBodyAsync(ctx, 4 * 1024);
+            string? targetId = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(raw) ? "{}" : raw);
+                TryGetStringCaseInsensitive(doc.RootElement, "targetAccountId", out targetId);
+            }
+            catch { }
+
+            if (string.IsNullOrWhiteSpace(targetId))
+                return Results.Json(new { error = "请指定要移交房主的目标成员账号 ID。", code = "INVALID_TARGET" }, Json, statusCode: 400);
+
+            var res = lobbies.TransferHost(lobby, auth.Account!.AccountId.ToString("N"), targetId);
+            if (!res.Ok)
+                return Results.Json(new { error = res.MessageZh, code = res.ErrorCode }, Json, statusCode: res.StatusCode);
+
+            return Results.Json(CoordinatorLobbyDto(lobby), Json);
+        });
+
+        // ── 公开房列表与多维度筛选（100% 兼容原版 GET /lobbies?limit=50）──────
         app.MapGet("/lobbies", (HttpContext ctx) =>
         {
             int limit = 50;
             if (int.TryParse(ctx.Request.Query["limit"], out int l)) limit = Math.Clamp(l, 1, 200);
-            var list = lobbies.PublicLobbies().Take(limit).Select(PublicDto).ToArray();
-            return Results.Json(list, Json);
+            string q = ctx.Request.Query["q"].ToString().Trim();
+            string modeId = ctx.Request.Query["modeId"].ToString().Trim();
+            string presetId = ctx.Request.Query["presetId"].ToString().Trim();
+            string hasPwdFilter = ctx.Request.Query["hasPassword"].ToString().Trim().ToLowerInvariant();
+            bool hideFull = string.Equals(ctx.Request.Query["hideFull"], "true", StringComparison.OrdinalIgnoreCase);
+            bool includeStarted = string.Equals(ctx.Request.Query["includeStartedSpectatable"], "true", StringComparison.OrdinalIgnoreCase);
+            string sort = ctx.Request.Query["sort"].ToString().Trim().ToLowerInvariant();
+
+            var candidates = lobbies.PublicLobbies(includeStarted).Select(l => SnapshotPublicRow(l, lobbies.SseHub));
+
+            if (!string.IsNullOrEmpty(q))
+            {
+                candidates = candidates.Where(x =>
+                    x.Name.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    x.HostUsername.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    x.Code.Contains(q, StringComparison.OrdinalIgnoreCase));
+            }
+            if (!string.IsNullOrEmpty(modeId) && !modeId.Equals("all", StringComparison.OrdinalIgnoreCase))
+                candidates = candidates.Where(x => x.ModeId.Equals(modeId, StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrEmpty(presetId) && !presetId.Equals("all", StringComparison.OrdinalIgnoreCase))
+                candidates = candidates.Where(x => x.PresetId.Equals(presetId, StringComparison.OrdinalIgnoreCase));
+            if (hasPwdFilter == "true")
+                candidates = candidates.Where(x => x.HasPassword);
+            else if (hasPwdFilter == "false")
+                candidates = candidates.Where(x => !x.HasPassword);
+            if (hideFull)
+                candidates = candidates.Where(x => x.HumanCount < x.PlayerCap);
+
+            candidates = sort switch
+            {
+                "players_desc" => candidates.OrderByDescending(x => x.JoinedCount).ThenByDescending(x => x.CreatedAt),
+                "human_desc" => candidates.OrderByDescending(x => x.HumanCount).ThenByDescending(x => x.CreatedAt),
+                _ => candidates.OrderByDescending(x => x.CreatedAt),
+            };
+
+            return Results.Json(candidates.Take(limit).ToArray(), Json);
         });
 
         app.MapGet("/lobbies/{id}", (string id) =>
         {
             var lobby = lobbies.Get(id) ?? lobbies.GetByCode(id);
             return lobby == null || lobby.IsCancelled
-                ? Results.Json(new { error = "lobby not found" }, Json, statusCode: 404)
+                ? Results.Json(new { error = "房间不存在或已解散。", code = "LOBBY_NOT_FOUND" }, Json, statusCode: 404)
                 : Results.Json(CoordinatorLobbyDto(lobby), Json);
         });
 
-        // ── 按码加入 ─────────────────────────────────────────────────────────
-        app.MapPost("/lobbies/{code}/members", (string code, HttpContext ctx, AccountStore accounts) =>
+        // ── 按码加入（修复 MP-P0-08：校验已开赛/密码/邀请码/满员，绝不返回 200 假成功）──
+        app.MapPost("/lobbies/{code}/members", async (string code, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            var lobby = lobbies.Join(code, acc);
-            if (lobby == null) return Results.Json(new { error = "invalid code" }, Json, statusCode: 404);
-            return Results.Json(new { LobbyId = lobby.LobbyId, Code = lobby.Code }, Json);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string? password = null;
+            string? inviteToken = ctx.Request.Query["t"].ToString();
+            string raw = await ReadBoundedBodyAsync(ctx, 4 * 1024);
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(raw);
+                    if (TryGetStringCaseInsensitive(doc.RootElement, "password", out var p)) password = p;
+                    if (TryGetStringCaseInsensitive(doc.RootElement, "inviteToken", out var t) && !string.IsNullOrWhiteSpace(t)) inviteToken = t;
+                }
+                catch { }
+            }
+
+            var res = lobbies.JoinWithResult(code, auth.Account!, password, inviteToken);
+            if (!res.Ok || res.Lobby == null)
+            {
+                int status = res.ErrorCode == "LOBBY_NOT_FOUND" ? 404 : 409;
+                return Results.Json(new { error = res.MessageZh ?? "加入房间失败。", code = res.ErrorCode ?? "JOIN_FAILED" }, Json, statusCode: status);
+            }
+
+            return Results.Json(new { LobbyId = res.Lobby.LobbyId, Code = res.Lobby.Code }, Json);
         });
 
-        // ── 我所在的房（严格对齐 TournamentHttpClient.CoordinatorMembership）────
+        // ── 我所在的房（严格对齐 TournamentHttpClient.CoordinatorMembership）──
         app.MapGet("/membership", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            string aid = acc.AccountId.ToString("N");
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: false);
+            if (auth.HasExplicitFailure) return AccountAuthResolver.ErrorResult(auth, Json);
+            if (auth.Account == null)
+                return Results.Json(new { State = "none", LobbyId = (string?)null, SessionId = (string?)null, Removal = (object?)null }, Json);
+
+            string aid = auth.Account.AccountId.ToString("N");
             var lobby = lobbies.GetByMember(aid);
             var member = lobby != null ? lobbies.FindMember(lobby, aid) : null;
 
@@ -1200,102 +2496,160 @@ public static class TournamentEndpoints
             }, Json);
         });
 
-        // 退房（支持客户端 /lobbies/{id}/membership 与短路径 /membership）
+        // 退房
         app.MapDelete("/membership", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            lobbies.Leave(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            lobbies.Leave(auth.Account!.AccountId.ToString("N"));
             return Results.NoContent();
         });
         app.MapDelete("/lobbies/{id}/membership", (string id, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            lobbies.Leave(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            lobbies.Leave(auth.Account!.AccountId.ToString("N"));
             return Results.NoContent();
         });
 
-        // 踢人（支持 /lobbies/{id}/members/{accountId} 与 /members/{accountId}）
-        app.MapDelete("/members/{accountId}", (string accountId) =>
+        // 踢人（根治 MP-P0-01：严禁匿名踢人，校验房主身份与业务边界，非房主返回 409 中文提示）
+        app.MapDelete("/members/{accountId}", (string accountId, HttpContext ctx, AccountStore accounts) =>
         {
-            lobbies.Leave(accountId, reason: "kicked");
-            return Results.Json(new { ok = true }, Json);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string callerAid = auth.Account!.AccountId.ToString("N");
+            var lobby = lobbies.GetByMember(callerAid);
+            if (lobby == null || lobby.IsCancelled)
+                return Results.Json(new { error = "您当前不在任何锦标赛房间中。", code = "NOT_IN_LOBBY" }, Json, statusCode: 404);
+
+            var res = lobbies.KickMember(lobby, callerAid, accountId);
+            if (!res.Ok)
+                return Results.Json(new { error = res.MessageZh, code = res.ErrorCode }, Json, statusCode: res.StatusCode);
+
+            return Results.Json(new { ok = true, message = res.MessageZh }, Json);
         });
-        app.MapDelete("/lobbies/{id}/members/{accountId}", (string id, string accountId) =>
+        app.MapDelete("/lobbies/{id}/members/{accountId}", (string id, string accountId, HttpContext ctx, AccountStore accounts) =>
         {
-            lobbies.Leave(accountId, reason: "kicked");
-            return Results.Json(new { ok = true }, Json);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            var lobby = lobbies.Get(id) ?? lobbies.GetByCode(id);
+            if (lobby == null || lobby.IsCancelled)
+                return Results.Json(new { error = "房间不存在或已解散。", code = "LOBBY_NOT_FOUND" }, Json, statusCode: 404);
+
+            var res = lobbies.KickMember(lobby, auth.Account!.AccountId.ToString("N"), accountId);
+            if (!res.Ok)
+                return Results.Json(new { error = res.MessageZh, code = res.ErrorCode }, Json, statusCode: res.StatusCode);
+
+            return Results.Json(new { ok = true, message = res.MessageZh }, Json);
         });
 
-        // ── 心跳 / 倒计时开局 ───────────────────────────────────────────────
+        // ── 心跳 / 倒计时开局（根治 MP-P0-01：仅房主可启动倒计时，非房主返 409 中文提示）──
         app.MapPut("/lobbies/{id}/presence", (string id, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            lobbies.Touch(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            lobbies.Touch(auth.Account!.AccountId.ToString("N"));
             return Results.Json(new { ok = true }, Json);
         });
         app.MapPut("/presence", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            lobbies.Touch(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            lobbies.Touch(auth.Account!.AccountId.ToString("N"));
             return Results.Json(new { ok = true }, Json);
         });
 
         app.MapPut("/countdown", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            var lobby = lobbies.GetByMember(acc.AccountId.ToString("N"));
-            if (lobby == null) return Results.Json(new { error = "not in lobby" }, Json, statusCode: 404);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string callerAid = auth.Account!.AccountId.ToString("N");
+            var lobby = lobbies.GetByMember(callerAid);
+            if (lobby == null || lobby.IsCancelled)
+                return Results.Json(new { error = "您当前不在任何锦标赛房间中。", code = "NOT_IN_LOBBY" }, Json, statusCode: 404);
+            if (!lobby.HostAccountId.Equals(callerAid, StringComparison.OrdinalIgnoreCase))
+                return Results.Json(new { error = "仅房主可以启动开赛倒计时。", code = "NOT_HOST" }, Json, statusCode: 409);
+            if (lobby.HasStarted)
+                return Results.Json(new { error = "房间已经开始，无需重复开启倒计时。", code = "LOBBY_ALREADY_STARTED" }, Json, statusCode: 409);
+
             lobbies.StartCountdown(lobby.LobbyId, Guid.NewGuid());
             return Results.Json(new { ok = true, tournamentSessionId = lobby.TournamentSessionId }, Json);
         });
         app.MapPut("/lobbies/{id}/countdown", (string id, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            var lobby = lobbies.Get(id) ?? lobbies.GetByMember(acc.AccountId.ToString("N"));
-            if (lobby == null) return Results.Json(new { error = "lobby not found" }, Json, statusCode: 404);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string callerAid = auth.Account!.AccountId.ToString("N");
+            var lobby = lobbies.Get(id) ?? lobbies.GetByCode(id) ?? lobbies.GetByMember(callerAid);
+            if (lobby == null || lobby.IsCancelled)
+                return Results.Json(new { error = "房间不存在或已解散。", code = "LOBBY_NOT_FOUND" }, Json, statusCode: 404);
+            if (!lobby.HostAccountId.Equals(callerAid, StringComparison.OrdinalIgnoreCase))
+                return Results.Json(new { error = "仅房主可以启动开赛倒计时。", code = "NOT_HOST" }, Json, statusCode: 409);
+            if (lobby.HasStarted)
+                return Results.Json(new { error = "房间已经开始，无需重复开启倒计时。", code = "LOBBY_ALREADY_STARTED" }, Json, statusCode: 409);
+
             lobbies.StartCountdown(lobby.LobbyId, Guid.NewGuid());
             return Results.Json(new { ok = true, tournamentSessionId = lobby.TournamentSessionId }, Json);
         });
 
-        // ── 匹配队列（单人秒排 8 人 AI 锦标赛）───────────────────────────────
+        // ── 匹配队列（加锁读取 lobby.Members 修复 MP-P1-01）──────────────────
         app.MapGet("/queue", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            var lobby = lobbies.GetByMember(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: false);
+            if (auth.HasExplicitFailure) return AccountAuthResolver.ErrorResult(auth, Json);
+            if (auth.Account == null)
+                return Results.Json(new { State = "idle", QueuedCount = 0, MaxPlayers = 8 }, Json);
+
+            string aid = auth.Account.AccountId.ToString("N");
+            var lobby = lobbies.GetByMember(aid);
             if (lobby != null && lobby.Kind == "matchmaking" && !lobby.IsCancelled)
             {
-                var mem = lobbies.FindMember(lobby, acc.AccountId.ToString("N"));
-                if (mem != null && !mem.HasFinishedRun)
+                lock (lobby.Members)
                 {
-                    return Results.Json(new
+                    var mem = lobby.Members.Find(m => m.AccountId.Equals(aid, StringComparison.OrdinalIgnoreCase));
+                    if (mem != null && !mem.HasFinishedRun)
                     {
-                        State = lobby.HasStarted ? "lobby" : "queued",
-                        QueuedCount = lobby.Members.Count,
-                        MaxPlayers = lobby.PlayerCap,
-                    }, Json);
+                        return Results.Json(new
+                        {
+                            State = lobby.HasStarted ? "lobby" : "queued",
+                            QueuedCount = lobby.Members.Count,
+                            MaxPlayers = lobby.PlayerCap,
+                        }, Json);
+                    }
                 }
             }
             return Results.Json(new { State = "idle", QueuedCount = 0, MaxPlayers = 8 }, Json);
         });
         app.MapPut("/queue", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            var lobby = lobbies.EnqueueMatchmaking(acc);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            var lobby = lobbies.EnqueueMatchmaking(auth.Account!);
+            int count;
+            lock (lobby.Members) count = lobby.Members.Count;
             return Results.Json(new
             {
                 State = "lobby",
-                QueuedCount = lobby.Members.Count,
+                QueuedCount = count,
                 MaxPlayers = lobby.PlayerCap,
                 TournamentSessionId = lobby.TournamentSessionId,
             }, Json);
         });
         app.MapDelete("/queue", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            var lobby = lobbies.GetByMember(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+
+            string aid = auth.Account!.AccountId.ToString("N");
+            var lobby = lobbies.GetByMember(aid);
             if (lobby != null && lobby.Kind == "matchmaking")
             {
-                lobbies.Leave(acc.AccountId.ToString("N"));
+                lobbies.Leave(aid);
             }
             return Results.Json(new { ok = true }, Json);
         });
@@ -1303,147 +2657,306 @@ public static class TournamentEndpoints
         // ── 接受 / 拒绝分配房 ───────────────────────────────────────────────
         app.MapPut("/acceptance", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            lobbies.Touch(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            lobbies.Touch(auth.Account!.AccountId.ToString("N"));
             return Results.Json(new { ok = true }, Json);
         });
         app.MapPut("/lobbies/{id}/acceptance", (string id, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            lobbies.Touch(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            lobbies.Touch(auth.Account!.AccountId.ToString("N"));
             return Results.Json(new { ok = true }, Json);
         });
         app.MapDelete("/acceptance", (HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            lobbies.Leave(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            lobbies.Leave(auth.Account!.AccountId.ToString("N"));
             return Results.NoContent();
         });
         app.MapDelete("/lobbies/{id}/acceptance", (string id, HttpContext ctx, AccountStore accounts) =>
         {
-            var acc = Resolve(ctx, accounts);
-            lobbies.Leave(acc.AccountId.ToString("N"));
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            lobbies.Leave(auth.Account!.AccountId.ToString("N"));
             return Results.NoContent();
         });
 
-        // ── 锦标赛状态（实时同步玩家 RunState 的 Day / Hour / V / D / Prestige / PvP）──
+        // ── 锦标赛状态 ───────────────────────────────────────────────────────
         app.MapGet("/sessions/current/status", (HttpContext ctx, AccountStore accounts, SessionStore sessions) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(StatusFor(acc, lobbies, sessions), Json);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            return Results.Json(StatusFor(auth.Account!, lobbies, sessions), Json);
         });
         app.MapGet("/sessions/current/gameplay-status", (HttpContext ctx, AccountStore accounts, SessionStore sessions) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(StatusFor(acc, lobbies, sessions), Json);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            return Results.Json(StatusFor(auth.Account!, lobbies, sessions), Json);
         });
         app.MapGet("/tournament/status", (HttpContext ctx, AccountStore accounts, SessionStore sessions) =>
         {
-            var acc = Resolve(ctx, accounts);
-            return Results.Json(StatusFor(acc, lobbies, sessions), Json);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            return Results.Json(StatusFor(auth.Account!, lobbies, sessions), Json);
         });
 
-        // ── 观战 ─────────────────────────────────────────────────────────────
-        app.MapGet("/spectate", () =>
+        // ── 观战名单与详情（修复 MP-P0-06：GET /spectate 必须包含完整 Players[] 名单）──
+        app.MapGet("/spectate", (SessionStore sessions) =>
         {
             var live = lobbies.All
                 .Where(l => l.HasStarted && !l.IsCancelled)
-                .Select(l => new
-                {
-                    WatchCode = l.Code,
-                    TournamentSessionId = l.TournamentSessionId ?? Guid.Empty,
-                    Name = l.Name,
-                    PlayMode = l.PlayMode,
-                    TotalPlayers = l.Members.Count,
-                    ActivePlayers = l.Members.Count(m => !m.FinalIsEliminated),
-                })
+                .Select(l => BuildSpectateSessionDto(l, lobbies, sessions))
                 .ToArray();
             return Results.Json(live, Json);
         });
         app.MapGet("/spectate/{code}", (string code, SessionStore sessions) =>
         {
             var lobby = lobbies.GetByCode(code) ?? lobbies.Get(code);
-            if (lobby == null) return Results.Json(new { error = "not found" }, Json, statusCode: 404);
-            var players = BuildPlayersSnapshot(lobby, null, null, 1, sessions);
-            uint curDay = players.Length > 0 ? players.Max(p => p.CurrentDay) : 1u;
-            int activeCount = players.Count(p => !p.IsEliminated);
-            return Results.Json(new
-            {
-                WatchCode = lobby.Code,
-                TournamentSessionId = lobby.TournamentSessionId ?? Guid.Empty,
-                Name = lobby.Name,
-                PlayMode = lobby.PlayMode,
-                Source = lobby.Kind,
-                Phase = activeCount <= 1 && lobby.HasStarted ? "RunEnded" : (lobby.HasStarted ? "DayFlow" : "WaitingRoom"),
-                CurrentDay = curDay,
-                TotalPlayers = players.Length,
-                ActivePlayers = activeCount,
-                ReadyPlayers = activeCount,
-                DeadlineAt = (DateTime?)null,
-                StartedAt = lobby.CreatedAt,
-                Players = players,
-            }, Json);
+            if (lobby == null || lobby.IsCancelled)
+                return Results.Json(new { error = "未找到对应的可观战锦标赛房间。", code = "SPECTATE_NOT_FOUND" }, Json, statusCode: 404);
+
+            return Results.Json(BuildSpectateSessionDto(lobby, lobbies, sessions), Json);
         });
 
-        // ── SSE 事件流（发送真实 data: update 包，唤醒客户端 ReadServerSentEventData）──
-        app.MapGet("/events", async (HttpContext ctx, CancellationToken ct) =>
+        // ── 房间级隔离 SSE 事件流（根治全局风暴 MP-P1-02，含断连释放与保活）──
+        app.MapGet("/events", async (HttpContext ctx, AccountStore accounts, CancellationToken ct) =>
         {
-            await StreamSseUpdatesAsync(ctx, lobbies, ct);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: false);
+            string? lobbyId = ctx.Request.Query["lobbyId"].ToString();
+            string ownerKey = auth.Account != null
+                ? auth.Account.AccountId.ToString("N")
+                : $"anon:{ctx.Connection.RemoteIpAddress}";
+            if (string.IsNullOrWhiteSpace(lobbyId) && auth.Account != null)
+            {
+                lobbyId = lobbies.GetByMember(auth.Account.AccountId.ToString("N"))?.LobbyId;
+            }
+            await StreamLobbySseAsync(ctx, lobbies, lobbyId, spectateLobbyId: null, ownerKey, ct);
         });
-        app.MapGet("/spectate/{code}/events", async (string code, HttpContext ctx, CancellationToken ct) =>
+        app.MapGet("/spectate/{code}/events", async (string code, HttpContext ctx, AccountStore accounts, CancellationToken ct) =>
         {
-            await StreamSseUpdatesAsync(ctx, lobbies, ct);
+            var lobby = lobbies.GetByCode(code) ?? lobbies.Get(code);
+            if (lobby == null || lobby.IsCancelled)
+            {
+                ctx.Response.StatusCode = 404;
+                await ctx.Response.WriteAsJsonAsync(new { error = "未找到观战房间。", code = "SPECTATE_NOT_FOUND" }, ct);
+                return;
+            }
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: false);
+            string ownerKey = auth.Account != null
+                ? auth.Account.AccountId.ToString("N")
+                : $"anon:{ctx.Connection.RemoteIpAddress}";
+            await StreamLobbySseAsync(ctx, lobbies, lobby.LobbyId, spectateLobbyId: lobby.LobbyId, ownerKey, ct);
         });
     }
 
-    private static async Task StreamSseUpdatesAsync(HttpContext ctx, LobbyStore lobbies, CancellationToken ct)
+    private static async Task StreamLobbySseAsync(
+        HttpContext ctx,
+        LobbyStore lobbies,
+        string? lobbyId,
+        string? spectateLobbyId,
+        string ownerKey,
+        CancellationToken ct)
     {
-        ctx.Response.ContentType = "text/event-stream";
-        ctx.Response.Headers["Cache-Control"] = "no-cache";
-        ctx.Response.Headers["Connection"] = "keep-alive";
-
-        long lastVer = lobbies.ChangeVersion;
-        await ctx.Response.WriteAsync("data: connected\n\n", ct);
-        await ctx.Response.Body.FlushAsync(ct);
-
-        try
+        var hub = lobbies.SseHub;
+        if (hub != null)
         {
+            string topic = !string.IsNullOrWhiteSpace(lobbyId)
+                ? SseEventHub.LobbyTopic(lobbyId)
+                : SseEventHub.PublicLobbiesTopic;
+            using var sub = hub.TrySubscribe(topic, ownerKey, spectateLobbyId);
+            if (sub == null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+                await ctx.Response.WriteAsJsonAsync(new { error = "当前实时事件连接数已达上限，请关闭多余窗口后重试。", code = "SSE_LIMIT_EXCEEDED" }, ct);
+                return;
+            }
+
+            SseEventHub.PrepareSseResponseHeaders(ctx.Response);
+            // 首帧发送注释行 : connected，兼容原版 ReadServerSentEvents(notifyOnConnect:true) 避免双拉取风暴
+            if (!await SseEventHub.TryWriteRawAsync(ctx.Response, ": connected\n\n", ct))
+                return;
+
             while (!ct.IsCancellationRequested)
             {
-                bool changed = await lobbies.WaitForChangeAsync(lastVer, TimeSpan.FromSeconds(25), ct);
+                using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                delayCts.CancelAfter(TimeSpan.FromSeconds(20));
+                try
+                {
+                    var frame = await sub.Reader.ReadAsync(delayCts.Token).ConfigureAwait(false);
+                    if (!await SseEventHub.TryWriteFrameAsync(ctx.Response, frame, ct))
+                        break;
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    if (!await SseEventHub.TryWriteRawAsync(ctx.Response, ": keepalive\n\n", ct))
+                        break;
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or IOException or ObjectDisposedException or System.Threading.Channels.ChannelClosedException)
+                {
+                    break;
+                }
+            }
+            return;
+        }
+
+        // 回退路径（未注册 SseEventHub 时仍使用房间级版本隔离 + 优雅断连保护）
+        SseEventHub.PrepareSseResponseHeaders(ctx.Response);
+        long lastVer = !string.IsNullOrWhiteSpace(lobbyId)
+            ? lobbies.GetLobbyChangeVersion(lobbyId)
+            : lobbies.ChangeVersion;
+
+        if (!await SseEventHub.TryWriteRawAsync(ctx.Response, ": connected\n\n", ct))
+            return;
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                bool changed = !string.IsNullOrWhiteSpace(lobbyId)
+                    ? await lobbies.WaitForLobbyChangeAsync(lobbyId, lastVer, TimeSpan.FromSeconds(20), ct)
+                    : await lobbies.WaitForChangeAsync(lastVer, TimeSpan.FromSeconds(20), ct);
                 if (ct.IsCancellationRequested) break;
 
-                long curVer = lobbies.ChangeVersion;
+                long curVer = !string.IsNullOrWhiteSpace(lobbyId)
+                    ? lobbies.GetLobbyChangeVersion(lobbyId)
+                    : lobbies.ChangeVersion;
                 if (changed || curVer != lastVer)
                 {
                     lastVer = curVer;
-                    await ctx.Response.WriteAsync("data: update\n\n", ct);
-                    await ctx.Response.Body.FlushAsync(ct);
+                    if (!await SseEventHub.TryWriteRawAsync(ctx.Response, "data: update\n\n", ct))
+                        break;
                 }
                 else
                 {
-                    await ctx.Response.WriteAsync(": keepalive\n\n", ct);
-                    await ctx.Response.Body.FlushAsync(ct);
+                    if (!await SseEventHub.TryWriteRawAsync(ctx.Response, ": keepalive\n\n", ct))
+                        break;
                 }
             }
+            catch (Exception ex) when (ex is OperationCanceledException or IOException or ObjectDisposedException)
+            {
+                break;
+            }
         }
-        catch (OperationCanceledException) { }
     }
 
-    // ── helpers ─────────────────────────────────────────────────────────────
+    // ── DTO 构造与实时状态快照 ──────────────────────────────────────────────
 
-    private static AccountStore.Account Resolve(HttpContext ctx, AccountStore accounts)
+    private static object BuildSpectateSessionDto(LobbyStore.Lobby lobby, LobbyStore lobbies, SessionStore sessions)
     {
-        var acc = accounts.FindByAccessToken(ctx.Request.Headers["Authorization"].ToString());
-        if (acc != null) return acc;
-        acc = accounts.FindByAccountId(ctx.Request.Headers["X-Account-Id"].ToString());
-        if (acc != null) return acc;
-        acc = accounts.FindByAccountId(ctx.Request.Headers["aid"].ToString());
-        if (acc != null) return acc;
-        string xUser = ctx.Request.Headers["X-Username"].ToString();
-        if (!string.IsNullOrWhiteSpace(xUser)) return accounts.GetOrCreateByName(xUser);
-        string uid = ctx.Request.Headers["uid"].ToString();
-        return accounts.GetOrCreateByName(string.IsNullOrWhiteSpace(uid) ? "guest" : uid);
+        var players = BuildPlayersSnapshot(lobby, null, null, 1, sessions, lobbies);
+        uint curDay = players.Length > 0 ? players.Max(p => p.CurrentDay) : 1u;
+        int activeCount = players.Count(p => !p.IsEliminated);
+        var barrier = lobby.HasStarted
+            ? lobbies.EvaluateRoundBarrier(lobby, curDay, null, null, sessions, startOrAdvanceCountdown: false)
+            : new LobbyStore.PvpBarrierDecision(true, false, null, activeCount, activeCount, 0, false, false, 0, null);
+
+        int aiAlive;
+        lock (lobby.Members)
+            aiAlive = lobby.Members.Count(m => m.IsAi && !m.FinalIsEliminated);
+
+        int readyPlayers = barrier.SurvivingHumans >= 2
+            ? Math.Max(0, barrier.ReadyHumans + aiAlive)
+            : activeCount;
+
+        return new
+        {
+            WatchCode = lobby.Code,
+            TournamentSessionId = lobby.TournamentSessionId ?? Guid.Empty,
+            Name = lobby.Name,
+            PlayMode = lobby.PlayMode,
+            ModeId = lobby.ModeId,
+            PresetId = lobby.PresetId,
+            Source = lobby.Kind,
+            Phase = activeCount <= 1 && lobby.HasStarted ? "RunEnded" : (lobby.HasStarted ? "DayFlow" : "WaitingRoom"),
+            CurrentDay = curDay,
+            TotalPlayers = players.Length,
+            ActivePlayers = activeCount,
+            ReadyPlayers = readyPlayers,
+            DeadlineAt = barrier.SurvivingHumans >= 2 ? barrier.DeadlineAt : null,
+            StartedAt = lobby.StartedAt ?? lobby.CreatedAt,
+            SpectatorCount = lobbies.SseHub?.GetSpectatorCount(lobby.LobbyId) ?? 0,
+            Players = players,
+        };
+    }
+
+    private sealed record PublicLobbyRowDto(
+        string LobbyId,
+        string Code,
+        string Name,
+        string HostAccountId,
+        string HostUsername,
+        int JoinedCount,
+        int PlayerCap,
+        int MaxPlayers,
+        DateTime CreatedAt,
+        DateTime ExpiresAt,
+        string State,
+        bool HasPassword,
+        bool IsInviteOnly,
+        string ModeId,
+        string PresetId,
+        string[] MutatorIds,
+        bool IsCustomPowerModified,
+        int HumanCount,
+        int BotCount,
+        int RoundCountdownSeconds,
+        bool Spectatable,
+        int SpectatorCount);
+
+    private static PublicLobbyRowDto SnapshotPublicRow(LobbyStore.Lobby lobby, SseEventHub? sseHub)
+    {
+        int joinedCount, humanCount, botCount, playerCap, roundCd;
+        string[] mutators;
+        bool isCustomPower;
+        string state, modeId, presetId, hostAid, hostUser;
+        bool hasPwd, isInv, spectatable;
+
+        lock (lobby.Members)
+        {
+            joinedCount = lobby.Members.Count;
+            humanCount = lobby.Members.Count(m => !m.IsAi);
+            botCount = joinedCount - humanCount;
+            playerCap = lobby.PlayerCap;
+            roundCd = lobby.RoundCountdownSeconds;
+            mutators = lobby.Rules?.MutatorIds?.ToArray() ?? Array.Empty<string>();
+            isCustomPower = lobby.Rules?.IsCustomPowerModified() ?? false;
+            state = lobby.IsCancelled ? "cancelled" : (lobby.HasStarted ? "started" : "waiting");
+            modeId = lobby.ModeId;
+            presetId = lobby.PresetId;
+            hostAid = lobby.HostAccountId;
+            hostUser = lobby.HostUsername;
+            hasPwd = lobby.HasPassword;
+            isInv = lobby.IsInviteOnly;
+            spectatable = lobby.HasStarted && !lobby.IsCancelled;
+        }
+
+        return new PublicLobbyRowDto(
+            LobbyId: lobby.LobbyId,
+            Code: lobby.Code,
+            Name: lobby.Name,
+            HostAccountId: hostAid,
+            HostUsername: hostUser,
+            JoinedCount: joinedCount,
+            PlayerCap: playerCap,
+            MaxPlayers: playerCap,
+            CreatedAt: lobby.CreatedAt,
+            ExpiresAt: lobby.ExpiresAt,
+            State: state,
+            HasPassword: hasPwd,
+            IsInviteOnly: isInv,
+            ModeId: modeId,
+            PresetId: presetId,
+            MutatorIds: mutators,
+            IsCustomPowerModified: isCustomPower,
+            HumanCount: humanCount,
+            BotCount: botCount,
+            RoundCountdownSeconds: roundCd,
+            Spectatable: spectatable,
+            SpectatorCount: sseHub?.GetSpectatorCount(lobby.LobbyId) ?? 0);
     }
 
     private static object CoordinatorLobbyDto(LobbyStore.Lobby lobby)
@@ -1453,9 +2966,9 @@ public static class TournamentEndpoints
         List<LobbyStore.Member> snapshot;
         CustomRunRuleSet rulesSnapshot;
         string[] bannedSnapshot;
-        int playerCap;
-        int roundCountdown;
-        int accelCountdown;
+        int playerCap, roundCountdown, accelCountdown;
+        string hostAid, hostName, modeId, presetId;
+        bool hasPwd, isInv;
         lock (lobby.Members)
         {
             snapshot = lobby.Members.ToList();
@@ -1464,6 +2977,12 @@ public static class TournamentEndpoints
             playerCap = lobby.PlayerCap;
             roundCountdown = lobby.RoundCountdownSeconds;
             accelCountdown = lobby.AcceleratedRoundCountdownSeconds;
+            hostAid = lobby.HostAccountId;
+            hostName = lobby.HostUsername;
+            modeId = lobby.ModeId;
+            presetId = lobby.PresetId;
+            hasPwd = lobby.HasPassword;
+            isInv = lobby.IsInviteOnly;
         }
 
         return new
@@ -1473,10 +2992,15 @@ public static class TournamentEndpoints
             Kind = lobby.Kind,
             State = lobby.IsCancelled ? "cancelled" : (lobby.HasStarted ? "started" : "waiting"),
             Code = lobby.Code,
-            HostAccountId = lobby.HostAccountId,
+            HostAccountId = hostAid,
+            HostUsername = hostName,
             PlayerCap = playerCap,
             MaxPlayers = playerCap,
             Name = lobby.Name,
+            ModeId = modeId,
+            PresetId = presetId,
+            HasPassword = hasPwd,
+            IsInviteOnly = isInv,
             ExcludeHostFromGameplay = lobby.ExcludeHostFromGameplay,
             IsPublic = lobby.IsPublic,
             ExpiresAt = lobby.ExpiresAt,
@@ -1493,26 +3017,14 @@ public static class TournamentEndpoints
                 Hero = m.Hero,
                 IsAi = m.IsAi,
                 State = "accepted",
+                ConnectionState = m.ConnectionState,
+                AiTakeoverRounds = m.MissedPvpDays,
                 PresenceExpiresAt = expires,
                 AcceptedAt = (DateTime?)m.JoinedAt,
                 LastHeartbeatAt = (DateTime?)m.LastSeenAt,
             }).ToArray(),
         };
     }
-
-    private static object PublicDto(LobbyStore.Lobby lobby) => new
-    {
-        LobbyId = lobby.LobbyId,
-        Code = lobby.Code,
-        Name = lobby.Name,
-        HostAccountId = lobby.HostAccountId,
-        HostUsername = lobby.HostUsername,
-        JoinedCount = lobby.Members.Count,
-        PlayerCap = lobby.PlayerCap,
-        MaxPlayers = lobby.PlayerCap,
-        CreatedAt = lobby.CreatedAt,
-        ExpiresAt = lobby.ExpiresAt,
-    };
 
     private static RunState? FindAccountActiveOrRecentRun(
         string accountIdHex,
@@ -1522,7 +3034,6 @@ public static class TournamentEndpoints
         var mem = sessions.GetByAccount(accountIdHex);
         if (mem == null) return null;
 
-        // 严格隔离历史非锦标赛对局与其它场次的锦标赛对局，避免新建锦标赛房开赛前继承旧终局淘汰态
         if (expectedTournamentSessionId.HasValue && expectedTournamentSessionId.Value != Guid.Empty)
         {
             if (!mem.TournamentSessionId.HasValue || mem.TournamentSessionId.Value != expectedTournamentSessionId.Value)
@@ -1536,9 +3047,6 @@ public static class TournamentEndpoints
         return SessionRegistry.Get(mem.Sid)?.Run;
     }
 
-    /// <summary>
-    /// 依据当前玩家真实 RunState 与房间成员，生成严格对齐 ETournamentPhase 的锦标赛实时状态。
-    /// </summary>
     private static object StatusFor(AccountStore.Account acc, LobbyStore lobbies, SessionStore sessions)
     {
         string aid = acc.AccountId.ToString("N");
@@ -1568,26 +3076,19 @@ public static class TournamentEndpoints
             isChampion = run.State == ERunState.EndRunVictory;
             isEliminated = run.State == ERunState.EndRunDefeat;
             isRunEnded = Persistence.IsTerminalState(run.State);
-            if (isRunEnded && selfMember != null && !selfMember.HasFinishedRun)
+            if (isRunEnded && selfMember != null && !selfMember.HasFinishedRun && lobby != null)
             {
-                selfMember.HasFinishedRun = true;
-                selfMember.FinalIsChampion = isChampion;
-                selfMember.FinalIsEliminated = isEliminated;
-                selfMember.FinalVictories = (int)run.Victories;
-                selfMember.FinalDefeats = (int)run.Defeats;
-                selfMember.FinalPrestige = run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 0);
-                selfMember.FinalDay = run.Day;
-                lobbies.NotifyChanged();
+                lobbies.RecordRunProgress(lobby, aid, run);
             }
         }
         else if (selfMember != null && selfMember.HasFinishedRun)
         {
             isChampion = selfMember.FinalIsChampion;
             isEliminated = selfMember.FinalIsEliminated;
+            isConceded = selfMember.FinalIsConceded;
             isRunEnded = true;
         }
 
-        // 仅当真正处于第 6 小时待打本日 PvP（或处于 TournamentPvpChoice/WaitingRoom）时才暴露 PvpReady
         bool isPvpReady = !isRunEnded && run != null &&
             (run.State == ERunState.TournamentPvpChoice ||
              run.State == ERunState.TournamentWaitingRoom ||
@@ -1618,10 +3119,9 @@ public static class TournamentEndpoints
         else
             phase = "DayFlow";
 
-        var players = BuildPlayersSnapshot(lobby, acc, run, currentDay, sessions);
+        var players = BuildPlayersSnapshot(lobby, acc, run, currentDay, sessions, lobbies);
         var selfSnapshot = players.FirstOrDefault(p => p.AccountId.Equals(aid, StringComparison.OrdinalIgnoreCase));
 
-        // 优先取 TournamentMatchmaker 为当前天分配的对称真实对手，未开赛或空房时回退兼容占位
         string assignedOppId = selfSnapshot?.AssignedOpponentAccountId ?? "";
         string assignedOppName = selfSnapshot?.AssignedOpponentUsername ?? "";
         if (string.IsNullOrWhiteSpace(assignedOppId))
@@ -1631,7 +3131,7 @@ public static class TournamentEndpoints
                 .OrderBy(p => p.IsEliminated ? 1 : 0)
                 .FirstOrDefault();
             assignedOppId = fallbackOpp?.AccountId ?? "";
-            assignedOppName = fallbackOpp?.Username ?? "Tournament Challenger";
+            assignedOppName = fallbackOpp?.Username ?? "锦标赛挑战者";
         }
 
         int? place = isChampion
@@ -1639,8 +3139,16 @@ public static class TournamentEndpoints
             : (isEliminated ? (selfSnapshot?.Place ?? Math.Max(2, players.Count(p => !p.IsEliminated) + 1)) : selfSnapshot?.Place);
 
         int activePlayers = Math.Max(1, players.Count(p => !p.IsEliminated));
+        int aiAlive = 0;
+        if (lobby != null)
+        {
+            lock (lobby.Members)
+            {
+                aiAlive = lobby.Members.Count(m => m.IsAi && !m.FinalIsEliminated);
+            }
+        }
         int readyPlayers = barrierDecision.SurvivingHumans >= 2
-            ? Math.Max(0, barrierDecision.ReadyHumans + players.Count(p => !p.IsEliminated && (lobby?.Members.Any(m => m.IsAi && m.AccountId.Equals(p.AccountId, StringComparison.OrdinalIgnoreCase)) ?? false)))
+            ? Math.Max(0, barrierDecision.ReadyHumans + aiAlive)
             : activePlayers;
 
         return new
@@ -1663,7 +3171,7 @@ public static class TournamentEndpoints
             Concede = isConceded,
             EndRun = isRunEnded,
             AssignedOpponentAccountId = assignedOppId,
-            AssignedOpponentUsername = string.IsNullOrWhiteSpace(assignedOppName) ? "Tournament Challenger" : assignedOppName,
+            AssignedOpponentUsername = string.IsNullOrWhiteSpace(assignedOppName) ? "锦标赛挑战者" : assignedOppName,
             WaitingForHumanDayStart = false,
             Players = players,
             ExitReason = isChampion ? "champion" : (isEliminated ? "eliminated" : ""),
@@ -1694,6 +3202,8 @@ public static class TournamentEndpoints
         public bool IsChampion { get; set; }
         public int? Place { get; set; }
         public bool CanObserve { get; set; }
+        public string ConnectionState { get; set; } = "online";
+        public int AiTakeoverRounds { get; set; }
     }
 
     private static ObservedPlayerRow[] BuildPlayersSnapshot(
@@ -1701,7 +3211,8 @@ public static class TournamentEndpoints
         AccountStore.Account? selfAcc,
         RunState? selfRun,
         uint currentDay,
-        SessionStore sessions)
+        SessionStore sessions,
+        LobbyStore? store = null)
     {
         var list = new List<ObservedPlayerRow>();
         string? selfAid = selfAcc?.AccountId.ToString("N");
@@ -1717,16 +3228,17 @@ public static class TournamentEndpoints
 
         List<LobbyStore.Member> members;
         CustomRunRuleSet rules;
+        bool canFreezeDay;
         lock (lobby.Members)
         {
+            store?.AdvanceAiStandingsUpToDayLocked(lobby, currentDay);
+            canFreezeDay = store == null || store.CanFreezeMatchupsForDayLocked(lobby, currentDay, sessions);
             members = lobby.Members.ToList();
             rules = lobby.Rules;
         }
 
-        bool nonLethalBots = rules.BotNonLethalPrestigeLock;
         var isAiById = new Dictionary<string, bool>(members.Count, StringComparer.OrdinalIgnoreCase);
 
-        int aiIdx = 0;
         foreach (var m in members)
         {
             isAiById[m.AccountId] = m.IsAi;
@@ -1741,7 +3253,7 @@ public static class TournamentEndpoints
             }
             else
             {
-                list.Add(BuildAiRow(m, currentDay, aiIdx++, nonLethalBots));
+                list.Add(BuildAiRow(m, currentDay));
             }
         }
 
@@ -1754,7 +3266,12 @@ public static class TournamentEndpoints
                     isAiById.GetValueOrDefault(p.AccountId, false),
                     p.IsEliminated))
                 .ToList();
-            var assignments = lobby.Matchmaker.AssignRoundMatchups(currentDay, participants, rules);
+
+            // 修复 MP-P0-05：未满足全员就位条件时绝不提前冻结未来天配对表，仅使用只读预览！
+            var assignments = canFreezeDay
+                ? lobby.Matchmaker.AssignRoundMatchups(currentDay, participants, rules)
+                : lobby.Matchmaker.PreviewRoundMatchups(currentDay, participants, rules);
+
             foreach (var row in list)
             {
                 if (assignments.TryGetValue(row.AccountId, out var a))
@@ -1765,7 +3282,6 @@ public static class TournamentEndpoints
             }
         }
 
-        // 计算实时排名 Place：活跃名次按 Prestige/Wins 排前，被淘汰的按坚持天数/胜场排后
         var ranked = list
             .OrderBy(p => p.IsEliminated ? 1 : 0)
             .ThenByDescending(p => p.Prestige)
@@ -1791,6 +3307,8 @@ public static class TournamentEndpoints
         {
             bool champ = r.State == ERunState.EndRunVictory;
             bool elim = r.State == ERunState.EndRunDefeat;
+            bool terminal = Persistence.IsTerminalState(r.State);
+            bool readyPvp = !terminal && LobbyStore.ComputeIsAtOrPastHour6Pvp(r);
             return new ObservedPlayerRow
             {
                 AccountId = accountId,
@@ -1802,10 +3320,14 @@ public static class TournamentEndpoints
                 HasVisitedFates = r.HasVisitedFates,
                 Wins = (int)r.Victories,
                 Losses = (int)r.Defeats,
-                Phase = Persistence.IsTerminalState(r.State) ? "RunEnded" : "DayFlow",
+                Phase = terminal ? "RunEnded" : (readyPvp ? "PvpReady" : "DayFlow"),
+                ReadyForPvp = readyPvp,
+                CombatSubmitted = r.State == ERunState.PVPCombat,
                 IsChampion = champ,
                 IsEliminated = elim,
-                CanObserve = !Persistence.IsTerminalState(r.State),
+                CanObserve = !terminal,
+                ConnectionState = m?.ConnectionState ?? "online",
+                AiTakeoverRounds = m?.MissedPvpDays ?? 0,
             };
         }
         return new ObservedPlayerRow
@@ -1814,54 +3336,55 @@ public static class TournamentEndpoints
             Username = username,
             Hero = m?.Hero ?? "Vanessa",
             CurrentDay = m?.FinalDay ?? fallbackDay,
-            CurrentHour = 1,
+            CurrentHour = m?.CurrentHour ?? 1,
             Prestige = m?.FinalPrestige ?? 20,
             Wins = m?.FinalVictories ?? 0,
             Losses = m?.FinalDefeats ?? 0,
             Phase = m?.HasFinishedRun == true ? "RunEnded" : "DayFlow",
             IsChampion = m?.FinalIsChampion ?? false,
             IsEliminated = m?.FinalIsEliminated ?? false,
+            IsConceded = m?.FinalIsConceded ?? false,
             CanObserve = false,
+            ConnectionState = m?.ConnectionState ?? "online",
+            AiTakeoverRounds = m?.MissedPvpDays ?? 0,
         };
     }
 
-    private static ObservedPlayerRow BuildAiRow(
-        LobbyStore.Member m,
-        uint currentDay,
-        int index,
-        bool botNonLethalPrestigeLock)
+    private static ObservedPlayerRow BuildAiRow(LobbyStore.Member m, uint currentDay)
     {
-        int roundsPlayed = Math.Max(0, (int)currentDay - 1);
-        int wins = 0;
-        int losses = 0;
-        int prestige = 20;
-        for (int d = 1; d <= roundsPlayed; d++)
-        {
-            bool wonRound = ((d * 3 + index) % 5) < 3;
-            if (wonRound) wins++;
-            else
-            {
-                losses++;
-                prestige = botNonLethalPrestigeLock
-                    ? Math.Max(1, prestige - d)
-                    : Math.Max(0, prestige - d);
-            }
-        }
-        bool eliminated = !botNonLethalPrestigeLock && prestige <= 0;
         return new ObservedPlayerRow
         {
             AccountId = m.AccountId,
             Username = m.Username,
             Hero = m.Hero,
-            CurrentDay = currentDay,
+            CurrentDay = Math.Max(currentDay, m.CurrentDay),
             CurrentHour = 6,
-            Prestige = prestige,
-            Wins = wins,
-            Losses = losses,
-            Phase = eliminated ? "RunEnded" : "DayFlow",
-            IsEliminated = eliminated,
+            Prestige = m.FinalPrestige,
+            Wins = m.FinalVictories,
+            Losses = m.FinalDefeats,
+            Phase = m.FinalIsEliminated ? "RunEnded" : "DayFlow",
+            IsEliminated = m.FinalIsEliminated,
             CanObserve = false,
+            ConnectionState = "online",
+            AiTakeoverRounds = 0,
         };
+    }
+
+    private static async Task<string> ReadBoundedBodyAsync(HttpContext ctx, int maxBytes)
+    {
+        if (ctx.Request.Body == null) return string.Empty;
+        using var ms = new MemoryStream();
+        byte[] buffer = new byte[4096];
+        int total = 0;
+        while (true)
+        {
+            int read = await ctx.Request.Body.ReadAsync(buffer, 0, Math.Min(buffer.Length, maxBytes - total + 1));
+            if (read <= 0) break;
+            total += read;
+            if (total > maxBytes) return string.Empty;
+            ms.Write(buffer, 0, read);
+        }
+        return Encoding.UTF8.GetString(ms.ToArray());
     }
 
     private static bool TryGetPropertyCaseInsensitive(JsonElement el, string name, out JsonElement value)

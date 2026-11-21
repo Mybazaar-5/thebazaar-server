@@ -2,35 +2,69 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using BazaarGameShared.Domain.Core.Types;
 using BazaarGameShared.Domain.Runs;
 using BazaarServer.Game;
+using BazaarServer.Storage;
 
 namespace BazaarServer.Accounts;
 
 /// <summary>
-/// 账号、令牌与英雄生涯战绩持久化。
-/// 自建服不依赖 Steam：有票据按票据建号，无票据按玩家名建号，所有生涯战绩落盘 SQLite。
+/// 账号、多端持久化令牌与英雄生涯战绩存储：
+/// - 令牌持久化至 SQLite account_tokens（仅存 SHA-256 哈希），支持同一账号最多 5 端并发登录不互踢、重启 100% 存活、严格过期与类型校验；
+/// - 支持可选账号口令/设备密钥保护（PBKDF2-SHA256 盐值哈希）；
+/// - 按 AccountId 提供 O(1) 哈希检索，并将高频局内进度写入改为 3 秒防抖合批落盘以消除 SQLite 锁争抢。
 /// </summary>
-public sealed class AccountStore
+public sealed class AccountStore : IDisposable
 {
+    public const int MaxActiveTokensPerType = 5;
+    public const int AccountProgressSaveDebounceMs = 3000;
+    private const int Pbkdf2Iterations = 60_000;
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         WriteIndented = false,
         PropertyNameCaseInsensitive = true,
     };
 
+    private static readonly Regex TmpTagRegex = new(@"<[^>]{0,128}>", RegexOptions.Compiled);
+
     public static readonly string[] KnownPlayableHeroes =
     [
         "Vanessa", "Pygmalien", "Dooley", "Mak", "Stelle", "Jules", "Karnok", "Hero8",
     ];
 
-    private readonly BazaarServer.Storage.Persistence _db;
-    private readonly ConcurrentDictionary<string, Account> _byKey = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, string> _byToken = new(StringComparer.Ordinal);
-    private readonly object _lock = new();
+    public sealed record IssuedTokenPair(
+        string AccessToken,
+        string RefreshToken,
+        DateTime AccessExpiresAt,
+        DateTime RefreshExpiresAt,
+        string ClientKind);
 
-    public AccountStore(BazaarServer.Storage.Persistence db) => _db = db;
+    private sealed record CachedToken(
+        string TokenHash,
+        Guid AccountId,
+        string TokenType,
+        string ClientKind,
+        DateTime ExpiresAt,
+        bool IsRevoked);
+
+    private readonly Persistence _db;
+    private readonly ConcurrentDictionary<string, Account> _byKey = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<Guid, Account> _byAccountId = new();
+    private readonly ConcurrentDictionary<string, CachedToken> _tokenCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<Guid, Account> _dirtyAccounts = new();
+    private readonly object _lock = new();
+    private readonly Timer _accountSaveTimer;
+    private int _disposed;
+
+    public AccountStore(Persistence db)
+    {
+        _db = db ?? throw new ArgumentNullException(nameof(db));
+        _accountSaveTimer = new Timer(OnAccountSaveTimer, null, Timeout.Infinite, Timeout.Infinite);
+        _db.RegisterFlushCallback(FlushPendingAccountSaves);
+    }
 
     public sealed class HeroCareerStats
     {
@@ -104,7 +138,6 @@ public sealed class AccountStore
     {
         public Dictionary<string, HeroCareerStats> Heroes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public List<string> RecordedRunIds { get; set; } = new();
-        // 账号级英雄配装、未开启宝箱数、已解锁卡牌皮肤与宝石余额持久化
         public Dictionary<string, HeroLoadoutState> HeroLoadouts { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public int? UnopenedChestCount { get; set; }
         public List<string> OpenedCardSkinIds { get; set; } = new();
@@ -114,13 +147,17 @@ public sealed class AccountStore
     public sealed class Account
     {
         public Guid AccountId { get; init; }
-        public string Username { get; init; }
-        public string IdentityKey { get; init; }
-        public string AccessToken { get; set; }
-        public string RefreshToken { get; set; }
+        public string Username { get; init; } = "";
+        public string IdentityKey { get; init; } = "";
+        public string AccessToken { get; set; } = "";
+        public string RefreshToken { get; set; } = "";
         public DateTime AccessExpiresAt { get; set; }
         public DateTime RefreshExpiresAt { get; set; }
         public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
+        public DateTime LastActiveUtc { get; set; } = DateTime.UtcNow;
+        public string AuthSecretHash { get; set; } = "";
+        public string Role { get; set; } = "player";
+        public int LastPingMs { get; set; }
         public int RunsCompleted { get; set; }
         public int Victories { get; set; }
         public int Defeats { get; set; }
@@ -131,45 +168,139 @@ public sealed class AccountStore
         public HashSet<string> RecordedRunIds { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, HeroLoadoutState> HeroLoadouts { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> OpenedCardSkinIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public bool HasSecretProtection => !string.IsNullOrWhiteSpace(AuthSecretHash);
     }
 
-    /// <summary>按 Steam 票据建号（旧路径）。</summary>
-    public Account GetOrCreateBySteamTicket(string ticketHex)
-        => GetOrCreate("steam:" + Fingerprint(ticketHex), DeriveNameFromFingerprint(ticketHex));
+    /// <summary>按 Steam 票据建号/登录（旧路径，支持多端并发不互踢）。</summary>
+    public Account GetOrCreateBySteamTicket(string ticketHex, string clientKind = "game", string deviceId = "")
+        => GetOrCreate("steam:" + Fingerprint(ticketHex), DeriveNameFromFingerprint(ticketHex), clientKind, deviceId);
 
-    /// <summary>按用户名建号（新路径：输入名字即登录）。</summary>
-    public Account GetOrCreateByName(string username)
+    /// <summary>按用户名建号/登录（新路径：输入名字即登录，支持多端并发不互踢）。</summary>
+    public Account GetOrCreateByName(string username, string clientKind = "game", string deviceId = "")
     {
         string clean = NormalizeName(username);
-        return GetOrCreate("name:" + clean.ToLowerInvariant(), clean);
+        return GetOrCreate("name:" + clean.ToLowerInvariant(), clean, clientKind, deviceId);
     }
 
-    private Account GetOrCreate(string key, string username)
+    /// <summary>
+    /// 按用户名登录并校验/绑定可选口令或设备密钥：
+    /// - 若账号尚未设置口令且客户端传入了 secret，自动首次绑定（平滑升级老账号）；
+    /// - 若账号已设置口令，必须提供匹配口令方可通过，杜绝同名抢号。
+    /// </summary>
+    public (bool Ok, Account? Account, IssuedTokenPair? Tokens, string? ErrorZh) LoginByNameWithSecret(
+        string username,
+        string? secret,
+        string clientKind = "game",
+        string deviceId = "")
     {
+        string clean = NormalizeName(username);
+        string key = "name:" + clean.ToLowerInvariant();
+        Account acc;
+        bool needSave = false;
+
         lock (_lock)
         {
-            if (_byKey.TryGetValue(key, out var existing))
-            {
-                return IssueTokens(existing);
-            }
+            acc = EnsureAccountLoadedLocked(key, clean, out bool isNew);
+            if (isNew) needSave = true;
 
-            // 先查持久化
-            var row = _db.LoadAccount(key);
-            var acc = row != null
-                ? AccountFromRow(row)
-                : new Account
+            if (acc.HasSecretProtection)
+            {
+                if (string.IsNullOrWhiteSpace(secret) || !VerifySecretHash(secret, acc.AuthSecretHash))
                 {
-                    AccountId = GuidFromHash("acc:" + key),
-                    Username = username,
-                    IdentityKey = key,
-                };
-            _byKey[key] = acc;
-            SaveAccount(acc);
-            return IssueTokens(acc);
+                    return (false, null, null, "账号口令校验失败，请输入正确的登录口令。");
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(secret))
+            {
+                string trimmed = secret.Trim();
+                if (trimmed.Length < 4 || trimmed.Length > 128)
+                    return (false, null, null, "账号口令长度需在 4 到 128 个字符之间。");
+
+                acc.AuthSecretHash = HashSecret(trimmed);
+                needSave = true;
+            }
+            acc.LastActiveUtc = DateTime.UtcNow;
         }
+
+        if (needSave)
+            SaveAccount(acc);
+
+        var pair = IssuePersistentTokens(acc, clientKind, deviceId);
+        return (true, acc, pair, null);
     }
 
-    private static Account AccountFromRow(BazaarServer.Storage.Persistence.AccountRow row)
+    /// <summary>为已登录账号设置或修改登录口令保护。</summary>
+    public (bool Ok, string? ErrorZh) SetOrUpdateSecret(Account acc, string? currentSecret, string newSecret)
+    {
+        if (acc == null) return (false, "账号不存在。");
+        string trimmedNew = (newSecret ?? "").Trim();
+        if (trimmedNew.Length < 4 || trimmedNew.Length > 128)
+            return (false, "新口令长度必须在 4 到 128 个字符之间。");
+
+        string newHash;
+        lock (_lock)
+        {
+            if (acc.HasSecretProtection)
+            {
+                if (string.IsNullOrWhiteSpace(currentSecret) || !VerifySecretHash(currentSecret, acc.AuthSecretHash))
+                    return (false, "原口令不正确，无法修改。");
+            }
+            newHash = HashSecret(trimmedNew);
+            acc.AuthSecretHash = newHash;
+        }
+
+        _db.UpdateAccountSecretHash(acc.AccountId, newHash);
+        return (true, null);
+    }
+
+    private Account GetOrCreate(string key, string username, string clientKind, string deviceId)
+    {
+        Account acc;
+        bool isNew;
+        lock (_lock)
+        {
+            acc = EnsureAccountLoadedLocked(key, username, out isNew);
+            acc.LastActiveUtc = DateTime.UtcNow;
+        }
+        if (isNew)
+            SaveAccount(acc);
+
+        IssuePersistentTokens(acc, clientKind, deviceId);
+        return acc;
+    }
+
+    private Account EnsureAccountLoadedLocked(string key, string username, out bool isNew)
+    {
+        isNew = false;
+        if (_byKey.TryGetValue(key, out var existing))
+        {
+            _byAccountId[existing.AccountId] = existing;
+            return existing;
+        }
+
+        var row = _db.LoadAccount(key);
+        Account acc;
+        if (row != null)
+        {
+            acc = AccountFromRow(row);
+        }
+        else
+        {
+            isNew = true;
+            acc = new Account
+            {
+                AccountId = GuidFromHash("acc:" + key),
+                Username = username,
+                IdentityKey = key,
+            };
+        }
+        _byKey[key] = acc;
+        _byAccountId[acc.AccountId] = acc;
+        return acc;
+    }
+
+    private static Account AccountFromRow(Persistence.AccountRow row)
     {
         var acc = new Account
         {
@@ -177,6 +308,10 @@ public sealed class AccountStore
             Username = row.Username,
             IdentityKey = row.IdentityKey,
             CreatedAt = row.CreatedAt,
+            LastActiveUtc = row.LastSeen,
+            AuthSecretHash = row.AuthSecretHash ?? "",
+            Role = string.IsNullOrWhiteSpace(row.Role) ? "player" : row.Role,
+            LastPingMs = row.LastPingMs,
             RunsCompleted = row.RunsCompleted,
             Victories = row.Victories,
             Defeats = row.Defeats,
@@ -253,53 +388,224 @@ public sealed class AccountStore
         return JsonSerializer.Serialize(dto, JsonOpts);
     }
 
-    private Account IssueTokens(Account acc)
+    // ── 多端持久化 Token 管理 ────────────────────────────────────────────────
+
+    /// <summary>
+    /// 签发新的持久化令牌对并落盘至 account_tokens。
+    /// 同一账号允许最多 5 端并存活跃令牌不互踢，超出上限时仅淘汰最旧 1 枚。
+    /// </summary>
+    public IssuedTokenPair IssuePersistentTokens(Account acc, string clientKind = "game", string deviceId = "")
     {
+        DateTime now = DateTime.UtcNow;
+        string kind = NormalizeClientKind(clientKind);
+        string dev = (deviceId ?? "").Trim();
+        if (dev.Length > 64) dev = dev[..64];
+
         string access = "acc_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
         string refresh = "ref_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
+        DateTime accessExp = now.AddHours(24);
+        DateTime refreshExp = now.AddDays(30);
 
-        if (!string.IsNullOrEmpty(acc.AccessToken)) _byToken.TryRemove(acc.AccessToken, out _);
-        if (!string.IsNullOrEmpty(acc.RefreshToken)) _byToken.TryRemove(acc.RefreshToken, out _);
+        string accessHash = Fingerprint(access);
+        string refreshHash = Fingerprint(refresh);
 
-        acc.AccessToken = access;
-        acc.RefreshToken = refresh;
-        acc.AccessExpiresAt = DateTime.UtcNow.AddHours(12);
-        acc.RefreshExpiresAt = DateTime.UtcNow.AddDays(30);
+        _db.UpsertAccountToken(new Persistence.AccountTokenRow(
+            accessHash, acc.AccountId, "access", kind, dev, now, accessExp, null));
+        _db.UpsertAccountToken(new Persistence.AccountTokenRow(
+            refreshHash, acc.AccountId, "refresh", kind, dev, now, refreshExp, null));
 
-        _byToken[access] = acc.IdentityKey;
-        _byToken[refresh] = acc.IdentityKey;
+        // 限制多端活跃令牌上限为 5，不互踢现有并存端
+        var trimmedAccess = _db.TrimExcessAccountTokens(acc.AccountId, "access", MaxActiveTokensPerType, now);
+        var trimmedRefresh = _db.TrimExcessAccountTokens(acc.AccountId, "refresh", MaxActiveTokensPerType, now);
+        foreach (string oldHash in trimmedAccess) _tokenCache.TryRemove(oldHash, out _);
+        foreach (string oldHash in trimmedRefresh) _tokenCache.TryRemove(oldHash, out _);
+
+        _tokenCache[accessHash] = new CachedToken(accessHash, acc.AccountId, "access", kind, accessExp, false);
+        _tokenCache[refreshHash] = new CachedToken(refreshHash, acc.AccountId, "refresh", kind, refreshExp, false);
+
+        lock (_lock)
+        {
+            acc.AccessToken = access;
+            acc.RefreshToken = refresh;
+            acc.AccessExpiresAt = accessExp;
+            acc.RefreshExpiresAt = refreshExp;
+            acc.LastActiveUtc = now;
+        }
+
+        return new IssuedTokenPair(access, refresh, accessExp, refreshExp, kind);
+    }
+
+    /// <summary>
+    /// 校验 Access Token（仅接受未吊销且未过期的 access 类型令牌；内存未命中时自动回查 SQLite 保证重启 100% 存活）。
+    /// </summary>
+    public Account? FindByAccessToken(string? token)
+    {
+        string raw = StripBearerPrefix(token);
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+
+        var entry = ResolveTokenEntry(raw);
+        if (entry == null || entry.IsRevoked) return null;
+        if (!string.Equals(entry.TokenType, "access", StringComparison.OrdinalIgnoreCase)) return null;
+        if (entry.ExpiresAt <= DateTime.UtcNow)
+        {
+            _tokenCache.TryRemove(entry.TokenHash, out _);
+            return null;
+        }
+
+        var acc = ResolveAccountByGuid(entry.AccountId);
+        if (acc != null)
+            acc.LastActiveUtc = DateTime.UtcNow;
         return acc;
     }
 
-    public Account FindByAccessToken(string token)
+    /// <summary>
+    /// 使用 Refresh Token（兼容旧客户端传有效 Access Token）轮换签发全新令牌对并落盘，同时吊销旧 Refresh Token。
+    /// </summary>
+    public (bool Ok, Account? Account, IssuedTokenPair? Tokens, string? ErrorZh) TryRefreshTokens(
+        string? rawToken,
+        string clientKind = "game",
+        string deviceId = "")
     {
-        if (string.IsNullOrWhiteSpace(token)) return null;
-        if (token.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) token = token[7..].Trim();
-        if (!_byToken.TryGetValue(token, out var key)) return null;
-        return _byKey.TryGetValue(key, out var acc) ? acc : null;
+        string clean = StripBearerPrefix(rawToken);
+        if (string.IsNullOrWhiteSpace(clean))
+            return (false, null, null, "缺少刷新令牌，请重新登录。");
+
+        var entry = ResolveTokenEntry(clean);
+        if (entry == null || entry.IsRevoked || entry.ExpiresAt <= DateTime.UtcNow)
+            return (false, null, null, "刷新令牌无效或已过期，请重新登录。");
+
+        var acc = ResolveAccountByGuid(entry.AccountId);
+        if (acc == null)
+            return (false, null, null, "关联账号不存在，请重新登录。");
+
+        string effectiveKind = string.IsNullOrWhiteSpace(clientKind) ? entry.ClientKind : clientKind;
+        var nextPair = IssuePersistentTokens(acc, effectiveKind, deviceId);
+
+        // 若使用 refresh 令牌刷新，则安全轮换吊销旧 refresh 令牌，防止重放
+        if (string.Equals(entry.TokenType, "refresh", StringComparison.OrdinalIgnoreCase))
+        {
+            RevokeTokenHash(entry.TokenHash);
+        }
+
+        return (true, acc, nextPair, null);
     }
 
-    public Account FindByAccountId(string accountId)
+    /// <summary>主动吊销指定明文令牌（用于登出）。</summary>
+    public bool RevokeToken(string? rawToken)
+    {
+        string clean = StripBearerPrefix(rawToken);
+        if (string.IsNullOrWhiteSpace(clean)) return false;
+        string hash = Fingerprint(clean);
+        RevokeTokenHash(hash);
+        return true;
+    }
+
+    private void RevokeTokenHash(string hash)
+    {
+        _tokenCache.TryRemove(hash, out _);
+        try { _db.RevokeAccountToken(hash); } catch { }
+    }
+
+    private CachedToken? ResolveTokenEntry(string rawToken)
+    {
+        string hash = Fingerprint(rawToken);
+        if (_tokenCache.TryGetValue(hash, out var cached))
+            return cached;
+
+        var row = _db.LoadAccountTokenByHash(hash);
+        if (row == null) return null;
+
+        bool revoked = row.RevokedAt.HasValue;
+        var entry = new CachedToken(row.TokenHash, row.AccountId, row.TokenType, row.ClientKind, row.ExpiresAt, revoked);
+        if (!revoked && row.ExpiresAt > DateTime.UtcNow)
+            _tokenCache[hash] = entry;
+        return entry;
+    }
+
+    private Account? ResolveAccountByGuid(Guid accountId)
+    {
+        if (accountId == Guid.Empty) return null;
+        if (_byAccountId.TryGetValue(accountId, out var acc))
+            return acc;
+
+        lock (_lock)
+        {
+            if (_byAccountId.TryGetValue(accountId, out acc))
+                return acc;
+
+            var row = _db.LoadAccountById(accountId);
+            if (row == null) return null;
+            acc = AccountFromRow(row);
+            _byKey[acc.IdentityKey] = acc;
+            _byAccountId[acc.AccountId] = acc;
+            return acc;
+        }
+    }
+
+    public Account? FindByAccountId(string? accountId)
     {
         if (string.IsNullOrWhiteSpace(accountId)) return null;
-        string norm = accountId.Replace("-", "").ToLowerInvariant();
-        foreach (var kv in _byKey)
-        {
-            if (kv.Value.AccountId.ToString("N") == norm) return kv.Value;
-        }
+        if (Guid.TryParse(accountId.Trim(), out var guid))
+            return ResolveAccountByGuid(guid);
+
+        string norm = accountId.Replace("-", "").Trim();
+        if (norm.Length == 32 && Guid.TryParseExact(norm, "N", out guid))
+            return ResolveAccountByGuid(guid);
+
         return null;
     }
 
-    public Account FindByUsername(string username)
+    public Account? FindByUsername(string? username)
     {
         if (string.IsNullOrWhiteSpace(username)) return null;
         string key = "name:" + NormalizeName(username).ToLowerInvariant();
-        return _byKey.TryGetValue(key, out var acc) ? acc : null;
+        if (_byKey.TryGetValue(key, out var acc)) return acc;
+
+        var row = _db.LoadAccount(key);
+        if (row == null) return null;
+        lock (_lock)
+        {
+            if (_byKey.TryGetValue(key, out acc)) return acc;
+            acc = AccountFromRow(row);
+            _byKey[key] = acc;
+            _byAccountId[acc.AccountId] = acc;
+            return acc;
+        }
     }
 
     public IEnumerable<Account> All => _byKey.Values;
 
-    /// <summary>从 SQLite 加载全部账号与生涯战绩到内存（服务端启动时调用）。</summary>
+    /// <summary>记录玩家在线心跳与最近测速 RTT。</summary>
+    public void TouchActivity(Account acc, int? pingMs = null)
+    {
+        if (acc == null) return;
+        acc.LastActiveUtc = DateTime.UtcNow;
+        if (pingMs.HasValue && pingMs.Value >= 0)
+        {
+            acc.LastPingMs = Math.Clamp(pingMs.Value, 0, 60000);
+        }
+    }
+
+    /// <summary>判断账号近期是否在线（默认 3 分钟内有请求/心跳即视为在线）。</summary>
+    public bool IsRecentlyOnline(Account acc, TimeSpan? window = null)
+    {
+        if (acc == null) return false;
+        return DateTime.UtcNow - acc.LastActiveUtc <= (window ?? TimeSpan.FromMinutes(3));
+    }
+
+    /// <summary>统计当前在线玩家总数。</summary>
+    public int CountOnlinePlayers(TimeSpan? window = null)
+    {
+        DateTime cutoff = DateTime.UtcNow - (window ?? TimeSpan.FromMinutes(3));
+        int count = 0;
+        foreach (var acc in _byKey.Values)
+        {
+            if (acc.LastActiveUtc >= cutoff) count++;
+        }
+        return count;
+    }
+
+    /// <summary>从 SQLite 加载全部账号、生涯战绩与有效持久化令牌到内存（服务端启动时调用）。</summary>
     public void LoadAllFromDb()
     {
         try
@@ -308,30 +614,87 @@ public sealed class AccountStore
             foreach (var row in rows)
             {
                 if (_byKey.ContainsKey(row.IdentityKey)) continue;
-                _byKey[row.IdentityKey] = AccountFromRow(row);
+                var acc = AccountFromRow(row);
+                _byKey[row.IdentityKey] = acc;
+                _byAccountId[acc.AccountId] = acc;
             }
-            Console.WriteLine($"[AccountStore] loaded {_byKey.Count} accounts from db");
+
+            var tokens = _db.LoadActiveAccountTokens();
+            foreach (var t in tokens)
+            {
+                _tokenCache[t.TokenHash] = new CachedToken(
+                    t.TokenHash, t.AccountId, t.TokenType, t.ClientKind, t.ExpiresAt, false);
+            }
+            Console.WriteLine($"[AccountStore] 已加载 {_byKey.Count} 个账号与 {tokens.Count} 枚活跃持久化令牌");
         }
-        catch (Exception ex) { Console.WriteLine("[AccountStore] LoadAllFromDb: " + ex.Message); }
+        catch (Exception ex) { Console.WriteLine("[AccountStore] LoadAllFromDb 失败: " + ex.Message); }
     }
 
-    /// <summary>把账号与生涯战绩写回 SQLite。</summary>
+    /// <summary>立即将账号与生涯战绩同步写回 SQLite（并移除挂起防抖项）。</summary>
     public void SaveAccount(Account acc)
     {
         if (acc == null) return;
+        _dirtyAccounts.TryRemove(acc.AccountId, out _);
+        SaveAccountCore(acc);
+    }
+
+    /// <summary>将所有挂起防抖的账号进度立即同步落盘（优雅停机调用）。</summary>
+    public void FlushPendingAccountSaves()
+    {
+        var toFlush = _dirtyAccounts.Keys.ToList();
+        foreach (Guid id in toFlush)
+        {
+            if (_dirtyAccounts.TryRemove(id, out var acc))
+                SaveAccountCore(acc);
+        }
+    }
+
+    private void ScheduleAccountSaveDebounced(Account acc)
+    {
+        if (acc == null) return;
+        if (_disposed != 0)
+        {
+            SaveAccountCore(acc);
+            return;
+        }
+        _dirtyAccounts[acc.AccountId] = acc;
+        try { _accountSaveTimer.Change(AccountProgressSaveDebounceMs, Timeout.Infinite); } catch { }
+    }
+
+    private void OnAccountSaveTimer(object? _)
+    {
+        if (_disposed != 0) return;
+        FlushPendingAccountSaves();
+    }
+
+    private void SaveAccountCore(Account acc)
+    {
         try
         {
             string careerJson;
+            string secretHash;
+            string role;
+            int pingMs;
+            int runsCompleted, victories, defeats;
+            uint bestDay;
             lock (_lock)
             {
                 careerJson = SerializeCareerJson(acc);
+                secretHash = acc.AuthSecretHash;
+                role = acc.Role;
+                pingMs = acc.LastPingMs;
+                runsCompleted = acc.RunsCompleted;
+                victories = acc.Victories;
+                defeats = acc.Defeats;
+                bestDay = acc.BestDay;
             }
-            _db.SaveAccount(new BazaarServer.Storage.Persistence.AccountRow(
+            _db.SaveAccount(new Persistence.AccountRow(
                 acc.AccountId, acc.Username, acc.IdentityKey,
-                acc.RunsCompleted, acc.Victories, acc.Defeats, acc.BestDay,
-                acc.CreatedAt, DateTime.UtcNow, careerJson));
+                runsCompleted, victories, defeats, bestDay,
+                acc.CreatedAt, DateTime.UtcNow, careerJson,
+                secretHash, role, pingMs));
         }
-        catch { /* 持久化失败不影响游戏 */ }
+        catch { /* 持久化失败不中断玩家当前操作 */ }
     }
 
     /// <summary>终局或投降结算生涯战绩（按 RunId 幂等，不会重复累计）。</summary>
@@ -360,7 +723,6 @@ public sealed class AccountStore
     {
         if (acc == null || string.IsNullOrWhiteSpace(runId)) return false;
 
-        // 数据库层幂等校验：若 runs 表存在该局且已标记 career_recorded，则直接跳过
         var dbRun = _db.LoadRun(runId);
         if (dbRun != null && !_db.TryMarkCareerRecorded(runId))
         {
@@ -416,7 +778,7 @@ public sealed class AccountStore
         return true;
     }
 
-    /// <summary>局内增量统计（PvE 胜负、卖卡、消费、事件完成、战斗伤害等）。</summary>
+    /// <summary>局内增量统计（内存即时累加 + 3 秒防抖落盘，消除高频买卖卡写锁争抢）。</summary>
     public void RecordInRunProgress(
         Account acc,
         EHero hero,
@@ -443,9 +805,10 @@ public sealed class AccountStore
             stats.MerchantsVisited += merchantsVisitedDelta;
             stats.DamageDealt += damageDealtDelta;
             stats.LegendaryItemsAcquired += legendaryAcquiredDelta;
+            acc.LastActiveUtc = DateTime.UtcNow;
         }
 
-        SaveAccount(acc);
+        ScheduleAccountSaveDebounced(acc);
     }
 
     /// <summary>返回全量英雄的真实生涯统计快照（供 /api/PlayerProfiles/me/career 使用）。</summary>
@@ -516,7 +879,6 @@ public sealed class AccountStore
 
     // ── 英雄配装、卡牌皮肤与宝箱库存持久化 ────────────────────────────────
 
-    /// <summary>将 GUID 统一规范为 32 位小写无连字符格式，对齐客户端 CollectionUtility.FixGuidNaming。</summary>
     public static string NormalizeCollectibleId(string? id)
     {
         if (string.IsNullOrWhiteSpace(id)) return "";
@@ -524,7 +886,6 @@ public sealed class AccountStore
         return id.Trim().Replace("-", "").ToLowerInvariant();
     }
 
-    /// <summary>获取指定英雄的当前配装快照（若无则创建默认空配装）。</summary>
     public HeroLoadoutState GetHeroLoadout(Account acc, string heroId)
     {
         string key = string.IsNullOrWhiteSpace(heroId) ? "Vanessa" : heroId.Trim();
@@ -534,7 +895,6 @@ public sealed class AccountStore
         }
     }
 
-    /// <summary>获取所有指定英雄的配装快照列表。</summary>
     public List<HeroLoadoutState> GetAllHeroLoadouts(Account acc, IEnumerable<string> heroIds)
     {
         lock (_lock)
@@ -557,7 +917,6 @@ public sealed class AccountStore
         }
     }
 
-    /// <summary>根据藏品分类将指定藏品装备到英雄对应槽位并落盘。</summary>
     public HeroLoadoutState EquipCollectible(Account acc, string heroId, string collectibleId, string? collectibleType)
     {
         string key = string.IsNullOrWhiteSpace(heroId) ? "Vanessa" : heroId.Trim();
@@ -621,7 +980,6 @@ public sealed class AccountStore
         return result;
     }
 
-    /// <summary>从指定英雄配装中卸下指定藏品并落盘。</summary>
     public HeroLoadoutState UnequipCollectible(Account acc, string heroId, string collectibleId)
     {
         string key = string.IsNullOrWhiteSpace(heroId) ? "Vanessa" : heroId.Trim();
@@ -648,7 +1006,6 @@ public sealed class AccountStore
         return result;
     }
 
-    /// <summary>批量应用 EquipLoadoutRequest 槽位配置并落盘。</summary>
     public HeroLoadoutState ApplyEquipLoadout(
         Account acc,
         string heroId,
@@ -695,7 +1052,6 @@ public sealed class AccountStore
         lock (_lock) return acc.OpenedCardSkinIds.ToList();
     }
 
-    /// <summary>为账号增加未开启宝箱数量并落盘。</summary>
     public int AddUnopenedChests(Account acc, int count)
     {
         int total;
@@ -708,7 +1064,6 @@ public sealed class AccountStore
         return total;
     }
 
-    /// <summary>原子扣除未开启宝箱并结算获得的卡牌皮肤与重复宝石奖励。</summary>
     public (bool Ok, List<ChestOpenDraw> Draws, int RemainingChests, int TotalGems) TryOpenChests(
         Account acc,
         int requestedCount,
@@ -755,15 +1110,104 @@ public sealed class AccountStore
         return loadout;
     }
 
-    // ── helpers ─────────────────────────────────────────────────────────────
+    // ── 安全哈希与文本清洗工具 ──────────────────────────────────────────────
 
-    private static string NormalizeName(string raw)
+    public static string HashSecret(string rawSecret)
+    {
+        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        byte[] hash = Rfc2898DeriveBytes.Pbkdf2(
+            Encoding.UTF8.GetBytes(rawSecret),
+            salt,
+            Pbkdf2Iterations,
+            HashAlgorithmName.SHA256,
+            32);
+        return $"v1:{Pbkdf2Iterations}:{Convert.ToHexString(salt).ToLowerInvariant()}:{Convert.ToHexString(hash).ToLowerInvariant()}";
+    }
+
+    public static bool VerifySecretHash(string rawSecret, string storedHash)
+    {
+        if (string.IsNullOrWhiteSpace(rawSecret) || string.IsNullOrWhiteSpace(storedHash))
+            return false;
+
+        string[] parts = storedHash.Split(':');
+        if (parts.Length != 4 || parts[0] != "v1" || !int.TryParse(parts[1], out int iterations) || iterations < 1000)
+            return false;
+
+        try
+        {
+            byte[] salt = Convert.FromHexString(parts[2]);
+            byte[] expected = Convert.FromHexString(parts[3]);
+            byte[] actual = Rfc2898DeriveBytes.Pbkdf2(
+                Encoding.UTF8.GetBytes(rawSecret),
+                salt,
+                iterations,
+                HashAlgorithmName.SHA256,
+                expected.Length);
+            return CryptographicOperations.FixedTimeEquals(actual, expected);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>剥离 Unity TMP 富文本尖括号、Unicode BiDi 双向控制符与不可见控制字符，防止 UI 注入。</summary>
+    public static string SanitizeDisplayText(string? raw, int maxLength = 200)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        string stripped = TmpTagRegex.Replace(raw, string.Empty);
+        var sb = new StringBuilder(Math.Min(stripped.Length, maxLength));
+        foreach (char c in stripped)
+        {
+            if (IsForbiddenControlOrBidi(c)) continue;
+            if (c == '<' || c == '>') continue;
+            if (c == '\r' || c == '\n' || c == '\t')
+            {
+                sb.Append(' ');
+            }
+            else
+            {
+                sb.Append(c);
+            }
+            if (sb.Length >= maxLength) break;
+        }
+        return sb.ToString().Trim();
+    }
+
+    private static bool IsForbiddenControlOrBidi(char c)
+    {
+        if (char.IsControl(c) && c != '\r' && c != '\n' && c != '\t')
+            return true;
+        int code = c;
+        return (code >= 0x202A && code <= 0x202E)
+            || (code >= 0x2066 && code <= 0x2069)
+            || code == 0x200E || code == 0x200F || code == 0xFEFF;
+    }
+
+    private static string StripBearerPrefix(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token)) return string.Empty;
+        string trimmed = token.Trim();
+        if (trimmed.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            return trimmed[7..].Trim();
+        return trimmed;
+    }
+
+    private static string NormalizeClientKind(string? clientKind)
+    {
+        string k = (clientKind ?? "game").Trim().ToLowerInvariant();
+        return k is "game" or "launcher" or "web" ? k : "game";
+    }
+
+    public static string NormalizeName(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return "Player";
-        var sb = new StringBuilder(raw.Length);
-        foreach (char c in raw.Trim())
+        string sanitized = SanitizeDisplayText(raw, 64);
+        var sb = new StringBuilder(sanitized.Length);
+        foreach (char c in sanitized)
         {
-            if (char.IsLetterOrDigit(c) || c == '_' || c == '-' || c == '.' || c > 127) sb.Append(c);
+            if (char.IsLetterOrDigit(c) || c == '_' || c == '-' || c == '.' || c > 127)
+                sb.Append(c);
         }
         string s = sb.ToString();
         if (string.IsNullOrEmpty(s)) s = "Player";
@@ -777,7 +1221,7 @@ public sealed class AccountStore
         return "Player_" + fp[..8];
     }
 
-    private static string Fingerprint(string s)
+    public static string Fingerprint(string s)
         => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(s ?? ""))).ToLowerInvariant();
 
     private static Guid GuidFromHash(string s)
@@ -786,5 +1230,14 @@ public sealed class AccountStore
         byte[] g = new byte[16];
         Array.Copy(hash, g, 16);
         return new Guid(g);
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+        try { _accountSaveTimer.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
+        try { FlushPendingAccountSaves(); } catch { }
+        try { _accountSaveTimer.Dispose(); } catch { }
     }
 }

@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using BazaarCore.Combat;
 using BazaarCore.Data;
 using BazaarCore.Models;
+using BazaarCore.Mods;
 using BazaarCore.Runtime;
 
 namespace BazaarCore.Engine;
@@ -95,6 +96,10 @@ public static class AbilityExecutor
         if (target == null) return [];
 
         bool hasSoldScope = SoldCardScopes.TryGetValue(ctx.ActiveExecution, out var soldScope);
+        // 战斗与局外 95%+ 调用不含出售上下文且非 XMost，直走零额外列表分配快路径
+        if (!hasSoldScope && !string.Equals(target.Type, "TTargetCardXMost", StringComparison.Ordinal))
+            return ResolveWithTargetingPriorities(target, ctx, maxCount);
+
         bool isNeighborsSection = target.Type is "TTargetCardSection" or "TTargetCardRandom"
             && target.TargetSection is "SelfNeighbors" or "TriggerSourceNeighbors";
         bool needsSoldCardInSlot = target.Type is "TTargetCardSelf" or "TTargetCardTriggerSource"
@@ -312,6 +317,16 @@ public static class AbilityExecutor
         if (trigger.Type == "TTriggerOr")
             return trigger.Triggers != null && trigger.Triggers.Any(sub =>
                 MatchesTrigger(sub, eventType, ownerCard, ownerPlayer, eventSourceCard, eventTargetCard, eventSubjectPlayer, changedAttr, prevVal, curVal, combatType, combatOutcome, ctx));
+
+        // 优先放行已通过 BazaarModKit 注册的 TTriggerMod_* 自定义触发器（单次评估避免重复执行）
+        if (ModRuntimeHooks.HasAnyCustomTriggers
+            && !string.IsNullOrEmpty(trigger.Type)
+            && trigger.Type.StartsWith("TTriggerMod_", StringComparison.Ordinal))
+        {
+            bool customMatch = ModRuntimeHooks.TryMatchCustomTrigger(trigger, ownerCard, ctx, eventType, out bool handled);
+            if (handled)
+                return customMatch;
+        }
 
         if ((ctx.OnUnknownRuleType != null || RuleExecutionContext.HasUnknownRuleTypeObserver) && !IsKnownTriggerType(trigger.Type))
         {
@@ -580,9 +595,20 @@ public static class AbilityExecutor
 
     private static bool MatchesCardSubject(RuleNode? subject, CardInstance ownerCard, PlayerState ownerPlayer, CardInstance candidate, RuleExecutionContext ctx)
     {
-        if (subject == null) return candidate == ownerCard;
-        var resolved = TargetResolver.ResolveCards(subject, ctx.WithCards(ownerCard, candidate));
-        return resolved.Contains(candidate);
+        if (subject == null) return ReferenceEquals(candidate, ownerCard);
+        var prevSelf = ctx.SelfCard;
+        var prevSrc = ctx.TriggerSourceCard;
+        try
+        {
+            ctx.SelfCard = ownerCard;
+            ctx.TriggerSourceCard = candidate;
+            return TargetResolver.MatchesCard(subject, candidate, ctx);
+        }
+        finally
+        {
+            ctx.SelfCard = prevSelf;
+            ctx.TriggerSourceCard = prevSrc;
+        }
     }
 
     private static void DispatchDetailed(
@@ -1018,7 +1044,7 @@ public static class AbilityExecutor
                         if (attr.Equals("Ammo", StringComparison.OrdinalIgnoreCase))
                         {
                             int curAmmo = card.CurrentAmmo;
-                            int ammoMax = Math.Max(0, (int)Math.Round(card.GetAttribute("AmmoMax")));
+                            int ammoMax = card.EffectiveAmmoMax;
                             int nextAmmo;
                             if (string.Equals(op, "Multiply", StringComparison.OrdinalIgnoreCase))
                                 nextAmmo = (int)Math.Round(curAmmo * val);
@@ -1256,7 +1282,7 @@ public static class AbilityExecutor
                     foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
                     {
                         int prevAmmo = card.CurrentAmmo;
-                        int ammoMax = Math.Max(0, (int)Math.Round(card.GetAttribute("AmmoMax")));
+                        int ammoMax = card.EffectiveAmmoMax;
                         card.CurrentAmmo = Math.Clamp(prevAmmo + amt, 0, ammoMax);
                         double curAmmo = card.CurrentAmmo;
                         var cardOwner = TargetResolver.FindOwner(card, ctx);
@@ -1394,14 +1420,35 @@ public static class AbilityExecutor
                 {
                     foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
                     {
+                        // 统一检测有效飞行态（含光环授予的 AuraAdd["Flying"]，修复 P1-6 双轨分裂）
+                        bool curFlying = card.IsFlying || card.GetAttribute("Flying") > 0;
                         bool next = action.Type switch
                         {
                             "TActionCardFlyingStart" => true,
                             "TActionCardFlyingStop" => false,
-                            _ => !card.IsFlying
+                            _ => !curFlying
                         };
-                        if (next == card.IsFlying) continue;
+                        if (next == curFlying) continue;
                         var cardOwner = TargetResolver.FindOwner(card, ctx);
+                        if (!next)
+                        {
+                            // 若当前由光环赋予 Flying，写入 CombatAdd 负偏移以压制光环飞行，保证 FlyingStop / Toggle 立即落地
+                            double auraFly = card.AuraAdd.GetValueOrDefault("Flying", 0);
+                            if (auraFly > 0)
+                            {
+                                card.CombatAdd["Flying"] = -auraFly;
+                                card.MarkAttributeDirty();
+                            }
+                            else
+                            {
+                                card.CombatAdd.Remove("Flying");
+                            }
+                        }
+                        else if (card.CombatAdd.TryGetValue("Flying", out var negSuppress) && negSuppress < 0)
+                        {
+                            card.CombatAdd.Remove("Flying");
+                            card.MarkAttributeDirty();
+                        }
                         ApplyFlyingTransition(ctx, cardOwner, sourceCard, card, next, action.Type);
                         DispatchDetailed(ctx, "TTriggerOnCardAttributeChanged", cardOwner, sourceCard, card, cardOwner, "Flying", next ? 0 : 1, next ? 1 : 0);
                     }
@@ -2085,6 +2132,12 @@ public static class AbilityExecutor
                     return true;
 
                 default:
+                    if (ModRuntimeHooks.HasAnyCustomActions)
+                    {
+                        bool modActionResult = ModRuntimeHooks.TryExecuteCustomAction(action, sourceCard, ctx, out bool handled);
+                        if (handled)
+                            return modActionResult;
+                    }
                     RuleExecutionContext.NotifyUnknownRuleType(ctx, "TAction", action.Type);
                     return false;
             }
@@ -2346,7 +2399,7 @@ public static class AbilityExecutor
     {
         isCrit = RollCrit(sourceCard, ctx);
         if (double.IsNaN(raw) || double.IsInfinity(raw) || raw <= 0) return 0;
-        double critPct = ctx.Repo?.GameMode.CritPercentMultiplier ?? 200;
+        double critPct = ctx.CombatCritPercentMultiplierOverride ?? (ctx.Repo?.GameMode.CritPercentMultiplier ?? 200);
         if (!string.IsNullOrEmpty(critBonusAttr))
             critPct += sourceCard.GetAttribute(critBonusAttr);
         double mult = isCrit ? Math.Max(0, critPct) / 100.0 : 1.0;
@@ -2365,7 +2418,7 @@ public static class AbilityExecutor
 
     private static bool RollCrit(CardInstance sourceCard, RuleExecutionContext ctx)
     {
-        double critChance = sourceCard.GetAttribute("CritChance");
+        double critChance = sourceCard.GetAttribute("CritChance") + ctx.CombatBonusCritChance;
         if (critChance <= 0) return false;
         if (critChance >= 100) return true;
         return ctx.Rng.NextDouble() * 100.0 < critChance;

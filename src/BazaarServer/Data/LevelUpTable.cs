@@ -47,11 +47,117 @@ public sealed class LevelUpTable
         public RuleNode? GroupNode { get; init; }
     }
 
+    private static readonly CardTier[] AllCardTiers =
+    [
+        CardTier.Bronze, CardTier.Silver, CardTier.Gold, CardTier.Diamond, CardTier.Legendary
+    ];
+
     private readonly Dictionary<int, LevelUpEntry> _byLevel = new();
-    private readonly Random _rng = new();
 
     public int Count => _byLevel.Count;
     public int MaxLevel => _byLevel.Count > 0 ? _byLevel.Keys.Max() : 0;
+
+    /// <summary>
+    /// 直接从已单次加载的 <see cref="GameDataRepository"/> 构建升级奖励表，消灭启动期重复解析 GameData.db。
+    /// </summary>
+    public static LevelUpTable FromRepository(GameDataRepository repo)
+    {
+        ArgumentNullException.ThrowIfNull(repo);
+        var table = new LevelUpTable();
+        foreach (var (fallbackLevel, tpl) in repo.LevelUps)
+        {
+            if (tpl == null) continue;
+            var entry = FromTemplate(fallbackLevel, tpl);
+            if (entry != null)
+                table._byLevel[entry.Level] = entry;
+        }
+        Console.WriteLine($"[LevelUpTable] (shared repo) mapped {table._byLevel.Count} level-ups");
+        return table;
+    }
+
+    private static LevelUpEntry? FromTemplate(int fallbackLevel, LevelUpTemplate tpl)
+    {
+        int level = tpl.Level > 0 ? tpl.Level : fallbackLevel;
+        var rewardsNode = tpl.Rewards;
+        string selectionMethod = string.IsNullOrWhiteSpace(rewardsNode?.SelectionMethod)
+            ? "Sequential"
+            : rewardsNode.SelectionMethod!;
+        int? totalLimit = null;
+        if (rewardsNode?.Limit?.GetFixedNumericValue() is double rd && rd > 0)
+            totalLimit = Math.Max(1, (int)Math.Round(rd));
+
+        var groups = new List<RewardGroup>();
+        if (rewardsNode?.Groups is { Count: > 0 } rawGroups)
+        {
+            const string inspiredByKarnokId = "0c71aef1-c049-483a-b9a0-19c5005b4fc7";
+            const string wrongKarnoksRageId = "1ac7830c-8506-4e7f-a1b6-8ba302f6a8fe";
+            const string correctInspiredRageId = "0beccea0-bb9b-444b-b063-bf6aeadaddc8";
+
+            foreach (var g in rawGroups)
+            {
+                if (g == null) continue;
+                var ids = new List<string>();
+                if (g.Filters != null)
+                {
+                    foreach (var f in g.Filters)
+                    {
+                        if (f?.Ids == null) continue;
+                        foreach (var id in f.Ids)
+                        {
+                            if (!string.IsNullOrWhiteSpace(id))
+                                ids.Add(id);
+                        }
+                    }
+                }
+
+                int? explicitLimit = g.Limit?.GetFixedNumericValue() is double gd && gd > 0
+                    ? Math.Max(1, (int)Math.Round(gd))
+                    : null;
+                int limit = explicitLimit ?? 1;
+                string grpMethod = string.IsNullOrWhiteSpace(g.SelectionMethod) ? "Random" : g.SelectionMethod!;
+
+                var grpNode = g;
+                // 保持与 Load(dbPath) 一致的官服 DB 原生 Bug 超越修复：Inspired by Karnok 互斥检查改为 Inspired Rage
+                if (ids.Contains(inspiredByKarnokId, StringComparer.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        string rawJson = JsonSerializer.Serialize(g, GameDatabaseLoader.JsonOptions);
+                        if (rawJson.Contains(wrongKarnoksRageId, StringComparison.OrdinalIgnoreCase))
+                        {
+                            string patchedJson = rawJson.Replace(
+                                wrongKarnoksRageId,
+                                correctInspiredRageId,
+                                StringComparison.OrdinalIgnoreCase);
+                            var patched = JsonSerializer.Deserialize<RuleNode>(patchedJson, GameDatabaseLoader.JsonOptions);
+                            if (patched != null) grpNode = patched;
+                        }
+                    }
+                    catch { /* 保留原始 grpNode */ }
+                }
+
+                groups.Add(new RewardGroup
+                {
+                    CardIds = ids,
+                    Limit = limit,
+                    ExplicitLimit = explicitLimit,
+                    RandomWeight = (int)Math.Round((double)(g.RandomWeight ?? 0)),
+                    SelectionMethod = grpMethod,
+                    GroupNode = grpNode,
+                });
+            }
+        }
+
+        return new LevelUpEntry
+        {
+            Level = level,
+            HealthIncrease = tpl.HealthIncrease,
+            Groups = groups,
+            RewardsNode = rewardsNode,
+            SelectionMethod = selectionMethod,
+            TotalLimit = totalLimit,
+        };
+    }
 
     public static LevelUpTable Load(string dbPath)
     {
@@ -219,7 +325,7 @@ public sealed class LevelUpTable
            v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out int i) ? i : fallback;
 
     /// <summary>
-    /// 简化版兼容重载（无玩家上下文时保留原行为）：先抽权重 > 0 组或全 0 组，再从 Ids 随机取。
+    /// 简化版兼容重载（无玩家上下文时保留原行为）：先抽权重 > 0 组或全 0 组，再从 Ids 随机取（线程安全使用 Random.Shared）。
     /// </summary>
     public List<string> RollRewards(int level, int pickCount)
     {
@@ -227,13 +333,14 @@ public sealed class LevelUpTable
         var entry = ResolveLevelEntry(level);
         if (entry == null || entry.Groups.Count == 0) return result;
 
+        var rng = Random.Shared;
         int totalWeight = entry.Groups.Sum(g => Math.Max(0, g.RandomWeight));
         for (int i = 0; i < pickCount; i++)
         {
             RewardGroup group;
             if (totalWeight > 0)
             {
-                int roll = _rng.Next(totalWeight);
+                int roll = rng.Next(totalWeight);
                 int acc = 0;
                 group = entry.Groups[0];
                 foreach (var g in entry.Groups)
@@ -246,22 +353,17 @@ public sealed class LevelUpTable
             }
             else
             {
-                group = entry.Groups[_rng.Next(entry.Groups.Count)];
+                group = entry.Groups[rng.Next(entry.Groups.Count)];
             }
 
             if (group.CardIds.Count == 0) continue;
-            result.Add(group.CardIds[_rng.Next(group.CardIds.Count)]);
+            result.Add(group.CardIds[rng.Next(group.CardIds.Count)]);
         }
         return result;
     }
 
     /// <summary>
-    /// 官方完整规则升级奖励抽取：
-    ///   1. 依据真实 PlayerState 评估每组 Prerequisites（TPrerequisiteRun / TPrerequisiteCardCount 等）。
-    ///   2. 解析 TSpawnFilterIdList 与 TSpawnFilterQuery，结合 Heroes / IgnoreHero / 资产白名单 / 去重语义过滤候选池。
-    ///   3. 若 Rewards.SelectionMethod == Sequential：先依次执行 RandomWeight == 0 的必出条件组（直至上限），
-    ///      再用 RandomWeight > 0 的权重组按权重不重复填满上限。
-    ///   4. 若 Rewards.SelectionMethod == Random（如 9 级/18 级附魔台奖励）：按权重在可用组中加权抽满上限。
+    /// 官方完整规则升级奖励抽取（兼容返回纯模板 ID 列表，内部委托给 <see cref="RollRewardsWithTier"/>）。
     /// </summary>
     public List<string> RollRewards(
         int level,
@@ -269,13 +371,32 @@ public sealed class LevelUpTable
         Func<string, bool>? isAssetValid = null,
         int? pickCountOverride = null)
     {
+        var withTiers = RollRewardsWithTier(level, ctx, isAssetValid, pickCountOverride);
+        var ids = new List<string>(withTiers.Count);
+        for (int i = 0; i < withTiers.Count; i++)
+            ids.Add(withTiers[i].TemplateId);
+        return ids;
+    }
+
+    /// <summary>
+    /// 官方完整规则升级奖励抽取（返回真实掷出的 (TemplateId, CardTier) 二元组，彻底修复 P1-12 品阶丢失与 StartingTier 误滤）：
+    ///   1. 依据真实 PlayerState 评估每组 Prerequisites（TPrerequisiteRun / TPrerequisiteCardCount 等）。
+    ///   2. 解析 TSpawnFilterIdList 与 TSpawnFilterQuery，结合 Heroes / IgnoreHero / IncludeCommonAndHero / 资产白名单 / 去重语义过滤候选池。
+    ///   3. 正确按模板支持品阶（Tiers）匹配 TSpawnBehaviorTier 约束并回传应发放品阶。
+    /// </summary>
+    public List<(string TemplateId, CardTier Tier)> RollRewardsWithTier(
+        int level,
+        RuleExecutionContext ctx,
+        Func<string, bool>? isAssetValid = null,
+        int? pickCountOverride = null)
+    {
         ArgumentNullException.ThrowIfNull(ctx);
 
-        var result = new List<string>();
+        var result = new List<(string TemplateId, CardTier Tier)>();
         var entry = ResolveLevelEntry(level);
         if (entry == null || entry.Groups.Count == 0) return result;
 
-        var rng = ctx.Rng ?? _rng;
+        var rng = ctx.Rng ?? Random.Shared;
         var topBehaviors = entry.RewardsNode?.Behaviors ?? [];
         int totalLimit = pickCountOverride ?? entry.TotalLimit ?? 0;
         if (totalLimit <= 0 && entry.RewardsNode?.Limit != null)
@@ -319,14 +440,14 @@ public sealed class LevelUpTable
 
         if (!isRandomTop)
         {
-            // Pass 1：Sequential 模式下先按顺序处理 RandomWeight == 0 的条件必出组（如 Core Initialization / Gourmet Kitchen / Chef Brolin / MusicNote / Core Upgrade）
+            // Pass 1：Sequential 模式下先按顺序处理 RandomWeight == 0 的条件必出组
             foreach (var gs in groupStates.Where(s => s.Group.RandomWeight <= 0))
             {
                 while (result.Count < totalLimit && gs.RemainingPicks > 0)
                 {
-                    string? picked = gs.PickOne(result, rng);
+                    var picked = gs.PickOne(result, rng);
                     if (picked == null) break;
-                    result.Add(picked);
+                    result.Add(picked.Value);
                 }
                 if (result.Count >= totalLimit) break;
             }
@@ -348,7 +469,7 @@ public sealed class LevelUpTable
     private void FillWeightedFromGroups(
         List<GroupDrawState> groups,
         int totalLimit,
-        List<string> result,
+        List<(string TemplateId, CardTier Tier)> result,
         Random rng)
     {
         while (result.Count < totalLimit)
@@ -374,17 +495,17 @@ public sealed class LevelUpTable
                 }
             }
 
-            string? picked = chosen.PickOne(result, rng);
+            var picked = chosen.PickOne(result, rng);
             if (picked == null)
             {
                 groups.Remove(chosen);
                 continue;
             }
-            result.Add(picked);
+            result.Add(picked.Value);
         }
     }
 
-    private static (List<string> Candidates, bool AllowDuplicates) ResolveGroupCandidates(
+    private static (List<(string TemplateId, CardTier Tier)> Candidates, bool AllowDuplicates) ResolveGroupCandidates(
         RewardGroup grp,
         List<RuleNode> topBehaviors,
         RuleExecutionContext ctx,
@@ -404,8 +525,9 @@ public sealed class LevelUpTable
         var filters = grp.GroupNode?.Filters ?? [];
         var idListFilters = filters.Where(f => f.Type == "TSpawnFilterIdList" && f.Ids != null).ToList();
         var queryFilters = filters.Where(f => f.Type == "TSpawnFilterQuery").ToList();
+        bool hasExplicitIdList = idListFilters.Count > 0 || grp.CardIds.Count > 0;
 
-        var heroFilteredIds = new List<string>();
+        var heroFilteredIds = new List<(string TemplateId, CardTier Tier)>();
         IEnumerable<string> rawIds;
         if (idListFilters.Count > 0)
         {
@@ -417,10 +539,7 @@ public sealed class LevelUpTable
         }
         else if (queryFilters.Count > 0 && ctx.Repo != null)
         {
-            rawIds = ctx.Repo.CardsById.Values
-                .Where(c => string.Equals(c.SpawningEligibility, "Always", StringComparison.OrdinalIgnoreCase) &&
-                            (c.Type == "Item" || c.Type == "Skill"))
-                .Select(c => c.Id);
+            rawIds = ctx.Repo.AlwaysSpawnableItemsAndSkills.Select(c => c.Id);
         }
         else
         {
@@ -442,7 +561,26 @@ public sealed class LevelUpTable
                 ownedSkillMaxTiers[sk.Template.Id] = sk.Tier;
         }
 
-        var dedupedBase = new List<string>();
+        var ownedItemMaxTiers = new Dictionary<string, CardTier>(StringComparer.OrdinalIgnoreCase);
+        foreach (var it in ctx.SelfPlayer.Hand.Cards.Concat(ctx.SelfPlayer.Stash.Cards))
+        {
+            if (it.IsDestroyed) continue;
+            if (!ownedItemMaxTiers.TryGetValue(it.Template.Id, out var prevTier) || it.Tier > prevTier)
+                ownedItemMaxTiers[it.Template.Id] = it.Tier;
+        }
+
+        HashSet<CardTier>? constrainedTiers = null;
+        if (tierConstraint?.Tiers is { Count: > 0 })
+        {
+            constrainedTiers = new HashSet<CardTier>();
+            foreach (var rawTier in tierConstraint.Tiers)
+            {
+                if (Enum.TryParse<CardTier>(rawTier, true, out var parsed))
+                    constrainedTiers.Add(parsed);
+            }
+        }
+
+        var dedupedBase = new List<(string TemplateId, CardTier Tier)>();
         var baseSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (string id in rawIds)
@@ -452,14 +590,15 @@ public sealed class LevelUpTable
             if (isAssetValid != null && !isAssetValid(id)) continue;
 
             var tpl = ctx.Repo?.GetCard(id);
+            CardTier resolvedTier = CardTier.Bronze;
             if (tpl != null)
             {
-                bool isExplicitSynthetic = (idListFilters.Count > 0 || grp.CardIds.Count > 0)
+                bool isExplicitSynthetic = hasExplicitIdList
                                         && GameDataRepository.IsSyntheticTestTemplate(tpl);
                 if (string.Equals(tpl.SpawningEligibility, "Never", StringComparison.OrdinalIgnoreCase) && !isExplicitSynthetic)
                     continue;
 
-                if (idListFilters.Count == 0 && grp.CardIds.Count == 0 &&
+                if (!hasExplicitIdList &&
                     !string.Equals(tpl.SpawningEligibility, "Always", StringComparison.OrdinalIgnoreCase) &&
                     !GameDataRepository.IsSyntheticTestTemplate(tpl))
                     continue;
@@ -474,10 +613,10 @@ public sealed class LevelUpTable
                 if (!Enum.TryParse<CardTier>(tpl.StartingTier, true, out var parsedStart))
                     continue;
 
+                resolvedTier = SpawnQueryEngine.ClampToSupportedTier(tpl, parsedStart);
                 if (tpl.Type is "Item" or "Skill" && tpl.Tiers is { Count: > 0 })
                 {
-                    var supportedTier = SpawnQueryEngine.ClampToSupportedTier(tpl, parsedStart);
-                    if (!tpl.Tiers.ContainsKey(supportedTier.ToString()))
+                    if (!tpl.Tiers.ContainsKey(resolvedTier.ToString()))
                         continue;
                 }
 
@@ -491,8 +630,8 @@ public sealed class LevelUpTable
                     if (!reqOk) continue;
                 }
 
-                // 关键修复：level_ups 里即使使用 TSpawnFilterIdList（例如 L2 G3 29 张卡与 L10 G2..G9 专属升级师），
-                // 除非显式声明 TSpawnBehaviorIgnoreHero，仍必须按玩家英雄或 Common 过滤。
+                // 关键修复（P1-12）：严格接入 includeCommonAndHero 与 excludePlayerHero：
+                // 对随机查询中的 Item，除非显式声明 includeCommonAndHero 或 IdList，否则排除纯 Common 野怪专属中立物品。
                 if (!ignoreHero && tpl.Heroes.Count > 0)
                 {
                     if (excludePlayerHero)
@@ -502,9 +641,12 @@ public sealed class LevelUpTable
                     }
                     else
                     {
-                        bool matchesHero = tpl.Heroes.Contains(playerHero, StringComparer.OrdinalIgnoreCase)
-                                        || tpl.Heroes.Contains(HeroNames.Common, StringComparer.OrdinalIgnoreCase);
-                        if (!matchesHero)
+                        bool matchesPlayerHero = tpl.Heroes.Contains(playerHero, StringComparer.OrdinalIgnoreCase);
+                        bool allowCommon = !string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                                        || hasExplicitIdList
+                                        || includeCommonAndHero;
+                        bool matchesCommon = allowCommon && tpl.Heroes.Contains(HeroNames.Common, StringComparer.OrdinalIgnoreCase);
+                        if (!matchesPlayerHero && !matchesCommon)
                             continue;
                     }
                 }
@@ -521,29 +663,51 @@ public sealed class LevelUpTable
                 }
                 if (!queryOk) continue;
 
-                if (tierConstraint?.Tiers != null && tierConstraint.Tiers.Count > 0)
+                // 修复 P1-12：TSpawnBehaviorTier 对 Item/Skill 校验模板是否支持目标品阶（DefaultTier <= targetTier && Tiers.ContainsKey），
+                // 并把匹配到的最高合法约束品阶记录到 resolvedTier，彻底修复按 StartingTier 错滤及丢品阶问题！
+                if (constrainedTiers is { Count: > 0 } && tpl.Type is "Item" or "Skill")
                 {
-                    bool inTiers = tierConstraint.Tiers.Contains(tpl.StartingTier, StringComparer.OrdinalIgnoreCase);
-                    if (tierConstraint.IsNot == true ? inTiers : !inTiers)
+                    bool isNot = tierConstraint!.IsNot == true;
+                    CardTier? matchedTier = null;
+                    for (int ti = 0; ti < AllCardTiers.Length; ti++)
+                    {
+                        var candidateTier = AllCardTiers[ti];
+                        bool matchesConstraint = isNot
+                            ? !constrainedTiers.Contains(candidateTier)
+                            : constrainedTiers.Contains(candidateTier);
+                        bool supportsTier = tpl.Tiers == null || tpl.Tiers.Count == 0 || tpl.Tiers.ContainsKey(candidateTier.ToString());
+                        if (matchesConstraint && candidateTier >= tpl.DefaultTier && supportsTier)
+                        {
+                            matchedTier = candidateTier;
+                            if (!isNot) break; // 取满足正向约束的最低合法品阶（如 Silver/Gold），不越阶膨胀
+                        }
+                    }
+                    if (!matchedTier.HasValue)
                         continue;
+                    resolvedTier = matchedTier.Value;
                 }
 
-                // Q38：已持有 Diamond+ 或高于升级选项默认阶级的技能不可再融合/升级，永不进入 LevelUp 候选池（包括去重放宽兜底池）
+                // Q38：已持有 Diamond+ 或高于升级选项发放品阶的技能/物品不可再融合升级，永不进入 LevelUp 候选池
                 if (string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase) &&
                     ownedSkillMaxTiers.TryGetValue(id, out var ownedSkillTier))
                 {
-                    var offeredSkillTier = SpawnQueryEngine.ClampToSupportedTier(tpl, tpl.DefaultTier);
-                    if (ownedSkillTier >= CardTier.Diamond || ownedSkillTier > offeredSkillTier)
+                    if (ownedSkillTier >= CardTier.Diamond || ownedSkillTier > resolvedTier)
+                        continue;
+                }
+                else if (string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase) &&
+                         ownedItemMaxTiers.TryGetValue(id, out var ownedItemTier))
+                {
+                    if (ownedItemTier >= CardTier.Diamond || ownedItemTier > resolvedTier)
                         continue;
                 }
             }
 
-            dedupedBase.Add(id);
+            dedupedBase.Add((id, resolvedTier));
             if (ownedTemplateIds == null || !ownedTemplateIds.Contains(id))
-                heroFilteredIds.Add(id);
+                heroFilteredIds.Add((id, resolvedTier));
         }
 
-        // 若因去重导致池空，放宽已拥有去重限制（仍严格守住英雄归属与白名单边界）
+        // 若因去重导致池空，放宽已拥有去重限制（仍严格守住英雄归属、高阶上限与白名单边界）
         if (heroFilteredIds.Count == 0 && dedupedBase.Count > 0)
             return (dedupedBase, allowDup);
 
@@ -553,12 +717,12 @@ public sealed class LevelUpTable
     private sealed class GroupDrawState
     {
         public RewardGroup Group { get; }
-        public List<string> Candidates { get; }
+        public List<(string TemplateId, CardTier Tier)> Candidates { get; }
         public int RemainingPicks { get; private set; }
         public bool AllowDuplicates { get; }
         private int _seqIdx;
 
-        public GroupDrawState(RewardGroup group, List<string> candidates, int limit, bool allowDuplicates)
+        public GroupDrawState(RewardGroup group, List<(string TemplateId, CardTier Tier)> candidates, int limit, bool allowDuplicates)
         {
             Group = group;
             Candidates = candidates;
@@ -566,16 +730,16 @@ public sealed class LevelUpTable
             AllowDuplicates = allowDuplicates;
         }
 
-        public bool HasRemaining(IReadOnlyCollection<string> alreadyPicked)
+        public bool HasRemaining(IReadOnlyCollection<(string TemplateId, CardTier Tier)> alreadyPicked)
             => RemainingPicks > 0 && AvailableCandidates(alreadyPicked).Count > 0;
 
-        public string? PickOne(IReadOnlyCollection<string> alreadyPicked, Random rng)
+        public (string TemplateId, CardTier Tier)? PickOne(IReadOnlyCollection<(string TemplateId, CardTier Tier)> alreadyPicked, Random rng)
         {
             if (RemainingPicks <= 0) return null;
             var avail = AvailableCandidates(alreadyPicked);
             if (avail.Count == 0) return null;
 
-            string chosen;
+            (string TemplateId, CardTier Tier) chosen;
             if (string.Equals(Group.SelectionMethod, "Sequential", StringComparison.OrdinalIgnoreCase))
             {
                 chosen = avail[Math.Min(_seqIdx, avail.Count - 1)];
@@ -590,11 +754,11 @@ public sealed class LevelUpTable
             return chosen;
         }
 
-        private List<string> AvailableCandidates(IReadOnlyCollection<string> alreadyPicked)
+        private List<(string TemplateId, CardTier Tier)> AvailableCandidates(IReadOnlyCollection<(string TemplateId, CardTier Tier)> alreadyPicked)
         {
             if (AllowDuplicates) return Candidates;
             return Candidates
-                .Where(id => !alreadyPicked.Contains(id, StringComparer.OrdinalIgnoreCase))
+                .Where(c => !alreadyPicked.Any(p => string.Equals(p.TemplateId, c.TemplateId, StringComparison.OrdinalIgnoreCase)))
                 .ToList();
         }
     }

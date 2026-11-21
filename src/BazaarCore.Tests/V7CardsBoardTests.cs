@@ -290,7 +290,9 @@ public sealed class V7CardsBoardTests
         Assert.Contains("Tiny", transformed.ExtraTags);
         Assert.Contains("Relic", transformed.ExtraTags);
         Assert.Equal("Fiery", transformed.Enchantment);
-        Assert.True(transformed.HasTag("Burn"));
+        // 严格对齐官方规则（P0-5）：Fiery 提供的 Burn 为 HiddenTag，不污染可见 HasTag
+        Assert.True(transformed.HasHiddenTag("Burn"));
+        Assert.False(transformed.HasTag("Burn"));
 
         // 3. 当源附魔与目标模板不兼容（目标模板不含 "NonExistentCustomEnch"）时，不得强行保留不兼容附魔
         var noEnchTargetTpl = repo.GetCard("7b30db1a-80c8-4889-ae2f-12b0ad047796")!; // Sizeinator (Legendary 仅测试目标 Enchantments 检查)
@@ -421,11 +423,12 @@ public sealed class V7CardsBoardTests
         string[] expected8 = ["Burn", "Poison", "Shield", "Heal", "Regen", "Freeze", "Slow", "Haste"];
         var allTags = dynamicCard.GetAllTags().ToList();
         var allHidden = dynamicCard.GetAllHiddenTags().ToList();
+        // 严格对齐官方规则（P0-5）：8 种动态效果标签归属 HiddenTags，绝不污染可见 Tags（HasTag / GetAllTags）
         foreach (var tag in expected8)
         {
-            Assert.True(dynamicCard.HasTag(tag), $"HasTag 应包含动态衍生标签 {tag}");
+            Assert.False(dynamicCard.HasTag(tag), $"P0-5：可见 HasTag 不应被动态隐藏效果标签 {tag} 污染");
             Assert.True(dynamicCard.HasHiddenTag(tag), $"HasHiddenTag 应包含动态衍生标签 {tag}");
-            Assert.Contains(tag, allTags, StringComparer.OrdinalIgnoreCase);
+            Assert.DoesNotContain(tag, allTags, StringComparer.OrdinalIgnoreCase);
             Assert.Contains(tag, allHidden, StringComparer.OrdinalIgnoreCase);
         }
 
@@ -448,15 +451,16 @@ public sealed class V7CardsBoardTests
         foreach (var (ench, expTag) in enchantCases)
         {
             var inst = new CardInstance(cleanWithFangEnchTpl);
-            Assert.False(inst.HasTag(expTag), $"未附魔前干净物品不应携带 {expTag}");
+            Assert.False(inst.HasHiddenTag(expTag), $"未附魔前干净物品不应携带隐藏标签 {expTag}");
+            Assert.False(inst.HasTag(expTag), $"未附魔前干净物品不应携带可见标签 {expTag}");
 
             inst.ApplyEnchantment(ench);
-            Assert.True(inst.HasTag(expTag), $"附魔 {ench} 后 HasTag 应包含 {expTag}");
+            Assert.False(inst.HasTag(expTag), $"P0-5：附魔 {ench} 后可见 HasTag 不应被隐藏效果标签 {expTag} 污染");
             Assert.True(inst.HasHiddenTag(expTag), $"附魔 {ench} 后 HasHiddenTag 应包含 {expTag}");
-            Assert.Contains(expTag, inst.GetAllTags(), StringComparer.OrdinalIgnoreCase);
+            Assert.Contains(expTag, inst.GetAllHiddenTags(), StringComparer.OrdinalIgnoreCase);
 
             inst.RemoveEnchantment();
-            Assert.False(inst.HasTag(expTag), $"移除附魔 {ench} 后应停止包含 {expTag}");
+            Assert.False(inst.HasHiddenTag(expTag), $"移除附魔 {ench} 后应停止包含隐藏标签 {expTag}");
         }
 
         // Duct Tape 自带 Shield/Slow，其 Shielded/Heavy 在 DB 中仅携带 ShieldReference/SlowReference 隐藏标签（不误衍生 Shield/Slow）
@@ -472,10 +476,11 @@ public sealed class V7CardsBoardTests
         Assert.False(ductHeavyOnly.HasHiddenTag("Slow"));
         Assert.False(ductHeavyOnly.HasTag("Slow"));
 
-        // 真实 DB 卡 Duct Tape 自带 TActionCardSlow，动态衍生也应直接检出 Slow，且附魔 Obsidian 后变成 Weapon
+        // 真实 DB 卡 Duct Tape 自带 TActionCardSlow，动态衍生应归入 HiddenTags（不污染可见 Tags），且附魔 Obsidian 后获得可见 Weapon + 隐藏 Damage
         var realDuct = new CardInstance(ductTpl);
-        Assert.True(realDuct.HasTag("Slow"));
-        Assert.Contains("Slow", realDuct.GetAllTags(), StringComparer.OrdinalIgnoreCase);
+        Assert.False(realDuct.HasTag("Slow"));
+        Assert.True(realDuct.HasHiddenTag("Slow"));
+        Assert.Contains("Slow", realDuct.GetAllHiddenTags(), StringComparer.OrdinalIgnoreCase);
 
         var obsidianDuct = new CardInstance(ductTpl, enchantment: "Obsidian");
         Assert.True(obsidianDuct.HasTag("Weapon"));

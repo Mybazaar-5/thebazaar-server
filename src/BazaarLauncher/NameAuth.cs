@@ -6,7 +6,7 @@ using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using BepInEx;
+using BazaarLauncher.Core;
 using HarmonyLib;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -14,14 +14,11 @@ using Newtonsoft.Json.Linq;
 namespace BazaarLauncher;
 
 /// <summary>
-/// 把 SteamAuthService 换成「用户名即登录」。
-///
-/// 原版：SteamAuthService.AuthenticateAsync()
-///          → SteamModule.GetSteamTicket() → POST /api/auth/login/silent
-/// 这里：POST /api/auth/login/user {"username": 名字}，直接拿 LoginResponse。
-///
-/// 只替换 AuthenticateAsync，不碰 TryAutoLoginAsync —— 后者是公开接口，
-/// 内部会调用被 patch 的 AuthenticateAsync，所以替换点越靠内越安全。
+/// 用户名即登录与自建服统一鉴权 HTTP 客户端（修复 P0-4 &amp; P2-5）：
+///   1. 严格通过泛型闭合方法构造精确的 Task&lt;AuthResult&gt; 返回值，彻底消除 Task&lt;object&gt; 错配与 InvalidCastException；
+///   2. 改用 Newtonsoft.Json 序列化登录请求体，彻底解决用户名反斜杠/特殊字符转义缺陷；
+///   3. 统一复用 HttpClientHub.SharedClient，杜绝重复登录 Socket 泄漏；
+///   4. 所有面向玩家的失败提示均采用简体中文，登录成功后自动触发 Mod/PNG/汉化词典增量同步。
 /// </summary>
 internal static class NameAuth
 {
@@ -31,21 +28,18 @@ internal static class NameAuth
     private static volatile string _currentAccessToken;
     private static int _accountIdFetchInFlight;
 
-    private static readonly HttpClient SharedHttp = new()
-    {
-        Timeout = TimeSpan.FromSeconds(12),
-    };
+    private static Type _cachedAuthResultType;
+    private static Type _cachedLoginResponseType;
+    private static MethodInfo _cachedTypedDispatchMethod;
 
-    /// <summary>服务端 HTTP 响应包装。</summary>
     internal sealed class HttpJsonResponse
     {
         public bool Ok { get; init; }
         public int StatusCode { get; init; }
-        public string Body { get; init; } = "";
-        public string Error { get; init; } = "";
+        public string Body { get; init; } = string.Empty;
+        public string Error { get; init; } = string.Empty;
     }
 
-    /// <summary>当前已解析的玩家用户名。</summary>
     internal static string CurrentUsername
     {
         get
@@ -64,7 +58,6 @@ internal static class NameAuth
         }
     }
 
-    /// <summary>当前已登录账号的标准化 AccountId（32 位小写无连字符 GUID）。</summary>
     internal static string CurrentAccountId
     {
         get
@@ -79,11 +72,10 @@ internal static class NameAuth
                 _currentAccountId = fromCache;
                 return fromCache;
             }
-            return "";
+            return string.Empty;
         }
     }
 
-    /// <summary>当前已持有的 AccessToken。</summary>
     internal static string CurrentAccessToken
     {
         get
@@ -98,20 +90,19 @@ internal static class NameAuth
                 _currentAccessToken = fromGame;
                 return fromGame;
             }
-            return "";
+            return string.Empty;
         }
     }
 
     internal static string NormalizeAccountId(string accountId)
     {
-        if (string.IsNullOrWhiteSpace(accountId)) return "";
+        if (string.IsNullOrWhiteSpace(accountId)) return string.Empty;
         return accountId.Replace("-", "").Trim().ToLowerInvariant();
     }
 
     internal static string GetServerBaseUrl()
-        => (BazaarLauncherPlugin.ServerBase?.Value ?? "").TrimEnd('/');
+        => (BazaarLauncherPlugin.ServerBase?.Value ?? string.Empty).TrimEnd('/');
 
-    /// <summary>为请求附带服务端鉴权头：X-Account-Id / X-Username / Authorization。</summary>
     internal static void ApplyAuthHeaders(HttpRequestMessage req)
     {
         if (req == null) return;
@@ -140,7 +131,6 @@ internal static class NameAuth
         }
     }
 
-    /// <summary>确保已知 AccountId（若尚未从 ClientCache 取得，则回查 /api/Accounts/me/summary）。</summary>
     internal static async Task EnsureAccountIdentityAsync(CancellationToken ct = default)
     {
         if (!string.IsNullOrWhiteSpace(CurrentAccountId)) return;
@@ -150,9 +140,10 @@ internal static class NameAuth
             string baseUrl = GetServerBaseUrl();
             if (string.IsNullOrWhiteSpace(baseUrl)) return;
 
+            using var linked = HttpClientHub.CreateLinkedCts(ct);
             using var req = new HttpRequestMessage(HttpMethod.Get, baseUrl + "/api/Accounts/me/summary");
             ApplyAuthHeaders(req);
-            using var resp = await SharedHttp.SendAsync(req, ct).ConfigureAwait(false);
+            using var resp = await HttpClientHub.SharedClient.SendAsync(req, linked.Token).ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode) return;
 
             string raw = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
@@ -185,14 +176,16 @@ internal static class NameAuth
     internal static Task<HttpJsonResponse> PutJsonAsync(string relativePath, object payload = null, CancellationToken ct = default)
         => SendJsonAsync(HttpMethod.Put, relativePath, payload, ct);
 
-    /// <summary>向 BazaarLauncherPlugin.ServerBase 发送带鉴权头的 JSON 请求。</summary>
+    internal static Task<HttpJsonResponse> DeleteJsonAsync(string relativePath, CancellationToken ct = default)
+        => SendJsonAsync(HttpMethod.Delete, relativePath, null, ct);
+
     internal static async Task<HttpJsonResponse> SendJsonAsync(
         HttpMethod method, string relativePath, object payload = null, CancellationToken ct = default)
     {
         string baseUrl = GetServerBaseUrl();
         if (string.IsNullOrWhiteSpace(baseUrl))
         {
-            return new HttpJsonResponse { Ok = false, StatusCode = 0, Error = "ServerBase 未配置" };
+            return new HttpJsonResponse { Ok = false, StatusCode = 0, Error = "未配置自建服地址（ServerBase）" };
         }
 
         if (string.IsNullOrWhiteSpace(CurrentAccountId) && !string.IsNullOrWhiteSpace(CurrentAccessToken))
@@ -200,9 +193,10 @@ internal static class NameAuth
             await EnsureAccountIdentityAsync(ct).ConfigureAwait(false);
         }
 
-        string url = baseUrl + "/" + (relativePath ?? "").TrimStart('/');
+        string url = baseUrl + "/" + (relativePath ?? string.Empty).TrimStart('/');
         try
         {
+            using var linked = HttpClientHub.CreateLinkedCts(ct);
             using var req = new HttpRequestMessage(method, url);
             ApplyAuthHeaders(req);
 
@@ -216,14 +210,23 @@ internal static class NameAuth
                 req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
             }
 
-            using var resp = await SharedHttp.SendAsync(req, ct).ConfigureAwait(false);
+            using var resp = await HttpClientHub.SharedClient.SendAsync(req, linked.Token).ConfigureAwait(false);
             string body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
             return new HttpJsonResponse
             {
                 Ok = resp.IsSuccessStatusCode,
                 StatusCode = (int)resp.StatusCode,
-                Body = body ?? "",
-                Error = resp.IsSuccessStatusCode ? "" : $"HTTP {(int)resp.StatusCode}: {body}",
+                Body = body ?? string.Empty,
+                Error = resp.IsSuccessStatusCode ? string.Empty : FormatFriendlyHttpError((int)resp.StatusCode, body),
+            };
+        }
+        catch (OperationCanceledException)
+        {
+            return new HttpJsonResponse
+            {
+                Ok = false,
+                StatusCode = 0,
+                Error = "请求已取消或超时，请稍后重试",
             };
         }
         catch (Exception ex)
@@ -232,9 +235,32 @@ internal static class NameAuth
             {
                 Ok = false,
                 StatusCode = 0,
-                Error = ex.Message,
+                Error = "网络连接失败：" + ex.Message,
             };
         }
+    }
+
+    private static string FormatFriendlyHttpError(int statusCode, string body)
+    {
+        if (!string.IsNullOrWhiteSpace(body))
+        {
+            try
+            {
+                var jo = JObject.Parse(body);
+                string serverMsg = (string)(jo["error"] ?? jo["message"] ?? jo["Message"]);
+                if (!string.IsNullOrWhiteSpace(serverMsg))
+                {
+                    if (Modules.LocalizationOverlayModule.Instance != null &&
+                        Modules.LocalizationOverlayModule.Instance.TryResolveText("zh-CN", null, serverMsg, "NetMessageError", out string zh))
+                    {
+                        return $"请求失败 ({statusCode})：{zh}";
+                    }
+                    return $"请求失败 ({statusCode})：{serverMsg}";
+                }
+            }
+            catch { }
+        }
+        return $"服务端返回异常状态 ({statusCode})";
     }
 
     private static string TryReadProfileMember(string memberName)
@@ -277,118 +303,192 @@ internal static class NameAuth
         catch { return null; }
     }
 
-    internal static void Apply(Harmony harmony)
+    internal static void ResetAppliedFlag() => _applied = false;
+
+    internal static void Apply(SafeHarmonyPatcher patcher)
     {
-        if (_applied) return;
+        if (_applied || patcher == null) return;
         _applied = true;
 
         var steamAuth = AccessTools.TypeByName("TheBazaar.Auth.SteamAuthService");
         if (steamAuth == null)
         {
-            BazaarLauncherPlugin.Log.LogError("SteamAuthService not found");
+            BazaarLauncherPlugin.Log?.LogError("NameAuth: 未找到 SteamAuthService");
             return;
         }
 
-        var auth = AccessTools.Method(steamAuth, "AuthenticateAsync");
-        if (auth == null)
+        _cachedAuthResultType = AccessTools.TypeByName("TheBazaar.Auth.AuthResult");
+        _cachedLoginResponseType = AccessTools.TypeByName("BazaarGameShared.TempoNet.Responses.LoginResponse");
+
+        var authMethod = AccessTools.Method(steamAuth, "AuthenticateAsync");
+        if (authMethod != null)
         {
-            BazaarLauncherPlugin.Log.LogError("SteamAuthService.AuthenticateAsync not found");
-            return;
+            // 提前解析目标精确返回类型 Task<T> 的泛型参数 T，构建严格闭合的泛型派发方法（根治 P0-4）
+            Type taskPayloadType = _cachedAuthResultType;
+            if (authMethod.ReturnType.IsGenericType && authMethod.ReturnType.GetGenericTypeDefinition() == typeof(Task<>))
+            {
+                taskPayloadType = authMethod.ReturnType.GetGenericArguments()[0];
+            }
+
+            if (taskPayloadType != null)
+            {
+                var open = AccessTools.Method(typeof(NameAuth), nameof(AuthenticateTypedAsync));
+                _cachedTypedDispatchMethod = open?.MakeGenericMethod(taskPayloadType);
+            }
+
+            patcher.TryPatchMethod(
+                authMethod,
+                prefix: AccessTools.Method(typeof(NameAuth), nameof(AuthenticatePrefix)),
+                label: "SteamAuthService.AuthenticateAsync");
         }
 
-        harmony.Patch(auth, prefix: new HarmonyMethod(
-            AccessTools.Method(typeof(NameAuth), nameof(AuthenticatePrefix))));
-        BazaarLauncherPlugin.Log.LogInfo("Patched SteamAuthService.AuthenticateAsync -> name login");
+        patcher.TryPatchPropertyGetter(
+            "TheBazaar.Auth.SteamAuthService",
+            "RequiresEmailVerification",
+            prefix: AccessTools.Method(typeof(NameAuth), nameof(ReturnFalse)),
+            optional: true);
 
-        // RequiresEmailVerification 恒 false
-        var req = AccessTools.Property(steamAuth, "RequiresEmailVerification");
-        if (req != null && req.CanRead && req.GetMethod != null)
-        {
-            harmony.Patch(req.GetMethod, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(NameAuth), nameof(ReturnFalse))));
-        }
+        patcher.TryPatchPropertyGetter(
+            "TheBazaar.Auth.SteamAuthService",
+            "IsAuthenticated",
+            prefix: AccessTools.Method(typeof(NameAuth), nameof(ReturnTrue)),
+            optional: true);
+    }
 
-        // IsAuthenticated 恒 true
-        var isAuth = AccessTools.Property(steamAuth, "IsAuthenticated");
-        if (isAuth != null && isAuth.CanRead && isAuth.GetMethod != null)
-        {
-            harmony.Patch(isAuth.GetMethod, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(NameAuth), nameof(ReturnTrue))));
-        }
+    internal static void Apply(Harmony harmony)
+    {
+        if (_applied || harmony == null) return;
+        Apply(new SafeHarmonyPatcher("nameauth.legacy"));
     }
 
     private static bool ReturnFalse(ref bool __result) { __result = false; return false; }
     private static bool ReturnTrue(ref bool __result) { __result = true; return false; }
 
-    /// <summary>
-    /// 替换 AuthenticateAsync() 的实现。
-    /// 返回 Task&lt;AuthResult&gt;：用反射构造 AuthResult.Ok(LoginResponse)。
-    /// </summary>
     private static bool AuthenticatePrefix(ref Task __result)
     {
         try
         {
-            __result = AuthenticateAsync();
+            if (_cachedTypedDispatchMethod != null)
+            {
+                __result = (Task)_cachedTypedDispatchMethod.Invoke(null, null);
+                return false;
+            }
+            __result = AuthenticateFallbackObjectAsync();
+            return false;
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log.LogError("NameAuth dispatch failed: " + ex);
-            __result = Task.FromResult<object>(null);
+            BazaarLauncherPlugin.Log?.LogError("NameAuth 登录派发异常: " + ex);
+            __result = CreateTypedErrorTask("TN-DISPATCH", "登录初始化异常：" + ex.Message);
+            return false;
         }
-        return false;
     }
 
-    private static async Task<object> AuthenticateAsync()
+    /// <summary>
+    /// 严格闭合返回类型 Task&lt;TAuthResult&gt; 的核心登录方法，彻底杜绝 Task&lt;object&gt; 泛型转换崩溃（P0-4）。
+    /// </summary>
+    private static async Task<TAuthResult> AuthenticateTypedAsync<TAuthResult>() where TAuthResult : class
+    {
+        object raw = await AuthenticateCoreAsync().ConfigureAwait(false);
+        if (raw is TAuthResult typed)
+        {
+            return typed;
+        }
+
+        object err = BuildError("TN-TYPE", "服务端响应与客户端登录数据结构不匹配");
+        return err as TAuthResult;
+    }
+
+    private static async Task<object> AuthenticateFallbackObjectAsync()
+        => await AuthenticateCoreAsync().ConfigureAwait(false);
+
+    private static Task CreateTypedErrorTask(string code, string message)
+    {
+        Type resultType = _cachedAuthResultType ?? typeof(object);
+        try
+        {
+            object errObj = BuildError(code, message);
+            MethodInfo fromResult = typeof(Task).GetMethod(nameof(Task.FromResult))?.MakeGenericMethod(resultType);
+            if (fromResult != null)
+            {
+                return (Task)fromResult.Invoke(null, new[] { errObj });
+            }
+        }
+        catch { }
+        return Task.FromResult<object>(null);
+    }
+
+    private static async Task<object> AuthenticateCoreAsync()
     {
         string name = PlayerIdentity.ResolveName();
         _currentUsername = name;
-        BazaarLauncherPlugin.Log.LogInfo($"NameAuth: logging in as '{name}'");
+        BazaarLauncherPlugin.Log?.LogInfo($"NameAuth: 正在以用户名「{name}」登录自建服");
 
-        string baseUrl = BazaarLauncherPlugin.ServerBase.Value.TrimEnd('/');
+        string baseUrl = GetServerBaseUrl();
         string url = baseUrl + "/api/auth/login/user";
-        string body = "{\"username\":\"" + name.Replace("\"", "\\\"") + "\"}";
+        string body = JsonConvert.SerializeObject(new { username = name });
 
         string json;
-        using (var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) })
+        try
         {
-            var content = new StringContent(body, Encoding.UTF8, "application/json");
-            var resp = await http.PostAsync(url, content);
-            json = await resp.Content.ReadAsStringAsync();
+            using var linked = HttpClientHub.CreateLinkedCts();
+            using var req = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json"),
+            };
+
+            using var resp = await HttpClientHub.SharedClient.SendAsync(req, linked.Token).ConfigureAwait(false);
+            json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode)
             {
-                BazaarLauncherPlugin.Log.LogError($"NameAuth: HTTP {(int)resp.StatusCode} {json}");
-                return BuildError("TN-LOGIN", "login failed " + resp.StatusCode);
+                BazaarLauncherPlugin.Log?.LogError($"NameAuth 登录失败: HTTP {(int)resp.StatusCode} {json}");
+                return BuildError("TN-LOGIN", $"登录自建服失败（状态码 {(int)resp.StatusCode}）");
             }
         }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogError("NameAuth 网络连接异常: " + ex.Message);
+            return BuildError("TN-NET", "无法连接自建服：" + ex.Message);
+        }
 
-        var loginResponseType = AccessTools.TypeByName("BazaarGameShared.TempoNet.Responses.LoginResponse");
+        var loginResponseType = _cachedLoginResponseType ?? AccessTools.TypeByName("BazaarGameShared.TempoNet.Responses.LoginResponse");
         if (loginResponseType == null)
         {
-            BazaarLauncherPlugin.Log.LogError("LoginResponse type not found");
-            return null;
+            BazaarLauncherPlugin.Log?.LogError("NameAuth: 未找到 LoginResponse 类型");
+            return BuildError("TN-SCHEMA", "客户端版本不匹配（缺少 LoginResponse 类型）");
         }
 
         object loginResponse = JsonConvert.DeserializeObject(json, loginResponseType);
+        if (loginResponse == null)
+        {
+            return BuildError("TN-PARSE", "解析自建服登录响应失败");
+        }
+
         try
         {
             string tok = AccessTools.Property(loginResponseType, "AccessToken")?.GetValue(loginResponse)?.ToString();
             if (!string.IsNullOrWhiteSpace(tok))
             {
                 _currentAccessToken = tok;
-                _ = Task.Run(() => EnsureAccountIdentityAsync());
+                _ = Task.Run(async () =>
+                {
+                    await EnsureAccountIdentityAsync(HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                    ModContentSyncClient.Instance.TriggerFullSyncInBackground(forceDownload: false);
+                });
             }
         }
         catch { }
-        BazaarLauncherPlugin.Log.LogInfo("NameAuth: got LoginResponse");
 
-        var authResultType = AccessTools.TypeByName("TheBazaar.Auth.AuthResult");
+        BazaarLauncherPlugin.Log?.LogInfo("NameAuth: 自建服登录成功，已启动 Mod 与词典缓存同步");
+
+        var authResultType = _cachedAuthResultType ?? AccessTools.TypeByName("TheBazaar.Auth.AuthResult");
         if (authResultType == null)
         {
-            BazaarLauncherPlugin.Log.LogError("AuthResult type not found");
-            return loginResponse;
+            return BuildError("TN-AUTHRESULT", "客户端缺少 AuthResult 类型");
         }
 
-        var okMethod = AccessTools.Method(authResultType, "Ok");
+        var okMethod = AccessTools.Method(authResultType, "Ok", new[] { loginResponseType })
+            ?? AccessTools.Method(authResultType, "Ok");
         if (okMethod != null)
         {
             return okMethod.Invoke(null, new[] { loginResponse });
@@ -402,7 +502,7 @@ internal static class NameAuth
 
     private static object BuildError(string code, string message)
     {
-        var authResultType = AccessTools.TypeByName("TheBazaar.Auth.AuthResult");
+        var authResultType = _cachedAuthResultType ?? AccessTools.TypeByName("TheBazaar.Auth.AuthResult");
         if (authResultType == null) return null;
 
         var errMethod = AccessTools.Method(authResultType, "Error");

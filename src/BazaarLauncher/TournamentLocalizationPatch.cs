@@ -1,7 +1,9 @@
 using System;
-using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
+using BazaarLauncher.Core;
+using BazaarLauncher.Modules;
 using HarmonyLib;
 using TMPro;
 using UnityEngine;
@@ -9,24 +11,19 @@ using UnityEngine;
 namespace BazaarLauncher;
 
 /// <summary>
-/// 锦标赛与奇遇禁用弹窗的简体中文补丁（Safe Harmony Postfix）。
-///
-/// 覆盖目标：
-///   - EncounterBanPopupController（全部类型 / 商人 / 奇遇事件 / 野怪战斗 / 强化基座 / 复制禁用码 / 粘贴禁用码 / 最近禁用）
-///   - TournamentHostSettingsView（创建房主参数界面文本）
-///   - TournamentLobbyView（解散房间 / 离开房间 / 开始锦标赛 / 复制房间码等）
-///   - 锦标赛大厅相关 LocalizableText 与子视图文本兜底
-///
-/// 所有反射查找均做空值防护并在缺失时仅记录一次日志，绝不抛异常阻断游戏流程。
+/// 锦标赛、奇遇禁用与高频原生视图硬编码英文兜底补丁（已升级并接入 LocalizationOverlayModule 四层词典，修复 P1-9）：
+///   1. 严格校验当前游戏语言（非中文模式不强行篡改英文界面）；
+///   2. 缓存所有反射 FieldInfo/PropertyInfo 与静态上下文词典，彻底消除热路径反射与 Dictionary 重复分配；
+///   3. 优先查询 LocalizationOverlayModule 四层外挂词典，回退内置兜底词典。
 /// </summary>
 internal static class TournamentLocalizationPatch
 {
     private static bool _applied;
     private static readonly HashSet<string> _loggedOnce = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<(Type, string), MemberInfo> _memberCache = new();
 
     private static readonly Dictionary<string, string> ExactEnglishToZh = new(StringComparer.OrdinalIgnoreCase)
     {
-        // EncounterBanPopupController
         ["All Types"] = "全部类型",
         ["Merchants"] = "商人",
         ["Events"] = "奇遇事件",
@@ -47,12 +44,10 @@ internal static class TournamentLocalizationPatch
         ["Clear All"] = "清空全部",
         ["Reset"] = "重置",
 
-        // 第 8 英雄双龙展示名兜底汉化
         ["The Dragons"] = "双龙",
         ["Hero8"] = "双龙",
         ["The Dragons' Hideout"] = "双龙的藏身处",
 
-        // TournamentHostSettingsView
         ["Host Settings"] = "房主建房设置",
         ["Tournament Settings"] = "锦标赛设置",
         ["Base Settings"] = "基础设置",
@@ -80,7 +75,6 @@ internal static class TournamentLocalizationPatch
         ["Edit Bans"] = "设置禁用",
         ["Ban List"] = "禁用列表",
 
-        // TournamentLobbyView & 兄弟界面
         ["Leave Lobby"] = "离开房间",
         ["Begin"] = "开始比赛",
         ["Begin Tournament"] = "开始锦标赛",
@@ -106,7 +100,22 @@ internal static class TournamentLocalizationPatch
         ["Open Lobbies"] = "公开房间",
         ["Live Tournaments"] = "进行中锦标赛",
         ["Watch"] = "观战",
+        ["Spectate"] = "观战",
+        ["End Run"] = "结束对局",
+        ["Eliminated"] = "已淘汰",
+        ["Pending"] = "等待中",
+        ["Started"] = "进行中",
+        ["Equip"] = "装备",
+        ["Unequip"] = "卸下",
+        ["View in Collection"] = "在藏品中查看",
+        ["Apprentice Merchant"] = "见习商人",
+        ["Max Rage"] = "最大怒气",
+        ["Combat will begin shortly."] = "战斗即将开始。",
+        ["Connection Issue"] = "连接异常",
+        ["Server"] = "服务器",
         ["Loading..."] = "加载中...",
+        ["Loading preview..."] = "正在加载预览...",
+        ["Loading previews..."] = "正在加载预览...",
         ["Starting..."] = "即将开始...",
         ["No public lobbies right now. Host one, or join with a code."] = "当前暂无公开房间，可自行创建或输入房间码加入。",
         ["No live tournaments to watch right now."] = "当前暂无可观战的锦标赛。",
@@ -148,71 +157,109 @@ internal static class TournamentLocalizationPatch
         ["Cancel"] = "取消匹配",
     };
 
-    internal static void Apply(Harmony harmony)
+    private static readonly Dictionary<string, string> LobbyHostOverrides = new(StringComparer.OrdinalIgnoreCase)
     {
-        if (_applied || harmony == null) return;
+        ["Cancel"] = "解散房间",
+        ["Leave Lobby"] = "解散房间",
+        ["Leave"] = "解散房间",
+    };
+
+    private static readonly Dictionary<string, string> LobbyGuestOverrides = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Cancel"] = "离开房间",
+        ["Leave Lobby"] = "离开房间",
+        ["Leave"] = "离开房间",
+    };
+
+    internal static void ResetAppliedFlag() => _applied = false;
+
+    internal static void Apply(SafeHarmonyPatcher patcher)
+    {
+        if (_applied || patcher == null) return;
         _applied = true;
 
         try
         {
-            PatchLocalizableText(harmony);
-            PatchEncounterBanPopup(harmony);
-            PatchTournamentHostSettingsView(harmony);
-            PatchTournamentLobbyView(harmony);
-            PatchOtherTournamentViews(harmony);
-            BazaarLauncherPlugin.Log?.LogInfo("TournamentLocalizationPatch applied");
+            // 注册基础内置兜底表到四层词典低优先层（让外挂 custom_zh_overlay.json 与 Mod 词典优先覆盖）
+            LocalizationOverlayModule.Instance?.RegisterExactOverrides("zh-CN", ExactEnglishToZh, null, priority: 20);
+
+            PatchEncounterBanPopup(patcher);
+            PatchTournamentHostSettingsView(patcher);
+            PatchTournamentLobbyView(patcher);
+            PatchOtherTournamentViews(patcher);
+            BazaarLauncherPlugin.Log?.LogInfo("TournamentLocalizationPatch（四层词典联动版）已加载");
         }
         catch (Exception ex)
         {
-            LogOnce("apply_root", "TournamentLocalizationPatch.Apply failed: " + ex.Message);
+            LogOnce("apply_root", "TournamentLocalizationPatch.Apply 异常: " + ex.Message);
         }
     }
 
-    // ── 1. LocalizableText.GetLocalizedText 全局白名单翻译 ────────────────────
-
-    private static void PatchLocalizableText(Harmony harmony)
+    internal static void Apply(Harmony harmony)
     {
-        var t = AccessTools.TypeByName("TheBazaar.Utilities.LocalizableText");
-        if (t == null)
-        {
-            LogOnce("missing:LocalizableText", "LocalizableText type not found");
-            return;
-        }
-        SafePatchPostfix(harmony, t, "GetLocalizedText", nameof(LocalizableTextPostfix));
+        if (_applied || harmony == null) return;
+        Apply(new SafeHarmonyPatcher("tournament.l10n.legacy"));
     }
 
-    private static void LocalizableTextPostfix(ref string __result)
+    private static void PatchEncounterBanPopup(SafeHarmonyPatcher patcher)
     {
-        if (string.IsNullOrWhiteSpace(__result)) return;
-        string trimmed = __result.Trim();
-        if (ExactEnglishToZh.TryGetValue(trimmed, out string zh))
-        {
-            __result = zh;
-        }
+        const string typeName = "TheBazaar.UI.EncounterBanPopupController";
+        var refresh = AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(BanPopupRefreshPostfix));
+        var codes = AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(BanPopupCodeLabelsPostfix));
+        var recent = AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(BanPopupRecentBansPostfix));
+
+        patcher.TryPatch(typeName, "Awake", postfix: refresh, optional: true);
+        patcher.TryPatch(typeName, "OnEnable", postfix: refresh, optional: true);
+        patcher.TryPatch(typeName, "Show", postfix: refresh, optional: true);
+        patcher.TryPatch(typeName, "ResetCodeLabels", postfix: codes, optional: true);
+        patcher.TryPatch(typeName, "FlashCodeLabel", postfix: codes, optional: true);
+        patcher.TryPatch(typeName, "RefreshRecentBans", postfix: recent, optional: true);
     }
 
-    // ── 2. EncounterBanPopupController ────────────────────────────────────────
-
-    private static void PatchEncounterBanPopup(Harmony harmony)
+    private static void PatchTournamentHostSettingsView(SafeHarmonyPatcher patcher)
     {
-        var t = AccessTools.TypeByName("TheBazaar.UI.EncounterBanPopupController");
-        if (t == null)
-        {
-            LogOnce("missing:EncounterBanPopupController", "EncounterBanPopupController not found");
-            return;
-        }
+        const string typeName = "TheBazaar.UI.Tournaments.TournamentHostSettingsView";
+        var refresh = AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(HostSettingsRefreshPostfix));
 
-        SafePatchPostfix(harmony, t, "Awake", nameof(BanPopupRefreshPostfix));
-        SafePatchPostfix(harmony, t, "OnEnable", nameof(BanPopupRefreshPostfix));
-        SafePatchPostfix(harmony, t, "Show", nameof(BanPopupRefreshPostfix));
-        SafePatchPostfix(harmony, t, "ResetCodeLabels", nameof(BanPopupCodeLabelsPostfix));
-        SafePatchPostfix(harmony, t, "FlashCodeLabel", nameof(BanPopupCodeLabelsPostfix));
-        SafePatchPostfix(harmony, t, "RefreshRecentBans", nameof(BanPopupRecentBansPostfix));
+        patcher.TryPatch(typeName, "OnEnable", postfix: refresh, optional: true);
+        patcher.TryPatch(typeName, "OnLocaleChanged", postfix: refresh, optional: true);
+        patcher.TryPatch(typeName, "SetInteractable", postfix: refresh, optional: true);
+        patcher.TryPatch(typeName, "OnSizeLimited", postfix: refresh, optional: true);
+        patcher.TryPatch(typeName, "DrawBannedEncounters", postfix: refresh, optional: true);
     }
+
+    private static void PatchTournamentLobbyView(SafeHarmonyPatcher patcher)
+    {
+        const string typeName = "TheBazaar.UI.Tournaments.TournamentLobbyView";
+        patcher.TryPatch(typeName, "SetIsHost", postfix: AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(LobbyViewSetIsHostPostfix)), optional: true);
+        patcher.TryPatch(typeName, "SetTournamentInfo", postfix: AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(LobbyViewSetInfoPostfix)), optional: true);
+    }
+
+    private static void PatchOtherTournamentViews(SafeHarmonyPatcher patcher)
+    {
+        var generic = AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(GenericViewTranslatePostfix));
+        var queue = AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(QueueViewTranslatePostfix));
+
+        patcher.TryPatch("TheBazaar.UI.Tournaments.TournamentHostOrJoinView", "OnEnable", postfix: generic, optional: true);
+
+        const string browser = "TheBazaar.UI.Tournaments.TournamentLobbyBrowserView";
+        patcher.TryPatch(browser, "OnEnable", postfix: generic, optional: true);
+        patcher.TryPatch(browser, "SetTab", postfix: generic, optional: true);
+        patcher.TryPatch(browser, "ShowLoading", postfix: generic, optional: true);
+        patcher.TryPatch(browser, "ShowResults", postfix: generic, optional: true);
+
+        const string queueType = "TheBazaar.UI.Tournaments.TournamentQueueView";
+        patcher.TryPatch(queueType, "OnEnable", postfix: queue, optional: true);
+        patcher.TryPatch(queueType, "SetProgress", postfix: queue, optional: true);
+        patcher.TryPatch(queueType, "SetStarting", postfix: queue, optional: true);
+    }
+
+    private static bool IsChineseActive()
+        => LocalizationOverlayModule.IsChineseLocale(LocalizationOverlayModule.DetectCurrentGameLocale());
 
     private static void BanPopupRefreshPostfix(object __instance)
     {
-        if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+        if (!IsChineseActive() || __instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
         try
         {
             TranslateBanPopupLabels(__instance);
@@ -220,7 +267,7 @@ internal static class TournamentLocalizationPatch
             BanPopupRecentBansPostfix(__instance);
             if (__instance is Component comp && comp != null)
             {
-                TranslateChildTexts(comp, BanPopupUiOverrides);
+                TranslateChildTexts(comp, BanPopupUiOverrides, "EncounterBanPopupController");
             }
         }
         catch (Exception ex)
@@ -255,11 +302,11 @@ internal static class TournamentLocalizationPatch
 
     private static void BanPopupCodeLabelsPostfix(object __instance)
     {
-        if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+        if (!IsChineseActive() || __instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
         try
         {
-            TranslateTmpField(__instance, "_copyCodeLabel");
-            TranslateTmpField(__instance, "_pasteCodeLabel");
+            TranslateTmpField(__instance, "_copyCodeLabel", "EncounterBanPopupController");
+            TranslateTmpField(__instance, "_pasteCodeLabel", "EncounterBanPopupController");
         }
         catch (Exception ex)
         {
@@ -269,7 +316,7 @@ internal static class TournamentLocalizationPatch
 
     private static void BanPopupRecentBansPostfix(object __instance)
     {
-        if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+        if (!IsChineseActive() || __instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
         try
         {
             var recent = GetFieldOrProp<TMP_Dropdown>(__instance, "_recentBansDropdown");
@@ -289,30 +336,12 @@ internal static class TournamentLocalizationPatch
         }
     }
 
-    // ── 3. TournamentHostSettingsView ─────────────────────────────────────────
-
-    private static void PatchTournamentHostSettingsView(Harmony harmony)
-    {
-        var t = AccessTools.TypeByName("TheBazaar.UI.Tournaments.TournamentHostSettingsView");
-        if (t == null)
-        {
-            LogOnce("missing:TournamentHostSettingsView", "TournamentHostSettingsView not found");
-            return;
-        }
-
-        SafePatchPostfix(harmony, t, "OnEnable", nameof(HostSettingsRefreshPostfix));
-        SafePatchPostfix(harmony, t, "OnLocaleChanged", nameof(HostSettingsRefreshPostfix));
-        SafePatchPostfix(harmony, t, "SetInteractable", nameof(HostSettingsRefreshPostfix));
-        SafePatchPostfix(harmony, t, "OnSizeLimited", nameof(HostSettingsRefreshPostfix));
-        SafePatchPostfix(harmony, t, "DrawBannedEncounters", nameof(HostSettingsRefreshPostfix));
-    }
-
     private static void HostSettingsRefreshPostfix(object __instance)
     {
-        if (__instance is not Component comp || comp == null) return;
+        if (!IsChineseActive() || __instance is not Component comp || comp == null) return;
         try
         {
-            TranslateChildTexts(comp, HostSettingsUiOverrides);
+            TranslateChildTexts(comp, HostSettingsUiOverrides, "TournamentHostSettingsView");
         }
         catch (Exception ex)
         {
@@ -320,24 +349,9 @@ internal static class TournamentLocalizationPatch
         }
     }
 
-    // ── 4. TournamentLobbyView ────────────────────────────────────────────────
-
-    private static void PatchTournamentLobbyView(Harmony harmony)
-    {
-        var t = AccessTools.TypeByName("TheBazaar.UI.Tournaments.TournamentLobbyView");
-        if (t == null)
-        {
-            LogOnce("missing:TournamentLobbyView", "TournamentLobbyView not found");
-            return;
-        }
-
-        SafePatchPostfix(harmony, t, "SetIsHost", nameof(LobbyViewSetIsHostPostfix));
-        SafePatchPostfix(harmony, t, "SetTournamentInfo", nameof(LobbyViewSetInfoPostfix));
-    }
-
     private static void LobbyViewSetIsHostPostfix(object __instance, bool isHost)
     {
-        if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+        if (!IsChineseActive() || __instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
         try
         {
             var leaveBtn = GetFieldOrProp<object>(__instance, "_leaveButton");
@@ -352,13 +366,10 @@ internal static class TournamentLocalizationPatch
 
             if (__instance is Component comp && comp != null)
             {
-                var overrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["Cancel"] = isHost ? "解散房间" : "离开房间",
-                    ["Leave Lobby"] = "离开房间",
-                    ["Leave"] = isHost ? "解散房间" : "离开房间",
-                };
-                TranslateChildTexts(comp, overrides);
+                TranslateChildTexts(
+                    comp,
+                    isHost ? LobbyHostOverrides : LobbyGuestOverrides,
+                    isHost ? "TournamentLobbyView.Host" : "TournamentLobbyView.Guest");
             }
         }
         catch (Exception ex)
@@ -369,16 +380,14 @@ internal static class TournamentLocalizationPatch
 
     private static void LobbyViewSetInfoPostfix(object __instance)
     {
-        if (__instance is not Component comp || comp == null) return;
+        if (!IsChineseActive() || __instance is not Component comp || comp == null) return;
         try
         {
             bool isHost = GetFieldOrProp<bool>(__instance, "_isHost");
-            var overrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["Cancel"] = isHost ? "解散房间" : "离开房间",
-                ["Leave Lobby"] = "离开房间",
-            };
-            TranslateChildTexts(comp, overrides);
+            TranslateChildTexts(
+                comp,
+                isHost ? LobbyHostOverrides : LobbyGuestOverrides,
+                isHost ? "TournamentLobbyView.Host" : "TournamentLobbyView.Guest");
         }
         catch (Exception ex)
         {
@@ -386,132 +395,88 @@ internal static class TournamentLocalizationPatch
         }
     }
 
-    // ── 5. 其余锦标赛辅助界面（空值安全兜底） ──────────────────────────────────
-
-    private static void PatchOtherTournamentViews(Harmony harmony)
-    {
-        var hostOrJoin = AccessTools.TypeByName("TheBazaar.UI.Tournaments.TournamentHostOrJoinView");
-        if (hostOrJoin != null)
-        {
-            SafePatchPostfix(harmony, hostOrJoin, "OnEnable", nameof(GenericViewTranslatePostfix));
-        }
-
-        var browser = AccessTools.TypeByName("TheBazaar.UI.Tournaments.TournamentLobbyBrowserView");
-        if (browser != null)
-        {
-            SafePatchPostfix(harmony, browser, "OnEnable", nameof(GenericViewTranslatePostfix));
-            SafePatchPostfix(harmony, browser, "SetTab", nameof(GenericViewTranslatePostfix));
-            SafePatchPostfix(harmony, browser, "ShowLoading", nameof(GenericViewTranslatePostfix));
-            SafePatchPostfix(harmony, browser, "ShowResults", nameof(GenericViewTranslatePostfix));
-        }
-
-        var queue = AccessTools.TypeByName("TheBazaar.UI.Tournaments.TournamentQueueView");
-        if (queue != null)
-        {
-            SafePatchPostfix(harmony, queue, "OnEnable", nameof(QueueViewTranslatePostfix));
-            SafePatchPostfix(harmony, queue, "SetProgress", nameof(QueueViewTranslatePostfix));
-            SafePatchPostfix(harmony, queue, "SetStarting", nameof(QueueViewTranslatePostfix));
-        }
-    }
-
     private static void GenericViewTranslatePostfix(object __instance)
     {
-        if (__instance is not Component comp || comp == null) return;
-        try { TranslateChildTexts(comp, null); }
+        if (!IsChineseActive() || __instance is not Component comp || comp == null) return;
+        try { TranslateChildTexts(comp, null, __instance.GetType().Name); }
         catch { }
     }
 
     private static void QueueViewTranslatePostfix(object __instance)
     {
-        if (__instance is not Component comp || comp == null) return;
-        try { TranslateChildTexts(comp, QueueUiOverrides); }
+        if (!IsChineseActive() || __instance is not Component comp || comp == null) return;
+        try { TranslateChildTexts(comp, QueueUiOverrides, "TournamentQueueView"); }
         catch { }
     }
 
-    // ── 工具函数（严格空值保护与单次日志） ────────────────────────────────────
-
-    private static void SafePatchPostfix(
-        Harmony harmony, Type targetType, string methodName, string postfixMethodName, Type[] parameterTypes = null)
-    {
-        if (targetType == null) return;
-        try
-        {
-            MethodInfo target = parameterTypes == null
-                ? AccessTools.Method(targetType, methodName)
-                : AccessTools.Method(targetType, methodName, parameterTypes);
-
-            if (target == null)
-            {
-                LogOnce($"missing_method:{targetType.FullName}.{methodName}",
-                    $"TournamentLocalizationPatch: method not found {targetType.FullName}.{methodName}");
-                return;
-            }
-
-            MethodInfo postfix = AccessTools.Method(typeof(TournamentLocalizationPatch), postfixMethodName);
-            if (postfix == null)
-            {
-                LogOnce($"missing_postfix:{postfixMethodName}",
-                    $"TournamentLocalizationPatch: postfix helper missing {postfixMethodName}");
-                return;
-            }
-
-            harmony.Patch(target, postfix: new HarmonyMethod(postfix));
-        }
-        catch (Exception ex)
-        {
-            LogOnce($"patch_fail:{targetType.FullName}.{methodName}",
-                $"TournamentLocalizationPatch: failed patching {targetType.FullName}.{methodName}: {ex.Message}");
-        }
-    }
-
-    private static void TranslateTmpField(object instance, string fieldName)
+    private static void TranslateTmpField(object instance, string fieldName, string contextKey)
     {
         var tmp = GetFieldOrProp<TMP_Text>(instance, fieldName);
         if (tmp == null || string.IsNullOrWhiteSpace(tmp.text)) return;
-        if (TryTranslateString(tmp.text, null, out string zh))
+        if (TryTranslateString(tmp.text, null, contextKey, out string zh) && !string.Equals(tmp.text, zh, StringComparison.Ordinal))
         {
             tmp.text = zh;
         }
     }
 
-    private static void TranslateChildTexts(Component root, IReadOnlyDictionary<string, string> overrides)
+    private static void TranslateChildTexts(Component root, IReadOnlyDictionary<string, string> overrides, string contextKey)
     {
         if (root == null) return;
         var texts = root.GetComponentsInChildren<TMP_Text>(includeInactive: true);
         if (texts == null) return;
 
-        foreach (var tmp in texts)
+        for (int i = 0; i < texts.Length; i++)
         {
+            var tmp = texts[i];
             if (tmp == null || string.IsNullOrWhiteSpace(tmp.text)) continue;
-            if (TryTranslateString(tmp.text, overrides, out string zh) && !string.Equals(tmp.text, zh, StringComparison.Ordinal))
+            if (TryTranslateString(tmp.text, overrides, contextKey, out string zh) && !string.Equals(tmp.text, zh, StringComparison.Ordinal))
             {
                 tmp.text = zh;
             }
         }
     }
 
-    private static bool TryTranslateString(string raw, IReadOnlyDictionary<string, string> overrides, out string translated)
+    internal static bool TryTranslateString(
+        string raw,
+        IReadOnlyDictionary<string, string> overrides,
+        string contextKey,
+        out string translated)
     {
-        string trimmed = (raw ?? "").Trim();
-        if (string.IsNullOrEmpty(trimmed))
+        if (string.IsNullOrEmpty(raw))
         {
             translated = raw;
             return false;
         }
 
-        if (overrides != null && overrides.TryGetValue(trimmed, out translated))
+        string lookup = (char.IsWhiteSpace(raw[0]) || char.IsWhiteSpace(raw[raw.Length - 1])) ? raw.Trim() : raw;
+        if (string.IsNullOrEmpty(lookup))
         {
-            return true;
+            translated = raw;
+            return false;
         }
-        if (ExactEnglishToZh.TryGetValue(trimmed, out translated))
+
+        // 1. 优先上下文显式局部覆盖
+        if (overrides != null && overrides.TryGetValue(lookup, out translated))
         {
             return true;
         }
 
-        // 处理带冒号的表单标签（如 "Player Cap:" -> "人数上限:"）
-        if (trimmed.EndsWith(":", StringComparison.Ordinal))
+        // 2. 查四层词典引擎（包含 Mod 词典 / 外挂 custom_zh_overlay.json / 上下文 / 正则）
+        if (LocalizationOverlayModule.Instance != null
+            && LocalizationOverlayModule.Instance.TryResolveText("zh-CN", null, lookup, contextKey, out translated))
         {
-            string stem = trimmed.Substring(0, trimmed.Length - 1).Trim();
+            return true;
+        }
+
+        // 3. 本地兜底字典
+        if (ExactEnglishToZh.TryGetValue(lookup, out translated))
+        {
+            return true;
+        }
+
+        if (lookup.Length > 1 && lookup[lookup.Length - 1] == ':')
+        {
+            string stem = lookup.Substring(0, lookup.Length - 1).TrimEnd();
             if (overrides != null && overrides.TryGetValue(stem, out string zhStem))
             {
                 translated = zhStem + "：";
@@ -534,34 +499,35 @@ internal static class TournamentLocalizationPatch
         try
         {
             Type t = obj.GetType();
-            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-            FieldInfo f = t.GetField(name, flags);
-            if (f != null)
+            var member = _memberCache.GetOrAdd((t, name), static key =>
             {
-                object val = f.GetValue(obj);
-                if (val is T tv) return tv;
-                return default;
-            }
-            PropertyInfo p = t.GetProperty(name, flags);
-            if (p != null && p.CanRead)
+                const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                MemberInfo f = key.Item1.GetField(key.Item2, flags);
+                if (f != null) return f;
+                return key.Item1.GetProperty(key.Item2, flags);
+            });
+
+            object val = member switch
             {
-                object val = p.GetValue(obj);
-                if (val is T tv) return tv;
-            }
+                FieldInfo fi => fi.GetValue(obj),
+                PropertyInfo pi when pi.CanRead => pi.GetValue(obj),
+                _ => null,
+            };
+            return val is T tv ? tv : default;
         }
         catch (Exception ex)
         {
             LogOnce($"reflect:{obj.GetType().Name}.{name}", $"TournamentLocalizationPatch reflection {name}: {ex.Message}");
+            return default;
         }
-        return default;
     }
 
     private static bool IsAsciiOnly(string s)
     {
         if (string.IsNullOrEmpty(s)) return true;
-        foreach (char c in s)
+        for (int i = 0; i < s.Length; i++)
         {
-            if (c > 127) return false;
+            if (s[i] > 127) return false;
         }
         return true;
     }

@@ -1,7 +1,9 @@
+using System.Collections.Frozen;
 using System.Text.Json;
 using BazaarCore.Data;
 using BazaarCore.Engine;
 using BazaarCore.Models;
+using BazaarCore.Mods;
 using Microsoft.Data.Sqlite;
 
 namespace BazaarServer.Data;
@@ -72,10 +74,15 @@ public sealed class CardPool
         /// <summary>完整的官方 `RewardVictory` / `RewardDefeat`（包含 SpawnContext、SelectionContextRules 等）。</summary>
         public CombatRewardData? RewardVictory { get; init; }
         public CombatRewardData? RewardDefeat { get; init; }
-    }
 
-    private const string DefaultWhitelistFallbackPath = @"e:\thebazaar\dist\data\valid_card_ids.json";
-    private const string DefaultZhCnFallbackPath = @"e:\thebazaar\dist\data\translations\zh-CN.bytes";
+        // ── Mod 自定义卡牌安全视觉载体元数据 ──────────────────────────────────
+        /// <summary>若本模板来自自定义 Mod，指向客户端白名单内同 Type+同 Size 的合法原版视觉载体 GUID。</summary>
+        public string? BaseVisualTemplateId { get; init; }
+        /// <summary>所属 Mod ID（官方原生卡为 null）。</summary>
+        public string? ModId { get; init; }
+        /// <summary>是否为 Mod 自定义卡。</summary>
+        public bool IsCustomModCard => !string.IsNullOrWhiteSpace(BaseVisualTemplateId);
+    }
 
     public const string TravelAgentEncounterId = "002d8f6d-0e36-4921-89ed-3f0f28682d7b";
     public const string JungleExpeditionTicketId = "77c8ef2d-62c8-4214-993d-648915c93e83";
@@ -102,12 +109,27 @@ public sealed class CardPool
             [TinyWorldExpeditionRoomId] = TinyWorldExpeditionTicketId,
         };
 
-    private readonly List<CardTemplate> _all = new();
-    private readonly Dictionary<string, CardTemplate> _byId = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, List<CardTemplate>> _byType = new(StringComparer.OrdinalIgnoreCase);
+    private sealed class PoolSnapshot
+    {
+        public required List<CardTemplate> All { get; init; }
+        public required Dictionary<string, CardTemplate> ById { get; init; }
+        public required Dictionary<string, List<CardTemplate>> ByType { get; init; }
+        public required Dictionary<string, string> CustomToBaseVisualId { get; init; }
+        public required int AssetValidCount { get; init; }
+        public ILocalizationStore? Localization { get; init; }
+    }
+
+    private volatile PoolSnapshot _snap = new()
+    {
+        All = new List<CardTemplate>(),
+        ById = new Dictionary<string, CardTemplate>(StringComparer.OrdinalIgnoreCase),
+        ByType = new Dictionary<string, List<CardTemplate>>(StringComparer.OrdinalIgnoreCase),
+        CustomToBaseVisualId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+        AssetValidCount = 0,
+    };
+
     private readonly HashSet<string> _validCardIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _zhTranslatedKeys = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Random _rng = new();
 
     /// <summary>默认游戏模式 Id（来自 GameData.db 的 game_modes 表，实测值）。</summary>
     public Guid DefaultGameModeId { get; private set; } = Guid.Empty;
@@ -122,14 +144,241 @@ public sealed class CardPool
     /// <summary>构造绑定到当前 GameData.db 权重表的 TierChances 实例。</summary>
     public TierChances CreateTierChances(int day = 1) => new(TierChancesByDay) { CurrentDay = day };
 
-    public int TotalRawCards => _all.Count;
-    public int TotalCards => WhitelistEnabled ? _all.Count(t => IsAssetValid(t.Id)) : _all.Count;
+    public int TotalRawCards => _snap.All.Count;
+    public int TotalCards => WhitelistEnabled ? _snap.AssetValidCount : _snap.All.Count;
+    public IReadOnlyList<CardTemplate> AllItems => _snap.ByType.TryGetValue("Item", out var list) ? list : Array.Empty<CardTemplate>();
+    public IReadOnlyList<CardTemplate> AllSkills => _snap.ByType.TryGetValue("Skill", out var list) ? list : Array.Empty<CardTemplate>();
     public string LoadedFrom { get; private set; } = "";
     public bool WhitelistEnabled { get; private set; }
     public string? WhitelistLoadedFrom { get; private set; }
     public bool ZhTranslationLoaded { get; private set; }
     public string? ZhTranslationLoadedFrom { get; private set; }
     public IReadOnlySet<string> ValidCardIds => _validCardIds;
+
+    /// <summary>
+    /// 直接基于已单次加载的 <see cref="GameDataRepository"/> 构造只读卡池（彻底消灭启动期重复解析 45MB GameData.db），
+    /// 同时兼容 Mod 热叠加和四层外挂中文词典校验。
+    /// </summary>
+    public static CardPool FromRepository(
+        GameDataRepository repo,
+        string? dataRoot = null,
+        IReadOnlySet<string>? validWhitelistOverride = null,
+        IReadOnlyDictionary<string, CustomCardVisualBinding>? visualBindings = null)
+    {
+        ArgumentNullException.ThrowIfNull(repo);
+        var pool = new CardPool();
+
+        string probeBase = !string.IsNullOrWhiteSpace(dataRoot)
+            ? Path.Combine(dataRoot, "GameData.db")
+            : (repo.SourceDataPath ?? string.Empty);
+
+        if (validWhitelistOverride is { Count: > 0 })
+        {
+            foreach (var id in validWhitelistOverride)
+            {
+                if (!string.IsNullOrWhiteSpace(id))
+                    pool._validCardIds.Add(id);
+            }
+            pool.WhitelistEnabled = pool._validCardIds.Count > 0;
+            pool.WhitelistLoadedFrom = "<injected>";
+        }
+        else if (!string.IsNullOrWhiteSpace(probeBase))
+        {
+            pool.TryLoadAssetWhitelist(probeBase);
+        }
+
+        if (repo.HasLocalizationLoaded)
+        {
+            pool.ZhTranslationLoaded = true;
+            pool.ZhTranslationLoadedFrom = repo.Localization?.SourcePath ?? "<repo-localization>";
+        }
+        else if (!string.IsNullOrWhiteSpace(probeBase))
+        {
+            pool.TryLoadZhTranslations(probeBase);
+        }
+
+        if (Guid.TryParse(repo.GameMode.Id, out var gmGuid))
+            pool.DefaultGameModeId = gmGuid;
+        if (repo.GameMode.ItemSkillSpawnTierPercantagesByDay is { Count: > 0 })
+            pool.TierChancesByDay = TierChances.FromGameModeMap(repo.GameMode.ItemSkillSpawnTierPercantagesByDay);
+        if (repo.GameMode.StandardPrices != null)
+            pool.StandardPrices = repo.GameMode.StandardPrices;
+
+        pool.LoadedFrom = repo.SourceDataPath ?? repo.SourceZipPath ?? "<repository>";
+        pool.ApplyRepositoryOverlay(repo, visualBindings);
+        Console.WriteLine(
+            $"[CardPool] (shared repo) mapped {pool.TotalRawCards} raw cards ({pool.TotalCards} asset-valid, whitelist={pool.WhitelistEnabled})");
+        return pool;
+    }
+
+    /// <summary>
+    /// 原子热刷新卡池快照（用于服务端 Mod 热重载/运行时启停，读路径全程无锁无撕裂）。
+    /// </summary>
+    public void ApplyRepositoryOverlay(
+        GameDataRepository activeRepo,
+        IReadOnlyDictionary<string, CustomCardVisualBinding>? visualBindings = null)
+    {
+        ArgumentNullException.ThrowIfNull(activeRepo);
+
+        var all = new List<CardTemplate>(activeRepo.CardsById.Count);
+        var byId = new Dictionary<string, CardTemplate>(activeRepo.CardsById.Count, StringComparer.OrdinalIgnoreCase);
+        var byType = new Dictionary<string, List<CardTemplate>>(StringComparer.OrdinalIgnoreCase);
+        var customMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        if (visualBindings != null)
+        {
+            foreach (var (cid, b) in visualBindings)
+            {
+                if (!string.IsNullOrWhiteSpace(cid) && !string.IsNullOrWhiteSpace(b.BaseVisualTemplateId))
+                    customMap[cid] = b.BaseVisualTemplateId;
+            }
+        }
+
+        int validCount = 0;
+        foreach (var core in activeRepo.CardsById.Values)
+        {
+            if (core == null || string.IsNullOrWhiteSpace(core.Id)) continue;
+            CustomCardVisualBinding? binding = null;
+            visualBindings?.TryGetValue(core.Id, out binding);
+            var mapped = MapFromCoreTemplate(core, binding);
+            all.Add(mapped);
+            byId[mapped.Id] = mapped;
+            if (!byType.TryGetValue(mapped.Type, out var list))
+            {
+                list = new List<CardTemplate>();
+                byType[mapped.Type] = list;
+            }
+            list.Add(mapped);
+
+            if (!WhitelistEnabled
+                || _validCardIds.Contains(mapped.Id)
+                || (!string.IsNullOrWhiteSpace(mapped.BaseVisualTemplateId) && _validCardIds.Contains(mapped.BaseVisualTemplateId)))
+            {
+                validCount++;
+            }
+        }
+
+        if (activeRepo.HasLocalizationLoaded)
+        {
+            ZhTranslationLoaded = true;
+            ZhTranslationLoadedFrom ??= activeRepo.Localization?.SourcePath ?? "<overlay>";
+        }
+
+        _snap = new PoolSnapshot
+        {
+            All = all,
+            ById = byId,
+            ByType = byType,
+            CustomToBaseVisualId = customMap,
+            AssetValidCount = validCount,
+            Localization = activeRepo.Localization,
+        };
+    }
+
+    /// <summary>解析自定义卡对应的合法原版视觉载体 GUID；若本身即为原版 GUID 则原样返回。</summary>
+    public string ResolveSafeWireTemplateId(string? templateId)
+    {
+        if (string.IsNullOrWhiteSpace(templateId)) return string.Empty;
+        var snap = _snap;
+        if (snap.CustomToBaseVisualId.TryGetValue(templateId, out var baseId) && !string.IsNullOrWhiteSpace(baseId))
+            return baseId;
+        if (snap.ById.TryGetValue(templateId, out var tpl) && !string.IsNullOrWhiteSpace(tpl.BaseVisualTemplateId))
+            return tpl.BaseVisualTemplateId!;
+        return templateId;
+    }
+
+    /// <summary>构建包含当前白名单与全部已启用 Mod 自定义卡 ID 的合并有效资产集（供 SpawnQueryEngine 放行 Mod 卡）。</summary>
+    public IReadOnlySet<string>? GetEffectiveValidAssetIds()
+    {
+        if (!WhitelistEnabled) return null;
+        var snap = _snap;
+        if (snap.CustomToBaseVisualId.Count == 0)
+            return _validCardIds;
+
+        var merged = new HashSet<string>(_validCardIds, StringComparer.OrdinalIgnoreCase);
+        foreach (var (customId, baseId) in snap.CustomToBaseVisualId)
+        {
+            if (_validCardIds.Contains(baseId))
+                merged.Add(customId);
+        }
+        return merged;
+    }
+
+    private static CardTemplate MapFromCoreTemplate(
+        BazaarCore.Models.CardTemplate core,
+        CustomCardVisualBinding? binding)
+    {
+        var tiers = new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
+        if (core.Tiers != null)
+        {
+            foreach (var (tierName, tierData) in core.Tiers)
+            {
+                var attrs = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                if (tierData?.Attributes != null)
+                {
+                    foreach (var (ak, av) in tierData.Attributes)
+                        attrs[ak] = (int)Math.Round(av);
+                }
+                tiers[tierName] = attrs;
+            }
+        }
+        else if (core.Attributes is { Count: > 0 })
+        {
+            var attrs = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (ak, av) in core.Attributes)
+                attrs[ak] = (int)Math.Round(av);
+            tiers[string.IsNullOrWhiteSpace(core.StartingTier) ? "Bronze" : core.StartingTier] = attrs;
+        }
+
+        var selReqs = new List<RuleNode>();
+        if (core.SelectionRequirements != null)
+            selReqs.Add(core.SelectionRequirements);
+
+        return new CardTemplate
+        {
+            Id = core.Id,
+            InternalName = core.InternalName ?? string.Empty,
+            Type = core.Type ?? string.Empty,
+            Heroes = core.Heroes?.ToArray() ?? Array.Empty<string>(),
+            Size = string.IsNullOrWhiteSpace(core.Size) ? "Medium" : core.Size,
+            StartingTier = string.IsNullOrWhiteSpace(core.StartingTier) ? "Bronze" : core.StartingTier,
+            Tags = core.Tags?.ToArray() ?? Array.Empty<string>(),
+            HiddenTags = core.HiddenTags?.ToArray() ?? Array.Empty<string>(),
+            ArtKey = core.ArtKey ?? string.Empty,
+            SpawningEligibility = string.IsNullOrWhiteSpace(core.SpawningEligibility) ? "Always" : core.SpawningEligibility!,
+            LocalizationTitleKey = core.Localization?.Title?.Key ?? string.Empty,
+            TranslationKey = core.TranslationKey ?? string.Empty,
+            TierAttributes = tiers,
+            ExperienceAwardUponSelection = core.ExperienceAwardUponSelection ?? 0,
+            ShouldProgressHour = core.ShouldProgressHour ?? true,
+            IsReselectable = core.IsReselectable ?? false,
+            NewSetIdOnExit = core.NewSetIdOnExit,
+            SelectionContext = core.SelectionContext,
+            NextEncounterOnSelection = core.NextEncounterOnSelection != null
+                ? new List<NextEncounterOption>(core.NextEncounterOnSelection)
+                : new List<NextEncounterOption>(),
+            SelectionRequirements = selReqs,
+            IsSingleSpawn = core.IsSingleSpawn ?? false,
+            IsTakeover = core.IsTakeover ?? false,
+            SpawningChance = core.SpawningChance ?? 0.0,
+            SpawningChanceIncrement = core.SpawningChanceIncrement ?? 0.0,
+            Behavior = core.Behavior,
+            SelectionCriteria = core.SelectionCriteria,
+            MonsterTemplateId = core.CombatantType?.MonsterTemplateId ?? string.Empty,
+            MonsterLevel = core.CombatantType?.Level ?? 0,
+            RewardCombatGold = core.RewardCombatGold ?? 0,
+            RewardCombatXp = core.RewardCombatXp ?? 0,
+            SandstormEnabled = core.SandstormEnabled ?? true,
+            RewardVictoryGold = core.RewardVictory?.GoldReward ?? 0,
+            RewardVictoryXp = core.RewardVictory?.ExperienceReward ?? 0,
+            RewardDefeatGold = core.RewardDefeat?.GoldReward ?? 0,
+            RewardDefeatXp = core.RewardDefeat?.ExperienceReward ?? 0,
+            RewardVictory = core.RewardVictory,
+            RewardDefeat = core.RewardDefeat,
+            BaseVisualTemplateId = binding?.BaseVisualTemplateId,
+            ModId = binding?.ModId ?? (core.Version?.StartsWith("mod:", StringComparison.OrdinalIgnoreCase) == true ? core.Version[4..] : null),
+        };
+    }
 
     public static CardPool Load(string dbPath)
     {
@@ -146,9 +395,7 @@ public sealed class CardPool
         using var conn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
         conn.Open();
 
-        // 先读 game_modes：客户端必须拿到真实 GameModeId，否则
-        //   "Failed to get GameModeTemplate for 00000000-..." 会连锁导致
-        //   时钟/血量/收入等 UI 全部降级；同时从权威 DB 同步每日品阶分布与标准价格，绝不让旧 JSON 覆盖。
+        // 先读 game_modes：客户端必须拿到真实 GameModeId，同时从权威 DB 同步每日品阶分布与标准价格
         try
         {
             using var gmCmd = conn.CreateCommand();
@@ -194,6 +441,11 @@ public sealed class CardPool
             Console.WriteLine("[CardPool] game_modes read failed: " + ex.Message);
         }
 
+        var all = new List<CardTemplate>(3600);
+        var byId = new Dictionary<string, CardTemplate>(3600, StringComparer.OrdinalIgnoreCase);
+        var byType = new Dictionary<string, List<CardTemplate>>(StringComparer.OrdinalIgnoreCase);
+        int validCount = 0;
+
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT Id, Data FROM cards";
         using var reader = cmd.ExecuteReader();
@@ -204,19 +456,30 @@ public sealed class CardPool
             string json = System.Text.Encoding.UTF8.GetString(blob);
             var t = Parse(id, json);
             if (t == null) continue;
-            pool._all.Add(t);
-            pool._byId[t.Id] = t;
-            if (!pool._byType.TryGetValue(t.Type, out var list))
+            all.Add(t);
+            byId[t.Id] = t;
+            if (!byType.TryGetValue(t.Type, out var list))
             {
                 list = new List<CardTemplate>();
-                pool._byType[t.Type] = list;
+                byType[t.Type] = list;
             }
             list.Add(t);
+            if (!pool.WhitelistEnabled || pool._validCardIds.Contains(t.Id))
+                validCount++;
         }
+
+        pool._snap = new PoolSnapshot
+        {
+            All = all,
+            ById = byId,
+            ByType = byType,
+            CustomToBaseVisualId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+            AssetValidCount = validCount,
+        };
         pool.LoadedFrom = dbPath;
         Console.WriteLine(
-            $"[CardPool] loaded {pool._all.Count} raw cards ({pool.TotalCards} asset-valid, whitelist={pool.WhitelistEnabled}) from {dbPath}");
-        foreach (var kv in pool._byType)
+            $"[CardPool] loaded {all.Count} raw cards ({pool.TotalCards} asset-valid, whitelist={pool.WhitelistEnabled}) from {dbPath}");
+        foreach (var kv in byType)
         {
             int validCnt = pool.WhitelistEnabled ? kv.Value.Count(c => pool.IsAssetValid(c.Id)) : kv.Value.Count;
             Console.WriteLine($"[CardPool]   {kv.Key,-22} {validCnt}/{kv.Value.Count}");
@@ -271,22 +534,29 @@ public sealed class CardPool
 
     private static string? ResolveWhitelistPath(string dbPath)
     {
-        string? dbDir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
+        string? dbDir = !string.IsNullOrWhiteSpace(dbPath) ? Path.GetDirectoryName(Path.GetFullPath(dbPath)) : null;
         var candidates = new[]
         {
             dbDir != null ? Path.Combine(dbDir, "valid_card_ids.json") : null,
             Path.Combine(AppContext.BaseDirectory, "data", "valid_card_ids.json"),
+            Path.Combine(Environment.CurrentDirectory, "data", "valid_card_ids.json"),
             Path.Combine(Environment.CurrentDirectory, "dist", "data", "valid_card_ids.json"),
-            DefaultWhitelistFallbackPath,
         };
         return candidates.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p) && File.Exists(p));
     }
 
-    /// <summary>判断卡牌 ID 是否具备客户端 Addressables 本地资产（未加载白名单时放行非空 ID）。</summary>
+    /// <summary>判断卡牌 ID 是否具备客户端 Addressables 本地资产（Mod 自定义卡校验其 BaseVisualTemplateId 是否位于白名单）。</summary>
     public bool IsAssetValid(string? id)
     {
         if (string.IsNullOrWhiteSpace(id)) return false;
-        return !WhitelistEnabled || _validCardIds.Contains(id);
+        if (!WhitelistEnabled) return true;
+        if (_validCardIds.Contains(id)) return true;
+        var snap = _snap;
+        if (snap.CustomToBaseVisualId.TryGetValue(id, out var baseId) && _validCardIds.Contains(baseId))
+            return true;
+        if (snap.ById.TryGetValue(id, out var tpl) && !string.IsNullOrWhiteSpace(tpl.BaseVisualTemplateId))
+            return _validCardIds.Contains(tpl.BaseVisualTemplateId);
+        return false;
     }
 
     private void TryLoadZhTranslations(string dbPath)
@@ -335,23 +605,34 @@ public sealed class CardPool
 
     private static string? ResolveZhTranslationPath(string dbPath)
     {
-        string? dbDir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
+        string? dbDir = !string.IsNullOrWhiteSpace(dbPath) ? Path.GetDirectoryName(Path.GetFullPath(dbPath)) : null;
         var candidates = new[]
         {
             dbDir != null ? Path.Combine(dbDir, "translations", "zh-CN.bytes") : null,
             Path.Combine(AppContext.BaseDirectory, "data", "translations", "zh-CN.bytes"),
+            Path.Combine(Environment.CurrentDirectory, "data", "translations", "zh-CN.bytes"),
             Path.Combine(Environment.CurrentDirectory, "dist", "data", "translations", "zh-CN.bytes"),
             SteamPathResolver.ResolveZhCnTranslationPath(),
-            DefaultZhCnFallbackPath,
         };
         return candidates.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p) && File.Exists(p));
     }
 
-    /// <summary>判断卡牌模板是否拥有官方简体中文标题（未加载词库时回退为 true）。</summary>
+    /// <summary>判断卡牌模板是否拥有官方或外挂/Mod 简体中文标题（未加载词库时回退为 true）。</summary>
     public bool HasZhTranslation(CardTemplate? tpl)
     {
         if (tpl == null) return false;
+        if (tpl.IsCustomModCard) return true;
         if (!ZhTranslationLoaded) return true;
+        var loc = _snap.Localization;
+        if (loc != null)
+        {
+            if (!string.IsNullOrWhiteSpace(tpl.LocalizationTitleKey) && loc.TryGetText(tpl.LocalizationTitleKey, out _))
+                return true;
+            if (!string.IsNullOrWhiteSpace(tpl.TranslationKey) && loc.TryGetText(tpl.TranslationKey, out _))
+                return true;
+            if (loc is OverlayLocalizationStore ov && ov.ExportMergedOverlay().Document.CardOverrides.ContainsKey(tpl.Id))
+                return true;
+        }
         if (!string.IsNullOrWhiteSpace(tpl.LocalizationTitleKey) && _zhTranslatedKeys.Contains(tpl.LocalizationTitleKey))
             return true;
         if (!string.IsNullOrWhiteSpace(tpl.TranslationKey) && _zhTranslatedKeys.Contains(tpl.TranslationKey))
@@ -377,6 +658,7 @@ public sealed class CardPool
         "41cdf4ee-7790-4da1-96f8-a46d3391a0d9", // The Tester
         "47704642-ae7a-4775-a26a-e5e5a8cff7bf", // Eating Contest
         "62d59e46-31cc-411d-af27-0f3bf82ca57b", // Big Bad Wolf
+        "4cdcc6d3-c0e6-4996-a0ea-c3457211f406", // [DEBUG] Transform
     };
 
     /// <summary>判断模板是否为必须全局屏蔽的开发调试/教程/剧情残留废卡。</summary>
@@ -630,7 +912,7 @@ public sealed class CardPool
 
     /// <summary>按模板 ID 查询（包含系统特殊占位卡如 Hour6PvpCardId；需要校验本地资产时请配合 IsAssetValid）。</summary>
     public CardTemplate Get(string id)
-        => !string.IsNullOrWhiteSpace(id) && _byId.TryGetValue(id, out var t) ? t : null;
+        => !string.IsNullOrWhiteSpace(id) && _snap.ById.TryGetValue(id, out var t) ? t : null;
 
     /// <summary>仅当模板存在且通过客户端 Addressables 资产白名单校验时返回。</summary>
     public CardTemplate? GetIfAssetValid(string id)
@@ -639,7 +921,7 @@ public sealed class CardPool
     /// <summary>按类型查询卡牌（若启用资产白名单则自动过滤无本地资产卡牌）。</summary>
     public IEnumerable<CardTemplate> OfType(string type)
     {
-        if (!_byType.TryGetValue(type, out var list)) return Enumerable.Empty<CardTemplate>();
+        if (!_snap.ByType.TryGetValue(type, out var list)) return Enumerable.Empty<CardTemplate>();
         return WhitelistEnabled ? list.Where(t => IsAssetValid(t.Id)) : list;
     }
 
@@ -777,10 +1059,20 @@ public sealed class CardPool
         TierChances chances,
         IReadOnlyDictionary<string, CardTier>? ownedMaxTiers,
         Func<string, ulong>? archetypeResolver,
-        CustomRunRuleSet? rules = null)
+        CustomRunRuleSet? rules = null,
+        Random? rngOverride = null)
     {
-        var pool = ShopItems(hero);
-        if (pool.Count == 0) return new List<(CardTemplate, string)>();
+        bool isCrossHero = rules?.SpecialModeId == ESpecialModeId.CrossHeroMayhem;
+        List<CardTemplate> ownHeroPool = ShopItems(hero);
+        List<CardTemplate> crossHeroPool = isCrossHero
+            ? OfType("Item")
+                .Where(t => IsPlayerSpawnable(t, allowGuidOnly: false))
+                .Where(t => t.Heroes.Any(h => HeroNames.PlayableHeroes.Contains(h, StringComparer.OrdinalIgnoreCase)))
+                .ToList()
+            : ownHeroPool;
+
+        if (crossHeroPool.Count == 0 && ownHeroPool.Count == 0)
+            return new List<(CardTemplate, string)>();
 
         Dictionary<string, CardTier>? ownedLookup = null;
         if (ownedMaxTiers is { Count: > 0 })
@@ -794,17 +1086,21 @@ public sealed class CardPool
             }
         }
 
+        var rng = rngOverride ?? Random.Shared;
         chances.CurrentDay = day;
         var allowedTiers = chances.GetNonZeroTiersForDay(day);
         if (allowedTiers.Count == 0)
             allowedTiers = ["Bronze"];
+
+        double ownBias = isCrossHero ? Math.Clamp(rules!.CrossHeroOwnHeroBias, 0.0, 1.0) : 1.0;
+        double highTierBonus = rules?.ShopHighTierBonusPct ?? 0.0;
 
         var result = new List<(CardTemplate, string)>();
         var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         for (int i = 0; i < count; i++)
         {
-            string rolledTier = chances.Roll(_rng);
+            string rolledTier = chances.Roll(rng, highTierBonus);
             var tryOrder = new List<string> { rolledTier };
             foreach (string t in allowedTiers)
             {
@@ -812,22 +1108,37 @@ public sealed class CardPool
                     tryOrder.Add(t);
             }
 
+            // 跨职业混池模式：按 40% 本英雄保底 + 60% 全英雄混池分流抽选
+            var activePool = isCrossHero && ownHeroPool.Count > 0 && rng.NextDouble() < ownBias
+                ? ownHeroPool
+                : (crossHeroPool.Count > 0 ? crossHeroPool : ownHeroPool);
+
             CardTemplate? picked = null;
             string pickedTier = rolledTier;
             foreach (string tier in tryOrder)
             {
                 int tierOrder = TierOrder(tier);
                 CardTier rolledCoreTier = TierHelper.ParseTier(tier);
-                var candidates = pool
+                var candidates = activePool
                     .Where(c => !used.Contains(c.Id)
                              && TierOrder(c.StartingTier) <= tierOrder
                              && c.TierAttributes.ContainsKey(tier)
                              && !HasExplicitZeroOrNegativeBuyPrice(c, tier)
                              && IsAllowedByOwnedMaxTiers(c.Id, rolledCoreTier, ownedLookup))
                     .ToList();
+                if (candidates.Count == 0 && isCrossHero && !ReferenceEquals(activePool, crossHeroPool))
+                {
+                    candidates = crossHeroPool
+                        .Where(c => !used.Contains(c.Id)
+                                 && TierOrder(c.StartingTier) <= tierOrder
+                                 && c.TierAttributes.ContainsKey(tier)
+                                 && !HasExplicitZeroOrNegativeBuyPrice(c, tier)
+                                 && IsAllowedByOwnedMaxTiers(c.Id, rolledCoreTier, ownedLookup))
+                        .ToList();
+                }
                 if (candidates.Count > 0)
                 {
-                    picked = PickShopCandidate(candidates, archetypeResolver, rules);
+                    picked = PickShopCandidate(candidates, archetypeResolver, rules, rng);
                     pickedTier = tier;
                     break;
                 }
@@ -843,8 +1154,9 @@ public sealed class CardPool
     private CardTemplate PickShopCandidate(
         List<CardTemplate> candidates,
         Func<string, ulong>? archetypeResolver,
-        CustomRunRuleSet? rules)
-        => SpawnQueryEngine.PickWeightedByArchetype(candidates, c => c.Id, _rng, archetypeResolver, rules)!;
+        CustomRunRuleSet? rules,
+        Random? rng = null)
+        => SpawnQueryEngine.PickWeightedByArchetype(candidates, c => c.Id, rng ?? Random.Shared, archetypeResolver, rules)!;
 
     private static bool IsAllowedByOwnedMaxTiers(
         string templateId,
@@ -871,6 +1183,7 @@ public sealed class CardPool
     {
         var pool = Encounters(hero, kind);
         if (pool.Count == 0) return new List<CardTemplate>();
+        var rng = Random.Shared;
         var used = new HashSet<string>();
         var result = new List<CardTemplate>();
         for (int i = 0; i < count && used.Count < pool.Count; i++)
@@ -879,7 +1192,7 @@ public sealed class CardPool
             int guard = 0;
             do
             {
-                pick = pool[_rng.Next(pool.Count)];
+                pick = pool[rng.Next(pool.Count)];
                 guard++;
             } while (used.Contains(pick.Id) && guard < 200);
             if (used.Contains(pick.Id)) continue;
@@ -911,7 +1224,7 @@ public sealed class CardPool
             .ToList();
         if (candidates.Count == 0) return null;
 
-        rng ??= _rng;
+        rng ??= Random.Shared;
         if (weightMultiplier != null)
         {
             var weighted = new List<(CardTemplate Template, double Weight)>(candidates.Count);
@@ -976,7 +1289,7 @@ public sealed class CardPool
     public CardTemplate RollSkill(string hero)
     {
         var pool = Skills(hero);
-        return pool.Count == 0 ? null : pool[_rng.Next(pool.Count)];
+        return pool.Count == 0 ? null : pool[Random.Shared.Next(pool.Count)];
     }
 
     public CardTemplate RollMonster(string hero)
@@ -984,7 +1297,7 @@ public sealed class CardPool
         var pool = OfType("CombatEncounter")
             .Where(t => t.SpawningEligibility != "Never")
             .ToList();
-        return pool.Count == 0 ? null : pool[_rng.Next(pool.Count)];
+        return pool.Count == 0 ? null : pool[Random.Shared.Next(pool.Count)];
     }
 }
 
@@ -1068,18 +1381,31 @@ public sealed class TierChances
         return _table[idx];
     }
 
-    public string Roll(Random rng)
+    public string Roll(Random rng, double highTierBonusPct = 0.0)
     {
         var row = GetWeightsForDay(CurrentDay);
-        double total = row.Bronze + row.Silver + row.Gold + row.Diamond;
+        double b = row.Bronze;
+        double s = row.Silver;
+        double g = row.Gold;
+        double d = row.Diamond;
+
+        if (highTierBonusPct > 0.0)
+        {
+            double boost = 1.0 + Math.Clamp(highTierBonusPct, 0.0, 100.0) / 100.0;
+            s *= boost;
+            g *= boost;
+            d *= boost;
+        }
+
+        double total = b + s + g + d;
         if (total <= 0) return "Bronze";
 
         double r = rng.NextDouble() * total;
-        if (r < row.Bronze) return "Bronze";
-        r -= row.Bronze;
-        if (r < row.Silver) return "Silver";
-        r -= row.Silver;
-        if (r < row.Gold) return "Gold";
+        if (r < b) return "Bronze";
+        r -= b;
+        if (r < s) return "Silver";
+        r -= s;
+        if (r < g) return "Gold";
         return "Diamond";
     }
 

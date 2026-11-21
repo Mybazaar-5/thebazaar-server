@@ -1,0 +1,29 @@
+{
+  "$schema": "https://bazaar-local.schema/mod-manifest/v1",
+  "schemaVersion": 1,
+  "id": "bazaar-chronicles-sample",
+  "name": "大巴扎编年史：星港奇物志",
+  "displayNameZh": "大巴扎编年史：星港奇物志",
+  "displayNameEn": "Bazaar Chronicles: Starport Curiosities",
+  "version": "1.0.0",
+  "author": "Bazaar Local Community",
+  "descriptionZh": "官方风格原创 Mod 扩展包示例：新增 4 件星港机械与炼金奇物（覆盖 Small/Medium/Large 及武器/护盾/灼烧/经济联动）、2 项专属技能、1 套 2 步联动「星港黑市走私船」奇遇事件链与 2 条肉鸽扩展词条，全部严格绑定白名单同 Type/Size 原版视觉载体并附带 6 张高清鎏金 PNG 卡图。",
+  "enabledByDefault": true,
+  "loadOrder": 100,
+  "coreApiVersion": "1.0.0",
+  "minServerVersion": "2.1.0",
+  "minLauncherVersion": "2.1.0",
+  "minGameDataVersion": "5.0.0",
+  "scope": "multiplayer-safe",
+  "affectsGhostPool": false,
+  "affectsStandardGhostPool": false,
+  "dependencies": [],
+  "contentRoots": {
+    "cards": "cards/custom_cards.json",
+    "events": "events/custom_events.json",
+    "modes": "modes/custom_mutators.json",
+    "localization": "localization/zh-CN.json",
+    "assets": "assets/*.png",
+    "artManifest": "assets/art_manifest.json"
+  }
+}

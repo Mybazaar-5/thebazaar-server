@@ -14,10 +14,23 @@ public static class SessionRegistry
 
     private static readonly ConcurrentDictionary<string, Handle> _map = new(StringComparer.Ordinal);
 
+    public static int ActiveCount => _map.Count;
+
+    public static Handle? TryFindByRunId(string? runId)
+    {
+        if (string.IsNullOrWhiteSpace(runId)) return null;
+        foreach (var kv in _map)
+        {
+            if (string.Equals(kv.Value.Run?.RunId, runId, StringComparison.OrdinalIgnoreCase))
+                return kv.Value;
+        }
+        return null;
+    }
+
     public static void Attach(string sid, RunState run, RunEngine engine)
         => _map[sid] = new Handle { Run = run, Engine = engine };
 
-    public static Handle Get(string sid) => _map.TryGetValue(sid, out var h) ? h : null;
+    public static Handle? Get(string sid) => _map.TryGetValue(sid, out var h) ? h : null;
 
     public static void Detach(string sid) => _map.TryRemove(sid, out _);
 

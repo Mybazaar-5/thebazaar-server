@@ -208,14 +208,17 @@ public sealed class SessionStore
     /// <summary>accountId → 当前活跃 sid。同一账号只保留一个会话，避免重复开局导致状态分裂。</summary>
     private readonly ConcurrentDictionary<string, string> _activeByAccount = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>会话被驱逐或替换时触发（用于同步清理 RidCaches、SessionRegistry、观战录制器，杜绝内存泄漏）。</summary>
+    public event Action<Session>? SessionEvicted;
+
     public Session Create(string accountId, string username, InitializeRunCommand init)
     {
-        // 同一账号重复开局：销毁旧会话
+        // 同一账号重复开局：摘除旧会话（严禁直接 Dispose(Gate)，防止正在执行 /commands 的线程触发 P1-1 ObjectDisposedException！）
         if (!string.IsNullOrWhiteSpace(accountId) && _activeByAccount.TryGetValue(accountId, out var oldSid))
         {
             if (_sessions.TryRemove(oldSid, out var old))
             {
-                try { old.Gate.Dispose(); } catch { }
+                NotifySessionEvictedSafe(old);
             }
             _activeByAccount.TryRemove(new KeyValuePair<string, string>(accountId, oldSid));
         }
@@ -253,11 +256,12 @@ public sealed class SessionStore
         {
             if (!string.IsNullOrWhiteSpace(s.AccountId))
                 _activeByAccount.TryRemove(new KeyValuePair<string, string>(s.AccountId, s.Sid));
-            try { s.Gate.Dispose(); } catch { }
+            // 不再直接调用 s.Gate.Dispose()：未持有 WaitHandle 的 SemaphoreSlim 由 GC 自动回收，100% 避免并发等待者崩 ObjectDisposedException
+            NotifySessionEvictedSafe(s);
         }
     }
 
-    /// <summary>驱逐超过 maxIdle 未活动的空闲会话并释放其 Gate，防止 100-CCU 长跑内存泄漏。</summary>
+    /// <summary>驱逐超过 maxIdle 未活动的空闲会话并触发外围缓存清理，防止 100-CCU 长跑内存泄漏。</summary>
     public int EvictIdleSessions(TimeSpan maxIdle)
     {
         DateTime now = DateTime.UtcNow;
@@ -273,12 +277,18 @@ public sealed class SessionStore
             {
                 if (!string.IsNullOrWhiteSpace(session.AccountId))
                     _activeByAccount.TryRemove(new KeyValuePair<string, string>(session.AccountId, session.Sid));
-                try { session.Gate.Dispose(); } catch { }
+                NotifySessionEvictedSafe(session);
                 evicted++;
             }
         }
 
         return evicted;
+    }
+
+    private void NotifySessionEvictedSafe(Session session)
+    {
+        try { SessionEvicted?.Invoke(session); }
+        catch { }
     }
 
     public int Count => _sessions.Count;

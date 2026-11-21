@@ -144,21 +144,24 @@ internal sealed class NativeUguiFactory
 
     internal void Dispose()
     {
-        try
-        {
-            var def = TMP_Settings.defaultFontAsset;
-            if (def != null && def.fallbackFontAssetTable != null && _osFallbackFont != null)
-            {
-                def.fallbackFontAssetTable.Remove(_osFallbackFont);
-            }
-            if (TMP_Settings.fallbackFontAssets != null && _osFallbackFont != null)
-            {
-                TMP_Settings.fallbackFontAssets.Remove(_osFallbackFont);
-            }
-        }
-        catch { }
-
+        // P1-2 修复：严禁触碰或篡改原版 TMP_Settings.defaultFontAsset / fallbackFontAssets，仅彻底回收自身创建的资源与动态图集显存
         var osMat = _osFallbackFont != null ? _osFallbackFont.material : null;
+        if (_osFallbackFont != null)
+        {
+            try
+            {
+                var atlases = _osFallbackFont.atlasTextures;
+                if (atlases != null)
+                {
+                    for (int i = 0; i < atlases.Length; i++)
+                    {
+                        DestroyObj(atlases[i]);
+                    }
+                }
+            }
+            catch { }
+        }
+
         DestroyObj(RoundedSprite);
         DestroyObj(BorderSprite);
         DestroyObj(CircleSprite);
@@ -205,137 +208,98 @@ internal sealed class NativeUguiFactory
 
         try
         {
-            // 无论游戏原生字库是否存在或是否为静默子集，优先构建并挂载真实系统动态中文字体作为三层全局兜底，彻底消灭 □ 缺字
-            var osFallback = GetOrCreateOsChineseFontAsset();
-
-            // 1. 扫描场景 TMP_Text，优先复用原生 Sans 中文字库，并在其 fallback 首位挂载 OS 动态字体
-            var sceneTexts = UnityEngine.Object.FindObjectsByType<TMP_Text>(FindObjectsInactive.Include, FindObjectsSortMode.None);
-            TMP_FontAsset chineseTextSans = null;
-            TMP_FontAsset chineseTextAny = null;
-            TMP_FontAsset otherTextSans = null;
-            TMP_FontAsset otherTextAny = null;
-
-            foreach (var t in sceneTexts)
+            // P1-2 修复：彻底废除全场景 FindObjectsByType / FindObjectsOfTypeAll 扫描，
+            // 直接零开销读取原版 NotoFontFallbackRuntime 已加载的中文字库，且绝不篡改原版全局 TMP 回退表！
+            TMP_FontAsset notoFont = TryGetNativeNotoFontAsset();
+            if (notoFont != null)
             {
-                if (t == null || t.font == null) continue;
-                var f = t.font;
-                if (!FontSupportsChineseWithoutOsFallback(f)) continue;
-
-                bool hasZhText = ContainsChineseChar(t.text);
-                bool isSans = (f.name ?? "").IndexOf("Sans", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                if (hasZhText)
-                {
-                    if (isSans)
-                    {
-                        chineseTextSans = f;
-                        break;
-                    }
-                    chineseTextAny ??= f;
-                }
-                else
-                {
-                    if (isSans) otherTextSans ??= f;
-                    else otherTextAny ??= f;
-                }
-            }
-
-            TMP_FontAsset chosenNative = chineseTextSans ?? chineseTextAny ?? otherTextSans ?? otherTextAny;
-            if (chosenNative != null)
-            {
-                EnsureOsFallbackAttachedToFont(chosenNative, osFallback);
-                EnsureRegisteredInDefaultFallback(osFallback);
                 isVerifiedChinese = true;
                 isNativeChinese = true;
-                return chosenNative;
+                return notoFont;
             }
 
-            // 2. 扫描已加载的 TMP_FontAsset 资源：优先名称包含 SC/CN/Hans/Chinese/CJK/Noto/SourceHan 的字库
-            var allFonts = Resources.FindObjectsOfTypeAll<TMP_FontAsset>();
-            TMP_FontAsset hintedSans = null;
-            TMP_FontAsset hintedAny = null;
-            TMP_FontAsset generalSans = null;
-            TMP_FontAsset generalAny = null;
-
-            foreach (var f in allFonts)
-            {
-                if (f == null || f == _osFallbackFont) continue;
-                if (!FontSupportsChineseWithoutOsFallback(f)) continue;
-
-                string n = f.name ?? "";
-                bool isSans = n.IndexOf("Sans", StringComparison.OrdinalIgnoreCase) >= 0;
-                bool hasHint = ContainsAnyHint(n, ChineseFontNameHints);
-
-                if (hasHint)
-                {
-                    if (isSans)
-                    {
-                        hintedSans = f;
-                        break;
-                    }
-                    hintedAny ??= f;
-                }
-                else
-                {
-                    if (isSans) generalSans ??= f;
-                    else generalAny ??= f;
-                }
-            }
-
-            chosenNative = hintedSans ?? hintedAny ?? generalSans ?? generalAny;
-            if (chosenNative != null)
-            {
-                EnsureOsFallbackAttachedToFont(chosenNative, osFallback);
-                EnsureRegisteredInDefaultFallback(osFallback);
-                isVerifiedChinese = true;
-                isNativeChinese = true;
-                return chosenNative;
-            }
-
-            // 3. 核查 TMP 默认字体本身（含原生回退链）是否可常显中文
+            // 2. 检查原版 TMP 默认字体本身（仅只读探测，tryAddCharacter=false 不触发额外 SDF 烘焙）
             var defFont = TMP_Settings.defaultFontAsset;
-            if (defFont != null && FontSupportsChineseWithoutOsFallback(defFont))
+            if (defFont != null && FontSupportsChineseReadOnly(defFont))
             {
-                EnsureOsFallbackAttachedToFont(defFont, osFallback);
-                EnsureRegisteredInDefaultFallback(osFallback);
                 isVerifiedChinese = true;
                 isNativeChinese = true;
                 return defFont;
             }
 
-            // 4. 终极保底：使用系统动态字体作为主字库
-            if (osFallback != null && FontSupportsChinese(osFallback))
+            // 3. 若原版 Noto 字库尚未加载完成，使用完全隔离的自建私有 OS 动态中文字体（绝不挂入原版全局回退表）
+            var osPrivateFont = GetOrCreateOsChineseFontAsset();
+            if (osPrivateFont != null)
             {
-                EnsureRegisteredInDefaultFallback(osFallback);
                 isVerifiedChinese = true;
                 isNativeChinese = false;
-                return osFallback;
+                return osPrivateFont;
             }
 
-            // 5. 若系统字体亦不可用，暂退回 TMP 默认字体并保持 _hasVerifiedChineseFont=false 以便后续继续重试
             if (defFont != null)
             {
                 return defFont;
-            }
-            foreach (var f in allFonts)
-            {
-                if (f != null) return f;
             }
         }
         catch { }
         return null;
     }
 
+    private static TMP_FontAsset TryGetNativeNotoFontAsset()
+    {
+        try
+        {
+            var notoType = HarmonyLib.AccessTools.TypeByName("TheBazaar.Localization.NotoFontFallbackRuntime");
+            if (notoType == null) return null;
+
+            const System.Reflection.BindingFlags flags =
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+
+            foreach (var fieldName in new[] { "_loadedSansPrimary", "_loadedSerifPrimary", "_sansPrimary", "_serifPrimary" })
+            {
+                var f = notoType.GetField(fieldName, flags);
+                if (f?.GetValue(null) is TMP_FontAsset fa && fa != null)
+                {
+                    return fa;
+                }
+            }
+
+            foreach (var propName in new[] { "LoadedSansPrimary", "LoadedSerifPrimary" })
+            {
+                var p = notoType.GetProperty(propName, flags);
+                if (p?.GetValue(null) is TMP_FontAsset fa && fa != null)
+                {
+                    return fa;
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static bool FontSupportsChineseReadOnly(TMP_FontAsset font)
+    {
+        if (font == null) return false;
+        try
+        {
+            return font.HasCharacter('规', searchFallbacks: true, tryAddCharacter: false)
+                && font.HasCharacter('则', searchFallbacks: true, tryAddCharacter: false)
+                && font.HasCharacter('戏', searchFallbacks: true, tryAddCharacter: false);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private TMP_FontAsset GetOrCreateOsChineseFontAsset()
     {
         if (_osFallbackFont != null)
         {
-            EnsureRegisteredInDefaultFallback(_osFallbackFont);
             return _osFallbackFont;
         }
 
-        // Unity 6 (6000.x) 中 Font.CreateDynamicFontFromOSFont 对系统字体报 Unable to load font face，
-        // 必须直接通过真实字体文件路径创建可动态光栅化全汉字集的多图集 TMP_FontAsset。
+        // 仅作为本插件私有 UI 独立字体，绝不写入 TMP_Settings.defaultFontAsset 或 TMP_Settings.fallbackFontAssets
         var candidates = CollectCandidateChineseFontPaths();
         foreach (string fontPath in candidates)
         {
@@ -353,12 +317,11 @@ internal sealed class NativeUguiFactory
 
                 if (tmpFont == null) continue;
 
-                tmpFont.name = "BazaarOsChineseFallbackFont";
+                tmpFont.name = "BazaarPrivateChineseUiFont";
                 tmpFont.hideFlags = HideFlags.HideAndDontSave;
                 tmpFont.atlasPopulationMode = AtlasPopulationMode.Dynamic;
                 tmpFont.isMultiAtlasTexturesEnabled = true;
 
-                // 确保材质与主贴图完整有效，避免渲染异常或隐形字形
                 if (tmpFont.material == null || tmpFont.material.shader == null)
                 {
                     Shader fallbackShader = TMP_Settings.defaultFontAsset?.material?.shader
@@ -368,7 +331,7 @@ internal sealed class NativeUguiFactory
                     {
                         var mat = new Material(fallbackShader)
                         {
-                            name = "BazaarOsChineseFallbackMat",
+                            name = "BazaarPrivateChineseUiMat",
                             hideFlags = HideFlags.HideAndDontSave,
                         };
                         if (tmpFont.atlasTexture != null)
@@ -387,54 +350,41 @@ internal sealed class NativeUguiFactory
                     }
                 }
 
-                // 实测游戏静态字库曾缺字的汉字是否可直接动态光栅化，确认无豆腐块后才采纳
                 bool probeOk = tmpFont.HasCharacter('槽', searchFallbacks: false, tryAddCharacter: true)
-                    && tmpFont.HasCharacter('键', searchFallbacks: false, tryAddCharacter: true)
-                    && tmpFont.HasCharacter('倾', searchFallbacks: false, tryAddCharacter: true)
-                    && tmpFont.HasCharacter('帧', searchFallbacks: false, tryAddCharacter: true);
+                    && tmpFont.HasCharacter('键', searchFallbacks: false, tryAddCharacter: true);
                 if (!probeOk)
                 {
-                    DestroyObj(tmpFont.material);
-                    DestroyObj(tmpFont);
+                    DestroyDynamicFontSafe(tmpFont);
                     continue;
                 }
 
                 _osFallbackFont = tmpFont;
-                EnsureRegisteredInDefaultFallback(_osFallbackFont);
-                BazaarLauncherPlugin.Log?.LogInfo($"NativeUguiFactory: created Unity6 file-backed dynamic TMP_FontAsset from '{Path.GetFileName(fontPath)}'");
+                BazaarLauncherPlugin.Log?.LogInfo($"NativeUguiFactory: 已创建私有隔离中文字库 '{Path.GetFileName(fontPath)}'（未改动原版 TMP 回退表）");
                 return _osFallbackFont;
             }
             catch (Exception ex)
             {
-                if (tmpFont != null)
-                {
-                    DestroyObj(tmpFont.material);
-                    DestroyObj(tmpFont);
-                }
-                BazaarLauncherPlugin.Log?.LogWarning($"NativeUguiFactory: failed loading OS font file '{fontPath}': {ex.Message}");
+                DestroyDynamicFontSafe(tmpFont);
+                BazaarLauncherPlugin.Log?.LogWarning($"NativeUguiFactory: 加载私有字体 '{fontPath}' 失败: {ex.Message}");
             }
         }
-
-        // 最后保底尝试家族名+样式重载
-        try
-        {
-            var byFamily = TMP_FontAsset.CreateFontAsset("Microsoft YaHei", "Regular", 36);
-            if (byFamily != null && byFamily.HasCharacter('槽', searchFallbacks: false, tryAddCharacter: true))
-            {
-                byFamily.name = "BazaarOsChineseFallbackFont";
-                byFamily.hideFlags = HideFlags.HideAndDontSave;
-                byFamily.atlasPopulationMode = AtlasPopulationMode.Dynamic;
-                byFamily.isMultiAtlasTexturesEnabled = true;
-                _osFallbackFont = byFamily;
-                EnsureRegisteredInDefaultFallback(_osFallbackFont);
-                BazaarLauncherPlugin.Log?.LogInfo("NativeUguiFactory: created family-backed OS Chinese dynamic TMP_FontAsset fallback");
-                return _osFallbackFont;
-            }
-            if (byFamily != null) DestroyObj(byFamily);
-        }
-        catch { }
 
         return null;
+    }
+
+    private static void DestroyDynamicFontSafe(TMP_FontAsset font)
+    {
+        if (font == null) return;
+        try
+        {
+            if (font.atlasTextures != null)
+            {
+                foreach (var tex in font.atlasTextures) DestroyObj(tex);
+            }
+            DestroyObj(font.material);
+            DestroyObj(font);
+        }
+        catch { }
     }
 
     private static List<string> CollectCandidateChineseFontPaths()
@@ -493,134 +443,6 @@ internal sealed class NativeUguiFactory
         catch { }
 
         return result;
-    }
-
-    private static void EnsureOsFallbackAttachedToFont(TMP_FontAsset targetFont, TMP_FontAsset osFallback)
-    {
-        if (targetFont == null || osFallback == null || targetFont == osFallback) return;
-        try
-        {
-            targetFont.fallbackFontAssetTable ??= new List<TMP_FontAsset>();
-            if (!targetFont.fallbackFontAssetTable.Contains(osFallback))
-            {
-                // 插入首位确保比损坏的备用回退更早兜底补字，同时不影响主字体的已有汉字
-                targetFont.fallbackFontAssetTable.Insert(0, osFallback);
-            }
-        }
-        catch { }
-    }
-
-    private static void EnsureRegisteredInDefaultFallback(TMP_FontAsset osFontAsset)
-    {
-        if (osFontAsset == null) return;
-        try
-        {
-            var def = TMP_Settings.defaultFontAsset;
-            if (def != null)
-            {
-                def.fallbackFontAssetTable ??= new List<TMP_FontAsset>();
-                if (!def.fallbackFontAssetTable.Contains(osFontAsset))
-                {
-                    def.fallbackFontAssetTable.Add(osFontAsset);
-                }
-            }
-
-            var globalFallbacks = TMP_Settings.fallbackFontAssets;
-            if (globalFallbacks != null && !globalFallbacks.Contains(osFontAsset))
-            {
-                globalFallbacks.Add(osFontAsset);
-            }
-        }
-        catch { }
-    }
-
-    private bool FontSupportsChineseWithoutOsFallback(TMP_FontAsset font)
-    {
-        if (font == null || font == _osFallbackFont) return false;
-
-        // 若当前字体或 TMP_Settings.defaultFontAsset 的回退链挂有自建 OS 保底字体，先暂移后判定，避免把纯拉丁字库误判为原生中文字库
-        List<TMP_FontAsset> table = font.fallbackFontAssetTable;
-        int removedIdx = -1;
-        if (_osFallbackFont != null && table != null)
-        {
-            removedIdx = table.IndexOf(_osFallbackFont);
-            if (removedIdx >= 0)
-            {
-                table.RemoveAt(removedIdx);
-            }
-        }
-
-        var def = TMP_Settings.defaultFontAsset;
-        List<TMP_FontAsset> defTable = (def != null && def != font) ? def.fallbackFontAssetTable : null;
-        int defRemovedIdx = -1;
-        if (_osFallbackFont != null && defTable != null)
-        {
-            defRemovedIdx = defTable.IndexOf(_osFallbackFont);
-            if (defRemovedIdx >= 0)
-            {
-                defTable.RemoveAt(defRemovedIdx);
-            }
-        }
-
-        try
-        {
-            return FontSupportsChinese(font);
-        }
-        finally
-        {
-            if (defRemovedIdx >= 0 && defTable != null && _osFallbackFont != null)
-            {
-                if (defRemovedIdx <= defTable.Count) defTable.Insert(defRemovedIdx, _osFallbackFont);
-                else defTable.Add(_osFallbackFont);
-            }
-            if (removedIdx >= 0 && table != null && _osFallbackFont != null)
-            {
-                if (removedIdx <= table.Count) table.Insert(removedIdx, _osFallbackFont);
-                else table.Add(_osFallbackFont);
-            }
-        }
-    }
-
-    private static bool ContainsChineseChar(string text)
-    {
-        if (string.IsNullOrEmpty(text)) return false;
-        for (int i = 0; i < text.Length; i++)
-        {
-            char ch = text[i];
-            if (ch >= '\u4E00' && ch <= '\u9FFF') return true;
-        }
-        return false;
-    }
-
-    private static bool ContainsAnyHint(string text, string[] hints)
-    {
-        if (string.IsNullOrEmpty(text) || hints == null) return false;
-        for (int i = 0; i < hints.Length; i++)
-        {
-            if (text.IndexOf(hints[i], StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static bool FontSupportsChinese(TMP_FontAsset font)
-    {
-        if (font == null) return false;
-        try
-        {
-            // 测试常用字及静态子集易缺汉字，确认主字库或已挂载 OS 动态回退可完整出字（消除 □ 豆腐块）
-            return font.HasCharacter('规', searchFallbacks: true, tryAddCharacter: true)
-                   && font.HasCharacter('则', searchFallbacks: true, tryAddCharacter: true)
-                   && font.HasCharacter('槽', searchFallbacks: true, tryAddCharacter: true)
-                   && font.HasCharacter('倾', searchFallbacks: true, tryAddCharacter: true)
-                   && font.HasCharacter('帧', searchFallbacks: true, tryAddCharacter: true);
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     private static Material ResolveNativeUiMaterial()
@@ -920,8 +742,23 @@ internal sealed class NativeUguiFactory
         tmp.textWrappingMode = wrap ? TextWrappingModes.Normal : TextWrappingModes.NoWrap;
         tmp.overflowMode = TextOverflowModes.Ellipsis;
         tmp.raycastTarget = raycastTarget;
+        if (_trackedTexts.Count >= 512)
+        {
+            PruneDeadTrackedTexts();
+        }
         _trackedTexts.Add(tmp);
         return tmp;
+    }
+
+    internal void PruneDeadTrackedTexts()
+    {
+        for (int i = _trackedTexts.Count - 1; i >= 0; i--)
+        {
+            if (_trackedTexts[i] == null)
+            {
+                _trackedTexts.RemoveAt(i);
+            }
+        }
     }
 
     internal sealed class ButtonHandle

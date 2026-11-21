@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using BazaarCore.Models;
 using BazaarCore.Runtime;
 using BazaarGameShared.Domain.Core;
@@ -42,6 +43,7 @@ public sealed class RunState
     public EHero Hero { get; init; }
     public EPlayMode PlayMode { get; init; }
     public string? AccountId { get; set; }
+    public string Username { get; set; } = string.Empty;
     public Guid? TournamentSessionId { get; set; }
 
     /// <summary>本局应用的自定义规则集（默认 MonsterLootChooseOne = true）。</summary>
@@ -53,6 +55,23 @@ public sealed class RunState
     /// <summary>当前对局是否修改了数值强度（为 true 时幽灵镜像自动隔离，不污染标准匹配池）。</summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public bool IsCustomRuleRun => CustomRules?.IsCustomPowerModified() ?? false;
+
+    /// <summary>是否为沙盒实验室对局（强制三禁隔离：不入镜像池、不计生涯、不上榜单）。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsSandboxRun => CustomRules?.IsSandboxRun ?? false;
+
+    /// <summary>Boss 车轮战已通关波次数。</summary>
+    public int BossRushWavesCleared { get; set; }
+
+    /// <summary>无尽爬塔模式是否已触发过 10 胜阶段里程碑祝贺。</summary>
+    public bool EndlessTenWinCelebrated { get; set; }
+
+    /// <summary>每日同种子挑战当前小时内商店刷新计数（用于派生互不干扰的子种子流）。</summary>
+    public int DailyRerollSequence { get; set; }
+
+    /// <summary>本局自定义卡视觉绑定变更版本号（随 Mod 卡生成/销毁递增，供响应头 X-Visual-Bindings-Rev 通知客户端增量拉取）。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public int VisualBindingsRevision { get; set; }
 
     /// <summary>分页怪物战利品模式下的单条持久化条目。</summary>
     public sealed record MonsterLootPageItemState(string TemplateId, string Tier, string? Enchantment, int SlotCost);
@@ -193,7 +212,10 @@ public sealed class RunState
     public sealed class CardEntry
     {
         public string InstanceId { get; init; }
+        /// <summary>下发给官方客户端的合法原版白名单模板 GUID（Mod 自定义卡时为 BaseVisualTemplateId，确保 0 白块 0 崩溃）。</summary>
         public Guid TemplateId { get; init; }
+        /// <summary>若本实例为 Mod 自定义卡，记录其逻辑模板 ID（如 bazaar-chronicles-sample:starport_compass_blade）；原版卡为 null。</summary>
+        public string? CustomCardId { get; set; }
         public ECardType Type { get; init; } = ECardType.Item;
         public ECardSize Size { get; set; } = ECardSize.Medium;
         public ETier Tier { get; set; } = ETier.Bronze;
@@ -453,6 +475,15 @@ public sealed class RunState
         };
     }
 
+    /// <summary>静态只读卡牌属性名映射表（替代热路径 Enum.TryParse 字符串解析，大幅削减 /commands CPU 与 GC）。</summary>
+    private static readonly FrozenDictionary<string, ECardAttributeType> CardAttrLookup =
+        Enum.GetValues<ECardAttributeType>()
+            .ToFrozenDictionary(v => v.ToString(), v => v, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>获取卡牌在核心引擎中的真实模板 ID（Mod 自定义卡返回 CustomCardId，原版卡返回 TemplateId）。</summary>
+    public static string ResolveCoreTemplateId(CardEntry entry)
+        => !string.IsNullOrWhiteSpace(entry.CustomCardId) ? entry.CustomCardId! : entry.TemplateId.ToString();
+
     private static readonly string[] RenderableCardAttributeNames =
     [
         "DamageAmount", "DamageCrit",
@@ -681,7 +712,7 @@ public sealed class RunState
         foreach (string key in candidateKeys)
         {
             if (key.Equals("Value", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!Enum.TryParse<ECardAttributeType>(key, out var attrType)) continue;
+            if (!CardAttrLookup.TryGetValue(key, out var attrType)) continue;
 
             if (attrType == ECardAttributeType.BuyPrice)
             {

@@ -2,26 +2,22 @@ using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
-using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using UnityEngine;
 
 namespace BazaarLauncher;
 
 /// <summary>
-/// 批量操作 + 条件等待 + 事件记录。
-///
-/// 设计目标：**一次 HTTP 往返完成一串操作**，而不是每条命令一次 round-trip。
-/// 配合 GameDriver 的主线程泵，整条链在游戏进程内同步执行，延迟接近零。
+/// 批量操作 + 条件等待 + 事件记录（修复 P0-1 主线程死锁）：
+/// 所有批次编排与条件等待均在后台工作线程异步执行（await Task.Delay），
+/// 仅将单条原子操作通过 GameDriver.RunOnMain 派发至主线程，严禁在 Unity 主线程调用 Thread.Sleep 或 .Wait()。
 /// </summary>
 internal static class DriverOps
 {
-    // ── 事件记录（供 /events 与 wait 使用）──────────────────────────────────
-
     private static readonly ConcurrentQueue<EventRecord> _events = new();
     private static int _eventSeq;
 
@@ -50,34 +46,16 @@ internal static class DriverOps
 
     internal static int LastSeq => _eventSeq;
 
-    // ── 批量执行 ────────────────────────────────────────────────────────────
-
     /// <summary>
-    /// 执行一串操作。每个 op 之间默认等 settleMs（默认 120ms），
-    /// 也可以给单条 op 指定 "wait" 条件。
-    ///
-    /// 请求体：
-    /// {
-    ///   "op": "batch",
-    ///   "settleMs": 120,
-    ///   "stopOnError": true,
-    ///   "ops": [
-    ///     {"op":"startRun","hero":"Vanessa"},
-    ///     {"wait":{"appState":"ChoiceState","minCards":3},"timeoutMs":15000},
-    ///     {"op":"selectSkill"},
-    ///     {"wait":{"selectionType":"Item"},"timeoutMs":8000},
-    ///     {"op":"buy"},
-    ///     {"op":"exit"}, {"op":"exit"}
-    ///   ]
-    /// }
+    /// 异步批量执行入口（HTTP 工作线程调用，0 主线程阻塞）。
     /// </summary>
-    internal static object RunBatch(JObject req)
+    internal static async Task<object> RunBatchAsync(JObject req, CancellationToken ct = default)
     {
-        var ops = req["ops"] as JArray;
+        var ops = req?["ops"] as JArray;
         if (ops == null || ops.Count == 0)
             return new { ok = false, error = "ops required" };
 
-        int settleMs = (int?)req["settleMs"] ?? 120;
+        int settleMs = Math.Clamp((int?)req["settleMs"] ?? 120, 0, 5000);
         bool stopOnError = (bool?)req["stopOnError"] ?? true;
 
         var log = new List<object>();
@@ -85,31 +63,43 @@ internal static class DriverOps
 
         foreach (var item in ops)
         {
+            if (ct.IsCancellationRequested)
+                return Fail(log, "batch cancelled", started);
+
             var o = item as JObject;
             if (o == null) continue;
 
-            // wait 节点
             if (o["wait"] != null)
             {
                 var waitSpec = o["wait"] as JObject ?? new JObject();
-                int timeout = (int?)o["timeoutMs"] ?? 10000;
-                var waitResult = WaitFor(waitSpec, timeout);
-                log.Add(new { kind = "wait", spec = waitSpec.ToString(Formatting.None), ok = waitResult.ok, elapsedMs = waitResult.elapsedMs, error = waitResult.error });
-                if (!waitResult.ok && stopOnError) return Fail(log, "wait timeout: " + waitResult.error, started);
+                int timeout = Math.Clamp((int?)o["timeoutMs"] ?? 10000, 100, 60000);
+                var waitResult = await WaitForAsync(waitSpec, timeout, ct).ConfigureAwait(false);
+                log.Add(new
+                {
+                    kind = "wait",
+                    spec = waitSpec.ToString(Formatting.None),
+                    ok = waitResult.ok,
+                    elapsedMs = waitResult.elapsedMs,
+                    error = waitResult.error,
+                });
+                if (!waitResult.ok && stopOnError)
+                    return Fail(log, "wait timeout: " + waitResult.error, started);
                 continue;
             }
 
-            // 普通 op
-            string op = (string)o["op"] ?? "";
+            string op = (string)o["op"] ?? string.Empty;
             if (string.IsNullOrEmpty(op)) continue;
 
-            var result = ExecuteOne(op, o);
+            object result = await ExecuteOneAsync(op, o, ct).ConfigureAwait(false);
             log.Add(new { kind = "op", op, ok = GetOk(result), result });
 
             if (!GetOk(result) && stopOnError)
                 return Fail(log, "op failed: " + op, started);
 
-            if (settleMs > 0) Thread.Sleep(settleMs);
+            if (settleMs > 0)
+            {
+                await Task.Delay(settleMs, ct).ConfigureAwait(false);
+            }
         }
 
         return new
@@ -121,35 +111,40 @@ internal static class DriverOps
         };
     }
 
-    private static object Fail(List<object> log, string error, DateTime started)
-        => new
-        {
-            ok = false,
-            error,
-            elapsedMs = (int)(DateTime.UtcNow - started).TotalMilliseconds,
-            log,
-        };
-
-    private static bool GetOk(object result)
+    internal static async Task<object> ExecuteOneAsync(string op, JObject req, CancellationToken ct = default)
     {
-        if (result == null) return false;
-        var t = result.GetType();
-        var p = t.GetProperty("ok");
-        if (p != null) return (bool)(p.GetValue(result) ?? false);
-        // 匿名类型 → 转 JSON 再看
-        try
+        string lower = (op ?? string.Empty).Trim().ToLowerInvariant();
+        if (lower == "resume")
         {
-            var j = JObject.FromObject(result);
-            return (bool?)j["ok"] ?? false;
+            return await GameDriver.DoResumeAsync(req).ConfigureAwait(false);
         }
-        catch { return false; }
+        if (lower == "concede")
+        {
+            return await GameDriver.DoConcedeAsync(req).ConfigureAwait(false);
+        }
+        if (lower == "sync")
+        {
+            return await GameDriver.DoSyncAsync(req, ct).ConfigureAwait(false);
+        }
+        if (lower is "forcestate" or "force_state")
+        {
+            return await GameDriver.DoForceStateAsync(req, ct).ConfigureAwait(false);
+        }
+        if (lower == "wait")
+        {
+            var spec = req["wait"] as JObject ?? req;
+            int timeout = Math.Clamp((int?)req["timeoutMs"] ?? 10000, 100, 60000);
+            var w = await WaitForAsync(spec, timeout, ct).ConfigureAwait(false);
+            return new { ok = w.ok, op = "wait", elapsedMs = w.elapsedMs, error = w.error };
+        }
+
+        return GameDriver.RunOnMain(() => ExecuteOneOnMain(lower, req));
     }
 
-    // ── 单条 op 分发（GameDriver 用）────────────────────────────────────────
-
-    internal static object ExecuteOne(string op, JObject req)
+    /// <summary>供单步主线程派发的安全原子命令执行（严禁含 Sleep/Wait）。</summary>
+    internal static object ExecuteOneOnMain(string opLower, JObject req)
     {
-        return op.ToLowerInvariant() switch
+        return opLower switch
         {
             "buy" => GameDriver.DoBuyPublic(req),
             "sell" => GameDriver.DoSellPublic(req),
@@ -163,39 +158,25 @@ internal static class DriverOps
             "inspect" => GameDriver.DoInspectPublic(),
             "cheat" => GameDriver.DoCheatPublic(req),
             "startrun" => GameDriver.DoStartRunPublic(req),
-            "wait" => new { ok = true, op = "wait", note = "use batch for waits" },
             "state" => new { ok = true, state = GameDriver.ReadStatePublic() },
-            _ => new { ok = false, error = "unknown op: " + op },
+            _ => new { ok = false, error = "unknown op: " + opLower },
         };
     }
 
-    // ── 条件等待 ────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// 轮询状态直到条件满足。条件字段：
-    ///   appState      : 期望的 AppState 类名（如 "ChoiceState"）
-    ///   runState      : 期望的 ERunState 名（如 "Choice"）
-    ///   minCards      : 卡牌数 >= N
-    ///   minSelection  : selectionSet 数量 >= N
-    ///   selectionType : selectionSet 里第一张卡的 Type（"Item"/"Skill"/...）
-    ///   minGold       : gold >= N
-    ///   maxGold       : gold <= N
-    ///   goldEquals    : gold == N
-    ///   dayEquals     : day == N
-    ///   hourEquals    : hour == N
-    /// </summary>
-    internal static (bool ok, int elapsedMs, string error) WaitFor(JObject spec, int timeoutMs)
+    /// <summary>异步条件等待（仅在后台轮询并短切主线程读取状态，0 主线程冻结）。</summary>
+    internal static async Task<(bool ok, int elapsedMs, string error)> WaitForAsync(
+        JObject spec, int timeoutMs, CancellationToken ct = default)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        string lastReason = "";
+        var sw = Stopwatch.StartNew();
+        string lastReason = string.Empty;
 
-        while (sw.ElapsedMilliseconds < timeoutMs)
+        while (sw.ElapsedMilliseconds < timeoutMs && !ct.IsCancellationRequested)
         {
-            var st = GameDriver.ReadStatePublic() as IDictionary<string, object>;
+            var st = GameDriver.RunOnMain(() => GameDriver.ReadStatePublic() as IDictionary<string, object>);
             if (st != null)
             {
                 bool all = true;
-                lastReason = "";
+                lastReason = string.Empty;
 
                 foreach (var kv in spec)
                 {
@@ -234,8 +215,6 @@ internal static class DriverOps
                         case "hourEquals":
                             if (IntOf(st, "hour") != want.Value<int>()) { all = false; lastReason = "hour"; }
                             break;
-                        default:
-                            break;
                     }
 
                     if (!all) break;
@@ -244,10 +223,33 @@ internal static class DriverOps
                 if (all) return (true, (int)sw.ElapsedMilliseconds, null);
             }
 
-            Thread.Sleep(60);
+            await Task.Delay(60, ct).ConfigureAwait(false);
         }
 
         return (false, (int)sw.ElapsedMilliseconds, "timeout on " + lastReason);
+    }
+
+    private static object Fail(List<object> log, string error, DateTime started)
+        => new
+        {
+            ok = false,
+            error,
+            elapsedMs = (int)(DateTime.UtcNow - started).TotalMilliseconds,
+            log,
+        };
+
+    private static bool GetOk(object result)
+    {
+        if (result == null) return false;
+        var t = result.GetType();
+        var p = t.GetProperty("ok");
+        if (p != null) return (bool)(p.GetValue(result) ?? false);
+        try
+        {
+            var j = JObject.FromObject(result);
+            return (bool?)j["ok"] ?? false;
+        }
+        catch { return false; }
     }
 
     private static bool StrEq(IDictionary<string, object> st, string key, string want)

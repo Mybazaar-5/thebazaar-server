@@ -920,17 +920,21 @@ public sealed class V12WikiCombatMechanicsTests
         var hit10s = res.Events.First(e => e.Type == CombatEventType.DamageApplied && e.TimeMs == 9980);
         Assert.Equal(70, hit10s.Value);
 
-        // Sandstorm DB 真值：20000ms 预警，30000ms 启动首跳 1 伤，随后每跳 +2 递增 (1, 3, 5, 7...)
+        // Sandstorm 官方真值（P1-11，对齐 BazaarCardDealer.cs:4243-4274）：
+        // 20000ms 预警，30000ms 启动首跳 1 伤；先按 -10ms/跳 将间隔从 250ms 降至 150ms 下限（期间伤害保持 1），
+        // 触底 150ms 后才按 +2/跳 递增伤害（ticks[0..9]=1, ticks[10]=3, ticks[11]=5, ticks[12]=7...）
         var warn = res.Events.First(e => e.Type == CombatEventType.SandstormWarning);
         Assert.InRange(warn.TimeMs, 19980, 20000);
-        var ticks = res.Events.Where(e => e.Type == CombatEventType.SandstormTick).Take(4).ToList();
-        Assert.Equal(4, ticks.Count);
+        var ticks = res.Events.Where(e => e.Type == CombatEventType.SandstormTick).ToList();
+        Assert.True(ticks.Count >= 13, $"沙暴应至少产生 13 跳以验证 150ms 触底后增伤，实际={ticks.Count}");
         Assert.InRange(ticks[0].TimeMs, 29980, 30000);
-        Assert.Equal(1, ticks[0].Value);
-        Assert.Equal(3, ticks[1].Value);
-        Assert.Equal(5, ticks[2].Value);
-        Assert.Equal(7, ticks[3].Value);
+        for (int i = 0; i <= 9; i++)
+            Assert.Equal(1, ticks[i].Value);
+        Assert.Equal(3, ticks[10].Value);
+        Assert.Equal(5, ticks[11].Value);
+        Assert.Equal(7, ticks[12].Value);
         Assert.True(ticks[1].TimeMs - ticks[0].TimeMs <= 260 && ticks[2].TimeMs - ticks[1].TimeMs <= ticks[1].TimeMs - ticks[0].TimeMs);
+        Assert.InRange(ticks[11].TimeMs - ticks[10].TimeMs, 140, 160);
 
         // Leather Jacket 收到沙暴自毁并给友军施加 Haste + +100% CritChance
         Assert.Contains(res.Events, e => e.Type == CombatEventType.CardDestroyed && e.TargetCardInstanceId == jacket.InstanceId && e.TimeMs >= 29980 && e.TimeMs <= 30000);

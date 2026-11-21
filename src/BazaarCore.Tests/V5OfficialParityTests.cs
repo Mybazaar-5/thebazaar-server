@@ -511,7 +511,8 @@ public sealed class V5OfficialParityTests
         var pol = InjectChoiceEncounter(run, PolShopId);
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol.InstanceId) }).Error);
         int curXp = run.PlayerAttributes[EPlayerAttributeType.Experience];
-        int almostLvl3 = Math.Max(0, fx.Mode.ExperiencePerLevel - curXp - (1 + Math.Max(1, fx.Mode.ExperiencePerHour)));
+        // P0-1 官方单份经验规则：商店离场仅发 1 份经验（ExperienceAwardUponSelection=1），不再额外叠发 ExperiencePerHour
+        int almostLvl3 = Math.Max(0, fx.Mode.ExperiencePerLevel - curXp - 1);
         if (almostLvl3 > 0)
             Assert.Null(engine.Handle(new CheatCommand { Args = ["exp", almostLvl3.ToString()] }).Error);
         var exitToLvl = engine.Handle(new ExitCurrentStateCommand());
@@ -1443,6 +1444,15 @@ public sealed class V5OfficialParityTests
                         zhName = "Red Gumball",
                         tier = "Bronze",
                     },
+                    new
+                    {
+                        slot = 4,
+                        width = 1,
+                        templateId = "6d6199b4-82a4-441d-9329-f4164737ac6b", // 凑足 Day 1 静态卫生过滤 totalWidth >= 2（仍保持 0 伤害/治疗/护盾）
+                        internalName = "Red Gumball",
+                        zhName = "Red Gumball",
+                        tier = "Bronze",
+                    },
                 },
                 skills = Array.Empty<object>(),
             });
@@ -1949,11 +1959,29 @@ public sealed class V5OfficialParityTests
                     {
                         new
                         {
-                            slot = 3,
-                            width = 1,
+                            slot = 2,
+                            width = 2,
                             templateId = CutlassId,
                             internalName = "Cutlass",
                             zhName = "Cutlass",
+                            tier = "Bronze",
+                        },
+                        new
+                        {
+                            slot = 4,
+                            width = 2,
+                            templateId = "07df297d-e116-42a4-9596-4af674764d1b", // Globe（凑足 Day 3 静态卫生过滤 totalWidth >= 5 且无 3 件同卡异常）
+                            internalName = "Globe",
+                            zhName = "Globe",
+                            tier = "Bronze",
+                        },
+                        new
+                        {
+                            slot = 6,
+                            width = 1,
+                            templateId = "03b1fd16-6b0d-4847-a76f-6c586f7c5958", // Kukri
+                            internalName = "Kukri",
+                            zhName = "Kukri",
                             tier = "Bronze",
                         },
                     },
