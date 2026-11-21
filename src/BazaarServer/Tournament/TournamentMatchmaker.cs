@@ -1,0 +1,627 @@
+using System.Security.Cryptography;
+using System.Text;
+using BazaarCore.Models;
+
+namespace BazaarServer.Tournament;
+
+/// <summary>
+/// 锦标赛轮次匹配的参与者快照。
+/// </summary>
+public sealed record MatchupParticipant(
+    string AccountId,
+    string Username,
+    bool IsBot,
+    bool IsEliminated = false,
+    bool IsSyntheticSparringBot = false);
+
+/// <summary>
+/// 单名参赛者在指定天数的对称匹配结果与战斗种子。
+/// </summary>
+public sealed record MatchupAssignment(
+    uint Day,
+    string AccountId,
+    string OpponentAccountId,
+    string OpponentUsername,
+    bool OpponentIsBot,
+    bool OpponentIsNonLethalBot,
+    bool OpponentIsSyntheticSparringBot,
+    int BattleSeed);
+
+/// <summary>
+/// 同一天真人对阵真人的对称战斗结果缓存记录。
+/// </summary>
+public sealed record HumanMatchResolution(
+    uint Day,
+    string PairKey,
+    string WinnerAccountId,
+    string LoserAccountId,
+    int BattleSeed,
+    int LoserPrestigeDamage,
+    DateTime ResolvedAtUtc);
+
+/// <summary>
+/// 锦标赛双约束完美匹配随机采样器：
+/// - 在全随机可预测性与多样性之间，数学上严格保证任意存活真人在连续 4 轮内必遇真人（s(u) <= 3）；
+/// - 针对奇数存活真人（如 3 人局）施加奇偶前瞻约束，消除 (3,3,3) 鸽巢死锁；
+/// - 维护逐房间/逐日对称配对、连续遇 AI 轮数 s(u)、上次交手轮次、确定性战斗种子与真人战果缓存。
+/// </summary>
+public sealed class TournamentMatchmaker
+{
+    private const double BackToBackRepeatPenalty = 0.05;
+    private const double UnmetBonusPerRound = 0.25;
+
+    private readonly object _gate = new();
+    private readonly string _lobbySeed;
+    private readonly Random _rng;
+
+    private readonly Dictionary<string, int> _consecutiveBotRounds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, uint> _lastMetRound = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<uint, Dictionary<string, MatchupAssignment>> _cachedByDay = new();
+    private readonly Dictionary<(uint Day, string PairKey), int> _pairSeeds = new();
+    private readonly Dictionary<(uint Day, string PairKey), HumanMatchResolution> _humanResolutions = new();
+    private uint _latestAssignedDay;
+
+    public TournamentMatchmaker(string? lobbySeed = null, Random? rng = null)
+    {
+        _lobbySeed = string.IsNullOrWhiteSpace(lobbySeed) ? Guid.NewGuid().ToString("N") : lobbySeed.Trim();
+        _rng = rng ?? Random.Shared;
+    }
+
+    /// <summary>
+    /// 构造无序规范化的双方键值，确保 (A, B) 与 (B, A) 命中同一缓存槽。
+    /// </summary>
+    public static string CanonicalPairKey(string accountA, string accountB)
+    {
+        string a = (accountA ?? string.Empty).Trim();
+        string b = (accountB ?? string.Empty).Trim();
+        return string.Compare(a, b, StringComparison.OrdinalIgnoreCase) <= 0
+            ? $"{a.ToLowerInvariant()}|{b.ToLowerInvariant()}"
+            : $"{b.ToLowerInvariant()}|{a.ToLowerInvariant()}";
+    }
+
+    /// <summary>
+    /// 使用 <see cref="CustomRunRuleSet"/> 分配并缓存第 <paramref name="day"/> 天的全部对称匹配。
+    /// 同一天重复调用是幂等的，不会二次累加连续遇 AI 轮数。
+    /// </summary>
+    public IReadOnlyDictionary<string, MatchupAssignment> AssignRoundMatchups(
+        uint day,
+        IReadOnlyList<MatchupParticipant> participants,
+        CustomRunRuleSet? rules)
+    {
+        return AssignRoundMatchups(
+            day,
+            participants,
+            humanMatchEvery4Rounds: rules?.HumanMatchEvery4Rounds ?? true,
+            botNonLethalPrestigeLock: rules?.BotNonLethalPrestigeLock ?? true);
+    }
+
+    /// <summary>
+    /// 为第 <paramref name="day"/> 天生成（或读取已缓存的）对称完美匹配。
+    /// </summary>
+    public IReadOnlyDictionary<string, MatchupAssignment> AssignRoundMatchups(
+        uint day,
+        IReadOnlyList<MatchupParticipant> participants,
+        bool humanMatchEvery4Rounds = true,
+        bool botNonLethalPrestigeLock = true)
+    {
+        if (day == 0) day = 1;
+
+        lock (_gate)
+        {
+            if (_cachedByDay.TryGetValue(day, out var existing))
+            {
+                return existing;
+            }
+
+            var humans = new List<MatchupParticipant>();
+            var bots = new List<MatchupParticipant>();
+            var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (participants != null)
+            {
+                foreach (var p in participants)
+                {
+                    if (p == null || p.IsEliminated || string.IsNullOrWhiteSpace(p.AccountId))
+                        continue;
+                    if (!seenIds.Add(p.AccountId))
+                        continue;
+
+                    if (p.IsBot || p.IsSyntheticSparringBot)
+                        bots.Add(p);
+                    else
+                        humans.Add(p);
+                }
+            }
+
+            if (humans.Count == 0 && bots.Count == 0)
+            {
+                var empty = new Dictionary<string, MatchupAssignment>(StringComparer.OrdinalIgnoreCase);
+                _cachedByDay[day] = empty;
+                return empty;
+            }
+
+            // 当总参战者为奇数（含全机器人已淘汰但存活真人为奇数，或仅剩单真人）时，合成临时非致死陪练机器人槽位
+            if (((humans.Count + bots.Count) & 1) == 1)
+            {
+                bots.Add(new MatchupParticipant(
+                    AccountId: DeterministicId($"sparring:{_lobbySeed}:d{day}"),
+                    Username: "SparringBot",
+                    IsBot: true,
+                    IsEliminated: false,
+                    IsSyntheticSparringBot: true));
+            }
+
+            int h = humans.Count;
+            int n = h + bots.Count;
+            var roster = new MatchupParticipant[n];
+            for (int i = 0; i < h; i++) roster[i] = humans[i];
+            for (int i = 0; i < bots.Count; i++) roster[h + i] = bots[i];
+
+            var s = new int[h];
+            for (int i = 0; i < h; i++)
+            {
+                s[i] = _consecutiveBotRounds.GetValueOrDefault(roster[i].AccountId, 0);
+            }
+
+            var weights = BuildPairWeights(day, roster, h);
+            bool enforceConstraints = humanMatchEvery4Rounds && h >= 2;
+            int[] partner = SampleMatching(n, h, s, weights, enforceConstraints);
+
+            // 仅当轮次单调推进（或首次分配）时推进状态，避免乱序查询历史天回写当前连续计数
+            bool advanceHistory = day >= _latestAssignedDay;
+            if (advanceHistory)
+            {
+                for (int i = 0; i < h; i++)
+                {
+                    int j = partner[i];
+                    if (j < h)
+                    {
+                        _consecutiveBotRounds[roster[i].AccountId] = 0;
+                        string pairKey = CanonicalPairKey(roster[i].AccountId, roster[j].AccountId);
+                        _lastMetRound[pairKey] = day;
+                    }
+                    else
+                    {
+                        _consecutiveBotRounds[roster[i].AccountId] = s[i] + 1;
+                    }
+                }
+                _latestAssignedDay = day;
+            }
+
+            var result = new Dictionary<string, MatchupAssignment>(n, StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < n; i++)
+            {
+                int j = partner[i];
+                var self = roster[i];
+                var opp = roster[j];
+                string pairKey = CanonicalPairKey(self.AccountId, opp.AccountId);
+                int battleSeed = GetOrCreatePairBattleSeedLocked(day, pairKey);
+                bool oppIsBot = opp.IsBot || opp.IsSyntheticSparringBot;
+                bool oppNonLethal = opp.IsSyntheticSparringBot || (oppIsBot && botNonLethalPrestigeLock);
+
+                result[self.AccountId] = new MatchupAssignment(
+                    Day: day,
+                    AccountId: self.AccountId,
+                    OpponentAccountId: opp.AccountId,
+                    OpponentUsername: opp.Username,
+                    OpponentIsBot: oppIsBot,
+                    OpponentIsNonLethalBot: oppNonLethal,
+                    OpponentIsSyntheticSparringBot: opp.IsSyntheticSparringBot,
+                    BattleSeed: battleSeed);
+            }
+
+            _cachedByDay[day] = result;
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// 查询指定账号在第 <paramref name="day"/> 天已分配的对局信息。
+    /// </summary>
+    public MatchupAssignment? GetAssignment(string accountId, uint day)
+    {
+        if (string.IsNullOrWhiteSpace(accountId)) return null;
+        lock (_gate)
+        {
+            if (_cachedByDay.TryGetValue(day, out var map) && map.TryGetValue(accountId, out var assignment))
+                return assignment;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 查询指定账号在当前匹配器中已累计的连续遇 AI 轮数 s(u)。
+    /// </summary>
+    public int GetConsecutiveBotRounds(string accountId)
+    {
+        if (string.IsNullOrWhiteSpace(accountId)) return 0;
+        lock (_gate)
+        {
+            return _consecutiveBotRounds.GetValueOrDefault(accountId, 0);
+        }
+    }
+
+    /// <summary>
+    /// 查询两名真人最近一次交手的天数；若未曾交手返回 null。
+    /// </summary>
+    public uint? GetLastMetRound(string accountA, string accountB)
+    {
+        lock (_gate)
+        {
+            return _lastMetRound.TryGetValue(CanonicalPairKey(accountA, accountB), out uint d) ? d : null;
+        }
+    }
+
+    /// <summary>
+    /// 判断指定玩家在第 <paramref name="day"/> 天的对手是否为非致死机器人（含临时陪练与开启声望锁时的 AI 机器人）。
+    /// </summary>
+    public bool IsOpponentNonLethalBot(string accountId, uint day)
+    {
+        return GetAssignment(accountId, day)?.OpponentIsNonLethalBot ?? false;
+    }
+
+    /// <summary>
+    /// 判断是否应抑制致死淘汰（例如负于临时非致死陪练机器人，或在启用 BotNonLethalPrestigeLock 时负于 AI 机器人）。
+    /// </summary>
+    public bool ShouldSuppressLethalElimination(string accountId, uint day, CustomRunRuleSet? rules)
+    {
+        return ShouldSuppressLethalElimination(accountId, day, rules?.BotNonLethalPrestigeLock ?? true);
+    }
+
+    /// <summary>
+    /// 判断是否应抑制致死淘汰。
+    /// </summary>
+    public bool ShouldSuppressLethalElimination(string accountId, uint day, bool botNonLethalPrestigeLock = true)
+    {
+        var assignment = GetAssignment(accountId, day);
+        if (assignment == null) return false;
+        if (assignment.OpponentIsSyntheticSparringBot) return true;
+        return assignment.OpponentIsBot && botNonLethalPrestigeLock;
+    }
+
+    /// <summary>
+    /// 获取或生成第 <paramref name="day"/> 天双方对阵的确定性战斗种子。
+    /// </summary>
+    public int GetOrCreatePairBattleSeed(uint day, string accountA, string accountB)
+    {
+        lock (_gate)
+        {
+            return GetOrCreatePairBattleSeedLocked(day, CanonicalPairKey(accountA, accountB));
+        }
+    }
+
+    /// <summary>
+    /// 查询第 <paramref name="day"/> 天这对真人是否已有对称战果缓存。
+    /// </summary>
+    public HumanMatchResolution? TryGetHumanMatchResolution(uint day, string accountA, string accountB)
+    {
+        lock (_gate)
+        {
+            return _humanResolutions.GetValueOrDefault((day, CanonicalPairKey(accountA, accountB)));
+        }
+    }
+
+    /// <summary>
+    /// 写入（若已存在则保持首次结果的幂等对称记录）第 <paramref name="day"/> 天真人对阵的战果缓存。
+    /// </summary>
+    public HumanMatchResolution RecordHumanMatchResolution(
+        uint day,
+        string accountA,
+        string accountB,
+        string winnerAccountId,
+        int loserPrestigeDamage = 0,
+        int? battleSeed = null)
+    {
+        string pairKey = CanonicalPairKey(accountA, accountB);
+        lock (_gate)
+        {
+            var key = (day, pairKey);
+            if (_humanResolutions.TryGetValue(key, out var existing))
+            {
+                return existing;
+            }
+
+            string loser = string.Equals(winnerAccountId, accountA, StringComparison.OrdinalIgnoreCase)
+                ? accountB
+                : accountA;
+            int seed = battleSeed ?? GetOrCreatePairBattleSeedLocked(day, pairKey);
+
+            var resolution = new HumanMatchResolution(
+                Day: day,
+                PairKey: pairKey,
+                WinnerAccountId: winnerAccountId,
+                LoserAccountId: loser,
+                BattleSeed: seed,
+                LoserPrestigeDamage: Math.Max(0, loserPrestigeDamage),
+                ResolvedAtUtc: DateTime.UtcNow);
+            _humanResolutions[key] = resolution;
+            return resolution;
+        }
+    }
+
+    private int GetOrCreatePairBattleSeedLocked(uint day, string pairKey)
+    {
+        var key = (day, pairKey);
+        if (_pairSeeds.TryGetValue(key, out int existing))
+        {
+            return existing;
+        }
+
+        // 零分配确定性 FNV-1a + SplitMix64 混合，保证同房同天同对阵双方拿到完全一致的战斗种子
+        ulong h = 14695981039346656037UL;
+        foreach (char c in _lobbySeed)
+            h = (h ^ char.ToLowerInvariant(c)) * 1099511628211UL;
+        h = (h ^ day) * 1099511628211UL;
+        foreach (char c in pairKey)
+            h = (h ^ c) * 1099511628211UL;
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9UL;
+        h ^= h >> 27;
+        h *= 0x94d049bb133111ebUL;
+        h ^= h >> 31;
+
+        int seed = (int)(h & 0x7FFFFFFFUL);
+        if (seed == 0) seed = 1;
+        _pairSeeds[key] = seed;
+        return seed;
+    }
+
+    private double[,] BuildPairWeights(uint day, MatchupParticipant[] roster, int h)
+    {
+        int n = roster.Length;
+        var weights = new double[n, n];
+
+        for (int i = 0; i < n; i++)
+        {
+            for (int j = i + 1; j < n; j++)
+            {
+                double w;
+                if (i < h && j < h)
+                {
+                    string pairKey = CanonicalPairKey(roster[i].AccountId, roster[j].AccountId);
+                    if (_lastMetRound.TryGetValue(pairKey, out uint lastDay) && day > lastDay)
+                    {
+                        uint delta = day - lastDay;
+                        w = delta == 1
+                            ? BackToBackRepeatPenalty
+                            : 1.0 + UnmetBonusPerRound * delta;
+                    }
+                    else
+                    {
+                        int roundsSince = Math.Max(0, (int)day - 1);
+                        w = 1.0 + UnmetBonusPerRound * roundsSince;
+                    }
+                }
+                else
+                {
+                    w = 1.0;
+                }
+
+                weights[i, j] = w;
+                weights[j, i] = w;
+            }
+        }
+
+        return weights;
+    }
+
+    private int[] SampleMatching(int n, int h, int[] s, double[,] weights, bool enforceConstraints)
+    {
+        bool oddAllAtLeast2 = enforceConstraints && (h & 1) == 1 && AllHumansAtLeast(s, h, 2);
+
+        if (n <= 10)
+        {
+            if (TrySampleExactSmallN(n, h, s, weights, enforceConstraints, oddAllAtLeast2, out var exact))
+                return exact;
+
+            // 仅在外部传入异常不可达状态（如禁用声望锁后出现三真人 3,3,3）时放宽约束保底
+            if (enforceConstraints && TrySampleExactSmallN(n, h, s, weights, enforceConstraints: false, oddAllAtLeast2: false, out var fallback))
+                return fallback;
+        }
+        else
+        {
+            if (TrySampleBacktrackingLargeN(n, h, s, weights, enforceConstraints, oddAllAtLeast2, out var large))
+                return large;
+
+            if (enforceConstraints && TrySampleBacktrackingLargeN(n, h, s, weights, enforceConstraints: false, oddAllAtLeast2: false, out var fallback))
+                return fallback;
+        }
+
+        var trivial = new int[n];
+        for (int i = 0; i < n; i += 2)
+        {
+            trivial[i] = i + 1;
+            trivial[i + 1] = i;
+        }
+        return trivial;
+    }
+
+    private bool TrySampleExactSmallN(
+        int n,
+        int h,
+        int[] s,
+        double[,] weights,
+        bool enforceConstraints,
+        bool oddAllAtLeast2,
+        out int[] chosenPartner)
+    {
+        var used = new bool[n];
+        var current = new int[n];
+        var best = new int[n];
+        int validCount = 0;
+        double totalWeight = 0.0;
+
+        void Dfs(int idx, int hhPairs, double curWeight)
+        {
+            while (idx < n && used[idx]) idx++;
+            if (idx == n)
+            {
+                if (oddAllAtLeast2 && hhPairs == 0)
+                    return;
+
+                validCount++;
+                totalWeight += curWeight;
+                if (validCount == 1 || _rng.NextDouble() * totalWeight < curWeight)
+                {
+                    Array.Copy(current, best, n);
+                }
+                return;
+            }
+
+            used[idx] = true;
+            bool mustPairWithHuman = enforceConstraints && idx < h && s[idx] >= 3;
+            int maxPartner = mustPairWithHuman ? h : n;
+
+            for (int j = idx + 1; j < maxPartner; j++)
+            {
+                if (used[j]) continue;
+
+                used[j] = true;
+                current[idx] = j;
+                current[j] = idx;
+                int nextHh = hhPairs + (idx < h && j < h ? 1 : 0);
+                Dfs(idx + 1, nextHh, curWeight * weights[idx, j]);
+                used[j] = false;
+            }
+
+            used[idx] = false;
+        }
+
+        Dfs(0, 0, 1.0);
+        chosenPartner = best;
+        return validCount > 0;
+    }
+
+    private bool TrySampleBacktrackingLargeN(
+        int n,
+        int h,
+        int[] s,
+        double[,] weights,
+        bool enforceConstraints,
+        bool oddAllAtLeast2,
+        out int[] chosenPartner)
+    {
+        var used = new bool[n];
+        var partner = new int[n];
+
+        int initialRemK = 0;
+        for (int i = 0; i < h; i++)
+        {
+            if (s[i] >= 3) initialRemK++;
+        }
+
+        bool Recurse(int remH, int remK, int hhPairs)
+        {
+            int u = PickNextVertex(n, h, s, used, enforceConstraints, oddAllAtLeast2, remK, hhPairs);
+            if (u < 0) return true;
+
+            // 收集并按 Efraimidis-Spirakis 指数竞赛 (-ln(U)/w) 对合法候选进行加权随机排序
+            var candidates = new List<(int Vertex, double Score)>(n);
+            bool uIsHuman = u < h;
+            bool uMustHuman = enforceConstraints && uIsHuman && s[u] >= 3;
+
+            for (int v = 0; v < n; v++)
+            {
+                if (v == u || used[v]) continue;
+
+                bool vIsHuman = v < h;
+                if (uMustHuman && !vIsHuman) continue;
+                if (enforceConstraints && vIsHuman && s[v] >= 3 && !uIsHuman) continue;
+
+                int newRemH = remH - (uIsHuman ? 1 : 0) - (vIsHuman ? 1 : 0);
+                int newRemK = remK - (uIsHuman && s[u] >= 3 ? 1 : 0) - (vIsHuman && s[v] >= 3 ? 1 : 0);
+                int newHhPairs = hhPairs + (uIsHuman && vIsHuman ? 1 : 0);
+
+                // 剪枝：若剩余待匹配人类全部是 s>=3 且数量为奇数，必产生无法互配死锁
+                if (enforceConstraints && newRemK == newRemH && (newRemK & 1) == 1)
+                    continue;
+                if (oddAllAtLeast2 && newHhPairs == 0 && newRemH < 2)
+                    continue;
+
+                double w = Math.Max(1e-6, weights[u, v]);
+                double uRand = Math.Max(1e-12, _rng.NextDouble());
+                double score = -Math.Log(uRand) / w;
+                candidates.Add((v, score));
+            }
+
+            if (candidates.Count == 0) return false;
+            candidates.Sort(static (a, b) => a.Score.CompareTo(b.Score));
+
+            used[u] = true;
+            foreach (var (v, _) in candidates)
+            {
+                bool vIsHuman = v < h;
+                int newRemH = remH - (uIsHuman ? 1 : 0) - (vIsHuman ? 1 : 0);
+                int newRemK = remK - (uIsHuman && s[u] >= 3 ? 1 : 0) - (vIsHuman && s[v] >= 3 ? 1 : 0);
+                int newHhPairs = hhPairs + (uIsHuman && vIsHuman ? 1 : 0);
+
+                used[v] = true;
+                partner[u] = v;
+                partner[v] = u;
+                if (Recurse(newRemH, newRemK, newHhPairs))
+                    return true;
+                used[v] = false;
+            }
+            used[u] = false;
+            return false;
+        }
+
+        if (Recurse(h, initialRemK, 0))
+        {
+            chosenPartner = partner;
+            return true;
+        }
+
+        chosenPartner = Array.Empty<int>();
+        return false;
+    }
+
+    private static int PickNextVertex(
+        int n,
+        int h,
+        int[] s,
+        bool[] used,
+        bool enforceConstraints,
+        bool oddAllAtLeast2,
+        int remK,
+        int hhPairs)
+    {
+        if (enforceConstraints && remK > 0)
+        {
+            for (int i = 0; i < h; i++)
+            {
+                if (!used[i] && s[i] >= 3) return i;
+            }
+        }
+
+        if (oddAllAtLeast2 && hhPairs == 0)
+        {
+            for (int i = 0; i < h; i++)
+            {
+                if (!used[i]) return i;
+            }
+        }
+
+        for (int i = 0; i < n; i++)
+        {
+            if (!used[i]) return i;
+        }
+
+        return -1;
+    }
+
+    private static bool AllHumansAtLeast(int[] s, int h, int threshold)
+    {
+        for (int i = 0; i < h; i++)
+        {
+            if (s[i] < threshold) return false;
+        }
+        return true;
+    }
+
+    private static string DeterministicId(string seed)
+    {
+        byte[] hash = MD5.HashData(Encoding.UTF8.GetBytes(seed));
+        return new Guid(hash).ToString("N");
+    }
+}

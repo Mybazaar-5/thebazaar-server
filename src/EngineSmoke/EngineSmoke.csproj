@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>EngineSmoke</AssemblyName>
+    <RestorePackages>false</RestorePackages>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="BazaarGameShared"><HintPath>..\..\ext\Managed\BazaarGameShared.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="BazaarBattleService"><HintPath>..\..\ext\Managed\BazaarBattleService.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="BazaarUnityTools"><HintPath>..\..\ext\Managed\BazaarUnityTools.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="MessagePack"><HintPath>..\..\ext\Managed\MessagePack.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="MessagePack.Annotations"><HintPath>..\..\ext\Managed\MessagePack.Annotations.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Newtonsoft.Json"><HintPath>..\..\ext\Managed\Newtonsoft.Json.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Nanoid"><HintPath>..\..\ext\Managed\Nanoid.dll</HintPath><Private>true</Private></Reference>
+  </ItemGroup>
+</Project>

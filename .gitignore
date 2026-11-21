@@ -1,0 +1,38 @@
+# Build outputs
+bin/
+obj/
+out/
+.vs/
+.idea/
+*.user
+*.suo
+
+# Godot
+.godot/
+.mono/
+export_presets.cfg
+*.tmp
+
+# External binaries & game data (download Release or copy from your local The Bazaar client)
+ext/
+asset_packs/
+BazaarCloneCache/
+GameData.db*
+local_ghosts.json
+.worktrees/
+_backups/
+_audit/
+docs/recon/
+dist/data/
+dist/server/
+dist/server-linux/
+dist/github-release/
+dist/*.zip
+dist/*.tar.gz
+dist/client/payload/*.dll
+dist/client/payload/BepInEx/core/
+logs/*.log
+logs/*-state/
+logs/*.json
+shots/
+output/

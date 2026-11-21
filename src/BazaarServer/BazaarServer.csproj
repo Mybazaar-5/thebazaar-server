@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>BazaarServer</AssemblyName>
+    <RootNamespace>BazaarServer</RootNamespace>
+    <NoWarn>$(NoWarn);CS0168;CS0219;MSB3277;NU1701;CS8632</NoWarn>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\BazaarCore\BazaarCore.csproj" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.11" />
+    <Reference Include="BazaarGameShared"><HintPath>..\..\ext\Managed\BazaarGameShared.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="BazaarBattleService"><HintPath>..\..\ext\Managed\BazaarBattleService.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="BazaarGameClient"><HintPath>..\..\ext\Managed\BazaarGameClient.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="BazaarUnityTools"><HintPath>..\..\ext\Managed\BazaarUnityTools.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="MessagePack"><HintPath>..\..\ext\Managed\MessagePack.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="MessagePack.Annotations"><HintPath>..\..\ext\Managed\MessagePack.Annotations.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Newtonsoft.Json"><HintPath>..\..\ext\Managed\Newtonsoft.Json.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Nanoid"><HintPath>..\..\ext\Managed\Nanoid.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Gilzoide.SqliteNet"><HintPath>..\..\ext\Managed\Gilzoide.SqliteNet.dll</HintPath><Private>true</Private></Reference>
+  </ItemGroup>
+</Project>
+
