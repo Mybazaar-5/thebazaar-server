@@ -198,6 +198,18 @@ public sealed class RunState
     /// <summary>当天已访问过的遭遇模板 ID（用于跨小时同天去重，跨天时清空）。</summary>
     public HashSet<string> VisitedDayEncounterIds { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 当前激活的多小时探险替换集（ReplacementSet）根房间 ID（Day 6 CrashSite / Day 9 Jungle Temple / Day 10 Tiny World）；
+    /// 非空时，当日 Hour 2–5 改为发该探险线的专属陷阱怪/宝库/Boss/圣物室/充能室，直到触发 TActionExitReplacementSet、进入 Hour 6 或跨天时清空。
+    /// </summary>
+    public string? ActiveExpeditionId { get; set; }
+
+    /// <summary>当前探险分支变体（例如神庙探险 Hour 1 选择的门："Fiery" / "Toxic" / "Obsidian"）。</summary>
+    public string? ActiveExpeditionVariant { get; set; }
+
+    /// <summary>当前探险内已进入过的房间 ID 集合（用于去重与多舱室推进）。</summary>
+    public HashSet<string> ExpeditionVisitedRoomIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>本局运行期动态遭遇排除集（初始化自 GameMode.ExclusionSet，并支持 Burn it Down 等事件动态增删）。</summary>
     public HashSet<string> ExclusionSet { get; } = new(StringComparer.OrdinalIgnoreCase);
 

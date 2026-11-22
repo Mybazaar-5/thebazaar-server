@@ -119,6 +119,13 @@ public sealed class EnchantmentData
     public bool HasAuras { get; set; }
 }
 
+public sealed class VfxConfigData
+{
+    public string? VFXOverrideKey { get; set; }
+    public bool VFXShouldPlay { get; set; } = true;
+    public bool VFXIsTakeover { get; set; }
+}
+
 public sealed class AbilityDefinition
 {
     public string Id { get; set; } = string.Empty;
@@ -131,6 +138,7 @@ public sealed class AbilityDefinition
     public string? InternalName { get; set; }
     public string? InternalDescription { get; set; }
     public string? TranslationKey { get; set; }
+    public VfxConfigData? VFXConfig { get; set; }
 }
 
 public sealed class AuraDefinition

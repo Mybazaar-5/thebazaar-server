@@ -83,6 +83,9 @@ public static class RunSnapshotSerializer
         public Dictionary<string, double> PlayerAuraMult { get; set; } = new();
         public List<string> VisitedSingleSpawnEncounterIds { get; set; } = new();
         public List<string> VisitedDayEncounterIds { get; set; } = new();
+        public string? ActiveExpeditionId { get; set; }
+        public string? ActiveExpeditionVariant { get; set; }
+        public List<string> ExpeditionVisitedRoomIds { get; set; } = new();
         public List<string> ExclusionSet { get; set; } = new();
         public bool ExclusionSetInitialized { get; set; }
         public Dictionary<string, int> OpponentAttributes { get; set; } = new();
@@ -249,7 +252,12 @@ public static class RunSnapshotSerializer
             EndlessTenWinCelebrated = run.EndlessTenWinCelebrated,
             DailyRerollSequence = run.DailyRerollSequence,
             PendingPvpGhost = run.PendingPvpGhost,
+            ActiveExpeditionId = run.ActiveExpeditionId,
+            ActiveExpeditionVariant = run.ActiveExpeditionVariant,
         };
+
+        foreach (string expRoomId in run.ExpeditionVisitedRoomIds)
+            dto.ExpeditionVisitedRoomIds.Add(expRoomId);
 
         foreach (var kv in run.PlayerAttributes)
             dto.PlayerAttributes[kv.Key.ToString()] = kv.Value;
@@ -430,7 +438,18 @@ public static class RunSnapshotSerializer
             EndlessTenWinCelebrated = dto.EndlessTenWinCelebrated,
             DailyRerollSequence = Math.Max(0, dto.DailyRerollSequence),
             PendingPvpGhost = dto.PendingPvpGhost,
+            ActiveExpeditionId = dto.ActiveExpeditionId,
+            ActiveExpeditionVariant = dto.ActiveExpeditionVariant,
         };
+
+        if (dto.ExpeditionVisitedRoomIds != null)
+        {
+            foreach (string expRoomId in dto.ExpeditionVisitedRoomIds)
+            {
+                if (!string.IsNullOrWhiteSpace(expRoomId))
+                    run.ExpeditionVisitedRoomIds.Add(expRoomId);
+            }
+        }
 
         if (dto.MonsterLootPages is { Count: > 0 })
         {

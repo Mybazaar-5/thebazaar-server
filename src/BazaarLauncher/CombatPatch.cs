@@ -55,6 +55,49 @@ internal static class CombatPatch
     private static Dictionary<string, object> _lastCombatAudit;
     private static readonly ConcurrentQueue<Dictionary<string, object>> _auditHistory = new();
 
+    // V13.2 战斗读条丝滑优化：仅战斗模拟期启用的 1ms Windows 高精度定时器 + 60/120+ FPS 冷却条平滑插值
+    private static bool _highResTimerActive;
+    private static bool _processExitHooked;
+    private static FieldInfo _cdAnimatedTransformField;
+    private static MethodInfo _cdRendererSetCooldownMethod;
+    private static MethodInfo _tooltipGetCurAttrMethod;
+    private static MethodInfo _tooltipNextTierHasAttrMethod;
+    private static MethodInfo _tooltipGetBaseFromTplMethod;
+    private static GameObject _smoothTickerGo;
+
+    private sealed class CooldownBarTrack
+    {
+        public Transform Transform;
+        public float CurrentY;
+        public float LastTargetY;
+        public float VelocityY;
+        public float LastSampleTime;
+        public bool HasVelocity;
+        public bool Active;
+    }
+
+    private static readonly Dictionary<int, CooldownBarTrack> _cdTracks = new(32);
+    private static readonly List<int> _cdDeadKeys = new(8);
+
+    [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    private static extern uint WinMmTimeBeginPeriod(uint uMilliseconds);
+
+    [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+    private static extern uint WinMmTimeEndPeriod(uint uMilliseconds);
+
+    private sealed class CooldownSmoothTicker : MonoBehaviour
+    {
+        private void Update()
+        {
+            TickSmoothCooldownBars();
+        }
+
+        private void OnDestroy()
+        {
+            ClearSmoothCooldownTracks();
+        }
+    }
+
     /// <summary>
     /// 调试/自动化战斗倍速覆盖（GameDriver 专用）。0 表示交由用户手动倍速或首战自动规则处理。
     /// </summary>
@@ -178,10 +221,47 @@ internal static class CombatPatch
 
     private static void UpdateHighResTimer(bool enable)
     {
-        // V12.1 性能优化：不再全局调用 timeBeginPeriod(1) 抬高系统定时器中断；仅在必要清理时尝试配对释放历史计时器
-        if (!enable)
+        try
         {
-            SyncFixedDeltaTimeForSpeed(1f);
+            if (enable)
+            {
+                if (!_highResTimerActive)
+                {
+                    if (WinMmTimeBeginPeriod(1) == 0)
+                    {
+                        _highResTimerActive = true;
+                        if (!_processExitHooked)
+                        {
+                            _processExitHooked = true;
+                            AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+                            {
+                                try
+                                {
+                                    if (_highResTimerActive)
+                                    {
+                                        _highResTimerActive = false;
+                                        WinMmTimeEndPeriod(1);
+                                    }
+                                }
+                                catch { }
+                            };
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if (_highResTimerActive)
+                {
+                    _highResTimerActive = false;
+                    WinMmTimeEndPeriod(1);
+                }
+                SyncFixedDeltaTimeForSpeed(1f);
+            }
+        }
+        catch
+        {
+            if (!enable) SyncFixedDeltaTimeForSpeed(1f);
         }
     }
 
@@ -213,6 +293,8 @@ internal static class CombatPatch
         PatchReplayAutoExit(harmony);
         PatchPostCombatVisualCleanup(harmony);
         PatchDisableTutorials(harmony);
+        PatchSmoothCooldownBars(harmony);
+        PatchPrecisionCooldownTooltip(harmony);
     }
 
     // ── 1. CombatState.GoToNextState 空值兜底 ───────────────────────────────
@@ -366,6 +448,9 @@ internal static class CombatPatch
 
             _inSimulateLoop = true;
             _currentFramesLeft = message?.Data?.Frames?.Count ?? int.MaxValue;
+            ClearSmoothCooldownTracks();
+            EnsureSmoothTickerInstalled();
+            UpdateHighResTimer(true);
             float targetSpeed = GetEffectiveTargetSpeed();
             SyncFixedDeltaTimeForSpeed(targetSpeed);
             CustomGameplayUI.Instance?.NotifyCombatSpeedChangedOnMain();
@@ -413,7 +498,8 @@ internal static class CombatPatch
         {
             _inSimulateLoop = false;
             _currentFramesLeft = -1;
-            SyncFixedDeltaTimeForSpeed(1f);
+            ClearSmoothCooldownTracks();
+            UpdateHighResTimer(false);
 
             // 若战斗被提前取消或慢镜未完全恢复，保证退出后不会卡在低 TimeScale 或残留高 SpeedMultiplier
             if (_speedOverride >= 4f || _manualUiSpeed >= 4f || (Time.timeScale > 0.01f && Time.timeScale < 0.99f))
@@ -711,7 +797,8 @@ internal static class CombatPatch
         {
             _inSimulateLoop = false;
             _currentFramesLeft = -1;
-            SyncFixedDeltaTimeForSpeed(1f);
+            ClearSmoothCooldownTracks();
+            UpdateHighResTimer(false);
 
             if (_speedOverride < 4f && _manualUiSpeed < 4f)
             {
@@ -1526,5 +1613,315 @@ internal static class CombatPatch
             }
             catch { }
         }
+    }
+
+    // ── 8. 战斗读条 60/120+ FPS 丝滑线性插值（消除 50ms 离散步进视觉卡顿） ──
+
+    private static void EnsureSmoothTickerInstalled()
+    {
+        try
+        {
+            if (_smoothTickerGo != null) return;
+            _smoothTickerGo = new GameObject("BazaarCooldownSmoothTicker");
+            UnityEngine.Object.DontDestroyOnLoad(_smoothTickerGo);
+            _smoothTickerGo.AddComponent<CooldownSmoothTicker>();
+        }
+        catch { }
+    }
+
+    private static void ClearSmoothCooldownTracks()
+    {
+        _cdTracks.Clear();
+        _cdDeadKeys.Clear();
+    }
+
+    private static void PatchSmoothCooldownBars(Harmony harmony)
+    {
+        try
+        {
+            var cdType = AccessTools.TypeByName("TheBazaar.Game.Cards.ItemVFXController+CooldownEffect");
+            if (cdType == null) return;
+
+            _cdAnimatedTransformField = AccessTools.Field(cdType, "animatedTransform");
+            var updM = AccessTools.Method(cdType, "UpdatePosition", new[] { typeof(float), typeof(float) });
+            var resetM = AccessTools.Method(cdType, "ResetPosition", Type.EmptyTypes);
+            var showM = AccessTools.Method(cdType, "Show", new[] { typeof(bool) });
+            var cleanM = AccessTools.Method(cdType, "Cleanup", Type.EmptyTypes);
+
+            if (updM != null && _cdAnimatedTransformField != null)
+            {
+                harmony.Patch(updM, postfix: new HarmonyMethod(
+                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectUpdatePositionPostfix))));
+            }
+            if (resetM != null && _cdAnimatedTransformField != null)
+            {
+                harmony.Patch(resetM, postfix: new HarmonyMethod(
+                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectDropTrackPostfix))));
+            }
+            if (showM != null && _cdAnimatedTransformField != null)
+            {
+                harmony.Patch(showM, postfix: new HarmonyMethod(
+                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectShowPostfix))));
+            }
+            if (cleanM != null && _cdAnimatedTransformField != null)
+            {
+                harmony.Patch(cleanM, postfix: new HarmonyMethod(
+                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectDropTrackPostfix))));
+            }
+            BazaarLauncherPlugin.Log?.LogInfo("Patched ItemVFXController.CooldownEffect (60/120+ FPS smooth cooldown bar interpolation)");
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("PatchSmoothCooldownBars: " + ex.Message);
+        }
+    }
+
+    private static void CooldownEffectUpdatePositionPostfix(object __instance, float newValue, float maxValue)
+    {
+        try
+        {
+            if (!_inSimulateLoop || __instance == null || _cdAnimatedTransformField == null || maxValue <= 0f)
+                return;
+
+            var tr = _cdAnimatedTransformField.GetValue(__instance) as Transform;
+            if (tr == null) return;
+
+            int key = tr.GetInstanceID();
+            float targetY = Mathf.InverseLerp(0f, maxValue, maxValue - newValue) * 2f - 1f;
+            float now = Time.unscaledTime;
+
+            if (!_cdTracks.TryGetValue(key, out var track))
+            {
+                track = new CooldownBarTrack
+                {
+                    Transform = tr,
+                    CurrentY = targetY,
+                    LastTargetY = targetY,
+                    VelocityY = 0f,
+                    LastSampleTime = now,
+                    HasVelocity = false,
+                    Active = true,
+                };
+                _cdTracks[key] = track;
+                return;
+            }
+
+            track.Transform = tr;
+            track.Active = true;
+
+            // 开火重置（newValue == maxValue 或倒退跳变）或大额瞬时充能跃变：直接瞬切不插值
+            bool isReset = Mathf.Abs(newValue - maxValue) <= 0.5f || targetY < track.LastTargetY - 0.06f;
+            bool isLargeChargeJump = targetY - track.LastTargetY > 0.35f;
+            if (isReset || isLargeChargeJump)
+            {
+                track.CurrentY = targetY;
+                track.LastTargetY = targetY;
+                track.VelocityY = 0f;
+                track.HasVelocity = false;
+                track.LastSampleTime = now;
+                return;
+            }
+
+            float dt = now - track.LastSampleTime;
+            float deltaY = targetY - track.LastTargetY;
+
+            // 冰冻或停滞（冷却未前进）：立即刹停，不再继续外推
+            if (deltaY <= 0.0001f)
+            {
+                track.CurrentY = targetY;
+                track.LastTargetY = targetY;
+                track.VelocityY = 0f;
+                track.HasVelocity = false;
+                track.LastSampleTime = now;
+                return;
+            }
+
+            if (dt >= 0.005f && dt <= 0.30f)
+            {
+                float sampleVel = deltaY / dt;
+                track.VelocityY = track.HasVelocity
+                    ? Mathf.Lerp(track.VelocityY, sampleVel, 0.55f)
+                    : sampleVel;
+                track.HasVelocity = true;
+            }
+            else if (dt > 0.30f)
+            {
+                track.VelocityY = 0f;
+                track.HasVelocity = false;
+                track.CurrentY = targetY;
+            }
+
+            track.LastTargetY = targetY;
+            track.LastSampleTime = now;
+
+            // 防止回拉抖动：若平滑外推位置与最新采样点误差在 1.5 帧步长内，保留平滑进度并由 Tick 温和收敛
+            float err = targetY - track.CurrentY;
+            if (Mathf.Abs(err) < 0.14f)
+            {
+                var lp = tr.localPosition;
+                lp.y = track.CurrentY;
+                tr.localPosition = lp;
+            }
+            else
+            {
+                track.CurrentY = targetY;
+            }
+        }
+        catch { }
+    }
+
+    private static void CooldownEffectShowPostfix(object __instance, bool show)
+    {
+        if (!show) CooldownEffectDropTrackPostfix(__instance);
+    }
+
+    private static void CooldownEffectDropTrackPostfix(object __instance)
+    {
+        try
+        {
+            if (__instance == null || _cdAnimatedTransformField == null) return;
+            var tr = _cdAnimatedTransformField.GetValue(__instance) as Transform;
+            if (tr != null)
+            {
+                _cdTracks.Remove(tr.GetInstanceID());
+            }
+        }
+        catch { }
+    }
+
+    private static bool IsGameCurrentlyPaused()
+    {
+        try
+        {
+            if (_gamePausedProp == null)
+            {
+                var gsmType = _gameServiceManagerType ?? AccessTools.TypeByName("TheBazaar.GameServiceManager");
+                _gameServiceManagerType = gsmType;
+                _gamePausedProp = gsmType?.GetProperty("IsGamePaused", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                    ?? gsmType?.GetProperty("GamePaused", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            }
+            if (_gamePausedProp != null && _gamePausedProp.GetValue(null) is bool paused)
+                return paused;
+        }
+        catch { }
+        return Time.timeScale <= 0.001f;
+    }
+
+    private static void TickSmoothCooldownBars()
+    {
+        if (!_inSimulateLoop || _cdTracks.Count == 0) return;
+        if (IsGameCurrentlyPaused()) return;
+
+        float dt = Time.unscaledDeltaTime;
+        if (dt <= 0f || dt > 0.1f) return;
+
+        float now = Time.unscaledTime;
+        _cdDeadKeys.Clear();
+
+        foreach (var kv in _cdTracks)
+        {
+            var t = kv.Value;
+            if (!t.Active || t.Transform == null)
+            {
+                _cdDeadKeys.Add(kv.Key);
+                continue;
+            }
+            if (t.VelocityY <= 0.0001f) continue;
+
+            // 若超过 120ms 未收到新的服务端帧（如终结慢镜停顿或冰冻），自动刹车避免冲过头
+            float sinceSample = now - t.LastSampleTime;
+            if (sinceSample > 0.12f) continue;
+
+            float maxLeadY = Mathf.Min(1f, t.LastTargetY + t.VelocityY * 0.065f);
+            // 带轻微相位校正（向 LastTargetY + VelocityY * sinceSample 收敛），既丝滑又零累计漂移
+            float idealY = Mathf.Min(maxLeadY, t.LastTargetY + t.VelocityY * sinceSample);
+            float stepY = t.CurrentY + t.VelocityY * dt;
+            t.CurrentY = Mathf.Clamp(Mathf.Lerp(stepY, idealY, 0.35f), -1f, maxLeadY);
+
+            var lp = t.Transform.localPosition;
+            lp.y = t.CurrentY;
+            t.Transform.localPosition = lp;
+        }
+
+        for (int i = 0; i < _cdDeadKeys.Count; i++)
+        {
+            _cdTracks.Remove(_cdDeadKeys[i]);
+        }
+    }
+
+    // ── 9. 冷却时间 Tooltip 精准显示（亚十分位如 1980ms 显示 1.98，整 0.1s 保持原版 2.0）──
+
+    private static void PatchPrecisionCooldownTooltip(Harmony harmony)
+    {
+        try
+        {
+            var rendererType = AccessTools.TypeByName("TheBazaar.UI.Tooltips.CooldownRenderer");
+            var tooltipDataType = AccessTools.TypeByName("TheBazaar.Tooltips.CardTooltipData");
+            if (rendererType == null || tooltipDataType == null) return;
+
+            var renderM = AccessTools.Method(rendererType, "RenderFromTooltip");
+            _cdRendererSetCooldownMethod = AccessTools.Method(rendererType, "SetCooldown", new[] { typeof(string), typeof(bool), typeof(string) });
+            _tooltipGetCurAttrMethod = AccessTools.Method(tooltipDataType, "GetCurrentAttributeValue", new[] { typeof(ECardAttributeType) });
+            _tooltipNextTierHasAttrMethod = AccessTools.Method(tooltipDataType, "NextTierHasAttribute", new[] { typeof(ECardAttributeType) });
+            _tooltipGetBaseFromTplMethod = AccessTools.Method(tooltipDataType, "GetBaseValueFromCardTemplate",
+                new[] { typeof(ECardAttributeType), typeof(ETier), typeof(float), typeof(ETier) });
+
+            if (renderM != null && _cdRendererSetCooldownMethod != null && _tooltipGetCurAttrMethod != null)
+            {
+                harmony.Patch(renderM, postfix: new HarmonyMethod(
+                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownRendererRenderPostfix))));
+                BazaarLauncherPlugin.Log?.LogInfo("Patched CooldownRenderer.RenderFromTooltip (sub-0.1s precision display, e.g. 1.98s)");
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("PatchPrecisionCooldownTooltip: " + ex.Message);
+        }
+    }
+
+    private static string FormatCooldownSecondsSmart(float seconds)
+    {
+        int ms = Mathf.RoundToInt(seconds * 1000f);
+        // 整 0.1 秒（如 2000ms / 3500ms）保持官方 F1（2.0 / 3.5）；存在百分位缩减（如 1980ms）显示 F2（1.98）
+        return (ms % 100) != 0 ? $"{seconds:F2}" : $"{seconds:F1}";
+    }
+
+    private static void CooldownRendererRenderPostfix(object __instance, object tooltipData, bool canFuse, ETier nextTier, ETier currentTier)
+    {
+        try
+        {
+            if (__instance == null || tooltipData == null || _tooltipGetCurAttrMethod == null || _cdRendererSetCooldownMethod == null)
+                return;
+
+            object curObj = _tooltipGetCurAttrMethod.Invoke(tooltipData, new object[] { ECardAttributeType.CooldownMax });
+            if (curObj is not float curSec || curSec <= 0f) return;
+
+            int curMs = Mathf.RoundToInt(curSec * 1000f);
+            bool curNeedsF2 = (curMs % 100) != 0;
+
+            bool fusedHasAttr = false;
+            float fusedSec = 0f;
+            bool fusedNeedsF2 = false;
+            if (canFuse && _tooltipNextTierHasAttrMethod != null && _tooltipGetBaseFromTplMethod != null)
+            {
+                if (_tooltipNextTierHasAttrMethod.Invoke(tooltipData, new object[] { ECardAttributeType.CooldownMax }) is bool has && has)
+                {
+                    object fObj = _tooltipGetBaseFromTplMethod.Invoke(tooltipData, new object[] { ECardAttributeType.CooldownMax, nextTier, curSec, currentTier });
+                    if (fObj is float fs && fs > 0f)
+                    {
+                        fusedHasAttr = true;
+                        fusedSec = fs;
+                        fusedNeedsF2 = (Mathf.RoundToInt(fs * 1000f) % 100) != 0;
+                    }
+                }
+            }
+
+            if (!curNeedsF2 && !fusedNeedsF2) return;
+
+            string curText = FormatCooldownSecondsSmart(curSec);
+            string fusedText = fusedHasAttr ? FormatCooldownSecondsSmart(fusedSec) : string.Empty;
+            _cdRendererSetCooldownMethod.Invoke(__instance, new object[] { curText, canFuse && fusedHasAttr, fusedText });
+        }
+        catch { }
     }
 }

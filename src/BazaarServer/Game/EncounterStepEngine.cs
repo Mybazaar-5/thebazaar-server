@@ -148,6 +148,10 @@ public sealed class EncounterStepEngine
             OnExitSelection = () =>
             {
                 result.ExitedEncounter = true;
+                // TActionExitReplacementSet：主动退出当前探险替换集，恢复常规事件池
+                _run.ActiveExpeditionId = null;
+                _run.ActiveExpeditionVariant = null;
+                _run.ExpeditionVisitedRoomIds.Clear();
                 result.ChangeLogs.Add("ExitReplacementSet");
             },
             OnDealCardsToSelection = (dealtCards, spawnMode) =>
@@ -168,6 +172,14 @@ public sealed class EncounterStepEngine
 
         // 记录执行前快照用于精准生成变更日志与事件（扣费前记快照以便 ChangeLogs 统一记录净变化）
         var prevPlayerAttrs = new Dictionary<string, double>(playerState.Attributes, StringComparer.OrdinalIgnoreCase);
+
+        // 记录神庙探险 Hour 1 所选元素门（Fiery / Toxic / Obsidian），驱动后续 Hour 2 陷阱房与 Hour 3 宝库的元素变体
+        if (stepTplId.Equals("99ac6ab3-0b14-44c3-b7f9-21e008291b85", StringComparison.OrdinalIgnoreCase))
+            _run.ActiveExpeditionVariant = "Fiery";
+        else if (stepTplId.Equals("c0f1cad2-8561-475a-9e08-a88e8bd62d04", StringComparison.OrdinalIgnoreCase))
+            _run.ActiveExpeditionVariant = "Toxic";
+        else if (stepTplId.Equals("cfaef293-1d93-4be9-8cf1-0baf3eee6dbb", StringComparison.OrdinalIgnoreCase))
+            _run.ActiveExpeditionVariant = "Obsidian";
 
         // 扣费
         if (buyPrice > 0)
@@ -1518,6 +1530,12 @@ public sealed class EncounterStepEngine
         {
             result.ChangeLogs.Add($"ConsumeTicket:{roomEncounterId}");
         }
+
+        // V13.2 修复问题 #9：激活多小时探险 ReplacementSet 状态机，保证选完入口第 1 步后 Hour 2-5 继续在遗迹/坠毁点/微观世界内推进
+        _run.ActiveExpeditionId = roomEncounterId;
+        _run.ActiveExpeditionVariant = null;
+        _run.ExpeditionVisitedRoomIds.Clear();
+        _run.ExpeditionVisitedRoomIds.Add(roomEncounterId);
 
         var (syncedPlayer, _, _, _, _, _) = BuildSyncedPlayerState();
         result.Events.AddRange(_shop.DealEncounterShelf(roomEncounterId, isReroll: false, playerState: syncedPlayer));

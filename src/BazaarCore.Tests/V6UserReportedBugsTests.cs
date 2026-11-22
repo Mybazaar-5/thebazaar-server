@@ -819,12 +819,25 @@ public sealed class V6UserReportedBugsTests
     {
         int p1Hp = initP1Hp;
         int p2Hp = initP2Hp;
-        foreach (var frame in sim.Frames)
+        bool p1Won = sim.Winner == ECombatantId.Player;
+        for (int i = 0; i < sim.Frames.Count; i++)
         {
+            var frame = sim.Frames[i];
             ApplyUpdate(frame.PlayerUpdates, ref p1Hp);
             ApplyUpdate(frame.OpponentUpdates, ref p2Hp);
-            Assert.True(p1Hp >= 0 && p2Hp >= 0);
+            // V13.2 还原官方负血击杀视觉：胜方全程血量应 >= 0（除非同归于尽尾帧），败方仅允许在致命帧之后处于负血溢出
+            bool isLastFrame = i == sim.Frames.Count - 1;
+            if (!isLastFrame)
+            {
+                if (p1Won) Assert.True(p1Hp >= 0, $"Frame {i}: 胜方 P1 不应提前出现负血 ({p1Hp})");
+                else Assert.True(p2Hp >= 0, $"Frame {i}: 胜方 P2 不应提前出现负血 ({p2Hp})");
+            }
+            Assert.True(p1Hp <= initP1Hp * 4 && p2Hp <= initP2Hp * 4);
         }
+
+        // 结束时败方血量应 <= 0（含官方负血击杀）
+        if (p1Won) Assert.True(p2Hp <= 0, $"P1 获胜后 P2 终场血量应 <= 0，实际={p2Hp}");
+        else Assert.True(p1Hp <= 0, $"P2 获胜后 P1 终场血量应 <= 0，实际={p1Hp}");
 
         static void ApplyUpdate(CombatSimPlayerUpdate? upd, ref int hp)
         {

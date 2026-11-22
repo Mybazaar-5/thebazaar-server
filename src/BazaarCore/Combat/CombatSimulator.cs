@@ -1308,13 +1308,15 @@ public static class CombatSimulator
         // 帧末死亡/复活检查：对照官方 BazaarCardDealer.cs:4301-4368 先查 p2 再查 p1，每名玩家至多触发一次 TTriggerOnPlayerDied
         bool CheckEndOfTickDeath()
         {
+            int savedP1Overkill = p1Overkill;
+            int savedP2Overkill = p2Overkill;
             for (int pass = 0; pass < 2; pass++)
             {
                 bool triggeredAny = false;
                 if (!p2.IsAlive && !p2DeathTriggered)
                 {
                     p2DeathTriggered = true;
-                    p2Overkill = 0; // 对齐官方 HealthSetToZeroFromOnDeath：先归零再执行 OnDeath
+                    p2Overkill = 0; // 对齐官方 HealthSetToZeroFromOnDeath：先归零再执行 OnDeath（确保复活按 0 血起算）
                     DispatchEvent("TTriggerOnPlayerDied", p2, null, null, p2);
                     ProcessIcdQueues();
                     triggeredAny = true;
@@ -1330,7 +1332,9 @@ public static class CombatSimulator
                 if (!triggeredAny) break;
             }
             if (p1.IsAlive) p1Overkill = 0;
+            else p1Overkill = Math.Max(p1Overkill, savedP1Overkill); // 未复活则保留真实致命溢出负血供血条呈现（如 -420）
             if (p2.IsAlive) p2Overkill = 0;
+            else p2Overkill = Math.Max(p2Overkill, savedP2Overkill);
             return !p1.IsAlive || !p2.IsAlive;
         }
 
@@ -1455,7 +1459,7 @@ public static class CombatSimulator
                     || (timeMs + TickMs) > nextSnapshotWindowEndMs;
                 if (shouldCapture)
                 {
-                    timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache));
+                    timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache, p1Overkill, p2Overkill));
                     while (nextSnapshotWindowEndMs <= timeMs + TickMs)
                         nextSnapshotWindowEndMs += effectiveSampleInterval;
                 }
@@ -1490,7 +1494,7 @@ public static class CombatSimulator
         }
 
         if (recordTimeline)
-            timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache));
+            timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache, p1Overkill, p2Overkill));
 
         if (recordEvents)
         {
@@ -2517,7 +2521,9 @@ public static class CombatSimulator
         bool sandstormActive,
         int nextSandstormDmg,
         StandardPricesSettings prices,
-        Dictionary<CardInstance, CachedCardSnapshotAttrs>? attrCache = null)
+        Dictionary<CardInstance, CachedCardSnapshotAttrs>? attrCache = null,
+        int p1Overkill = 0,
+        int p2Overkill = 0)
     {
         static int ReadIntAttr(CardInstance c, string attr)
         {
@@ -2621,7 +2627,7 @@ public static class CombatSimulator
         return new CombatTickState
         {
             TimeMs = timeMs,
-            P1Hp = p1.CurrentHealth,
+            P1Hp = p1.CurrentHealth > 0 ? p1.CurrentHealth : -Math.Max(0, p1Overkill),
             P1MaxHp = p1.HealthMax,
             P1Shield = p1.Shield,
             P1Burn = p1.Burn,
@@ -2630,7 +2636,7 @@ public static class CombatSimulator
             P1Rage = p1.Rage,
             P1Enraged = p1.IsEnraged,
             P1Tempo = p1.Tempo,
-            P2Hp = p2.CurrentHealth,
+            P2Hp = p2.CurrentHealth > 0 ? p2.CurrentHealth : -Math.Max(0, p2Overkill),
             P2MaxHp = p2.HealthMax,
             P2Shield = p2.Shield,
             P2Burn = p2.Burn,

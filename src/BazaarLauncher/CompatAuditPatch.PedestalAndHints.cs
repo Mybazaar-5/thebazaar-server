@@ -149,6 +149,28 @@ internal static partial class CompatAuditPatch
                 _bmIsBoardStatePresLoadingProp = bmType.GetProperty("IsBoardStatePresentationLoading", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 _bmLoadRequestVersionField = bmType.GetField("_boardStatePresentationLoadRequestVersion", BindingFlags.NonPublic | BindingFlags.Instance);
                 _bmPresRefField = bmType.GetField("boardStatePresentationReference", BindingFlags.NonPublic | BindingFlags.Instance);
+                _bmEncounterAssetSoField ??= bmType.GetField("_encounterAssetDataSO", BindingFlags.NonPublic | BindingFlags.Instance);
+                _bmOpponentBoardAnchorField = bmType.GetField("opponentBoardAnchor", BindingFlags.NonPublic | BindingFlags.Instance);
+                _cardSocketCtrlType = GameInspector.FindTypeSafe("CardSocketController", "TheBazaar.CardSocketController");
+                _cardCtrlBaseType = GameInspector.FindTypeSafe("CardController", "TheBazaar.CardController");
+                _socketEffectCtrlType = GameInspector.FindTypeSafe("SocketEffectController", "TheBazaar.SocketEffectController");
+
+                // 锚定 Unity.VisualScripting.CustomEvent.Trigger(GameObject, string, object[]) 供销毁前同步派发原生 "Clean Up"
+                var vsCustomEventType = GameInspector.FindTypeSafe("Unity.VisualScripting.CustomEvent");
+                if (vsCustomEventType != null)
+                {
+                    _vsCustomEventTriggerMethod = vsCustomEventType
+                        .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                        .FirstOrDefault(m =>
+                        {
+                            if (m.Name != "Trigger") return false;
+                            var ps = m.GetParameters();
+                            return ps.Length == 3
+                                && ps[0].ParameterType == typeof(GameObject)
+                                && ps[1].ParameterType == typeof(string)
+                                && ps[2].ParameterType == typeof(object[]);
+                        });
+                }
 
                 var onStateChanged = AccessTools.Method(bmType, "OnStateChanged");
                 if (onStateChanged != null)
@@ -169,8 +191,9 @@ internal static partial class CompatAuditPatch
                 var loadPres = AccessTools.Method(bmType, "LoadBoardStatePresentation", Type.EmptyTypes);
                 if (loadPres != null)
                 {
-                    harmony.Patch(loadPres, postfix: new HarmonyMethod(
-                        AccessTools.Method(typeof(CompatAuditPatch), nameof(LoadBoardStatePresentationPostfix))));
+                    harmony.Patch(loadPres,
+                        prefix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(LoadBoardStatePresentationPrefix))),
+                        postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(LoadBoardStatePresentationPostfix))));
                     _patchedCount++;
                 }
 
@@ -543,7 +566,29 @@ internal static partial class CompatAuditPatch
             if ((wasPedestal || _wasInAnyPedestal || _pedestalVerifyNonPedestalExit) && !nowPedestalContext)
             {
                 _wasInAnyPedestal = false;
+                // V13.2 修复问题 #4（根因 2）：PedestalState.OnGameSimMessage 移除了 GameSimEventStateTransitioned，
+                // 导致 GameSimHandler 不会调用 TryLoadCurrentEncounterSO()，BoardManager._encounterAssetDataSO 会残留指向旧基座资产！
+                // 离开基座或无当前遭遇 ID 时立即置空 _encounterAssetDataSO，杜绝旧附魔/升级台被后续事件二次加载！
+                if (!HasActiveCurrentEncounterId())
+                {
+                    ClearStaleBoardManagerEncounterAssetSo(__instance);
+                }
                 CleanupStalePedestalBoardPresentation(__instance, "OnStateChanged", forceImmediate: true, allowWhileInPedestalState: false);
+                SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
+            }
+            else if (curStateName is "ChoiceState" or "CombatState" or "PVPCombatState" or "LootState")
+            {
+                // 任何时候切入三选一/战斗/战利品且无激活遭遇 ID，兜底清理陈旧 _encounterAssetDataSO 与残余中台对象
+                if (!HasActiveCurrentEncounterId())
+                {
+                    ClearStaleBoardManagerEncounterAssetSo(__instance);
+                }
+                var curPres = GetBoardStatePresentationObj(__instance);
+                if (curPres != null && !IsInPedestalContext())
+                {
+                    CleanupStalePedestalBoardPresentation(__instance, "OnStateChanged:" + curStateName, forceImmediate: true, allowWhileInPedestalState: false);
+                }
+                SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
             }
         }
         catch (Exception ex)
@@ -633,6 +678,34 @@ internal static partial class CompatAuditPatch
         }
     }
 
+    private static bool LoadBoardStatePresentationPrefix(object __instance, ref Task __result)
+    {
+        if (__instance == null || (__instance is UnityEngine.Object bmUo && bmUo == null)) return true;
+        try
+        {
+            // V13.2 修复问题 #4：无激活遭遇 ID（例如刚退出附魔/升级台回到 ChoiceState）时，立即清掉陈旧 _encounterAssetDataSO
+            // 与残留 BoardStatePresentation，直接短路阻止把上一跳的附魔/升级台再次加载到中间 3 格！
+            if (!HasActiveCurrentEncounterId())
+            {
+                ClearStaleBoardManagerEncounterAssetSo(__instance);
+                var curPres = GetBoardStatePresentationObj(__instance);
+                bool isLoading = _bmIsBoardStatePresLoadingProp?.GetValue(__instance) is bool b && b;
+                if (curPres != null || isLoading)
+                {
+                    CleanupStalePedestalBoardPresentation(__instance, "LoadBoardStatePresentationPrefix:NoEncounter", forceImmediate: true, allowWhileInPedestalState: false);
+                }
+                SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
+                __result = Task.CompletedTask;
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.LoadBoardStatePresentationPrefix: " + ex.Message);
+        }
+        return true;
+    }
+
     private static void LoadBoardStatePresentationPostfix(object __instance, ref Task __result)
     {
         try
@@ -709,21 +782,33 @@ internal static partial class CompatAuditPatch
             var curPres = GetBoardStatePresentationObj(__instance);
             bool isLoading = _bmIsBoardStatePresLoadingProp?.GetValue(__instance) is bool b && b;
             bool inPedestalCtx = IsInPedestalContext();
+            bool shouldLoad = _bmShouldLoadPresMethod != null
+                && _bmShouldLoadPresMethod.Invoke(__instance, null) is bool sl && sl;
             bool isPedestalPres = curPres != null
                 && (IsTrackedOrPedestalPresentation(curPres) || IsForceCleanedPresentation(curPres) || inPedestalCtx);
             bool hasPendingExitAbort = (_pendingPedestalExitAbort || inPedestalCtx) && (curPres != null || isLoading);
+            // V13.2 修复问题 #4：Artisan Dunes / Form / Forja 等非 PedestalState 中台事件退出时同样可能卡入原版 10s CleanUp，
+            // 只要处于切离无中台状态（!shouldLoad）且持有现存呈现对象，统一先触发原生 "Clean Up" 再同步即时回收。
+            bool staleAnyPresentationOnExit = !inPedestalCtx && !shouldLoad && (curPres != null || isLoading);
 
-            if (!isPedestalPres && !hasPendingExitAbort)
+            if (!isPedestalPres && !hasPendingExitAbort && !staleAnyPresentationOnExit)
             {
                 if (!inPedestalCtx && _pedestalVerifyNonPedestalExit)
                 {
                     SweepOrphanPedestalPresentationsInScene(curPres);
+                    SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
                 }
                 return true;
             }
 
-            // 绝不走原生 await BoardStatePresentation.CleanUp() 10 秒超时分支，直接同步即时销毁并重置全部引用
+            if (!HasActiveCurrentEncounterId())
+            {
+                ClearStaleBoardManagerEncounterAssetSo(__instance);
+            }
+
+            // 绝不走原生 await BoardStatePresentation.CleanUp() 10 秒超时分支，先触发原生 "Clean Up" 卸载外部台座，再同步即时销毁并重置全部引用
             CleanupStalePedestalBoardPresentation(__instance, "RemoveBoardStatePresentationPrefix", forceImmediate: true, allowWhileInPedestalState: true);
+            SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
             __result = Task.CompletedTask;
             return false;
         }
@@ -868,25 +953,53 @@ internal static partial class CompatAuditPatch
         return IsCurrentEncounterPedestal();
     }
 
+    private static bool HasActiveCurrentEncounterId()
+    {
+        try
+        {
+            return GetStaticDataMember("CurrentEncounterId") is Guid encGuid && encGuid != Guid.Empty;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void ClearStaleBoardManagerEncounterAssetSo(object boardManager)
+    {
+        if (boardManager == null || _bmEncounterAssetSoField == null) return;
+        try
+        {
+            if (_bmEncounterAssetSoField.GetValue(boardManager) != null)
+            {
+                _bmEncounterAssetSoField.SetValue(boardManager, null);
+            }
+        }
+        catch { }
+    }
+
     private static bool IsCurrentEncounterPedestal()
     {
         try
         {
+            // V13.2 修复问题 #4（根因 1）：PedestalState 退出调用 AppState.SetState(ChoiceState) 瞬间，
+            // Data.CurrentEncounterId 已被置为 null，但 Data.CurrentEncounterController 尚未被 ClearPortrait() 清除！
+            // 若继续回退读取旧 CurrentEncounterController，会误判当前仍在基座态，导致 OnStateChanged 跳过清理！
+            if (GetStaticDataMember("CurrentEncounterId") is not Guid encGuid || encGuid == Guid.Empty)
+                return false;
+
+            var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
+            var getStaticM = dataType?.GetMethod("GetStatic", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+            var staticMgr = getStaticM?.Invoke(null, null);
+            var getCardM = staticMgr?.GetType().GetMethod("GetCardById", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(Guid) }, null);
+            if (getCardM?.Invoke(staticMgr, new object[] { encGuid }) is TCardEncounterPedestal)
+                return true;
+
             var curEncCtrl = GetStaticDataMember("CurrentEncounterController");
             if (curEncCtrl != null && !(curEncCtrl is UnityEngine.Object uo && uo == null))
             {
                 var encCard = GameInspector.GetMember(curEncCtrl, "CardData");
                 if (GameInspector.GetMember(encCard, "Template") is TCardEncounterPedestal)
-                    return true;
-            }
-
-            if (GetStaticDataMember("CurrentEncounterId") is Guid encGuid && encGuid != Guid.Empty)
-            {
-                var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
-                var getStaticM = dataType?.GetMethod("GetStatic", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
-                var staticMgr = getStaticM?.Invoke(null, null);
-                var getCardM = staticMgr?.GetType().GetMethod("GetCardById", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(Guid) }, null);
-                if (getCardM?.Invoke(staticMgr, new object[] { encGuid }) is TCardEncounterPedestal)
                     return true;
             }
         }
@@ -1006,6 +1119,13 @@ internal static partial class CompatAuditPatch
             }
         }
 
+        // 0. V13.2 修复问题 #4（根因 3）：在销毁 BoardStatePresentation.gameObject 前，先同步触发原生 Visual Scripting "Clean Up" 事件，
+        //    让基座蓝图自行清理它在 OnInitialize 中挂载到 BoardOpponentAnchor 或场景外部的附魔/升级台实体与粒子，防止台座遗留挡住中间 3 格！
+        if (presObj is Component vsComp && vsComp.gameObject != null && vsComp.gameObject.activeInHierarchy)
+        {
+            InvokeVisualScriptingCleanUpEvent(vsComp.gameObject);
+        }
+
         // 1. 立即置位 CleanupComplete = true 并取消等待令牌，瞬间满足 <CleanUp>b__70_0 条件
         try { _bspCleanUpCompleteMethod?.Invoke(presObj, null); } catch { }
         try
@@ -1028,6 +1148,67 @@ internal static partial class CompatAuditPatch
         }
 
         return newlyMarked;
+    }
+
+    private static void InvokeVisualScriptingCleanUpEvent(GameObject targetGo)
+    {
+        if (targetGo == null || _vsCustomEventTriggerMethod == null) return;
+        try
+        {
+            _vsCustomEventTriggerMethod.Invoke(null, new object[] { targetGo, "Clean Up", Array.Empty<object>() });
+        }
+        catch
+        {
+            // 忽略已失活或不含 Visual Scripting ScriptMachine 的对象异常
+        }
+    }
+
+    private static void SweepOrphanPedestalChildrenUnderOpponentAnchor(object boardManager)
+    {
+        if (boardManager == null || _bmOpponentBoardAnchorField == null) return;
+        try
+        {
+            if (IsInPedestalContext()) return;
+            var curPres = GetBoardStatePresentationObj(boardManager);
+            if (curPres != null) return;
+            if (_bmOpponentBoardAnchorField.GetValue(boardManager) is not Transform oppAnchor || oppAnchor == null)
+                return;
+
+            int childCount = oppAnchor.childCount;
+            for (int i = childCount - 1; i >= 0; i--)
+            {
+                var child = oppAnchor.GetChild(i);
+                if (child == null || child.gameObject == null) continue;
+                var go = child.gameObject;
+
+                // 严格保护合法卡槽、卡牌与插槽特效子物体
+                if (_cardSocketCtrlType != null && go.GetComponent(_cardSocketCtrlType) != null) continue;
+                if (_cardCtrlBaseType != null && go.GetComponent(_cardCtrlBaseType) != null) continue;
+                if (_socketEffectCtrlType != null && go.GetComponent(_socketEffectCtrlType) != null) continue;
+
+                bool hasBsp = _bspType != null && go.GetComponentInChildren(_bspType, includeInactive: true) != null;
+                string nm = go.name ?? "";
+                bool looksLikePedestalVisual = hasBsp
+                    || nm.IndexOf("Pedestal", StringComparison.OrdinalIgnoreCase) >= 0
+                    || nm.IndexOf("Enchant", StringComparison.OrdinalIgnoreCase) >= 0
+                    || nm.IndexOf("Upgrade", StringComparison.OrdinalIgnoreCase) >= 0
+                    || nm.IndexOf("Artisan", StringComparison.OrdinalIgnoreCase) >= 0
+                    || nm.IndexOf("Artist", StringComparison.OrdinalIgnoreCase) >= 0
+                    || nm.IndexOf("Forge", StringComparison.OrdinalIgnoreCase) >= 0
+                    || nm.IndexOf("Anvil", StringComparison.OrdinalIgnoreCase) >= 0
+                    || nm.IndexOf("Altar", StringComparison.OrdinalIgnoreCase) >= 0
+                    || nm.IndexOf("Presentation", StringComparison.OrdinalIgnoreCase) >= 0
+                    || nm.IndexOf("Scroll", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                if (!looksLikePedestalVisual) continue;
+
+                InvokeVisualScriptingCleanUpEvent(go);
+                if (go.activeSelf) go.SetActive(false);
+                UnityEngine.Object.Destroy(go);
+                Interlocked.Increment(ref _pedestalPresentationCleanedCount);
+            }
+        }
+        catch { }
     }
 
     private static object GetBoardStatePresentationObj(object boardManager)

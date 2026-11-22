@@ -90,6 +90,9 @@ public static class CombatSimConverter
         var prevQuestProgress = new Dictionary<(string CardId, int GroupIdx, int EntryIdx), int>();
         var questCompletedCount = new Dictionary<string, int>(StringComparer.Ordinal);
         var itemActionCredits = new Dictionary<(int TimeMs, string CardInstanceId, EActionCommandType ActionType), int>();
+        var vfxKeyMap = new Dictionary<string, int>(StringComparer.Ordinal);
+        sim.VfxKeys ??= new List<string>();
+        sim.VfxKeys.Clear();
         var firedInFrame = new HashSet<CardRenderState>();
         bool sandstormCountdownEmitted = false;
         bool sandstormStartedEmitted = false;
@@ -176,6 +179,7 @@ public static class CombatSimConverter
                     prevQuestProgress,
                     questCompletedCount,
                     itemActionCredits,
+                    vfxKeyMap,
                     simHealthState,
                     ref sandstormCountdownEmitted,
                     ref sandstormStartedEmitted);
@@ -364,16 +368,11 @@ public static class CombatSimConverter
                 ? existingCd
                 : effectiveCdMax;
 
-            // 属性变更差分压缩：首帧/末帧/开火重置/冷却上限变/冰冻急速减速状态变/充能等非线性跃变/每 200ms 校准心跳才写 Cooldown，
-            // 大幅削减 50ms 线性倒计时冗余帧（单场包体直降 60%-75%，同时保持客户端进度条丝滑精准）
-            int framesSinceEmit = frameIndex - state.LastEmittedCdFrame;
-            int predictedCd = state.LastEmittedCdValue >= 0
-                ? (int)Math.Clamp(Math.Round(state.LastEmittedCdValue - framesSinceEmit * FrameStepMs * state.LastEmittedCdRate), 0, effectiveCdMax)
-                : curCd;
-            bool nonLinearJump = Math.Abs(curCd - predictedCd) > 45;
-            bool heartbeatDue = framesSinceEmit >= 4 && curCd != prevCd;
-
-            if (firedThisFrame || isFirstFrame || isLastFrame || cdMaxChanged || paceChanged || nonLinearJump || heartbeatDue)
+            // V13.2 修复战斗读条 5 FPS 跳帧卡顿：
+            // 反编译 ItemVFXController.CooldownEffect.UpdatePosition 直接将 localPosition.y 硬切到服务端下发的 Cooldown 值，
+            // 客户端原生没有任何 200ms 间补间插值。必须严格对齐官方 50ms/帧（20 Hz）步进，只要冷却推进变化即逐帧发射 Cooldown。
+            bool cdChanged = curCd != prevCd;
+            if (firedThisFrame || isFirstFrame || isLastFrame || cdMaxChanged || paceChanged || cdChanged)
             {
                 cu ??= new CombatSimCardUpdate { CardInstanceId = cardId };
                 cu.Attributes[ECardAttributeType.Cooldown] = new CombatSimCardAttributeUpdate
@@ -513,6 +512,7 @@ public static class CombatSimConverter
         Dictionary<(string CardId, int GroupIdx, int EntryIdx), int> prevQuestProgress,
         Dictionary<string, int> questCompletedCount,
         Dictionary<(int TimeMs, string CardInstanceId, EActionCommandType ActionType), int> itemActionCredits,
+        Dictionary<string, int> vfxKeyMap,
         FrameCombatantState simHealthState,
         ref bool sandstormCountdownEmitted,
         ref bool sandstormStartedEmitted)
@@ -552,6 +552,7 @@ public static class CombatSimConverter
                         Source = new InstanceId(srcMeta.Entry.InstanceId),
                         TriggerSource = new InstanceId(srcMeta.Entry.InstanceId),
                         Target = target,
+                        VfxIndex = ResolveVfxIndex(tpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, sim.VfxKeys),
                     });
 
                     // 记录本时间点该卡由 CardFired 覆盖的动作，防止主效果重复发射 EffectExecuted
@@ -572,7 +573,7 @@ public static class CombatSimConverter
                         ApplyDamageWithShieldSplit(frame, simHealthState, targetSide, EDamageType.Damage, amt, ev.IsCrit);
                         if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var dmgSrc))
                         {
-                            EmitActionExecutionIfNeeded(frame, ev, dmgSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerDamage, new EffectTargetPlayer { Target = targetSide }, itemActionCredits);
+                            EmitActionExecutionIfNeeded(frame, ev, dmgSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerDamage, new EffectTargetPlayer { Target = targetSide }, itemActionCredits, vfxKeyMap, sim.VfxKeys);
                             sim.UpdateStats(dmgSrc.Entry.InstanceId, ECardStats.DamageDone, amt);
                         }
                     }
@@ -591,7 +592,7 @@ public static class CombatSimConverter
                         AddHealthAdj(frame, targetSide, EDamageType.Shield, EPlayerHealthChangeType.Shield, amt, false);
                         if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var shSrc))
                         {
-                            EmitActionExecutionIfNeeded(frame, ev, shSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerShieldApply, new EffectTargetPlayer { Target = targetSide }, itemActionCredits);
+                            EmitActionExecutionIfNeeded(frame, ev, shSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerShieldApply, new EffectTargetPlayer { Target = targetSide }, itemActionCredits, vfxKeyMap, sim.VfxKeys);
                             sim.UpdateStats(shSrc.Entry.InstanceId, ECardStats.ShieldAdded, amt);
                         }
                     }
@@ -621,7 +622,9 @@ public static class CombatSimConverter
                                     frame, ev, hlSrc, frameIndex, eventSeq, repo,
                                     isRegenGain ? EActionCommandType.PlayerRegenApply : EActionCommandType.PlayerHeal,
                                     new EffectTargetPlayer { Target = targetSide },
-                                    itemActionCredits);
+                                    itemActionCredits,
+                                    vfxKeyMap,
+                                    sim.VfxKeys);
                                 sim.UpdateStats(hlSrc.Entry.InstanceId, isRegenGain ? ECardStats.RegenAdded : ECardStats.HealAdded, amt);
                             }
                         }
@@ -633,7 +636,7 @@ public static class CombatSimConverter
                 if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var bSrc))
                 {
                     var targetSide = ParseCombatantSide(ev.TargetPlayerId);
-                    EmitActionExecutionIfNeeded(frame, ev, bSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerBurnApply, new EffectTargetPlayer { Target = targetSide }, itemActionCredits);
+                    EmitActionExecutionIfNeeded(frame, ev, bSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerBurnApply, new EffectTargetPlayer { Target = targetSide }, itemActionCredits, vfxKeyMap, sim.VfxKeys);
                     sim.UpdateStats(bSrc.Entry.InstanceId, ECardStats.BurnAdded, Math.Max(0, (int)Math.Round(ev.Value)));
                 }
                 break;
@@ -642,61 +645,62 @@ public static class CombatSimConverter
                 if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var pSrc))
                 {
                     var targetSide = ParseCombatantSide(ev.TargetPlayerId);
-                    EmitActionExecutionIfNeeded(frame, ev, pSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerPoisonApply, new EffectTargetPlayer { Target = targetSide }, itemActionCredits);
+                    EmitActionExecutionIfNeeded(frame, ev, pSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerPoisonApply, new EffectTargetPlayer { Target = targetSide }, itemActionCredits, vfxKeyMap, sim.VfxKeys);
                     sim.UpdateStats(pSrc.Entry.InstanceId, ECardStats.PoisonAdded, Math.Max(0, (int)Math.Round(ev.Value)));
                 }
                 break;
 
             case CombatEventType.HasteApplied:
-                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardHaste);
+                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardHaste, vfxKeyMap, sim.VfxKeys);
                 if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var hSrc))
                     sim.UpdateStats(hSrc.Entry.InstanceId, ECardStats.HastedCardsCount, 1);
                 break;
 
             case CombatEventType.SlowApplied:
-                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardSlow);
+                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardSlow, vfxKeyMap, sim.VfxKeys);
                 if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var sSrc))
                     sim.UpdateStats(sSrc.Entry.InstanceId, ECardStats.SlowedCardsCount, 1);
                 break;
 
             case CombatEventType.FreezeApplied:
-                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardFreeze);
+                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardFreeze, vfxKeyMap, sim.VfxKeys);
                 if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var fSrc))
                     sim.UpdateStats(fSrc.Entry.InstanceId, ECardStats.FrozenCardsCount, 1);
                 break;
 
             case CombatEventType.ChargeApplied:
-                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardCharge);
+                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardCharge, vfxKeyMap, sim.VfxKeys);
                 break;
 
             case CombatEventType.CardReloaded:
-                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardReload);
+                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardReload, vfxKeyMap, sim.VfxKeys);
                 break;
 
             case CombatEventType.CardDestroyed:
-                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardDestroy);
+                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardDestroy, vfxKeyMap, sim.VfxKeys);
                 break;
 
             case CombatEventType.FlyingChanged:
                 EmitCardTargetedEffect(
                     frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId,
-                    ev.Value > 0 ? EActionCommandType.FlyingStart : EActionCommandType.FlyingStop);
+                    ev.Value > 0 ? EActionCommandType.FlyingStart : EActionCommandType.FlyingStop,
+                    vfxKeyMap, sim.VfxKeys);
                 break;
 
             case CombatEventType.CardAttributeModified:
-                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardModifyAttribute);
+                EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardModifyAttribute, vfxKeyMap, sim.VfxKeys);
                 break;
 
             case CombatEventType.CardUpgraded:
-                HandleCardUpgradedEvent(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId);
+                HandleCardUpgradedEvent(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, vfxKeyMap, sim.VfxKeys);
                 break;
 
             case CombatEventType.CardEnchanted:
-                HandleCardEnchantedEvent(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId);
+                HandleCardEnchantedEvent(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, vfxKeyMap, sim.VfxKeys);
                 break;
 
             case CombatEventType.CardTransformed:
-                HandleCardTransformedEvent(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId);
+                HandleCardTransformedEvent(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, vfxKeyMap, sim.VfxKeys);
                 break;
 
             case CombatEventType.QuestUpdated:
@@ -711,7 +715,7 @@ public static class CombatSimConverter
                 if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var tpSrc))
                 {
                     var targetSide = ParseCombatantSide(ev.TargetPlayerId);
-                    EmitActionExecutionIfNeeded(frame, ev, tpSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerTempoApply, new EffectTargetPlayer { Target = targetSide }, itemActionCredits);
+                    EmitActionExecutionIfNeeded(frame, ev, tpSrc, frameIndex, eventSeq, repo, EActionCommandType.PlayerTempoApply, new EffectTargetPlayer { Target = targetSide }, itemActionCredits, vfxKeyMap, sim.VfxKeys);
                     int gained = Math.Max(0, (int)Math.Round(ev.Value));
                     if (gained > 0)
                         sim.UpdateStats(tpSrc.Entry.InstanceId, ECardStats.TempoAdded, gained);
@@ -738,7 +742,13 @@ public static class CombatSimConverter
                 {
                     var targetSide = ParseCombatantSide(ev.TargetPlayerId);
                     int amt = Math.Max(0, (int)Math.Round(ev.Value));
-                    if (amt > 0) AddHealthAdj(frame, targetSide, EDamageType.Burn, EPlayerHealthChangeType.Health, -amt, false);
+                    if (amt > 0)
+                    {
+                        // Burn 穿透一半护盾（Simulator 已折算净扣血量 ev.Value），同步到帧内血量并允许击杀显示负血
+                        if (targetSide == ECombatantId.Player) simHealthState.P1Hp -= amt;
+                        else simHealthState.P2Hp -= amt;
+                        AddHealthAdj(frame, targetSide, EDamageType.Burn, EPlayerHealthChangeType.Health, -amt, false);
+                    }
                 }
                 break;
 
@@ -746,7 +756,12 @@ public static class CombatSimConverter
                 {
                     var targetSide = ParseCombatantSide(ev.TargetPlayerId);
                     int amt = Math.Max(0, (int)Math.Round(ev.Value));
-                    if (amt > 0) AddHealthAdj(frame, targetSide, EDamageType.Poison, EPlayerHealthChangeType.Health, -amt, false);
+                    if (amt > 0)
+                    {
+                        if (targetSide == ECombatantId.Player) simHealthState.P1Hp -= amt;
+                        else simHealthState.P2Hp -= amt;
+                        AddHealthAdj(frame, targetSide, EDamageType.Poison, EPlayerHealthChangeType.Health, -amt, false);
+                    }
                 }
                 break;
 
@@ -754,7 +769,14 @@ public static class CombatSimConverter
                 {
                     var targetSide = ParseCombatantSide(ev.TargetPlayerId);
                     int amt = Math.Max(0, (int)Math.Round(ev.Value));
-                    if (amt > 0) AddHealthAdj(frame, targetSide, EDamageType.Regen, EPlayerHealthChangeType.Health, amt, false);
+                    if (amt > 0)
+                    {
+                        if (targetSide == ECombatantId.Player)
+                            simHealthState.P1Hp = simHealthState.P1MaxHp > 0 ? Math.Min(simHealthState.P1MaxHp, simHealthState.P1Hp + amt) : simHealthState.P1Hp + amt;
+                        else
+                            simHealthState.P2Hp = simHealthState.P2MaxHp > 0 ? Math.Min(simHealthState.P2MaxHp, simHealthState.P2Hp + amt) : simHealthState.P2Hp + amt;
+                        AddHealthAdj(frame, targetSide, EDamageType.Regen, EPlayerHealthChangeType.Health, amt, false);
+                    }
                 }
                 break;
 
@@ -791,7 +813,9 @@ public static class CombatSimConverter
         int eventSeq,
         GameDataRepository repo,
         Dictionary<string, CardRenderState> cardEntryByCoreId,
-        EActionCommandType defaultAction)
+        EActionCommandType defaultAction,
+        Dictionary<string, int> vfxKeyMap,
+        List<string> vfxKeys)
     {
         bool hasSrc = TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var srcMeta);
         bool hasTgt = TryResolveCard(cardEntryByCoreId, ev.TargetCardInstanceId, out var tgtMeta);
@@ -829,6 +853,7 @@ public static class CombatSimConverter
             Source = new InstanceId(effectiveSrc.Entry.InstanceId),
             TriggerSource = new InstanceId(effectiveSrc.Entry.InstanceId),
             Target = target,
+            VfxIndex = ResolveVfxIndex(tpl, effectId, effectiveSrc.Entry.Enchantment, vfxKeyMap, vfxKeys),
         });
     }
 
@@ -862,7 +887,9 @@ public static class CombatSimConverter
         GameDataRepository repo,
         EActionCommandType defaultAction,
         IEffectTarget target,
-        Dictionary<(int TimeMs, string CardInstanceId, EActionCommandType ActionType), int> itemActionCredits)
+        Dictionary<(int TimeMs, string CardInstanceId, EActionCommandType ActionType), int> itemActionCredits,
+        Dictionary<string, int> vfxKeyMap,
+        List<string> vfxKeys)
     {
         var tpl = repo.GetCard(srcMeta.Entry.TemplateId.ToString());
         string effectId = ResolveEffectId(ev, tpl);
@@ -891,6 +918,7 @@ public static class CombatSimConverter
             Source = new InstanceId(srcMeta.Entry.InstanceId),
             TriggerSource = new InstanceId(srcMeta.Entry.InstanceId),
             Target = target,
+            VfxIndex = ResolveVfxIndex(tpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys),
         });
     }
 
@@ -900,9 +928,11 @@ public static class CombatSimConverter
         int frameIndex,
         int eventSeq,
         GameDataRepository repo,
-        Dictionary<string, CardRenderState> cardEntryByCoreId)
+        Dictionary<string, CardRenderState> cardEntryByCoreId,
+        Dictionary<string, int> vfxKeyMap,
+        List<string> vfxKeys)
     {
-        EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardUpgrade);
+        EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardUpgrade, vfxKeyMap, vfxKeys);
 
         string? tgtKey = !string.IsNullOrEmpty(ev.TargetCardInstanceId) ? ev.TargetCardInstanceId : ev.SourceCardInstanceId;
         if (!TryResolveCard(cardEntryByCoreId, tgtKey, out var tgtMeta)) return;
@@ -922,9 +952,11 @@ public static class CombatSimConverter
         int frameIndex,
         int eventSeq,
         GameDataRepository repo,
-        Dictionary<string, CardRenderState> cardEntryByCoreId)
+        Dictionary<string, CardRenderState> cardEntryByCoreId,
+        Dictionary<string, int> vfxKeyMap,
+        List<string> vfxKeys)
     {
-        EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardEnchant);
+        EmitCardTargetedEffect(frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardEnchant, vfxKeyMap, vfxKeys);
 
         string? tgtKey = !string.IsNullOrEmpty(ev.TargetCardInstanceId) ? ev.TargetCardInstanceId : ev.SourceCardInstanceId;
         if (!TryResolveCard(cardEntryByCoreId, tgtKey, out var tgtMeta)) return;
@@ -951,7 +983,9 @@ public static class CombatSimConverter
         int frameIndex,
         int eventSeq,
         GameDataRepository repo,
-        Dictionary<string, CardRenderState> cardEntryByCoreId)
+        Dictionary<string, CardRenderState> cardEntryByCoreId,
+        Dictionary<string, int> vfxKeyMap,
+        List<string> vfxKeys)
     {
         TryParseTransformDetail(ev.Detail, out string? detailOrigOrNewId, out string? newTemplateId, out bool isArrowFormat);
 
@@ -991,6 +1025,7 @@ public static class CombatSimConverter
             Source = new InstanceId(srcMeta.Entry.InstanceId),
             TriggerSource = new InstanceId(srcMeta.Entry.InstanceId),
             Target = target,
+            VfxIndex = ResolveVfxIndex(srcTpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys),
         });
 
         if (!Guid.TryParse(newTemplateId, out var newTemplateGuid))
@@ -1318,7 +1353,8 @@ public static class CombatSimConverter
         int hpLost = amount - shieldAbsorbed;
 
         shield -= shieldAbsorbed;
-        hp = Math.Max(0, hp - hpLost);
+        // 对齐官方负血击杀视觉（HealthBarController.cs:781 原生支持显示负血数字如 -420），不再强制钳制在 0
+        hp -= hpLost;
 
         if (targetSide == ECombatantId.Player)
         {
@@ -1405,6 +1441,59 @@ public static class CombatSimConverter
     {
         if (!string.IsNullOrEmpty(ev.AbilityId)) return ev.AbilityId;
         return tpl?.Abilities.Keys.FirstOrDefault() ?? string.Empty;
+    }
+
+    /// <summary>
+    /// 从官方 GameData.db 的 Ability.VFXConfig.VFXOverrideKey（全库 523 项技能、131 种专属弹道/斩击/激光特效）
+    /// 解析当前动作的专属 VFX 键并登记进 <c>CombatSim.VfxKeys</c>，返回客户端 <c>CombatSimHandler.ExtractFrameEffects</c> 所需的 <c>VfxIndex</c>。
+    /// </summary>
+    private static int? ResolveVfxIndex(
+        CardTemplate? tpl,
+        string effectId,
+        EEnchantmentType? enchantment,
+        Dictionary<string, int> vfxKeyMap,
+        List<string> vfxKeys)
+    {
+        if (tpl == null || string.IsNullOrEmpty(effectId)) return null;
+
+        string? overrideKey = null;
+        if (tpl.Abilities.TryGetValue(effectId, out var ab))
+        {
+            overrideKey = ab.VFXConfig?.VFXOverrideKey;
+        }
+
+        if (string.IsNullOrEmpty(overrideKey) && enchantment.HasValue && tpl.Enchantments != null)
+        {
+            string enchName = enchantment.Value.ToString();
+            if (tpl.Enchantments.TryGetValue(enchName, out var enchData) &&
+                enchData.Abilities.TryGetValue(effectId, out var enchAb))
+            {
+                overrideKey = enchAb.VFXConfig?.VFXOverrideKey;
+            }
+        }
+
+        if (string.IsNullOrEmpty(overrideKey) && tpl.Enchantments != null)
+        {
+            foreach (var enchData in tpl.Enchantments.Values)
+            {
+                if (enchData.Abilities.TryGetValue(effectId, out var enchAb) &&
+                    !string.IsNullOrEmpty(enchAb.VFXConfig?.VFXOverrideKey))
+                {
+                    overrideKey = enchAb.VFXConfig!.VFXOverrideKey;
+                    break;
+                }
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(overrideKey)) return null;
+        string key = overrideKey.Trim();
+        if (!vfxKeyMap.TryGetValue(key, out int idx))
+        {
+            idx = vfxKeys.Count;
+            vfxKeys.Add(key);
+            vfxKeyMap[key] = idx;
+        }
+        return idx;
     }
 
     private static IEffectTarget ResolveCardFiredTarget(

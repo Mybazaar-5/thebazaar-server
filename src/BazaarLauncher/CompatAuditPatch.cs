@@ -54,10 +54,15 @@ internal static partial class CompatAuditPatch
     private static PropertyInfo _bmIsBoardStatePresLoadingProp;
     private static FieldInfo _bmLoadRequestVersionField;
     private static FieldInfo _bmPresRefField;
+    private static FieldInfo _bmOpponentBoardAnchorField;
     private static MethodInfo _bspCleanUpCompleteMethod;
     private static MethodInfo _bspHasFeatureMethod;
     private static FieldInfo _bspCancellationTokenField;
+    private static MethodInfo _vsCustomEventTriggerMethod;
     private static Type _bspType;
+    private static Type _cardSocketCtrlType;
+    private static Type _cardCtrlBaseType;
+    private static Type _socketEffectCtrlType;
     private static readonly List<object> _pedestalFeatureValues = new();
     private static volatile bool _pendingPedestalExitAbort;
     private static volatile bool _pedestalVerifyNonPedestalExit;

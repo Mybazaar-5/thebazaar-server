@@ -566,6 +566,16 @@ public sealed class ShopEngine
 
         var streamRng = ResolveStreamRng(hour == 3 ? DailyChallengeSeedGenerator.StreamMonster : DailyChallengeSeedGenerator.StreamEncounter);
 
+        // V13.2 修复问题 #9：处于 Day 6 坠毁点 / Day 9 神庙遗迹 / Day 10 微观世界探险替换集（ReplacementSet）中时，
+        // Hour 2–5 严格沿用该探险的官方专属房间/陷阱怪/宝库/Boss/圣物室/充能室序列，不再提前退回普通事件。
+        if (hour is >= 2 and <= 5 &&
+            !string.IsNullOrWhiteSpace(_run.ActiveExpeditionId) &&
+            TryDealActiveExpeditionHourChoices((int)hour, events))
+        {
+            events.Add(new GameSimEventStateTransitioned(ERunState.Choice, null));
+            return events;
+        }
+
         if (hour == 3)
         {
             // Boss 车轮战模式（BossRush）：使用 BossRushCatalog 10 波强化传奇 Boss 专属编排
@@ -716,17 +726,18 @@ public sealed class ShopEngine
             var activeEventPool = nonZeroEvents.Count > 0 ? nonZeroEvents : allHourlyEvents;
             var activeWeightFn = nonZeroEvents.Count > 0 ? weightFn : null;
 
-            // 槽位 0（左槽）：固定 1 家商人（对齐官方左槽商人，遵循天阶权重 + 同日去重）
+            // 槽位 0（左槽）：固定 1 家商人（对齐官方左槽商人 + 独立商人天数阶梯门控 + 同日/同名去重）
+            ETier maxMerchantDayTier = GetMaxMerchantTierForDay(effectiveDay);
             CardPool.CardTemplate? m1 = null;
             if (merchants.Count > 0)
             {
-                m1 = RollDayTieredEncounterWithDailyDedup(merchants, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, effectiveDay)
-                  ?? RollDayTieredEncounterWithDailyDedup(merchants, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, effectiveDay);
+                m1 = RollDayTieredEncounterWithDailyDedup(merchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, effectiveDay, isMerchantPool: true)
+                  ?? RollDayTieredEncounterWithDailyDedup(merchants, maxMerchantDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, effectiveDay, isMerchantPool: true);
             }
             else if (!hasMultipliers)
             {
                 var allMerchants = allHourlyEvents.Where(e => IsMerchantEncounter(e)).ToList();
-                m1 = RollDayTieredEncounterWithDailyDedup(allMerchants, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, effectiveDay);
+                m1 = RollDayTieredEncounterWithDailyDedup(allMerchants, maxMerchantDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, effectiveDay, isMerchantPool: true);
             }
 
             if (m1 == null)
@@ -742,7 +753,7 @@ public sealed class ShopEngine
                 events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), ECardType.EventEncounter));
             }
 
-            // 槽位 1（中槽）：对齐官方规律——支持双商人布局（Day 1 Hour 1 约 45%、其余常规小时约 35% 刷第 2 家不同商人），
+            // 槽位 1（中槽）：对齐官方规律——支持双商人布局（Day 1 Hour 1 约 40%、其余常规小时约 30% 刷第 2 家不同商人），
             // 或投放交互奇遇事件（动态解锁的 ExclusionSet 事件优先；EventCarnival/放大事件倍率时让位给奇遇）
             var nonMerchantAll = allHourlyEvents.Where(e => !IsMerchantEncounter(e) && HasPlayableEncounterPayload(e)).ToList();
             var nonMerchantFallbackPool = nonMerchantAll.Count > 0 ? nonMerchantAll : allHourlyEvents.Where(e => !IsMerchantEncounter(e)).ToList();
@@ -759,15 +770,15 @@ public sealed class ShopEngine
 
             if (ev2 == null && m1 != null && IsMerchantEncounter(m1) && merchants.Count > 1)
             {
-                double doubleMerchantChance = (effectiveDay == 1 && hour == 1) ? 0.45 : 0.35;
+                double doubleMerchantChance = (effectiveDay == 1 && hour == 1) ? 0.40 : 0.30;
                 if (effectiveRules?.HasMutator(MutatorCatalog.EventCarnival) == true)
                     doubleMerchantChance *= 0.45;
                 if (streamRng.NextDouble() < doubleMerchantChance)
                 {
-                    // 第 2 家商人严格遵循同日去重与当日上限（不突破 maxDayTier 且不与左槽重复）
+                    // 第 2 家商人严格遵循同日去重与商人当日上限（不突破 maxMerchantDayTier 且不与左槽重复）
                     ev2 = RollDayTieredEncounterWithDailyDedup(
                         merchants,
-                        maxDayTier,
+                        maxMerchantDayTier,
                         pickedIds,
                         _run.VisitedSingleSpawnEncounterIds,
                         dailyVisited,
@@ -776,7 +787,8 @@ public sealed class ShopEngine
                         weightFn,
                         bannedIds,
                         tierExemptIds,
-                        effectiveDay);
+                        effectiveDay,
+                        isMerchantPool: true);
                 }
             }
 
@@ -795,8 +807,8 @@ public sealed class ShopEngine
                 events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), ECardType.EventEncounter));
             }
 
-            // 槽位 2（右槽）：合规天数窗地图基座（低概率 ≤18%，仅限 B1&B2 D1-5 / Sterling D2+ / Forja D4-10 / The Artist D6+，
-            // 彻底踢除 12 座 Lv10/Fates 定向附魔祭坛与 8 座 Partner Portal - Forja）或免费资源 / 经济成长 / 物品改造类事件。
+            // 槽位 2（右槽）：合规天数窗地图基座（Day 3 起低概率 ≤18%：B1&B2 D3-5 / Sterling D3+ / Forja D4-10 / The Artist D6+，
+            // 彻底踢除 12 座 Lv10/Fates 定向附魔祭坛与 8 座 Partner Portal - Forja）或纯免费资源 / 经济补给类事件。
             bool guaranteedPedestalHour =
                 hour == 2 &&
                 (effectiveRules?.SpecialModeId == ESpecialModeId.BossRush ||
@@ -806,18 +818,19 @@ public sealed class ShopEngine
                 ? 1.0
                 : effectiveDay switch
                 {
-                    <= 1 => hour >= 2 ? 0.10 : 0.0,
-                    <= 3 => 0.14,
-                    <= 5 => 0.16,
+                    <= 2 => 0.0,
+                    <= 5 => 0.14,
                     _ => 0.18,
                 };
             var rawPedestals = pedestalChance > 0 ? _pool.HourlyEncounters(hero, "PedestalEncounter") : new List<CardPool.CardTemplate>();
             var allPedestals = rawPedestals.Where(IsEligibleEncounter).ToList();
             if (pedestalChance > 0)
             {
-                // Forja 官方在 Day 4-10 即可合法刷新（虽然 DB StartingTier=Diamond），豁免 maxDayTier 限制
+                // Forja 官方在 Day 4-10、The Artist 在 Day 6+ 即可合法刷新（虽然 DB StartingTier=Diamond），豁免 maxDayTier 限制
                 if (effectiveDay is >= 4 and <= 10)
                     tierExemptIds.Add(CardPool.PedestalForjaId);
+                if (effectiveDay >= 6)
+                    tierExemptIds.Add(CardPool.PedestalTheArtistId);
 
                 TryIncludeDynamicallyUnlockedExclusionEvents(
                     allPedestals,
@@ -946,6 +959,139 @@ public sealed class ShopEngine
         return events;
     }
 
+    /// <summary>
+    /// V13.2 三套官方探险多小时 ReplacementSet 发牌状态机（全部 GUID 与结构经 GameData.db + Mobalytics / BazaarDB 核验）：
+    ///   · Day 9  Temple Expedition (`91287d25`)：H1 选门(Fiery/Toxic/Obsidian) -> H2 对应元素 3 陷阱怪 -> H3 对应元素 Temple Vault -> H4 绿心 3 Boss -> H5 Temple Reliquary；
+    ///   · Day 6  Crash Site Expedition (`ead0a1ed`)：H1 5 选 3 舱室 -> H2 特殊舱室(Cargo Hold/Crystal Growth/Command Nexus) -> H3 3 坠毁点 Boss -> H4-5 剩余未访特殊舱室；
+    ///   · Day 10 Tiny World Expedition (`42db3205`)：H1 缩小拿 Depleted Device -> H2 Where am I? -> H3 Bananniboss / Barnacle Bigwig -> H4 Ethergy Nexus 充能 -> H5 自然退出回归常态。
+    /// 若某小时无剩余可用探险房或资源校验失败，自动清空 ActiveExpeditionId 并返回 false 无缝回落常规发牌，绝不空桌。
+    /// </summary>
+    private bool TryDealActiveExpeditionHourChoices(int hour, List<IGameSimEvent> events)
+    {
+        string? expId = _run.ActiveExpeditionId;
+        if (string.IsNullOrWhiteSpace(expId)) return false;
+
+        List<(string Id, ECardType ExpectedType)> candidates = new();
+
+        if (expId.Equals(CardPool.JungleExpeditionRoomId, StringComparison.OrdinalIgnoreCase))
+        {
+            string variant = _run.ActiveExpeditionVariant ?? "Fiery";
+            switch (hour)
+            {
+                case 2:
+                    // Hour 2: 对应元素门的 3 个陷阱房怪物（Blowguns / Caltrops / Boulder）
+                    if (variant.Equals("Toxic", StringComparison.OrdinalIgnoreCase))
+                    {
+                        candidates.Add(("7570c77c-7d47-4ab2-ab33-a140bcdf4b70", ECardType.CombatEncounter)); // Blowguns Monster (Toxic)
+                        candidates.Add(("e915e6f0-93c1-46cc-a546-3867f192bb17", ECardType.CombatEncounter)); // Caltrops Monster (Toxic)
+                        candidates.Add(("374416cd-89ed-451d-a131-e3839400432e", ECardType.CombatEncounter)); // Boulder Monster (Toxic)
+                    }
+                    else if (variant.Equals("Obsidian", StringComparison.OrdinalIgnoreCase))
+                    {
+                        candidates.Add(("9283b658-2d0b-4c0a-8e62-b185a8ac6ad0", ECardType.CombatEncounter)); // Blowguns Monster (Obsidian)
+                        candidates.Add(("967508d9-5c1b-4084-a445-23e53a3839bc", ECardType.CombatEncounter)); // Caltrops Monster (Obsidian)
+                        candidates.Add(("b654d08b-cd50-44af-b92c-ebf189d81547", ECardType.CombatEncounter)); // Boulder Monster (Obsidian)
+                    }
+                    else
+                    {
+                        candidates.Add(("14854ca0-bd1f-4f63-951b-97c1afb3af3b", ECardType.CombatEncounter)); // Blowguns Monster (Fiery)
+                        candidates.Add(("16a97acb-0b8c-4d04-b30a-c861a52a82e2", ECardType.CombatEncounter)); // Caltrops Monster (Fiery)
+                        candidates.Add(("3b0b8b93-75bd-4a2d-8001-1cb8171e71bb", ECardType.CombatEncounter)); // Boulder Monster (Fiery)
+                    }
+                    break;
+                case 3:
+                    // Hour 3: 对应元素神庙宝库（Temple Vault）
+                    string vaultId = variant.Equals("Toxic", StringComparison.OrdinalIgnoreCase)
+                        ? "810acb8e-e60a-4a84-b773-431d4d10a071"
+                        : variant.Equals("Obsidian", StringComparison.OrdinalIgnoreCase)
+                            ? "7a6ce8eb-3098-403f-96d4-faa47048272b"
+                            : "a1d43a69-6798-41a2-b356-211a726eee9d";
+                    candidates.Add((vaultId, ECardType.EventEncounter));
+                    break;
+                case 4:
+                    // Hour 4: 绿心神庙 3 位 Boss（Greenheart Guardian / Mythkeeper / Qomatz）
+                    candidates.Add(("d1dc075f-f5d4-4bb7-9655-55591e123941", ECardType.CombatEncounter));
+                    candidates.Add(("4ce6d441-4aed-455b-b83f-0b057b462515", ECardType.CombatEncounter));
+                    candidates.Add(("a5103989-fb08-4ac6-a5e8-6a610e0b1d46", ECardType.CombatEncounter));
+                    break;
+                case 5:
+                    // Hour 5: 神庙圣物室（Temple Reliquary — 传奇圣物抉择）
+                    candidates.Add(("5852a0ba-c097-419b-98b7-dadd8bd7ae6e", ECardType.EventEncounter));
+                    break;
+            }
+        }
+        else if (expId.Equals(CardPool.CrashSiteExpeditionRoomId, StringComparison.OrdinalIgnoreCase))
+        {
+            string[] rooms =
+            [
+                "07139793-c844-4fbb-ad90-9f279843cdc8", // Cargo Hold
+                "2950afee-ce0e-40c1-becb-735570e560c5", // Crystal Growth Chamber
+                "54a0e045-36fe-4de4-92fb-9254fa73c48f", // Command Nexus
+            ];
+            if (hour == 3)
+            {
+                candidates.Add(("10504dc3-99cf-46be-b8ac-ea0be24c7b0b", ECardType.CombatEncounter)); // Augmented Hellbilly
+                candidates.Add(("7718437a-cc2e-44d0-b3f1-4a370ea84fdc", ECardType.CombatEncounter)); // Conspiracy Theorist
+                candidates.Add(("4ef60802-3b84-482a-8ba5-640534a94c64", ECardType.CombatEncounter)); // The Vessel
+            }
+            else
+            {
+                foreach (string rid in rooms)
+                {
+                    if (!_run.ExpeditionVisitedRoomIds.Contains(rid))
+                        candidates.Add((rid, ECardType.EventEncounter));
+                }
+            }
+        }
+        else if (expId.Equals(CardPool.TinyWorldExpeditionRoomId, StringComparison.OrdinalIgnoreCase))
+        {
+            switch (hour)
+            {
+                case 2:
+                    candidates.Add(("875caea4-93c5-440b-a9fd-2886eeaa0fc5", ECardType.EventEncounter)); // Where am I?
+                    break;
+                case 3:
+                    candidates.Add(("1a3f7d6a-3f24-42dc-ba27-9d4bf199d0b8", ECardType.CombatEncounter)); // Bananniboss
+                    candidates.Add(("9f8fa7f6-c322-4ff6-b81f-c379305b97f4", ECardType.CombatEncounter)); // Barnacle Bigwig
+                    break;
+                case 4:
+                    candidates.Add(("f418a73c-d442-4ee1-aa7f-ec43f0418d9f", ECardType.EventEncounter)); // Ethergy Nexus
+                    break;
+                default:
+                    // Hour 5 自然结束微观世界返回常规事件
+                    _run.ActiveExpeditionId = null;
+                    _run.ActiveExpeditionVariant = null;
+                    _run.ExpeditionVisitedRoomIds.Clear();
+                    return false;
+            }
+        }
+
+        int dealtCount = 0;
+        foreach (var (cid, expectedType) in candidates)
+        {
+            var tpl = _pool.GetIfAssetValid(cid);
+            if (tpl == null) continue;
+            ECardType actualType = ParseCardType(tpl.Type);
+            if (actualType == ECardType.Item) actualType = expectedType;
+            string prefix = actualType == ECardType.CombatEncounter ? "cbt" : "exp";
+            var entry = CreateEncounterCandidate(tpl, actualType, prefix);
+            entry.Attributes[ECardAttributeType.BuyPrice] = 0;
+            _run.Cards[entry.InstanceId] = entry;
+            _run.SelectionSet.Add(entry.InstanceId);
+            events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), actualType));
+            dealtCount++;
+        }
+
+        if (dealtCount == 0)
+        {
+            _run.ActiveExpeditionId = null;
+            _run.ActiveExpeditionVariant = null;
+            _run.ExpeditionVisitedRoomIds.Clear();
+            return false;
+        }
+        return true;
+    }
+
     private void EnsureRunExclusionSetInitialized()
     {
         if (_run.ExclusionSetInitialized) return;
@@ -999,27 +1145,77 @@ public sealed class ShopEngine
             h.Equals("Common", StringComparison.OrdinalIgnoreCase));
     }
 
+    // V13.2 官方 GameData.db + BazaarDB / HowBazaar 核验的精准遭遇 GUID 门控表
+    private const string MerchantCurioId = "c6cffe25-8e94-4a7b-a821-3e3c7093333b";
+    private const string EventMountainPassId = "956e9c74-7d98-4a2b-b500-def577914945";
+    private const string EventFaraiId = "412fb3ec-88de-40b4-a475-10e583189d8a";
+    private const string MerchantFlexId = "7bd967dd-4631-4252-bdff-ee0bd5e3ddb7";
+    private const string MerchantUitarCenterId = "c5a68a92-9932-40bd-a45f-e1c902807814";
+
     /// <summary>
-    /// 判断遭遇（常规基座或特殊奇遇）是否处于官方允许出现的天数与小时窗口内（V13.1 问题 #2）：
-    ///   · B1&amp;B2：Days 1–5；
-    ///   · Sterling：Day 2+；
-    ///   · Forja：Days 4–10；
-    ///   · The Artist：Day 6+；
-    ///   · Tiny Furry Creature：Days 1–3，且避开 Day 1 Hour 1–2（确保玩家有基础装备后再触发）。
+    /// 真正适合右槽（Free Option / Resource / Utility）的免费或低门槛补给事件名称白名单，
+    /// 避免把高消费/纯技能导师/非补给事件塞入右槽造成中/右两槽池重叠。
+    /// </summary>
+    private static readonly string[] RightSlotFreeUtilityNames =
+    [
+        "The Docks", "The Lost Crate", "Lost Crate", "Jungle Ruins", "A Strange Mushroom",
+        "Jules' Cafe", "Gumball Machine", "Likit", "Mandala", "Finn's Big Bite",
+        "Apothecary", "Eating Contest", "Bex", "Dabora", "Wishing Fountain",
+        "Artisan Dunes", "Salvage Yard", "Pearl's Dig Site", "Street Festival",
+        "Gunpowder Cache", "Moonlit Meadow", "Economic Seminar", "Ledger",
+    ];
+
+    /// <summary>
+    /// 判断遭遇（常规基座、商人或特殊奇遇）是否处于官方权威允许出现的天数与小时窗口内（V13.2 严谨核验版）：
+    ///   · [BazaarDB / Reddit] B1&amp;B2（青铜升阶基座）：Days 3–5（不再在 Day 1 Hour 2 过早出现）；
+    ///   · [BazaarDB / 社区实测] Sterling（白银升阶基座）：Day 3+；
+    ///   · [BazaarDB / 社区实测] Forja（黄金/钻石升阶基座）：Days 4–10；
+    ///   · [BazaarDB / 社区实测] The Artist（随机附魔基座）：Day 6+；
+    ///   · [Reddit / 社区实测] Tiny Furry Monster（小怪兽）：Days 1–3，且避开 Day 1 Hour 1–2；
+    ///   · [GameData.db 原生 CurrentDay] Mountain Pass（全部子组 CurrentDay==4..6）：Day 4+；
+    ///   · [GameData.db 原生 CurrentDay] Farai（核心子组 CurrentDay>=5）：Day 5+；
+    ///   · [GameData.db 原生 CurrentDay] Flex / Uitar Center（子组 CurrentDay>=6）：Day 6+；
+    ///   · [GameData.db + BazaarDB / Steam 指南] Day 1 银阶商人仅放行官方确认的 Curio（其余 11 名 DB 含 CurrentDay>=2 的银商从 Day 2 起解锁）。
     /// </summary>
     public static bool IsWithinOfficialDayWindow(CardPool.CardTemplate? enc, int day, int hour)
     {
         if (enc == null || string.IsNullOrWhiteSpace(enc.Id)) return true;
+
+        // 1. 4 座地图基座天数窗（BazaarDB / Reddit）
         if (enc.Id.Equals(CardPool.PedestalB1B2Id, StringComparison.OrdinalIgnoreCase))
-            return day is >= 1 and <= 5;
+            return day is >= 3 and <= 5;
         if (enc.Id.Equals(CardPool.PedestalSterlingId, StringComparison.OrdinalIgnoreCase))
-            return day >= 2;
+            return day >= 3;
         if (enc.Id.Equals(CardPool.PedestalForjaId, StringComparison.OrdinalIgnoreCase))
             return day is >= 4 and <= 10;
         if (enc.Id.Equals(CardPool.PedestalTheArtistId, StringComparison.OrdinalIgnoreCase))
             return day >= 6;
+
+        // 2. 特殊奇遇天数与小时窗
         if (enc.Id.Equals(TinyFurryCreatureEncounterId, StringComparison.OrdinalIgnoreCase))
             return day is >= 1 and <= 3 && !(day == 1 && hour <= 2);
+
+        // 3. GameData.db 原生 CurrentDay 门控（防止子组尚未激活导致空货架或越级出现）
+        if (enc.Id.Equals(EventMountainPassId, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(enc.InternalName, "Mountain Pass", StringComparison.OrdinalIgnoreCase))
+            return day >= 4;
+        if (enc.Id.Equals(EventFaraiId, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(enc.InternalName, "Farai", StringComparison.OrdinalIgnoreCase))
+            return day >= 5;
+        if (enc.Id.Equals(MerchantFlexId, StringComparison.OrdinalIgnoreCase)
+            || enc.Id.Equals(MerchantUitarCenterId, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(enc.InternalName, "Uitar Center", StringComparison.OrdinalIgnoreCase))
+            return day >= 6;
+
+        // 4. Day 1 银阶商人限制：按 BazaarDB / Steam 指南与 GameData.db（11 名专业银商子组含 CurrentDay>=2），
+        //    Day 1 仅放行青铜商人 + 官方确认 Day 1 可出的中立银商 Curio，其余专业银商（Nautica/Colt/Kev's Armory 等）自 Day 2 起解锁。
+        bool isMerchant = enc.Tags != null && enc.Tags.Any(t => string.Equals(t, "Merchant", StringComparison.OrdinalIgnoreCase));
+        if (day <= 1 && isMerchant && ParseTier(enc.StartingTier) >= ETier.Silver)
+        {
+            return enc.Id.Equals(MerchantCurioId, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(enc.InternalName, "Curio", StringComparison.OrdinalIgnoreCase);
+        }
+
         return true;
     }
 
@@ -1044,10 +1240,26 @@ public sealed class ShopEngine
         var utility = new List<CardPool.CardTemplate>();
         foreach (var e in nonMerchants)
         {
-            var cat = archetypeIndex != null && archetypeIndex.TryGetEncounterCategory(e.Id, out var c)
-                ? c
-                : CardArchetypeIndex.ClassifyEncounter(e, _repo.GetCard(e.Id));
-            if (cat is EEncounterWeightCategory.EventFreeDealTransform or EEncounterWeightCategory.EventEconomyStats)
+            string name = e.InternalName ?? string.Empty;
+            bool isFreeUtility = false;
+            for (int i = 0; i < RightSlotFreeUtilityNames.Length; i++)
+            {
+                if (name.Contains(RightSlotFreeUtilityNames[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    isFreeUtility = true;
+                    break;
+                }
+            }
+            // 若玩家通过自定义规则显式拉高某非商遭遇类别倍率（如 EventExpeditionAgent = 8.0），允许进入右槽参与加权抽取
+            var effectiveRules = ActiveRules ?? _run.CustomRules;
+            if (!isFreeUtility && effectiveRules?.EncounterCategoryMultipliers is { Count: > 0 } && archetypeIndex != null &&
+                archetypeIndex.TryGetEncounterCategory(e.Id, out var cat) &&
+                effectiveRules.EncounterCategoryMultipliers.TryGetValue(cat.ToString(), out double mult) &&
+                mult > 1.0)
+            {
+                isFreeUtility = true;
+            }
+            if (isFreeUtility)
                 utility.Add(e);
         }
         return utility;
@@ -1117,22 +1329,43 @@ public sealed class ShopEngine
         Func<CardPool.CardTemplate, double>? weightMultiplier = null,
         ISet<string>? bannedIds = null,
         ISet<string>? tierExemptIds = null,
-        int effectiveDay = 1)
+        int effectiveDay = 1,
+        bool isMerchantPool = false)
     {
         if (pool.Count == 0) return null;
 
+        // 收集本小时已抽中与本日已访问的遭遇 InternalName，防止同名多阶事件（如 Gunpowder Cache 银/金/钻、Moonlit Meadow 四阶）同小时/同日重刷
+        var pickedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string pid in pickedIds)
+        {
+            var pt = _pool.Get(pid);
+            if (!string.IsNullOrWhiteSpace(pt?.InternalName))
+                pickedNames.Add(pt.InternalName);
+        }
+
         if (dailyVisited is { Count: > 0 })
         {
-            var unvisited = pool.Where(c => !dailyVisited.Contains(c.Id)).ToList();
+            var visitedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string vid in dailyVisited)
+            {
+                var vt = _pool.Get(vid);
+                if (!string.IsNullOrWhiteSpace(vt?.InternalName))
+                    visitedNames.Add(vt.InternalName);
+            }
+
+            var unvisited = pool.Where(c =>
+                !dailyVisited.Contains(c.Id) &&
+                (string.IsNullOrWhiteSpace(c.InternalName) || !visitedNames.Contains(c.InternalName)))
+                .ToList();
             if (unvisited.Count > 0)
             {
-                var pick = RollDayTieredEncounter(unvisited, maxDayTier, pickedIds, visitedSingleSpawn, allowExceedDayCap: false, weightMultiplier, bannedIds, tierExemptIds, effectiveDay);
+                var pick = RollDayTieredEncounter(unvisited, maxDayTier, pickedIds, visitedSingleSpawn, allowExceedDayCap: false, weightMultiplier, bannedIds, tierExemptIds, effectiveDay, isMerchantPool, pickedNames);
                 if (pick != null) return pick;
             }
             if (!allowDailyFallback) return null;
         }
 
-        return RollDayTieredEncounter(pool, maxDayTier, pickedIds, visitedSingleSpawn, allowExceedDayCap, weightMultiplier, bannedIds, tierExemptIds, effectiveDay);
+        return RollDayTieredEncounter(pool, maxDayTier, pickedIds, visitedSingleSpawn, allowExceedDayCap, weightMultiplier, bannedIds, tierExemptIds, effectiveDay, isMerchantPool, pickedNames);
     }
 
     /// <summary>在 ChoiceState 下发指定的 Day-start Expedition 房间候选项（供持票进入探索时选择）。</summary>
@@ -1172,49 +1405,77 @@ public sealed class ShopEngine
     }
 
     /// <summary>
-    /// V13.1 问题 #2：修正遭遇阶级天数开放曲线（解除 Day 1 纯 Bronze 锁导致的 3 青铜事件死循环）：
-    ///   · Day 1：开放 Bronze + Silver（70%/30% 权重，合法刷出 Curio/Valpak/Colt 及 The Docks/Lost Crate 等基础事件）；
-    ///   · Day 2–5：开放至 Gold（Day 2–3 低权 Gold 12%，Day 4–5 Gold 28%，Forja 在 Day 4–10 豁免入池）；
-    ///   · Day 6+：全面开放至 Diamond/Legendary（7 大跨英雄商人、The Artist、Zurphin's Safari 等）。
+    /// V13.2 非商人事件阶级天数开放曲线（对照 GameData.db + BazaarDB / HowBazaar / Steam 社区实测）：
+    ///   · Day 1–3：Bronze + Silver（基础事件与中前期事件；绝不在 Day 2–3 刷出金阶事件如 Grandmaster/Nufu/Library，仅官方特例 Travel Agent 豁免）；
+    ///   · Day 4–6：开放至 Gold（Forja D4–10、Mountain Pass D4+、Farai D5+、The Artist D6+ 豁免）；
+    ///   · Day 7+：全面开放至 Diamond / Legendary。
     /// </summary>
     private static ETier GetMaxEncounterTierForDay(int day) => day switch
     {
-        <= 1 => ETier.Silver,
-        <= 5 => ETier.Gold,
+        <= 3 => ETier.Silver,
+        <= 6 => ETier.Gold,
         _ => ETier.Legendary,
     };
 
-    private double GetEncounterTierBaseWeight(int effectiveDay, ETier tier)
+    /// <summary>
+    /// V13.2 商人阶级独立天数开放曲线（对照 GameData.db 11 名专业银商 CurrentDay>=2 + BazaarDB / Steam 商人指南）：
+    ///   · Day 1：Bronze 商人 + 官方确认的 Day 1 中立银商 Curio（由 IsWithinOfficialDayWindow 精准放行）；
+    ///   · Day 2–4：Bronze + 全部 Silver 商人（绝不在 Day 2–4 过早刷出 6 金重随的金商如 Goldie/Aimbot/Tatiana）；
+    ///   · Day 5–6：开放至 Gold 商人；
+    ///   · Day 7+：开放至 Diamond 商人（含跨英雄 8 金重随钻商，权重随 Day 7→9+ 渐进抬升）。
+    /// </summary>
+    private static ETier GetMaxMerchantTierForDay(int day) => day switch
     {
-        if (effectiveDay <= 1)
+        <= 4 => ETier.Silver,
+        <= 6 => ETier.Gold,
+        _ => ETier.Legendary,
+    };
+
+    private double GetEncounterTierBaseWeight(int effectiveDay, ETier tier, bool isMerchantPool = false)
+    {
+        if (isMerchantPool)
         {
-            return tier switch
-            {
-                ETier.Bronze => 0.70,
-                ETier.Silver => 0.30,
-                _ => 0.05,
-            };
+            if (effectiveDay <= 1)
+                return tier == ETier.Bronze ? 0.80 : (tier == ETier.Silver ? 0.20 : 0.02);
+            if (effectiveDay <= 2)
+                return tier == ETier.Bronze ? 0.55 : (tier == ETier.Silver ? 0.45 : 0.02);
+            if (effectiveDay <= 4)
+                return tier == ETier.Bronze ? 0.35 : (tier == ETier.Silver ? 0.65 : 0.02);
+            if (effectiveDay <= 6)
+                return tier switch
+                {
+                    ETier.Bronze => 0.15,
+                    ETier.Silver => 0.55,
+                    ETier.Gold => 0.30,
+                    _ => 0.02,
+                };
+            if (effectiveDay <= 8)
+                return tier switch
+                {
+                    ETier.Bronze => 0.08,
+                    ETier.Silver => 0.35,
+                    ETier.Gold => 0.37,
+                    ETier.Diamond => 0.20,
+                    _ => 0.05,
+                };
         }
-        if (effectiveDay <= 3)
+        else
         {
-            return tier switch
-            {
-                ETier.Bronze => 0.50,
-                ETier.Silver => 0.38,
-                ETier.Gold => 0.12,
-                _ => 0.05,
-            };
+            if (effectiveDay <= 1)
+                return tier == ETier.Bronze ? 0.55 : (tier == ETier.Silver ? 0.45 : 0.02);
+            if (effectiveDay <= 3)
+                return tier == ETier.Bronze ? 0.40 : (tier == ETier.Silver ? 0.60 : 0.02);
+            if (effectiveDay <= 6)
+                return tier switch
+                {
+                    ETier.Bronze => 0.22,
+                    ETier.Silver => 0.46,
+                    ETier.Gold => 0.32,
+                    _ => 0.05,
+                };
         }
-        if (effectiveDay <= 5)
-        {
-            return tier switch
-            {
-                ETier.Bronze => 0.30,
-                ETier.Silver => 0.42,
-                ETier.Gold => 0.28,
-                _ => 0.08,
-            };
-        }
+
+        // Day 7+ 事件 / Day 9+ 商人回归官方 game_modes.EncounterSpawnTierPercentages (0.4 / 0.3 / 0.2 / 0.1)
         var pct = _repo.GameMode.EncounterSpawnTierPercentages;
         return (pct.TryGetValue(tier.ToString(), out double raw) && raw > 0) ? raw : 0.05;
     }
@@ -1228,12 +1489,15 @@ public sealed class ShopEngine
         Func<CardPool.CardTemplate, double>? weightMultiplier = null,
         ISet<string>? bannedIds = null,
         ISet<string>? tierExemptIds = null,
-        int effectiveDay = 1)
+        int effectiveDay = 1,
+        bool isMerchantPool = false,
+        ISet<string>? pickedNames = null)
     {
         if (pool.Count == 0) return null;
 
         var unpicked = pool
             .Where(c => !pickedIds.Contains(c.Id) &&
+                        (pickedNames == null || string.IsNullOrWhiteSpace(c.InternalName) || !pickedNames.Contains(c.InternalName)) &&
                         (bannedIds == null || !bannedIds.Contains(c.Id)) &&
                         (visitedSingleSpawn == null || !visitedSingleSpawn.Contains(c.Id)) &&
                         (weightMultiplier == null || weightMultiplier(c) > 0.0))
@@ -1259,7 +1523,13 @@ public sealed class ShopEngine
         var weightedTiers = new List<(ETier Tier, double Weight)>();
         foreach (var (tier, tierCards) in byTier)
         {
-            double basePct = GetEncounterTierBaseWeight(effectiveDay, tier);
+            double basePct = GetEncounterTierBaseWeight(effectiveDay, tier, isMerchantPool);
+            // V13.2 池容平滑系数：当多阶共存且某一阶仅剩 1~3 张卡（例如 Day 1 凡妮莎青铜非商事件仅 2 张、或银商仅 Curio 1 张）时，
+            // 按 sqrt(count / 4) 温和折算桶权，杜绝极少数卡吃掉 70% 权重反复刷屏。
+            if (byTier.Count > 1 && tierCards.Count < 4)
+            {
+                basePct *= Math.Sqrt(tierCards.Count / 4.0);
+            }
             double tierWeight = basePct;
             if (weightMultiplier != null)
             {

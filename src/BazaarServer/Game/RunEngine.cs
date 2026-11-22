@@ -727,7 +727,7 @@ public sealed class RunEngine
 
         var preMoveSnapshot = SnapshotPlayerItemPlacements();
         var movedEntries = new List<(RunState.CardEntry Entry, EContainerSocketId NewSocket, EInventorySection Section)>();
-        bool placed = TryPlaceIntoSection(card, coreCard, targetSection, desiredSlot, movedEntries);
+        bool placed = TryPlaceIntoSection(card, coreCard, targetSection, desiredSlot, movedEntries, cmd.TargetSockets);
 
         if (!placed)
         {
@@ -902,7 +902,8 @@ public sealed class RunEngine
         CardInstance coreCard,
         EInventorySection section,
         int desiredSlot,
-        List<(RunState.CardEntry Entry, EContainerSocketId NewSocket, EInventorySection Section)> moved)
+        List<(RunState.CardEntry Entry, EContainerSocketId NewSocket, EInventorySection Section)> moved,
+        List<EContainerSocketId>? targetSockets = null)
     {
         _run.HandGrid.UnlockedMask = _run.UnlockedSlots;
         _run.StashGrid.UnlockedMask = 1023;
@@ -917,6 +918,18 @@ public sealed class RunEngine
         var sourceSnapshot = sourceGrid != null && !sameGrid ? SnapshotGridSlots(sourceGrid) : null;
         int oldSlot = coreCard.StartSlot;
 
+        List<int>? officialSockets = null;
+        if (targetSockets is { Count: > 0 })
+        {
+            officialSockets = targetSockets.Select(s => (int)s).ToList();
+        }
+        else if (desiredSlot >= 0)
+        {
+            officialSockets = new List<int>(coreCard.SlotWidth);
+            for (int i = 0; i < coreCard.SlotWidth; i++)
+                officialSockets.Add(desiredSlot + i);
+        }
+
         if (sourceGrid != null && !sameGrid)
         {
             sourceGrid.Remove(coreCard);
@@ -925,10 +938,12 @@ public sealed class RunEngine
         bool ok = false;
         if (sourceGrid == null)
         {
-            // 买卡/衍生发卡：只要目标区已解锁总空位 >= 物品宽度，优先在指定位挤位，失败则自动紧凑滑移现有卡腾位，绝不误丢 Stash
+            // 买卡/衍生发卡：只要目标区已解锁总空位 >= 物品宽度，优先走 1:1 客户端 SocketOperations.AddItemToContainer 插入算法
             if (targetGrid.CountFreeUnlockedSlots() >= coreCard.SlotWidth)
             {
-                if (desiredSlot >= 0)
+                if (officialSockets != null)
+                    ok = targetGrid.TryInsertIntoGridSocketOps(coreCard, officialSockets);
+                if (!ok && desiredSlot >= 0)
                     ok = targetGrid.TryPlaceWithDisplaceOrSwap(coreCard, desiredSlot);
                 if (!ok)
                     ok = targetGrid.TryAddAuto(coreCard);
@@ -936,24 +951,31 @@ public sealed class RunEngine
         }
         else if (sameGrid)
         {
-            if (desiredSlot >= 0)
+            // 同盘移牌：优先走 1:1 客户端官方 SocketOperations.MoveCardToSocketOnSameCarpet 链表保序算法，
+            // 确保服务端与客户端在满盘换位/滑动挤位后每个槽位完全一致（彻底杜绝无关卡瞬移至最左导致卖战利品打偏）。
+            if (officialSockets != null)
+                ok = targetGrid.TryMoveSameGridSocketOps(coreCard, officialSockets);
+            if (!ok && desiredSlot >= 0)
                 ok = targetGrid.TryPlaceWithDisplaceOrSwap(coreCard, desiredSlot);
             if (!ok && desiredSlot < 0)
                 ok = targetGrid.TryAddAuto(coreCard);
         }
         else
         {
-            // 跨区移牌：优先直接放进目标区；若目标区空位不足且指定了槽位，执行原子跨区换位（对齐客户端 SocketOperations.SwapItemsOnToBoard）
+            // 跨区移牌：优先走 1:1 官方 SocketOperations.MoveCardToSocketOnDifferentCarpet；
+            // 若目标区空位不足且指定了槽位，执行原子跨区换位（对齐客户端 SocketOperations.SwapItemsOnToBoard）
             if (targetGrid.CountFreeUnlockedSlots() >= coreCard.SlotWidth)
             {
-                if (desiredSlot >= 0)
+                if (officialSockets != null)
+                    ok = targetGrid.TryInsertIntoGridSocketOps(coreCard, officialSockets);
+                if (!ok && desiredSlot >= 0)
                     ok = targetGrid.TryPlaceWithDisplaceOrSwap(coreCard, desiredSlot);
                 if (!ok)
                     ok = targetGrid.TryAddAuto(coreCard);
             }
             else if (desiredSlot >= 0 && sourceGrid != null)
             {
-                ok = TryCrossSectionSwap(coreCard, sourceGrid, targetGrid, desiredSlot, oldSlot);
+                ok = TryCrossSectionSwap(coreCard, sourceGrid, targetGrid, desiredSlot, oldSlot, officialSockets);
             }
         }
 
@@ -984,7 +1006,8 @@ public sealed class RunEngine
         BoardGrid sourceGrid,
         BoardGrid targetGrid,
         int desiredSlot,
-        int oldSlot)
+        int oldSlot,
+        List<int>? officialSockets = null)
     {
         if (!targetGrid.TryNormalizeSlotToUnlocked(desiredSlot, incoming.SlotWidth, out int normSlot))
             return false;
@@ -1001,13 +1024,15 @@ public sealed class RunEngine
         foreach (var b in blockers)
             targetGrid.Remove(b);
 
-        bool placedIncoming = targetGrid.TryPlaceWithDisplaceOrSwap(incoming, normSlot) || targetGrid.TryAddAuto(incoming);
+        bool placedIncoming = (officialSockets != null && targetGrid.TryInsertIntoGridSocketOps(incoming, officialSockets))
+            || targetGrid.TryPlaceWithDisplaceOrSwap(incoming, normSlot)
+            || targetGrid.TryAddAuto(incoming);
         if (!placedIncoming) return false;
 
         int fallbackSlot = oldSlot >= 0 ? oldSlot : 0;
         foreach (var b in blockers)
         {
-            bool placedBlocker = sourceGrid.TryPlaceWithDisplaceOrSwap(b, fallbackSlot) || sourceGrid.TryAddAuto(b);
+            bool placedBlocker = sourceGrid.TryAddAuto(b) || sourceGrid.TryPlaceWithDisplaceOrSwap(b, fallbackSlot);
             if (!placedBlocker) return false;
             fallbackSlot = Math.Min(BoardGrid.Capacity - 1, b.StartSlot + b.SlotWidth);
         }
@@ -1167,6 +1192,7 @@ public sealed class RunEngine
 
     private Outcome MoveOwnedCard(RunState.CardEntry card, List<EContainerSocketId>? targetSockets, EInventorySection targetSection)
     {
+        bool coreRecreated = card.CoreCard == null;
         var coreCard = EnsureCoreCard(card);
         EInventorySection? fromSection = card.Section;
         string fromLoc = $"{fromSection}:{card.Socket}";
@@ -1174,7 +1200,7 @@ public sealed class RunEngine
         var preMoveSnapshot = SnapshotPlayerItemPlacements();
         var moved = new List<(RunState.CardEntry Entry, EContainerSocketId NewSocket, EInventorySection Section)>();
 
-        if (!TryPlaceIntoSection(card, coreCard, targetSection, desiredSlot, moved))
+        if (!TryPlaceIntoSection(card, coreCard, targetSection, desiredSlot, moved, targetSockets))
         {
             LogBoardAudit("MoveCard", card.InstanceId, card.TemplateId.ToString(), fromLoc, $"{targetSection}:{desiredSlot}", "目标槽位空间不足，无法移动卡牌");
             return NotAllowed("目标槽位空间不足，无法移动该卡牌");
@@ -1250,6 +1276,10 @@ public sealed class RunEngine
             {
                 if (mv.Entry.CoreCard != null)
                     mv.Entry.CoreCard.StartSlot = (int)mv.NewSocket;
+            }
+            if (coreRecreated)
+            {
+                o.Events.AddRange(_run.SyncEntryFromCoreCardAndDiff(card, _repo.GameMode.StandardPrices));
             }
             ReconcileAndVerifyBoardInvariants("MoveCard", o.DirtyCardIds, o.Events, preMoveSnapshot);
         }
@@ -1650,6 +1680,8 @@ public sealed class RunEngine
         if (!string.IsNullOrEmpty(encId))
         {
             _run.VisitedDayEncounterIds.Add(encId);
+            if (!string.IsNullOrEmpty(_run.ActiveExpeditionId))
+                _run.ExpeditionVisitedRoomIds.Add(encId);
         }
 
         _run.CurrentEncounterId = encId;
@@ -2391,9 +2423,14 @@ public sealed class RunEngine
                     ? (int)_run.Day
                     : Math.Clamp((int)_run.Day, 1, 15);
                 var lockedGhost = _run.PendingPvpGhost;
+                // V13.2 修复问题 #8：自定义规则模式允许回落抽取标准池幽灵（lockedGhost.PoolPartition="standard" 而 ghostPartition="custom"），
+                // 严禁在此错误比对 PoolPartition 导致点击 Hour 6 对手头像时丢弃已锁定预览幽灵、重抽一名完全不同的英雄！
+                bool partitionCompatible = lockedGhost != null && (
+                    string.Equals(lockedGhost.PoolPartition, ghostPartition, StringComparison.OrdinalIgnoreCase)
+                    || (_run.IsCustomRuleRun && string.Equals(lockedGhost.PoolPartition, PvpGhostPool.StandardPartition, StringComparison.OrdinalIgnoreCase)));
                 bool canUseLockedGhost = lockedGhost != null
                                       && lockedGhost.Day == expectedDay
-                                      && string.Equals(lockedGhost.PoolPartition, ghostPartition, StringComparison.OrdinalIgnoreCase)
+                                      && partitionCompatible
                                       && (_run.IsCustomRuleRun || (!lockedGhost.IsCustomRule && Storage.Persistence.IsSaneGhostForDay(Math.Clamp(expectedDay, 1, 15), lockedGhost.HealthMax)));
                 var ghostRng = tourneyAssignment != null
                     ? new Random(combatSeed)
@@ -2426,8 +2463,9 @@ public sealed class RunEngine
                     // #15 锦标赛 AI 机器人公平同步房间开局预设（血量差值、初始装备、初始技能）
                     ApplyTournamentRulesToAiBot(p2Core, tourneyLobby.Rules);
                 }
+                // 仅当严格复用了预览幽灵时才保留预览 accountId；若极端兜底重抽了新幽灵，使用新幽灵自己的 BoardId 避免旧 accountId + 新英雄张冠李戴
                 string oppAccountId = tourneyAssignment?.OpponentAccountId
-                    ?? _run.CurrentPvpOpponent?.PlayerLoadout?.accountId
+                    ?? (canUseLockedGhost ? _run.CurrentPvpOpponent?.PlayerLoadout?.accountId : null)
                     ?? (!string.IsNullOrWhiteSpace(ghost.BoardId) ? $"ghost_{ghost.BoardId}" : $"ghost_{Guid.NewGuid():N}");
                 string oppDisplayName = tourneyAssignment != null
                     ? tourneyAssignment.OpponentUsername
@@ -2877,21 +2915,32 @@ public sealed class RunEngine
                     TriggerOnEncounterCardsDealtOnly(_run.CurrentEncounterId, despawnEvents);
                 }
             }
-            else if (_run.PendingLevelUp)
-            {
-                ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
-                ConsumeNextPendingLevelUpToEvents(despawnEvents);
-            }
-            else if (_run.SuspendedStates.Count > 0)
-            {
-                // V13.1 Hour 6 保底（根因 #6）：若由升级奖励或子状态意外触发战斗，战后优先通过 SuspendedStates 恢复挂起现场避免脏栈残留
-                ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
-                AdvanceAfterSubStateToEvents(despawnEvents);
-            }
             else
             {
-                ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
-                AdvanceHourOrDay(despawnEvents);
+                // 探险内 PvE（陷阱怪 / 神庙 Boss / 坠毁点 Boss）战败时按官方规则退出探险替换集，回归常规事件池
+                if (!isPvp && !win && !string.IsNullOrEmpty(_run.ActiveExpeditionId))
+                {
+                    _run.ActiveExpeditionId = null;
+                    _run.ActiveExpeditionVariant = null;
+                    _run.ExpeditionVisitedRoomIds.Clear();
+                }
+
+                if (_run.PendingLevelUp)
+                {
+                    ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
+                    ConsumeNextPendingLevelUpToEvents(despawnEvents);
+                }
+                else if (_run.SuspendedStates.Count > 0)
+                {
+                    // V13.1 Hour 6 保底（根因 #6）：若由升级奖励或子状态意外触发战斗，战后优先通过 SuspendedStates 恢复挂起现场避免脏栈残留
+                    ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
+                    AdvanceAfterSubStateToEvents(despawnEvents);
+                }
+                else
+                {
+                    ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
+                    AdvanceHourOrDay(despawnEvents);
+                }
             }
         }
         else
@@ -3346,6 +3395,9 @@ public sealed class RunEngine
             // 1) 清理 UntilEndOfDay 临时层（并同步回写属性/附魔还原事件）与当日已访问遭遇集合
             ClearDayModifiersOnRun(events);
             _run.VisitedDayEncounterIds.Clear();
+            _run.ActiveExpeditionId = null;
+            _run.ActiveExpeditionVariant = null;
+            _run.ExpeditionVisitedRoomIds.Clear();
             _run.PendingPvpGhost = null;
             _run.CurrentPvpOpponent = null;
 
@@ -6329,9 +6381,12 @@ public sealed class RunEngine
         int expectedDay = _run.CustomRules.SpecialModeId == ESpecialModeId.EndlessTower
             ? day
             : Math.Clamp(day, 1, 15);
+        bool ghostPartitionOk = _run.PendingPvpGhost != null && (
+            string.Equals(_run.PendingPvpGhost.PoolPartition, ghostPartition, StringComparison.OrdinalIgnoreCase)
+            || (_run.IsCustomRuleRun && string.Equals(_run.PendingPvpGhost.PoolPartition, PvpGhostPool.StandardPartition, StringComparison.OrdinalIgnoreCase)));
         bool ghostValid = _run.PendingPvpGhost != null
                        && _run.PendingPvpGhost.Day == expectedDay
-                       && string.Equals(_run.PendingPvpGhost.PoolPartition, ghostPartition, StringComparison.OrdinalIgnoreCase)
+                       && ghostPartitionOk
                        && (_run.IsCustomRuleRun || (!_run.PendingPvpGhost.IsCustomRule && Storage.Persistence.IsSaneGhostForDay(Math.Clamp(expectedDay, 1, 15), _run.PendingPvpGhost.HealthMax)));
         if (!ghostValid)
         {

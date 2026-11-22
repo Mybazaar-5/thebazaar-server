@@ -314,6 +314,454 @@ public sealed class BoardGrid
         return false;
     }
 
+    private sealed class OfficialSocketNode
+    {
+        public CardInstance? Card { get; }
+        public List<int> Sockets { get; }
+        public bool Locked { get; set; }
+
+        public OfficialSocketNode(CardInstance? card, List<int> sockets, bool locked = false)
+        {
+            Card = card;
+            Sockets = sockets;
+            Locked = locked;
+        }
+    }
+
+    /// <summary>
+    /// V13.2：1:1 复刻客户端官方 <c>BazaarGameShared.Domain.Cards.SocketOperations.MoveCardToSocketOnSameCarpet</c>
+    /// 链表保序移牌算法，确保同盘拖拽重排（含满盘相邻互换、跨卡滑动挤位）在服务端与 Unity 客户端产生逐槽完全一致的结果，
+    /// 彻底杜绝满盘拖放时把无关远端卡瞬移到最左槽位造成的前后端错位。
+    /// </summary>
+    public bool TryMoveSameGridSocketOps(CardInstance card, IReadOnlyList<int>? desiredSockets)
+        => TryMoveSameGridSocketOps(card, desiredSockets, out _);
+
+    public bool TryMoveSameGridSocketOps(CardInstance card, IReadOnlyList<int>? desiredSockets, out List<CardInstance> displacedCards)
+    {
+        var beforeSlots = CaptureGridSlots();
+        bool ok = TryMoveSameGridSocketOpsCore(card, desiredSockets);
+        displacedCards = ok ? CollectDisplacedCards(beforeSlots) : [];
+        return ok;
+    }
+
+    private bool TryMoveSameGridSocketOpsCore(CardInstance card, IReadOnlyList<int>? desiredSockets)
+    {
+        if (!Cards.Contains(card) || card.StartSlot < 0) return false;
+
+        int width = card.SlotWidth;
+        var sockets = BuildAndModifyOfficialSockets(desiredSockets, width);
+        if (sockets == null || sockets.Count < width) return false;
+
+        int curStart = card.StartSlot;
+        if (curStart == sockets[0])
+        {
+            // 已位于目标起始槽位，保持幂等成功（不改动任何其他卡牌）
+            return true;
+        }
+
+        int moveDirection = curStart > sockets[0] ? -1 : 1;
+        var arrWithoutCard = BuildSocketArray(excludeCard: card);
+        var list = BuildOfficialLinkedList(arrWithoutCard);
+        AddOfficialCardNode(card, sockets, list, moveDirection);
+        if (!RemoveOfficialNullNodes(list, card, moveDirection))
+            return false;
+
+        var newArr = BuildSocketsFromOfficialLinkedList(list);
+        if (newArr == null)
+            return false;
+
+        CommitSocketArrayToCards(newArr);
+        return true;
+    }
+
+    /// <summary>
+    /// V13.2：1:1 复刻客户端官方 <c>SocketOperations.AddItemToContainer / MoveCardToSocketOnDifferentCarpet</c>
+    /// 链表插入与平衡算法（含买卡落位、储藏箱拖入棋盘），在有足够空位时与客户端本地预览排布保持 100% 一致。
+    /// </summary>
+    public bool TryInsertIntoGridSocketOps(CardInstance card, IReadOnlyList<int>? desiredSockets)
+        => TryInsertIntoGridSocketOps(card, desiredSockets, out _);
+
+    public bool TryInsertIntoGridSocketOps(CardInstance card, IReadOnlyList<int>? desiredSockets, out List<CardInstance> displacedCards)
+    {
+        var beforeSlots = CaptureGridSlots();
+        bool ok = TryInsertIntoGridSocketOpsCore(card, desiredSockets);
+        displacedCards = ok ? CollectDisplacedCards(beforeSlots) : [];
+        return ok;
+    }
+
+    private bool TryInsertIntoGridSocketOpsCore(CardInstance card, IReadOnlyList<int>? desiredSockets)
+    {
+        int width = card.SlotWidth;
+        bool alreadyInGrid = Cards.Contains(card);
+        int freeSlots = CountFreeUnlockedSlots() + (alreadyInGrid ? width : 0);
+        if (freeSlots < width) return false;
+
+        var sockets = BuildAndModifyOfficialSockets(desiredSockets, width);
+        if (sockets == null || sockets.Count < width) return false;
+
+        var arrWithoutCard = BuildSocketArray(excludeCard: alreadyInGrid ? card : null);
+        var list = new LinkedList<OfficialSocketNode>();
+        list.AddFirst(new OfficialSocketNode(card, sockets));
+        BuildToOfficialLinkedList(list, arrWithoutCard);
+
+        var newArr = BuildSocketsFromOfficialLinkedList(list);
+        if (newArr == null) return false;
+
+        CommitSocketArrayToCards(newArr);
+        return true;
+    }
+
+    private List<int>? BuildAndModifyOfficialSockets(IReadOnlyList<int>? rawSockets, int width)
+    {
+        if (width <= 0 || width > Capacity) return null;
+
+        int lowest = -1;
+        int highest = -1;
+        for (int s = 0; s < Capacity; s++)
+        {
+            if (IsSlotUnlocked(s))
+            {
+                if (lowest < 0) lowest = s;
+                highest = s;
+            }
+        }
+        if (lowest < 0 || highest - lowest + 1 < width) return null;
+
+        var sockets = new List<int>(width);
+        if (rawSockets is { Count: > 0 })
+        {
+            int take = Math.Min(width, rawSockets.Count);
+            for (int i = 0; i < take; i++)
+                sockets.Add(rawSockets[i]);
+            sockets.Sort();
+            while (sockets.Count < width)
+                sockets.Add(sockets[^1] + 1);
+        }
+        else
+        {
+            for (int i = 0; i < width; i++)
+                sockets.Add(lowest + i);
+        }
+
+        // 对齐官方 SocketOperations.ModifySockets：按最大越界偏移整体平移至已解锁区间
+        int maxDist = 0;
+        int shift = 0;
+        for (int i = 0; i < sockets.Count; i++)
+        {
+            int s = sockets[i];
+            int clamped = Math.Clamp(s, lowest, highest);
+            int dist = Math.Abs(clamped - s);
+            if (dist > maxDist)
+            {
+                maxDist = dist;
+                shift = clamped - s;
+            }
+        }
+        if (shift != 0)
+        {
+            for (int i = 0; i < sockets.Count; i++)
+                sockets[i] += shift;
+        }
+
+        // 校验全部目标槽位合法且已解锁
+        for (int i = 0; i < sockets.Count; i++)
+        {
+            if (sockets[i] < 0 || sockets[i] >= Capacity || !IsSlotUnlocked(sockets[i]))
+                return null;
+        }
+        return sockets;
+    }
+
+    private CardInstance?[] BuildSocketArray(CardInstance? excludeCard = null)
+    {
+        var arr = new CardInstance?[Capacity];
+        for (int i = 0; i < Cards.Count; i++)
+        {
+            var c = Cards[i];
+            if (ReferenceEquals(c, excludeCard) || c.StartSlot < 0) continue;
+            for (int s = c.StartSlot; s < c.StartSlot + c.SlotWidth && s < Capacity; s++)
+                arr[s] = c;
+        }
+        return arr;
+    }
+
+    private LinkedList<OfficialSocketNode> BuildOfficialLinkedList(CardInstance?[] arr)
+    {
+        var list = new LinkedList<OfficialSocketNode>();
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (!IsSlotUnlocked(i))
+            {
+                list.AddLast(new OfficialSocketNode(null, new List<int>(1) { i }, locked: true));
+                continue;
+            }
+            var c = arr[i];
+            if (c == null || c.SlotWidth <= 1)
+            {
+                list.AddLast(new OfficialSocketNode(c, new List<int>(1) { i }));
+            }
+            else
+            {
+                int w = Math.Min(c.SlotWidth, Capacity - i);
+                var occ = new List<int>(w);
+                for (int k = 0; k < w; k++) occ.Add(i + k);
+                list.AddLast(new OfficialSocketNode(c, occ));
+                i += w - 1;
+            }
+        }
+        return list;
+    }
+
+    private static void AddOfficialCardNode(CardInstance card, List<int> sockets, LinkedList<OfficialSocketNode> list, int direction)
+    {
+        int anchorSocket = direction < 0 ? sockets[0] : sockets[^1];
+        LinkedListNode<OfficialSocketNode>? node = list.First;
+        while (node != null)
+        {
+            if (node.Value.Sockets.Contains(anchorSocket))
+                break;
+            node = node.Next;
+        }
+
+        var newNode = new OfficialSocketNode(card, new List<int>(sockets));
+        if (node == null)
+            list.AddLast(newNode);
+        else if (direction >= 0)
+            list.AddAfter(node, newNode);
+        else
+            list.AddBefore(node, newNode);
+    }
+
+    private static bool RemoveOfficialNullNodes(LinkedList<OfficialSocketNode> list, CardInstance card, int direction)
+    {
+        int remaining = card.SlotWidth;
+        if (direction >= 0)
+        {
+            remaining -= RemoveOfficialNullNodesLeft(list, card, remaining);
+            if (remaining > 0)
+                remaining -= RemoveOfficialNullNodesRight(list, card, remaining);
+        }
+        else
+        {
+            remaining -= RemoveOfficialNullNodesRight(list, card, remaining);
+            if (remaining > 0)
+                remaining -= RemoveOfficialNullNodesLeft(list, card, remaining);
+        }
+        return remaining <= 0;
+    }
+
+    private static int RemoveOfficialNullNodesLeft(LinkedList<OfficialSocketNode> list, CardInstance card, int amountToRemove)
+    {
+        if (amountToRemove <= 0) return 0;
+        var node = list.First;
+        while (node != null && !ReferenceEquals(node.Value.Card, card))
+            node = node.Next;
+
+        int removed = 0;
+        while (node != null && amountToRemove > 0)
+        {
+            var prev = node.Previous;
+            if (node.Value.Card == null && !node.Value.Locked)
+            {
+                list.Remove(node);
+                amountToRemove--;
+                removed++;
+            }
+            node = prev;
+        }
+        return removed;
+    }
+
+    private static int RemoveOfficialNullNodesRight(LinkedList<OfficialSocketNode> list, CardInstance card, int amountToRemove)
+    {
+        if (amountToRemove <= 0) return 0;
+        var node = list.First;
+        while (node != null && !ReferenceEquals(node.Value.Card, card))
+            node = node.Next;
+
+        int removed = 0;
+        while (node != null && amountToRemove > 0)
+        {
+            var next = node.Next;
+            if (node.Value.Card == null && !node.Value.Locked)
+            {
+                list.Remove(node);
+                amountToRemove--;
+                removed++;
+            }
+            node = next;
+        }
+        return removed;
+    }
+
+    private void BuildToOfficialLinkedList(LinkedList<OfficialSocketNode> list, CardInstance?[] arr)
+    {
+        var cardNode = list.First!;
+        var rightAnchor = cardNode;
+        int targetLeft = cardNode.Value.Sockets[0];
+        int targetRight = cardNode.Value.Sockets[^1];
+        int leftRemain = targetLeft;
+        int rightRemain = Capacity - targetRight - 1;
+
+        bool IsRangeUnlocked(int start, int size)
+        {
+            int len = Math.Max(1, size);
+            for (int j = start; j < start + len && j < Capacity; j++)
+            {
+                if (!IsSlotUnlocked(j)) return false;
+            }
+            return true;
+        }
+
+        for (int i = 0; i < Capacity; i++)
+        {
+            var c = arr[i];
+            if (!IsSlotUnlocked(i))
+            {
+                if (i < targetLeft)
+                {
+                    list.AddFirst(new OfficialSocketNode(null, new List<int>(), locked: true));
+                }
+                else if (i > targetRight)
+                {
+                    list.AddLast(new OfficialSocketNode(null, new List<int>(), locked: true));
+                }
+                continue;
+            }
+
+            int sz = c?.SlotWidth ?? 0;
+            int stepSkip = c != null ? c.SlotWidth - 1 : 0;
+
+            if (i <= targetLeft && sz <= leftRemain && IsRangeUnlocked(i, sz))
+            {
+                list.AddBefore(cardNode, new OfficialSocketNode(c, new List<int>()));
+                i += stepSkip;
+                leftRemain -= sz;
+            }
+            else if (i <= targetLeft && sz <= rightRemain)
+            {
+                var n = new OfficialSocketNode(c, new List<int>());
+                list.AddAfter(rightAnchor, n);
+                rightAnchor = list.Find(n)!;
+                i += stepSkip;
+                rightRemain -= sz;
+            }
+            else if (i >= targetRight && sz <= rightRemain)
+            {
+                list.AddLast(new OfficialSocketNode(c, new List<int>()));
+                i += stepSkip;
+                rightRemain -= sz;
+            }
+            else if (i >= targetRight && sz <= leftRemain)
+            {
+                list.AddBefore(cardNode, new OfficialSocketNode(c, new List<int>()));
+                i += stepSkip;
+                leftRemain -= sz;
+            }
+            else if (i >= targetLeft && sz <= leftRemain)
+            {
+                list.AddBefore(cardNode, new OfficialSocketNode(c, new List<int>()));
+                i += stepSkip;
+                leftRemain -= sz;
+            }
+            else if (i >= targetLeft && sz <= rightRemain)
+            {
+                var n = new OfficialSocketNode(c, new List<int>());
+                list.AddAfter(rightAnchor, n);
+                rightAnchor = list.Find(n)!;
+                i += stepSkip;
+                rightRemain -= sz;
+            }
+            else if (i <= targetLeft)
+            {
+                list.AddBefore(cardNode, new OfficialSocketNode(c, new List<int>()));
+                i += stepSkip;
+                leftRemain -= sz;
+            }
+            else if (i >= targetRight)
+            {
+                list.AddLast(new OfficialSocketNode(c, new List<int>()));
+                i += stepSkip;
+                rightRemain -= sz;
+            }
+        }
+
+        if (rightRemain < 0)
+            RemoveOfficialNullNodesLeft(list, cardNode.Value.Card!, Math.Abs(rightRemain));
+        if (leftRemain < 0)
+            RemoveOfficialNullNodesLeft(list, cardNode.Value.Card!, Math.Abs(leftRemain));
+
+        BalanceOfficialLinkedList(list, cardNode);
+    }
+
+    private static void BalanceOfficialLinkedList(LinkedList<OfficialSocketNode> list, LinkedListNode<OfficialSocketNode> cardNode)
+    {
+        int totalSlots = 0;
+        for (var n = list.First; n != null; n = n.Next)
+            totalSlots += n.Value.Card?.SlotWidth ?? 1;
+
+        int beforeSlots = 0;
+        var cur = list.First;
+        while (cur != null && cur != cardNode)
+        {
+            beforeSlots += cur.Value.Card?.SlotWidth ?? 1;
+            cur = cur.Next;
+        }
+        if (cur == null) return;
+
+        int desiredLeft = cardNode.Value.Sockets[0];
+        if (beforeSlots >= desiredLeft)
+            totalSlots -= RemoveOfficialNullNodesLeft(list, cardNode.Value.Card!, beforeSlots - desiredLeft);
+        if (totalSlots > Capacity)
+            totalSlots -= RemoveOfficialNullNodesRight(list, cardNode.Value.Card!, totalSlots - Capacity);
+        if (totalSlots > Capacity)
+            totalSlots -= RemoveOfficialNullNodesLeft(list, cardNode.Value.Card!, totalSlots - Capacity);
+        while (totalSlots < Capacity)
+        {
+            list.AddAfter(cardNode, new OfficialSocketNode(null, new List<int>()));
+            totalSlots++;
+        }
+    }
+
+    private CardInstance?[]? BuildSocketsFromOfficialLinkedList(LinkedList<OfficialSocketNode> list)
+    {
+        var arr = new CardInstance?[Capacity];
+        int cursor = 0;
+        for (var n = list.First; n != null; n = n.Next)
+        {
+            int w = n.Value.Card?.SlotWidth ?? 1;
+            if (cursor + w > Capacity) return null;
+            for (int k = 0; k < w; k++)
+            {
+                int slot = cursor + k;
+                if (n.Value.Card != null && !IsSlotUnlocked(slot))
+                    return null;
+                arr[slot] = n.Value.Card;
+            }
+            cursor += w;
+        }
+        if (cursor != Capacity) return null;
+        return arr;
+    }
+
+    private void CommitSocketArrayToCards(CardInstance?[] arr)
+    {
+        var seen = new HashSet<CardInstance>();
+        var nextCards = new List<CardInstance>(Cards.Count + 1);
+        for (int s = 0; s < Capacity; s++)
+        {
+            var c = arr[s];
+            if (c != null && seen.Add(c))
+            {
+                c.StartSlot = s;
+                nextCards.Add(c);
+            }
+        }
+        Cards.Clear();
+        Cards.AddRange(nextCards);
+        SortCards();
+    }
+
     /// <summary>
     /// 拖拽或投放卡牌到 <paramref name="targetSlot"/>：优先直接放置，冲突时依次尝试同盘原位换位、
     /// 最小位移左右让位挤开或无损回溯重排，严格保留锁定槽位并在无解时原子回滚。

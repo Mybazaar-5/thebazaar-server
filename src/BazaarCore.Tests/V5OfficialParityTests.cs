@@ -1481,14 +1481,15 @@ public sealed class V5OfficialParityTests
             Assert.Null(pvpOut.Error);
             Assert.NotNull(pvpOut.Combat);
             Assert.Equal(ECombatantId.Player, pvpOut.Combat!.Winner);
+            // V13.2 还原官方负血击杀视觉：致命沙尘暴/DoT 允许把生命值打到 <= 0（如负血溢出）
             Assert.Contains(pvpOut.Combat.Frames, f =>
                 f.PlayerUpdates?.Attributes != null &&
                 f.PlayerUpdates.Attributes.TryGetValue(EPlayerAttributeType.Health, out var u) &&
-                u.CurrentValue == 0);
+                u.CurrentValue <= 0);
             Assert.Contains(pvpOut.Combat.Frames, f =>
                 f.OpponentUpdates?.Attributes != null &&
                 f.OpponentUpdates.Attributes.TryGetValue(EPlayerAttributeType.Health, out var u) &&
-                u.CurrentValue == 0);
+                u.CurrentValue <= 0);
             Assert.Equal(1u, run.Victories);
             Assert.Equal(0u, run.Defeats);
             Assert.Equal(prestigeBefore, run.PlayerAttributes[EPlayerAttributeType.Prestige]);
