@@ -991,12 +991,35 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         {
             try
             {
-                await GameDriver.DoConcedeAsync(new JObject { ["forceHttp"] = true }).ConfigureAwait(false);
+                object res = await GameDriver.DoConcedeAsync(new JObject { ["forceHttp"] = true }).ConfigureAwait(false);
+                bool ok = true;
+                string errMsg = null;
+                if (res != null)
+                {
+                    var okProp = res.GetType().GetProperty("ok");
+                    if (okProp != null && okProp.GetValue(res) is bool b) ok = b;
+                    var errProp = res.GetType().GetProperty("error");
+                    if (errProp != null) errMsg = errProp.GetValue(res)?.ToString();
+                }
+
                 _pendingUpdates.Enqueue(() =>
                 {
                     _isBusy = false;
                     _lastToolboxKey = "";
+                    if (!ok)
+                    {
+                        SetStatus("放弃对局失败：" + Truncate(string.IsNullOrWhiteSpace(errMsg) ? "服务端未返回成功" : errMsg, 64), isError: true);
+                        RefreshModalContentsIfOpen();
+                        return;
+                    }
+
+                    _activeRunId = "";
+                    _activeRunFetchedId = "";
+                    _activeRunTendencyLocked = false;
+                    _showPreRunPrompt = false;
+                    CompatAuditPatch.RefreshActiveMainMenuUiFromData();
                     SetStatus("已结束当前对局，现在可以自由切换英雄与打开换装界面！", isError: false);
+                    RefreshMainMenuToolboxUi();
                     RefreshModalContentsIfOpen();
                     RefreshHudOverlays(force: true);
                 });

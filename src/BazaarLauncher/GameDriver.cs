@@ -706,13 +706,37 @@ internal sealed class GameDriver : MonoBehaviour
 
     private static string Err(string msg) => JsonConvert.SerializeObject(new { ok = false, error = msg });
 
-    /// <summary>把委托丢到主线程执行并等结果，同时统计最近主线程耗时。</summary>
+    /// <summary>
+    /// 把委托丢到 Unity 主线程执行并等结果，同时统计最近主线程耗时。
+    /// 即使默认关闭了 GameDriver HTTP 控制面（Instance == null），也会自动经由常驻
+    /// <see cref="BazaarLauncher.Core.MainThreadDispatcher"/> 回到主线程执行，绝不静默跳过。
+    /// </summary>
     internal static T RunOnMain<T>(Func<T> fn, int timeoutMs = 8000)
     {
-        if (Instance == null) return default;
+        if (fn == null) return default;
 
-        var tcs = new TaskCompletionSource<T>();
-        _mainThreadQueue.Enqueue(() =>
+        if (BazaarLauncher.Core.MainThreadDispatcher.IsOnMainThread)
+        {
+            long t0 = Stopwatch.GetTimestamp();
+            try
+            {
+                return fn();
+            }
+            finally
+            {
+                double ms = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
+                GameInspector.RecordMainThreadOpMs(ms);
+            }
+        }
+
+        bool useDriverQueue = Instance != null;
+        if (!useDriverQueue && !BazaarLauncher.Core.MainThreadDispatcher.IsInstalled)
+        {
+            return default;
+        }
+
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Action work = () =>
         {
             long t0 = Stopwatch.GetTimestamp();
             try
@@ -728,7 +752,16 @@ internal sealed class GameDriver : MonoBehaviour
                 GameInspector.RecordMainThreadOpMs(ms);
                 tcs.TrySetException(ex);
             }
-        });
+        };
+
+        if (useDriverQueue)
+        {
+            _mainThreadQueue.Enqueue(work);
+        }
+        else
+        {
+            BazaarLauncher.Core.MainThreadDispatcher.Enqueue(work);
+        }
 
         if (!tcs.Task.Wait(timeoutMs))
             throw new TimeoutException("main thread did not respond in " + timeoutMs + "ms");
@@ -1923,6 +1956,18 @@ internal sealed class GameDriver : MonoBehaviour
                 vt.GetField("NumberOfVictories")?.SetValue(boxed, Convert.ToInt32(GetProp(dto, "Victories") ?? 0));
                 valProp.SetValue(runCfg, boxed);
             }
+            try
+            {
+                if (!hasActive)
+                {
+                    runCfg.GetType().GetMethod("SetTournamentSessionId", BindingFlags.Public | BindingFlags.Instance)?.Invoke(runCfg, new object[] { null });
+                    runCfg.GetType().GetMethod("ClearPersistedInitializedRunState", BindingFlags.NonPublic | BindingFlags.Static)?.Invoke(null, null);
+                }
+                var eventsType = AccessTools.TypeByName("TheBazaar.Events");
+                var runCfgUpdated = eventsType?.GetField("RunConfigurationUpdated", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                runCfgUpdated?.GetType().GetMethod("Trigger", BindingFlags.Public | BindingFlags.Instance)?.Invoke(runCfgUpdated, new[] { runCfg });
+            }
+            catch { }
             CompatAuditPatch.RefreshActiveMainMenuUiFromData();
         }
         catch (Exception ex)
@@ -1949,6 +1994,15 @@ internal sealed class GameDriver : MonoBehaviour
                 vt.GetField("NumberOfDefeats")?.SetValue(boxed, 0);
                 valProp.SetValue(runCfg, boxed);
             }
+            try
+            {
+                runCfg.GetType().GetMethod("SetTournamentSessionId", BindingFlags.Public | BindingFlags.Instance)?.Invoke(runCfg, new object[] { null });
+                runCfg.GetType().GetMethod("ClearPersistedInitializedRunState", BindingFlags.NonPublic | BindingFlags.Static)?.Invoke(null, null);
+                var eventsType = AccessTools.TypeByName("TheBazaar.Events");
+                var runCfgUpdated = eventsType?.GetField("RunConfigurationUpdated", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                runCfgUpdated?.GetType().GetMethod("Trigger", BindingFlags.Public | BindingFlags.Instance)?.Invoke(runCfgUpdated, new[] { runCfg });
+            }
+            catch { }
             CompatAuditPatch.RefreshActiveMainMenuUiFromData();
         }
         catch (Exception ex)

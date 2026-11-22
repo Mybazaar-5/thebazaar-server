@@ -17,6 +17,8 @@ internal sealed class MainThreadDispatcher : MonoBehaviour
 
     internal static bool IsOnMainThread => _mainThreadId > 0 && Thread.CurrentThread.ManagedThreadId == _mainThreadId;
 
+    internal static bool IsInstalled => _instance != null;
+
     internal static void EnsureInstalled()
     {
         if (_mainThreadId <= 0)
