@@ -317,7 +317,7 @@ internal sealed partial class CustomGameplayUI
         _inRunBadgeRt.anchorMin = new Vector2(1f, 1f);
         _inRunBadgeRt.anchorMax = new Vector2(1f, 1f);
         _inRunBadgeRt.pivot = new Vector2(1f, 1f);
-        _inRunBadgeRt.anchoredPosition = new Vector2(-118f, -10f);
+        _inRunBadgeRt.anchoredPosition = new Vector2(-132f, -12f);
         _inRunBadgeRt.sizeDelta = new Vector2(248f, 32f);
 
         var ibDotGo = new GameObject("Dot", typeof(RectTransform));
@@ -376,7 +376,7 @@ internal sealed partial class CustomGameplayUI
         _speedChipRt.anchorMin = new Vector2(1f, 1f);
         _speedChipRt.anchorMax = new Vector2(1f, 1f);
         _speedChipRt.pivot = new Vector2(1f, 1f);
-        _speedChipRt.anchoredPosition = new Vector2(-118f, -48f);
+        _speedChipRt.anchoredPosition = new Vector2(-132f, -50f);
         _speedChipRt.sizeDelta = new Vector2(262f, 34f);
 
         var scRow = _speedChipGo.AddComponent<HorizontalLayoutGroup>();
@@ -418,7 +418,7 @@ internal sealed partial class CustomGameplayUI
         _tourneyWaitBannerRt.anchorMin = new Vector2(1f, 1f);
         _tourneyWaitBannerRt.anchorMax = new Vector2(1f, 1f);
         _tourneyWaitBannerRt.pivot = new Vector2(1f, 1f);
-        _tourneyWaitBannerRt.anchoredPosition = new Vector2(-118f, -48f);
+        _tourneyWaitBannerRt.anchoredPosition = new Vector2(-132f, -50f);
         _tourneyWaitBannerRt.sizeDelta = new Vector2(316f, 52f);
 
         var wbDotGo = new GameObject("Dot", typeof(RectTransform));
@@ -587,7 +587,20 @@ internal sealed partial class CustomGameplayUI
         NativeUguiFactory.SetLayout(_btnResetAllOfficial.Root, minW: 215f, prefW: 224f, minH: 38f, prefH: 40f);
 
         _headerAccountText = _ui.CreateText("AccountInfo", row.transform, "", 13f, NativeUguiFactory.ColMuted, FontStyles.Normal, TextAlignmentOptions.MidlineRight, wrap: false);
-        NativeUguiFactory.SetLayout(_headerAccountText.gameObject, minW: 150f, prefW: 190f, minH: 34f);
+        NativeUguiFactory.SetLayout(_headerAccountText.gameObject, minW: 120f, prefW: 155f, minH: 34f);
+
+        var btnNativeSettings = _ui.CreateButton(
+            "BtnOpenNativeSettings",
+            row.transform,
+            "原生设置",
+            13.5f,
+            NativeUguiFactory.ColBtnNormal,
+            NativeUguiFactory.ColBtnHover,
+            NativeUguiFactory.ColGold,
+            OpenNativeGameSettings,
+            borderColor: NativeUguiFactory.ColGoldDim,
+            fontStyle: FontStyles.Bold);
+        NativeUguiFactory.SetLayout(btnNativeSettings.Root, minW: 92f, prefW: 98f, minH: 38f, prefH: 40f);
 
         var btnClose = _ui.CreateButton(
             "BtnClose",
@@ -601,6 +614,41 @@ internal sealed partial class CustomGameplayUI
             borderColor: NativeUguiFactory.ColGoldDim,
             fontStyle: FontStyles.Bold);
         NativeUguiFactory.SetLayout(btnClose.Root, minW: 82f, prefW: 86f, minH: 38f, prefH: 40f);
+    }
+
+    private void OpenNativeGameSettings()
+    {
+        ClosePanel();
+        BazaarLauncher.Core.MainThreadDispatcher.Enqueue(() =>
+        {
+            try
+            {
+                var popupType = AccessTools.TypeByName("TheBazaar.PopupManager");
+                if (popupType == null) return;
+
+                object pm = null;
+                var servicesType = AccessTools.TypeByName("TheBazaar.AppFramework.Services");
+                if (servicesType != null)
+                {
+                    var getM = servicesType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                        .FirstOrDefault(m => m.Name == "Get" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0);
+                    if (getM != null)
+                    {
+                        try { pm = getM.MakeGenericMethod(popupType).Invoke(null, null); } catch { }
+                    }
+                }
+                pm ??= UnityEngine.Object.FindFirstObjectByType(popupType);
+                if (pm != null)
+                {
+                    var showM = popupType.GetMethod("ShowSettings", BindingFlags.Public | BindingFlags.Instance);
+                    showM?.Invoke(pm, new object[] { null });
+                }
+            }
+            catch (Exception ex)
+            {
+                BazaarLauncherPlugin.Log?.LogWarning("OpenNativeGameSettings: " + ex.Message);
+            }
+        });
     }
 
     private void BuildModalTabBar(Transform parent)
@@ -2086,7 +2134,7 @@ internal sealed partial class CustomGameplayUI
         {
             float targetW = Mathf.Min(334f, maxAvailW);
             _inRunBadgeRt.sizeDelta = new Vector2(targetW, 46f);
-            _inRunBadgeRt.anchoredPosition = new Vector2(-118f, -10f);
+            _inRunBadgeRt.anchoredPosition = new Vector2(-132f, -12f);
 
             if (_inRunBadgeBg != null) _inRunBadgeBg.color = Color.white;
             if (_inRunBadgeBtn != null) ApplyInRunPillButtonColors(_inRunBadgeBtn, ColRuleActiveBg, ColRuleActiveHoverBg);
@@ -2126,7 +2174,7 @@ internal sealed partial class CustomGameplayUI
         {
             float targetW = Mathf.Min(232f, maxAvailW);
             _inRunBadgeRt.sizeDelta = new Vector2(targetW, 32f);
-            _inRunBadgeRt.anchoredPosition = new Vector2(-118f, -10f);
+            _inRunBadgeRt.anchoredPosition = new Vector2(-132f, -12f);
 
             if (_inRunBadgeBg != null) _inRunBadgeBg.color = Color.white;
             if (_inRunBadgeBtn != null) ApplyInRunPillButtonColors(_inRunBadgeBtn, ColRuleVanillaBg, ColRuleVanillaHoverBg);

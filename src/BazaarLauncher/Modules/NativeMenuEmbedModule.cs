@@ -68,7 +68,9 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
     private static FieldInfo _navDataField;
     private static Type _sceneIdEnumType;
     private static Type _traversableSceneType;
-    private static FieldInfo _fightSettingsBtnField;
+    private static FieldInfo _fightOptionsBtnField;
+    private static FieldInfo _fightMenuDialogRootField;
+    private static MethodInfo _fightHideDialogsMethod;
     private static FieldInfo _optionsGameplayBtnField;
 
     internal string SelectedQuickModeId => _selectedQuickModeId;
@@ -413,11 +415,13 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
             label: "NativeUi.SceneSelectOptionContainer.HandleSceneChange");
 
         // 锚点三：局内 ESC 暂停菜单 (FightMenuDialog.Start / UpdateButtonsState)
+        // 严禁触碰 SettingButton（它是常驻右上角的原生齿轮图标本体！），仅读取弹窗内部的 optionsButton 与 fightMenuDialog 容器
         var fightMenuType = GameInspector.FindTypeSafe("FightMenuDialog");
         if (fightMenuType != null)
         {
-            _fightSettingsBtnField = AccessTools.Field(fightMenuType, "SettingButton")
-                ?? AccessTools.Field(fightMenuType, "optionsButton");
+            _fightOptionsBtnField = AccessTools.Field(fightMenuType, "optionsButton");
+            _fightMenuDialogRootField = AccessTools.Field(fightMenuType, "fightMenuDialog");
+            _fightHideDialogsMethod = AccessTools.Method(fightMenuType, "HideDialogs", Type.EmptyTypes);
             patcher.TryPatch(
                 fightMenuType,
                 "Start",
@@ -795,13 +799,21 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         if (__instance == null || Instance == null) return;
         try
         {
-            object rawBtn = _fightSettingsBtnField?.GetValue(__instance);
+            // 仅允许在暂停菜单弹窗内部（fightMenuDialog）且存在 LayoutGroup 的按钮列表中安全追加，
+            // 绝不触碰右上角常驻齿轮（SettingButton），也绝不在无排版容器的固定坐标上原地克隆覆盖原生按钮。
+            GameObject dialogRoot = _fightMenuDialogRootField?.GetValue(__instance) as GameObject;
+            object rawBtn = _fightOptionsBtnField?.GetValue(__instance);
             Button templateBtn = (rawBtn as Button)
-                ?? (rawBtn as Component)?.GetComponentInChildren<Button>(true)
-                ?? __instance.GetComponentsInChildren<Button>(true).FirstOrDefault(b => b != null && b.gameObject.activeInHierarchy);
-            if (templateBtn == null || templateBtn.transform.parent == null) return;
+                ?? (rawBtn as Component)?.GetComponentInChildren<Button>(true);
+            if (dialogRoot == null || templateBtn == null || templateBtn.transform.parent == null) return;
+            if (!templateBtn.transform.IsChildOf(dialogRoot.transform)) return;
 
             Transform container = templateBtn.transform.parent;
+            if (container.GetComponent<LayoutGroup>() == null)
+            {
+                return;
+            }
+
             var buttons = Instance.GetRegisteredEscapeMenuButtons();
             foreach (var desc in buttons)
             {
@@ -815,18 +827,33 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 cloned.name = goName;
                 cloned.SetActive(true);
 
-                // 剥离原版持久化监听并绑定新回调
+                // 移除克隆体上的 ButtonCustom，避免其 Start() 额外绑定导致重复或误触原生逻辑
+                var customBtnType = GameInspector.FindTypeSafe("ButtonCustom");
+                if (customBtnType != null)
+                {
+                    var customComp = cloned.GetComponent(customBtnType);
+                    if (customComp != null) UnityEngine.Object.Destroy(customComp);
+                }
+
+                // 剥离原版持久化监听并绑定新回调；关闭弹窗必须调用原生 HideDialogs()，绝不能停用 __instance.gameObject（否则会注销 ESC 监听！）
                 Button btn = cloned.GetComponent<Button>();
                 if (btn != null)
                 {
                     btn.onClick = new Button.ButtonClickedEvent();
                     var captured = desc;
+                    var dialogInst = __instance;
                     btn.onClick.AddListener(() =>
                     {
                         try
                         {
-                            // 先关闭 ESC 菜单再打开目标原生面板，避免叠加遮挡
-                            __instance.gameObject.SetActive(false);
+                            if (_fightHideDialogsMethod != null && dialogInst != null)
+                            {
+                                _fightHideDialogsMethod.Invoke(dialogInst, null);
+                            }
+                            else if (dialogRoot != null)
+                            {
+                                dialogRoot.SetActive(false);
+                            }
                         }
                         catch { }
                         captured.OnClick?.Invoke();
@@ -854,11 +881,17 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         if (__instance == null || Instance == null) return;
         try
         {
-            Button gameplayBtn = (_optionsGameplayBtnField?.GetValue(__instance) as Button)
-                ?? __instance.GetComponentsInChildren<Button>(true).FirstOrDefault();
+            // 仅在 _gameplayButton 明确存在且父节点具备 LayoutGroup 时才追加分栏入口，
+            // 严禁在无自动排版的固定布局上原地克隆覆盖原生「玩法设置 / 关闭 / 退出」按钮。
+            Button gameplayBtn = _optionsGameplayBtnField?.GetValue(__instance) as Button;
             if (gameplayBtn == null || gameplayBtn.transform.parent == null) return;
 
             Transform container = gameplayBtn.transform.parent;
+            if (container.GetComponent<LayoutGroup>() == null)
+            {
+                return;
+            }
+
             foreach (var sec in Instance._optionsSections)
             {
                 string goName = "BazaarOptSec_" + sec.Id;
