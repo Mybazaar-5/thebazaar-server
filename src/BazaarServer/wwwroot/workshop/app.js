@@ -24,6 +24,7 @@
     { key: 'PercentCooldownReduction', label: '冷却缩减（%）', isSec: false },
     { key: 'Custom_0', label: '特殊数值 1', isSec: false },
     { key: 'Custom_1', label: '特殊数值 2', isSec: false },
+    { key: 'Custom_2', label: '特殊数值 3', isSec: false },
   ];
 
   // 官方标准买卖价表（严格对齐官方 gamemodes.json StandardPrices）
@@ -130,6 +131,7 @@
     selectedPatchIdx: -1,
     selectedEventIdx: -1,
     previewTier: 'Bronze',
+    previewEnchant: '',
     lastValidation: null,
     token: localStorage.getItem('bazaar_workshop_token') || sessionStorage.getItem('bazaar_workshop_token') || '',
     searchTimer: null,
@@ -234,6 +236,13 @@
       opt.textContent = `${p.scope === 'aura' ? '[光环] ' : '[能力] '}${p.nameZh}`;
       pSel.appendChild(opt);
     });
+
+    // 填充右侧附魔预览下拉框
+    const peSel = $('previewEnchantSelect');
+    if (peSel) {
+      peSel.innerHTML = '<option value="">（无附魔）</option>'
+        + (res.data.enchantments || []).map((e) => `<option value="${escapeHtml(e.id)}">${escapeHtml(e.nameZh)}</option>`).join('');
+    }
   }
 
   async function loadModsList() {
@@ -708,12 +717,36 @@
     $('pvTags').innerHTML = (card.tags || []).map((t) => `<span>${escapeHtml(lookupZhName(state.catalog?.tags, t))}</span>`).join('');
 
     const lines = [
-      ...(card.activeTooltipsZh || []).map((l) => `[主动] ${renderTooltipPreview(l, attrs)}`),
-      ...(card.passiveTooltipsZh || []).map((l) => `[被动] ${renderTooltipPreview(l, attrs)}`),
+      ...(card.activeTooltipsZh || []).map((l) => `<div>[主动] ${escapeHtml(renderTooltipPreview(l, attrs))}</div>`),
+      ...(card.passiveTooltipsZh || []).map((l) => `<div>[被动] ${escapeHtml(renderTooltipPreview(l, attrs))}</div>`),
     ];
+
+    // 实时附魔横幅与附魔词条预览
+    const enchBanner = $('pvEnchantBanner');
+    const pvEnch = state.previewEnchant || '';
+    if (pvEnch) {
+      const enchZh = lookupZhName(state.catalog?.enchantments, pvEnch);
+      if (enchBanner) {
+        enchBanner.textContent = `✨ 附魔预览：${enchZh}`;
+        enchBanner.classList.remove('hidden');
+      }
+      const enchTips = card.enchantTooltipsZh?.[pvEnch] || [];
+      if (enchTips.length) {
+        enchTips.forEach((l) => {
+          lines.push(`<div class="bc-ench-tip">✨ [${escapeHtml(enchZh)}] ${escapeHtml(renderTooltipPreview(l, attrs))}</div>`);
+        });
+      } else {
+        lines.push(`<div class="bc-ench-tip muted">✨ [${escapeHtml(enchZh)}] 尚未配置此附魔（可在中间「13 种官方附魔配置」一键生成）</div>`);
+      }
+    } else if (enchBanner) {
+      enchBanner.classList.add('hidden');
+    }
+
     $('pvTooltips').innerHTML = lines.length
-      ? lines.map((l) => `<div>${escapeHtml(l)}</div>`).join('')
+      ? lines.join('')
       : escapeHtml(card.descZh || '（填写主动/被动文案即可实时预览数值渲染）');
+
+    renderUpgradePreviewBox(card);
 
     if (card.customArtFile && state.currentModId) {
       const img = $('pvArtImg');
@@ -746,6 +779,83 @@
       if (t === targetTier) break;
     }
     return out;
+  }
+
+  const TIER_ZH_MAP = { Bronze: '青铜', Silver: '白银', Gold: '黄金', Diamond: '钻石' };
+  const NEXT_TIER_MAP = { Bronze: 'Silver', Silver: 'Gold', Gold: 'Diamond', Diamond: null };
+
+  function formatAttrDisp(key, val) {
+    if (val === undefined || val === null) return '-';
+    if (DURATION_ATTRS.has(key) && Math.abs(val) >= 100) return `${Number((val / 1000).toFixed(2))}秒`;
+    return String(Math.round(val * 10) / 10);
+  }
+
+  function renderTooltipUpgradeHtml(tpl, curAttrs, nextAttrs) {
+    return escapeHtml(tpl).replace(/\{([^}]+)\}/g, (_, tok) => {
+      const parts = tok.split('.');
+      const key = parts.length >= 2 ? parts[1] : tok;
+      const cv = curAttrs[key];
+      const nv = nextAttrs[key];
+      if (cv === undefined) return '?';
+      const fmtRaw = (v) => (DURATION_ATTRS.has(key) && Math.abs(v) >= 100 ? String(Number((v / 1000).toFixed(2))) : String(Math.round(v * 10) / 10));
+      const cStr = fmtRaw(cv);
+      if (nv !== undefined && Math.abs(nv - cv) > 1e-6) {
+        return `${cStr} → <span class="up-arrow-val">${fmtRaw(nv)}</span>`;
+      }
+      return cStr;
+    });
+  }
+
+  function renderUpgradePreviewBox(card) {
+    const box = $('upgradePreviewBox');
+    if (!box) return;
+    if (!card || !card.tiers) {
+      box.classList.add('hidden');
+      return;
+    }
+    box.classList.remove('hidden');
+    const curTier = state.previewTier;
+    const nextTier = NEXT_TIER_MAP[curTier];
+    const titleEl = $('upgradePreviewTitle');
+    const priceEl = $('upgradePreviewPrice');
+    const diffGrid = $('upgradeDiffGrid');
+    const tipLines = $('upgradeTipLines');
+
+    if (!nextTier) {
+      titleEl.textContent = '💎 已达最高品质（钻石 Diamond）';
+      priceEl.textContent = '满阶状态';
+      diffGrid.innerHTML = '<span class="muted">点击上方「铜 / 银 / 金」按钮即可预览各阶升级对比效果。</span>';
+      tipLines.innerHTML = '';
+      return;
+    }
+
+    const curAttrs = mergeAttrsForTier(card, curTier);
+    const nextAttrs = mergeAttrsForTier(card, nextTier);
+    titleEl.textContent = `⬆️ 升级对比预览：${TIER_ZH_MAP[curTier]} → ${TIER_ZH_MAP[nextTier]}`;
+    priceEl.textContent = (curAttrs.BuyPrice != null && nextAttrs.BuyPrice != null)
+      ? `买价 ${curAttrs.BuyPrice}→${nextAttrs.BuyPrice}金`
+      : '';
+
+    const chips = [];
+    MATRIX_ATTRS.forEach((m) => {
+      if (m.isPrice) return;
+      const cv = curAttrs[m.key];
+      const nv = nextAttrs[m.key];
+      if (cv === undefined && nv === undefined) return;
+      if (cv !== undefined && nv !== undefined && Math.abs(nv - cv) > 1e-6) {
+        const shortLabel = m.label.replace(/（.*）/, '');
+        chips.push(`<span class="upgrade-diff-chip">${escapeHtml(shortLabel)} ${escapeHtml(formatAttrDisp(m.key, cv))} → <b>${escapeHtml(formatAttrDisp(m.key, nv))}</b></span>`);
+      }
+    });
+    diffGrid.innerHTML = chips.length
+      ? chips.join('')
+      : '<span class="muted">当前品质与下一阶数值相同，修改四阶表格即可实时看到升级成长。</span>';
+
+    const upTips = [
+      ...(card.activeTooltipsZh || []).map((l) => `<div>[主动] ${renderTooltipUpgradeHtml(l, curAttrs, nextAttrs)}</div>`),
+      ...(card.passiveTooltipsZh || []).map((l) => `<div>[被动] ${renderTooltipUpgradeHtml(l, curAttrs, nextAttrs)}</div>`),
+    ];
+    tipLines.innerHTML = upTips.join('');
   }
 
   function renderTooltipPreview(tpl, attrs) {
@@ -1519,6 +1629,12 @@
       });
     });
 
+    $('previewEnchantSelect')?.addEventListener('change', () => {
+      state.previewEnchant = $('previewEnchantSelect').value || '';
+      const card = state.workspace?.cards[state.selectedCardIdx];
+      if (card) updateLivePreview(card);
+    });
+
     $('btnChooseArt').addEventListener('click', () => $('artFileInput').click());
     $('artFileInput').addEventListener('change', (e) => {
       if (e.target.files?.[0]) handleArtFileUpload(e.target.files[0]);
@@ -1710,6 +1826,11 @@
     saveDraft,
     loadMeta,
     generateUniqueCardId,
+    MATRIX_ATTRS,
+    TIERS,
+    DURATION_ATTRS,
+    mergeAttrsForTier,
+    renderTooltipPreview,
   };
 
   document.addEventListener('DOMContentLoaded', init);

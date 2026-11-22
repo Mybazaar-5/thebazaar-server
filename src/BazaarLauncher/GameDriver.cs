@@ -1100,6 +1100,7 @@ internal sealed class GameDriver : MonoBehaviour
                 case "openheroselect": return OpenHeroSelectPopup();
                 case "openchestscene": return OpenChestScene();
                 case "returnhome": return ReturnToHeroSelectScene();
+                case "hovercard": return DoHoverCard(req);
                 default: return new { ok = false, error = "unknown op: " + op };
             }
         }
@@ -1121,6 +1122,68 @@ internal sealed class GameDriver : MonoBehaviour
     internal static object DoStartRunPublic(JObject req) => DoStartRun(req);
     internal static object DoInspectPublic() => GameInspector.InspectAll();
     internal static object ReadStatePublic() => ReadState();
+
+    /// <summary>诊断展示/隐藏指定卡牌的原生 Tooltip 浮窗（支持 upgradePreview=true 预览下一阶数值箭头）。</summary>
+    private static object DoHoverCard(JObject req)
+    {
+        bool hide = (bool?)req["hide"] ?? false;
+        string targetId = (string)req["instanceId"];
+        bool upgradePreview = (bool?)req["upgradePreview"] ?? false;
+
+        var dataType = GameInspector.FindTypeSafe("TheBazaar.Data", "Data");
+        var tipParent = dataType?.GetProperty("TooltipParentComponent", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+        if (tipParent == null) return new { ok = false, error = "TooltipParentComponent unavailable" };
+
+        if (hide || string.IsNullOrWhiteSpace(targetId))
+        {
+            var hideM = tipParent.GetType().GetMethod("HideCardTooltipController", BindingFlags.Public | BindingFlags.Instance)
+                     ?? tipParent.GetType().GetMethod("HideAllTooltips", BindingFlags.Public | BindingFlags.Instance);
+            try { hideM?.Invoke(tipParent, null); } catch { }
+            return new { ok = true, op = "hovercard", hidden = true };
+        }
+
+        var ccType = GameInspector.FindTypeSafe("CardController", "TheBazaar.CardController");
+        if (ccType == null) return new { ok = false, error = "CardController type missing" };
+        var allCtrls = UnityEngine.Object.FindObjectsByType(ccType, FindObjectsSortMode.None);
+        Component matched = null;
+        foreach (var o in allCtrls)
+        {
+            if (o is not Component c) continue;
+            var cd = ccType.GetProperty("CardData", BindingFlags.Public | BindingFlags.Instance)?.GetValue(c);
+            string cid = cd?.GetType().GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance)?.GetValue(cd)?.ToString();
+            if (string.Equals(cid, targetId, StringComparison.OrdinalIgnoreCase))
+            {
+                matched = c;
+                break;
+            }
+        }
+        if (matched == null) return new { ok = false, error = "CardController not found: " + targetId };
+
+        var tdField = ccType.GetField("_cardTooltipData", BindingFlags.NonPublic | BindingFlags.Instance);
+        var td = tdField?.GetValue(matched);
+        if (td == null) return new { ok = false, error = "_cardTooltipData null" };
+
+        var canFuseProp = td.GetType().GetProperty("CanFuse", BindingFlags.Public | BindingFlags.Instance);
+        canFuseProp?.SetValue(td, upgradePreview);
+        if (upgradePreview)
+            ccType.GetMethod("EnterUpgradePreview", BindingFlags.Public | BindingFlags.Instance)?.Invoke(matched, null);
+        else
+            ccType.GetMethod("ExitUpgradePreview", BindingFlags.Public | BindingFlags.Instance)?.Invoke(matched, null);
+
+        var offsetProp = ccType.GetProperty("TooltipOffset", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        Vector3 offset = offsetProp?.GetValue(matched) is Vector3 v ? v : Vector3.zero;
+        var showM = tipParent.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "ShowCardTooltipController" && m.GetParameters().Length >= 3);
+        if (showM == null) return new { ok = false, error = "ShowCardTooltipController not found" };
+        var parms = showM.GetParameters();
+        var args = new object[parms.Length];
+        args[0] = matched.transform;
+        args[1] = offset;
+        args[2] = td;
+        for (int i = 3; i < parms.Length; i++) args[i] = parms[i].HasDefaultValue ? parms[i].DefaultValue : null;
+        showM.Invoke(tipParent, args);
+        return new { ok = true, op = "hovercard", instanceId = targetId, upgradePreview };
+    }
 
     private static object GetCurrentAppState() => GameInspector.GetCurrentAppState();
 

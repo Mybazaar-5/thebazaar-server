@@ -193,6 +193,29 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         lock (_sync) return _bindings.Count;
     }
 
+    /// <summary>当 /api/mods/active-bindings 同步返回新实例绑定后，在主线程对已在场的 3D 物品卡立即补刷定制 PNG 贴图。</summary>
+    internal void ReapplyActiveVisualsOnMainThread()
+    {
+        try
+        {
+            var agents = UnityEngine.Object.FindObjectsByType<CardVisualOverrideAgent>(FindObjectsSortMode.None);
+            if (agents == null || agents.Length == 0) return;
+            for (int i = 0; i < agents.Length; i++)
+            {
+                var ag = agents[i];
+                if (ag == null || !ag.HasContext || ag.HostController == null) continue;
+                if (ag.LastQuery.Target == CardVisualTarget.ItemArt)
+                {
+                    TryApplyItemVisual(ag.HostController, ag, ag.Epoch);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(ReapplyActiveVisualsOnMainThread), ex);
+        }
+    }
+
     // ── 安装 4 大渲染通路 Harmony 钩子 ───────────────────────────────────────
 
     private static void InstallFourRenderPipelinePatches(SafeHarmonyPatcher patcher)
@@ -348,8 +371,14 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         {
             if (__instance == null || __0 == null || Instance == null) return;
             var agent = GetOrAddAgent(__instance);
+            agent.HostController = __instance;
             var query = BuildQueryFromCard(__0, CardVisualTarget.ItemArt);
             agent.SetContext(query);
+
+            if (!Instance.TryResolveVisual(in query, out _) && !string.IsNullOrEmpty(query.InstanceId))
+            {
+                ModContentSyncClient.Instance.NotifyUnboundInstanceSeen(query.InstanceId, query.TemplateId);
+            }
 
             if (__result != null && !__result.IsCompleted)
             {
@@ -989,6 +1018,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         public uint Epoch => _epoch;
         public bool HasContext { get; private set; }
         public CardVisualQuery LastQuery { get; private set; }
+        public Component HostController { get; set; }
 
         public void SetContext(in CardVisualQuery query)
         {

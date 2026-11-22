@@ -116,6 +116,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         public PropertyInfo TemplateId;
         public PropertyInfo Attributes;
         public PropertyInfo Enchantment;
+        public PropertyInfo Tier;
         public PropertyInfo Id;
     }
 
@@ -135,7 +136,12 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
     private static PropertyInfo _prefsLangProp;
     private static PropertyInfo _tooltipCardInstanceProp;
     private static PropertyInfo _tooltipCardTemplateProp;
+    private static PropertyInfo _tooltipCanFuseProp;
     private static readonly ConcurrentDictionary<Type, CardMemberCache> _cardMembersByType = new();
+    private static readonly HashSet<string> DurationAttrNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CooldownMax", "HasteAmount", "SlowAmount", "FreezeAmount", "ChargeAmount"
+    };
     private static Type _tLocalizableTextType;
     private static ConstructorInfo _tLocCtor2;
     private static PropertyInfo _tLocTextProp;
@@ -859,6 +865,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         {
             _tooltipCardInstanceProp = AccessTools.Property(tooltipType, "CardInstance");
             _tooltipCardTemplateProp = AccessTools.Property(tooltipType, "CardTemplate");
+            _tooltipCanFuseProp = AccessTools.Property(tooltipType, "CanFuse");
 
             patcher.TryPatch(
                 tooltipType,
@@ -889,6 +896,30 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                     postfix: AccessTools.Method(typeof(LocalizationOverlayModule), nameof(CardTooltipGetTooltipsOfTypePostfix)),
                     optional: true,
                     label: "L10n.CardTooltipData.GetCurrentTooltipsOfType");
+            }
+
+            // V14：自定义 Mod 卡真实四阶升级预览拦截（防止悬停升级预览时串成原版底板卡的四阶数值）
+            var eCardAttrType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Core.Types.ECardAttributeType");
+            var eTierType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Core.Types.ETier");
+            if (eCardAttrType != null)
+            {
+                patcher.TryPatch(
+                    tooltipType,
+                    "NextTierHasAttribute",
+                    new[] { eCardAttrType },
+                    postfix: AccessTools.Method(typeof(LocalizationOverlayModule), nameof(CardTooltipNextTierHasAttrPostfix)),
+                    optional: true,
+                    label: "L10n.CardTooltipData.NextTierHasAttribute");
+            }
+            if (eCardAttrType != null && eTierType != null)
+            {
+                patcher.TryPatch(
+                    tooltipType,
+                    "GetBaseValueFromCardTemplate",
+                    new[] { eCardAttrType, eTierType, typeof(float), eTierType },
+                    postfix: AccessTools.Method(typeof(LocalizationOverlayModule), nameof(CardTooltipGetBaseValuePostfix)),
+                    optional: true,
+                    label: "L10n.CardTooltipData.GetBaseValueFromCardTemplate");
             }
         }
     }
@@ -1016,7 +1047,18 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 lines = ov.PassiveTooltips;
             }
 
-            if (lines == null || lines.Length == 0) return;
+            string[] enchLinesToAppend = null;
+            if (ov.EnchantmentTooltips != null && cardInst != null && string.Equals(tipKind, "Passive", StringComparison.OrdinalIgnoreCase))
+            {
+                var cardMembers = GetCardMemberCache(cardInst.GetType());
+                string ench = SafeGetPropertyValue(cardMembers.Enchantment, cardInst)?.ToString();
+                if (!string.IsNullOrEmpty(ench) && ov.EnchantmentTooltips.TryGetValue(ench, out var foundEnchLines) && foundEnchLines != null && foundEnchLines.Length > 0)
+                    enchLinesToAppend = foundEnchLines;
+            }
+
+            bool hasBaseLines = lines != null && lines.Length > 0;
+            bool hasEnchLines = enchLinesToAppend != null && enchLinesToAppend.Length > 0;
+            if (!hasBaseLines && !hasEnchLines) return;
 
             EnsureTLocalizableTextMeta();
             if (_tLocalizableTextType == null) return;
@@ -1024,25 +1066,29 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             var listType = typeof(List<>).MakeGenericType(_tLocalizableTextType);
             if (Activator.CreateInstance(listType) is not IList customList) return;
 
-            for (int i = 0; i < lines.Length; i++)
+            bool isUpgradePreview = SafeGetPropertyValue(_tooltipCanFuseProp, __instance) is bool cf && cf;
+
+            if (hasBaseLines)
             {
-                string rendered = RenderDynamicAttributePlaceholders(lines[i], cardInst);
-                object locObj = CreateTLocalizableText(rendered);
-                if (locObj != null) customList.Add(locObj);
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string rendered = RenderDynamicAttributePlaceholders(lines[i], cardInst, ov, isUpgradePreview);
+                    object locObj = CreateTLocalizableText(rendered);
+                    if (locObj != null) customList.Add(locObj);
+                }
+            }
+            else if (__result != null)
+            {
+                // 若未覆写基础被动词条但命了附魔词条，保留原列表并追加自定义附魔词条
+                foreach (var existing in __result) customList.Add(existing);
             }
 
-            // 附魔词条自动追加（按运行时真实类型查反射缓存，彻底杜绝 ItemCard.Enchantment 误用于 SkillCard/Card 的沉睡炸弹）
-            if (ov.EnchantmentTooltips != null && cardInst != null && string.Equals(tipKind, "Passive", StringComparison.OrdinalIgnoreCase))
+            if (hasEnchLines)
             {
-                var cardMembers = GetCardMemberCache(cardInst.GetType());
-                string ench = SafeGetPropertyValue(cardMembers.Enchantment, cardInst)?.ToString();
-                if (!string.IsNullOrEmpty(ench) && ov.EnchantmentTooltips.TryGetValue(ench, out var enchLines) && enchLines != null)
+                foreach (var el in enchLinesToAppend)
                 {
-                    foreach (var el in enchLines)
-                    {
-                        object locObj = CreateTLocalizableText(RenderDynamicAttributePlaceholders(el, cardInst));
-                        if (locObj != null) customList.Add(locObj);
-                    }
+                    object locObj = CreateTLocalizableText(RenderDynamicAttributePlaceholders(el, cardInst, ov, isUpgradePreview));
+                    if (locObj != null) customList.Add(locObj);
                 }
             }
 
@@ -1054,7 +1100,71 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         catch { }
     }
 
+    private static void CardTooltipNextTierHasAttrPostfix(object __instance, object __0, ref bool __result)
+    {
+        try
+        {
+            var inst = Instance;
+            if (inst == null || __instance == null || __0 == null) return;
+            if (!TryExtractCardOverride(__instance, inst.CurrentLocale, out var ov, out var cardInst)) return;
+            if (ov?.TierAttributes == null || ov.TierAttributes.Count == 0 || cardInst == null) return;
+
+            var members = GetCardMemberCache(cardInst.GetType());
+            string curTier = SafeGetPropertyValue(members.Tier, cardInst)?.ToString();
+            string nextTier = GetNextTierName(curTier);
+            if (nextTier == null)
+            {
+                __result = false;
+                return;
+            }
+            string attrName = __0.ToString();
+            __result = ov.TierAttributes.TryGetValue(nextTier, out var nextMap)
+                       && nextMap != null
+                       && nextMap.ContainsKey(attrName);
+        }
+        catch { }
+    }
+
+    private static void CardTooltipGetBaseValuePostfix(object __instance, object __0, object __1, float __2, object __3, ref float? __result)
+    {
+        try
+        {
+            var inst = Instance;
+            if (inst == null || __instance == null || __0 == null || __1 == null || __3 == null) return;
+            if (!TryExtractCardOverride(__instance, inst.CurrentLocale, out var ov, out _)) return;
+            if (ov?.TierAttributes == null || ov.TierAttributes.Count == 0) return;
+
+            string attrName = __0.ToString();
+            string nextTier = __1.ToString();
+            string curTier = __3.ToString();
+            if (!ov.TierAttributes.TryGetValue(nextTier, out var nextMap) || nextMap == null || !nextMap.TryGetValue(attrName, out double nextRaw))
+                return;
+
+            bool isDur = DurationAttrNames.Contains(attrName);
+            double nextDisp = isDur ? nextRaw / 1000.0 : nextRaw;
+            if (ov.TierAttributes.TryGetValue(curTier, out var curMap) && curMap != null && curMap.TryGetValue(attrName, out double curRaw))
+            {
+                double curDisp = isDur ? curRaw / 1000.0 : curRaw;
+                double delta = __2 - curDisp;
+                __result = (float)Math.Max(0, nextDisp + delta);
+            }
+            else
+            {
+                __result = (float)nextDisp;
+            }
+        }
+        catch { }
+    }
+
     // ── 工具方法 ─────────────────────────────────────────────────────────────
+
+    private static string GetNextTierName(string currentTier) => currentTier switch
+    {
+        "Bronze" => "Silver",
+        "Silver" => "Gold",
+        "Gold" => "Diamond",
+        _ => null,
+    };
 
     private static CardMemberCache GetCardMemberCache(Type runtimeType)
     {
@@ -1064,6 +1174,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             TemplateId = t.GetProperty("TemplateId", BindingFlags.Public | BindingFlags.Instance),
             Attributes = t.GetProperty("Attributes", BindingFlags.Public | BindingFlags.Instance),
             Enchantment = t.GetProperty("Enchantment", BindingFlags.Public | BindingFlags.Instance),
+            Tier = t.GetProperty("Tier", BindingFlags.Public | BindingFlags.Instance),
             Id = t.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance),
         });
     }
@@ -1109,7 +1220,19 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         return Instance != null && Instance.TryResolveCardText(locale, iid, null, tplId, out ov) && ov != null;
     }
 
-    private static string RenderDynamicAttributePlaceholders(string template, object cardInst)
+    private static string FormatAttrNumber(string attrName, double rawVal)
+    {
+        bool isDur = DurationAttrNames.Contains(attrName);
+        double disp = isDur && Math.Abs(rawVal) >= 100 ? rawVal / 1000.0 : rawVal;
+        double rounded = Math.Round(disp, isDur ? 2 : 1);
+        return rounded.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static string RenderDynamicAttributePlaceholders(
+        string template,
+        object cardInst,
+        CardTextOverride ov = null,
+        bool isUpgradePreview = false)
     {
         if (string.IsNullOrEmpty(template) || cardInst == null || template.IndexOf("{attr.", StringComparison.Ordinal) < 0)
         {
@@ -1122,6 +1245,16 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             return template;
         }
 
+        string curTier = isUpgradePreview ? SafeGetPropertyValue(members.Tier, cardInst)?.ToString() : null;
+        string nextTier = isUpgradePreview ? GetNextTierName(curTier) : null;
+        Dictionary<string, double> curBaseMap = null;
+        Dictionary<string, double> nextBaseMap = null;
+        if (nextTier != null && ov?.TierAttributes != null)
+        {
+            ov.TierAttributes.TryGetValue(curTier ?? string.Empty, out curBaseMap);
+            ov.TierAttributes.TryGetValue(nextTier, out nextBaseMap);
+        }
+
         return AttrPlaceholderRegex.Replace(template, m =>
         {
             string attrName = m.Groups[1].Value;
@@ -1129,7 +1262,20 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             {
                 if (string.Equals(kv.Key?.ToString(), attrName, StringComparison.OrdinalIgnoreCase))
                 {
-                    return kv.Value?.ToString() ?? "0";
+                    if (!double.TryParse(kv.Value?.ToString(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double curRaw))
+                        return kv.Value?.ToString() ?? "0";
+
+                    string curStr = FormatAttrNumber(attrName, curRaw);
+                    if (isUpgradePreview && nextBaseMap != null && nextBaseMap.TryGetValue(attrName, out double nextBaseRaw))
+                    {
+                        double nextRaw = nextBaseRaw;
+                        if (curBaseMap != null && curBaseMap.TryGetValue(attrName, out double curBaseRaw))
+                            nextRaw = Math.Max(0, nextBaseRaw + (curRaw - curBaseRaw));
+                        string nextStr = FormatAttrNumber(attrName, nextRaw);
+                        if (!string.Equals(curStr, nextStr, StringComparison.Ordinal))
+                            return $"{curStr} → <color=#4ADE80>{nextStr}</color>";
+                    }
+                    return curStr;
                 }
             }
             return m.Value;

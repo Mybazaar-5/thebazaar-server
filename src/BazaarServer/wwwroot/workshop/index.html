@@ -340,7 +340,9 @@
                     <button type="button" class="chip" data-ins="{attr.HealAmount}">治疗</button>
                     <button type="button" class="chip" data-ins="{attr.HasteAmount}">加速秒</button>
                     <button type="button" class="chip" data-ins="{attr.ChargeAmount}">充能秒</button>
-                    <button type="button" class="chip" data-ins="{attr.Custom_0}">自定义0</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_0}">特殊数值1</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_1}">特殊数值2</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_2}">特殊数值3</button>
                   </div>
                 </div>
                 <div class="form-grid">
@@ -411,6 +413,19 @@
                   </div>
                 </div>
                 <div id="ceAttachedMechanicsList" class="mech-attach-list"></div>
+              </div>
+
+              <!-- 13 种官方附魔可视化配置面板 -->
+              <div class="sub-block" id="ceEnchantmentsSection">
+                <div class="sub-block-title">
+                  <span>✨ 13 种官方附魔配置（点选任意附魔定制效果，支持一键按本卡数值自动生成全套）</span>
+                  <div class="btn-row">
+                    <button type="button" class="btn btn-gold btn-xs" id="btnAutoGenAllEnchants">🪄 一键智能生成全部 13 种附魔</button>
+                    <button type="button" class="btn btn-subtle btn-xs" id="btnClearAllEnchants">清空附魔</button>
+                  </div>
+                </div>
+                <div class="pill-picker" id="ceEnchantPills"></div>
+                <div id="ceEnchantEditorPane" class="ench-editor-pane hidden"></div>
               </div>
             </div>
 
@@ -526,12 +541,20 @@
               </div>
             </div>
 
+            <div class="ench-preview-row">
+              <span class="muted">预览附魔：</span>
+              <select id="previewEnchantSelect">
+                <option value="">（无附魔）</option>
+              </select>
+            </div>
+
             <div class="card-preview-stage">
               <div class="bazaar-card tier-Bronze" id="liveCardFrame">
                 <div class="bc-top">
-                  <span class="bc-size" id="pvSize">Medium</span>
-                  <span class="bc-cd" id="pvCooldown">4.0s</span>
+                  <span class="bc-size" id="pvSize">中型 · 物品</span>
+                  <span class="bc-cd" id="pvCooldown">4.0 秒</span>
                 </div>
+                <div class="bc-ench-banner hidden" id="pvEnchantBanner"></div>
                 <div class="bc-art" id="pvArtBox">
                   <img id="pvArtImg" alt="卡图预览" class="hidden" />
                   <div class="bc-art-placeholder" id="pvArtPlaceholder">继承原版白名单 3D 卡面<br />或下方上传 PNG 替换</div>
@@ -540,10 +563,20 @@
                 <div class="bc-tags" id="pvTags"></div>
                 <div class="bc-tips" id="pvTooltips">点击左侧原版卡开始克隆或新建</div>
                 <div class="bc-footer">
-                  <span id="pvBuyPrice">买 2g</span>
-                  <span id="pvHero">Common</span>
+                  <span id="pvBuyPrice">买 4 金 / 卖 2 金</span>
+                  <span id="pvHero">全英雄通用</span>
                 </div>
               </div>
+            </div>
+
+            <!-- ⬆️ 升级对比预览（所见即所得，与局内悬停预览一致） -->
+            <div class="upgrade-preview-box hidden" id="upgradePreviewBox">
+              <div class="upgrade-preview-head">
+                <span id="upgradePreviewTitle">⬆️ 升级预览：青铜 → 白银</span>
+                <span class="muted" id="upgradePreviewPrice"></span>
+              </div>
+              <div class="upgrade-diff-grid" id="upgradeDiffGrid"></div>
+              <div class="upgrade-tip-lines" id="upgradeTipLines"></div>
             </div>
 
             <!-- PNG 拖拽上传 & 自动裁切缩放转标准 PNG -->

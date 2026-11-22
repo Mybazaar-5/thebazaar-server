@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "modId": "clockwork-forge",
+  "updatedAtUtc": "2026-11-22T04:20:23.1519006+00:00",
+  "assets": [
+    {
+      "filename": "z_sword_custom_d83alo.png",
+      "logicalPath": "assets/z_sword_custom_d83alo.png",
+      "width": 512,
+      "height": 512,
+      "bytes": 652149,
+      "sha256": "3f9916db29cf17e1cc7a045ea1ff2a45d23d61895f909e0cf699f2eebab05673",
+      "customArtHash": "sha256:3f9916db29cf17e1cc7a045ea1ff2a45d23d61895f909e0cf699f2eebab05673"
+    }
+  ]
+}

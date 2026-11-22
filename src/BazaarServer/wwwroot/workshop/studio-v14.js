@@ -14,6 +14,7 @@
   const v14 = {
     serverMechanics: [],
     selectedMechIdx: -1,
+    selectedEnchantKey: 'Fiery',
     builderState: {
       mode: 'ability', // 'ability' | 'aura'
       targetHost: 'card', // 'card' | 'patch'
@@ -1576,6 +1577,27 @@
 
     $('btnStressTestMechanic')?.addEventListener('click', stressTestCurrentMechanic);
 
+    // 13 种官方附魔可视化按钮绑定
+    $('btnAutoGenAllEnchants')?.addEventListener('click', () => {
+      const card = B().state.workspace?.cards?.[B().state.selectedCardIdx];
+      if (!card) return;
+      autoGenerateAll13Enchantments(card);
+      B().markDirty(true);
+      renderEnchantmentsEditor();
+      B().updateLivePreview(card);
+      B().toast('已按本卡属性智能生成全部 13 种官方附魔与中文说明！可在右侧「预览附魔」逐一查看。');
+    });
+    $('btnClearAllEnchants')?.addEventListener('click', () => {
+      const card = B().state.workspace?.cards?.[B().state.selectedCardIdx];
+      if (!card) return;
+      card.enchantments = {};
+      card.enchantTooltipsZh = {};
+      B().markDirty(true);
+      renderEnchantmentsEditor();
+      B().updateLivePreview(card);
+      B().toast('已清空本卡附魔配置。');
+    });
+
     // Tab 6 纯中文对话式 AI 提示词生成器
     $('aiIdeaInput')?.addEventListener('input', () => updateAiPromptPreview('interview'));
     $('btnCopyAiInterview')?.addEventListener('click', async () => {
@@ -1696,7 +1718,362 @@
     }
   }
 
-  // ── 6. Tab 6：纯中文自然语言对话访谈 AI 造卡提示词生成器 ──────────────────────
+  // ── 6. 13 种官方附魔可视化编辑器 & 一键智能生成 ──────────────────────────────
+  function buildSmartEnchantmentPreset(enchKey, card) {
+    const bronzeAttrs = card?.tiers?.Bronze?.attributes || card?.attributes || {};
+    const hasDmg = bronzeAttrs.DamageAmount !== undefined && Number(bronzeAttrs.DamageAmount) > 0;
+    const dmgValNode = hasDmg
+      ? { $type: 'TReferenceValueCardAttribute', attributeType: 'DamageAmount', target: { $type: 'TTargetCardSelf' } }
+      : { $type: 'TFixedValue', value: 20 };
+
+    switch (enchKey) {
+      case 'Fiery':
+        return {
+          tooltipZh: '触发时额外对敌方施加 6 层灼烧',
+          data: {
+            attributes: { BurnApplyAmount: 6 },
+            hiddenTags: ['Burn'],
+            hasAbilities: true,
+            abilities: {
+              e0: {
+                id: 'e0', activeIn: 'HandOnly',
+                trigger: { $type: 'TTriggerOnCardFired' },
+                action: { $type: 'TActionPlayerBurnApply', target: { $type: 'TTargetPlayerRelative', targetMode: 'Opponent' }, value: { $type: 'TFixedValue', value: 6 } },
+              },
+            },
+          },
+        };
+      case 'Toxic':
+        return {
+          tooltipZh: '触发时额外对敌方施加 4 层剧毒',
+          data: {
+            attributes: { PoisonApplyAmount: 4 },
+            hiddenTags: ['Poison'],
+            hasAbilities: true,
+            abilities: {
+              e0: {
+                id: 'e0', activeIn: 'HandOnly',
+                trigger: { $type: 'TTriggerOnCardFired' },
+                action: { $type: 'TActionPlayerPoisonApply', target: { $type: 'TTargetPlayerRelative', targetMode: 'Opponent' }, value: { $type: 'TFixedValue', value: 4 } },
+              },
+            },
+          },
+        };
+      case 'Shielded':
+        return {
+          tooltipZh: hasDmg ? '触发时额外获得等同于本卡伤害（{attr.DamageAmount}）的护盾' : '触发时额外获得 20 点护盾',
+          data: {
+            hiddenTags: ['Shield'],
+            hasAbilities: true,
+            abilities: {
+              e0: {
+                id: 'e0', activeIn: 'HandOnly',
+                trigger: { $type: 'TTriggerOnCardFired' },
+                action: { $type: 'TActionPlayerShieldApply', target: { $type: 'TTargetPlayerRelative', targetMode: 'Self' }, value: dmgValNode },
+              },
+            },
+          },
+        };
+      case 'Restorative':
+        return {
+          tooltipZh: hasDmg ? '触发时额外回复等同于本卡伤害（{attr.DamageAmount}）的生命并净化灼烧/剧毒' : '触发时额外回复 20 点生命并净化灼烧/剧毒',
+          data: {
+            hiddenTags: ['Heal'],
+            hasAbilities: true,
+            abilities: {
+              e0: {
+                id: 'e0', activeIn: 'HandOnly',
+                trigger: { $type: 'TTriggerOnCardFired' },
+                action: { $type: 'TActionPlayerHeal', target: { $type: 'TTargetPlayerRelative', targetMode: 'Self' }, value: dmgValNode },
+              },
+            },
+          },
+        };
+      case 'Mossy':
+        return {
+          tooltipZh: '触发时额外获得 5 层再生',
+          data: {
+            hiddenTags: ['Regen'],
+            hasAbilities: true,
+            abilities: {
+              e0: {
+                id: 'e0', activeIn: 'HandOnly',
+                trigger: { $type: 'TTriggerOnCardFired' },
+                action: { $type: 'TActionPlayerRegenApply', target: { $type: 'TTargetPlayerRelative', targetMode: 'Self' }, value: { $type: 'TFixedValue', value: 5 } },
+              },
+            },
+          },
+        };
+      case 'Heavy':
+        return {
+          tooltipZh: '触发时使随机一件敌方物品减速 2 秒',
+          data: {
+            hiddenTags: ['Slow'],
+            hasAbilities: true,
+            abilities: {
+              e0: {
+                id: 'e0', activeIn: 'HandOnly',
+                trigger: { $type: 'TTriggerOnCardFired' },
+                action: { $type: 'TActionCardSlow', target: { $type: 'TTargetCardRandom', targetSection: 'OpponentHand' }, value: { $type: 'TFixedValue', value: 2000 } },
+              },
+            },
+          },
+        };
+      case 'Icy':
+        return {
+          tooltipZh: '触发时冻结随机一件敌方物品 1.5 秒',
+          data: {
+            hiddenTags: ['Freeze'],
+            hasAbilities: true,
+            abilities: {
+              e0: {
+                id: 'e0', activeIn: 'HandOnly',
+                trigger: { $type: 'TTriggerOnCardFired' },
+                action: { $type: 'TActionCardFreeze', target: { $type: 'TTargetCardRandom', targetSection: 'OpponentHand' }, value: { $type: 'TFixedValue', value: 1500 } },
+              },
+            },
+          },
+        };
+      case 'Turbo':
+        return {
+          tooltipZh: '触发时额外使左右相邻物品各加速 1.5 秒',
+          data: {
+            hiddenTags: ['Haste'],
+            hasAbilities: true,
+            abilities: {
+              e0: {
+                id: 'e0', activeIn: 'HandOnly',
+                trigger: { $type: 'TTriggerOnCardFired' },
+                action: { $type: 'TActionCardHaste', target: { $type: 'TTargetCardPositional', origin: 'Self', targetMode: 'Neighbor' }, value: { $type: 'TFixedValue', value: 1500 } },
+              },
+            },
+          },
+        };
+      case 'Deadly':
+        return {
+          tooltipZh: '本卡永久获得 +50% 暴击率',
+          data: {
+            hiddenTags: ['Crit'],
+            attributes: { CritChance: 50 },
+          },
+        };
+      case 'Obsidian':
+        return hasDmg
+          ? {
+              tooltipZh: '本卡基础伤害翻倍（×2）',
+              data: {
+                hiddenTags: ['Damage'],
+                hasAuras: true,
+                auras: {
+                  ea0: {
+                    id: 'ea0', activeIn: 'HandOnly',
+                    action: {
+                      $type: 'TAuraActionCardModifyAttribute',
+                      target: { $type: 'TTargetCardSelf' },
+                      attributeType: 'DamageAmount',
+                      operation: 'Multiply',
+                      value: { $type: 'TFixedValue', value: 2 },
+                    },
+                  },
+                },
+              },
+            }
+          : {
+              tooltipZh: '触发时额外对敌方造成 25 点伤害',
+              data: {
+                hiddenTags: ['Damage'],
+                hasAbilities: true,
+                abilities: {
+                  e0: {
+                    id: 'e0', activeIn: 'HandOnly',
+                    trigger: { $type: 'TTriggerOnCardFired' },
+                    action: { $type: 'TActionPlayerDamage', target: { $type: 'TTargetPlayerRelative', targetMode: 'Opponent' }, value: { $type: 'TFixedValue', value: 25 } },
+                  },
+                },
+              },
+            };
+      case 'Shiny':
+        return {
+          tooltipZh: '获得 +1 多重施放（每次冷却连发两轮）',
+          data: {
+            attributes: { Multicast: 1 },
+          },
+        };
+      case 'Radiant':
+        return {
+          tooltipZh: '免疫冻结、减速与摧毁',
+          data: {
+            tags: ['Radiant'],
+            attributes: { PercentFreezeReduction: 100, PercentSlowReduction: 100 },
+          },
+        };
+      case 'Golden':
+      default:
+        return {
+          tooltipZh: '出售价值翻倍，且每次触发获得 2 金币',
+          data: {
+            hiddenTags: ['EconomyReference'],
+            hasAbilities: true,
+            hasAuras: true,
+            abilities: {
+              e0: {
+                id: 'e0', activeIn: 'HandOnly',
+                trigger: { $type: 'TTriggerOnCardFired' },
+                action: {
+                  $type: 'TActionPlayerModifyAttribute',
+                  target: { $type: 'TTargetPlayerAbsolute', targetMode: 'Player' },
+                  attributeType: 'Gold',
+                  operation: 'Add',
+                  value: { $type: 'TFixedValue', value: 2 },
+                },
+              },
+            },
+            auras: {
+              ea0: {
+                id: 'ea0', activeIn: 'HandAndStash',
+                action: {
+                  $type: 'TAuraActionCardModifyAttribute',
+                  target: { $type: 'TTargetCardSelf' },
+                  attributeType: 'SellPrice',
+                  operation: 'Multiply',
+                  value: { $type: 'TFixedValue', value: 2 },
+                },
+              },
+            },
+          },
+        };
+    }
+  }
+
+  function autoGenerateAll13Enchantments(card) {
+    const enchList = catalog().enchantments || [];
+    card.enchantments = card.enchantments || {};
+    card.enchantTooltipsZh = card.enchantTooltipsZh || {};
+    enchList.forEach((e) => {
+      const preset = buildSmartEnchantmentPreset(e.id, card);
+      card.enchantments[e.id] = preset.data;
+      card.enchantTooltipsZh[e.id] = [preset.tooltipZh];
+    });
+  }
+
+  function renderEnchantmentsEditor() {
+    const pillsBox = $('ceEnchantPills');
+    const pane = $('ceEnchantEditorPane');
+    if (!pillsBox || !pane) return;
+    const st = B().state;
+    const card = st.workspace && st.selectedCardIdx >= 0 ? st.workspace.cards[st.selectedCardIdx] : null;
+    if (!card) {
+      pillsBox.innerHTML = '';
+      pane.classList.add('hidden');
+      return;
+    }
+
+    const enchList = catalog().enchantments || [];
+    if (!enchList.length) return;
+    if (!enchList.some((e) => e.id === v14.selectedEnchantKey)) v14.selectedEnchantKey = enchList[0].id;
+
+    const configuredCount = enchList.filter((e) => Boolean(card.enchantments?.[e.id] || card.enchantTooltipsZh?.[e.id]?.length)).length;
+
+    pillsBox.innerHTML = enchList.map((e) => {
+      const hasData = Boolean(card.enchantments?.[e.id] || card.enchantTooltipsZh?.[e.id]?.length);
+      const isAct = e.id === v14.selectedEnchantKey;
+      return `<button type="button" class="pill-btn ${hasData ? 'has-data' : ''} ${isAct ? 'active' : ''}" data-ench-key="${escapeHtml(e.id)}">${hasData ? '✓ ' : ''}${escapeHtml(e.nameZh)}</button>`;
+    }).join('');
+
+    pillsBox.querySelectorAll('[data-ench-key]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        v14.selectedEnchantKey = btn.dataset.enchKey;
+        // 联动右侧附魔预览下拉框，所见即所得！
+        st.previewEnchant = v14.selectedEnchantKey;
+        if ($('previewEnchantSelect')) $('previewEnchantSelect').value = v14.selectedEnchantKey;
+        renderEnchantmentsEditor();
+        B().updateLivePreview(card);
+      });
+    });
+
+    const curKey = v14.selectedEnchantKey;
+    const curMeta = enchList.find((e) => e.id === curKey) || { id: curKey, nameZh: curKey };
+    const curData = card.enchantments?.[curKey];
+    const curTips = card.enchantTooltipsZh?.[curKey] || [];
+    const summaryParts = [];
+    if (curData?.attributes) {
+      Object.entries(curData.attributes).forEach(([k, v]) => summaryParts.push(`属性 ${k} +${v}`));
+    }
+    if (curData?.abilities) {
+      Object.values(curData.abilities).forEach((ab) => summaryParts.push(summarizeAffixZh('ability', ab)));
+    }
+    if (curData?.auras) {
+      Object.values(curData.auras).forEach((au) => summaryParts.push(summarizeAffixZh('aura', au)));
+    }
+
+    pane.classList.remove('hidden');
+    pane.innerHTML = `
+      <div class="panel-header compact">
+        <div>
+          <span class="badge ${curData ? 'badge-green' : 'badge-yellow'}">${curData ? '已配置' : '未配置'}</span>
+          <strong style="margin-left:6px;">${escapeHtml(curMeta.nameZh)}</strong>
+          <small class="muted" style="margin-left:8px;">本卡已配置 ${configuredCount} / ${enchList.length} 种附魔</small>
+        </div>
+        <div class="btn-row">
+          <button type="button" class="btn btn-outline btn-xs" id="btnEnchAutoSingle">✨ 生成此附魔标准效果</button>
+          ${curData ? '<button type="button" class="btn btn-danger btn-xs" id="btnEnchRemoveSingle">移除此附魔</button>' : ''}
+        </div>
+      </div>
+      <div class="form-grid">
+        <label class="field span-2">
+          <span>附魔中文说明（局内获得该附魔后自动显示在卡面，支持 <code>{attr.DamageAmount}</code> 等变量）</span>
+          <input type="text" id="ceEnchTipInput" value="${escapeHtml(curTips.join('；'))}" placeholder="例如：触发时额外施加 6 层灼烧" />
+        </label>
+      </div>
+      <div class="muted" style="margin-top:6px;">实战生效规则：${escapeHtml(summaryParts.length ? summaryParts.join('；') : '尚未生成战斗效果，点击右上角「✨ 生成此附魔标准效果」即可立即生效！')}</div>
+      <details class="advanced-json" style="margin-top:6px;">
+        <summary>开发者代码视图（本附魔 JSON 规则）</summary>
+        <textarea id="ceEnchRawJson" rows="5" spellcheck="false">${escapeHtml(JSON.stringify(curData || {}, null, 2))}</textarea>
+        <button type="button" class="btn btn-outline btn-xs" id="btnEnchApplyJson" style="margin-top:4px;">应用附魔代码</button>
+      </details>
+    `;
+
+    $('ceEnchTipInput')?.addEventListener('input', (e) => {
+      card.enchantTooltipsZh = card.enchantTooltipsZh || {};
+      const lines = e.target.value.split(/[；\n]/).map((s) => s.trim()).filter(Boolean);
+      if (lines.length) card.enchantTooltipsZh[curKey] = lines;
+      else delete card.enchantTooltipsZh[curKey];
+      B().markDirty(true);
+      B().updateLivePreview(card);
+    });
+    $('btnEnchAutoSingle')?.addEventListener('click', () => {
+      card.enchantments = card.enchantments || {};
+      card.enchantTooltipsZh = card.enchantTooltipsZh || {};
+      const preset = buildSmartEnchantmentPreset(curKey, card);
+      card.enchantments[curKey] = preset.data;
+      card.enchantTooltipsZh[curKey] = [preset.tooltipZh];
+      B().markDirty(true);
+      renderEnchantmentsEditor();
+      B().updateLivePreview(card);
+      B().toast(`已生成「${curMeta.nameZh}」附魔规则与中文说明！`);
+    });
+    $('btnEnchRemoveSingle')?.addEventListener('click', () => {
+      if (card.enchantments) delete card.enchantments[curKey];
+      if (card.enchantTooltipsZh) delete card.enchantTooltipsZh[curKey];
+      B().markDirty(true);
+      renderEnchantmentsEditor();
+      B().updateLivePreview(card);
+    });
+    $('btnEnchApplyJson')?.addEventListener('click', () => {
+      try {
+        const parsed = JSON.parse($('ceEnchRawJson').value);
+        card.enchantments = card.enchantments || {};
+        card.enchantments[curKey] = parsed;
+        B().markDirty(true);
+        renderEnchantmentsEditor();
+        B().toast(`已应用「${curMeta.nameZh}」附魔规则 JSON！`);
+      } catch (ex) {
+        B().toast(`附魔 JSON 语法错误：${ex.message}`, 'err');
+      }
+    });
+  }
+
+  // ── 7. Tab 6：纯中文自然语言对话访谈 AI 造卡提示词生成器 ──────────────────────
   function buildAiPromptText(mode = 'interview') {
     const ws = B()?.state?.workspace;
     const modId = ws?.manifest?.id || 'my-custom-pack';
@@ -1747,6 +2124,7 @@ ${idea ? `\n【我目前的初步想法】\n${idea}\n\n请基于这个初步想�
       renderPatchAbilitiesSummary();
       renderCardAttachedMechanics();
       renderAllPillPickers();
+      renderEnchantmentsEditor();
       updateAiPromptPreview('interview');
     },
     onWorkspaceLoaded: () => {
@@ -1758,12 +2136,14 @@ ${idea ? `\n【我目前的初步想法】\n${idea}\n\n请基于这个初步想�
       renderPatchAbilitiesSummary();
       renderCardAttachedMechanics();
       renderAllPillPickers();
+      renderEnchantmentsEditor();
       updateAiPromptPreview('interview');
     },
     onCardOrPatchRendered: () => {
       renderPatchAbilitiesSummary();
       renderCardAttachedMechanics();
       renderAllPillPickers();
+      renderEnchantmentsEditor();
     },
     onEventEditorRendered: () => {
       renderAllPillPickers();

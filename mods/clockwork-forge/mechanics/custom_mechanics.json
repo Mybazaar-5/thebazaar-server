@@ -1,0 +1,165 @@
+{
+  "schemaVersion": 1,
+  "modId": "clockwork-forge",
+  "mechanics": [
+    {
+      "id": "clockwork-forge:overload_burst",
+      "nameZh": "过载引爆",
+      "descZh": "左右相邻物品每次触发都会为本卡叠加 1 层过载；攒满 3 层后，下一次本卡开火消耗全部层数，连续喷射火球并强化全队伤害与自身冷却。",
+      "categoryZh": "摆盘蓄能连爆",
+      "version": "1.0.0",
+      "parameters": [
+        {
+          "key": "threshold",
+          "labelZh": "触发过载所需层数",
+          "type": "int",
+          "defaultValue": 3,
+          "min": 1,
+          "max": 10
+        },
+        {
+          "key": "intervalMs",
+          "labelZh": "火球连发间隔(ms)",
+          "type": "int",
+          "defaultValue": 150,
+          "min": 50,
+          "max": 1000
+        },
+        {
+          "key": "selfCdrPct",
+          "labelZh": "引爆后自身冷却缩减(%)",
+          "type": "int",
+          "defaultValue": 10,
+          "min": 0,
+          "max": 30
+        },
+        {
+          "key": "vfxKey",
+          "labelZh": "连爆特效键",
+          "type": "vfxKey",
+          "defaultValue": "Fireball"
+        }
+      ],
+      "tooltipTemplateZh": "满 {threshold} 层过载时开火引爆：连射 {attr.Custom_0} 发火球（每发 {attr.Custom_1} 伤），全队其他物品本战 +{attr.Custom_2} 伤害，本卡减 {selfCdrPct}% 冷却",
+      "hooks": [
+        {
+          "id": "stack_on_adjacent_fire",
+          "hook": "OnCardFired",
+          "scope": "OwnerBoard",
+          "filter": {
+            "onlyWhenAdjacentSource": true
+          },
+          "steps": [
+            {
+              "op": "ModifyCounter",
+              "operation": "Add",
+              "value": {
+                "const": 1
+              },
+              "target": "Self",
+              "key": "overload",
+              "syncAttribute": "Custom_3",
+              "bypassShield": false,
+              "suppressNormalDestroyTriggers": false
+            }
+          ]
+        },
+        {
+          "id": "detonate_on_self_fire",
+          "hook": "OnCardFired",
+          "scope": "SelfCard",
+          "filter": {
+            "onlyWhenSelfSource": true
+          },
+          "steps": [
+            {
+              "op": "If",
+              "condition": {
+                "left": {
+                  "counter": "overload",
+                  "source": "Self"
+                },
+                "compare": "Gte",
+                "right": {
+                  "param": "threshold"
+                }
+              },
+              "then": [
+                {
+                  "op": "ModifyCounter",
+                  "operation": "Set",
+                  "value": {
+                    "const": 0
+                  },
+                  "target": "Self",
+                  "key": "overload",
+                  "syncAttribute": "Custom_3",
+                  "bypassShield": false,
+                  "suppressNormalDestroyTriggers": false
+                },
+                {
+                  "op": "Repeat",
+                  "count": {
+                    "cardAttr": "Custom_0",
+                    "source": "Self"
+                  },
+                  "intervalMs": {
+                    "param": "intervalMs"
+                  },
+                  "steps": [
+                    {
+                      "op": "DealDamage",
+                      "playerTarget": "Opponent",
+                      "amount": {
+                        "cardAttr": "Custom_1",
+                        "source": "Self"
+                      },
+                      "bypassShield": false,
+                      "vfxKeyParam": "vfxKey",
+                      "suppressNormalDestroyTriggers": false
+                    }
+                  ],
+                  "bypassShield": false,
+                  "suppressNormalDestroyTriggers": false
+                },
+                {
+                  "op": "ModifyCardAttribute",
+                  "operation": "Add",
+                  "value": {
+                    "cardAttr": "Custom_2",
+                    "source": "Self"
+                  },
+                  "bypassShield": false,
+                  "targetSpec": {
+                    "mode": "OtherAllies",
+                    "includeDisabled": false
+                  },
+                  "attribute": "DamageAmount",
+                  "duration": "Combat",
+                  "suppressNormalDestroyTriggers": false
+                },
+                {
+                  "op": "ModifyCardAttribute",
+                  "operation": "Add",
+                  "value": {
+                    "param": "selfCdrPct"
+                  },
+                  "bypassShield": false,
+                  "targetSpec": {
+                    "mode": "Self",
+                    "includeDisabled": false
+                  },
+                  "attribute": "PercentCooldownReduction",
+                  "duration": "Combat",
+                  "suppressNormalDestroyTriggers": false
+                }
+              ],
+              "bypassShield": false,
+              "suppressNormalDestroyTriggers": false
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

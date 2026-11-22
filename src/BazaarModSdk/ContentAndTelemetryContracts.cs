@@ -172,6 +172,9 @@ public sealed class CardTextOverride
     /// <summary>附加纯展示标签（不改动底层 Card.Tags，确保联机协议与巴扎罗盘兼容）。</summary>
     public string[]? ExtraDisplayTags { get; set; }
 
+    /// <summary>四阶属性表（Bronze/Silver/Gold/Diamond），供局内自定义卡升级预览精准渲染下一阶数值。</summary>
+    public Dictionary<string, Dictionary<string, double>>? TierAttributes { get; set; }
+
     /// <summary>同级冲突时的覆盖优先级。</summary>
     public int Priority { get; set; }
 }

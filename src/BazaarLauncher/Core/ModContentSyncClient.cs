@@ -51,8 +51,11 @@ internal sealed class ModContentSyncClient
     private readonly List<IDisposable> _syncedCardTextHandles = new();
     private List<ServerModEntry> _serverMods = new();
     private List<ServerCustomContentItem> _customContents = new();
+    private HashSet<string> _donorTemplateIds = new(StringComparer.OrdinalIgnoreCase);
     private int _syncInFlight;
     private int _activeBindingsInFlight;
+    private int _activeBindingsResyncQueued;
+    private long _lastAutoBindingsTickMs;
     private string _lastModSetHash = string.Empty;
     private string _lastOverlaySha256 = string.Empty;
     private string _lastSyncSummary = "尚未同步";
@@ -124,6 +127,7 @@ internal sealed class ModContentSyncClient
     {
         if (Interlocked.CompareExchange(ref _activeBindingsInFlight, 1, 0) != 0)
         {
+            Interlocked.Exchange(ref _activeBindingsResyncQueued, 1);
             return;
         }
 
@@ -141,8 +145,34 @@ internal sealed class ModContentSyncClient
             finally
             {
                 Interlocked.Exchange(ref _activeBindingsInFlight, 0);
+                if (Interlocked.Exchange(ref _activeBindingsResyncQueued, 0) != 0)
+                {
+                    TriggerActiveBindingsSyncInBackground(runId);
+                }
             }
         });
+    }
+
+    /// <summary>当 3D 棋盘/商店新刷出的卡牌命中任意自定义卡底板 GUID 且尚未绑定时，按需触发防抖拉取 /api/mods/active-bindings。</summary>
+    internal void NotifyUnboundInstanceSeen(string instanceId, string templateId)
+    {
+        if (string.IsNullOrEmpty(instanceId) || string.IsNullOrEmpty(templateId)) return;
+        bool isDonor;
+        lock (_sync)
+        {
+            isDonor = _donorTemplateIds.Contains(templateId);
+        }
+        if (!isDonor) return;
+
+        long nowMs = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
+        long prevMs = Interlocked.Read(ref _lastAutoBindingsTickMs);
+        if (nowMs - prevMs < 250)
+        {
+            Interlocked.Exchange(ref _activeBindingsResyncQueued, 1);
+            return;
+        }
+        Interlocked.Exchange(ref _lastAutoBindingsTickMs, nowMs);
+        TriggerActiveBindingsSyncInBackground();
     }
 
     /// <summary>执行一次完整的 Mod 清单、PNG 资产、四层中文词典和活跃绑定同步。</summary>
@@ -248,6 +278,13 @@ internal sealed class ModContentSyncClient
             {
                 _serverMods = parsedMods;
                 _customContents = parsedContents;
+                var donors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var item in parsedContents)
+                {
+                    if (!string.IsNullOrWhiteSpace(item.BaseVisualTemplateId))
+                        donors.Add(item.BaseVisualTemplateId.Trim());
+                }
+                _donorTemplateIds = donors;
             }
             _lastModSetHash = modSetHash;
         }
@@ -434,10 +471,28 @@ internal sealed class ModContentSyncClient
             }
         }
 
+        Dictionary<string, Dictionary<string, double>> tierAttrs = null;
+        if (bo["tierAttributes"] is JObject taObj)
+        {
+            tierAttrs = new Dictionary<string, Dictionary<string, double>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var tp in taObj.Properties())
+            {
+                if (tp.Value is not JObject attrMap) continue;
+                var inner = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                foreach (var ap in attrMap.Properties())
+                {
+                    if (ap.Value != null && double.TryParse(ap.Value.ToString(), out double dv))
+                        inner[ap.Name] = dv;
+                }
+                if (inner.Count > 0) tierAttrs[tp.Name] = inner;
+            }
+        }
+
         if (!string.IsNullOrWhiteSpace(nameZh) || !string.IsNullOrWhiteSpace(descZh)
             || (activeTips != null && activeTips.Length > 0)
             || (passiveTips != null && passiveTips.Length > 0)
-            || (enchantTips != null && enchantTips.Count > 0))
+            || (enchantTips != null && enchantTips.Count > 0)
+            || (tierAttrs != null && tierAttrs.Count > 0))
         {
             texts.Add(new CardTextOverride
             {
@@ -452,6 +507,7 @@ internal sealed class ModContentSyncClient
                 PassiveTooltips = passiveTips,
                 EnchantmentTooltips = enchantTips,
                 ExtraDisplayTags = extraTags,
+                TierAttributes = tierAttrs,
                 Priority = string.IsNullOrWhiteSpace(instanceId) ? 100 : 500,
             });
         }
@@ -490,6 +546,13 @@ internal sealed class ModContentSyncClient
         }
 
         visualReg?.InvalidateVisualCache(null);
+        if (isActiveBinding)
+        {
+            MainThreadDispatcher.Enqueue(() =>
+            {
+                BazaarLauncher.Modules.CustomContentVisualModule.Instance?.ReapplyActiveVisualsOnMainThread();
+            });
+        }
     }
 
     private async Task<string> EnsureAssetCachedAsync(string sha256, bool forceDownload, CancellationToken ct)

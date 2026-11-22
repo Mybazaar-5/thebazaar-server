@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "clockwork-forge",
+  "name": "发条锻炉扩展包",
+  "displayNameZh": "发条锻炉扩展包",
+  "version": "1.0.0",
+  "author": "星港工匠",
+  "description": "包含原创青铜摆盘联动神器「过载蓄能炉」与 V14 开放沙盒机制「过载引爆」，支持四阶升级预览与全 13 种官方附魔。",
+  "descriptionZh": "包含原创青铜摆盘联动神器「过载蓄能炉」与 V14 开放沙盒机制「过载引爆」，支持四阶升级预览与全 13 种官方附魔。",
+  "coreApiVersion": "2.0.0",
+  "minServerVersion": "2.0.0",
+  "minLauncherVersion": "2.0.0",
+  "minGameDataVersion": "5.0.0",
+  "scope": "multiplayer-safe",
+  "affectsGhostPool": false,
+  "dependencies": [],
+  "enabledByDefault": false,
+  "loadOrder": 100,
+  "contentRoots": {
+    "cards": "cards/custom_cards.json",
+    "patches": "patches/vanilla_patches.json",
+    "events": "events/custom_events.json",
+    "modes": "modes/*.json",
+    "mechanics": "mechanics/custom_mechanics.json",
+    "localization": "localization/zh-CN.json",
+    "assets": "assets/*.png",
+    "artManifest": "assets/art_manifest.json"
+  }
+}

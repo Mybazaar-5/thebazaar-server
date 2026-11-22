@@ -82,6 +82,10 @@ public sealed class MechanicHookFilter
     [JsonPropertyName("onlyWhenSelfSource")]
     public bool? OnlyWhenSelfSource { get; set; }
 
+    /// <summary>仅当事件触发源卡牌位于本卡左右相邻棋盘格时触发。</summary>
+    [JsonPropertyName("onlyWhenAdjacentSource")]
+    public bool? OnlyWhenAdjacentSource { get; set; }
+
     /// <summary>允许已被禁用/摧毁的卡牌继续监听该钩子（例如拦截对自身的 Repair 修复请求或监听自爆后续事件）。</summary>
     [JsonPropertyName("includeDisabledSelf")]
     public bool? IncludeDisabledSelf { get; set; }

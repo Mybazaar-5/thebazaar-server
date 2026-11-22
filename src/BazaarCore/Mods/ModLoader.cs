@@ -181,8 +181,32 @@ public static class ModLoader
                     ? new CustomCardArtRect { Width = card.ArtRect.Width, Height = card.ArtRect.Height, CropMode = card.ArtRect.CropMode }
                     : null,
                 Tags = new List<string>(card.Tags),
-                AccentColor = card.AccentColor
+                AccentColor = card.AccentColor,
+                TierAttributes = BuildTierAttributesSnapshot(card)
             };
+        }
+
+        static Dictionary<string, Dictionary<string, double>>? BuildTierAttributesSnapshot(CustomCardDefinition card)
+        {
+            if (card.Tiers == null || card.Tiers.Count == 0) return null;
+            var res = new Dictionary<string, Dictionary<string, double>>(StringComparer.OrdinalIgnoreCase);
+            var running = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            if (card.Attributes != null)
+            {
+                foreach (var (k, v) in card.Attributes)
+                    running[k] = v;
+            }
+            foreach (var tierName in new[] { "Bronze", "Silver", "Gold", "Diamond" })
+            {
+                if (card.Tiers.TryGetValue(tierName, out var td) && td?.Attributes != null)
+                {
+                    foreach (var (k, v) in td.Attributes)
+                        running[k] = v;
+                }
+                if (running.Count > 0)
+                    res[tierName] = new Dictionary<string, double>(running, StringComparer.OrdinalIgnoreCase);
+            }
+            return res.Count > 0 ? res : null;
         }
 
         for (int i = 0; i < pkg.Cards.Count; i++)

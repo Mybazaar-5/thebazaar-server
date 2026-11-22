@@ -1,0 +1,605 @@
+{
+  "schemaVersion": 1,
+  "modId": "clockwork-forge",
+  "cards": [
+    {
+      "customId": "clockwork-forge:z_sword_custom_d83alo",
+      "baseVisualTemplateId": "34476196-7d30-4664-8fe3-e99411022a86",
+      "type": "Item",
+      "size": "Medium",
+      "startingTier": "Bronze",
+      "spawningEligibility": "Always",
+      "heroes": [
+        "Common"
+      ],
+      "tags": [
+        "Weapon",
+        "Tech",
+        "Tool"
+      ],
+      "hiddenTags": [
+        "Burn",
+        "Damage",
+        "Cooldown"
+      ],
+      "titleZh": "过载蓄能炉",
+      "titleEn": "Z-Sword Custom",
+      "descZh": "星港工坊研制的发条蓄能炉，靠左右相邻物品驱动蓄能，攒满 3 层过载后连喷炽焰火球并鼓舞全队。",
+      "activeTooltipsZh": [
+        "造成 {attr.DamageAmount} 点伤害，并使左右相邻物品各加速 {attr.HasteAmount} 秒"
+      ],
+      "passiveTooltipsZh": [
+        "每当左右相邻物品使用时，本卡充能 {attr.ChargeAmount} 秒并获得 +1 层「过载」",
+        "【过载引爆】满 3 层过载时开火：连射 {attr.Custom_0} 发火球（每发 {attr.Custom_1} 伤），其他友军本战 +{attr.Custom_2} 伤害且本卡减 10% 冷却"
+      ],
+      "enchantTooltipsZh": {
+        "Heavy": [
+          "触发时使随机一件敌方物品减速 2 秒"
+        ],
+        "Icy": [
+          "触发时冻结随机一件敌方物品 1.5 秒"
+        ],
+        "Turbo": [
+          "触发时额外使左右相邻物品各加速 1.5 秒"
+        ],
+        "Shielded": [
+          "触发时额外获得等同于本卡伤害（{attr.DamageAmount}）的护盾"
+        ],
+        "Restorative": [
+          "触发时额外回复等同于本卡伤害（{attr.DamageAmount}）的生命并净化灼烧/剧毒"
+        ],
+        "Toxic": [
+          "触发时额外对敌方施加 4 层剧毒"
+        ],
+        "Fiery": [
+          "触发时额外对敌方施加 6 层灼烧"
+        ],
+        "Shiny": [
+          "获得 +1 多重施放（每次冷却连发两轮）"
+        ],
+        "Deadly": [
+          "本卡永久获得 +50% 暴击率"
+        ],
+        "Radiant": [
+          "免疫冻结、减速与摧毁"
+        ],
+        "Obsidian": [
+          "本卡基础伤害翻倍（×2）"
+        ],
+        "Golden": [
+          "出售价值翻倍，且每次触发获得 2 金币"
+        ],
+        "Mossy": [
+          "触发时额外获得 5 层再生"
+        ]
+      },
+      "customArtFile": "assets/z_sword_custom_d83alo.png",
+      "artRect": {
+        "width": 512,
+        "height": 512,
+        "cropMode": "cover"
+      },
+      "tiers": {
+        "Silver": {
+          "attributes": {
+            "CooldownMax": 4500,
+            "DamageAmount": 24,
+            "Custom_0": 3,
+            "BuyPrice": 8,
+            "SellPrice": 4,
+            "HasteAmount": 1500,
+            "ChargeAmount": 700,
+            "Custom_1": 20,
+            "Custom_2": 8
+          },
+          "abilityIds": [
+            "0",
+            "1"
+          ],
+          "auraIds": [],
+          "tooltipIds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "Gold": {
+          "attributes": {
+            "CooldownMax": 4000,
+            "Custom_0": 4,
+            "BuyPrice": 16,
+            "SellPrice": 8,
+            "DamageAmount": 48,
+            "HasteAmount": 2000,
+            "ChargeAmount": 900,
+            "Custom_1": 40,
+            "Custom_2": 16
+          },
+          "abilityIds": [
+            "0",
+            "1"
+          ],
+          "auraIds": [],
+          "tooltipIds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "Diamond": {
+          "attributes": {
+            "CooldownMax": 3500,
+            "Custom_0": 5,
+            "BuyPrice": 32,
+            "SellPrice": 16,
+            "DamageAmount": 96,
+            "HasteAmount": 2500,
+            "ChargeAmount": 1200,
+            "Custom_1": 75,
+            "Custom_2": 32
+          },
+          "abilityIds": [
+            "0",
+            "1"
+          ],
+          "auraIds": [],
+          "tooltipIds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "Bronze": {
+          "attributes": {
+            "BuyPrice": 4,
+            "SellPrice": 2,
+            "CooldownMax": 5000,
+            "DamageAmount": 12,
+            "HasteAmount": 1000,
+            "ChargeAmount": 500,
+            "Custom_0": 2,
+            "Custom_1": 10,
+            "Custom_2": 4
+          },
+          "abilityIds": [
+            "0",
+            "1"
+          ],
+          "auraIds": [],
+          "tooltipIds": []
+        }
+      },
+      "enchantments": {
+        "Golden": {
+          "attributes": {},
+          "abilities": {
+            "e0": {
+              "id": "e0",
+              "trigger": {
+                "$type": "TTriggerOnCardFired"
+              },
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TActionPlayerModifyAttribute",
+                "attributeType": "Gold",
+                "operation": "Add",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 2
+                },
+                "target": {
+                  "$type": "TTargetPlayerAbsolute",
+                  "targetMode": "Player"
+                }
+              }
+            }
+          },
+          "auras": {
+            "ea0": {
+              "id": "ea0",
+              "activeIn": "HandAndStash",
+              "action": {
+                "$type": "TAuraActionCardModifyAttribute",
+                "attributeType": "SellPrice",
+                "operation": "Multiply",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 2
+                },
+                "target": {
+                  "$type": "TTargetCardSelf"
+                }
+              }
+            }
+          },
+          "tags": [],
+          "hiddenTags": [
+            "EconomyReference"
+          ],
+          "hasAbilities": true,
+          "hasAuras": true
+        },
+        "Heavy": {
+          "attributes": {},
+          "abilities": {
+            "e0": {
+              "id": "e0",
+              "trigger": {
+                "$type": "TTriggerOnCardFired"
+              },
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TActionCardSlow",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 2000
+                },
+                "target": {
+                  "$type": "TTargetCardRandom",
+                  "targetSection": "OpponentHand"
+                }
+              }
+            }
+          },
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [
+            "Slow"
+          ],
+          "hasAbilities": true,
+          "hasAuras": false
+        },
+        "Icy": {
+          "attributes": {},
+          "abilities": {
+            "e0": {
+              "id": "e0",
+              "trigger": {
+                "$type": "TTriggerOnCardFired"
+              },
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TActionCardFreeze",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 1500
+                },
+                "target": {
+                  "$type": "TTargetCardRandom",
+                  "targetSection": "OpponentHand"
+                }
+              }
+            }
+          },
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [
+            "Freeze"
+          ],
+          "hasAbilities": true,
+          "hasAuras": false
+        },
+        "Turbo": {
+          "attributes": {},
+          "abilities": {
+            "e0": {
+              "id": "e0",
+              "trigger": {
+                "$type": "TTriggerOnCardFired"
+              },
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TActionCardHaste",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 1500
+                },
+                "target": {
+                  "$type": "TTargetCardPositional",
+                  "targetMode": "Neighbor",
+                  "origin": "Self"
+                }
+              }
+            }
+          },
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [
+            "Haste"
+          ],
+          "hasAbilities": true,
+          "hasAuras": false
+        },
+        "Shielded": {
+          "attributes": {},
+          "abilities": {
+            "e0": {
+              "id": "e0",
+              "trigger": {
+                "$type": "TTriggerOnCardFired"
+              },
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TActionPlayerShieldApply",
+                "Value": {
+                  "$type": "TReferenceValueCardAttribute",
+                  "attributeType": "DamageAmount",
+                  "target": {
+                    "$type": "TTargetCardSelf"
+                  }
+                },
+                "target": {
+                  "$type": "TTargetPlayerRelative",
+                  "targetMode": "Self"
+                }
+              }
+            }
+          },
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [
+            "Shield"
+          ],
+          "hasAbilities": true,
+          "hasAuras": false
+        },
+        "Restorative": {
+          "attributes": {},
+          "abilities": {
+            "e0": {
+              "id": "e0",
+              "trigger": {
+                "$type": "TTriggerOnCardFired"
+              },
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TActionPlayerHeal",
+                "Value": {
+                  "$type": "TReferenceValueCardAttribute",
+                  "attributeType": "DamageAmount",
+                  "target": {
+                    "$type": "TTargetCardSelf"
+                  }
+                },
+                "target": {
+                  "$type": "TTargetPlayerRelative",
+                  "targetMode": "Self"
+                }
+              }
+            }
+          },
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [
+            "Heal"
+          ],
+          "hasAbilities": true,
+          "hasAuras": false
+        },
+        "Toxic": {
+          "attributes": {
+            "PoisonApplyAmount": 4
+          },
+          "abilities": {
+            "e0": {
+              "id": "e0",
+              "trigger": {
+                "$type": "TTriggerOnCardFired"
+              },
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TActionPlayerPoisonApply",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 4
+                },
+                "target": {
+                  "$type": "TTargetPlayerRelative",
+                  "targetMode": "Opponent"
+                }
+              }
+            }
+          },
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [
+            "Poison"
+          ],
+          "hasAbilities": true,
+          "hasAuras": false
+        },
+        "Fiery": {
+          "attributes": {
+            "BurnApplyAmount": 6
+          },
+          "abilities": {
+            "e0": {
+              "id": "e0",
+              "trigger": {
+                "$type": "TTriggerOnCardFired"
+              },
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TActionPlayerBurnApply",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 6
+                },
+                "target": {
+                  "$type": "TTargetPlayerRelative",
+                  "targetMode": "Opponent"
+                }
+              }
+            }
+          },
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [
+            "Burn"
+          ],
+          "hasAbilities": true,
+          "hasAuras": false
+        },
+        "Shiny": {
+          "attributes": {
+            "Multicast": 1
+          },
+          "abilities": {},
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [],
+          "hasAbilities": false,
+          "hasAuras": false
+        },
+        "Deadly": {
+          "attributes": {
+            "CritChance": 50
+          },
+          "abilities": {},
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [
+            "Crit"
+          ],
+          "hasAbilities": false,
+          "hasAuras": false
+        },
+        "Radiant": {
+          "attributes": {
+            "PercentFreezeReduction": 100,
+            "PercentSlowReduction": 100
+          },
+          "abilities": {},
+          "auras": {},
+          "tags": [
+            "Radiant"
+          ],
+          "hiddenTags": [],
+          "hasAbilities": false,
+          "hasAuras": false
+        },
+        "Obsidian": {
+          "attributes": {},
+          "abilities": {},
+          "auras": {
+            "ea0": {
+              "id": "ea0",
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TAuraActionCardModifyAttribute",
+                "attributeType": "DamageAmount",
+                "operation": "Multiply",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 2
+                },
+                "target": {
+                  "$type": "TTargetCardSelf"
+                }
+              }
+            }
+          },
+          "tags": [],
+          "hiddenTags": [
+            "Damage"
+          ],
+          "hasAbilities": false,
+          "hasAuras": true
+        },
+        "Mossy": {
+          "attributes": {},
+          "abilities": {
+            "e0": {
+              "id": "e0",
+              "trigger": {
+                "$type": "TTriggerOnCardFired"
+              },
+              "activeIn": "HandOnly",
+              "action": {
+                "$type": "TActionPlayerRegenApply",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 5
+                },
+                "target": {
+                  "$type": "TTargetPlayerRelative",
+                  "targetMode": "Self"
+                }
+              }
+            }
+          },
+          "auras": {},
+          "tags": [],
+          "hiddenTags": [
+            "Regen"
+          ],
+          "hasAbilities": true,
+          "hasAuras": false
+        }
+      },
+      "abilities": {
+        "0": {
+          "id": "0",
+          "trigger": {
+            "$type": "TTriggerOnCardFired"
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionAnd",
+            "actions": [
+              {
+                "$type": "TActionPlayerDamage",
+                "target": {
+                  "$type": "TTargetPlayerRelative",
+                  "targetMode": "Opponent"
+                }
+              },
+              {
+                "$type": "TActionCardHaste",
+                "target": {
+                  "$type": "TTargetCardPositional",
+                  "targetMode": "Neighbor",
+                  "origin": "Self"
+                }
+              }
+            ]
+          }
+        },
+        "1": {
+          "id": "1",
+          "trigger": {
+            "$type": "TTriggerOnItemUsed",
+            "subject": {
+              "$type": "TTargetCardPositional",
+              "targetMode": "Neighbor",
+              "origin": "Self"
+            }
+          },
+          "activeIn": "HandOnly",
+          "action": {
+            "$type": "TActionCardCharge",
+            "target": {
+              "$type": "TTargetCardSelf"
+            }
+          }
+        }
+      },
+      "auras": {},
+      "customMechanics": [
+        {
+          "mechanicId": "clockwork-forge:overload_burst",
+          "params": {
+            "threshold": 3,
+            "intervalMs": 150,
+            "selfCdrPct": 10,
+            "vfxKey": "Fireball"
+          },
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

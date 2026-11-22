@@ -527,6 +527,11 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
         if (filter.OnlyWhenOwnerTarget == true && ev.TargetPlayer != binding.OwnerPlayer) return false;
         if (filter.OnlyWhenSelfTarget == true && ev.TargetCard != binding.Card) return false;
         if (filter.OnlyWhenSelfSource == true && ev.SourceCard != binding.Card) return false;
+        if (filter.OnlyWhenAdjacentSource == true)
+        {
+            if (ev.SourceCard == null || !binding.OwnerPlayer.Hand.GetNeighbors(binding.Card).Contains(ev.SourceCard))
+                return false;
+        }
 
         if (filter.DamageTypes is { Count: > 0 } &&
             (string.IsNullOrEmpty(ev.DamageType) || !filter.DamageTypes.Any(d => d.Equals(ev.DamageType, StringComparison.OrdinalIgnoreCase))))

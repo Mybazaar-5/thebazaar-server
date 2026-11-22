@@ -731,6 +731,10 @@ public sealed class CustomCardVisualBinding
     [JsonPropertyName("tags")]
     public List<string> Tags { get; set; } = new();
 
+    /// <summary>四阶基础属性映射（Bronze/Silver/Gold/Diamond → 属性表），供客户端局内升级预览精确渲染自定义卡成长数值。</summary>
+    [JsonPropertyName("tierAttributes")]
+    public Dictionary<string, Dictionary<string, double>>? TierAttributes { get; set; }
+
     [JsonPropertyName("accentColor")]
     public string? AccentColor { get; set; }
 
@@ -752,7 +756,11 @@ public sealed class CustomCardVisualBinding
         CustomArtSha256 = CustomArtSha256,
         ArtRect = ArtRect != null ? new CustomCardArtRect { Width = ArtRect.Width, Height = ArtRect.Height, CropMode = ArtRect.CropMode } : null,
         Tags = new List<string>(Tags),
-        AccentColor = AccentColor
+        AccentColor = AccentColor,
+        TierAttributes = TierAttributes?.ToDictionary(
+            kv => kv.Key,
+            kv => new Dictionary<string, double>(kv.Value, StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase)
     };
 }
 
