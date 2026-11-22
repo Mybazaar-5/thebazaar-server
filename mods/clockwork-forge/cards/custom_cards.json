@@ -10,7 +10,14 @@
       "startingTier": "Bronze",
       "spawningEligibility": "Always",
       "heroes": [
-        "Common"
+        "Vanessa",
+        "Dooley",
+        "Pygmalien",
+        "Mak",
+        "Karnok",
+        "Jules",
+        "Stelle",
+        "Hero8"
       ],
       "tags": [
         "Weapon",
@@ -29,7 +36,7 @@
         "造成 {attr.DamageAmount} 点伤害，并使左右相邻物品各加速 {attr.HasteAmount} 秒"
       ],
       "passiveTooltipsZh": [
-        "每当左右相邻物品使用时，本卡充能 {attr.ChargeAmount} 秒并获得 +1 层「过载」",
+        "每当左右相邻物品使用时，本卡充能 {attr.ChargeAmount} 秒并获得 +1 层「过载」（当前 {attr.Custom_3}/3 层）",
         "【过载引爆】满 3 层过载时开火：连射 {attr.Custom_0} 发火球（每发 {attr.Custom_1} 伤），其他友军本战 +{attr.Custom_2} 伤害且本卡减 10% 冷却"
       ],
       "enchantTooltipsZh": {
@@ -90,7 +97,8 @@
             "HasteAmount": 1500,
             "ChargeAmount": 700,
             "Custom_1": 20,
-            "Custom_2": 8
+            "Custom_2": 8,
+            "Custom_3": 0
           },
           "abilityIds": [
             "0",
@@ -114,7 +122,8 @@
             "HasteAmount": 2000,
             "ChargeAmount": 900,
             "Custom_1": 40,
-            "Custom_2": 16
+            "Custom_2": 16,
+            "Custom_3": 0
           },
           "abilityIds": [
             "0",
@@ -138,7 +147,8 @@
             "HasteAmount": 2500,
             "ChargeAmount": 1200,
             "Custom_1": 75,
-            "Custom_2": 32
+            "Custom_2": 32,
+            "Custom_3": 0
           },
           "abilityIds": [
             "0",
@@ -162,7 +172,8 @@
             "ChargeAmount": 500,
             "Custom_0": 2,
             "Custom_1": 10,
-            "Custom_2": 4
+            "Custom_2": 4,
+            "Custom_3": 0
           },
           "abilityIds": [
             "0",

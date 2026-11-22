@@ -11,7 +11,14 @@
       "startingTier": "Bronze",
       "spawningEligibility": "Always",
       "heroes": [
-        "Common"
+        "Vanessa",
+        "Dooley",
+        "Pygmalien",
+        "Mak",
+        "Karnok",
+        "Jules",
+        "Stelle",
+        "Hero8"
       ],
       "tags": [
         "Weapon",
@@ -182,7 +189,14 @@
       "startingTier": "Silver",
       "spawningEligibility": "Always",
       "heroes": [
-        "Common"
+        "Vanessa",
+        "Dooley",
+        "Pygmalien",
+        "Mak",
+        "Karnok",
+        "Jules",
+        "Stelle",
+        "Hero8"
       ],
       "tags": [
         "Tool",
@@ -336,7 +350,14 @@
       "startingTier": "Bronze",
       "spawningEligibility": "Always",
       "heroes": [
-        "Common"
+        "Vanessa",
+        "Dooley",
+        "Pygmalien",
+        "Mak",
+        "Karnok",
+        "Jules",
+        "Stelle",
+        "Hero8"
       ],
       "tags": [
         "Tool",
@@ -466,7 +487,14 @@
       "startingTier": "Gold",
       "spawningEligibility": "Always",
       "heroes": [
-        "Common"
+        "Vanessa",
+        "Dooley",
+        "Pygmalien",
+        "Mak",
+        "Karnok",
+        "Jules",
+        "Stelle",
+        "Hero8"
       ],
       "tags": [
         "Vehicle",
@@ -660,7 +688,14 @@
       "startingTier": "Silver",
       "spawningEligibility": "Always",
       "heroes": [
-        "Common"
+        "Vanessa",
+        "Dooley",
+        "Pygmalien",
+        "Mak",
+        "Karnok",
+        "Jules",
+        "Stelle",
+        "Hero8"
       ],
       "tags": [
         "Merchant",
@@ -784,7 +819,14 @@
       "startingTier": "Bronze",
       "spawningEligibility": "Always",
       "heroes": [
-        "Common"
+        "Vanessa",
+        "Dooley",
+        "Pygmalien",
+        "Mak",
+        "Karnok",
+        "Jules",
+        "Stelle",
+        "Hero8"
       ],
       "tags": [
         "Tool"

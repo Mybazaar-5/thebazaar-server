@@ -325,7 +325,7 @@ public sealed class RunState
         {
             if (card.Owner != ECombatantId.Player) continue;
             if (card.Type is not (ECardType.Item or ECardType.Skill)) continue;
-            string tplId = card.TemplateId.ToString();
+            string tplId = ResolveCoreTemplateId(card);
             var coreTier = ShopEngine.ToCoreTier(card.Tier);
             if (!owned.TryGetValue(tplId, out var existing) || coreTier > existing)
                 owned[tplId] = coreTier;

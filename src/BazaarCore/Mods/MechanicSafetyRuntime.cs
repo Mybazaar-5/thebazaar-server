@@ -101,6 +101,8 @@ public sealed class CombatMechanicHostCallbacks
     public required Action<CardInstance, CardInstance?> ForceUseCard { get; init; }
     public required Action RecalculateAuras { get; init; }
     public required Func<string?, bool> IsValidVfxKey { get; init; }
+    /// <summary>可选：当机制计数器同步写入 Custom_* 属性槽发生变更时通知模拟器发射轻脉冲事件。</summary>
+    public Action<CardInstance, string, double>? OnCardCounterSynced { get; init; }
 }
 
 /// <summary>
@@ -812,7 +814,11 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
         if (!string.IsNullOrWhiteSpace(syncAttribute) && MechanicDefinition.AllowedSyncAttributes.Contains(syncAttribute))
         {
             double curAttr = card.GetAttribute(syncAttribute);
-            card.ModifyAttribute(syncAttribute, "Add", next - curAttr, Engine.DurationTarget.Combat);
+            if (Math.Abs(next - curAttr) > 1e-6)
+            {
+                card.ModifyAttribute(syncAttribute, "Add", next - curAttr, Engine.DurationTarget.Combat);
+                _host.OnCardCounterSynced?.Invoke(card, syncAttribute, next);
+            }
         }
         return next;
     }

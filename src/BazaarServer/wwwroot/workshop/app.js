@@ -713,7 +713,11 @@
     $('pvSize').textContent = `${TYPE_ZH_MAP[card.type] || card.type} · ${SIZE_ZH_MAP[card.size] || card.size}${exclNote}`;
     $('pvCooldown').textContent = attrs.CooldownMax ? `${(attrs.CooldownMax / 1000).toFixed(1)} 秒` : '被动';
     $('pvBuyPrice').textContent = `买 ${attrs.BuyPrice ?? '-'}金 / 卖 ${attrs.SellPrice ?? '-'}金`;
-    $('pvHero').textContent = (card.heroes || ['Common']).map((h) => lookupZhName(state.catalog?.heroes, h)).join(' / ');
+    const heroesArr = card.heroes && card.heroes.length ? card.heroes : ['Vanessa', 'Dooley', 'Pygmalien', 'Mak', 'Karnok', 'Jules', 'Stelle', 'Hero8'];
+    const allPlayableCount = ['Vanessa', 'Dooley', 'Pygmalien', 'Mak', 'Karnok', 'Jules', 'Stelle', 'Hero8'].filter((h) => heroesArr.includes(h)).length;
+    $('pvHero').textContent = (allPlayableCount >= 8 && !heroesArr.includes('Common'))
+      ? '全 8 英雄常规商店'
+      : heroesArr.map((h) => lookupZhName(state.catalog?.heroes, h)).join(' / ');
     $('pvTags').innerHTML = (card.tags || []).map((t) => `<span>${escapeHtml(lookupZhName(state.catalog?.tags, t))}</span>`).join('');
 
     const lines = [
@@ -1409,7 +1413,7 @@
         customId: generateUniqueCardId(modId, `custom_item_${idx}`),
         baseVisualTemplateId: DEFAULT_ITEM_SMALL_VISUAL,
         type: 'Item', size: 'Small', startingTier: 'Bronze', spawningEligibility: 'Always',
-        heroes: ['Common'], tags: ['Weapon'], hiddenTags: ['Damage'],
+        heroes: ['Vanessa', 'Dooley', 'Pygmalien', 'Mak', 'Karnok', 'Jules', 'Stelle', 'Hero8'], tags: ['Weapon'], hiddenTags: ['Damage'],
         titleZh: `原创星港短刃 #${idx}`, titleEn: `Custom Blade ${idx}`,
         descZh: '使用全中文创意工坊打造的原创武器。',
         activeTooltipsZh: ['造成 {attr.DamageAmount} 点伤害'],

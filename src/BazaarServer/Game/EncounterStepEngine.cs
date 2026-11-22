@@ -37,6 +37,8 @@ public sealed class EncounterStepResult
     public List<RunState.CardEntry> DealtCards { get; } = new();
     public List<RunState.CardEntry> SpawnedCards { get; } = new();
     public List<RunState.CardEntry> TransformedCards { get; } = new();
+    /// <summary>执行期间发生属性/品阶/附魔变更且需向客户端下发 SimUpdateCard 强同步的玩家卡牌实例 ID。</summary>
+    public HashSet<string> ModifiedCardIds { get; } = new(StringComparer.Ordinal);
 
     public static EncounterStepResult Fail(string reason) => new()
     {
@@ -170,8 +172,8 @@ public sealed class EncounterStepEngine
         if (!ValidateSelectionRequirements(poolTpl, coreTpl, ctx, out string? reqErr))
             return EncounterStepResult.Fail(reqErr ?? "未满足该选项的触发前提条件");
 
-        // 记录执行前快照用于精准生成变更日志与事件（扣费前记快照以便 ChangeLogs 统一记录净变化）
-        var prevPlayerAttrs = new Dictionary<string, double>(playerState.Attributes, StringComparer.OrdinalIgnoreCase);
+        // 记录执行前玩家各属性的有效快照（含 Aura / Hour / Day 限时层），确保 UntilEndOfDay/Hour 增益可被精确识别并下发
+        var prevEffectivePlayerAttrs = CaptureEffectivePlayerAttributes(playerState);
 
         // 记录神庙探险 Hour 1 所选元素门（Fiery / Toxic / Obsidian），驱动后续 Hour 2 陷阱房与 Hour 3 宝库的元素变体
         if (stepTplId.Equals("99ac6ab3-0b14-44c3-b7f9-21e008291b85", StringComparison.OrdinalIgnoreCase))
@@ -231,8 +233,8 @@ public sealed class EncounterStepEngine
             result.DealtNewCards = _run.SelectionSet.Count > 0;
         }
 
-        // 4. 将 PlayerState 变动无损回写 RunState，并生成完整增量事件与变更日志
-        SyncPlayerAttributesBack(playerState, prevPlayerAttrs, result, grantExperience);
+        // 4. 将 PlayerState 变动（含 Hour/Day 限时层）无损回写 RunState，并生成完整增量事件与变更日志
+        SyncPlayerAttributesBack(playerState, prevEffectivePlayerAttrs, result, grantExperience);
         SyncOwnedCardsBack(playerState, ownedByCore, initialHandSet, initialStashSet, initialSkillSet, initialSocketSet, prevCardSnapshot, result);
         SyncShelfChangesBack(shelfState, shelfByCore, result);
 
@@ -508,7 +510,7 @@ public sealed class EncounterStepEngine
         var usedTemplates = new HashSet<string>(
             _run.SelectionSet
                 .Where(id => _run.Cards.ContainsKey(id))
-                .Select(id => _run.Cards[id].TemplateId.ToString()),
+                .Select(id => RunState.ResolveCoreTemplateId(_run.Cards[id])),
             StringComparer.OrdinalIgnoreCase);
 
         int usedWidth = 0;
@@ -817,21 +819,29 @@ public sealed class EncounterStepEngine
             Losses = (int)_run.Defeats,
             FatesUsed = _run.HasVisitedFates,
         };
-        // P0-1：从 _run.PlayerAttributes 剥离局外光环追踪层，将 AuraAdd/AuraMult 放回对应字段，防止属性加成被反复吞入基础值
+        // P0-1 & V14.2：同时从 _run.PlayerAttributes 剥离小时/天限时层与局外光环层，确保 Aura 与 UntilEndOfDay/Hour 临时增益完全幂等
         foreach (var (ak, av) in _run.PlayerAttributes)
         {
             string key = ak.ToString();
             double baseVal = av;
-            double mult = _run.PlayerAuraMult.GetValueOrDefault(key, 1.0);
+            double mult = _run.PlayerHourMult.GetValueOrDefault(key, 1.0)
+                        * _run.PlayerDayMult.GetValueOrDefault(key, 1.0)
+                        * _run.PlayerAuraMult.GetValueOrDefault(key, 1.0);
             if (Math.Abs(mult) > 1e-6 && Math.Abs(mult - 1.0) > 1e-6)
                 baseVal /= mult;
-            baseVal -= _run.PlayerAuraAdd.GetValueOrDefault(key, 0.0);
+            baseVal -= _run.PlayerHourAdd.GetValueOrDefault(key, 0.0)
+                     + _run.PlayerDayAdd.GetValueOrDefault(key, 0.0)
+                     + _run.PlayerAuraAdd.GetValueOrDefault(key, 0.0);
             ps.Attributes[key] = baseVal;
         }
+        foreach (var (k, v) in _run.PlayerHourAdd) ps.HourAdd[k] = v;
+        foreach (var (k, v) in _run.PlayerHourMult) ps.HourMult[k] = v;
+        foreach (var (k, v) in _run.PlayerDayAdd) ps.DayAdd[k] = v;
+        foreach (var (k, v) in _run.PlayerDayMult) ps.DayMult[k] = v;
         foreach (var (k, v) in _run.PlayerAuraAdd) ps.AuraAdd[k] = v;
         foreach (var (k, v) in _run.PlayerAuraMult) ps.AuraMult[k] = v;
 
-        ps.CurrentHealth = Math.Clamp(hp, 0, Math.Max(1, hpMax));
+        ps.CurrentHealth = Math.Clamp(hp, 0, Math.Max(1, ps.HealthMax));
         ps.Hand.UnlockedMask = _run.UnlockedSlots;
         ps.Stash.UnlockedMask = 1023;
 
@@ -903,14 +913,15 @@ public sealed class EncounterStepEngine
 
     private CardInstance? EnsureSyncedCoreCard(RunState.CardEntry entry)
     {
-        var coreTpl = _repo.GetCard(entry.TemplateId.ToString());
+        string coreTplId = RunState.ResolveCoreTemplateId(entry);
+        var coreTpl = _repo.GetCard(coreTplId) ?? _repo.GetCard(entry.TemplateId.ToString());
         if (entry.CoreCard == null)
         {
             if (coreTpl == null)
             {
                 coreTpl = new BazaarCore.Models.CardTemplate
                 {
-                    Id = entry.TemplateId.ToString(),
+                    Id = coreTplId,
                     Type = entry.Type.ToString(),
                     Size = entry.Size.ToString(),
                     StartingTier = entry.Tier.ToString(),
@@ -925,12 +936,16 @@ public sealed class EncounterStepEngine
         {
             string key = ak.ToString();
             if ((int)Math.Round(ci.GetAttribute(key)) == av) continue;
-            double auraMult = ci.AuraMult.GetValueOrDefault(key, 1.0);
-            double auraAdd = ci.AuraAdd.GetValueOrDefault(key, 0.0);
-            double effectiveBase = Math.Abs(auraMult) > 1e-6 && Math.Abs(auraMult - 1.0) > 1e-6
-                ? av / auraMult
+            double totalMult = ci.PermanentMult.GetValueOrDefault(key, 1.0)
+                             * ci.HourMult.GetValueOrDefault(key, 1.0)
+                             * ci.DayMult.GetValueOrDefault(key, 1.0)
+                             * ci.AuraMult.GetValueOrDefault(key, 1.0);
+            double effectiveBase = Math.Abs(totalMult) > 1e-6 && Math.Abs(totalMult - 1.0) > 1e-6
+                ? av / totalMult
                 : av;
-            effectiveBase -= auraAdd;
+            effectiveBase -= ci.HourAdd.GetValueOrDefault(key, 0.0)
+                           + ci.DayAdd.GetValueOrDefault(key, 0.0)
+                           + ci.AuraAdd.GetValueOrDefault(key, 0.0);
             double baseV = ci.BaseAttributes.GetValueOrDefault(key, 0);
             ci.PermanentAdd[key] = effectiveBase - baseV;
         }
@@ -969,43 +984,80 @@ public sealed class EncounterStepEngine
         foreach (var (ci, entry) in owned)
         {
             var attrs = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-            foreach (var (k, v) in ci.BaseAttributes)
-                attrs[k] = ci.GetAttribute(k);
-            foreach (var (k, _) in ci.PermanentAdd)
-                attrs[k] = ci.GetAttribute(k);
+            foreach (var (k, _) in ci.BaseAttributes) attrs[k] = ci.GetAttribute(k);
+            foreach (var (k, _) in ci.PermanentAdd) attrs[k] = ci.GetAttribute(k);
+            foreach (var (k, _) in ci.HourAdd) attrs[k] = ci.GetAttribute(k);
+            foreach (var (k, _) in ci.HourMult) attrs[k] = ci.GetAttribute(k);
+            foreach (var (k, _) in ci.DayAdd) attrs[k] = ci.GetAttribute(k);
+            foreach (var (k, _) in ci.DayMult) attrs[k] = ci.GetAttribute(k);
+            foreach (var (k, _) in ci.AuraAdd) attrs[k] = ci.GetAttribute(k);
             snap[ci] = new CardSnap(ci.Tier, ci.Enchantment, ci.StartSlot, attrs, ci.ExtraTags.Count);
         }
         return snap;
     }
 
+    private static double ComputeEffectivePlayerAttr(PlayerState ps, EPlayerAttributeType attrType)
+    {
+        if (attrType == EPlayerAttributeType.Health)
+            return ps.CurrentHealth;
+        string key = attrType.ToString();
+        double baseVal = ps.Attributes.GetValueOrDefault(key, 0.0);
+        return (baseVal
+                + ps.AuraAdd.GetValueOrDefault(key, 0.0)
+                + ps.HourAdd.GetValueOrDefault(key, 0.0)
+                + ps.DayAdd.GetValueOrDefault(key, 0.0))
+               * ps.AuraMult.GetValueOrDefault(key, 1.0)
+               * ps.HourMult.GetValueOrDefault(key, 1.0)
+               * ps.DayMult.GetValueOrDefault(key, 1.0);
+    }
+
+    private static Dictionary<string, double> CaptureEffectivePlayerAttributes(PlayerState ps)
+    {
+        var snap = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        foreach (EPlayerAttributeType attrType in Enum.GetValues<EPlayerAttributeType>())
+            snap[attrType.ToString()] = ComputeEffectivePlayerAttr(ps, attrType);
+        return snap;
+    }
+
+    private static void CopyLayerDict(Dictionary<string, double> src, Dictionary<string, double> dst)
+    {
+        dst.Clear();
+        foreach (var (k, v) in src)
+            dst[k] = v;
+    }
+
     private void SyncPlayerAttributesBack(
         PlayerState ps,
-        Dictionary<string, double> prevAttrs,
+        Dictionary<string, double> prevEffectiveAttrs,
         EncounterStepResult result,
         Func<int, List<IGameSimEvent>>? grantExperience = null)
     {
         // Health 特殊处理：PlayerState.CurrentHealth 反映当前血量
         ps.Attributes["Health"] = ps.CurrentHealth;
 
+        // V14.2 关键修复：完整回写玩家局外限时层（UntilEndOfHour / UntilEndOfDay），确保咖啡店 Relax 等临时属性持久化并带入战斗
+        CopyLayerDict(ps.HourAdd, _run.PlayerHourAdd);
+        CopyLayerDict(ps.HourMult, _run.PlayerHourMult);
+        CopyLayerDict(ps.DayAdd, _run.PlayerDayAdd);
+        CopyLayerDict(ps.DayMult, _run.PlayerDayMult);
+
         int deferredXpDelta = 0;
+        int healthMaxDeltaForHeal = 0;
+        bool healthExplicitlyChanged = false;
+
         foreach (EPlayerAttributeType attrType in Enum.GetValues<EPlayerAttributeType>())
         {
             string key = attrType.ToString();
-            if (!ps.Attributes.TryGetValue(key, out double curBaseVal)) continue;
+            bool hasInAnyLayer = ps.Attributes.ContainsKey(key)
+                              || ps.HourAdd.ContainsKey(key) || ps.HourMult.ContainsKey(key)
+                              || ps.DayAdd.ContainsKey(key) || ps.DayMult.ContainsKey(key)
+                              || ps.AuraAdd.ContainsKey(key) || ps.AuraMult.ContainsKey(key);
+            if (!hasInAnyLayer && attrType != EPlayerAttributeType.Health) continue;
 
-            // 仅回写执行期在 PlayerState 上真实发生变动的属性，防止经验升级写回的新 Level/HealthMax 被后续旧快照覆写还原
-            bool changedInStep = !prevAttrs.TryGetValue(key, out double prevVal) || Math.Abs(curBaseVal - prevVal) > 1e-6;
+            double effectiveVal = ComputeEffectivePlayerAttr(ps, attrType);
+            // 仅回写执行期有效值真实发生变动的属性（覆盖 Base / Hour / Day / Aura 全部层级），同时防止未变动属性覆写经验升级结果
+            bool changedInStep = !prevEffectiveAttrs.TryGetValue(key, out double prevVal) || Math.Abs(effectiveVal - prevVal) > 1e-6;
             if (!changedInStep) continue;
-
-            double effectiveVal = attrType == EPlayerAttributeType.Health
-                ? curBaseVal
-                : (curBaseVal
-                   + ps.AuraAdd.GetValueOrDefault(key, 0.0)
-                   + ps.HourAdd.GetValueOrDefault(key, 0.0)
-                   + ps.DayAdd.GetValueOrDefault(key, 0.0))
-                  * ps.AuraMult.GetValueOrDefault(key, 1.0)
-                  * ps.HourMult.GetValueOrDefault(key, 1.0)
-                  * ps.DayMult.GetValueOrDefault(key, 1.0);
 
             int newInt = (int)Math.Round(effectiveVal);
             int oldInt = _run.PlayerAttributes.TryGetValue(attrType, out int oldV) ? oldV : 0;
@@ -1021,6 +1073,10 @@ public sealed class EncounterStepEngine
             }
 
             _run.PlayerAttributes[attrType] = newInt;
+            if (attrType == EPlayerAttributeType.HealthMax && delta > 0)
+                healthMaxDeltaForHeal = delta;
+            if (attrType == EPlayerAttributeType.Health)
+                healthExplicitlyChanged = true;
             if (attrType == EPlayerAttributeType.Gold && delta > 0)
                 _run.IncrementPlayerAttribute(EPlayerAttributeType.Custom_3, delta);
             result.ChangeLogs.Add($"{key}{(delta >= 0 ? "+" : "")}{delta}");
@@ -1029,6 +1085,16 @@ public sealed class EncounterStepEngine
                 result.Events.Add(new GameSimEventPlayerIncomeGained((uint)delta));
             else if (attrType == EPlayerAttributeType.Prestige)
                 result.Events.Add(new GameSimEventPlayerPrestigeChanged(delta));
+        }
+
+        // 若最大生命值因临时/永久增益上涨且 Health 未单独结算，同步抬升当前生命值并钳制在最新 HealthMax 内
+        if (healthMaxDeltaForHeal > 0 && !healthExplicitlyChanged)
+        {
+            int maxHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, 250);
+            int oldHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, maxHp);
+            int newHp = Math.Clamp(oldHp + healthMaxDeltaForHeal, 0, Math.Max(1, maxHp));
+            if (newHp != oldHp)
+                _run.PlayerAttributes[EPlayerAttributeType.Health] = newHp;
         }
 
         if (deferredXpDelta > 0 && grantExperience != null)
@@ -1122,6 +1188,7 @@ public sealed class EncounterStepEngine
                     entry.Tier = ShopEngine.ParseTier(core.Tier.ToString());
                     result.Events.Add(new GameSimEventCardUpgraded(entry.InstanceId, entry.Tier));
                     result.ChangeLogs.Add($"Upgrade:{entry.InstanceId}->{entry.Tier}");
+                    result.ModifiedCardIds.Add(entry.InstanceId);
                 }
                 if (!string.Equals(core.Enchantment, snap.Enchantment, StringComparison.OrdinalIgnoreCase) &&
                     !string.IsNullOrEmpty(core.Enchantment) &&
@@ -1135,6 +1202,7 @@ public sealed class EncounterStepEngine
                         IsReverted = false,
                     });
                     result.ChangeLogs.Add($"Enchant:{entry.InstanceId}->{enchEnum}");
+                    result.ModifiedCardIds.Add(entry.InstanceId);
                 }
             }
 
@@ -1144,7 +1212,11 @@ public sealed class EncounterStepEngine
                     entry.Tags.Add(et);
             }
 
-            SyncEntryAttributesFromCore(entry, core);
+            bool forceAllAttrs = result.ModifiedCardIds.Contains(entry.InstanceId) && !string.IsNullOrWhiteSpace(entry.CustomCardId);
+            if (SyncEntryAttributesFromCore(entry, core, recordForceSync: true, forceAll: forceAllAttrs))
+            {
+                result.ModifiedCardIds.Add(entry.InstanceId);
+            }
         }
 
         // 2. 检查新生成（SpawnCards / 非变形式生成）的 Hand / Stash / Skill / SocketEffect 卡牌
@@ -1336,25 +1408,56 @@ public sealed class EncounterStepEngine
         _run.SelectionSet.Remove(entry.InstanceId);
     }
 
-    private static void SyncEntryAttributesFromCore(RunState.CardEntry entry, CardInstance core)
+    private static bool SyncEntryAttributesFromCore(
+        RunState.CardEntry entry,
+        CardInstance core,
+        bool recordForceSync = false,
+        bool forceAll = false)
     {
         var keys = new HashSet<string>(core.BaseAttributes.Keys, StringComparer.OrdinalIgnoreCase);
         foreach (var k in core.PermanentAdd.Keys) keys.Add(k);
         foreach (var k in core.PermanentMult.Keys) keys.Add(k);
+        foreach (var k in core.HourAdd.Keys) keys.Add(k);
+        foreach (var k in core.HourMult.Keys) keys.Add(k);
+        foreach (var k in core.DayAdd.Keys) keys.Add(k);
+        foreach (var k in core.DayMult.Keys) keys.Add(k);
         foreach (var k in core.AuraAdd.Keys) keys.Add(k);
         foreach (var k in core.AuraMult.Keys) keys.Add(k);
 
+        bool anyChanged = false;
         foreach (string key in keys)
         {
             if (Enum.TryParse<ECardAttributeType>(key, out var attrType))
             {
-                entry.Attributes[attrType] = attrType == ECardAttributeType.Flying
+                int newVal = attrType == ECardAttributeType.Flying
                     ? Math.Max(core.IsFlying ? 1 : 0, (int)Math.Round(core.GetAttribute(key)))
                     : (int)Math.Round(core.GetAttribute(key));
+                bool changed = !entry.Attributes.TryGetValue(attrType, out int oldVal) || oldVal != newVal;
+                entry.Attributes[attrType] = newVal;
+                if (changed)
+                {
+                    anyChanged = true;
+                    if (recordForceSync)
+                        entry.PendingForceSyncAttributes[attrType] = newVal;
+                }
+                else if (recordForceSync && forceAll)
+                {
+                    entry.PendingForceSyncAttributes[attrType] = newVal;
+                }
             }
         }
         if (core.IsFlying)
+        {
+            bool changed = !entry.Attributes.TryGetValue(ECardAttributeType.Flying, out int oldFly) || oldFly != 1;
             entry.Attributes[ECardAttributeType.Flying] = 1;
+            if (changed)
+            {
+                anyChanged = true;
+                if (recordForceSync)
+                    entry.PendingForceSyncAttributes[ECardAttributeType.Flying] = 1;
+            }
+        }
+        return anyChanged;
     }
 
     // ── 2.8 Expedition 探索系统辅助 API ──────────────────────────────────────

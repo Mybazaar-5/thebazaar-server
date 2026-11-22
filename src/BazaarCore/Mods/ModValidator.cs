@@ -1513,6 +1513,22 @@ public static partial class ModValidator
             var baseTpl = baseRepo.GetCard(card.BaseVisualTemplateId) ?? new CardTemplate { Id = card.BaseVisualTemplateId, Type = card.Type, Size = card.Size };
             var renderedTpl = card.ToCardTemplate(baseTpl, modId);
             CheckTextAndRender(card.CustomId, card.TitleZh, card.DescZh, card.ActiveTooltipsZh, card.PassiveTooltipsZh, card.EnchantTooltipsZh, renderedTpl, requireTitleAndDesc: true);
+
+            // V14.2 问题 2 提示：若常规可刷新商店物品仅勾选了 Common，提醒作者它只会出现在 Curio 等中立池而非杰杰等常规英雄商店
+            if (string.Equals(card.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(card.SpawningEligibility, "Always", StringComparison.OrdinalIgnoreCase)
+                && card.Heroes is { Count: 1 }
+                && string.Equals(card.Heroes[0], HeroNames.Common, StringComparison.OrdinalIgnoreCase))
+            {
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Warning,
+                    modId,
+                    "COMMON_ONLY_SHOP_POOL",
+                    $"物品 '{card.CustomId}' 仅选择了 Common（中立池），只会出现在 Curio 等中立商店，不会在杰杰等常规英雄商店刷新。",
+                    card.CustomId,
+                    GateId: 7,
+                    FixHintZh: "若希望常规商店正常刷出，请在「所属英雄」中勾选目标英雄或点击「全英雄常规店通用」。"));
+            }
         }
 
         foreach (var ev in pkg.Events)

@@ -1,6 +1,8 @@
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -372,6 +374,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             if (__instance == null || __0 == null || Instance == null) return;
             var agent = GetOrAddAgent(__instance);
             agent.HostController = __instance;
+            agent.BoundCardObj = __0;
             var query = BuildQueryFromCard(__0, CardVisualTarget.ItemArt);
             agent.SetContext(query);
 
@@ -1008,23 +1011,31 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
-    /// <summary>挂在对象池视图上的轻量版本号代理：防止池化复用后晚到的异步 PNG 回调污染新卡（铁律四），销毁时归还引用计数（铁律六）。</summary>
+    /// <summary>挂在对象池视图上的轻量版本号代理：防止池化复用后晚到的异步 PNG 回调污染新卡（铁律四），销毁时归还引用计数（铁律六），并承载通用自定义机制实时计数胶囊角标。</summary>
     internal sealed class CardVisualOverrideAgent : MonoBehaviour
     {
+        private static readonly ConcurrentDictionary<Type, PropertyInfo> AttrsPropCache = new();
+        private static GUIStyle _pillTextStyle;
+        private static Texture2D _solidWhiteTex;
+        private static Font _cnFont;
+
         private uint _epoch;
         private CardTextureCache.CacheEntry _primaryEntry;
         private CardTextureCache.CacheEntry _secondaryEntry;
+        private Renderer _cachedRenderer;
 
         public uint Epoch => _epoch;
         public bool HasContext { get; private set; }
         public CardVisualQuery LastQuery { get; private set; }
         public Component HostController { get; set; }
+        public object BoundCardObj { get; set; }
 
         public void SetContext(in CardVisualQuery query)
         {
             _epoch++;
             HasContext = true;
             LastQuery = query;
+            _cachedRenderer = null;
             ReleaseBoundEntries();
         }
 
@@ -1042,15 +1053,148 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _secondaryEntry = entry;
         }
 
+        private void OnGUI()
+        {
+            try
+            {
+                if (!HasContext || BoundCardObj == null || LastQuery.Target != CardVisualTarget.ItemArt) return;
+                if (Event.current == null || Event.current.type != EventType.Repaint) return;
+
+                var l10n = LocalizationOverlayModule.Instance;
+                if (l10n == null) return;
+                if (!l10n.TryResolveCardText(l10n.CurrentLocale, LastQuery.InstanceId, LastQuery.CustomCardId, LastQuery.TemplateId, out var ov)
+                    || ov?.CounterDisplays == null || ov.CounterDisplays.Length == 0)
+                {
+                    return;
+                }
+
+                Camera cam = Camera.main;
+                if (cam == null) return;
+
+                if (_cachedRenderer == null)
+                    _cachedRenderer = GetComponentInChildren<Renderer>(false);
+                if (_cachedRenderer == null || !_cachedRenderer.enabled || !_cachedRenderer.isVisible) return;
+
+                Bounds b = _cachedRenderer.bounds;
+                if (b.size.sqrMagnitude < 0.0001f) return;
+
+                // 锚定在 3D 卡面中下部偏底区（避开顶部伤害/护盾/冷却原生角标与左下售价标）
+                Vector3 anchorWorld = new Vector3(b.center.x, b.min.y + b.size.y * 0.17f, b.center.z);
+                Vector3 sp = cam.WorldToScreenPoint(anchorWorld);
+                if (sp.z <= 0.1f || sp.x < 10f || sp.x > Screen.width - 10f || sp.y < 10f || sp.y > Screen.height - 10f)
+                    return;
+
+                var attrsProp = AttrsPropCache.GetOrAdd(
+                    BoundCardObj.GetType(),
+                    static t => t.GetProperty("Attributes", BindingFlags.Public | BindingFlags.Instance));
+                var attrs = attrsProp?.GetValue(BoundCardObj) as IDictionary;
+
+                EnsurePillResources();
+                float guiX = sp.x;
+                float guiY = Screen.height - sp.y;
+                float offsetY = 0f;
+
+                for (int i = 0; i < ov.CounterDisplays.Length; i++)
+                {
+                    var cd = ov.CounterDisplays[i];
+                    if (cd == null || string.IsNullOrWhiteSpace(cd.SyncAttribute)) continue;
+
+                    int curVal = ReadLiveIntAttr(attrs, cd.SyncAttribute);
+                    if (cd.HideWhenZero && curVal <= 0) continue;
+
+                    bool hasMax = cd.MaxValue.HasValue && cd.MaxValue.Value > 0;
+                    bool isReady = hasMax && curVal >= cd.MaxValue.Value;
+                    string label = string.IsNullOrWhiteSpace(cd.LabelZh) ? "层数" : cd.LabelZh;
+                    string text = hasMax ? $"{label} {curVal}/{cd.MaxValue.Value}" : $"{label} {curVal}";
+
+                    Vector2 sz = _pillTextStyle.CalcSize(new GUIContent(text));
+                    float pillW = Mathf.Max(66f, sz.x + 16f);
+                    float pillH = Mathf.Max(22f, sz.y + 6f);
+                    Rect rect = new Rect(guiX - pillW * 0.5f, guiY - pillH * 0.5f - offsetY, pillW, pillH);
+
+                    Color accent = isReady ? new Color(0.98f, 0.80f, 0.08f, 0.98f) : ParseHexColor(cd.ColorHex, new Color(0.98f, 0.45f, 0.09f, 0.95f));
+                    Color bg = isReady ? new Color(0.24f, 0.13f, 0.02f, 0.93f) : new Color(0.06f, 0.09f, 0.16f, 0.88f);
+
+                    Color prevColor = GUI.color;
+                    // 外框高光边
+                    GUI.color = accent;
+                    GUI.DrawTexture(new Rect(rect.x - 1.5f, rect.y - 1.5f, rect.width + 3f, rect.height + 3f), _solidWhiteTex);
+                    // 内核深底
+                    GUI.color = bg;
+                    GUI.DrawTexture(rect, _solidWhiteTex);
+                    // 亮色文字
+                    GUI.color = isReady ? new Color(1f, 0.95f, 0.65f, 1f) : Color.white;
+                    GUI.Label(rect, text, _pillTextStyle);
+                    GUI.color = prevColor;
+
+                    offsetY += pillH + 3f;
+                }
+            }
+            catch { }
+        }
+
+        private static int ReadLiveIntAttr(IDictionary attrs, string attrName)
+        {
+            if (attrs == null || string.IsNullOrEmpty(attrName)) return 0;
+            foreach (DictionaryEntry kv in attrs)
+            {
+                if (string.Equals(kv.Key?.ToString(), attrName, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (kv.Value != null && double.TryParse(kv.Value.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out double d))
+                        return (int)Math.Round(d);
+                    return 0;
+                }
+            }
+            return 0;
+        }
+
+        private static Color ParseHexColor(string hex, Color fallback)
+        {
+            if (string.IsNullOrWhiteSpace(hex)) return fallback;
+            string s = hex.Trim();
+            if (!s.StartsWith("#", StringComparison.Ordinal)) s = "#" + s;
+            return ColorUtility.TryParseHtmlString(s, out Color parsed) ? parsed : fallback;
+        }
+
+        private static void EnsurePillResources()
+        {
+            if (_solidWhiteTex == null)
+            {
+                _solidWhiteTex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+                _solidWhiteTex.SetPixel(0, 0, Color.white);
+                _solidWhiteTex.Apply();
+                UnityEngine.Object.DontDestroyOnLoad(_solidWhiteTex);
+            }
+            if (_pillTextStyle == null)
+            {
+                try { _cnFont = Font.CreateDynamicFontFromOSFont(new[] { "Microsoft YaHei", "SimHei", "Arial" }, 13); }
+                catch { _cnFont = null; }
+
+                _pillTextStyle = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.MiddleCenter,
+                    fontSize = 13,
+                    fontStyle = FontStyle.Bold,
+                    wordWrap = false,
+                };
+                if (_cnFont != null) _pillTextStyle.font = _cnFont;
+                _pillTextStyle.normal.textColor = Color.white;
+            }
+        }
+
         private void OnDisable()
         {
             _epoch++;
+            BoundCardObj = null;
+            _cachedRenderer = null;
             ReleaseBoundEntries();
         }
 
         private void OnDestroy()
         {
             _epoch++;
+            BoundCardObj = null;
+            _cachedRenderer = null;
             ReleaseBoundEntries();
         }
 

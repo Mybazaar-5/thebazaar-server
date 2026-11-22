@@ -19,6 +19,19 @@ public static class CombatSimConverter
 {
     public const int FrameStepMs = 50;
 
+    private static readonly ECardAttributeType[] SyncedCustomAttrs =
+    [
+        ECardAttributeType.Custom_0,
+        ECardAttributeType.Custom_1,
+        ECardAttributeType.Custom_2,
+        ECardAttributeType.Custom_3,
+        ECardAttributeType.Custom_4,
+        ECardAttributeType.Custom_5,
+        ECardAttributeType.Custom_6,
+        ECardAttributeType.Custom_7,
+        ECardAttributeType.Custom_8,
+    ];
+
     private sealed class CardRenderState
     {
         public RunState.CardEntry Entry { get; set; } = null!;
@@ -416,6 +429,15 @@ public static class CombatSimConverter
         EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Multicast, cf.Multicast, ref hasUpdate);
         EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Lifesteal, cf.Lifesteal, ref hasUpdate);
         EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Counter, cf.Counter, ref hasUpdate);
+
+        // V14.2 问题 7 通用根治：逐帧差分同步 Custom_0..Custom_9，使任意自定义机制的黑板计数/层数在战斗中实时刷新到客户端
+        for (int ci = 0; ci < SyncedCustomAttrs.Length; ci++)
+        {
+            var cattr = SyncedCustomAttrs[ci];
+            int cval = cf.CustomAttrs != null && ci < cf.CustomAttrs.Length ? cf.CustomAttrs[ci] : 0;
+            if (cval != 0 || state.PrevAttributes.ContainsKey(cattr))
+                EmitAttrIfChangedLazy(state, cardId, ref cu, cattr, cval, ref hasUpdate);
+        }
 
         // 兼容 Core 侧可能使用 GetAttribute("SellPrice") 或 GetSellPrice() 两种初始价口径，防止把商店售价误归零
         if (!state.SellPriceOffsetResolved)
@@ -898,7 +920,8 @@ public static class CombatSimConverter
             : defaultAction;
 
         bool isSkill = ev.IsSkillSource || srcMeta.Entry.Type == ECardType.Skill;
-        if (!isSkill)
+        bool hasExplicitVfx = !string.IsNullOrWhiteSpace(ev.VfxKeyOverride);
+        if (!isSkill && !hasExplicitVfx)
         {
             var key = (ev.TimeMs, srcMeta.Entry.InstanceId, act);
             if (itemActionCredits.TryGetValue(key, out int credits) && credits > 0)
@@ -1457,7 +1480,7 @@ public static class CombatSimConverter
     {
         if (!string.IsNullOrWhiteSpace(explicitOverrideKey))
         {
-            string customKey = explicitOverrideKey.Trim();
+            string customKey = BazaarCore.Mods.ModRuleCatalog.ResolveOfficialVfxKey(explicitOverrideKey) ?? explicitOverrideKey.Trim();
             if (!vfxKeyMap.TryGetValue(customKey, out int customIdx))
             {
                 customIdx = vfxKeys.Count;

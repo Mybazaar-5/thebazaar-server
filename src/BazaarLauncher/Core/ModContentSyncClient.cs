@@ -488,11 +488,33 @@ internal sealed class ModContentSyncClient
             }
         }
 
+        CardCounterDisplayInfo[] counterDisplays = null;
+        if (bo["counterDisplays"] is JArray cdArr && cdArr.Count > 0)
+        {
+            var cdList = new List<CardCounterDisplayInfo>(cdArr.Count);
+            foreach (var item in cdArr)
+            {
+                if (item is not JObject cdo) continue;
+                string syncAttr = ((string)cdo["syncAttribute"])?.Trim();
+                if (string.IsNullOrEmpty(syncAttr)) continue;
+                cdList.Add(new CardCounterDisplayInfo
+                {
+                    LabelZh = ((string)cdo["labelZh"])?.Trim() ?? string.Empty,
+                    SyncAttribute = syncAttr,
+                    MaxValue = (int?)cdo["maxValue"],
+                    ColorHex = ((string)cdo["colorHex"])?.Trim(),
+                    HideWhenZero = (bool?)cdo["hideWhenZero"] ?? false,
+                });
+            }
+            if (cdList.Count > 0) counterDisplays = cdList.ToArray();
+        }
+
         if (!string.IsNullOrWhiteSpace(nameZh) || !string.IsNullOrWhiteSpace(descZh)
             || (activeTips != null && activeTips.Length > 0)
             || (passiveTips != null && passiveTips.Length > 0)
             || (enchantTips != null && enchantTips.Count > 0)
-            || (tierAttrs != null && tierAttrs.Count > 0))
+            || (tierAttrs != null && tierAttrs.Count > 0)
+            || (counterDisplays != null && counterDisplays.Length > 0))
         {
             texts.Add(new CardTextOverride
             {
@@ -508,6 +530,7 @@ internal sealed class ModContentSyncClient
                 EnchantmentTooltips = enchantTips,
                 ExtraDisplayTags = extraTags,
                 TierAttributes = tierAttrs,
+                CounterDisplays = counterDisplays,
                 Priority = string.IsNullOrWhiteSpace(instanceId) ? 100 : 500,
             });
         }

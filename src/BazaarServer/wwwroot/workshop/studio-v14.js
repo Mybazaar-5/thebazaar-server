@@ -516,6 +516,35 @@
     $('abGeneratedJson').value = JSON.stringify(obj, null, 2);
   }
 
+  function renderVfxOptionsHtml(selectedVal) {
+    const cat = catalog();
+    const presets = (cat.mechanicSchema && cat.mechanicSchema.vfxPresets) || [];
+    const rawKeys = cat.vfxKeys || [];
+    const cur = selectedVal || '';
+    const seen = new Set();
+    let html = '<option value="">（使用默认特效）</option>';
+    if (presets.length > 0) {
+      html += '<optgroup label="✨ 官方实测推荐特效（中文预设）">';
+      presets.forEach((p) => {
+        seen.add(p.id);
+        html += `<option value="${escapeHtml(p.id)}" ${cur === p.id ? 'selected' : ''}>${escapeHtml(p.nameZh)} [${escapeHtml(p.category || '特效')}]</option>`;
+      });
+      html += '</optgroup>';
+    }
+    const extraRaw = rawKeys.filter((k) => !seen.has(k));
+    if (extraRaw.length > 0) {
+      html += '<optgroup label="🔧 全部官方原生 Prefab 键">';
+      extraRaw.forEach((k) => {
+        html += `<option value="${escapeHtml(k)}" ${cur === k ? 'selected' : ''}>${escapeHtml(k)}</option>`;
+      });
+      html += '</optgroup>';
+    }
+    if (cur && !seen.has(cur) && !rawKeys.includes(cur)) {
+      html += `<option value="${escapeHtml(cur)}" selected>${escapeHtml(cur)}（自定义）</option>`;
+    }
+    return html;
+  }
+
   function renderBuilderActionsList() {
     const cat = catalog();
     const allActions = (cat.actions || []).filter((a) => a.id !== 'TActionAnd');
@@ -523,7 +552,6 @@
     const htags = cat.hiddenTags || [];
     const attrs = cat.attributes || [];
     const enchants = cat.enchantments || [];
-    const vfxKeys = cat.vfxKeys || [];
 
     const box = $('abActionsList');
     box.innerHTML = v14.builderState.actions.map((row, idx) => {
@@ -608,8 +636,7 @@
             <label class="field">
               <span>专属战斗特效（可选，留空用默认特效）</span>
               <select data-af="vfxKey" data-aidx="${idx}">
-                <option value="">（使用默认特效）</option>
-                ${vfxKeys.map((k) => `<option value="${escapeHtml(k)}" ${k === row.vfxKey ? 'selected' : ''}>${escapeHtml(k)}</option>`).join('')}
+                ${renderVfxOptionsHtml(row.vfxKey)}
               </select>
             </label>
           </div>
@@ -981,7 +1008,7 @@
         } else if (p.type === 'targetMode') {
           ctrl = `<select data-mp-idx="${idx}" data-mp-key="${escapeHtml(p.key)}" data-mp-type="string">${(mSchema.targetModes || []).map((tm) => `<option value="${escapeHtml(tm.id)}" ${cur === tm.id ? 'selected' : ''}>${escapeHtml(tm.nameZh)}</option>`).join('')}</select>`;
         } else if (p.type === 'vfxKey') {
-          ctrl = `<select data-mp-idx="${idx}" data-mp-key="${escapeHtml(p.key)}" data-mp-type="string"><option value="">默认特效</option>${(cat.vfxKeys || []).map((k) => `<option value="${escapeHtml(k)}" ${cur === k ? 'selected' : ''}>${escapeHtml(k)}</option>`).join('')}</select>`;
+          ctrl = `<select data-mp-idx="${idx}" data-mp-key="${escapeHtml(p.key)}" data-mp-type="string">${renderVfxOptionsHtml(cur)}</select>`;
         } else if (p.type === 'int' || p.type === 'float') {
           ctrl = `<input type="number" step="${p.type === 'float' ? '0.1' : '1'}" ${p.min != null ? `min="${p.min}"` : ''} ${p.max != null ? `max="${p.max}"` : ''} value="${escapeHtml(cur)}" data-mp-idx="${idx}" data-mp-key="${escapeHtml(p.key)}" data-mp-type="${p.type}" />`;
         } else {
@@ -1660,6 +1687,49 @@
     });
   }
 
+  const PLAYABLE_HERO_IDS = ['Vanessa', 'Dooley', 'Pygmalien', 'Mak', 'Karnok', 'Jules', 'Stelle', 'Hero8'];
+
+  function renderHeroPillGroup(containerId, heroesCatalog, selectedList, onToggle) {
+    const box = $(containerId);
+    if (!box) return;
+    const selectedSet = new Set(selectedList || []);
+    const allPlayableSelected = PLAYABLE_HERO_IDS.every((h) => selectedSet.has(h)) && !selectedSet.has('Common');
+    const playableItems = (heroesCatalog || []).filter((h) => h.id !== 'Common');
+    const commonItem = (heroesCatalog || []).find((h) => h.id === 'Common')
+      || { id: 'Common', nameZh: '中立/奇物店专属 (Common)' };
+
+    let html = `<button type="button" class="pill-btn ${allPlayableSelected ? 'active' : ''}" data-hero-action="all-playable" title="自动勾选全部 8 位英雄，杰杰等常规商店均可按正常概率刷出">✨ 全 8 英雄常规店通用</button>`;
+    html += playableItems.map((item) => {
+      const active = selectedSet.has(item.id) ? 'active' : '';
+      return `<button type="button" class="pill-btn ${active}" data-pill-val="${escapeHtml(item.id)}" title="${escapeHtml(item.descZh || '')}">${escapeHtml(item.nameZh || item.id)}</button>`;
+    }).join('');
+    html += `<button type="button" class="pill-btn ${selectedSet.has('Common') ? 'active' : ''}" data-pill-val="Common" title="仅在 Curio 等中立奇物商店刷出，不会出现在杰杰等常规英雄店">🧭 ${escapeHtml(commonItem.nameZh)}</button>`;
+    box.innerHTML = html;
+
+    box.querySelector('[data-hero-action="all-playable"]')?.addEventListener('click', () => {
+      onToggle([...PLAYABLE_HERO_IDS]);
+    });
+
+    box.querySelectorAll('[data-pill-val]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const val = btn.dataset.pillVal;
+        let next = Array.from(selectedSet);
+        if (val === 'Common') {
+          next = ['Common'];
+        } else {
+          if (selectedSet.has(val)) {
+            next = next.filter((x) => x !== val);
+          } else {
+            next = next.filter((x) => x !== 'Common');
+            next.push(val);
+          }
+          if (next.length === 0) next = [...PLAYABLE_HERO_IDS];
+        }
+        onToggle(next);
+      });
+    });
+  }
+
   function renderAllPillPickers() {
     const cat = catalog();
     const heroes = cat.heroes || [];
@@ -1670,13 +1740,13 @@
     // 1) 自定义新卡：英雄、物品标签、效果分类
     const card = st.workspace && st.selectedCardIdx >= 0 ? st.workspace.cards[st.selectedCardIdx] : null;
     if (card) {
-      renderPillGroup('ceHeroPills', heroes, card.heroes || ['Common'], (next) => {
+      renderHeroPillGroup('ceHeroPills', heroes, card.heroes && card.heroes.length ? card.heroes : [...PLAYABLE_HERO_IDS], (next) => {
         card.heroes = next;
         if ($('ceHeroes')) $('ceHeroes').value = next.join(', ');
         B().markDirty(true);
         renderAllPillPickers();
         B().updateLivePreview(card);
-      }, { exclusiveValue: 'Common', fallbackValue: 'Common' });
+      });
 
       renderPillGroup('ceTagPills', tags, card.tags || [], (next) => {
         card.tags = next;

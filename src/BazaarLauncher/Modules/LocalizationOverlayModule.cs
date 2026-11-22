@@ -1240,45 +1240,71 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         }
 
         var members = GetCardMemberCache(cardInst.GetType());
-        if (SafeGetPropertyValue(members.Attributes, cardInst) is not IDictionary attrs)
-        {
-            return template;
-        }
+        var attrs = SafeGetPropertyValue(members.Attributes, cardInst) as IDictionary;
 
-        string curTier = isUpgradePreview ? SafeGetPropertyValue(members.Tier, cardInst)?.ToString() : null;
+        string curTier = SafeGetPropertyValue(members.Tier, cardInst)?.ToString();
         string nextTier = isUpgradePreview ? GetNextTierName(curTier) : null;
         Dictionary<string, double> curBaseMap = null;
         Dictionary<string, double> nextBaseMap = null;
-        if (nextTier != null && ov?.TierAttributes != null)
+        if (ov?.TierAttributes != null && ov.TierAttributes.Count > 0)
         {
-            ov.TierAttributes.TryGetValue(curTier ?? string.Empty, out curBaseMap);
-            ov.TierAttributes.TryGetValue(nextTier, out nextBaseMap);
+            if (!string.IsNullOrEmpty(curTier))
+                ov.TierAttributes.TryGetValue(curTier, out curBaseMap);
+            if (curBaseMap == null)
+            {
+                // 兜底：若当前品阶未显式列于 TierAttributes，取第一个可用阶
+                foreach (var kv in ov.TierAttributes) { curBaseMap = kv.Value; break; }
+            }
+            if (nextTier != null)
+                ov.TierAttributes.TryGetValue(nextTier, out nextBaseMap);
         }
 
         return AttrPlaceholderRegex.Replace(template, m =>
         {
             string attrName = m.Groups[1].Value;
-            foreach (DictionaryEntry kv in attrs)
-            {
-                if (string.Equals(kv.Key?.ToString(), attrName, StringComparison.OrdinalIgnoreCase))
-                {
-                    if (!double.TryParse(kv.Value?.ToString(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double curRaw))
-                        return kv.Value?.ToString() ?? "0";
+            double curRaw = 0;
+            bool found = false;
 
-                    string curStr = FormatAttrNumber(attrName, curRaw);
-                    if (isUpgradePreview && nextBaseMap != null && nextBaseMap.TryGetValue(attrName, out double nextBaseRaw))
+            if (attrs != null)
+            {
+                foreach (DictionaryEntry kv in attrs)
+                {
+                    if (string.Equals(kv.Key?.ToString(), attrName, StringComparison.OrdinalIgnoreCase))
                     {
-                        double nextRaw = nextBaseRaw;
-                        if (curBaseMap != null && curBaseMap.TryGetValue(attrName, out double curBaseRaw))
-                            nextRaw = Math.Max(0, nextBaseRaw + (curRaw - curBaseRaw));
-                        string nextStr = FormatAttrNumber(attrName, nextRaw);
-                        if (!string.Equals(curStr, nextStr, StringComparison.Ordinal))
-                            return $"{curStr} → <color=#4ADE80>{nextStr}</color>";
+                        if (!double.TryParse(kv.Value?.ToString(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out curRaw))
+                            return kv.Value?.ToString() ?? "0";
+                        found = true;
+                        break;
                     }
-                    return curStr;
                 }
             }
-            return m.Value;
+
+            // V14.2 问题 1 通用根治：
+            // 当属性不在官方 ECardAttributeType 枚举中（如 GoldGainAmount 或自定义属性）导致运行时字典不含该键时，
+            // 自动回退读取服务端同步的四阶 TierAttributes[当前阶]，彻底杜绝界面裸露 "attr.XXX" 乱码，且完整支持升阶预览箭头。
+            if (!found && curBaseMap != null && curBaseMap.TryGetValue(attrName, out double tierFallbackVal))
+            {
+                curRaw = tierFallbackVal;
+                found = true;
+            }
+            if (!found && attrName.StartsWith("Custom_", StringComparison.OrdinalIgnoreCase))
+            {
+                curRaw = 0;
+                found = true;
+            }
+            if (!found) return m.Value;
+
+            string curStr = FormatAttrNumber(attrName, curRaw);
+            if (isUpgradePreview && nextBaseMap != null && nextBaseMap.TryGetValue(attrName, out double nextBaseRaw))
+            {
+                double nextRaw = nextBaseRaw;
+                if (curBaseMap != null && curBaseMap.TryGetValue(attrName, out double curBaseRaw))
+                    nextRaw = Math.Max(0, nextBaseRaw + (curRaw - curBaseRaw));
+                string nextStr = FormatAttrNumber(attrName, nextRaw);
+                if (!string.Equals(curStr, nextStr, StringComparison.Ordinal))
+                    return $"{curStr} → <color=#4ADE80>{nextStr}</color>";
+            }
+            return curStr;
         });
     }
 

@@ -654,7 +654,7 @@ public sealed class RunEngine
                 var fuseCore = EnsureCoreCard(fuseTarget);
                 fuseCore.ApplyEnchantment(finalEnchantment!.Value.ToString(), preventOverride: false, isTemporary: false);
             }
-            UpgradeCardEntryToTier(fuseTarget, nextTier);
+            UpgradeCardEntryToTier(fuseTarget, nextTier, o.DirtyCardIds, o.Events);
             _run.SelectionsMadeInCurrentContext++;
 
             o.Events.Add(new GameSimEventCardPurchased(
@@ -859,14 +859,19 @@ public sealed class RunEngine
     {
         if (incoming.Type is not (ECardType.Item or ECardType.Skill) || incoming.Tier >= ETier.Diamond)
             return null;
+        string incomingCoreId = RunState.ResolveCoreTemplateId(incoming);
         return _run.Cards.Values.FirstOrDefault(c =>
             c.Owner == ECombatantId.Player &&
             c.Type == incoming.Type &&
-            c.TemplateId == incoming.TemplateId &&
+            string.Equals(RunState.ResolveCoreTemplateId(c), incomingCoreId, StringComparison.OrdinalIgnoreCase) &&
             c.Tier == incoming.Tier);
     }
 
-    private void UpgradeCardEntryToTier(RunState.CardEntry entry, ETier nextTier)
+    private void UpgradeCardEntryToTier(
+        RunState.CardEntry entry,
+        ETier nextTier,
+        ICollection<string>? dirtyCardIds = null,
+        List<IGameSimEvent>? uiRefreshEvents = null)
     {
         entry.Tier = nextTier;
 
@@ -893,8 +898,28 @@ public sealed class RunEngine
         }
 
         // 将 CoreCard 升阶后变化的新基础属性同步进 entry.Attributes（不发重复 Upgrade 事件，由调用方按需派发）
-        var dummyEvents = new List<IGameSimEvent>();
-        dummyEvents.AddRange(_run.SyncEntryFromCoreCardAndDiff(entry, _repo.GameMode.StandardPrices, emitAuraRefreshEvent: false));
+        _ = _run.SyncEntryFromCoreCardAndDiff(entry, _repo.GameMode.StandardPrices, emitAuraRefreshEvent: false);
+
+        // V14.2 问题 6 通用根治：
+        // 客户端执行 GameSimEventCardUpgraded 时会按原版载体 TemplateId 的升阶表重算面板数值；
+        // 必须把服务端升阶后的全量有效属性写入 PendingForceSyncAttributes 并标脏下发 SimUpdateCard，
+        // 彻底覆盖载体模板的旧阶/恒定数值，确保任意自定义卡的基础伤害、冷却与 Custom_* 随品阶同步生效。
+        foreach (var (attrType, attrVal) in entry.Attributes)
+            entry.PendingForceSyncAttributes[attrType] = attrVal;
+        dirtyCardIds?.Add(entry.InstanceId);
+
+        if (uiRefreshEvents != null && entry.Type == ECardType.Item)
+        {
+            uiRefreshEvents.Add(new GameSimEventEffectAuraExecuted
+            {
+                ExecutionContextId = "upg_sync_" + entry.InstanceId + "_" + nextTier,
+                EffectId = "CardUpgradeAttrSync",
+                AppliedTo = new HashSet<IEffectTarget>
+                {
+                    new EffectTargetCard { Target = new BazaarGameShared.Domain.Core.InstanceId(entry.InstanceId) },
+                },
+            });
+        }
     }
 
     private bool TryPlaceIntoSection(
@@ -1385,10 +1410,11 @@ public sealed class RunEngine
         bool isSameTierFuse = fuseTarget != null;
         if (fuseTarget == null)
         {
+            string cardCoreId = RunState.ResolveCoreTemplateId(card);
             var existingOwnedSkill = _run.Cards.Values.FirstOrDefault(c =>
                 c.Owner == ECombatantId.Player &&
                 c.Type == ECardType.Skill &&
-                c.TemplateId == card.TemplateId);
+                string.Equals(RunState.ResolveCoreTemplateId(c), cardCoreId, StringComparison.OrdinalIgnoreCase));
             if (existingOwnedSkill != null)
             {
                 if (existingOwnedSkill.Tier >= card.Tier)
@@ -1415,7 +1441,7 @@ public sealed class RunEngine
             }
 
             ETier nextTier = isSameTierFuse ? fuseTarget.Tier + 1 : card.Tier;
-            UpgradeCardEntryToTier(fuseTarget, nextTier);
+            UpgradeCardEntryToTier(fuseTarget, nextTier, o.DirtyCardIds, o.Events);
 
             o.Events.Add(new GameSimEventCardPurchased(
                 selectedId,
@@ -1827,6 +1853,25 @@ public sealed class RunEngine
         _run.SelectionsMadeInCurrentContext++;
         var o = new Outcome();
         o.Events.AddRange(stepResult.Events);
+        if (stepResult.ModifiedCardIds.Count > 0)
+        {
+            var refreshTargets = new HashSet<IEffectTarget>();
+            foreach (string modId in stepResult.ModifiedCardIds)
+            {
+                o.DirtyCardIds.Add(modId);
+                if (_run.Cards.TryGetValue(modId, out var modEntry) && modEntry.Type == ECardType.Item)
+                    refreshTargets.Add(new EffectTargetCard { Target = new BazaarGameShared.Domain.Core.InstanceId(modId) });
+            }
+            if (refreshTargets.Count > 0)
+            {
+                o.Events.Add(new GameSimEventEffectAuraExecuted
+                {
+                    ExecutionContextId = "step_sync_" + _run.Day + "_" + _run.Hour,
+                    EffectId = "EncounterStepAttrSync",
+                    AppliedTo = refreshTargets,
+                });
+            }
+        }
 
         // 先对 EncounterStepEngine 的变形/发卡执行单真值网格校验并校准事件坐标，再重算局外光环
         ReconcileAndVerifyBoardInvariants("EncounterStep", o.DirtyCardIds, o.Events, preStepPlacements);
@@ -3912,7 +3957,7 @@ public sealed class RunEngine
                 if (card.Tier >= ETier.Diamond || nextTier > ETier.Diamond)
                     return NotAllowed("该卡牌已达最高品阶，无法继续升阶");
 
-                UpgradeCardEntryToTier(card, nextTier);
+                UpgradeCardEntryToTier(card, nextTier, o.DirtyCardIds, o.Events);
                 o.Events.Add(new GameSimEventPedestalActivated());
                 o.Events.Add(new GameSimEventCardUpgraded(card.InstanceId, nextTier));
 
@@ -5681,11 +5726,45 @@ public sealed class RunEngine
             core.CombatAdd.Clear();
             core.CombatMult.Clear();
             core.CombatTags.Clear();
+            core.CombatCustomFlags.Clear();
+            core.CombatCustomCounters.Clear();
             core.TransformedFromInstanceId = null;
         }
 
         // 先清除 Combat 临时状态并重算局外光环，确保固有/光环飞行为 1、纯战斗临时状态为 0，弹药恢复至 EffectiveAmmoMax
         RecalculateAurasAndSyncBoard(events);
+
+        // V14.2 问题 4 通用根治：战斗回放可能由原版卡或任意自定义机制临时修改伤害/护盾/冷却/Custom_* 等属性，
+        // 战后服务端虽已清除 CombatAdd/CombatMult，但客户端本地卡牌内存仍残留战中最终值；
+        // 因此战后首帧必须将所有核心战斗属性强刷回服务端权威局外基线，杜绝“本战临时增益看似永久”的视觉残留。
+        ECardAttributeType[] postCombatResetAttrs =
+        [
+            ECardAttributeType.DamageAmount,
+            ECardAttributeType.ShieldApplyAmount,
+            ECardAttributeType.BurnApplyAmount,
+            ECardAttributeType.PoisonApplyAmount,
+            ECardAttributeType.HealAmount,
+            ECardAttributeType.RegenApplyAmount,
+            ECardAttributeType.CooldownMax,
+            ECardAttributeType.HasteAmount,
+            ECardAttributeType.SlowAmount,
+            ECardAttributeType.FreezeAmount,
+            ECardAttributeType.ChargeAmount,
+            ECardAttributeType.CritChance,
+            ECardAttributeType.Multicast,
+            ECardAttributeType.Lifesteal,
+            ECardAttributeType.Counter,
+            ECardAttributeType.SellPrice,
+            ECardAttributeType.Custom_0,
+            ECardAttributeType.Custom_1,
+            ECardAttributeType.Custom_2,
+            ECardAttributeType.Custom_3,
+            ECardAttributeType.Custom_4,
+            ECardAttributeType.Custom_5,
+            ECardAttributeType.Custom_6,
+            ECardAttributeType.Custom_7,
+            ECardAttributeType.Custom_8,
+        ];
 
         foreach (var entry in _run.Cards.Values)
         {
@@ -5705,7 +5784,7 @@ public sealed class RunEngine
             if (ammoMax > 0 || entry.Attributes.ContainsKey(ECardAttributeType.Ammo))
                 entry.Attributes[ECardAttributeType.Ammo] = ammoMax;
 
-            // 在战后首帧 NetMessageGameSim.Data.Cards 显式下发这些属性的归零/弹药补满 SimUpdateCard，彻底清除客户端残余飞行/冰冻特效
+            // 在战后首帧 NetMessageGameSim.Data.Cards 显式下发这些属性的归零/弹药补满/局外基线还原 SimUpdateCard
             entry.PendingForceSyncAttributes[ECardAttributeType.Freeze] = 0;
             entry.PendingForceSyncAttributes[ECardAttributeType.Slow] = 0;
             entry.PendingForceSyncAttributes[ECardAttributeType.Haste] = 0;
@@ -5714,6 +5793,29 @@ public sealed class RunEngine
             entry.PendingForceSyncAttributes[ECardAttributeType.Chilled] = outChilled;
             if (ammoMax > 0 || entry.Attributes.ContainsKey(ECardAttributeType.Ammo))
                 entry.PendingForceSyncAttributes[ECardAttributeType.Ammo] = ammoMax;
+
+            foreach (var attrType in postCombatResetAttrs)
+            {
+                if (core != null)
+                {
+                    string attrName = attrType.ToString();
+                    bool existsOnCard = entry.Attributes.ContainsKey(attrType)
+                        || core.BaseAttributes.ContainsKey(attrName)
+                        || core.PermanentAdd.ContainsKey(attrName)
+                        || core.HourAdd.ContainsKey(attrName)
+                        || core.DayAdd.ContainsKey(attrName)
+                        || core.AuraAdd.ContainsKey(attrName);
+                    if (!existsOnCard) continue;
+
+                    int restored = (int)Math.Round(core.GetAttribute(attrName));
+                    entry.Attributes[attrType] = restored;
+                    entry.PendingForceSyncAttributes[attrType] = restored;
+                }
+                else if (entry.Attributes.TryGetValue(attrType, out int existingVal))
+                {
+                    entry.PendingForceSyncAttributes[attrType] = existingVal;
+                }
+            }
             dirtyCardIds?.Add(entry.InstanceId);
         }
     }

@@ -135,6 +135,23 @@ public sealed class LocalizationRegexRule
 }
 
 /// <summary>
+/// 通用自定义机制卡面实时计数角标描述（由服务端解析并下发，任意自定义叠层/充能/倒计时机制共用）。
+/// </summary>
+public sealed class CardCounterDisplayInfo
+{
+    /// <summary>角标中文短名（如「过载」「剑意」「热量」）。</summary>
+    public string LabelZh { get; set; } = string.Empty;
+    /// <summary>绑定的原生同步属性槽（Custom_0..Custom_8）。</summary>
+    public string SyncAttribute { get; set; } = "Custom_3";
+    /// <summary>可选上限值（存在时按「当前/上限」展示）。</summary>
+    public int? MaxValue { get; set; }
+    /// <summary>角标高光色（十六进制如 "#F97316"）。</summary>
+    public string? ColorHex { get; set; }
+    /// <summary>为 true 时计数为 0 自动隐藏。</summary>
+    public bool HideWhenZero { get; set; }
+}
+
+/// <summary>
 /// 实例级或模板级卡牌名称、描述、主被动词条与附加展示标签覆盖模型。
 /// </summary>
 public sealed class CardTextOverride
@@ -174,6 +191,9 @@ public sealed class CardTextOverride
 
     /// <summary>四阶属性表（Bronze/Silver/Gold/Diamond），供局内自定义卡升级预览精准渲染下一阶数值。</summary>
     public Dictionary<string, Dictionary<string, double>>? TierAttributes { get; set; }
+
+    /// <summary>通用机制实时计数角标列表（如过载 2/3、剑意 4/5 等）。</summary>
+    public CardCounterDisplayInfo[]? CounterDisplays { get; set; }
 
     /// <summary>同级冲突时的覆盖优先级。</summary>
     public int Priority { get; set; }

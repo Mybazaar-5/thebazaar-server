@@ -456,6 +456,12 @@ public sealed class ModRegistry : IModContentRegistry
                         AccentColor = binding.AccentColor
                     };
                 }
+                if (mergedCardsById.TryGetValue(cid, out var mergedTpl) && mergedTpl.CustomMechanics is { Count: > 0 })
+                {
+                    var displays = ResolveCounterDisplaysForCard(mergedTpl.CustomMechanics, mechanicsMap);
+                    if (displays.Count > 0)
+                        resolved.CounterDisplays = displays;
+                }
                 visualBindingsMap[cid] = resolved;
             }
 
@@ -798,5 +804,125 @@ public sealed class ModRegistry : IModContentRegistry
         string composite = $"{report.ModSetHash}|{localizationHash}|{visualCatalogHash}";
         dto.ManifestHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(composite))).ToLowerInvariant();
         return dto;
+    }
+
+    /// <summary>
+    /// 通用解析某张卡牌挂载的全部自定义机制的实时计数角标配置：
+    /// 1. 优先消费机制显式声明的 counterDisplay（自动解析 maxParam 参数或 maxConst 常量）；
+    /// 2. 若机制未手写 counterDisplay，但步骤流中使用了 ModifyCounter + syncAttribute，则自动推导默认角标，
+    ///    确保任意玩家/开发者自创的叠层、充能、倒计时机制都能开箱即得实时卡面进度显示。
+    /// </summary>
+    private static List<ResolvedCounterDisplay> ResolveCounterDisplaysForCard(
+        IReadOnlyList<CardMechanicAttachment> attachments,
+        IReadOnlyDictionary<string, MechanicDefinition> mechanicsMap)
+    {
+        var list = new List<ResolvedCounterDisplay>();
+        var usedSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var att in attachments)
+        {
+            if (att == null || !att.Enabled || string.IsNullOrWhiteSpace(att.MechanicId)) continue;
+            if (!mechanicsMap.TryGetValue(att.MechanicId.Trim(), out var mech) || mech == null) continue;
+
+            if (mech.CounterDisplay != null && !string.IsNullOrWhiteSpace(mech.CounterDisplay.SyncAttribute))
+            {
+                var cd = mech.CounterDisplay;
+                string slot = cd.SyncAttribute.Trim();
+                if (!usedSlots.Add(slot)) continue;
+
+                int? maxVal = cd.MaxConst;
+                if (!string.IsNullOrWhiteSpace(cd.MaxParam))
+                    maxVal = TryResolveMechanicIntParam(mech, att, cd.MaxParam!) ?? maxVal;
+
+                list.Add(new ResolvedCounterDisplay
+                {
+                    LabelZh = !string.IsNullOrWhiteSpace(cd.LabelZh) ? cd.LabelZh.Trim() : (mech.NameZh ?? "层数"),
+                    SyncAttribute = slot,
+                    MaxValue = maxVal,
+                    ColorHex = string.IsNullOrWhiteSpace(cd.ColorHex) ? "#F97316" : cd.ColorHex!.Trim(),
+                    HideWhenZero = cd.HideWhenZero
+                });
+                continue;
+            }
+
+            // 自动推导兜底：扫描该机制任意步骤里的 ModifyCounter.syncAttribute
+            string? autoSlot = FindFirstSyncAttribute(mech.Hooks);
+            if (!string.IsNullOrWhiteSpace(autoSlot) && usedSlots.Add(autoSlot!))
+            {
+                int? inferredMax = TryResolveMechanicIntParam(mech, att, "threshold")
+                                ?? TryResolveMechanicIntParam(mech, att, "maxStacks")
+                                ?? TryResolveMechanicIntParam(mech, att, "charges");
+                list.Add(new ResolvedCounterDisplay
+                {
+                    LabelZh = !string.IsNullOrWhiteSpace(mech.NameZh) ? mech.NameZh.Trim() : "计数",
+                    SyncAttribute = autoSlot!,
+                    MaxValue = inferredMax,
+                    ColorHex = "#38BDF8",
+                    HideWhenZero = false
+                });
+            }
+        }
+
+        return list;
+    }
+
+    private static int? TryResolveMechanicIntParam(MechanicDefinition mech, CardMechanicAttachment att, string paramKey)
+    {
+        if (att.Params != null && att.Params.TryGetValue(paramKey, out var boundEl))
+        {
+            if (TryExtractInt(boundEl, out int bv)) return bv;
+        }
+        var pdef = mech.Parameters.FirstOrDefault(p => string.Equals(p.Key, paramKey, StringComparison.OrdinalIgnoreCase));
+        if (pdef?.DefaultValue is { } defEl && TryExtractInt(defEl, out int dv))
+            return dv;
+        return null;
+    }
+
+    private static bool TryExtractInt(System.Text.Json.JsonElement el, out int value)
+    {
+        value = 0;
+        if (el.ValueKind == System.Text.Json.JsonValueKind.Number)
+        {
+            if (el.TryGetInt32(out value)) return true;
+            if (el.TryGetDouble(out double d) && !double.IsNaN(d) && !double.IsInfinity(d))
+            {
+                value = (int)Math.Round(d);
+                return true;
+            }
+        }
+        else if (el.ValueKind == System.Text.Json.JsonValueKind.String && int.TryParse(el.GetString(), out value))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    private static string? FindFirstSyncAttribute(IReadOnlyList<MechanicHookDefinition>? hooks)
+    {
+        if (hooks == null) return null;
+        foreach (var h in hooks)
+        {
+            string? found = FindSyncAttrInSteps(h.Steps, 0);
+            if (!string.IsNullOrEmpty(found)) return found;
+        }
+        return null;
+    }
+
+    private static string? FindSyncAttrInSteps(IReadOnlyList<MechanicStep>? steps, int depth)
+    {
+        if (steps == null || depth > 8) return null;
+        foreach (var s in steps)
+        {
+            if (s == null) continue;
+            if (string.Equals(s.Op, "ModifyCounter", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(s.SyncAttribute)
+                && MechanicDefinition.AllowedSyncAttributes.Contains(s.SyncAttribute))
+                return s.SyncAttribute.Trim();
+            string? sub = FindSyncAttrInSteps(s.Then, depth + 1)
+                       ?? FindSyncAttrInSteps(s.Else, depth + 1)
+                       ?? FindSyncAttrInSteps(s.Steps, depth + 1);
+            if (!string.IsNullOrEmpty(sub)) return sub;
+        }
+        return null;
     }
 }

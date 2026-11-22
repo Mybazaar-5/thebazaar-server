@@ -238,6 +238,10 @@ public sealed class MechanicStep
     [JsonPropertyName("count")]
     public MechanicValueExpr? Count { get; set; }
 
+    /// <summary>可选首段延迟（ms），用于 Repeat 连击与主攻击错峰发射（0 表示首段立即触发）。</summary>
+    [JsonPropertyName("initialDelayMs")]
+    public MechanicValueExpr? InitialDelayMs { get; set; }
+
     [JsonPropertyName("intervalMs")]
     public MechanicValueExpr? IntervalMs { get; set; }
 
@@ -352,6 +356,37 @@ public sealed class MechanicHookDefinition
 }
 
 /// <summary>
+/// 通用自定义机制卡面实时计数角标声明（不绑定任何特定玩法：过载/剑意/热量/灵魂/蓄力等均可声明）。
+/// 客户端收到后会在对应卡牌左上/右上角渲染轻量实时胶囊，战斗中随 Custom_0..Custom_9 逐帧跳动。
+/// </summary>
+public sealed class MechanicCounterDisplay
+{
+    /// <summary>角标中文短名（如「过载」「剑意」「热量」「充能」）。</summary>
+    [JsonPropertyName("labelZh")]
+    public string LabelZh { get; set; } = string.Empty;
+
+    /// <summary>绑定的同步属性槽（Custom_0..Custom_9）。</summary>
+    [JsonPropertyName("syncAttribute")]
+    public string SyncAttribute { get; set; } = "Custom_3";
+
+    /// <summary>可选：从机制参数读取上限值（如 "threshold"），用于渲染「当前/上限」格式。</summary>
+    [JsonPropertyName("maxParam")]
+    public string? MaxParam { get; set; }
+
+    /// <summary>可选：固定上限常量（若未指定 maxParam 且未指定 maxConst，则渲染纯数字如「过载 2」）。</summary>
+    [JsonPropertyName("maxConst")]
+    public int? MaxConst { get; set; }
+
+    /// <summary>角标主题色（十六进制如 "#F97316"）。</summary>
+    [JsonPropertyName("colorHex")]
+    public string? ColorHex { get; set; }
+
+    /// <summary>为 true 时当层数为 0 自动隐藏角标；默认 false 以便局外也能清晰看到「0/3」。</summary>
+    [JsonPropertyName("hideWhenZero")]
+    public bool HideWhenZero { get; set; }
+}
+
+/// <summary>
 /// 声明式开放自定义机制完整定义（对应 mods/&lt;mod-id&gt;/mechanics/*.json）。
 /// 不预制具体玩法，由玩家或 Mod 开发者自由声明管线钩子、黑板状态与参数 Schema，并自动同步至 Web 创意工坊表单。
 /// </summary>
@@ -411,7 +446,8 @@ public sealed class MechanicDefinition
 
     public static readonly IReadOnlySet<string> AllowedSyncAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "Custom_0", "Custom_1", "Custom_2", "Custom_3"
+        "Custom_0", "Custom_1", "Custom_2", "Custom_3", "Custom_4",
+        "Custom_5", "Custom_6", "Custom_7", "Custom_8"
     };
 
     [JsonPropertyName("id")]
@@ -437,6 +473,10 @@ public sealed class MechanicDefinition
 
     [JsonPropertyName("tooltipTemplateZh")]
     public string? TooltipTemplateZh { get; set; }
+
+    /// <summary>可选：通用卡面实时计数角标配置（任意叠层/充能/倒计时机制均可声明）。</summary>
+    [JsonPropertyName("counterDisplay")]
+    public MechanicCounterDisplay? CounterDisplay { get; set; }
 
     [JsonPropertyName("hooks")]
     public List<MechanicHookDefinition> Hooks { get; set; } = new();

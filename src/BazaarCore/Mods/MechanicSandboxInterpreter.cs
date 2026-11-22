@@ -52,15 +52,19 @@ public static class MechanicSandboxInterpreter
                     int count = Math.Clamp(rawCount, 0, CombatMechanicRuntime.MaxRepeatCount);
                     if (count <= 0 || step.Steps == null || step.Steps.Count == 0) break;
 
+                    int initialDelayMs = step.InitialDelayMs != null
+                        ? Math.Clamp((int)Math.Round(EvaluateValue(step.InitialDelayMs, def, attachment, selfCard, ownerPlayer, opponentPlayer, pipeEvent, runtime)), 0, 10000)
+                        : 0;
                     int intervalMs = step.IntervalMs != null
                         ? Math.Clamp((int)Math.Round(EvaluateValue(step.IntervalMs, def, attachment, selfCard, ownerPlayer, opponentPlayer, pipeEvent, runtime)), 0, 10000)
                         : 0;
 
                     for (int k = 0; k < count; k++)
                     {
-                        if (intervalMs > 0 && k > 0)
+                        int totalDelay = initialDelayMs + intervalMs * k;
+                        if (totalDelay > 0)
                         {
-                            int delay = Math.Clamp(intervalMs * k, 20, 60000);
+                            int delay = Math.Clamp(totalDelay, 20, 60000);
                             var capturedSteps = step.Steps;
                             runtime.ScheduleDelayed(delay, def.Id, selfCard, _ =>
                             {

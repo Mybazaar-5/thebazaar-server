@@ -20,6 +20,12 @@ public static class CombatSimulator
     public const int MaxSameTickCardFires = 2;
     public const int MaxDispatchDepth = 24;
 
+    private static readonly string[] CustomAttrNames =
+    [
+        "Custom_0", "Custom_1", "Custom_2", "Custom_3", "Custom_4",
+        "Custom_5", "Custom_6", "Custom_7", "Custom_8"
+    ];
+
     private readonly record struct TriggerQueueKey(string PlayerId, string CardId);
     private readonly record struct IndexedAbility(CardInstance Card, AbilityDefinition Ability, int ActiveOrder);
 
@@ -74,6 +80,7 @@ public static class CombatSimulator
         public int SellPrice;
         public bool AuraHeated;
         public bool AuraChilled;
+        public int[]? CustomAttrs;
     }
 
     /// <summary>
@@ -979,7 +986,29 @@ public static class CombatSimulator
                         ctx.OnForceUseRequested?.Invoke(targetCard, srcCard);
                     },
                     RecalculateAuras = () => RecalculateCombatAuras(),
-                    IsValidVfxKey = key => !string.IsNullOrWhiteSpace(key) && key.Length <= 80 && key.All(ch => char.IsLetterOrDigit(ch) || ch is '_' or '-' or ' ')
+                    IsValidVfxKey = key =>
+                    {
+                        var resolved = ModRuleCatalog.ResolveOfficialVfxKey(key);
+                        return !string.IsNullOrWhiteSpace(resolved)
+                            && resolved.Length <= 160
+                            && resolved.All(ch => char.IsLetterOrDigit(ch) || ch is '_' or '-' or ' ' or '/' or '.');
+                    },
+                    OnCardCounterSynced = (card, syncAttr, newVal) =>
+                    {
+                        if (!recordEvents) return;
+                        var owner = (p1.Hand.Cards.Contains(card) || p1.Skills.Contains(card) || p1.Stash.Cards.Contains(card)) ? p1 : p2;
+                        Emit(new CombatEvent
+                        {
+                            TimeMs = timeMs,
+                            Type = CombatEventType.CardAttributeModified,
+                            SourcePlayerId = owner.PlayerId,
+                            TargetPlayerId = owner.PlayerId,
+                            SourceCardInstanceId = card.InstanceId,
+                            TargetCardInstanceId = card.InstanceId,
+                            Detail = syncAttr,
+                            Value = newVal
+                        });
+                    }
                 },
                 frozenDefs,
                 activeInterceptors);
@@ -2824,6 +2853,29 @@ public static class CombatSimulator
             return (int)Math.Round(v);
         }
 
+        static int[]? ReadCustomAttrsSparse(CardInstance c)
+        {
+            int[]? arr = null;
+            for (int ci = 0; ci < CustomAttrNames.Length; ci++)
+            {
+                string key = CustomAttrNames[ci];
+                bool hasKey = (c.BaseAttributes.Count > 0 && c.BaseAttributes.ContainsKey(key))
+                           || (c.PermanentAdd.Count > 0 && c.PermanentAdd.ContainsKey(key))
+                           || (c.CombatAdd.Count > 0 && c.CombatAdd.ContainsKey(key))
+                           || (c.AuraAdd.Count > 0 && c.AuraAdd.ContainsKey(key))
+                           || (c.HourAdd.Count > 0 && c.HourAdd.ContainsKey(key))
+                           || (c.DayAdd.Count > 0 && c.DayAdd.ContainsKey(key));
+                if (!hasKey) continue;
+                int v = ReadIntAttr(c, key);
+                if (v != 0)
+                {
+                    arr ??= new int[CustomAttrNames.Length];
+                    arr[ci] = v;
+                }
+            }
+            return arr;
+        }
+
         var cards = new List<CardCooldownFrame>(p1.Hand.Cards.Count + p2.Hand.Cards.Count);
 
         void AppendHandFrames(List<CardInstance> handCards)
@@ -2856,6 +2908,7 @@ public static class CombatSimulator
                         cached.SellPrice = c.GetSellPrice(prices);
                         cached.AuraHeated = c.GetAttribute("Heated") > 0;
                         cached.AuraChilled = c.GetAttribute("Chilled") > 0;
+                        cached.CustomAttrs = ReadCustomAttrsSparse(c);
                     }
                 }
                 else
@@ -2875,7 +2928,8 @@ public static class CombatSimulator
                         Lifesteal = ReadIntAttr(c, "Lifesteal"),
                         SellPrice = c.GetSellPrice(prices),
                         AuraHeated = c.GetAttribute("Heated") > 0,
-                        AuraChilled = c.GetAttribute("Chilled") > 0
+                        AuraChilled = c.GetAttribute("Chilled") > 0,
+                        CustomAttrs = ReadCustomAttrsSparse(c)
                     };
                 }
 
@@ -2908,7 +2962,8 @@ public static class CombatSimulator
                     Multicast = cached.Multicast,
                     Lifesteal = cached.Lifesteal,
                     SellPrice = cached.SellPrice,
-                    Counter = c.TimesFiredThisFight
+                    Counter = c.TimesFiredThisFight,
+                    CustomAttrs = cached.CustomAttrs
                 });
             }
         }

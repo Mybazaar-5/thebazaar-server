@@ -97,6 +97,8 @@ public sealed class CardCooldownFrame
     public int Lifesteal { get; init; }
     public int SellPrice { get; init; }
     public int Counter { get; init; }
+    /// <summary>Custom_0..Custom_9 动态属性值快照（按需稀疏分配，原版无自定义属性卡牌保持 null 零开销）。</summary>
+    public int[]? CustomAttrs { get; init; }
 }
 
 public sealed class CombatTickState

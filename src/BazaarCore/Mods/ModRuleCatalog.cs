@@ -25,6 +25,84 @@ public static class ModRuleCatalog
         [property: JsonPropertyName("descZh")] string DescZh,
         [property: JsonPropertyName("template")] object Template);
 
+    /// <summary>
+    /// 经过 dist/data/GameData.db 实测验证的官方 Unity Addressable 真实 VFX 特效预设库。
+    /// 友好短名（如 Fireball / Cannonball / LaserRed）会自动解析为客户端真实可加载的 Prefab 键；
+    /// 也完全支持高级作者直接填写 GameData.db 中全部 131 个原生 Assets/.../*.prefab 路径。
+    /// </summary>
+    public static readonly IReadOnlyList<CatalogItem> OfficialVfxPresets =
+    [
+        new("Fireball", "炽焰火球弹道 (Fireball)", "高速爆裂火焰弹道（官方 Harkuvian Launcher 爆裂火焰特效）", true, null, "火焰/爆炸"),
+        new("Flamethrower", "喷射烈焰 (Flamethrower)", "高冲击力火焰喷射特效（官方 Blow Torch 特效）", true, null, "火焰/爆炸"),
+        new("Firecracker", "爆竹火花 (Firecracker)", "轻快连续火花爆裂弹道（官方 Firecrackers 特效）", true, null, "火焰/爆炸"),
+        new("PowderKeg", "火药桶巨爆 (PowderKeg)", "大范围高能引爆特效（官方 Powder Keg 特效）", true, null, "火焰/爆炸"),
+        new("FireSlash", "烈焰斩击 (FireSlash)", "巨剑火焰劈斩特效（官方 Infernal Greatsword 特效）", true, null, "火焰/爆炸"),
+        new("BurnThrow", "燃焰抛射 (BurnThrow)", "灼烧药瓶抛射爆燃特效", false, null, "火焰/爆炸"),
+        new("Cannonball", "重型炮弹 (Cannonball)", "经典加农炮弹抛射（官方 Cannon 特效）", true, null, "弹道/重火"),
+        new("Missile", "追踪导弹 (Missile)", "连发火箭导弹齐射（官方 Miss Isles 特效）", true, null, "弹道/重火"),
+        new("VortexCannon", "涡流冲击炮 (VortexCannon)", "重型能量旋涡炮（官方 Vortex Cannon 特效）", false, null, "弹道/重火"),
+        new("LaserRed", "赤红激光 (LaserRed)", "红色高能射线（官方 Alpha Ray 特效）", true, null, "激光/电击"),
+        new("LaserOrange", "炽橙激光 (LaserOrange)", "橙色核心射线（官方 Ignition Core 特效）", true, null, "激光/电击"),
+        new("LaserBlue", "苍蓝激光 (LaserBlue)", "蓝色脉冲射线（官方 Beta Ray 特效）", true, null, "激光/电击"),
+        new("LaserGreen", "翠绿激光 (LaserGreen)", "绿色能量射线（官方 C.O.R.A 特效）", false, null, "激光/电击"),
+        new("SpaceLaser", "轨道太空激光 (SpaceLaser)", "巨型太空光束打击（官方 Space Laser 特效）", true, null, "激光/电击"),
+        new("Electric", "高压电弧 (Electric)", "电击闪电弹道（官方 Arc Blaster 特效）", true, null, "激光/电击"),
+        new("DragonSlash", "龙息斩击 (DragonSlash)", "凌厉刃气斩击（官方 Dragon Slash 特效）", true, null, "斩击/射击"),
+        new("Arrow", "劲箭射击 (Arrow)", "高速箭矢弹道（官方 Recurve Bow 特效）", false, null, "斩击/射击"),
+        new("Gunshot", "燧发枪击 (Gunshot)", "清脆手枪子弹射击（官方 Pistol Sword 特效）", false, null, "斩击/射击"),
+        new("IceBurst", "寒霜冰爆 (IceBurst)", "冰冻寒霜抛射特效", true, null, "异常/辅助"),
+        new("PoisonThrow", "剧毒泼洒 (PoisonThrow)", "剧毒药液抛射特效", true, null, "异常/辅助"),
+        new("ShieldOrb", "壁垒光球 (ShieldOrb)", "护盾防御弹道特效", false, null, "异常/辅助"),
+        new("HealOrb", "治愈光球 (HealOrb)", "生命回复弹道特效", false, null, "异常/辅助"),
+    ];
+
+    private static readonly Dictionary<string, string> OfficialVfxAliasMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Fireball"] = "Assets/TheBazaar/Projectiles/Fireworks/Projectile_HarkurvianLauncher_PV.prefab",
+        ["Fire"] = "Assets/TheBazaar/Projectiles/Fireworks/Projectile_HarkurvianLauncher_PV.prefab",
+        ["Flamethrower"] = "Projectile_Flamethrower_PV",
+        ["Firecracker"] = "Assets/TheBazaar/Projectiles/Fireworks/Projectile_Firecracker_PV.prefab",
+        ["PowderKeg"] = "Assets/TheBazaar/Projectiles/PowderKeg/Projectile_Powderkeg_PV.prefab",
+        ["Explosion"] = "Assets/TheBazaar/Projectiles/PowderKeg/Projectile_Powderkeg_PV.prefab",
+        ["FireSlash"] = "Assets/TheBazaar/Projectiles/FireSlashEpic/Projectile_Fireslashepic_PV.prefab",
+        ["FireClaw"] = "Assets/TheBazaar/Projectiles/FireClaw/Projectile_FireClaw_PV.prefab",
+        ["BurnThrow"] = "Assets/TheBazaar/Projectiles/PotionsThrowing/Burn/Projectile_PotionsThrowing_Burn_PV.prefab",
+        ["Burn"] = "Assets/TheBazaar/Projectiles/PotionsThrowing/Burn/Projectile_PotionsThrowing_Burn_PV.prefab",
+        ["Cannonball"] = "Assets/TheBazaar/Projectiles/Cannonball/Projectile_Cannonball_PV.prefab",
+        ["Missile"] = "Assets/TheBazaar/Projectiles/Missile/Projectile_Missile_PV.prefab",
+        ["VortexCannon"] = "Assets/TheBazaar/Projectiles/VortexCannon/Projectile_VortexCannon_PV.prefab",
+        ["LaserRed"] = "Projectile_LaserBeam_Red_PV",
+        ["LaserOrange"] = "Projectile_LaserBeam_Orange_PV",
+        ["LaserBlue"] = "Projectile_LaserBeam_Blue_PV",
+        ["LaserGreen"] = "Projectile_LaserBeam_Green_PV",
+        ["SpaceLaser"] = "Assets/TheBazaar/Projectiles/SpaceLaser/Projectile_SpaceLaser_PV.prefab",
+        ["Electric"] = "Projectile_Electric_PV",
+        ["Lightning"] = "Projectile_Electric_PV",
+        ["DragonSlash"] = "Assets/TheBazaar/Projectiles/SlashesDragons/Projectile_DragonSlash_M_PV.prefab",
+        ["Slash"] = "Assets/TheBazaar/Emitters/Slash/VFX_Slash_Tier2_PV.prefab",
+        ["Arrow"] = "Assets/TheBazaar/Projectiles/Arrow/Projectile_Damage_Arrow_PV.prefab",
+        ["Gunshot"] = "Assets/TheBazaar/Projectiles/ProjectilesForDerek/Projectile_ShootSingle_PV.prefab",
+        ["IceBurst"] = "Assets/TheBazaar/Projectiles/PotionsThrowing/Freeze/Projectile_PotionsThrowing_Freeze_PV.prefab",
+        ["Freeze"] = "Assets/TheBazaar/Projectiles/PotionsThrowing/Freeze/Projectile_PotionsThrowing_Freeze_PV.prefab",
+        ["PoisonThrow"] = "Assets/TheBazaar/Projectiles/PotionsThrowing/Poison/Projectile_PotionsThrowing_Poison_PV.prefab",
+        ["Poison"] = "Assets/TheBazaar/Projectiles/PotionsThrowing/Poison/Projectile_PotionsThrowing_Poison_PV.prefab",
+        ["ShieldOrb"] = "Assets/TheBazaar/Projectiles/PigglesLauncher/Shield/Projectile_PigglesShield_PV.prefab",
+        ["HealOrb"] = "Assets/TheBazaar/Projectiles/PigglesLauncher/Heal/Projectile_PigglesHeal_PV.prefab",
+    };
+
+    /// <summary>
+    /// 将友好特效别名（如 Fireball / Cannonball / LaserRed）解析为官方 Unity 客户端真实可加载的 Addressable Prefab 键；
+    /// 若已是原生官方路径（Assets/... 或 Projectile_...）则原样返回。
+    /// </summary>
+    public static string? ResolveOfficialVfxKey(string? rawKey)
+    {
+        if (string.IsNullOrWhiteSpace(rawKey)) return null;
+        string trimmed = rawKey.Trim();
+        if (OfficialVfxAliasMap.TryGetValue(trimmed, out var mapped))
+            return mapped;
+        return trimmed;
+    }
+
     /// <summary>引擎已真实实现的 4 种前置条件白名单（严格对齐 ValueAndConditionEvaluator.EvaluatePrerequisite）。</summary>
     public static readonly IReadOnlySet<string> SupportedPrerequisiteTypes = new HashSet<string>(StringComparer.Ordinal)
     {
@@ -164,6 +242,8 @@ public static class ModRuleCatalog
             heroes = new[] { HeroNames.Common }.Concat(HeroNames.PlayableHeroes).Select(h =>
             {
                 var p = HeroNames.GetHeroProfile(h);
+                if (string.Equals(h, HeroNames.Common, StringComparison.OrdinalIgnoreCase))
+                    return new CatalogItem(h, "中立/奇物店专属 (Common)", "仅在 Curio 等中立商店池刷出，不会出现在杰杰等常规英雄商店", false);
                 return new CatalogItem(h, p.DisplayName, p.Summary, true);
             }).ToList(),
             sizes = new[]
@@ -260,7 +340,12 @@ public static class ModRuleCatalog
             new CatalogItem("Freeze", "冻结 (ms)", "冻结目标卡牌冷却", true),
             new CatalogItem("Charge", "充能 (ms)", "立即推进目标卡牌冷却进度", true)
         },
-        syncAttributes = new[] { "Custom_0", "Custom_1", "Custom_2", "Custom_3" },
+        syncAttributes = new[]
+        {
+            "Custom_0", "Custom_1", "Custom_2", "Custom_3", "Custom_4",
+            "Custom_5", "Custom_6", "Custom_7", "Custom_8"
+        },
+        vfxPresets = OfficialVfxPresets,
         budgets = new
         {
             maxChainDepth = CombatMechanicRuntime.MaxChainDepth,

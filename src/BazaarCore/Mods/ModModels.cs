@@ -682,6 +682,27 @@ public sealed class CustomModeDefinition
 }
 
 /// <summary>
+/// 已按具体卡牌参数实例解析后的通用卡面计数角标元数据（由服务端下发给客户端渲染实时叠层/充能/倒计时胶囊）。
+/// </summary>
+public sealed class ResolvedCounterDisplay
+{
+    [JsonPropertyName("labelZh")]
+    public string LabelZh { get; set; } = string.Empty;
+
+    [JsonPropertyName("syncAttribute")]
+    public string SyncAttribute { get; set; } = "Custom_3";
+
+    [JsonPropertyName("maxValue")]
+    public int? MaxValue { get; set; }
+
+    [JsonPropertyName("colorHex")]
+    public string? ColorHex { get; set; }
+
+    [JsonPropertyName("hideWhenZero")]
+    public bool HideWhenZero { get; set; }
+}
+
+/// <summary>
 /// 实例级自定义卡牌视觉绑定（对应服务端侧信道 visual-bindings API，锚定 InstanceId / CustomTemplateId 防客户端白块）。
 /// </summary>
 public sealed class CustomCardVisualBinding
@@ -735,6 +756,10 @@ public sealed class CustomCardVisualBinding
     [JsonPropertyName("tierAttributes")]
     public Dictionary<string, Dictionary<string, double>>? TierAttributes { get; set; }
 
+    /// <summary>通用自定义机制实时计数角标列表（任意叠层/充能/倒计时机制均可声明并自动下发给客户端实时渲染）。</summary>
+    [JsonPropertyName("counterDisplays")]
+    public List<ResolvedCounterDisplay>? CounterDisplays { get; set; }
+
     [JsonPropertyName("accentColor")]
     public string? AccentColor { get; set; }
 
@@ -760,7 +785,15 @@ public sealed class CustomCardVisualBinding
         TierAttributes = TierAttributes?.ToDictionary(
             kv => kv.Key,
             kv => new Dictionary<string, double>(kv.Value, StringComparer.OrdinalIgnoreCase),
-            StringComparer.OrdinalIgnoreCase)
+            StringComparer.OrdinalIgnoreCase),
+        CounterDisplays = CounterDisplays?.Select(cd => new ResolvedCounterDisplay
+        {
+            LabelZh = cd.LabelZh,
+            SyncAttribute = cd.SyncAttribute,
+            MaxValue = cd.MaxValue,
+            ColorHex = cd.ColorHex,
+            HideWhenZero = cd.HideWhenZero
+        }).ToList()
     };
 }
 
