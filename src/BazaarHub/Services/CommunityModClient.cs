@@ -44,8 +44,9 @@ public sealed class CommunityModClient : IDisposable
         try
         {
             using var req = new HttpRequestMessage(HttpMethod.Get, $"{normalized}/api/community/mods");
-            if (!string.IsNullOrWhiteSpace(playerName))
-                req.Headers.TryAddWithoutValidation("X-Player-Name", playerName.Trim());
+            string encodedName = EncodeHeaderPlayerName(playerName);
+            if (!string.IsNullOrEmpty(encodedName))
+                req.Headers.TryAddWithoutValidation("X-Player-Name", encodedName);
 
             using var resp = await _http.SendAsync(req, ct).ConfigureAwait(false);
             string body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
@@ -167,7 +168,9 @@ public sealed class CommunityModClient : IDisposable
             {
                 Content = form
             };
-            req.Headers.TryAddWithoutValidation("X-Player-Name", string.IsNullOrWhiteSpace(playerName) ? Environment.UserName : playerName.Trim());
+            string encodedUploader = EncodeHeaderPlayerName(playerName, Environment.UserName);
+            if (!string.IsNullOrEmpty(encodedUploader))
+                req.Headers.TryAddWithoutValidation("X-Player-Name", encodedUploader);
 
             using var resp = await _http.SendAsync(req, ct).ConfigureAwait(false);
             string body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
@@ -192,6 +195,17 @@ public sealed class CommunityModClient : IDisposable
     }
 
     private static string NormalizeBase(string url) => (url ?? string.Empty).Trim().TrimEnd('/');
+
+    /// <summary>
+    /// 对写入 HTTP 请求头的玩家昵称执行百分号编码，兼容中文及空格字符，同时保持常规 ASCII 昵称原样。
+    /// </summary>
+    private static string EncodeHeaderPlayerName(string? playerName, string? fallback = null)
+    {
+        string raw = string.IsNullOrWhiteSpace(playerName)
+            ? (fallback ?? string.Empty).Trim()
+            : playerName.Trim();
+        return string.IsNullOrEmpty(raw) ? string.Empty : Uri.EscapeDataString(raw);
+    }
 
     private static string GetStr(JsonElement el, string prop, string fallback = "")
         => el.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.String ? (v.GetString() ?? fallback) : fallback;

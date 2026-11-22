@@ -170,6 +170,32 @@ internal sealed partial class CustomGameplayUI
         _tourneyHostModPickerContainer = _ui.CreateVerticalGroup("HostModPickerList", card.transform, spacing: 4f).transform;
     }
 
+    private string _autoSyncRoomModInFlightSig = string.Empty;
+
+    /// <summary>热切服后在主线程彻底清理旧服缓存状态、断开旧 SSE 并重新拉取新服配置与社区列表。</summary>
+    internal void OnServerBaseSwitched()
+    {
+        StopSocialSse();
+        _catalogLoaded = false;
+        _currentLobby = null;
+        _lobbyDirty = false;
+        _lastAutoSyncedRoomModSignature = string.Empty;
+        _autoSyncRoomModInFlightSig = string.Empty;
+        _autoAppliedLobbyIds.Clear();
+        _socialMessages.Clear();
+        System.Threading.Interlocked.Exchange(ref _lastSocialEventId, 0L);
+
+        RefreshServerAndCommunityUi();
+        StartInitialBackgroundFetch();
+        RefreshCommunityModsAsync(force: true);
+        SyncSocialSseForLobbyOrPanelState();
+        RefreshHudOverlays(force: true);
+        if (_isOpen)
+        {
+            RefreshModalContentsIfOpen();
+        }
+    }
+
     private void SwitchToServerUrl(string url, string displayName = null)
     {
         if (!BazaarLauncherPlugin.TrySwitchServerBase(url, out string normalized, out string err))
@@ -181,8 +207,6 @@ internal sealed partial class CustomGameplayUI
         string label = string.IsNullOrWhiteSpace(displayName) ? normalized : $"{displayName}（{normalized}）";
         SetStatus($"已切换服务器到 {label}（若已在对局中，请回主界面或重启游戏生效）", isError: false);
         ShowToastBanner($"已切换服务器：{label}");
-        RefreshServerAndCommunityUi();
-        RefreshCommunityModsAsync(force: true);
     }
 
     private void PingAllSavedServersAsync()
@@ -523,26 +547,56 @@ internal sealed partial class CustomGameplayUI
 
     private void AutoSyncCurrentLobbyModsIfNeeded(LobbyDetailSnapshot detail)
     {
-        if (detail == null || detail.RequiredMods == null || detail.RequiredMods.Count == 0)
+        var ids = detail?.RequiredMods?.Where(m => m.AvailableOnServer).Select(m => m.ModId).ToList();
+        if (ids == null || ids.Count == 0)
+        {
+            // 退出 Mod 房间或房主清空房内 Mod 时，立刻卸载旧房 Mod 视觉/文本句柄，杜绝泄漏到后续标准局
+            if (!string.IsNullOrEmpty(_lastAutoSyncedRoomModSignature) || !string.IsNullOrEmpty(_autoSyncRoomModInFlightSig))
+            {
+                _lastAutoSyncedRoomModSignature = string.Empty;
+                _autoSyncRoomModInFlightSig = string.Empty;
+                ModContentSyncClient.Instance.ClearSyncedRoomBundleMods();
+            }
             return;
+        }
         if (BazaarLauncherPlugin.AcceptServerMods != null && !BazaarLauncherPlugin.AcceptServerMods.Value)
             return;
 
-        var ids = detail.RequiredMods.Where(m => m.AvailableOnServer).Select(m => m.ModId).ToList();
-        if (ids.Count == 0) return;
-
         string sig = detail.LobbyId + "|" + string.Join(",", ids.OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
-        if (string.Equals(_lastAutoSyncedRoomModSignature, sig, StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(_lastAutoSyncedRoomModSignature, sig, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(_autoSyncRoomModInFlightSig, sig, StringComparison.OrdinalIgnoreCase))
             return;
-        _lastAutoSyncedRoomModSignature = sig;
 
+        // 同步完成前仅写入进行中签名，成功后再提交 _lastAutoSyncedRoomModSignature，确保网络瞬断失败后能自动重试
+        _autoSyncRoomModInFlightSig = sig;
         _ = Task.Run(async () =>
         {
-            var (ok, summary) = await ModContentSyncClient.Instance
-                .SyncSelectedModBundleAsync(ids, force: false, HttpClientHub.ShutdownToken).ConfigureAwait(false);
-            if (ok)
+            bool ok = false;
+            string summary = string.Empty;
+            try
             {
-                _pendingUpdates.Enqueue(() => ShowToastBanner(summary));
+                (ok, summary) = await ModContentSyncClient.Instance
+                    .SyncSelectedModBundleAsync(ids, force: false, HttpClientHub.ShutdownToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                ok = false;
+                summary = ex.Message;
+            }
+            finally
+            {
+                _pendingUpdates.Enqueue(() =>
+                {
+                    if (string.Equals(_autoSyncRoomModInFlightSig, sig, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _autoSyncRoomModInFlightSig = string.Empty;
+                    }
+                    if (ok)
+                    {
+                        _lastAutoSyncedRoomModSignature = sig;
+                        ShowToastBanner(summary);
+                    }
+                });
             }
         });
     }

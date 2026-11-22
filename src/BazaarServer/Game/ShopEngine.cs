@@ -127,6 +127,10 @@ public sealed class ShopEngine
                 ? Math.Clamp((int)Math.Round((1.0 - (double)discountedPrice / origPrice) * 100.0), 1, 99)
                 : MerchantItemDiscountPercent;
             double mult = origPrice > 0 ? Math.Clamp((double)discountedPrice / origPrice, 0.01, 1.0) : (1.0 - pct / 100.0);
+            if (entry.CoreCard != null && !entry.CoreCard.HourMult.ContainsKey("BuyPrice"))
+            {
+                entry.CoreCard.HourMult["BuyPrice"] = mult;
+            }
             entry.Attributes[ECardAttributeType.BuyPrice] = discountedPrice;
             _activeShelfDiscounts[instanceId] = new MerchantDiscountInfo(
                 instanceId,
@@ -235,7 +239,7 @@ public sealed class ShopEngine
         return ValidRandomEnchantments[rng.Next(ValidRandomEnchantments.Length)];
     }
 
-    private void ApplyModeAndMutatorModifiersToEntry(RunState.CardEntry entry, bool isFree, bool isMerchant, Random rng)
+    internal void ApplyModeAndMutatorModifiersToEntry(RunState.CardEntry entry, bool isFree, bool isMerchant, Random rng)
     {
         var rules = ActiveRules ?? _run.CustomRules;
         if (rules == null) return;
@@ -2262,69 +2266,78 @@ public sealed class ShopEngine
                         Prerequisites = normalizedCtx.Prerequisites,
                     }
                     : normalizedCtx;
-                var spawned = SpawnQueryEngine.SpawnCards(
+                // V15.3 问题 1 根治：将后置校验作为 tryAcceptCard 接入 SpawnQueryEngine，
+                // 当商店/事件抽到已拥有更高阶物品、超货架宽度、或 BuyPrice<=0 时自动继续重抽回补至目标 Limit，不再无声缺失货架格子！
+                SpawnQueryEngine.SpawnCards(
                     spawnCtxForRoll,
                     ctx,
                     defaultCountOverride: spawnCountOverride,
                     ownedMaxTiers: effectiveOwnedMaxTiers,
                     validAssetIds: validAssetIds,
                     archetypeResolver,
-                    effectiveCustomRules);
-                foreach (var inst in spawned)
-                {
-                    var itemPoolTpl = _pool.Get(inst.Template.Id);
-                    if (!_pool.IsPlayerSpawnableId(inst.Template.Id, allowGuidOnly: true) &&
-                        !IsFaraiExplicitPackageOption(encounterTemplateId, inst.Template))
+                    effectiveCustomRules,
+                    maxItemSlotWidthProvider: () => Math.Max(0, MaxShelfSlotWidth - usedWidth),
+                    spawnAppliesTiny: false,
+                    tryAcceptCard: inst =>
                     {
-                        continue;
-                    }
-                    // P1-25：过滤已过期探险门票
-                    if (CardPool.IsExpeditionTicketExpired(inst.Template.Id, day, (int)_run.Hour))
-                        continue;
-                    // P0-13：对动态抽出的 EventEncounter（如 Mysterious Portal）二次拦截 DEFUNCT/教程/未解锁 ExclusionSet 卡
-                    if (string.Equals(inst.Template.Type, "EventEncounter", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (_run.ExclusionSet.Contains(inst.Template.Id)) continue;
-                        if (itemPoolTpl != null && CardPool.IsExcludedDevOrStoryTemplate(itemPoolTpl)) continue;
-                        if (inst.Template.InternalName is string evName &&
-                            (evName.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase) ||
-                             evName.Contains("Tutorial", StringComparison.OrdinalIgnoreCase) ||
-                             evName.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase)))
-                            continue;
-                    }
-                    // 对子遭遇/步骤选项（如 EncounterStep）在发牌阶段即校验天数/局外 Run 前置条件
-                    if (inst.Template.Type is "EncounterStep" or "EventEncounter" or "PedestalEncounter" or "CombatEncounter" &&
-                        !CheckChildOptionRunPrerequisites(itemPoolTpl, inst.Template, ctx))
-                    {
-                        continue;
-                    }
-                    if (isPaidContext && inst.Template.Type is "Item" or "Skill" &&
-                        IsZeroBuyPriceOrFreePackage(itemPoolTpl, inst.Template, inst.Tier.ToString()))
-                    {
-                        continue;
-                    }
-                    if (isMerchant && !allowPlayerDuplicates &&
-                        inst.Template.Type is "Item" or "Skill" &&
-                        IsBlockedByOwnedMaxTiers(inst.Template.Id, inst.Tier, effectiveOwnedMaxTiers))
-                    {
-                        continue;
-                    }
-                    if (!allowDuplicates && !usedTemplateIds.Add(inst.Template.Id)) continue;
+                        var itemPoolTpl = _pool.Get(inst.Template.Id);
+                        if (!_pool.IsPlayerSpawnableId(inst.Template.Id, allowGuidOnly: true) &&
+                            !IsFaraiExplicitPackageOption(encounterTemplateId, inst.Template))
+                        {
+                            return false;
+                        }
+                        // P1-25：过滤已过期探险门票
+                        if (CardPool.IsExpeditionTicketExpired(inst.Template.Id, day, (int)_run.Hour))
+                            return false;
+                        // P0-13：对动态抽出的 EventEncounter（如 Mysterious Portal）二次拦截 DEFUNCT/教程/未解锁 ExclusionSet 卡
+                        if (string.Equals(inst.Template.Type, "EventEncounter", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (_run.ExclusionSet.Contains(inst.Template.Id)) return false;
+                            if (itemPoolTpl != null && CardPool.IsExcludedDevOrStoryTemplate(itemPoolTpl)) return false;
+                            if (inst.Template.InternalName is string evName &&
+                                (evName.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase) ||
+                                 evName.Contains("Tutorial", StringComparison.OrdinalIgnoreCase) ||
+                                 evName.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase)))
+                                return false;
+                        }
+                        // 对子遭遇/步骤选项（如 EncounterStep）在发牌阶段即校验天数/局外 Run 前置条件
+                        if (inst.Template.Type is "EncounterStep" or "EventEncounter" or "PedestalEncounter" or "CombatEncounter" &&
+                            !CheckChildOptionRunPrerequisites(itemPoolTpl, inst.Template, ctx))
+                        {
+                            return false;
+                        }
+                        if (isPaidContext && inst.Template.Type is "Item" or "Skill" &&
+                            IsZeroBuyPriceOrFreePackage(itemPoolTpl, inst.Template, inst.Tier.ToString()))
+                        {
+                            return false;
+                        }
+                        if (isMerchant && !allowPlayerDuplicates &&
+                            inst.Template.Type is "Item" or "Skill" &&
+                            IsBlockedByOwnedMaxTiers(inst.Template.Id, inst.Tier, effectiveOwnedMaxTiers))
+                        {
+                            return false;
+                        }
+                        if (!allowDuplicates && usedTemplateIds.Contains(inst.Template.Id))
+                            return false;
 
-                    bool isItemShelfCard = string.Equals(inst.Template.Type, "Item", StringComparison.OrdinalIgnoreCase);
-                    int slotWidth = isItemShelfCard ? GetShelfSlotWidth(inst) : 0;
-                    if (isItemShelfCard && usedWidth + slotWidth > MaxShelfSlotWidth) continue;
+                        bool isItemShelfCard = string.Equals(inst.Template.Type, "Item", StringComparison.OrdinalIgnoreCase);
+                        int slotWidth = isItemShelfCard ? GetShelfSlotWidth(inst) : 0;
+                        if (isItemShelfCard && usedWidth + slotWidth > MaxShelfSlotWidth)
+                            return false;
 
-                    var entry = CreateEntryFromCoreInstance(inst, _run.SelectionRules.SelectionIsFree);
-                    if (isPaidContext && entry.Type is ECardType.Item or ECardType.Skill &&
-                        entry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0) <= 0)
-                    {
-                        continue;
-                    }
-                    dealtList.Add(entry);
-                    if (isItemShelfCard)
-                        usedWidth += slotWidth;
-                }
+                        var entry = CreateEntryFromCoreInstance(inst, _run.SelectionRules.SelectionIsFree);
+                        if (isPaidContext && entry.Type is ECardType.Item or ECardType.Skill &&
+                            entry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0) <= 0)
+                        {
+                            return false;
+                        }
+                        if (!allowDuplicates)
+                            usedTemplateIds.Add(inst.Template.Id);
+                        dealtList.Add(entry);
+                        if (isItemShelfCard)
+                            usedWidth += slotWidth;
+                        return true;
+                    });
             }
         }
 

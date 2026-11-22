@@ -728,6 +728,47 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
 
     // ── 锚点二实现：左侧原生导航抽屉注入（哨兵 SceneID 9001..9003） ─────────
 
+    private static Type _localizableTextType;
+
+    private static int? TryExtractTraversableSceneId(object item, PropertyInfo sceneProp, FieldInfo sceneField)
+    {
+        if (item == null) return null;
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        // 真实数据模型：NavigationMenuController._data 直接存放 TraversableScenesSO+TraversableScene，字段名为 ID (SceneID)
+        Type t = item.GetType();
+        object directId = t.GetField("ID", flags)?.GetValue(item)
+            ?? t.GetField("sceneID", flags)?.GetValue(item)
+            ?? t.GetProperty("ID", flags)?.GetValue(item)
+            ?? t.GetProperty("SceneID", flags)?.GetValue(item);
+        if (directId != null)
+        {
+            return Convert.ToInt32(directId);
+        }
+
+        // 兼容旧版包装对象（含 Scene/_scene 字段）
+        object sceneObj = sceneProp?.GetValue(item) ?? sceneField?.GetValue(item);
+        if (sceneObj != null)
+        {
+            Type st = sceneObj.GetType();
+            object nestedId = st.GetField("ID", flags)?.GetValue(sceneObj)
+                ?? st.GetField("sceneID", flags)?.GetValue(sceneObj)
+                ?? st.GetProperty("SceneID", flags)?.GetValue(sceneObj);
+            if (nestedId != null)
+            {
+                return Convert.ToInt32(nestedId);
+            }
+        }
+        return null;
+    }
+
+    private static object TryCreateLocalizableText(string text)
+    {
+        _localizableTextType ??= GameInspector.FindTypeSafe("TheBazaar.Utilities.LocalizableText", "LocalizableText");
+        if (_localizableTextType == null) return null;
+        var ctor = _localizableTextType.GetConstructor(new[] { typeof(string) });
+        return ctor?.Invoke(new object[] { text ?? string.Empty });
+    }
+
     private static void NavigationMenuPopulateDataPostfix(object __instance)
     {
         if (__instance == null || Instance == null || _navDataField == null) return;
@@ -745,27 +786,22 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
             var entries = Instance.GetRegisteredNavEntries();
             if (entries.Count == 0 || _sceneIdEnumType == null) return;
 
-            // 收集已有哨兵 ID 防重复注入
+            // 收集已有 SceneID（含哨兵 ID 9001..9003）防重复注入
             var existingIds = new HashSet<int>();
             foreach (var item in dataList)
             {
-                if (item == null) continue;
-                object sceneObj = sceneProp?.GetValue(item) ?? sceneField?.GetValue(item);
-                if (sceneObj != null)
-                {
-                    object sidVal = sceneObj.GetType().GetField("sceneID", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(sceneObj)
-                        ?? sceneObj.GetType().GetProperty("SceneID", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(sceneObj);
-                    if (sidVal != null) existingIds.Add(Convert.ToInt32(sidVal));
-                }
+                int? sid = TryExtractTraversableSceneId(item, sceneProp, sceneField);
+                if (sid.HasValue) existingIds.Add(sid.Value);
             }
 
             foreach (var entry in entries)
             {
                 if (existingIds.Contains(entry.SentinelSceneId)) continue;
-                object clonedItem = TryCreateSentinelNavData(dataItemType, templateData, entry);
-                if (clonedItem != null)
+                object sentinelItem = TryCreateSentinelNavData(dataItemType, templateData, entry);
+                if (sentinelItem != null)
                 {
-                    dataList.Add(clonedItem);
+                    dataList.Add(sentinelItem);
+                    existingIds.Add(entry.SentinelSceneId);
                 }
             }
         }
@@ -780,32 +816,61 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         try
         {
             if (_traversableSceneType == null || _sceneIdEnumType == null) return null;
-            object sceneObj = Activator.CreateInstance(_traversableSceneType);
             object sentinelEnum = Enum.ToObject(_sceneIdEnumType, entry.SentinelSceneId);
+            object localizedTitle = TryCreateLocalizableText(entry.Title);
 
-            SetFieldOrProp(sceneObj, "sceneID", sentinelEnum);
-            SetFieldOrProp(sceneObj, "SceneID", sentinelEnum);
-            SetFieldOrProp(sceneObj, "displayName", entry.Title);
-            SetFieldOrProp(sceneObj, "DisplayName", entry.Title);
-            SetFieldOrProp(sceneObj, "title", entry.Title);
-            SetFieldOrProp(sceneObj, "Title", entry.Title);
+            // 真实模型：dataList 元素本身就是 TraversableScenesSO+TraversableScene（继承 PoolableUIData）
+            if (_traversableSceneType.IsAssignableFrom(dataItemType))
+            {
+                var cloneMethod = typeof(object).GetMethod("MemberwiseClone", BindingFlags.NonPublic | BindingFlags.Instance);
+                object item = cloneMethod?.Invoke(templateData, null) ?? Activator.CreateInstance(_traversableSceneType);
+                if (item == null) return null;
 
-            // 尝试使用带 TraversableScene 参数的构造器，否则浅拷贝模板再替换 Scene
+                bool idSet = TrySetFieldOrProp(item, "ID", sentinelEnum)
+                    || TrySetFieldOrProp(item, "sceneID", sentinelEnum)
+                    || TrySetFieldOrProp(item, "SceneID", sentinelEnum);
+                if (!idSet) return null; // 严禁在 ID 未写成功时追加原版项克隆
+
+                if (localizedTitle != null)
+                {
+                    TrySetFieldOrProp(item, "DisplayName", localizedTitle);
+                }
+                else
+                {
+                    TrySetFieldOrProp(item, "DisplayName", entry.Title);
+                }
+                TrySetFieldOrProp(item, "OptionalLink", null);
+                TrySetFieldOrProp(item, "IsActiveScene", false);
+                return item;
+            }
+
+            // 兼容旧版包装结构：构造 TraversableScene 并嵌入外层 DataItem
+            object sceneObj = Activator.CreateInstance(_traversableSceneType);
+            if (sceneObj == null) return null;
+            bool sceneIdSet = TrySetFieldOrProp(sceneObj, "ID", sentinelEnum)
+                || TrySetFieldOrProp(sceneObj, "sceneID", sentinelEnum)
+                || TrySetFieldOrProp(sceneObj, "SceneID", sentinelEnum);
+            if (!sceneIdSet) return null;
+
+            if (localizedTitle != null)
+            {
+                TrySetFieldOrProp(sceneObj, "DisplayName", localizedTitle);
+            }
+            TrySetFieldOrProp(sceneObj, "OptionalLink", null);
+            TrySetFieldOrProp(sceneObj, "IsActiveScene", false);
+
             var ctor = dataItemType.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
                 .FirstOrDefault(c => c.GetParameters().Length == 1 && c.GetParameters()[0].ParameterType.IsAssignableFrom(_traversableSceneType));
-
             if (ctor != null)
             {
                 return ctor.Invoke(new[] { sceneObj });
             }
 
-            var cloneMethod = typeof(object).GetMethod("MemberwiseClone", BindingFlags.NonPublic | BindingFlags.Instance);
-            object copy = cloneMethod?.Invoke(templateData, null);
-            if (copy != null)
+            var fallbackClone = typeof(object).GetMethod("MemberwiseClone", BindingFlags.NonPublic | BindingFlags.Instance);
+            object copy = fallbackClone?.Invoke(templateData, null);
+            if (copy != null && (TrySetFieldOrProp(copy, "Scene", sceneObj) || TrySetFieldOrProp(copy, "_scene", sceneObj)))
             {
-                SetFieldOrProp(copy, "Scene", sceneObj);
-                SetFieldOrProp(copy, "_scene", sceneObj);
-                SetFieldOrProp(copy, "Title", entry.Title);
+                TrySetFieldOrProp(copy, "Title", entry.Title);
                 return copy;
             }
         }
@@ -930,7 +995,13 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 return;
             }
 
-            foreach (var sec in Instance._optionsSections)
+            List<NativeOptionsSectionDescriptor> sectionsSnapshot;
+            lock (Instance._sync)
+            {
+                sectionsSnapshot = new List<NativeOptionsSectionDescriptor>(Instance._optionsSections);
+            }
+
+            foreach (var sec in sectionsSnapshot)
             {
                 string goName = "BazaarOptSec_" + sec.Id;
                 if (container.Find(goName) != null) continue;
@@ -964,22 +1035,24 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         }
     }
 
-    private static void SetFieldOrProp(object target, string name, object value)
+    private static bool TrySetFieldOrProp(object target, string name, object value)
     {
-        if (target == null) return;
+        if (target == null) return false;
         Type t = target.GetType();
         const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
         var f = t.GetField(name, flags);
-        if (f != null && (value == null || f.FieldType.IsInstanceOfType(value)))
+        if (f != null && (value == null ? !f.FieldType.IsValueType : f.FieldType.IsInstanceOfType(value)))
         {
             f.SetValue(target, value);
-            return;
+            return true;
         }
         var p = t.GetProperty(name, flags);
-        if (p != null && p.CanWrite && (value == null || p.PropertyType.IsInstanceOfType(value)))
+        if (p != null && p.CanWrite && (value == null ? !p.PropertyType.IsValueType : p.PropertyType.IsInstanceOfType(value)))
         {
             p.SetValue(target, value);
+            return true;
         }
+        return false;
     }
 
     private sealed class CallbackDisposable : IDisposable

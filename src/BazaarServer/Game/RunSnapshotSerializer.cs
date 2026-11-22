@@ -1053,6 +1053,19 @@ public static class RunSnapshotSerializer
             },
         };
 
+        // V15.3 问题 6：必须在 PlayerInitialized 之后、CardSpawned 之前显式下发玩家当前全部已解锁槽位掩码，
+        // 防止客户端重连时 Hand 容器仍保持初始窄槽掩码导致左右外侧槽位物品被 PlaceOnSocket 拒放而凭空消失！
+        var unlockedSockets = new HashSet<EContainerSocketId>();
+        for (int s = 0; s < 10; s++)
+        {
+            if ((run.UnlockedSlots & (1 << s)) != 0)
+                unlockedSockets.Add((EContainerSocketId)s);
+        }
+        if (unlockedSockets.Count > 0)
+        {
+            events.Add(new GameSimEventSocketsUnlocked(unlockedSockets, run.UnlockedSlots, EInventorySection.Hand));
+        }
+
         // 1. 恢复玩家已拥有的物品与技能
         foreach (var card in run.Cards.Values.Where(c => c.Owner == ECombatantId.Player))
         {
@@ -1095,11 +1108,17 @@ public static class RunSnapshotSerializer
             }
         }
 
-        // 3. 恢复当前真实状态与当前遭遇（P1-28：统一复用 RunState.ResolveWireCurrentEncounterId，防止空串/子步/非 GUID Mod 遭遇崩溃）
+        // 3. 若处于远征/特殊遭遇切板态，同包下发 GameSimEventBoardOverridden（客户端 GameSimHandler 要求与 StateTransitioned 同包方触发 TransitionToBoard）
+        if (!string.IsNullOrWhiteSpace(run.CurrentBoardId))
+        {
+            events.Add(new GameSimEventBoardOverridden(run.CurrentBoardId, null));
+        }
+
+        // 4. 恢复当前真实状态与当前遭遇（P1-28：统一复用 RunState.ResolveWireCurrentEncounterId，防止空串/子步/非 GUID Mod 遭遇崩溃）
         string? resumeEncounterId = run.ResolveWireCurrentEncounterId();
         events.Add(new GameSimEventStateTransitioned(run.State, resumeEncounterId));
 
-        // 4. P1-35：若断线恢复结算中断战斗直接进入终局，补发终局结算事件使客户端弹出 RunCompleted 结算面板
+        // 5. P1-35：若断线恢复结算中断战斗直接进入终局，补发终局结算事件使客户端弹出 RunCompleted 结算面板
         if (run.PendingResumeRunCompletedEvent != null)
         {
             events.Add(run.PendingResumeRunCompletedEvent);

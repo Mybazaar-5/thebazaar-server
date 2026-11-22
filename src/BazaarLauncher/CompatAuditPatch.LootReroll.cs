@@ -12,6 +12,7 @@ internal static partial class CompatAuditPatch
 {
     // ── V14.3：野怪战利品超过 10 格分页时的原生免费刷新/翻页支持 ──────────────────
     private static PropertyInfo _lrDataCurrentStateProp;
+    private static FieldInfo _lrStateNameField;
     private static PropertyInfo _lrStateNameProp;
     private static PropertyInfo _lrRerollsRemainingProp;
     private static PropertyInfo _lrRerollCostProp;
@@ -49,7 +50,9 @@ internal static partial class CompatAuditPatch
             var runStateType = _lrDataCurrentStateProp?.PropertyType;
             if (runStateType != null)
             {
-                _lrStateNameProp = runStateType.GetProperty("StateName", BindingFlags.Public | BindingFlags.Instance);
+                // RunState.StateName 在 BazaarGameClient.dll 中为 public ERunState 字段，非属性；优先按字段读取并保留属性回退
+                _lrStateNameField = runStateType.GetField("StateName", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                _lrStateNameProp = runStateType.GetProperty("StateName", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 _lrRerollsRemainingProp = runStateType.GetProperty("RerollsRemaining", BindingFlags.Public | BindingFlags.Instance);
                 _lrRerollCostProp = runStateType.GetProperty("RerollCost", BindingFlags.Public | BindingFlags.Instance);
             }
@@ -107,7 +110,7 @@ internal static partial class CompatAuditPatch
             }
 
             // 2. BoardManager：多页野怪战利品改用带免费刷新轮盘的 defaultMerchantBoardButtons
-            var bmType = AccessTools.TypeByName("BoardManager") ?? AccessTools.TypeByName("TheBazaar.BoardManager");
+            var bmType = GameInspector.FindTypeSafe("BoardManager");
             if (bmType != null)
             {
                 _lrBmButtonsForRevealField = AccessTools.Field(bmType, "buttonsForReveal");
@@ -168,7 +171,9 @@ internal static partial class CompatAuditPatch
             object curState = _lrDataCurrentStateProp?.GetValue(null);
             if (curState == null) return false;
 
-            object stateNameObj = _lrStateNameProp?.GetValue(curState);
+            object stateNameObj = _lrStateNameField != null
+                ? _lrStateNameField.GetValue(curState)
+                : _lrStateNameProp?.GetValue(curState);
             if (stateNameObj == null) return false;
             if (stateNameObj is ERunState ers)
             {

@@ -860,12 +860,12 @@ public sealed class V9ScheduleXpPvpTests
 
         var rng = new Random(909);
 
-        // 9a. Day 1 实池抽样 100 次：100% Level <= 1 && HealthMax <= 320，且均属于含 Hero8 在内的 8 位正式英雄
+        // 9a. Day 1 实池抽样 100 次：100% Level <= 2 && HealthMax <= 550（允许当天正常升级到 Lv2 的玩家镜像），且均属于含 Hero8 在内的 8 位正式英雄
         bool sawHero8 = false;
         for (int i = 0; i < 100; i++)
         {
             var g = fx.Ghosts.PickOpponent(day: 1, playerWins: 0, playerLosses: 0, rng, fx.Repo);
-            Assert.True(g.Level <= 1 && g.HealthMax <= 320, $"Day 1 镜像异常: {g.BoardId} Lv{g.Level} HP={g.HealthMax}");
+            Assert.True(g.Level <= 2 && g.HealthMax <= 550, $"Day 1 镜像异常: {g.BoardId} Lv{g.Level} HP={g.HealthMax}");
             Assert.Contains(g.Hero, HeroNames.PlayableHeroes, StringComparer.OrdinalIgnoreCase);
             if (string.Equals(g.Hero, HeroNames.Hero8, StringComparison.OrdinalIgnoreCase))
                 sawHero8 = true;

@@ -7665,6 +7665,13 @@ public sealed class RunEngine
             mutated = true;
         }
 
+        int baseStartIncome = _mode.StartingIncome > 0 ? _mode.StartingIncome : 5;
+        if (rules.StartingIncome != baseStartIncome && rules.StartingIncome > 0)
+        {
+            p2Core.Attributes["Income"] = rules.StartingIncome;
+            mutated = true;
+        }
+
         if (rules.StartingItems is { Count: > 0 })
         {
             int itemSeq = 0;
@@ -7731,6 +7738,9 @@ public sealed class RunEngine
             _shop.RestoreActiveShelfDiscountsFromRun();
             var p1 = BuildCorePlayerFromRun();
             var selCards = CollectSelectionCoreCards();
+            IReadOnlyList<CardInstance>? externalAuras = _run.CurrentEncounterCoreCard != null
+                ? new[] { _run.CurrentEncounterCoreCard }
+                : null;
             IReadOnlyList<AuraEngine.AuraEffectTargetsSnapshot>? snaps = null;
             AuraEngine.RecalculateAuras(
                 p1,
@@ -7740,7 +7750,9 @@ public sealed class RunEngine
                 hour: (int)_run.Hour,
                 repo: _repo,
                 selectionCards: selCards.Count > 0 ? selCards : null,
-                onAuraSnapshot: s => snaps = s);
+                onAuraSnapshot: s => snaps = s,
+                externalAuraCards: externalAuras,
+                currentEncounterId: _run.CurrentEncounterId);
 
             SyncTrackedPlayerTempModifiersFromCore(p1);
             SyncEffectivePlayerAttributesFromCore(p1);

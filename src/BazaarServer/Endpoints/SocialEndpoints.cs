@@ -288,7 +288,7 @@ public static class SocialEndpoints
                 onlinePlayers = Math.Max(sessions.Count, accounts.CountOnlinePlayers()),
                 activeRuns = sessions.Count,
                 activeLobbies = lobbies.ActiveLobbyCount,
-                serverVersion = "15.2.0",
+                serverVersion = "15.3.0",
                 protocolVersion = 2,
             }, CamelJson);
         });

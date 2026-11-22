@@ -53,6 +53,7 @@ public sealed class AccountStore : IDisposable
     private readonly Persistence _db;
     private readonly ConcurrentDictionary<string, Account> _byKey = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<Guid, Account> _byAccountId = new();
+    private readonly ConcurrentDictionary<string, Account> _byEmail = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, CachedToken> _tokenCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<Guid, Account> _dirtyAccounts = new();
     private readonly object _lock = new();
@@ -142,6 +143,7 @@ public sealed class AccountStore : IDisposable
         public int? UnopenedChestCount { get; set; }
         public List<string> OpenedCardSkinIds { get; set; } = new();
         public int? Gems { get; set; }
+        public string? BoundEmail { get; set; }
     }
 
     public sealed class Account
@@ -149,6 +151,7 @@ public sealed class AccountStore : IDisposable
         public Guid AccountId { get; init; }
         public string Username { get; init; } = "";
         public string IdentityKey { get; init; } = "";
+        public string BoundEmail { get; set; } = "";
         public string AccessToken { get; set; } = "";
         public string RefreshToken { get; set; } = "";
         public DateTime AccessExpiresAt { get; set; }
@@ -176,48 +179,71 @@ public sealed class AccountStore : IDisposable
     public Account GetOrCreateBySteamTicket(string ticketHex, string clientKind = "game", string deviceId = "")
         => GetOrCreate("steam:" + Fingerprint(ticketHex), DeriveNameFromFingerprint(ticketHex), clientKind, deviceId);
 
-    /// <summary>按用户名建号/登录（新路径：输入名字即登录，支持多端并发不互踢）。</summary>
+    /// <summary>按用户名建号/登录（新路径：输入名字即登录，支持邮箱 @ 前缀自动归一同名账号，支持多端并发不互踢）。</summary>
     public Account GetOrCreateByName(string username, string clientKind = "game", string deviceId = "")
     {
-        string clean = NormalizeName(username);
+        string clean = NormalizeName(ExtractEmailPrefixOrSelf(username));
         return GetOrCreate("name:" + clean.ToLowerInvariant(), clean, clientKind, deviceId);
     }
 
     /// <summary>
-    /// 按用户名登录并校验/绑定可选口令或设备密钥：
-    /// - 若账号尚未设置口令且客户端传入了 secret，自动首次绑定（平滑升级老账号）；
-    /// - 若账号已设置口令，必须提供匹配口令方可通过，杜绝同名抢号。
+    /// 按用户名或邮箱登录并校验/绑定可选口令或设备密钥：
+    /// - 邮箱输入优先匹配已绑定邮箱，否则按 @ 前缀自动归一到 PC 同名账号（例如 alice@bazaar.local -> alice）；
+    /// - 若账号尚未设置口令：传统显式口令登录（allowAutoBindSecret=true）自动首次绑定；移动端邮箱登录（allowAutoBindSecret=false）无口令保护账号直登，避免锁死 PC 免密登录；
+    /// - 若账号已设置口令，必须提供匹配口令方可通过（同时兼容明文与移动端 SHA-256 哈希）。
     /// </summary>
     public (bool Ok, Account? Account, IssuedTokenPair? Tokens, string? ErrorZh) LoginByNameWithSecret(
         string username,
         string? secret,
         string clientKind = "game",
-        string deviceId = "")
+        string deviceId = "",
+        bool allowAutoBindSecret = true,
+        string? boundEmail = null)
     {
-        string clean = NormalizeName(username);
+        string normalizedEmail = NormalizeEmail(boundEmail);
+        if (string.IsNullOrEmpty(normalizedEmail) && LooksLikeEmail(username))
+        {
+            normalizedEmail = NormalizeEmail(username);
+        }
+
+        string clean = NormalizeName(ExtractEmailPrefixOrSelf(username));
         string key = "name:" + clean.ToLowerInvariant();
         Account acc;
         bool needSave = false;
 
         lock (_lock)
         {
-            acc = EnsureAccountLoadedLocked(key, clean, out bool isNew);
-            if (isNew) needSave = true;
+            if (!string.IsNullOrEmpty(normalizedEmail) && _byEmail.TryGetValue(normalizedEmail, out var emailAcc))
+            {
+                acc = emailAcc;
+            }
+            else
+            {
+                acc = EnsureAccountLoadedLocked(key, clean, out bool isNew);
+                if (isNew) needSave = true;
+            }
 
             if (acc.HasSecretProtection)
             {
-                if (string.IsNullOrWhiteSpace(secret) || !VerifySecretHash(secret, acc.AuthSecretHash))
+                if (string.IsNullOrWhiteSpace(secret) || !VerifySecretHash(secret.Trim(), acc.AuthSecretHash))
                 {
                     return (false, null, null, "账号口令校验失败，请输入正确的登录口令。");
                 }
             }
-            else if (!string.IsNullOrWhiteSpace(secret))
+            else if (allowAutoBindSecret && !string.IsNullOrWhiteSpace(secret))
             {
                 string trimmed = secret.Trim();
                 if (trimmed.Length < 4 || trimmed.Length > 128)
                     return (false, null, null, "账号口令长度需在 4 到 128 个字符之间。");
 
                 acc.AuthSecretHash = HashSecret(trimmed);
+                needSave = true;
+            }
+
+            if (!string.IsNullOrEmpty(normalizedEmail) && string.IsNullOrWhiteSpace(acc.BoundEmail))
+            {
+                acc.BoundEmail = normalizedEmail;
+                _byEmail[normalizedEmail] = acc;
                 needSave = true;
             }
             acc.LastActiveUtc = DateTime.UtcNow;
@@ -243,7 +269,7 @@ public sealed class AccountStore : IDisposable
         {
             if (acc.HasSecretProtection)
             {
-                if (string.IsNullOrWhiteSpace(currentSecret) || !VerifySecretHash(currentSecret, acc.AuthSecretHash))
+                if (string.IsNullOrWhiteSpace(currentSecret) || !VerifySecretHash(currentSecret.Trim(), acc.AuthSecretHash))
                     return (false, "原口令不正确，无法修改。");
             }
             newHash = HashSecret(trimmedNew);
@@ -297,6 +323,7 @@ public sealed class AccountStore : IDisposable
         }
         _byKey[key] = acc;
         _byAccountId[acc.AccountId] = acc;
+        IndexBoundEmail(acc);
         return acc;
     }
 
@@ -370,6 +397,10 @@ public sealed class AccountStore : IDisposable
             {
                 acc.Gems = Math.Max(0, snap.Gems.Value);
             }
+            if (!string.IsNullOrWhiteSpace(snap.BoundEmail))
+            {
+                acc.BoundEmail = NormalizeEmail(snap.BoundEmail);
+            }
         }
         catch { }
     }
@@ -384,8 +415,17 @@ public sealed class AccountStore : IDisposable
             UnopenedChestCount = acc.UnopenedChestCount,
             OpenedCardSkinIds = acc.OpenedCardSkinIds.ToList(),
             Gems = acc.Gems,
+            BoundEmail = string.IsNullOrWhiteSpace(acc.BoundEmail) ? null : acc.BoundEmail,
         };
         return JsonSerializer.Serialize(dto, JsonOpts);
+    }
+
+    private void IndexBoundEmail(Account acc)
+    {
+        if (!string.IsNullOrWhiteSpace(acc.BoundEmail))
+        {
+            _byEmail[acc.BoundEmail] = acc;
+        }
     }
 
     // ── 多端持久化 Token 管理 ────────────────────────────────────────────────
@@ -401,10 +441,10 @@ public sealed class AccountStore : IDisposable
         string dev = (deviceId ?? "").Trim();
         if (dev.Length > 64) dev = dev[..64];
 
-        string access = "acc_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
-        string refresh = "ref_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
         DateTime accessExp = now.AddHours(24);
         DateTime refreshExp = now.AddDays(30);
+        string access = BuildJwtAccessToken(acc, now, accessExp);
+        string refresh = "ref_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
 
         string accessHash = Fingerprint(access);
         string refreshHash = Fingerprint(refresh);
@@ -538,6 +578,7 @@ public sealed class AccountStore : IDisposable
             acc = AccountFromRow(row);
             _byKey[acc.IdentityKey] = acc;
             _byAccountId[acc.AccountId] = acc;
+            IndexBoundEmail(acc);
             return acc;
         }
     }
@@ -558,7 +599,13 @@ public sealed class AccountStore : IDisposable
     public Account? FindByUsername(string? username)
     {
         if (string.IsNullOrWhiteSpace(username)) return null;
-        string key = "name:" + NormalizeName(username).ToLowerInvariant();
+        if (LooksLikeEmail(username))
+        {
+            string normEmail = NormalizeEmail(username);
+            if (!string.IsNullOrEmpty(normEmail) && _byEmail.TryGetValue(normEmail, out var byEmailAcc))
+                return byEmailAcc;
+        }
+        string key = "name:" + NormalizeName(ExtractEmailPrefixOrSelf(username)).ToLowerInvariant();
         if (_byKey.TryGetValue(key, out var acc)) return acc;
 
         var row = _db.LoadAccount(key);
@@ -569,6 +616,7 @@ public sealed class AccountStore : IDisposable
             acc = AccountFromRow(row);
             _byKey[key] = acc;
             _byAccountId[acc.AccountId] = acc;
+            IndexBoundEmail(acc);
             return acc;
         }
     }
@@ -617,6 +665,7 @@ public sealed class AccountStore : IDisposable
                 var acc = AccountFromRow(row);
                 _byKey[row.IdentityKey] = acc;
                 _byAccountId[acc.AccountId] = acc;
+                IndexBoundEmail(acc);
             }
 
             var tokens = _db.LoadActiveAccountTokens();
@@ -1136,16 +1185,94 @@ public sealed class AccountStore : IDisposable
 
     // ── 安全哈希与文本清洗工具 ──────────────────────────────────────────────
 
+    private static readonly string JwtHeaderB64 = Base64UrlEncode(Encoding.UTF8.GetBytes("{\"alg\":\"HS256\",\"typ\":\"JWT\"}"));
+
+    /// <summary>
+    /// 构造标准三段式 JWT 形态 AccessToken（header.payload.sig），payload 内含 email 与 native_verified="true"
+    /// 以兼容移动端 MobileAuthService.AccountState 解析，同时由随机 jti + 192-bit 签名保证密码学熵。
+    /// </summary>
+    public static string BuildJwtAccessToken(Account acc, DateTime issuedAtUtc, DateTime expiresAtUtc)
+    {
+        string email = !string.IsNullOrWhiteSpace(acc.BoundEmail)
+            ? acc.BoundEmail
+            : acc.Username + "@bazaar.local";
+        string payloadJson = JsonSerializer.Serialize(new
+        {
+            sub = acc.AccountId.ToString("D"),
+            name = acc.Username,
+            email,
+            native_verified = "true",
+            iat = new DateTimeOffset(issuedAtUtc).ToUnixTimeSeconds(),
+            exp = new DateTimeOffset(expiresAtUtc).ToUnixTimeSeconds(),
+            jti = Convert.ToHexString(RandomNumberGenerator.GetBytes(12)).ToLowerInvariant(),
+        });
+        string payloadB64 = Base64UrlEncode(Encoding.UTF8.GetBytes(payloadJson));
+        string sigB64 = Base64UrlEncode(RandomNumberGenerator.GetBytes(24));
+        return $"{JwtHeaderB64}.{payloadB64}.{sigB64}";
+    }
+
+    private static string Base64UrlEncode(byte[] data)
+        => Convert.ToBase64String(data).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    public static bool LooksLikeEmail(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        string s = raw.Trim();
+        int at = s.IndexOf('@');
+        return at > 0 && at < s.Length - 1;
+    }
+
+    public static string NormalizeEmail(string? raw)
+    {
+        if (!LooksLikeEmail(raw)) return string.Empty;
+        string s = raw!.Trim().ToLowerInvariant();
+        return s.Length > 128 ? s[..128] : s;
+    }
+
+    public static string ExtractEmailPrefixOrSelf(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        string s = raw.Trim();
+        int at = s.IndexOf('@');
+        if (at > 0 && at < s.Length - 1)
+        {
+            string prefix = s[..at].Trim();
+            if (!string.IsNullOrEmpty(prefix))
+                return prefix;
+        }
+        return s;
+    }
+
+    public static bool IsSha256Hex(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        string s = raw.Trim();
+        if (s.Length != 64) return false;
+        foreach (char c in s)
+        {
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return true;
+    }
+
     public static string HashSecret(string rawSecret)
     {
         byte[] salt = RandomNumberGenerator.GetBytes(16);
-        byte[] hash = Rfc2898DeriveBytes.Pbkdf2(
+        byte[] hashRaw = Rfc2898DeriveBytes.Pbkdf2(
             Encoding.UTF8.GetBytes(rawSecret),
             salt,
             Pbkdf2Iterations,
             HashAlgorithmName.SHA256,
             32);
-        return $"v1:{Pbkdf2Iterations}:{Convert.ToHexString(salt).ToLowerInvariant()}:{Convert.ToHexString(hash).ToLowerInvariant()}";
+        string sha256Hex = Fingerprint(rawSecret);
+        byte[] hashSha256 = Rfc2898DeriveBytes.Pbkdf2(
+            Encoding.UTF8.GetBytes(sha256Hex),
+            salt,
+            Pbkdf2Iterations,
+            HashAlgorithmName.SHA256,
+            32);
+        return $"v1:{Pbkdf2Iterations}:{Convert.ToHexString(salt).ToLowerInvariant()}:{Convert.ToHexString(hashRaw).ToLowerInvariant()}:{Convert.ToHexString(hashSha256).ToLowerInvariant()}";
     }
 
     public static bool VerifySecretHash(string rawSecret, string storedHash)
@@ -1154,20 +1281,48 @@ public sealed class AccountStore : IDisposable
             return false;
 
         string[] parts = storedHash.Split(':');
-        if (parts.Length != 4 || parts[0] != "v1" || !int.TryParse(parts[1], out int iterations) || iterations < 1000)
+        if ((parts.Length != 4 && parts.Length != 5) || parts[0] != "v1" || !int.TryParse(parts[1], out int iterations) || iterations < 1000)
             return false;
 
         try
         {
             byte[] salt = Convert.FromHexString(parts[2]);
-            byte[] expected = Convert.FromHexString(parts[3]);
+            byte[] expectedRaw = Convert.FromHexString(parts[3]);
             byte[] actual = Rfc2898DeriveBytes.Pbkdf2(
                 Encoding.UTF8.GetBytes(rawSecret),
                 salt,
                 iterations,
                 HashAlgorithmName.SHA256,
-                expected.Length);
-            return CryptographicOperations.FixedTimeEquals(actual, expected);
+                expectedRaw.Length);
+            if (CryptographicOperations.FixedTimeEquals(actual, expectedRaw))
+                return true;
+
+            // 兼容场景 1：服务端存储的是移动端 SHA-256 口令，调用方传入明文
+            string sha256Input = Fingerprint(rawSecret);
+            byte[] actualFromPlainSha = Rfc2898DeriveBytes.Pbkdf2(
+                Encoding.UTF8.GetBytes(sha256Input),
+                salt,
+                iterations,
+                HashAlgorithmName.SHA256,
+                expectedRaw.Length);
+            if (CryptographicOperations.FixedTimeEquals(actualFromPlainSha, expectedRaw))
+                return true;
+
+            // 兼容场景 2：服务端存储了明文+SHA-256 双摘要（5 段式），移动端前端传入 SHA-256 哈希
+            if (parts.Length == 5)
+            {
+                byte[] expectedSha256 = Convert.FromHexString(parts[4]);
+                byte[] actualMobileSha = Rfc2898DeriveBytes.Pbkdf2(
+                    Encoding.UTF8.GetBytes(rawSecret.Trim().ToLowerInvariant()),
+                    salt,
+                    iterations,
+                    HashAlgorithmName.SHA256,
+                    expectedSha256.Length);
+                if (CryptographicOperations.FixedTimeEquals(actualMobileSha, expectedSha256))
+                    return true;
+            }
+
+            return false;
         }
         catch
         {

@@ -243,16 +243,45 @@ public static class CommunityModEndpoints
             return (resolved.Account.AccountId.ToString("N"), resolved.Account.Username, true);
         }
 
-        // 兼容 BazaarHub / 轻量客户端通过 X-Player-Name 请求头声明上传者昵称
-        string? headerName = ctx.Request.Headers["X-Player-Name"].FirstOrDefault()?.Trim();
+        // 兼容 BazaarHub / 轻量客户端 / 网页工坊通过 X-Player-Name 请求头声明上传者昵称
+        // 安全解码 Uri.EscapeDataString / encodeURIComponent 编码后的中文昵称，同时完全保留纯 ASCII 原样兼容
+        string? rawHeaderName = ctx.Request.Headers["X-Player-Name"].FirstOrDefault();
+        string headerName = DecodeHeaderPlayerName(rawHeaderName);
         if (!string.IsNullOrWhiteSpace(headerName))
         {
-            if (headerName.Length > 32) headerName = headerName[..32];
             string hashKey = "name_" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(headerName.ToLowerInvariant())))[..16].ToLowerInvariant();
             return (hashKey, headerName, true);
         }
 
         return (string.Empty, string.Empty, false);
+    }
+
+    /// <summary>
+    /// 安全解码客户端经 <c>Uri.EscapeDataString</c> / <c>encodeURIComponent</c> 编码的 <c>X-Player-Name</c> 请求头：
+    /// - 含百分号编码时还原为 UTF-8 中文昵称；
+    /// - 遇到非法 <c>%</c> 序列时不抛异常，安全回退为原串；
+    /// - 纯 ASCII 昵称原样保留，并经 <see cref="AccountStore.SanitizeDisplayText"/> 过滤控制符与超长截断（≤32 字符）。
+    /// </summary>
+    public static string DecodeHeaderPlayerName(string? rawHeader)
+    {
+        if (string.IsNullOrWhiteSpace(rawHeader))
+            return string.Empty;
+
+        string trimmed = rawHeader.Trim();
+        string decoded = trimmed;
+        if (trimmed.Contains('%', StringComparison.Ordinal))
+        {
+            try
+            {
+                decoded = Uri.UnescapeDataString(trimmed);
+            }
+            catch
+            {
+                decoded = trimmed;
+            }
+        }
+
+        return AccountStore.SanitizeDisplayText(decoded, maxLength: 32);
     }
 
     internal static bool IsServerAdmin(HttpContext ctx)

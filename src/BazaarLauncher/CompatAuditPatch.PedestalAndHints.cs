@@ -641,28 +641,51 @@ internal static partial class CompatAuditPatch
         catch { }
     }
 
-    private static void PedestalOnEnterPostfix(object __instance)
+    private static void PedestalOnEnterPostfix(object __instance, Task __result)
     {
         _pedestalCommitRequested = false;
         _pendingPedestalExitAbort = false;
         _wasInAnyPedestal = true;
         ResetPendingPedestalCommitTracking();
+
+        ApplyPedestalOnEnterRefresh(__instance, checkStillCurrent: false);
+
+        // PedestalState.OnEnter 为 async Task，原版在 await base.OnEnter() 之后才赋值 _pedestalTemplate，
+        // 因此需挂载 __result 完成回调，回到主线程后再补刷一次模板与悬停升级预览。
+        if (__result != null && !__result.IsCompleted && __instance != null)
+        {
+            var captured = __instance;
+            __result.ContinueWith(_ =>
+            {
+                BazaarLauncher.Core.MainThreadDispatcher.Enqueue(() => ApplyPedestalOnEnterRefresh(captured, checkStillCurrent: true));
+            }, TaskScheduler.Default);
+        }
+    }
+
+    private static void ApplyPedestalOnEnterRefresh(object pedestalInstance, bool checkStillCurrent)
+    {
         try
         {
-            if (__instance == null) return;
+            if (pedestalInstance == null) return;
+            if (checkStillCurrent)
+            {
+                if (!_wasInAnyPedestal) return;
+                var curState = GetStaticDataMember("CurrentState");
+                if (curState != null && !ReferenceEquals(curState, pedestalInstance)) return;
+            }
 
             // 若原生 OnEnter 时 _pedestalTemplate 为空，尝试按 Data.CurrentEncounterId 补全
-            if (_pedestalTemplateField != null && _pedestalTemplateField.GetValue(__instance) == null)
+            if (_pedestalTemplateField != null && _pedestalTemplateField.GetValue(pedestalInstance) == null)
             {
-                var fallbackTpl = ResolveActiveUpgradePedestalTemplate(null, __instance);
+                var fallbackTpl = ResolveActiveUpgradePedestalTemplate(null, pedestalInstance);
                 if (fallbackTpl != null)
                 {
-                    _pedestalTemplateField.SetValue(__instance, fallbackTpl);
+                    _pedestalTemplateField.SetValue(pedestalInstance, fallbackTpl);
                 }
             }
 
-            var pedTpl = _pedestalTemplateField?.GetValue(__instance) as TCardEncounterPedestal
-                         ?? ResolveActiveUpgradePedestalTemplate(null, __instance);
+            var pedTpl = _pedestalTemplateField?.GetValue(pedestalInstance) as TCardEncounterPedestal
+                         ?? ResolveActiveUpgradePedestalTemplate(null, pedestalInstance);
             if (pedTpl?.Behavior is not TPedestalBehaviorUpgrade)
             {
                 _wasInUpgradePedestal = false;
@@ -3049,6 +3072,8 @@ internal static partial class CompatAuditPatch
             if (rcType == null) return;
 
             _rewardHideCompleteField = rcType.GetField("hideComplete", BindingFlags.NonPublic | BindingFlags.Instance);
+            // RewardController 继承自 CardController，其 Animator 为公有字段而非属性，优先按层级查字段并保留属性兜底
+            _rewardAnimatorField = FindFieldInHierarchy(rcType, "Animator");
             _rewardAnimatorProp = rcType.GetProperty("Animator", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
             _rewardSoundHandlerField = rcType.GetField("soundRewardHandler", BindingFlags.NonPublic | BindingFlags.Instance);
 
@@ -3081,7 +3106,7 @@ internal static partial class CompatAuditPatch
             if (__instance is not Component comp || comp.gameObject == null || !comp.gameObject.activeSelf)
                 return true;
 
-            var animator = _rewardAnimatorProp?.GetValue(__instance);
+            var animator = _rewardAnimatorField?.GetValue(__instance) ?? _rewardAnimatorProp?.GetValue(__instance);
             if (animator != null)
             {
                 var setBool = animator.GetType().GetMethod("SetBool", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(string), typeof(bool) }, null);

@@ -87,7 +87,7 @@ public static class TempoNetEndpoints
                 ?? ctx.Request.Headers["X-Client-Kind"].ToString();
             string deviceId = ExtractStringProperty(raw, "deviceId", "device_id")
                 ?? ctx.Request.Headers["X-Device-Id"].ToString();
-            string? secret = ExtractStringProperty(raw, "password", "passphrase", "deviceSecret", "secret");
+            string? secret = ExtractStringProperty(raw, "password", "Password", "passphrase", "deviceSecret", "secret");
 
             AccountStore.Account acc;
             AccountStore.IssuedTokenPair? issued = null;
@@ -99,8 +99,10 @@ public static class TempoNetEndpoints
             else
             {
                 string name = ctx.Request.Headers["uid"].ToString();
-                if (string.IsNullOrWhiteSpace(name)) name = ExtractName(raw);
-                var login = accounts.LoginByNameWithSecret(name, secret, clientKind, deviceId);
+                if (string.IsNullOrWhiteSpace(name)) name = ExtractName(raw) ?? "";
+                string? email = ExtractStringProperty(raw, "email", "Email");
+                bool isEmailOrMobileHash = !string.IsNullOrWhiteSpace(email) || AccountStore.IsSha256Hex(secret);
+                var login = accounts.LoginByNameWithSecret(name, secret, clientKind, deviceId, allowAutoBindSecret: !isEmailOrMobileHash, boundEmail: email);
                 if (!login.Ok || login.Account == null)
                     return Results.Json(new { error = login.ErrorZh ?? "登录失败，请检查用户名或口令。", code = "LOGIN_FAILED" }, Json, statusCode: 401);
                 acc = login.Account;
@@ -118,21 +120,23 @@ public static class TempoNetEndpoints
             }, Json);
         });
 
-        // ── 直接按名字登录（插件与启动器首选，多端并发不互踢）─────────────────
+        // ── 直接按名字/邮箱登录（PC 启动器与移动端双兼容，多端并发不互踢）────────
         app.MapPost("/api/auth/login/user", async (HttpContext ctx, AccountStore accounts, ILogger<Program> log) =>
         {
             string raw = await ReadBoundedBodyAsync(ctx, 16 * 1024);
-            string name = ExtractName(raw);
+            string name = ExtractName(raw) ?? "";
             if (string.IsNullOrWhiteSpace(name)) name = ctx.Request.Headers["uid"].ToString();
+            string? email = ExtractStringProperty(raw, "email", "Email");
             string clientKind = ExtractStringProperty(raw, "clientKind", "client_kind")
                 ?? ctx.Request.Headers["X-Client-Kind"].ToString();
             string deviceId = ExtractStringProperty(raw, "deviceId", "device_id")
                 ?? ctx.Request.Headers["X-Device-Id"].ToString();
-            string? secret = ExtractStringProperty(raw, "password", "passphrase", "deviceSecret", "secret");
+            string? secret = ExtractStringProperty(raw, "password", "Password", "passphrase", "deviceSecret", "secret");
+            bool isEmailOrMobileHash = !string.IsNullOrWhiteSpace(email) || AccountStore.IsSha256Hex(secret);
 
-            var login = accounts.LoginByNameWithSecret(name, secret, clientKind, deviceId);
+            var login = accounts.LoginByNameWithSecret(name, secret, clientKind, deviceId, allowAutoBindSecret: !isEmailOrMobileHash, boundEmail: email);
             if (!login.Ok || login.Account == null || login.Tokens == null)
-                return Results.Json(new { error = login.ErrorZh ?? "账号登录失败。", code = "LOGIN_FAILED" }, Json, statusCode: 401);
+                return Results.Json(new { error = login.ErrorZh ?? "账号登录失败。", code = "LOGIN_FAILED", errorCode = "TN-20013" }, Json, statusCode: 401);
 
             log.LogInformation("login/user: '{name}' -> {user} ({kind})", name, login.Account.Username, login.Tokens.ClientKind);
             return Results.Json(new LoginResponseDto
@@ -145,18 +149,20 @@ public static class TempoNetEndpoints
             }, Json);
         });
 
-        // ── 注册（名字可用性检查 + 注册即登录，可选绑定口令保护）───────────────
+        // ── 注册（名字可用性检查 + 注册即登录，兼容移动端邮箱/SHA-256 口令）──────
         app.MapPost("/api/auth/register", async (HttpContext ctx, AccountStore accounts) =>
         {
             string raw = await ReadBoundedBodyAsync(ctx, 16 * 1024);
-            string name = ExtractName(raw);
+            string name = ExtractName(raw) ?? "";
+            string? email = ExtractStringProperty(raw, "email", "Email");
             string clientKind = ExtractStringProperty(raw, "clientKind", "client_kind")
                 ?? ctx.Request.Headers["X-Client-Kind"].ToString();
             string deviceId = ExtractStringProperty(raw, "deviceId", "device_id")
                 ?? ctx.Request.Headers["X-Device-Id"].ToString();
-            string? secret = ExtractStringProperty(raw, "password", "passphrase", "deviceSecret", "secret");
+            string? secret = ExtractStringProperty(raw, "password", "Password", "passphrase", "deviceSecret", "secret");
+            bool isEmailOrMobileHash = !string.IsNullOrWhiteSpace(email) || AccountStore.IsSha256Hex(secret);
 
-            var login = accounts.LoginByNameWithSecret(name, secret, clientKind, deviceId);
+            var login = accounts.LoginByNameWithSecret(name, secret, clientKind, deviceId, allowAutoBindSecret: !isEmailOrMobileHash, boundEmail: email);
             if (!login.Ok || login.Account == null || login.Tokens == null)
                 return Results.Json(new { error = login.ErrorZh ?? "注册失败。", code = "REGISTER_FAILED" }, Json, statusCode: 401);
 
@@ -170,6 +176,75 @@ public static class TempoNetEndpoints
             }, Json);
         });
 
+        // ── 移动端外部平台登录与绑定（Google Play Games / Game Center）──────────
+        app.MapPost("/api/auth/external", async (HttpContext ctx, AccountStore accounts, ILogger<Program> log) =>
+        {
+            string raw = await ReadBoundedBodyAsync(ctx, 16 * 1024);
+            string? deviceId = ExtractStringProperty(raw, "deviceId", "DeviceId", "device_id")
+                ?? ctx.Request.Headers["X-Device-Id"].ToString();
+            string? username = ExtractStringProperty(raw, "username", "Username", "userName", "UserName");
+
+            if (IsMobileDeviceAutoLoginEnabled() &&
+                (!string.IsNullOrWhiteSpace(username) || !string.IsNullOrWhiteSpace(deviceId)))
+            {
+                string resolvedName = !string.IsNullOrWhiteSpace(username)
+                    ? username!
+                    : "mobile_" + AccountStore.Fingerprint(deviceId!)[..8];
+                // 统一走 LoginByNameWithSecret（不自动绑口令），既只签发单次令牌避免占用双倍配额，又杜绝绕过已设口令保护账号
+                var login = accounts.LoginByNameWithSecret(
+                    resolvedName,
+                    secret: null,
+                    clientKind: "game",
+                    deviceId: deviceId ?? "",
+                    allowAutoBindSecret: false);
+                if (!login.Ok || login.Account == null || login.Tokens == null)
+                {
+                    return Results.Json(new
+                    {
+                        errorCode = "TN-20013",
+                        code = "LOGIN_FAILED",
+                        message = "Protected account requires Tempo password login.",
+                        error = login.ErrorZh ?? "该账号已开启口令保护，请使用账号密码登录。",
+                    }, Json, statusCode: StatusCodes.Status401Unauthorized);
+                }
+                var acc = login.Account;
+                var pair = login.Tokens;
+                log.LogInformation("auth/external: auto-login -> {user} (device={dev})", acc.Username, deviceId);
+                return Results.Json(new LoginResponseDto
+                {
+                    AccessToken = pair.AccessToken,
+                    RefreshToken = pair.RefreshToken,
+                    AlternateRefreshToken = pair.RefreshToken,
+                    AccessTokenExpiresAt = pair.AccessExpiresAt,
+                    CurrentTime = DateTime.UtcNow,
+                }, Json);
+            }
+
+            return Results.Json(new
+            {
+                errorCode = "TN-20013",
+                code = "TN-20013",
+                message = "No external account linked. Please sign in with Tempo email.",
+                error = "未绑定外部平台账号，请使用邮箱/账号登录。",
+            }, Json, statusCode: StatusCodes.Status404NotFound);
+        });
+
+        app.MapPost("/api/auth/external/link", (HttpContext ctx, AccountStore accounts) =>
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: false);
+            if (auth.IsAuthenticated)
+            {
+                return Results.Json(new { ok = true }, Json);
+            }
+            return Results.Json(new
+            {
+                errorCode = "TN-20013",
+                code = "TN-20013",
+                message = "Please sign in with Tempo account first.",
+                error = "请先登录后再绑定外部账号。",
+            }, Json, statusCode: StatusCodes.Status404NotFound);
+        });
+
         // ── 设置/修改账号登录口令（需已认证身份）─────────────────────────────
         app.MapPost("/api/auth/password", async (HttpContext ctx, AccountStore accounts) =>
         {
@@ -178,7 +253,7 @@ public static class TempoNetEndpoints
 
             string raw = await ReadBoundedBodyAsync(ctx, 8 * 1024);
             string? currentSecret = ExtractStringProperty(raw, "currentPassword", "oldPassword", "currentSecret");
-            string? newSecret = ExtractStringProperty(raw, "newPassword", "password", "passphrase", "newSecret");
+            string? newSecret = ExtractStringProperty(raw, "newPassword", "password", "Password", "passphrase", "newSecret");
             if (string.IsNullOrWhiteSpace(newSecret))
                 return Results.Json(new { error = "请提供新的账号口令。", code = "INVALID_PASSWORD" }, Json, statusCode: 400);
 
@@ -206,6 +281,44 @@ public static class TempoNetEndpoints
                 available = existing == null,
                 username = name,
                 hasPassword = existing?.HasSecretProtection ?? false,
+            }, Json);
+        });
+
+        app.MapPost("/api/accounts/check-username", async (HttpContext ctx, AccountStore accounts) =>
+        {
+            string raw = await ReadBoundedBodyAsync(ctx, 4 * 1024);
+            string? name = ExtractStringProperty(raw, "Username", "username", "UserName", "userName", "name", "Name");
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return Results.Json(new
+                {
+                    available = false,
+                    errorCode = "TN-20001",
+                    code = "INVALID_USERNAME",
+                    error = "用户名不能为空。",
+                }, Json, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            string clean = AccountStore.NormalizeName(name);
+            var existing = accounts.FindByUsername(clean);
+            if (existing != null && existing.HasSecretProtection)
+            {
+                return Results.Json(new
+                {
+                    available = false,
+                    username = clean,
+                    hasPassword = true,
+                    errorCode = "TN-20002",
+                    code = "USERNAME_TAKEN",
+                    error = "该用户名已被口令保护，请直接登录或更换用户名。",
+                }, Json, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            return Results.Json(new
+            {
+                available = true,
+                username = clean,
+                hasPassword = false,
             }, Json);
         });
 
@@ -272,7 +385,7 @@ public static class TempoNetEndpoints
             {
                 UserName = acc!.Username,
                 Username = acc.Username,
-                Email = acc.Username + "@local",
+                Email = ResolveAccountEmail(acc),
                 IsEmailVerified = true,
                 AccountId = acc.AccountId,
                 CountryCode = "CN",
@@ -285,6 +398,29 @@ public static class TempoNetEndpoints
             return Results.Json(AllAccess(acc!), Json);
         });
         app.MapGet("/api/accounts/me/email-verification-status", () => Results.Json(true, Json));
+        app.MapPost("/api/accounts/me/credentials", (HttpContext ctx, AccountStore accounts) =>
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            return Results.Json(new { ok = true }, Json);
+        });
+        app.MapGet("/api/accounts/me/deletion-status", () =>
+            Results.Json(new { isPendingDeletion = false }, Json));
+        app.MapGet("/api/purchase/mobile/hero-unlock", () => Results.Json(new
+        {
+            ProductId = "",
+            HasAllHeroes = true,
+            OwnedHeroIds = PlayableHeroes.Select(h => h.Id).ToArray(),
+            Enabled = false,
+        }, Json));
+        app.MapPost("/api/purchase/mobile/hero-unlock", () => Results.Json(new
+        {
+            ProductId = "",
+            HasAllHeroes = true,
+            OwnedHeroIds = PlayableHeroes.Select(h => h.Id).ToArray(),
+            Enabled = false,
+        }, Json));
+        app.MapGet("/api/purchase/mobile/gems", () => Results.Json(Array.Empty<object>(), Json));
 
         // ── 档案 / 排名 / 钱包 ───────────────────────────────────────────────
         app.MapGet("/api/PlayerProfiles/me", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
@@ -769,6 +905,7 @@ public static class TempoNetEndpoints
                 {
                     AccountId = acc.AccountId,
                     PlayMode = r.PlayMode,
+                    Type = r.PlayMode,
                     TournamentSessionId = memSession.TournamentSessionId,
                     HeroID = (r.Hero == EHero.Common ? EHero.Vanessa : r.Hero).ToString(),
                     PlayerVictories = (int)r.Victories,
@@ -790,6 +927,7 @@ public static class TempoNetEndpoints
             {
                 AccountId = acc.AccountId,
                 PlayMode = row.PlayMode,
+                Type = row.PlayMode,
                 TournamentSessionId = tsid,
                 HeroID = (row.Hero == EHero.Common ? EHero.Vanessa : row.Hero).ToString(),
                 PlayerVictories = (int)row.Victories,
@@ -869,7 +1007,17 @@ public static class TempoNetEndpoints
     }
 
     private static string? ExtractName(string raw)
-        => ExtractStringProperty(raw, "username", "Username", "userName", "UserName", "name", "Name");
+        => ExtractStringProperty(raw, "username", "Username", "userName", "UserName", "name", "Name", "email", "Email");
+
+    private static string ResolveAccountEmail(AccountStore.Account acc)
+        => !string.IsNullOrWhiteSpace(acc.BoundEmail) ? acc.BoundEmail : acc.Username + "@bazaar.local";
+
+    private static bool IsMobileDeviceAutoLoginEnabled()
+    {
+        string? raw = Environment.GetEnvironmentVariable("BAZAAR_ALLOW_MOBILE_DEVICE_AUTOLOGIN");
+        return string.Equals(raw?.Trim(), "1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(raw?.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static string? ExtractStringProperty(string raw, params string[] keys)
     {
@@ -1772,7 +1920,7 @@ public static class TempoNetEndpoints
             {
                 UserName = acc.Username,
                 Username = acc.Username,
-                Email = acc.Username + "@local",
+                Email = ResolveAccountEmail(acc),
                 IsEmailVerified = true,
                 AccountId = acc.AccountId,
                 CountryCode = "CN",
@@ -1806,7 +1954,7 @@ public static class TempoNetEndpoints
                 {
                     UserName = acc.Username,
                     Username = acc.Username,
-                    Email = acc.Username + "@local",
+                    Email = ResolveAccountEmail(acc),
                     IsEmailVerified = true,
                     AccountId = acc.AccountId,
                     CountryCode = "CN",

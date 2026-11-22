@@ -761,6 +761,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                     {
                         _lobbyPollInFlight = false;
                         _currentLobby = null;
+                        AutoSyncCurrentLobbyModsIfNeeded(null);
                         SyncSocialSseForLobbyOrPanelState();
                         RefreshHudOverlays(force: true);
                         RefreshModalContentsIfOpen();
@@ -777,6 +778,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                         _lobbyPollInFlight = false;
                         _currentLobby = null;
                         _lobbyDirty = false;
+                        AutoSyncCurrentLobbyModsIfNeeded(null);
                         SyncSocialSseForLobbyOrPanelState();
                         RefreshHudOverlays(force: true);
                         RefreshModalContentsIfOpen();
@@ -797,9 +799,11 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 }
 
                 var detail = ParseLobbyDetail(lobbyResp.Body, lobbyId);
-                bool hasStarted = (bool?)JObject.Parse(lobbyResp.Body)["HasStarted"]
-                                  ?? (bool?)JObject.Parse(lobbyResp.Body)["hasStarted"]
-                                  ?? false;
+                var lobbyJo = JObject.Parse(lobbyResp.Body);
+                string lobbyState = (string)(lobbyJo["state"] ?? lobbyJo["State"]) ?? string.Empty;
+                bool hasStarted = (bool?)lobbyJo["HasStarted"]
+                                  ?? (bool?)lobbyJo["hasStarted"]
+                                  ?? string.Equals(lobbyState, "started", StringComparison.OrdinalIgnoreCase);
 
                 _pendingUpdates.Enqueue(() =>
                 {
@@ -1093,16 +1097,16 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     private void SavePersonalTendencyDraftAsync(ulong mask)
     {
         SetStatus("正在同步个人流派倾向预设（全模式共用，未锁开局可用）...", isError: false);
-        RefreshStatusBarUi();
+        // 在主线程先拍摄规则快照，避免后台线程在 404 回退分支访问/克隆 _normalRules 触发竞态
+        var fallbackSnapshot = _normalRules.Clone();
+        fallbackSnapshot.SelectedArchetypeMask = mask;
 
         Task.Run(async () =>
         {
             var resp = await NameAuth.PutJsonAsync("/custom-rules/me/tendency", new { selectedArchetypeMask = mask }).ConfigureAwait(false);
             if (!resp.Ok && resp.StatusCode == 404)
             {
-                var fallback = _normalRules.Clone();
-                fallback.SelectedArchetypeMask = mask;
-                resp = await NameAuth.PutJsonAsync("/custom-rules/me", fallback).ConfigureAwait(false);
+                resp = await NameAuth.PutJsonAsync("/custom-rules/me", fallbackSnapshot).ConfigureAwait(false);
             }
             var saved = resp.Ok ? TryDeserializeRules(resp.Body) : null;
             _pendingUpdates.Enqueue(() =>
@@ -1592,18 +1596,39 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 return true;
 
             // 触发原生 Events.CombatBlocked 让状态机保持备战一致，并用右上角简体中文横幅代替英文弹窗阻塞
+            // 注意：TheBazaar.Event<T>.Trigger(T parameter = default) 为 internal 且带 1 个可选参数，必须查 NonPublic 并传入对应数量参数
             try
             {
                 if (_eventsCombatBlockedField == null)
                 {
                     var eventsType = AccessTools.TypeByName("TheBazaar.Events");
-                    _eventsCombatBlockedField = eventsType?.GetField("CombatBlocked", BindingFlags.Public | BindingFlags.Static);
+                    _eventsCombatBlockedField = eventsType?.GetField("CombatBlocked", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
                 }
                 var evObj = _eventsCombatBlockedField?.GetValue(null);
                 if (evObj != null)
                 {
-                    _combatBlockedTriggerMethod ??= evObj.GetType().GetMethod("Trigger", BindingFlags.Public | BindingFlags.Instance);
-                    _combatBlockedTriggerMethod?.Invoke(evObj, null);
+                    _combatBlockedTriggerMethod ??= evObj.GetType().GetMethod(
+                        "Trigger",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (_combatBlockedTriggerMethod != null)
+                    {
+                        var ps = _combatBlockedTriggerMethod.GetParameters();
+                        if (ps.Length == 0)
+                        {
+                            _combatBlockedTriggerMethod.Invoke(evObj, null);
+                        }
+                        else
+                        {
+                            var invokeArgs = new object[ps.Length];
+                            for (int i = 0; i < ps.Length; i++)
+                            {
+                                invokeArgs[i] = ps[i].HasDefaultValue
+                                    ? ps[i].DefaultValue
+                                    : (ps[i].ParameterType.IsValueType ? Activator.CreateInstance(ps[i].ParameterType) : null);
+                            }
+                            _combatBlockedTriggerMethod.Invoke(evObj, invokeArgs);
+                        }
+                    }
                 }
             }
             catch { }
@@ -1970,6 +1995,14 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     {
         _statusMessage = msg ?? "";
         _statusIsError = isError;
+        if (BazaarLauncher.Core.MainThreadDispatcher.IsOnMainThread)
+        {
+            RefreshStatusBarUi();
+        }
+        else
+        {
+            _pendingUpdates.Enqueue(RefreshStatusBarUi);
+        }
     }
 
     private static bool IsInActiveCombatPlayback()

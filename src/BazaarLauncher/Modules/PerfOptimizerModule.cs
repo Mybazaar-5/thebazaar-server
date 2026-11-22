@@ -843,14 +843,51 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         }
     }
 
-    private static void SoundManagerLoadGuardPrefix()
+    private static FieldInfo _soundMgrPlayingField;
+    private static PropertyInfo _soundMgrPlayingProp;
+    private static FieldInfo _soundtrackPathField;
+    private static PropertyInfo _soundtrackPathProp;
+    private static string _lastLoadedSoundtrackPath;
+    private static float _lastSoundtrackLoadUnscaledTime = -100f;
+
+    /// <summary>
+    /// A-6 真实音频句柄保护：原版 SoundManager.LoadSoundtrack 每次调用都会 Addressables.LoadAssetAsync 且不释放旧句柄；
+    /// 当短时间内针对同一首正在播放的 SoundtrackPath 重复触发加载时直接跳过，避免重复泄漏异步句柄与重装 FMOD Bank。
+    /// </summary>
+    private static bool SoundManagerLoadGuardPrefix(object __instance, object __0)
     {
         try
         {
-            // A-6 预留温和检查点：若开关关闭直接放行
-            if (!OptAudioHandleGuard) return;
+            if (!OptAudioHandleGuard || __instance == null || __0 == null) return true;
+
+            Type soType = __0.GetType();
+            _soundtrackPathProp ??= soType.GetProperty("SoundtrackPath", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            _soundtrackPathField ??= soType.GetField("SoundtrackPath", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            string reqPath = (_soundtrackPathProp?.GetValue(__0) ?? _soundtrackPathField?.GetValue(__0)) as string;
+            if (string.IsNullOrWhiteSpace(reqPath)) return true;
+
+            Type smType = __instance.GetType();
+            _soundMgrPlayingProp ??= smType.GetProperty("PlayingSoundTrackSO", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            _soundMgrPlayingField ??= smType.GetField("PlayingSoundTrackSO", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            object curPlaying = _soundMgrPlayingProp?.GetValue(__instance) ?? _soundMgrPlayingField?.GetValue(__instance);
+
+            float now = Time.unscaledTime;
+            if (curPlaying != null && !(curPlaying is UnityEngine.Object uo && uo == null))
+            {
+                string curPath = (_soundtrackPathProp?.GetValue(curPlaying) ?? _soundtrackPathField?.GetValue(curPlaying)) as string;
+                if (string.Equals(curPath, reqPath, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(_lastLoadedSoundtrackPath, reqPath, StringComparison.OrdinalIgnoreCase)
+                    && (now - _lastSoundtrackLoadUnscaledTime) < 3.0f)
+                {
+                    return false;
+                }
+            }
+
+            _lastLoadedSoundtrackPath = reqPath;
+            _lastSoundtrackLoadUnscaledTime = now;
         }
         catch { }
+        return true;
     }
 
     private static bool AssetLoaderDoesAddressExistPrefix(string address, ref bool __result)
@@ -1474,6 +1511,11 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             }
             if (_hudRoot != null && !_hudRoot.activeSelf) _hudRoot.SetActive(true);
             if (_hudText == null) return;
+            var uiFont = CustomGameplayUI.Instance?.GetActiveUiFont();
+            if (uiFont != null && _hudText.font != uiFont)
+            {
+                _hudText.font = uiFont;
+            }
 
             var snap = _owner.GetLatestSnapshot();
             _sb.Clear();
@@ -1528,6 +1570,11 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             txtRt.offsetMax = new Vector2(-8f, -2f);
 
             _hudText = txtGo.AddComponent<TextMeshProUGUI>();
+            var uiFont = CustomGameplayUI.Instance?.GetActiveUiFont();
+            if (uiFont != null)
+            {
+                _hudText.font = uiFont;
+            }
             _hudText.fontSize = 14f;
             _hudText.color = new Color(0.95f, 0.85f, 0.45f, 1f);
             _hudText.alignment = TextAlignmentOptions.MidlineLeft;

@@ -212,6 +212,7 @@ public static class SpawnQueryEngine
         if (groups.Count == 0) return results;
 
         bool sequential = string.Equals(spawnContext.SelectionMethod, "Sequential", StringComparison.OrdinalIgnoreCase);
+        HashSet<string>? rejectedTemplateIds = null;
 
         if (sequential)
         {
@@ -223,14 +224,28 @@ public static class SpawnQueryEngine
                 if (results.Count >= totalLimit) break;
                 // 当 Sequential 仅单个有效组且组自身 Limit 为 null（如 Mystery Bundle / Candy Stash）时，直接采用外层 totalLimit
                 int defaultGroupLimit = eligibleSeqGroups.Count == 1 ? totalLimit : 1;
-                int gLimit = (int)Math.Round(ValueAndConditionEvaluator.EvaluateValue(grp.Limit, ctx, defaultGroupLimit));
-                for (int i = 0; i < Math.Max(1, gLimit) && results.Count < totalLimit; i++)
+                int gLimit = Math.Max(1, (int)Math.Round(ValueAndConditionEvaluator.EvaluateValue(grp.Limit, ctx, defaultGroupLimit)));
+                int groupPicked = 0;
+                int consecutiveRejects = 0;
+                int maxAttempts = Math.Max(gLimit + 6, gLimit * 3);
+                for (int attempt = 0; attempt < maxAttempts && groupPicked < gLimit && results.Count < totalLimit; attempt++)
                 {
                     int? curMaxWidth = maxItemSlotWidthProvider?.Invoke();
-                    var picked = PickFromGroup(grp, topBehaviors, ctx, results, ownedLookup, validAssetLookup, archetypeResolver, rules, curMaxWidth, spawnAppliesTiny);
+                    var picked = PickFromGroup(grp, topBehaviors, ctx, results, ownedLookup, validAssetLookup, archetypeResolver, rules, curMaxWidth, spawnAppliesTiny, gLimit, rejectedTemplateIds);
                     if (picked == null) break;
-                    if (tryAcceptCard != null && !tryAcceptCard(picked)) break;
+                    if (tryAcceptCard != null && !tryAcceptCard(picked))
+                    {
+                        bool isItemNoSpace = string.Equals(picked.Template.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                            && maxItemSlotWidthProvider != null
+                            && (maxItemSlotWidthProvider() ?? 1) <= 0;
+                        rejectedTemplateIds ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        if (isItemNoSpace || !rejectedTemplateIds.Add(picked.Template.Id) || ++consecutiveRejects >= 6)
+                            break;
+                        continue;
+                    }
+                    consecutiveRejects = 0;
                     results.Add(picked);
+                    groupPicked++;
                 }
             }
 
@@ -240,21 +255,38 @@ public static class SpawnQueryEngine
                 .Where(g => g.Limit == null && HasMultiPickPotential(g))
                 .ToList();
             int seqSafety = 0;
-            while (results.Count < totalLimit && refillableSeqGroups.Count > 0 && seqSafety++ < 40)
+            int seqConsecutiveRejects = 0;
+            while (results.Count < totalLimit && refillableSeqGroups.Count > 0 && seqSafety++ < 24)
             {
                 bool anyAdded = false;
+                bool anyRejected = false;
                 foreach (var grp in refillableSeqGroups)
                 {
                     if (results.Count >= totalLimit) break;
                     int? curMaxWidth = maxItemSlotWidthProvider?.Invoke();
-                    var picked = PickFromGroup(grp, topBehaviors, ctx, results, ownedLookup, validAssetLookup, archetypeResolver, rules, curMaxWidth, spawnAppliesTiny);
-                    if (picked != null && (tryAcceptCard == null || tryAcceptCard(picked)))
+                    var picked = PickFromGroup(grp, topBehaviors, ctx, results, ownedLookup, validAssetLookup, archetypeResolver, rules, curMaxWidth, spawnAppliesTiny, totalLimit, rejectedTemplateIds);
+                    if (picked == null) continue;
+                    if (tryAcceptCard == null || tryAcceptCard(picked))
                     {
                         results.Add(picked);
                         anyAdded = true;
+                        seqConsecutiveRejects = 0;
+                    }
+                    else
+                    {
+                        bool isItemNoSpace = string.Equals(picked.Template.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                            && maxItemSlotWidthProvider != null
+                            && (maxItemSlotWidthProvider() ?? 1) <= 0;
+                        rejectedTemplateIds ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        if (isItemNoSpace || !rejectedTemplateIds.Add(picked.Template.Id) || ++seqConsecutiveRejects >= 6)
+                        {
+                            anyRejected = false;
+                            break;
+                        }
+                        anyRejected = true;
                     }
                 }
-                if (!anyAdded) break;
+                if (!anyAdded && !anyRejected) break;
             }
         }
         else
@@ -272,6 +304,7 @@ public static class SpawnQueryEngine
             }
 
             int safety = 0;
+            int rndConsecutiveRejects = 0;
             while (results.Count < totalLimit && safety++ < 40)
             {
                 var activeGroups = eligibleGroups
@@ -282,17 +315,34 @@ public static class SpawnQueryEngine
                 var grp = PickWeightedGroup(activeGroups, ctx.Rng);
                 if (grp == null) break;
                 int? curMaxWidth = maxItemSlotWidthProvider?.Invoke();
-                var picked = PickFromGroup(grp, topBehaviors, ctx, results, ownedLookup, validAssetLookup, archetypeResolver, rules, curMaxWidth, spawnAppliesTiny);
-                if (picked != null && (tryAcceptCard == null || tryAcceptCard(picked)))
+                int grpTarget = groupRemaining.TryGetValue(grp, out int gRem) ? gRem : totalLimit;
+                var picked = PickFromGroup(grp, topBehaviors, ctx, results, ownedLookup, validAssetLookup, archetypeResolver, rules, curMaxWidth, spawnAppliesTiny, grpTarget, rejectedTemplateIds);
+                if (picked == null)
+                {
+                    // 该组候选池已耗尽时移除，避免空转消耗次数导致少发
+                    eligibleGroups.Remove(grp);
+                    continue;
+                }
+                if (tryAcceptCard == null || tryAcceptCard(picked))
                 {
                     results.Add(picked);
+                    rndConsecutiveRejects = 0;
                     if (groupRemaining.TryGetValue(grp, out int rem))
                         groupRemaining[grp] = rem - 1;
                 }
                 else
                 {
-                    // 该组候选池已耗尽或空间不足无法接纳时移除，避免空转消耗次数导致少发
-                    eligibleGroups.Remove(grp);
+                    bool isItemNoSpace = string.Equals(picked.Template.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                        && maxItemSlotWidthProvider != null
+                        && (maxItemSlotWidthProvider() ?? 1) <= 0;
+                    if (isItemNoSpace)
+                        break;
+                    rejectedTemplateIds ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    if (!rejectedTemplateIds.Add(picked.Template.Id) || ++rndConsecutiveRejects >= 8)
+                    {
+                        eligibleGroups.Remove(grp);
+                        rndConsecutiveRejects = 0;
+                    }
                 }
             }
         }
@@ -417,7 +467,9 @@ public static class SpawnQueryEngine
         Func<string, ulong>? archetypeResolver,
         CustomRunRuleSet? rules,
         int? maxItemSlotWidth = null,
-        bool spawnAppliesTiny = false)
+        bool spawnAppliesTiny = false,
+        int targetPickCount = 1,
+        HashSet<string>? rejectedTemplateIds = null)
     {
         var behaviors = new List<RuleNode>(topBehaviors);
         if (grp.Behaviors != null) behaviors.AddRange(grp.Behaviors);
@@ -427,6 +479,7 @@ public static class SpawnQueryEngine
         bool excludePlayerHero = behaviors.Any(b => b.Type == "TSpawnBehaviorExcludePlayerHero");
         bool ignoreTierTable = behaviors.Any(b => b.Type == "TSpawnBehaviorIgnoreTierTable" && (b.IgnoreTierTable ?? true));
         bool allowDup = behaviors.Any(b => b.Type == "TSpawnBehaviorAllowDuplicates" && (b.AllowDuplicates ?? true));
+        bool explicitForbidDup = behaviors.Any(b => b.Type == "TSpawnBehaviorAllowDuplicates" && b.AllowDuplicates == false);
         bool allowPlayerDup = behaviors.Any(b => b.Type == "TSpawnBehaviorAllowPlayerDuplicates" && (b.AllowPlayerDuplicates ?? true));
         bool explicitForbidPlayerDup = behaviors.Any(b => b.Type == "TSpawnBehaviorAllowPlayerDuplicates" && b.AllowPlayerDuplicates == false);
         bool inheritTier = behaviors.Any(b => b.Type == "TSpawnBehaviorInheritTier" && (b.Inherits ?? true));
@@ -439,6 +492,13 @@ public static class SpawnQueryEngine
 
         var filters = grp.Filters ?? [];
         var idListFilter = filters.FirstOrDefault(f => f.Type == "TSpawnFilterIdList");
+        // 当显式 IdList 目标抽取数大于去重后的模板数（如 Collect Spare Change (4) 单 ID 刷 4 张）且未显式禁止重复时，自动允许重复抽取
+        if (!allowDup && !explicitForbidDup && idListFilter?.Ids is { Count: > 0 } && targetPickCount > 1)
+        {
+            int distinctIds = idListFilter.Ids.Distinct(StringComparer.OrdinalIgnoreCase).Count();
+            if (targetPickCount > distinctIds)
+                allowDup = true;
+        }
         var targetFilters = filters.Where(f => f.Type == "TSpawnFilterTarget" && f.Target != null).ToList();
         var upgradeFilter = filters.FirstOrDefault(f => f.Type == "TSpawnFilterUpgrade");
 
@@ -532,10 +592,13 @@ public static class SpawnQueryEngine
                 if (tpl.SelectionRequirements != null && !EvaluateTemplateSelectionRequirements(tpl.SelectionRequirements, ctx))
                     return false;
 
-                if (ownedLookup != null &&
-                    (string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase)) &&
-                    ownedLookup.TryGetValue(tpl.Id, out var ownedMaxTier) &&
+                // TSpawnBehaviorAllowPlayerDuplicates 仅豁免 Item 的 ownedLookup 限制；
+                // 已持有满阶 Diamond Skill 永不允许重复刷出（即便显式带 AllowPlayerDuplicates）。
+                bool checkOwnedForTpl = ownedLookup != null && (
+                    string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase) ||
+                    (!allowPlayerDup && string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)));
+                if (checkOwnedForTpl &&
+                    ownedLookup!.TryGetValue(tpl.Id, out var ownedMaxTier) &&
                     ownedMaxTier >= CardTier.Diamond)
                     return false;
             }
@@ -708,6 +771,8 @@ public static class SpawnQueryEngine
         var candidates = new List<CardTemplate>();
         foreach (var tpl in pool)
         {
+            if (rejectedTemplateIds != null && rejectedTemplateIds.Contains(tpl.Id))
+                continue;
             if (!PassesGroupTemplateRules(tpl, isOwnedTarget: isOwnedPool))
                 continue;
 
@@ -802,20 +867,25 @@ public static class SpawnQueryEngine
             var excludedTiers = (tierConstraint != null && tierConstraint.IsNot == true)
                 ? ParseConstrainedTiers(tierConstraint)
                 : null;
-            if (!TryPickByDayTierFirst(candidates, ctx.CurrentDay, downShiftTier, ctx.Rng, ctx.Repo?.GameMode, excludedTiers, ownedLookup, archetypeResolver, rules, ctx.SelfPlayer.Hero, out chosen!, out tier, isSequential: isSequentialGroup))
+            if (!TryPickByDayTierFirst(candidates, ctx.CurrentDay, downShiftTier, ctx.Rng, ctx.Repo?.GameMode, excludedTiers, ownedLookup, archetypeResolver, rules, ctx.SelfPlayer.Hero, out chosen!, out tier, isSequential: isSequentialGroup, allowItemPlayerDup: allowPlayerDup))
                 return null;
         }
         else if (forcedTiers.Count > 0 && idListFilter == null && targetTemplateIds == null)
         {
             var forcedPool = ownedLookup == null
                 ? candidates
-                : candidates.Where(c => c.Type != "Item" || GetValidForcedTiersForCandidate(c, forcedTiers, ownedLookup).Count > 0).ToList();
+                : candidates.Where(c =>
+                {
+                    bool checkOwned = string.Equals(c.Type, "Skill", StringComparison.OrdinalIgnoreCase)
+                        || (!allowPlayerDup && string.Equals(c.Type, "Item", StringComparison.OrdinalIgnoreCase));
+                    return !checkOwned || GetValidForcedTiersForCandidate(c, forcedTiers, ownedLookup, allowPlayerDup).Count > 0;
+                }).ToList();
             if (forcedPool.Count == 0) return null;
 
             chosen = PickCandidateForGroup(forcedPool);
             if (chosen.Type is "Item" or "Skill")
             {
-                var validForced = GetValidForcedTiersForCandidate(chosen, forcedTiers, ownedLookup);
+                var validForced = GetValidForcedTiersForCandidate(chosen, forcedTiers, ownedLookup, allowPlayerDup);
                 tier = validForced.Count > 0
                     ? validForced[ctx.Rng.Next(validForced.Count)]
                     : ClampToSupportedTier(chosen, chosen.DefaultTier);
@@ -862,7 +932,7 @@ public static class SpawnQueryEngine
                         .Where(c => c.Type is "Item" or "Skill"
                                  && c.DefaultTier <= tryTier
                                  && SupportsTier(c, tryTier)
-                                 && IsItemAllowedByOwnedTier(c, tryTier, ownedLookup))
+                                 && IsItemAllowedByOwnedTier(c, tryTier, ownedLookup, allowPlayerDup))
                         .ToList();
                     if (tierPool.Count > 0)
                     {
@@ -897,7 +967,8 @@ public static class SpawnQueryEngine
                     forceNative,
                     forcedTiers,
                     ctx.Repo?.GameMode,
-                    ownedLookup);
+                    ownedLookup,
+                    allowPlayerDup);
                 if (eligibleForOwned.Count == 0) return null;
                 candidates = eligibleForOwned;
             }
@@ -905,7 +976,7 @@ public static class SpawnQueryEngine
             chosen = PickCandidateForGroup(candidates);
             if (forcedTiers.Count > 0 && chosen.Type is "Item" or "Skill")
             {
-                var validForced = GetValidForcedTiersForCandidate(chosen, forcedTiers, ownedLookup);
+                var validForced = GetValidForcedTiersForCandidate(chosen, forcedTiers, ownedLookup, allowPlayerDup);
                 tier = validForced.Count > 0
                     ? validForced[ctx.Rng.Next(validForced.Count)]
                     : ClampToSupportedTier(chosen, chosen.DefaultTier);
@@ -914,7 +985,7 @@ public static class SpawnQueryEngine
             {
                 tier = forceNative
                     ? ClampToSupportedTier(chosen, chosen.DefaultTier)
-                    : RollTierForDayWithOwnedConstraint(chosen, ctx.CurrentDay, ignoreTierTable, inheritTier ? ctx.SelfCard : null, downShiftTier, ctx.Rng, ctx.Repo?.GameMode, ownedLookup);
+                    : RollTierForDayWithOwnedConstraint(chosen, ctx.CurrentDay, ignoreTierTable, inheritTier ? ctx.SelfCard : null, downShiftTier, ctx.Rng, ctx.Repo?.GameMode, ownedLookup, allowPlayerDup);
             }
         }
 
@@ -1190,11 +1261,15 @@ public static class SpawnQueryEngine
     private static bool IsItemAllowedByOwnedTier(
         CardTemplate tpl,
         CardTier candidateTier,
-        Dictionary<string, CardTier>? ownedLookup)
+        Dictionary<string, CardTier>? ownedLookup,
+        bool allowItemPlayerDup = false)
     {
-        if (ownedLookup == null || (
-            !string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase)))
+        if (ownedLookup == null)
+            return true;
+        bool isSkill = string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase);
+        bool isItem = string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase);
+        // AllowPlayerDuplicates 仅豁免 Item；Skill 始终受 ownedLookup 约束（满阶 Diamond 禁重复，低阶不可降级刷新）
+        if (!isSkill && (!isItem || allowItemPlayerDup))
             return true;
         if (!ownedLookup.TryGetValue(tpl.Id, out var ownedTier))
             return true;
@@ -1206,10 +1281,11 @@ public static class SpawnQueryEngine
     private static List<CardTier> GetValidForcedTiersForCandidate(
         CardTemplate tpl,
         HashSet<CardTier> forcedTiers,
-        Dictionary<string, CardTier>? ownedLookup)
+        Dictionary<string, CardTier>? ownedLookup,
+        bool allowItemPlayerDup = false)
     {
         return forcedTiers
-            .Where(t => t >= tpl.DefaultTier && SupportsTier(tpl, t) && IsItemAllowedByOwnedTier(tpl, t, ownedLookup))
+            .Where(t => t >= tpl.DefaultTier && SupportsTier(tpl, t) && IsItemAllowedByOwnedTier(tpl, t, ownedLookup, allowItemPlayerDup))
             .ToList();
     }
 
@@ -1222,13 +1298,15 @@ public static class SpawnQueryEngine
         bool forceNative,
         HashSet<CardTier> forcedTiers,
         GameModeData? gameMode,
-        Dictionary<string, CardTier> ownedLookup)
+        Dictionary<string, CardTier> ownedLookup,
+        bool allowItemPlayerDup = false)
     {
         var result = new List<CardTemplate>(candidates.Count);
         foreach (var c in candidates)
         {
-            if ((!string.Equals(c.Type, "Item", StringComparison.OrdinalIgnoreCase) &&
-                 !string.Equals(c.Type, "Skill", StringComparison.OrdinalIgnoreCase)) ||
+            bool isSkill = string.Equals(c.Type, "Skill", StringComparison.OrdinalIgnoreCase);
+            bool isItem = string.Equals(c.Type, "Item", StringComparison.OrdinalIgnoreCase);
+            if ((!isSkill && (!isItem || allowItemPlayerDup)) ||
                 !ownedLookup.TryGetValue(c.Id, out var ownedTier))
             {
                 result.Add(c);
@@ -1239,7 +1317,7 @@ public static class SpawnQueryEngine
 
             if (forcedTiers.Count > 0)
             {
-                if (GetValidForcedTiersForCandidate(c, forcedTiers, ownedLookup).Count > 0)
+                if (GetValidForcedTiersForCandidate(c, forcedTiers, ownedLookup, allowItemPlayerDup).Count > 0)
                     result.Add(c);
                 continue;
             }
@@ -1290,11 +1368,14 @@ public static class SpawnQueryEngine
         bool downShift,
         Random rng,
         GameModeData? gameMode,
-        Dictionary<string, CardTier>? ownedLookup)
+        Dictionary<string, CardTier>? ownedLookup,
+        bool allowItemPlayerDup = false)
     {
-        if (ownedLookup == null ||
-            !string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase) ||
-            !ownedLookup.TryGetValue(tpl.Id, out var ownedTier) ||
+        bool checkOwned = ownedLookup != null && (
+            string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase) ||
+            (!allowItemPlayerDup && string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)));
+        if (!checkOwned ||
+            !ownedLookup!.TryGetValue(tpl.Id, out var ownedTier) ||
             inheritSource != null ||
             ignoreTierTable)
         {
@@ -1342,7 +1423,8 @@ public static class SpawnQueryEngine
         string? playerHero,
         out CardTemplate? chosen,
         out CardTier chosenTier,
-        bool isSequential = false)
+        bool isSequential = false,
+        bool allowItemPlayerDup = false)
     {
         chosen = null;
         chosenTier = CardTier.Bronze;
@@ -1395,7 +1477,7 @@ public static class SpawnQueryEngine
         {
             var matching = candidates
                 .Where(c => c.Type is not ("Item" or "Skill")
-                         || (c.DefaultTier <= tier && SupportsTier(c, tier) && IsItemAllowedByOwnedTier(c, tier, ownedLookup)))
+                         || (c.DefaultTier <= tier && SupportsTier(c, tier) && IsItemAllowedByOwnedTier(c, tier, ownedLookup, allowItemPlayerDup)))
                 .ToList();
             if (matching.Count > 0)
             {

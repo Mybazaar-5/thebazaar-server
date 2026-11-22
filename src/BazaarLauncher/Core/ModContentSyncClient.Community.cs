@@ -79,10 +79,17 @@ internal sealed partial class ModContentSyncClient
         }
     }
 
-    /// <summary>切换服务器后清空旧服内存绑定并立即重新拉取新服清单。</summary>
+    /// <summary>切换服务器后清空旧服内存绑定与 server_overlay 词典层并立即重新拉取新服清单。</summary>
     internal void OnServerChanged()
     {
         ClearSyncedServerMods();
+        try { LocalizationOverlayModule.Instance?.ClearServerOverlayLayer(); } catch { }
+        try
+        {
+            // 删除旧服磁盘 overlay 缓存，避免新服无 /api/localization/overlay 时回退加载旧服残留词典
+            if (File.Exists(OverlayCachePath)) File.Delete(OverlayCachePath);
+        }
+        catch { }
         lock (_sync)
         {
             _communityMods = new List<CommunityModEntry>();
@@ -93,7 +100,30 @@ internal sealed partial class ModContentSyncClient
         TriggerFullSyncInBackground(forceDownload: false);
     }
 
-    /// <summary>卸载当前已注册的所有服务器/房间同步 Mod 视觉与文案覆盖。</summary>
+    private static void NotifyVisualAndLocaleChanged(string reason)
+    {
+        try
+        {
+            var visMod = CustomContentVisualModule.Instance;
+            visMod?.InvalidateVisualCache(null);
+            if (visMod != null)
+            {
+                MainThreadDispatcher.Enqueue(() =>
+                {
+                    try { visMod.ReapplyActiveVisualsOnMainThread(); } catch { }
+                });
+            }
+        }
+        catch { }
+
+        try
+        {
+            LocalizationOverlayModule.Instance?.NotifyLocaleReloaded(reason);
+        }
+        catch { }
+    }
+
+    /// <summary>卸载当前已注册的所有服务器/房间同步 Mod 视觉与文案覆盖并触发缓存刷新。</summary>
     internal void ClearSyncedServerMods()
     {
         lock (_sync)
@@ -107,6 +137,26 @@ internal sealed partial class ModContentSyncClient
             _customContents = new List<ServerCustomContentItem>();
             _donorTemplateIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _lastSyncedRoomModKey = string.Empty;
+        }
+        NotifyVisualAndLocaleChanged("clear-server-mods");
+    }
+
+    /// <summary>离房或房主清空 Mod 时卸载房间专属 Mod 句柄并刷新视觉/文本缓存。</summary>
+    internal void ClearSyncedRoomBundleMods()
+    {
+        bool hadAny;
+        lock (_sync)
+        {
+            hadAny = _syncedRoomBundleVisualHandles.Count > 0
+                || _syncedRoomBundleTextHandles.Count > 0
+                || !string.IsNullOrEmpty(_lastSyncedRoomModKey);
+            DisposeHandlesLocked(_syncedRoomBundleVisualHandles);
+            DisposeHandlesLocked(_syncedRoomBundleTextHandles);
+            _lastSyncedRoomModKey = string.Empty;
+        }
+        if (hadAny)
+        {
+            NotifyVisualAndLocaleChanged("clear-room-mods");
         }
     }
 
@@ -186,12 +236,7 @@ internal sealed partial class ModContentSyncClient
 
         if (modIds == null || modIds.Count == 0)
         {
-            lock (_sync)
-            {
-                DisposeHandlesLocked(_syncedRoomBundleVisualHandles);
-                DisposeHandlesLocked(_syncedRoomBundleTextHandles);
-                _lastSyncedRoomModKey = string.Empty;
-            }
+            ClearSyncedRoomBundleMods();
             return (true, "本房未使用额外 Mod");
         }
 
@@ -249,6 +294,57 @@ internal sealed partial class ModContentSyncClient
                 }
             }
 
+            // 同步解析 /api/community/mods/bundle 返回的 cardOverrides，确保纯文案/词条魔改 Mod 也能在房间内生效
+            if (root["cardOverrides"] is JObject overridesMap)
+            {
+                foreach (var prop in overridesMap.Properties())
+                {
+                    if (prop.Value is not JObject co) continue;
+                    string cid = ((string)(co["customId"] ?? co["customCardId"] ?? co["id"]))?.Trim();
+                    if (string.IsNullOrWhiteSpace(cid)) cid = prop.Name?.Trim();
+                    if (string.IsNullOrWhiteSpace(cid)) continue;
+
+                    string titleZh = (string)(co["titleZh"] ?? co["title"] ?? co["nameZh"]);
+                    string descZh = (string)(co["descriptionZh"] ?? co["description"] ?? co["descZh"]);
+                    string[] activeTips = ReadStringArray(co["activeTooltipsZh"] ?? co["activeTooltips"]);
+                    string[] passiveTips = ReadStringArray(co["passiveTooltipsZh"] ?? co["passiveTooltips"]);
+                    string[] extraTags = ReadStringArray(co["tags"] ?? co["extraDisplayTags"] ?? co["displayTags"]);
+
+                    Dictionary<string, string[]> enchTips = null;
+                    if ((co["enchantTooltipsZh"] ?? co["enchantmentTooltips"]) is JObject eo)
+                    {
+                        enchTips = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var ep in eo.Properties())
+                        {
+                            var arr = ReadStringArray(ep.Value);
+                            if (arr != null && arr.Length > 0) enchTips[ep.Name] = arr;
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(titleZh) || !string.IsNullOrWhiteSpace(descZh)
+                        || (activeTips != null && activeTips.Length > 0)
+                        || (passiveTips != null && passiveTips.Length > 0)
+                        || (enchTips != null && enchTips.Count > 0)
+                        || (extraTags != null && extraTags.Length > 0))
+                    {
+                        textOverrides.Add(new CardTextOverride
+                        {
+                            ModId = (string)(co["modId"] ?? co["ModId"]) ?? "room-mod",
+                            CustomCardId = cid,
+                            TemplateId = Guid.TryParse(cid, out _) ? cid : null,
+                            Locale = "zh-CN",
+                            Title = string.IsNullOrWhiteSpace(titleZh) ? null : titleZh,
+                            Description = string.IsNullOrWhiteSpace(descZh) ? null : descZh,
+                            ActiveTooltips = activeTips,
+                            PassiveTooltips = passiveTips,
+                            EnchantmentTooltips = enchTips,
+                            ExtraDisplayTags = extraTags,
+                            Priority = 150,
+                        });
+                    }
+                }
+            }
+
             // 合并写入独立句柄组，不覆盖全局 Mod 句柄
             var visMod = CustomContentVisualModule.Instance;
             var l10nMod = LocalizationOverlayModule.Instance;
@@ -285,9 +381,12 @@ internal sealed partial class ModContentSyncClient
                 _lastSyncedRoomModKey = key;
             }
 
+            // 立即失效旧视觉缓存并在主线程重绘，同时刷新本地化缓存
+            NotifyVisualAndLocaleChanged("room-mod-bundle");
+
             int missing = (root["missingModIds"] as JArray)?.Count ?? 0;
             string note = missing > 0 ? $"（其中 {missing} 个在服务器未找到）" : string.Empty;
-            return (true, $"已同步本房 {cleanIds.Count} 个 Mod（贴图 {pngCount} 张，绑定 {visualBindings.Count} 条）{note}");
+            return (true, $"已同步本房 {cleanIds.Count} 个 Mod（贴图 {pngCount} 张，视觉 {visualBindings.Count} 条，文案 {textOverrides.Count} 条）{note}");
         }
         catch (Exception ex)
         {
@@ -310,8 +409,10 @@ internal sealed partial class ModContentSyncClient
         string cleanId = modId.Trim();
         try
         {
+            using var linked = HttpClientHub.CreateLinkedCts(ct);
             using var req = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/api/community/mods/{Uri.EscapeDataString(cleanId)}/download");
-            using var resp = await HttpClientHub.DownloadClient.SendAsync(req, ct).ConfigureAwait(false);
+            NameAuth.ApplyAuthHeaders(req);
+            using var resp = await HttpClientHub.DownloadClient.SendAsync(req, linked.Token).ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode)
             {
                 return (false, $"下载失败（HTTP {(int)resp.StatusCode}）", string.Empty, string.Empty);
@@ -335,6 +436,16 @@ internal sealed partial class ModContentSyncClient
         }
     }
 
+    private static string ResolveLocalModManifestPath(string dir)
+    {
+        if (string.IsNullOrWhiteSpace(dir)) return null;
+        string modJson = Path.Combine(dir, "mod.json");
+        if (File.Exists(modJson)) return modJson;
+        string manifestJson = Path.Combine(dir, "manifest.json");
+        if (File.Exists(manifestJson)) return manifestJson;
+        return null;
+    }
+
     /// <summary>扫描本地可用 Mod（包括 BepInEx/mods、游戏目录 mods/ 以及下载缓存目录里的 .bazaarmod.zip）。</summary>
     internal static List<LocalModSource> DiscoverLocalMods()
     {
@@ -353,11 +464,11 @@ internal sealed partial class ModContentSyncClient
             if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) continue;
             try
             {
-                // 1. 子目录形式的 Mod（含 mod.json）
+                // 1. 子目录形式的 Mod（兼容 mod.json 与 manifest.json，与 ModuleHost 保持一致）
                 foreach (string dir in Directory.GetDirectories(root))
                 {
-                    string manifestPath = Path.Combine(dir, "mod.json");
-                    if (!File.Exists(manifestPath)) continue;
+                    string manifestPath = ResolveLocalModManifestPath(dir);
+                    if (string.IsNullOrEmpty(manifestPath)) continue;
                     string full = Path.GetFullPath(dir);
                     if (!seenPaths.Add(full)) continue;
                     var info = ReadModSummaryFromManifest(manifestPath, Path.GetFileName(dir));
@@ -412,9 +523,9 @@ internal sealed partial class ModContentSyncClient
             string uploadName;
             if (Directory.Exists(pathOrDir))
             {
-                string manifestPath = Path.Combine(pathOrDir, "mod.json");
-                if (!File.Exists(manifestPath))
-                    return (false, "该目录缺少 mod.json，无法作为 Mod 上传");
+                string manifestPath = ResolveLocalModManifestPath(pathOrDir);
+                if (string.IsNullOrEmpty(manifestPath))
+                    return (false, "该目录缺少 mod.json / manifest.json，无法作为 Mod 上传");
                 var meta = ReadModSummaryFromManifest(manifestPath, Path.GetFileName(pathOrDir));
                 zipBytes = PackLocalModFolderToZip(pathOrDir, meta.Id);
                 uploadName = $"{meta.Id}.bazaarmod.zip";
@@ -434,6 +545,8 @@ internal sealed partial class ModContentSyncClient
             if (zipBytes.Length > 10 * 1024 * 1024)
                 return (false, $"文件大小 {zipBytes.Length / 1024.0 / 1024.0:F1} MB 超过 10 MB 限制");
 
+            await NameAuth.EnsureAccountIdentityAsync(ct).ConfigureAwait(false);
+            using var linked = HttpClientHub.CreateLinkedCts(ct);
             using var content = new MultipartFormDataContent();
             var fileContent = new ByteArrayContent(zipBytes);
             fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
@@ -443,14 +556,12 @@ internal sealed partial class ModContentSyncClient
             {
                 Content = content
             };
-            string token = NameAuth.CurrentAccessToken;
-            if (!string.IsNullOrWhiteSpace(token))
-                req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + token);
+            NameAuth.ApplyAuthHeaders(req);
             string playerName = PlayerIdentity.ResolveName();
             if (!string.IsNullOrWhiteSpace(playerName))
-                req.Headers.TryAddWithoutValidation("X-Player-Name", playerName);
+                req.Headers.TryAddWithoutValidation("X-Player-Name", Uri.EscapeDataString(playerName));
 
-            using var resp = await HttpClientHub.DownloadClient.SendAsync(req, ct).ConfigureAwait(false);
+            using var resp = await HttpClientHub.DownloadClient.SendAsync(req, linked.Token).ConfigureAwait(false);
             string body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
             try
             {
@@ -478,15 +589,15 @@ internal sealed partial class ModContentSyncClient
 
         try
         {
+            await NameAuth.EnsureAccountIdentityAsync(ct).ConfigureAwait(false);
+            using var linked = HttpClientHub.CreateLinkedCts(ct);
             using var req = new HttpRequestMessage(HttpMethod.Delete, $"{baseUrl}/api/community/mods/{Uri.EscapeDataString(modId.Trim())}");
-            string token = NameAuth.CurrentAccessToken;
-            if (!string.IsNullOrWhiteSpace(token))
-                req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + token);
+            NameAuth.ApplyAuthHeaders(req);
             string playerName = PlayerIdentity.ResolveName();
             if (!string.IsNullOrWhiteSpace(playerName))
-                req.Headers.TryAddWithoutValidation("X-Player-Name", playerName);
+                req.Headers.TryAddWithoutValidation("X-Player-Name", Uri.EscapeDataString(playerName));
 
-            using var resp = await HttpClientHub.DownloadClient.SendAsync(req, ct).ConfigureAwait(false);
+            using var resp = await HttpClientHub.DownloadClient.SendAsync(req, linked.Token).ConfigureAwait(false);
             string body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
             try
             {

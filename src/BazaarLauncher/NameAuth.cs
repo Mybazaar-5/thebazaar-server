@@ -26,6 +26,7 @@ internal static class NameAuth
     private static volatile string _currentUsername;
     private static volatile string _currentAccountId;
     private static volatile string _currentAccessToken;
+    private static volatile bool _ignoreGameCachedAuthUntilRelogin;
     private static int _accountIdFetchInFlight;
 
     private static Type _cachedAuthResultType;
@@ -66,6 +67,10 @@ internal static class NameAuth
             {
                 return _currentAccountId;
             }
+            if (_ignoreGameCachedAuthUntilRelogin)
+            {
+                return string.Empty;
+            }
             string fromCache = NormalizeAccountId(TryReadProfileMember("AccountId"));
             if (!string.IsNullOrWhiteSpace(fromCache) && fromCache != "00000000000000000000000000000000")
             {
@@ -84,6 +89,10 @@ internal static class NameAuth
             {
                 return _currentAccessToken;
             }
+            if (_ignoreGameCachedAuthUntilRelogin)
+            {
+                return string.Empty;
+            }
             string fromGame = TryReadAccessTokenFromGame();
             if (!string.IsNullOrWhiteSpace(fromGame))
             {
@@ -92,6 +101,24 @@ internal static class NameAuth
             }
             return string.Empty;
         }
+    }
+
+    /// <summary>切换服务器后清空旧服账号 ID 与 JWT 缓存，禁止回退读取游戏内旧服令牌，并在后台向新服静默重签。</summary>
+    internal static void OnServerChanged()
+    {
+        _currentAccountId = null;
+        _currentAccessToken = null;
+        _ignoreGameCachedAuthUntilRelogin = true;
+        _ = Task.Run(() => EnsureAccountIdentityAsync(HttpClientHub.ShutdownToken));
+    }
+
+    private static bool IsPureAscii(string s)
+    {
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (s[i] > 0x7F) return false;
+        }
+        return true;
     }
 
     internal static string NormalizeAccountId(string accountId)
@@ -116,12 +143,8 @@ internal static class NameAuth
         string user = CurrentUsername;
         if (!string.IsNullOrWhiteSpace(user))
         {
-            bool added = false;
-            try { added = req.Headers.TryAddWithoutValidation("X-Username", user); } catch { }
-            if (!added)
-            {
-                try { req.Headers.TryAddWithoutValidation("X-Username", Uri.EscapeDataString(user)); } catch { }
-            }
+            string headerVal = IsPureAscii(user) ? user : Uri.EscapeDataString(user);
+            try { req.Headers.TryAddWithoutValidation("X-Username", headerVal); } catch { }
         }
 
         string token = CurrentAccessToken;
@@ -133,7 +156,7 @@ internal static class NameAuth
 
     internal static async Task EnsureAccountIdentityAsync(CancellationToken ct = default)
     {
-        if (!string.IsNullOrWhiteSpace(CurrentAccountId)) return;
+        if (!_ignoreGameCachedAuthUntilRelogin && !string.IsNullOrWhiteSpace(CurrentAccountId)) return;
         if (Interlocked.CompareExchange(ref _accountIdFetchInFlight, 1, 0) != 0) return;
         try
         {
@@ -141,6 +164,37 @@ internal static class NameAuth
             if (string.IsNullOrWhiteSpace(baseUrl)) return;
 
             using var linked = HttpClientHub.CreateLinkedCts(ct);
+
+            // 热切服后旧 JWT 失效：先向新服 /api/auth/login/user 签发新 JWT 与 AccountId，避免后续请求遭遇 401 INVALID_TOKEN
+            if (_ignoreGameCachedAuthUntilRelogin)
+            {
+                string loginName = PlayerIdentity.ResolveName();
+                using var loginReq = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/api/auth/login/user")
+                {
+                    Content = new StringContent(JsonConvert.SerializeObject(new { username = loginName }), Encoding.UTF8, "application/json"),
+                };
+                using var loginResp = await HttpClientHub.SharedClient.SendAsync(loginReq, linked.Token).ConfigureAwait(false);
+                if (loginResp.IsSuccessStatusCode)
+                {
+                    string loginRaw = await loginResp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(loginRaw))
+                    {
+                        var lObj = JObject.Parse(loginRaw);
+                        string newTok = (string)(lObj["accessToken"] ?? lObj["AccessToken"] ?? lObj["token"]);
+                        string newAid = NormalizeAccountId((string)(lObj["accountId"] ?? lObj["AccountId"] ?? lObj["id"] ?? lObj["Id"]));
+                        string newUser = (string)(lObj["username"] ?? lObj["Username"]);
+                        if (!string.IsNullOrWhiteSpace(newTok)) _currentAccessToken = newTok;
+                        if (!string.IsNullOrWhiteSpace(newAid) && newAid != "00000000000000000000000000000000") _currentAccountId = newAid;
+                        if (!string.IsNullOrWhiteSpace(newUser)) _currentUsername = newUser;
+                        if (!string.IsNullOrWhiteSpace(_currentAccessToken))
+                        {
+                            _ignoreGameCachedAuthUntilRelogin = false;
+                        }
+                    }
+                }
+                if (!string.IsNullOrWhiteSpace(_currentAccountId)) return;
+            }
+
             using var req = new HttpRequestMessage(HttpMethod.Get, baseUrl + "/api/Accounts/me/summary");
             ApplyAuthHeaders(req);
             using var resp = await HttpClientHub.SharedClient.SendAsync(req, linked.Token).ConfigureAwait(false);
@@ -188,7 +242,8 @@ internal static class NameAuth
             return new HttpJsonResponse { Ok = false, StatusCode = 0, Error = "未配置自建服地址（ServerBase）" };
         }
 
-        if (string.IsNullOrWhiteSpace(CurrentAccountId) && !string.IsNullOrWhiteSpace(CurrentAccessToken))
+        if (_ignoreGameCachedAuthUntilRelogin
+            || (string.IsNullOrWhiteSpace(CurrentAccountId) && !string.IsNullOrWhiteSpace(CurrentAccessToken)))
         {
             await EnsureAccountIdentityAsync(ct).ConfigureAwait(false);
         }

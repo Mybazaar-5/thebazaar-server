@@ -59,6 +59,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         string tag = label ?? $"{typeName}.{methodName}";
         if (string.IsNullOrWhiteSpace(typeName) || string.IsNullOrWhiteSpace(methodName))
         {
+            Interlocked.Increment(ref _attempted);
             RecordDegraded(tag, "类型名或方法名为空", optional);
             return false;
         }
@@ -66,6 +67,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         Type targetType = GameInspector.FindTypeSafe(typeName);
         if (targetType == null)
         {
+            Interlocked.Increment(ref _attempted);
             RecordDegraded(tag, $"目标类型不存在: {typeName}", optional);
             return false;
         }
@@ -101,6 +103,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         string tag = label ?? $"{targetType?.FullName ?? "<null>"}.{methodName}";
         if (targetType == null)
         {
+            Interlocked.Increment(ref _attempted);
             RecordDegraded(tag, "目标类型为 null", optional);
             return false;
         }
@@ -108,6 +111,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         MethodBase target = ResolveMethodSafely(targetType, methodName, parameterTypes, out string resolveError);
         if (target == null)
         {
+            Interlocked.Increment(ref _attempted);
             RecordDegraded(tag, resolveError, optional);
             return false;
         }
@@ -256,8 +260,11 @@ internal sealed class SafeHarmonyPatcher : IDisposable
 
         if (matched.Count > 1)
         {
-            // 若存在多重载，优先取参数最少的重载并允许通过，但保留明确诊断提示
+            // 若存在多重载，优先取参数最少的重载并记录明确诊断日志，便于定位是否需要补充 parameterTypes
             matched.Sort((a, b) => a.GetParameters().Length.CompareTo(b.GetParameters().Length));
+            var chosen = matched[0];
+            BazaarLauncherPlugin.Log?.LogDebug(
+                $"[SafeHarmonyPatcher] {targetType.FullName}.{methodName} 匹配到 {matched.Count} 个重载，未指定 parameterTypes，自动选择最短签名 ({chosen.GetParameters().Length} 参)。");
         }
 
         return matched[0];

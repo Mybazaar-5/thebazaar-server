@@ -540,10 +540,22 @@ internal static partial class CompatAuditPatch
             var spawnedInBatch = new HashSet<string>(StringComparer.Ordinal);
             bool hasSkillEquipped = false;
             bool shouldArmHour6Watchdog = false;
+            int preUnlockPlayerHandMask = 0;
+            int preUnlockPlayerSocketMask = 0;
             for (int i = 0; i < events.Count; i++)
             {
                 var ev = events[i];
-                if (ev is GameSimEventCardSpawned sp && !string.IsNullOrEmpty(sp.InstanceId))
+                if (ev is GameSimEventSocketsUnlocked su && su.UnlockedSocketsBitmask != 0)
+                {
+                    // GameSimHandler.ProcessEvents 先执行 ProcessCardSpawnedEvents(:354) 再处理 SocketsUnlocked(:426)，
+                    // 此处前置应用同批解锁掩码，防止 Resume 或扩容同帧发卡被 PlaceOnSocket 拒放
+                    if (su.Section == EInventorySection.Hand)
+                    {
+                        preUnlockPlayerHandMask |= su.UnlockedSocketsBitmask;
+                        preUnlockPlayerSocketMask |= su.UnlockedSocketsBitmask;
+                    }
+                }
+                else if (ev is GameSimEventCardSpawned sp && !string.IsNullOrEmpty(sp.InstanceId))
                 {
                     spawnedInBatch.Add(sp.InstanceId);
                 }
@@ -578,6 +590,16 @@ internal static partial class CompatAuditPatch
                 else if (ev is GameSimEventPlayerSkillEquipped)
                 {
                     hasSkillEquipped = true;
+                }
+            }
+
+            if (preUnlockPlayerHandMask != 0 || preUnlockPlayerSocketMask != 0)
+            {
+                var run = GameInspector.GetDataRun();
+                var player = run != null ? GameInspector.GetMember(run, "Player") : null;
+                if (player != null)
+                {
+                    EnsurePlayerContainerSocketsUnlocked(player, preUnlockPlayerHandMask, unionOnly: true, socketMaskOverride: preUnlockPlayerSocketMask);
                 }
             }
 

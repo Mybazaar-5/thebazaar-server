@@ -1,4 +1,7 @@
 using System.IO.Compression;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using BazaarCore.Data;
@@ -8,7 +11,12 @@ using BazaarServer.Accounts;
 using BazaarServer.Data;
 using BazaarServer.Game;
 using BazaarServer.Mods;
+using BazaarServer.Storage;
 using BazaarServer.Tournament;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace BazaarCore.Tests;
 
@@ -409,6 +417,173 @@ public sealed class CommunityModAndRoomSyncTests
         }
         finally
         {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void DecodeHeaderPlayerName_ShouldSafelyDecodeEncodedChineseAndPreserveAscii()
+    {
+        // 1. Uri.EscapeDataString 编码后的中文昵称正常解码还原
+        string zhName = "大巴扎测试员";
+        Assert.Equal(zhName, CommunityModEndpoints.DecodeHeaderPlayerName(Uri.EscapeDataString(zhName)));
+
+        // 2. 含空格与百分号的中文昵称经编码后可精确还原
+        string zhWithPercent = "张三 100%";
+        Assert.Equal(zhWithPercent, CommunityModEndpoints.DecodeHeaderPlayerName(Uri.EscapeDataString(zhWithPercent)));
+
+        // 3. 纯 ASCII 昵称原样兼容
+        Assert.Equal("Alice_01", CommunityModEndpoints.DecodeHeaderPlayerName("Alice_01"));
+        Assert.Equal("Bob-99", CommunityModEndpoints.DecodeHeaderPlayerName("  Bob-99  "));
+
+        // 4. 非法或不完整百分号序列不会抛异常，安全保留可打印字符
+        string malformed = CommunityModEndpoints.DecodeHeaderPlayerName("bad%ZZ%2");
+        Assert.Equal("bad%ZZ%2", malformed);
+
+        // 5. 空值/空白返回空串，超长中文按 32 字符安全截断
+        Assert.Equal(string.Empty, CommunityModEndpoints.DecodeHeaderPlayerName(null));
+        Assert.Equal(string.Empty, CommunityModEndpoints.DecodeHeaderPlayerName("   "));
+        string longZh = new string('巴', 40);
+        string decodedLong = CommunityModEndpoints.DecodeHeaderPlayerName(Uri.EscapeDataString(longZh));
+        Assert.Equal(32, decodedLong.Length);
+        Assert.Equal(new string('巴', 32), decodedLong);
+    }
+
+    [Fact]
+    public async Task CommunityModHttpEndpoints_ChinesePlayerNameHeader_ShouldUploadListAndDeleteSafely()
+    {
+        var fx = Shared.Value;
+        var (tempRoot, _, store) = CreateIsolatedHostAndStore(fx);
+        WebApplication? app = null;
+        HttpClient? http = null;
+        try
+        {
+            string dbPath = Path.Combine(tempRoot, "state.db");
+            var persistence = new Persistence(dbPath);
+            var accounts = new AccountStore(persistence);
+
+            var builder = WebApplication.CreateBuilder(Array.Empty<string>());
+            builder.WebHost.UseUrls("http://127.0.0.1:0");
+            builder.Services.AddSingleton(persistence);
+            builder.Services.AddSingleton(accounts);
+            builder.Services.AddSingleton(store);
+
+            app = builder.Build();
+            CommunityModEndpoints.Map(app);
+            await app.StartAsync();
+
+            http = new HttpClient { BaseAddress = new Uri(app.Urls.First()) };
+
+            const string modId = "test-zh-header-mod";
+            const string zhAuthor = "大巴扎测试员";
+            const string zhOther = "路人甲";
+            byte[] zipBytes = BuildValidCommunityModZip(fx, modId);
+
+            // 1. 使用 Uri.EscapeDataString 编码后的中文 X-Player-Name 上传 Mod（附 X-Forwarded-For 模拟非管理员远程玩家）
+            using (var uploadReq = new HttpRequestMessage(HttpMethod.Post, "/api/community/mods/upload"))
+            {
+                uploadReq.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
+                uploadReq.Headers.TryAddWithoutValidation("X-Player-Name", Uri.EscapeDataString(zhAuthor));
+
+                var form = new MultipartFormDataContent();
+                var fileContent = new ByteArrayContent(zipBytes);
+                fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
+                form.Add(fileContent, "file", $"{modId}.bazaarmod.zip");
+                uploadReq.Content = form;
+
+                using var uploadResp = await http.SendAsync(uploadReq);
+                string uploadBody = await uploadResp.Content.ReadAsStringAsync();
+                Assert.Equal(HttpStatusCode.OK, uploadResp.StatusCode);
+
+                using var doc = JsonDocument.Parse(uploadBody);
+                Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
+                Assert.Equal(zhAuthor, doc.RootElement.GetProperty("mod").GetProperty("uploaderName").GetString());
+            }
+
+            // 2. 以同一中文玩家名查询列表：确认 uploaderName 无乱码且识别为本人（canDelete == true）
+            using (var listReq = new HttpRequestMessage(HttpMethod.Get, "/api/community/mods"))
+            {
+                listReq.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
+                listReq.Headers.TryAddWithoutValidation("X-Player-Name", Uri.EscapeDataString(zhAuthor));
+
+                using var listResp = await http.SendAsync(listReq);
+                string listBody = await listResp.Content.ReadAsStringAsync();
+                Assert.Equal(HttpStatusCode.OK, listResp.StatusCode);
+
+                using var doc = JsonDocument.Parse(listBody);
+                Assert.False(doc.RootElement.GetProperty("isAdmin").GetBoolean());
+                var matched = doc.RootElement.GetProperty("mods").EnumerateArray()
+                    .Single(m => string.Equals(m.GetProperty("modId").GetString(), modId, StringComparison.OrdinalIgnoreCase));
+                Assert.Equal(zhAuthor, matched.GetProperty("uploaderName").GetString());
+                Assert.True(matched.GetProperty("canDelete").GetBoolean());
+            }
+
+            // 3. 另一位中文玩家尝试删除该 Mod：必须返回 403 拒绝越权删除
+            using (var badDelReq = new HttpRequestMessage(HttpMethod.Delete, $"/api/community/mods/{modId}"))
+            {
+                badDelReq.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
+                badDelReq.Headers.TryAddWithoutValidation("X-Player-Name", Uri.EscapeDataString(zhOther));
+
+                using var badDelResp = await http.SendAsync(badDelReq);
+                Assert.Equal(HttpStatusCode.Forbidden, badDelResp.StatusCode);
+            }
+
+            // 4. 上传者本人携带编码中文 X-Player-Name 删除 Mod：应返回 200 并彻底移除
+            using (var delReq = new HttpRequestMessage(HttpMethod.Delete, $"/api/community/mods/{modId}"))
+            {
+                delReq.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
+                delReq.Headers.TryAddWithoutValidation("X-Player-Name", Uri.EscapeDataString(zhAuthor));
+
+                using var delResp = await http.SendAsync(delReq);
+                string delBody = await delResp.Content.ReadAsStringAsync();
+                Assert.Equal(HttpStatusCode.OK, delResp.StatusCode);
+                using var doc = JsonDocument.Parse(delBody);
+                Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
+            }
+
+            Assert.DoesNotContain(store.ListCatalog("acc_check", isAdmin: false),
+                m => string.Equals(m.ModId, modId, StringComparison.OrdinalIgnoreCase));
+
+            // 5. 回归确认纯 ASCII 玩家名 X-Player-Name 上传与删除完全保持兼容
+            const string asciiModId = "test-ascii-header-mod";
+            const string asciiAuthor = "Alice_01";
+            byte[] asciiZip = BuildValidCommunityModZip(fx, asciiModId);
+
+            using (var asciiUpload = new HttpRequestMessage(HttpMethod.Post, "/api/community/mods/upload"))
+            {
+                asciiUpload.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
+                asciiUpload.Headers.TryAddWithoutValidation("X-Player-Name", asciiAuthor);
+
+                var form = new MultipartFormDataContent();
+                var fileContent = new ByteArrayContent(asciiZip);
+                fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
+                form.Add(fileContent, "file", $"{asciiModId}.bazaarmod.zip");
+                asciiUpload.Content = form;
+
+                using var resp = await http.SendAsync(asciiUpload);
+                Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+                Assert.Equal(asciiAuthor, doc.RootElement.GetProperty("mod").GetProperty("uploaderName").GetString());
+            }
+
+            using (var asciiDel = new HttpRequestMessage(HttpMethod.Delete, $"/api/community/mods/{asciiModId}"))
+            {
+                asciiDel.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
+                asciiDel.Headers.TryAddWithoutValidation("X-Player-Name", asciiAuthor);
+
+                using var resp = await http.SendAsync(asciiDel);
+                Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+            }
+        }
+        finally
+        {
+            http?.Dispose();
+            if (app != null)
+            {
+                try { await app.StopAsync(); } catch { }
+                try { await app.DisposeAsync(); } catch { }
+            }
+            SqliteConnection.ClearAllPools();
             try { Directory.Delete(tempRoot, recursive: true); } catch { }
         }
     }

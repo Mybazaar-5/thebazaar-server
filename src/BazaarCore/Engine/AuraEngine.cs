@@ -84,10 +84,12 @@ public static class AuraEngine
         GameDataRepository? repo,
         IReadOnlyList<CardInstance>? selectionCards,
         Action<AuraFlyingTransition>? onFlyingTransition = null,
-        Action<IReadOnlyList<AuraEffectTargetsSnapshot>>? onAuraSnapshot = null)
+        Action<IReadOnlyList<AuraEffectTargetsSnapshot>>? onAuraSnapshot = null,
+        IReadOnlyList<CardInstance>? externalAuraCards = null,
+        string? currentEncounterId = null)
     {
         List<AuraEffectTargetsSnapshot>? finalSnapshots = onAuraSnapshot != null ? new List<AuraEffectTargetsSnapshot>() : null;
-        var transitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards, finalSnapshots);
+        var transitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards, finalSnapshots, externalAuraCards, currentEncounterId);
 
         if (scope == RuleScope.OutOfCombat)
         {
@@ -96,7 +98,7 @@ public static class AuraEngine
             if (anyAmmoChanged)
             {
                 finalSnapshots?.Clear();
-                var secondTransitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards, finalSnapshots);
+                var secondTransitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards, finalSnapshots, externalAuraCards, currentEncounterId);
                 if (secondTransitions.Count > 0)
                 {
                     if (transitions.Count == 0)

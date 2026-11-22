@@ -15,7 +15,7 @@ namespace BazaarLauncher;
 ///   - 自动扫描 BepInEx/plugins/BazaarMods/*.dll 与 BepInEx/mods/ 热加载外部第三方 IBazaarClientMod 扩展；
 ///   - OnDestroy 统一回收全部 Harmony 补丁、HTTP 取消令牌与运行时宿主对象，零僵尸补丁泄漏。
 /// </summary>
-[BepInPlugin(Guid, "BazaarLauncher", "15.2.0")]
+[BepInPlugin(Guid, "BazaarLauncher", "15.3.0")]
 public sealed class BazaarLauncherPlugin : BaseUnityPlugin
 {
     public const string Guid = "local.thebazaar.bazaarlauncher";
@@ -98,7 +98,7 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
         ModContentSyncClient.Instance.TriggerFullSyncInBackground(forceDownload: false);
 
         Log.LogInfo(
-            $"BazaarLauncher 2.1.0 (BazaarModKit) 启动就绪 -> {ServerBase.Value} | 玩家={PlayerIdentity.ResolveName()} | 外部扩展={extCount}");
+            $"BazaarLauncher 15.3.0 (BazaarModKit) 启动就绪 -> {ServerBase.Value} | 玩家={PlayerIdentity.ResolveName()} | 外部扩展={extCount}");
     }
 
     private void OnDestroy()
@@ -194,7 +194,15 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
             try { Enabled.ConfigFile?.Save(); } catch { }
         }
 
+        // 完整热切服事务：1) 重设游戏原生 TheBazaar.Config 五大端点；2) 清空旧服 JWT/账号缓存并触发新服鉴权；
+        // 3) 清空旧服 Mod 与 server_overlay 并拉取新服清单；4) 重置 CustomGameplayUI 远端状态与 SSE 订阅。
+        try { ApplyUrls(GameInspector.FindTypeSafe("TheBazaar.Config")); } catch { }
+        try { NameAuth.OnServerChanged(); } catch { }
         ModContentSyncClient.Instance.OnServerChanged();
+        MainThreadDispatcher.Enqueue(() =>
+        {
+            try { CustomGameplayUI.Instance?.OnServerBaseSwitched(); } catch { }
+        });
         return true;
     }
 

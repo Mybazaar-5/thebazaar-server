@@ -1,4 +1,7 @@
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using BazaarCore.Data;
 using BazaarServer.Accounts;
 using BazaarServer.Data;
@@ -157,15 +160,21 @@ Console.WriteLine(
 builder.Services.AddSingleton<ISandboxEngineBridge, SandboxEngineService>();
 MultiplayerEndpointModule.RegisterServices(builder.Services);
 
-// 端口：BAZAAR_PORT（默认 8080）；监听 0.0.0.0 以便公网直连
+// 端口与监听地址：BAZAAR_BIND（默认 0.0.0.0，伴侣纯单机模式可设 127.0.0.1）、BAZAAR_PORT（默认 8080）
+string bindHost = Environment.GetEnvironmentVariable("BAZAAR_BIND")?.Trim();
+if (string.IsNullOrEmpty(bindHost)) bindHost = "0.0.0.0";
 string port = Environment.GetEnvironmentVariable("BAZAAR_PORT") ?? "8080";
-builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+builder.WebHost.UseUrls($"http://{bindHost}:{port}");
 
 var app = builder.Build();
 
 // 启动时把存档里的账号加载进内存
 try { app.Services.GetRequiredService<AccountStore>().LoadAllFromDb(); }
 catch (Exception ex) { Console.WriteLine("[startup] LoadAllFromDb failed: " + ex.Message); }
+
+// 路径前缀剥离（/bz-enter、/bz-server、/bz-static-data），须在显式 UseRouting 之前注册，使直连、本地代理与伴侣模式路由完全一致
+BazaarStaticDataPipeline.UseBazaarRoutePrefixStrip(app);
+app.UseRouting();
 
 // 请求日志（只记方法与路径，不记 body）
 app.Use(async (ctx, next) =>
@@ -267,7 +276,10 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
-// 静态数据托管（maintenance.json / manifest.json / GameData.db / translations / valid_card_ids.json）
+// 静态数据稳定 SHA-256 ETag 与 If-None-Match -> 304 Not Modified（配合安卓预置数据 0 首次下载）
+BazaarStaticDataPipeline.UseBazaarStaticDataStableEtag(app, dataRoot);
+
+// 静态数据托管（manifest.json / GameData.db / GameData.db.zip / translations / valid_card_ids.json）
 app.UseStaticFiles(new StaticFileOptions
 {
     FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(dataRoot),
@@ -291,44 +303,239 @@ app.MapGet("/healthz", () => Results.Json(new
     memoryMb = Math.Round(GC.GetTotalMemory(false) / 1024d / 1024d, 2),
 }));
 
-// 版本门：客户端读 {DataURL}/maintenance.json，这里也提供一份兜底
-app.MapGet("/maintenance.json", (HttpContext ctx) =>
-{
-    string path = Path.Combine(dataRoot, "maintenance.json");
-    if (File.Exists(path))
-    {
-        ctx.Response.ContentType = "application/json";
-        return ctx.Response.SendFileAsync(path);
-    }
-    ctx.Response.ContentType = "application/json";
-    return ctx.Response.WriteAsync(JsonSerializer.Serialize(new
-    {
-        status = new
-        {
-            systems = new
-            {
-                temponet = new { isAvailable = true },
-                tempoidentity = new { isAvailable = true },
-                tempoplatform = new { isAvailable = true },
-            },
-            versions = new Dictionary<string, string>(),
-        },
-        breakingChange = false,
-        httpGameClientTimeouts = new
-        {
-            defaultRequestSeconds = 60,
-            inRunCommandSeconds = 60,
-            deleteSessionSeconds = 60,
-        },
-        locales = new[] { new { code = "zh-CN", name = "简体中文" }, new { code = "en-US", name = "English" } },
-    }));
-});
+// 版本门：客户端读 {DataURL}/maintenance.json，同时支持 GET/HEAD，稳定输出仅含 zh-CN 的 locales 与 SHA-256 ETag / 304
+app.MapMethods("/maintenance.json", new[] { HttpMethods.Get, HttpMethods.Head }, (HttpContext ctx) => BazaarStaticDataPipeline.ServeMaintenanceJsonAsync(ctx, dataRoot));
 
 Console.WriteLine("======================================================");
 Console.WriteLine(" BazaarServer (Wave 3B: Engine + ModHost + 5 Modes)");
 Console.WriteLine($" data root : {dataRoot}");
 Console.WriteLine($" mods root : {modHost.ModsRootDirectory} (enabled={modHost.EnabledModCount})");
-Console.WriteLine($" listening : http://0.0.0.0:{port}");
+Console.WriteLine($" listening : http://{bindHost}:{port}");
 Console.WriteLine("======================================================");
 
 app.Run();
+
+public static class BazaarStaticDataPipeline
+{
+    private static readonly PathString[] StrippableRoutePrefixes =
+    [
+        new PathString("/bz-enter"),
+        new PathString("/bz-server"),
+        new PathString("/bz-static-data"),
+    ];
+
+    private static readonly ConcurrentDictionary<string, (long LastWriteUtcTicks, long Length, string ETag)> FileSha256EtagCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 剥离安卓本地代理 / 伴侣等长前缀（/bz-enter、/bz-server、/bz-static-data），须在 app.UseRouting() 之前调用。
+    /// </summary>
+    public static void UseBazaarRoutePrefixStrip(IApplicationBuilder app)
+    {
+        app.Use(async (ctx, next) =>
+        {
+            PathString path = ctx.Request.Path;
+            for (int i = 0; i < StrippableRoutePrefixes.Length; i++)
+            {
+                if (path.StartsWithSegments(StrippableRoutePrefixes[i], StringComparison.OrdinalIgnoreCase, out PathString remaining))
+                {
+                    ctx.Request.Path = remaining.HasValue ? remaining : new PathString("/");
+                    break;
+                }
+            }
+            await next();
+        });
+    }
+
+    /// <summary>
+    /// 为 /GameData.db.zip 与 /translations/*.bytes 提供基于文件内容 SHA-256 的稳定 ETag 与 If-None-Match -> 304 校验，
+    /// 同时保留下游 StaticFileMiddleware 的 Range/206 断点续传与 HEAD 支持。
+    /// </summary>
+    public static void UseBazaarStaticDataStableEtag(IApplicationBuilder app, string dataRoot)
+    {
+        string fullRoot = Path.GetFullPath(dataRoot);
+        if (!fullRoot.EndsWith(Path.DirectorySeparatorChar))
+            fullRoot += Path.DirectorySeparatorChar;
+
+        app.Use(async (ctx, next) =>
+        {
+            if (HttpMethods.IsGet(ctx.Request.Method) || HttpMethods.IsHead(ctx.Request.Method))
+            {
+                string reqPath = ctx.Request.Path.Value ?? "";
+                bool isTrackedStatic =
+                    string.Equals(reqPath, "/GameData.db.zip", StringComparison.OrdinalIgnoreCase)
+                    || (reqPath.StartsWith("/translations/", StringComparison.OrdinalIgnoreCase)
+                        && reqPath.EndsWith(".bytes", StringComparison.OrdinalIgnoreCase));
+
+                if (isTrackedStatic)
+                {
+                    string relPath = reqPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
+                    string candidate = Path.GetFullPath(Path.Combine(fullRoot, relPath));
+                    if (candidate.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase) && File.Exists(candidate))
+                    {
+                        string etag = ComputeCachedFileSha256Etag(candidate);
+                        if (IsIfNoneMatchSatisfied(ctx.Request.Headers.IfNoneMatch, etag))
+                        {
+                            ctx.Response.Headers.ETag = etag;
+                            ctx.Response.Headers.CacheControl = "no-cache";
+                            ctx.Response.StatusCode = StatusCodes.Status304NotModified;
+                            return;
+                        }
+
+                        // 移除原始 If-None-Match，防止下游 StaticFileMiddleware 使用 mtime ETag 产生误判，并在响应头写出前覆写为 SHA-256 ETag
+                        ctx.Request.Headers.Remove("If-None-Match");
+                        ctx.Response.OnStarting(() =>
+                        {
+                            if (ctx.Response.StatusCode is >= 200 and < 300)
+                            {
+                                ctx.Response.Headers.ETag = etag;
+                                ctx.Response.Headers.CacheControl = "no-cache";
+                            }
+                            return Task.CompletedTask;
+                        });
+                    }
+                }
+            }
+
+            await next();
+        });
+    }
+
+    /// <summary>
+    /// 计算并缓存单个静态文件的强 SHA-256 ETag（格式："\"<64位小写十六进制>\""）。
+    /// </summary>
+    public static string ComputeCachedFileSha256Etag(string filePath)
+    {
+        var fi = new FileInfo(filePath);
+        long ticks = fi.LastWriteTimeUtc.Ticks;
+        long len = fi.Length;
+        if (FileSha256EtagCache.TryGetValue(filePath, out var cached)
+            && cached.LastWriteUtcTicks == ticks
+            && cached.Length == len)
+        {
+            return cached.ETag;
+        }
+
+        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        byte[] hash = SHA256.HashData(fs);
+        string etag = $"\"{Convert.ToHexString(hash).ToLowerInvariant()}\"";
+        FileSha256EtagCache[filePath] = (ticks, len, etag);
+        return etag;
+    }
+
+    public static bool IsIfNoneMatchSatisfied(Microsoft.Extensions.Primitives.StringValues headerValues, string expectedQuotedEtag)
+    {
+        if (headerValues.Count == 0 || string.IsNullOrWhiteSpace(expectedQuotedEtag))
+            return false;
+
+        string expectedBare = StripWeakAndQuotes(expectedQuotedEtag);
+        foreach (string? rawHeader in headerValues)
+        {
+            if (string.IsNullOrWhiteSpace(rawHeader)) continue;
+            foreach (string token in rawHeader.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (token == "*") return true;
+                if (string.Equals(StripWeakAndQuotes(token), expectedBare, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private static string StripWeakAndQuotes(string tag)
+    {
+        string s = tag.Trim();
+        if (s.StartsWith("W/", StringComparison.OrdinalIgnoreCase))
+            s = s[2..].Trim();
+        return s.Trim('"');
+    }
+
+    /// <summary>
+    /// 构建标准化 maintenance.json（默认仅保留 zh-CN locale，防止移动端首启下载 8 国多余翻译包）并支持 SHA-256 ETag / 304。
+    /// </summary>
+    public static byte[] BuildNormalizedMaintenanceJsonBytes(string dataRoot)
+    {
+        string path = Path.Combine(dataRoot, "maintenance.json");
+        JsonObject rootObj;
+        if (File.Exists(path))
+        {
+            try
+            {
+                rootObj = JsonNode.Parse(File.ReadAllText(path)) as JsonObject ?? new JsonObject();
+            }
+            catch
+            {
+                rootObj = new JsonObject();
+            }
+        }
+        else
+        {
+            rootObj = new JsonObject();
+        }
+
+        var statusObj = rootObj["status"] as JsonObject;
+        if (statusObj == null)
+        {
+            statusObj = new JsonObject
+            {
+                ["systems"] = new JsonObject
+                {
+                    ["temponet"] = new JsonObject { ["isAvailable"] = true },
+                    ["tempoidentity"] = new JsonObject { ["isAvailable"] = true },
+                    ["tempoplatform"] = new JsonObject { ["isAvailable"] = true },
+                },
+                ["versions"] = new JsonObject(),
+                ["breakingChange"] = false,
+                ["httpGameClientTimeouts"] = new JsonObject
+                {
+                    ["defaultRequestSeconds"] = 60,
+                    ["inRunCommandSeconds"] = 60,
+                    ["deleteSessionSeconds"] = 60,
+                },
+            };
+            rootObj["status"] = statusObj;
+        }
+
+        // 强制 status.locales 仅保留简体中文 zh-CN（避免安卓客户端首启拉取 7.5 MB 其余语言包）
+        statusObj["locales"] = new JsonArray
+        {
+            new JsonObject
+            {
+                ["id"] = "zh-CN",
+                ["displayName"] = "简体中文",
+            },
+        };
+        if (rootObj["breakingChange"] == null)
+            rootObj["breakingChange"] = false;
+        if (rootObj["httpGameClientTimeouts"] == null)
+        {
+            rootObj["httpGameClientTimeouts"] = new JsonObject
+            {
+                ["defaultRequestSeconds"] = 60,
+                ["inRunCommandSeconds"] = 60,
+                ["deleteSessionSeconds"] = 60,
+            };
+        }
+
+        return System.Text.Encoding.UTF8.GetBytes(rootObj.ToJsonString());
+    }
+
+    public static Task ServeMaintenanceJsonAsync(HttpContext ctx, string dataRoot)
+    {
+        byte[] payload = BuildNormalizedMaintenanceJsonBytes(dataRoot);
+        string etag = $"\"{Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant()}\"";
+        ctx.Response.Headers.ETag = etag;
+        ctx.Response.Headers.CacheControl = "no-cache";
+        if (IsIfNoneMatchSatisfied(ctx.Request.Headers.IfNoneMatch, etag))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status304NotModified;
+            return Task.CompletedTask;
+        }
+
+        ctx.Response.ContentType = "application/json; charset=utf-8";
+        ctx.Response.ContentLength = payload.Length;
+        return HttpMethods.IsHead(ctx.Request.Method)
+            ? Task.CompletedTask
+            : ctx.Response.Body.WriteAsync(payload, 0, payload.Length);
+    }
+}

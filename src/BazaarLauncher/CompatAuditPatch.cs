@@ -80,6 +80,7 @@ internal static partial class CompatAuditPatch
     private static FieldInfo _pedestalAnimCompletedField;
     private static FieldInfo _pedestalTemplateField;
     private static FieldInfo _rewardHideCompleteField;
+    private static FieldInfo _rewardAnimatorField;
     private static PropertyInfo _rewardAnimatorProp;
     private static FieldInfo _rewardSoundHandlerField;
     private static PropertyInfo _dataSimPvpOpponentProp;
@@ -178,6 +179,11 @@ internal static partial class CompatAuditPatch
         ["hackH6EncounterFallback"] = Volatile.Read(ref _encounterPortraitFallbackCount)
             + Volatile.Read(ref _encounterTooltipFallbackCount),
         ["hackH7GoToNextStateFallback"] = CombatPatch.HackH7GoToNextStateFallbackCount,
+        ["gameplayMsgFontFixed"] = Volatile.Read(ref _gameplayMsgFontFixedCount),
+        ["layoutColliderGuard"] = Volatile.Read(ref _layoutColliderGuardCount),
+        ["opponentCardsForceShown"] = Volatile.Read(ref _opponentCardsForceShownCount),
+        ["resumeCardsRecovered"] = Volatile.Read(ref _resumeCardsRecoveredCount),
+        ["resumeSkillsRecovered"] = Volatile.Read(ref _resumeSkillsRecoveredCount),
     };
 
     /// <summary>P2-15 (H-1~H-6)：低频记录客户端防御兜底命中诊断日志（第 1、5 次及每 25 次输出），便于验证服务端修完后零触发。</summary>
@@ -198,6 +204,7 @@ internal static partial class CompatAuditPatch
         Interlocked.Exchange(ref _gameSimPatchedCount, 0);
         _lastTriggeredPvpSnapshot = default;
         Interlocked.Increment(ref _gameSimVersion);
+        CancelPendingRunScopedWatchdogs();
         TryUnsubscribeSceneCleanupIfIdle();
     }
 
@@ -263,6 +270,7 @@ internal static partial class CompatAuditPatch
             _cardTagSyncStamps.Clear();
             _lastTriggeredPvpSnapshot = default;
             Interlocked.Increment(ref _gameSimVersion);
+            CancelPendingRunScopedWatchdogs();
             ResetPedestalAndDragRunScopedCaches();
             ClearParentEncounterCache(reason);
             ClearEndOfRunChallengeGuards();
@@ -291,6 +299,7 @@ internal static partial class CompatAuditPatch
         PatchCardRevealAnimationDriver(patcher);
         PatchDataApplySimPvpOpponent(patcher);
         PatchTransitionInHour6Guard(patcher);
+        PatchUserFeedbackFixes(patcher);
         Interlocked.Exchange(ref _gameSimPatchedCount, Math.Max(0, patcher.SucceededCount - before));
     }
 

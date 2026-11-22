@@ -86,7 +86,7 @@ public static class WorkshopEndpoints
                 mode = access.ModeLabel,
                 canWrite = access.CanWrite,
                 tokenConfigured = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BAZAAR_WORKSHOP_TOKEN")),
-                serverVersion = "15.2.0",
+                serverVersion = "15.3.0",
                 baseCardCount = modHost.BaseRepository.CardsById.Count,
                 whitelistedCardCount = modHost.ValidVisualWhitelist.Count,
                 registeredMechanicCount = modHost.Registry.MechanicsById.Count,

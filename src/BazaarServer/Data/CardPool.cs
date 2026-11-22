@@ -2054,7 +2054,7 @@ public sealed class GuidOnlyHourlyEncounterCatalog
             }
         }
 
-        // 2. 分天拆分白昼奇遇（Invest in Yourself / Trophy Hunt / Deadly Duel / Epic Battle）：严格按 (MinDay..MaxDay) 精确匹配
+        // 2. 分天拆分白昼奇遇（Invest in Yourself / Deadly Duel / Epic Battle）：严格按 (MinDay..MaxDay) 精确匹配
         foreach (var suite in DayRangeSuites)
         {
             foreach (var v in suite.Variants)
@@ -2097,6 +2097,7 @@ public sealed class GuidOnlyHourlyEncounterCatalog
             card.Id.Equals(CardArchetypeIndex.MysteriousPortalEncounterId, StringComparison.OrdinalIgnoreCase) ||
             card.Id.Equals(CardArchetypeIndex.FuturaEncounterId, StringComparison.OrdinalIgnoreCase) ||
             card.Id.Equals(CardPool.GrandOpeningEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            card.Id.Equals("5e1ac00b-1abc-44cb-8f9c-6755327580c5", StringComparison.OrdinalIgnoreCase) || // Sprout：Day 10 Tiny World 远征子节点，非独立小时事件
             CardPool.IsExpeditionRoomTemplate(card.Id))
         {
             return true;
@@ -2110,7 +2111,8 @@ public sealed class GuidOnlyHourlyEncounterCatalog
             name.Contains("(Start)", StringComparison.OrdinalIgnoreCase) ||
             name.Contains("Expedition", StringComparison.OrdinalIgnoreCase) ||
             name.Contains("Fates", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase))
+            name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("Trophy Hunt", StringComparison.OrdinalIgnoreCase)) // 已废弃老“获得3件怪物战利品”事件（新版本由 Jungle Ruins 等替代）
         {
             return true;
         }

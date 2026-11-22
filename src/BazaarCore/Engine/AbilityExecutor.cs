@@ -548,14 +548,46 @@ public static class AbilityExecutor
         if (subject == null) return ReferenceEquals(candidate, ownerCard);
         var prevSelf = ctx.SelfCard;
         var prevSrc = ctx.TriggerSourceCard;
+        BoardGrid? tempInsertedGrid = null;
+        List<CardInstance>? prevOrderSnapshot = null;
+        int prevSlot = candidate.StartSlot;
         try
         {
             ctx.SelfCard = ownerCard;
             ctx.TriggerSourceCard = candidate;
+
+            // 若正在处理已提前摘除腾格的被卖卡，在主体条件求值期间临时还原至原网格原槽位，确保邻位/分区条件精确命中
+            if (SoldCardScopes.TryGetValue(ctx.ActiveExecution, out var soldScope)
+                && soldScope != null
+                && ReferenceEquals(candidate, soldScope.SoldCard)
+                && soldScope.OriginalGrid != null
+                && !soldScope.OriginalGrid.Cards.Contains(candidate)
+                && soldScope.OriginalStartSlot >= 0)
+            {
+                prevOrderSnapshot = new List<CardInstance>(soldScope.OriginalGrid.Cards);
+                candidate.StartSlot = soldScope.OriginalStartSlot;
+                soldScope.OriginalGrid.Cards.Add(candidate);
+                soldScope.OriginalGrid.Cards.Sort((a, b) =>
+                {
+                    int sa = a.StartSlot < 0 ? int.MaxValue : a.StartSlot;
+                    int sb = b.StartSlot < 0 ? int.MaxValue : b.StartSlot;
+                    int c = sa.CompareTo(sb);
+                    return c != 0 ? c : string.CompareOrdinal(a.InstanceId, b.InstanceId);
+                });
+                tempInsertedGrid = soldScope.OriginalGrid;
+            }
+
             return TargetResolver.MatchesCard(subject, candidate, ctx);
         }
         finally
         {
+            if (tempInsertedGrid != null)
+            {
+                tempInsertedGrid.Cards.Clear();
+                if (prevOrderSnapshot != null)
+                    tempInsertedGrid.Cards.AddRange(prevOrderSnapshot);
+                candidate.StartSlot = prevSlot;
+            }
             ctx.SelfCard = prevSelf;
             ctx.TriggerSourceCard = prevSrc;
         }

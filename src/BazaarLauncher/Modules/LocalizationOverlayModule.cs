@@ -780,6 +780,27 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         }
     }
 
+    /// <summary>切换服务器时卸载旧服写入的 server_overlay 文本层并刷新原版 LRU 缓存。</summary>
+    internal void ClearServerOverlayLayer()
+    {
+        bool hadEntries;
+        lock (_sync)
+        {
+            hadEntries = _overlayHandles.Count > 0;
+            for (int i = _overlayHandles.Count - 1; i >= 0; i--)
+            {
+                try { _overlayHandles[i]?.Dispose(); } catch { }
+            }
+            _overlayHandles.Clear();
+            _overlayRevision = string.Empty;
+            _overlayTotalEntries = 0;
+        }
+        if (hadEntries)
+        {
+            NotifyLocaleReloaded("server-overlay-cleared");
+        }
+    }
+
     private int RegisterRegexArray(string locale, JArray arr, string defaultScope, int priority, List<IDisposable> handles)
     {
         if (arr == null) return 0;
@@ -875,13 +896,39 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 optional: true,
                 label: "L10n.CardTooltipData.GetTitle");
 
-            patcher.TryPatch(
-                tooltipType,
-                "GetCardDescription",
-                Type.EmptyTypes,
-                postfix: AccessTools.Method(typeof(LocalizationOverlayModule), nameof(CardTooltipGetDescriptionPostfix)),
-                optional: true,
-                label: "L10n.CardTooltipData.GetCardDescription");
+            // CardTooltipData.GetCardDescription() 在当前客户端返回 ValueTuple<string, TooltipSegment?>，
+            // 需按真实返回类型动态绑定泛型元组 Postfix（同时兼容旧版 string 返回值），否则会被 SafeHarmonyPatcher 静默跳过。
+            var getDescMethod = AccessTools.Method(tooltipType, "GetCardDescription", Type.EmptyTypes);
+            if (getDescMethod != null)
+            {
+                MethodInfo descPostfix = null;
+                Type retType = getDescMethod.ReturnType;
+                if (retType == typeof(string))
+                {
+                    descPostfix = AccessTools.Method(typeof(LocalizationOverlayModule), nameof(CardTooltipGetDescriptionStringPostfix));
+                }
+                else if (retType.IsGenericType
+                    && retType.GetGenericTypeDefinition() == typeof(ValueTuple<,>)
+                    && retType.GetGenericArguments()[0] == typeof(string))
+                {
+                    var openGeneric = typeof(LocalizationOverlayModule).GetMethod(
+                        nameof(CardTooltipGetDescriptionTuplePostfix),
+                        BindingFlags.NonPublic | BindingFlags.Static);
+                    if (openGeneric != null && openGeneric.IsGenericMethodDefinition)
+                    {
+                        descPostfix = openGeneric.MakeGenericMethod(retType.GetGenericArguments()[1]);
+                    }
+                }
+
+                if (descPostfix != null)
+                {
+                    patcher.TryPatchMethod(
+                        getDescMethod,
+                        postfix: descPostfix,
+                        optional: true,
+                        label: "L10n.CardTooltipData.GetCardDescription");
+                }
+            }
 
             // 修正命名空间：真实类型为 BazaarGameShared.Domain.Tooltips.ETooltipType，消除启动告警 #1
             var eTooltipType = GameInspector.FindTypeSafe(
@@ -1008,19 +1055,41 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         catch { }
     }
 
-    private static void CardTooltipGetDescriptionPostfix(object __instance, ref string __result)
+    private static bool TryResolveCardDescriptionOverride(object tooltipData, out string renderedDescription)
+    {
+        renderedDescription = null;
+        var inst = Instance;
+        if (inst == null || tooltipData == null) return false;
+        string locale = inst.CurrentLocale;
+        if (!IsChineseLocale(locale)) return false;
+
+        if (!TryExtractCardOverride(tooltipData, locale, out var ov, out var cardInst)) return false;
+        if (string.IsNullOrWhiteSpace(ov.Description)) return false;
+
+        renderedDescription = RenderDynamicAttributePlaceholders(ov.Description, cardInst);
+        return true;
+    }
+
+    private static void CardTooltipGetDescriptionStringPostfix(object __instance, ref string __result)
     {
         try
         {
-            var inst = Instance;
-            if (inst == null || __instance == null) return;
-            string locale = inst.CurrentLocale;
-            if (!IsChineseLocale(locale)) return;
+            if (TryResolveCardDescriptionOverride(__instance, out string desc))
+            {
+                __result = desc;
+            }
+        }
+        catch { }
+    }
 
-            if (!TryExtractCardOverride(__instance, locale, out var ov, out var cardInst)) return;
-            if (string.IsNullOrWhiteSpace(ov.Description)) return;
-
-            __result = RenderDynamicAttributePlaceholders(ov.Description, cardInst);
+    private static void CardTooltipGetDescriptionTuplePostfix<TSecond>(object __instance, ref ValueTuple<string, TSecond> __result)
+    {
+        try
+        {
+            if (TryResolveCardDescriptionOverride(__instance, out string desc))
+            {
+                __result = (desc, __result.Item2);
+            }
         }
         catch { }
     }
@@ -1356,7 +1425,22 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
 
             var cacheField = AccessTools.Field(svcType, "_cache");
             var cacheObj = cacheField?.GetValue(locSvc);
-            cacheObj?.GetType().GetMethod("Clear", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null)?.Invoke(cacheObj, null);
+            if (cacheObj == null) return;
+
+            var clearMethod = cacheObj.GetType().GetMethod("Clear", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, Type.EmptyTypes, null);
+            if (clearMethod != null)
+            {
+                clearMethod.Invoke(cacheObj, null);
+                return;
+            }
+
+            // 原版 TheBazaar.Localization.LruCache<string, string> 无 Clear() 方法，
+            // 直接反射清空内部 _map (Dictionary) 与 _list (LinkedList) 以真正失效旧译文缓存。
+            const BindingFlags privFlags = BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance;
+            var mapObj = cacheObj.GetType().GetField("_map", privFlags)?.GetValue(cacheObj);
+            var listObj = cacheObj.GetType().GetField("_list", privFlags)?.GetValue(cacheObj);
+            mapObj?.GetType().GetMethod("Clear", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null)?.Invoke(mapObj, null);
+            listObj?.GetType().GetMethod("Clear", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null)?.Invoke(listObj, null);
         }
         catch { }
     }

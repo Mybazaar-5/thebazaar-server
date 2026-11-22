@@ -1311,7 +1311,7 @@
     const grid = $('communityModGrid');
     if (!grid) return;
     const playerName = getCommunityPlayerName();
-    const headers = playerName ? { 'X-Player-Name': playerName } : {};
+    const headers = playerName ? { 'X-Player-Name': encodeURIComponent(playerName) } : {};
     const res = await apiFetch('/api/community/mods', { headers });
     if (!res.ok) {
       grid.innerHTML = `<div class="empty-hint">加载社区 Mod 列表失败（HTTP ${res.status}）</div>`;
@@ -1394,7 +1394,7 @@
     toast('正在上传并执行安全检测与 25 场模拟对战，请稍候...');
     const res = await apiFetch('/api/community/mods/upload', {
       method: 'POST',
-      headers: { 'X-Player-Name': playerName },
+      headers: { 'X-Player-Name': encodeURIComponent(playerName) },
       body: fd
     });
     if (!res.ok) {
@@ -1412,7 +1412,7 @@
   async function handleCommunityModAction(action, modId) {
     if (!modId) return;
     const playerName = getCommunityPlayerName();
-    const headers = playerName ? { 'X-Player-Name': playerName } : {};
+    const headers = playerName ? { 'X-Player-Name': encodeURIComponent(playerName) } : {};
 
     if (action === 'delete') {
       if (!confirm(`确定删除社区 Mod「${modId}」吗？`)) return;

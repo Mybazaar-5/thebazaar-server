@@ -1,4 +1,4 @@
-# 《The Bazaar》自建服务端与客户端增强插件（V15.0 · 官方全库一致性 + Patch 20.2 事件调度 + 开放沙盒 Mod 平台）
+# 《The Bazaar》自建服务端与客户端增强插件（V15.3 · 全栈官方对齐修复 + 插件深度治理 + BazaarHub 暗金界面重构）
 
 > [!IMPORTANT]
 > **客户端版本要求（必看）**：本项目**必须使用 Steam 官方测试服（PTR 分支）客户端才可以正常使用，暂不支持官方正式服最新版！**
@@ -10,9 +10,13 @@
 
 ---
 
-## 核心特性（V15.0 里程碑升级）
+## 核心特性（V15.3 里程碑升级）
 
-- **127 项全库深度一致性对齐 + Patch 20.2 官方事件调度（598 / 598 自动化回归全绿）**：
+- **V15.3 全栈官方对齐修复、插件深度治理、安卓兼容与 BazaarHub 暗金界面重构（636 / 636 自动化回归全绿）**：
+  - 服务端核心机制深度对齐与修复：补齐卖卡提前腾格与原位回滚、PvP 幽灵镜像去光环与防双重冷却缩减、断线重连 `SocketsUnlocked`/`BoardOverridden`/货架折扣与遭遇光环还原、遭遇引擎防幽灵卡与非 GUID Mod 兼容，以及安卓/外部登录兼容（`HEAD /maintenance.json`、SHA-256 ETag/304、受保护外部鉴权与中文昵称全链路编码对齐）；
+  - 游戏插件全面实效治理：逐一对照官方客户端运行时签名对齐 `GameSimHandler`、`BoardManager`、`CardTooltipData`、`LruCache` 与音频/场景阻塞事件，补齐 9 项自定义规则字段对齐、SSE 退避重连与热切服事务保护；
+  - `BazaarHub` 图形启动器全新暗黑黑曜石 × 暖鎏金视觉重构：纯自绘暗黑控件零露白、矢量图标、高 DPI `PerMonitorV2` 适配与 1060×680 紧凑布局防裁切，内置一键更新、自建服切换与社区工坊直连。
+- **127 项全库深度一致性对齐 + Patch 20.2 官方事件调度**：
   - 完整对齐官方 `50ms` 战斗时钟与沙暴节拍、同跳 DoT 顺序（`Poison → Regen → Burn`）、单次施放原子暴击与护盾/治疗暴击标识、灼烧护盾拆分扣减、再生与治疗解耦、附魔同名动作独立域隔离、Karnok 完整战斗属性与头像包、以及 4 张元进度全表（`challenges` 80 条、`collectibles` 1,644 条、`seasons` 21 赛季、`tooltips` 136 条）；
   - 接入官方 Patch 20.2 全量 170 项白昼遭遇天数窗、小时禁令、英雄解锁覆盖与三槽（左商 / 中奇遇+基座 / 右免费与保底）Plackett-Luce Hazard 实测权重曲线，对齐 Day 10+ 商店品阶稳态；
   - 全面修复局内权重体系：`ShopHighTierBonusPct` 等比折算与 Day 6+ 平滑转阶、流派倾向权重覆盖商店/开局/事件分支/局外衍生（铲子/钓竿等）/变形祭坛/野怪战利品/升级奖励全链路，以及 Mod 自定义奇遇 `weight` / `minDay` / `maxDay` 调度落地；
@@ -60,7 +64,7 @@ dotnet build src/BazaarLauncher/BazaarLauncher.csproj -c Release
 # 编译 BazaarHub 图形启动器（Windows）
 dotnet publish src/BazaarHub/BazaarHub.csproj -c Release -r win-x64 --self-contained false
 
-# 运行全量自动化测试（406+ 用例）
+# 运行全量自动化测试（636+ 用例）
 $env:BAZAAR_DATA_DIR = "./dist/data"
 dotnet test Bazaar.sln -c Release
 ```

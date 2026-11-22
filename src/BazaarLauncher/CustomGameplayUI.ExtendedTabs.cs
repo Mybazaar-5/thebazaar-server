@@ -69,7 +69,8 @@ internal sealed partial class CustomGameplayUI
     private string _activeLeaderboardKey = "endless";
     private string _activeChatChannel = "lobby";
     private CancellationTokenSource _socialSseCts;
-    private string _subscribedSseLobbyId = string.Empty;
+    private string _subscribedSseKey = string.Empty;
+    private long _lastSocialEventId;
     private readonly List<(long Id, string Channel, string Sender, string Content)> _socialMessages = new();
 
     // ── 性能监控与诊断控件引用 ──────────────────────────────────────────────────
@@ -220,9 +221,16 @@ internal sealed partial class CustomGameplayUI
         {
             rules.StartingGold = 999;
             rules.StartingIncome = 100;
+            rules.StartingExperience = 0;
             rules.StartingHealth = 1000;
             rules.StartingPrestige = 99;
             rules.SandboxFreeInfiniteReroll = true;
+            rules.ShopHighTierBonusPct = 0.0;
+            rules.ShopPriceMultiplier = 1.0;
+            rules.MonsterLootBonusChoices = 0;
+            rules.MonsterLootTierBonus = 0;
+            rules.EnemyStatMultiplier = 1.0;
+            rules.DisableFatesRevive = false;
             return;
         }
         if (string.Equals(presetId, "EnhancedFun", StringComparison.OrdinalIgnoreCase))
@@ -233,6 +241,12 @@ internal sealed partial class CustomGameplayUI
             rules.StartingPrestige = 25;
             rules.StartingHealth = 350;
             rules.MonsterLootChooseOne = true;
+            rules.MonsterLootBonusChoices = 1;
+            rules.MonsterLootTierBonus = 0;
+            rules.ShopHighTierBonusPct = 15.0;
+            rules.ShopPriceMultiplier = 1.0;
+            rules.EnemyStatMultiplier = 1.0;
+            rules.DisableFatesRevive = false;
             return;
         }
         if (string.Equals(presetId, "ExtremeRoguelike", StringComparison.OrdinalIgnoreCase))
@@ -243,15 +257,27 @@ internal sealed partial class CustomGameplayUI
             rules.StartingPrestige = 12;
             rules.StartingHealth = 220;
             rules.MonsterLootChooseOne = true;
+            rules.MonsterLootBonusChoices = 0;
+            rules.MonsterLootTierBonus = 1;
+            rules.ShopHighTierBonusPct = 20.0;
+            rules.ShopPriceMultiplier = 1.10;
+            rules.EnemyStatMultiplier = 1.25;
+            rules.DisableFatesRevive = false;
             return;
         }
 
         rules.StartingGold = 15;
         rules.StartingIncome = 5;
-        rules.StartingExperience = 3;
+        rules.StartingExperience = 0;
         rules.StartingPrestige = 20;
         rules.StartingHealth = 250;
         rules.MonsterLootChooseOne = true;
+        rules.MonsterLootBonusChoices = 0;
+        rules.MonsterLootTierBonus = 0;
+        rules.ShopHighTierBonusPct = 0.0;
+        rules.ShopPriceMultiplier = 1.0;
+        rules.EnemyStatMultiplier = 1.0;
+        rules.DisableFatesRevive = false;
     }
 
     // ── 构建三大全新原生级页签（由 BuildModalPanel 调用） ──────────────────────
@@ -736,6 +762,7 @@ internal sealed partial class CustomGameplayUI
             NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
             {
                 _activeChatChannel = "lobby";
+                EnsureSocialSseSubscribed();
                 RefreshSocialChatAsync();
             });
         NativeUguiFactory.SetLayout(btnChLobby.Root, minW: 82f, prefW: 86f, minH: 26f);
@@ -744,6 +771,7 @@ internal sealed partial class CustomGameplayUI
             NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
             {
                 _activeChatChannel = "global";
+                EnsureSocialSseSubscribed();
                 RefreshSocialChatAsync();
             });
         NativeUguiFactory.SetLayout(btnChGlobal.Root, minW: 86f, prefW: 92f, minH: 26f);
@@ -911,53 +939,116 @@ internal sealed partial class CustomGameplayUI
 
     private void RefreshSocialChatAsync()
     {
+        string targetChannel = _activeChatChannel;
+        string lobbyId = _currentLobby?.LobbyId ?? string.Empty;
+        bool isLobbyChannel = string.Equals(targetChannel, "lobby", StringComparison.OrdinalIgnoreCase);
+
+        if (isLobbyChannel && string.IsNullOrEmpty(lobbyId))
+        {
+            _socialMessages.Clear();
+            RenderSocialChatLines();
+            return;
+        }
+
         _ = Task.Run(async () =>
         {
-            string endpoint = string.Equals(_activeChatChannel, "lobby", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(_currentLobby?.LobbyId)
-                ? $"/api/lobbies/{Uri.EscapeDataString(_currentLobby.LobbyId)}/chat?limit=25"
-                : "/api/social/announcements?limit=25";
+            var parsed = new List<(long Id, string Channel, string Sender, string Content)>();
+            var seenIds = new HashSet<long>();
 
-            var resp = await NameAuth.GetJsonAsync(endpoint).ConfigureAwait(false);
-            if (!resp.Ok && endpoint.Contains("/announcements"))
+            void CollectFromJson(string body, string fallbackChannel)
             {
-                resp = await NameAuth.GetJsonAsync("/api/social/chat?channel=global&limit=25").ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(body)) return;
+                try
+                {
+                    var token = JToken.Parse(body);
+                    JArray arr = token as JArray ?? token["messages"] as JArray ?? token["items"] as JArray;
+                    if (arr == null) return;
+                    foreach (var item in arr)
+                    {
+                        if (item is not JObject mo) continue;
+                        long id = (long?)(mo["id"] ?? mo["Id"]) ?? 0L;
+                        if (id > 0 && !seenIds.Add(id)) continue;
+                        string ch = (string)(mo["channelType"] ?? mo["channel"]) ?? fallbackChannel;
+                        string sender = (string)(mo["senderName"] ?? mo["sender"]) ?? "系统";
+                        string content = (string)(mo["content"] ?? mo["message"]) ?? string.Empty;
+                        if (string.IsNullOrWhiteSpace(content)) continue;
+                        parsed.Add((id, ch, sender, content));
+                    }
+                }
+                catch { }
+            }
+
+            if (isLobbyChannel)
+            {
+                var resp = await NameAuth.GetJsonAsync($"/api/lobbies/{Uri.EscapeDataString(lobbyId)}/chat?limit=25").ConfigureAwait(false);
+                if (resp.Ok) CollectFromJson(resp.Body, "lobby");
+            }
+            else
+            {
+                // 世界频道同时拉取玩家世界聊天与系统播报，按消息 ID 去重并按时间序合并，避免只拉公告导致玩家发言刷新消失
+                var chatTask = NameAuth.GetJsonAsync("/api/social/chat?channel=global&limit=25");
+                var annTask = NameAuth.GetJsonAsync("/api/social/announcements?limit=15");
+                await Task.WhenAll(chatTask, annTask).ConfigureAwait(false);
+                if (chatTask.Result.Ok) CollectFromJson(chatTask.Result.Body, "global");
+                if (annTask.Result.Ok) CollectFromJson(annTask.Result.Body, "system");
+            }
+
+            parsed.Sort((a, b) => a.Id.CompareTo(b.Id));
+            if (parsed.Count > 40)
+            {
+                parsed.RemoveRange(0, parsed.Count - 40);
             }
 
             _pendingUpdates.Enqueue(() =>
             {
-                if (!resp.Ok || string.IsNullOrWhiteSpace(resp.Body))
-                {
-                    RenderSocialChatLines();
+                // 若拉取期间玩家已切换频道，丢弃过期结果防止串频
+                if (!string.Equals(_activeChatChannel, targetChannel, StringComparison.OrdinalIgnoreCase))
                     return;
-                }
-                try
+
+                _socialMessages.Clear();
+                long maxId = Interlocked.Read(ref _lastSocialEventId);
+                for (int i = 0; i < parsed.Count; i++)
                 {
-                    var token = JToken.Parse(resp.Body);
-                    JArray arr = token as JArray ?? token["messages"] as JArray ?? token["items"] as JArray;
-                    if (arr != null)
-                    {
-                        _socialMessages.Clear();
-                        foreach (var item in arr)
-                        {
-                            if (item is not JObject mo) continue;
-                            _socialMessages.Add((
-                                (long?)(mo["id"] ?? mo["Id"]) ?? 0L,
-                                (string)(mo["channelType"] ?? mo["channel"]) ?? _activeChatChannel,
-                                (string)(mo["senderName"] ?? mo["sender"] ?? "系统"),
-                                (string)(mo["content"] ?? mo["message"]) ?? string.Empty));
-                        }
-                    }
+                    _socialMessages.Add(parsed[i]);
+                    if (parsed[i].Id > maxId) maxId = parsed[i].Id;
                 }
-                catch { }
+                if (maxId > 0) Interlocked.Exchange(ref _lastSocialEventId, maxId);
                 RenderSocialChatLines();
             });
         });
+    }
+
+    private void UpsertSocialMessageOnMain(long id, string channel, string sender, string content)
+    {
+        if (string.IsNullOrWhiteSpace(content)) return;
+        if (id > 0)
+        {
+            for (int i = 0; i < _socialMessages.Count; i++)
+            {
+                if (_socialMessages[i].Id == id) return;
+            }
+            long curMax = Interlocked.Read(ref _lastSocialEventId);
+            if (id > curMax) Interlocked.Exchange(ref _lastSocialEventId, id);
+        }
+
+        _socialMessages.Add((id, channel ?? _activeChatChannel, string.IsNullOrWhiteSpace(sender) ? "系统" : sender, content));
+        if (_socialMessages.Count > 40) _socialMessages.RemoveAt(0);
     }
 
     private void SendSocialChatMessageAsync()
     {
         string raw = _socialChatInput?.text?.Trim();
         if (string.IsNullOrWhiteSpace(raw)) return;
+
+        string targetChannel = _activeChatChannel;
+        string lobbyId = _currentLobby?.LobbyId ?? string.Empty;
+        bool isLobbyChannel = string.Equals(targetChannel, "lobby", StringComparison.OrdinalIgnoreCase);
+        if (isLobbyChannel && string.IsNullOrEmpty(lobbyId))
+        {
+            SetStatus("当前未加入锦标赛房间，无法在房间频道发言（可切换至「世界/播报」频道）。", true);
+            return;
+        }
+
         if (raw.Length > 200) raw = raw.Substring(0, 200);
         // 客户端二次剥离尖括号防 Unity TMP 富文本标签注入
         string clean = raw.Replace("<", "＜").Replace(">", "＞");
@@ -965,18 +1056,38 @@ internal sealed partial class CustomGameplayUI
 
         _ = Task.Run(async () =>
         {
-            string path = string.Equals(_activeChatChannel, "lobby", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(_currentLobby?.LobbyId)
-                ? $"/api/lobbies/{Uri.EscapeDataString(_currentLobby.LobbyId)}/chat"
+            string path = isLobbyChannel
+                ? $"/api/lobbies/{Uri.EscapeDataString(lobbyId)}/chat"
                 : "/api/social/chat";
 
-            var resp = await NameAuth.PostJsonAsync(path, new { content = clean, channel = _activeChatChannel }).ConfigureAwait(false);
+            var resp = await NameAuth.PostJsonAsync(path, new { content = clean, channel = targetChannel }).ConfigureAwait(false);
+            long msgId = 0L;
+            string respChannel = targetChannel;
+            string respSender = NameAuth.CurrentUsername;
+            string respContent = clean;
+
+            if (resp.Ok && !string.IsNullOrWhiteSpace(resp.Body))
+            {
+                try
+                {
+                    var jo = JObject.Parse(resp.Body);
+                    msgId = (long?)(jo["id"] ?? jo["Id"]) ?? 0L;
+                    respChannel = (string)(jo["channelType"] ?? jo["channel"]) ?? targetChannel;
+                    respSender = (string)(jo["senderName"] ?? jo["sender"]) ?? respSender;
+                    respContent = (string)(jo["content"] ?? jo["message"]) ?? clean;
+                }
+                catch { }
+            }
+
             _pendingUpdates.Enqueue(() =>
             {
                 if (resp.Ok)
                 {
-                    _socialMessages.Add((DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), _activeChatChannel, NameAuth.CurrentUsername, clean));
-                    if (_socialMessages.Count > 40) _socialMessages.RemoveAt(0);
-                    RenderSocialChatLines();
+                    if (string.Equals(_activeChatChannel, targetChannel, StringComparison.OrdinalIgnoreCase))
+                    {
+                        UpsertSocialMessageOnMain(msgId, respChannel, respSender, respContent);
+                        RenderSocialChatLines();
+                    }
                 }
                 else
                 {
@@ -992,7 +1103,10 @@ internal sealed partial class CustomGameplayUI
         ClearChildren(_socialChatMessagesContainer);
         if (_socialMessages.Count == 0)
         {
-            _ui.CreateText("Empty", _socialChatMessagesContainer, "暂无聊天或系统播报消息。", 12.5f, NativeUguiFactory.ColMuted);
+            string emptyHint = string.Equals(_activeChatChannel, "lobby", StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(_currentLobby?.LobbyId)
+                ? "当前未加入锦标赛房间，加入或创建房间后可开启房间频道聊天。"
+                : "暂无聊天或系统播报消息。";
+            _ui.CreateText("Empty", _socialChatMessagesContainer, emptyHint, 12.5f, NativeUguiFactory.ColMuted);
             return;
         }
         int start = Math.Max(0, _socialMessages.Count - 12);
@@ -1011,14 +1125,29 @@ internal sealed partial class CustomGameplayUI
 
     private void StopSocialSse()
     {
+        var cts = Interlocked.Exchange(ref _socialSseCts, null);
         try
         {
-            _socialSseCts?.Cancel();
-            _socialSseCts?.Dispose();
+            cts?.Cancel();
+            cts?.Dispose();
         }
         catch { }
-        _socialSseCts = null;
-        _subscribedSseLobbyId = string.Empty;
+        _subscribedSseKey = string.Empty;
+    }
+
+    private string ComputeDesiredSseTopic(out string sseUrl)
+    {
+        string baseUrl = NameAuth.GetServerBaseUrl();
+        string lobbyId = _currentLobby?.LobbyId ?? string.Empty;
+        bool useLobbyTopic = string.Equals(_activeChatChannel, "lobby", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrEmpty(lobbyId);
+        if (useLobbyTopic)
+        {
+            sseUrl = $"{baseUrl}/api/social/events?scope=lobby&lobbyId={Uri.EscapeDataString(lobbyId)}";
+            return "lobby:" + lobbyId;
+        }
+        sseUrl = $"{baseUrl}/api/social/events?scope=global";
+        return "global";
     }
 
     private void SyncSocialSseForLobbyOrPanelState()
@@ -1032,81 +1161,152 @@ internal sealed partial class CustomGameplayUI
             return;
         }
 
-        if (_socialSseCts != null && !_socialSseCts.IsCancellationRequested)
+        string desiredKey = ComputeDesiredSseTopic(out _);
+        if (_socialSseCts == null || _socialSseCts.IsCancellationRequested
+            || !string.Equals(_subscribedSseKey, desiredKey, StringComparison.Ordinal))
         {
-            string desiredLobbyId = _currentLobby?.LobbyId ?? string.Empty;
-            if (!string.Equals(_subscribedSseLobbyId, desiredLobbyId, StringComparison.Ordinal))
-            {
-                EnsureSocialSseSubscribed();
-            }
+            EnsureSocialSseSubscribed();
         }
     }
 
     private void EnsureSocialSseSubscribed()
     {
-        string desiredLobbyId = _currentLobby?.LobbyId ?? string.Empty;
-        if (_socialSseCts != null && !_socialSseCts.IsCancellationRequested)
+        string baseUrl = NameAuth.GetServerBaseUrl();
+        if (string.IsNullOrWhiteSpace(baseUrl)) return;
+
+        string desiredKey = ComputeDesiredSseTopic(out string sseUrl);
+        var existingCts = _socialSseCts;
+        if (existingCts != null && !existingCts.IsCancellationRequested)
         {
-            // P2-41：若已订阅同一 lobbyId 则复用，切换锦标赛房间时断开旧连接并按新 lobbyId 重建
-            if (string.Equals(_subscribedSseLobbyId, desiredLobbyId, StringComparison.Ordinal))
+            if (string.Equals(_subscribedSseKey, desiredKey, StringComparison.Ordinal))
                 return;
             StopSocialSse();
         }
 
-        string baseUrl = NameAuth.GetServerBaseUrl();
-        if (string.IsNullOrWhiteSpace(baseUrl)) return;
-
-        _subscribedSseLobbyId = desiredLobbyId;
+        _subscribedSseKey = desiredKey;
+        Interlocked.Exchange(ref _lastSocialEventId, 0L);
         var cts = HttpClientHub.CreateLinkedCts();
         _socialSseCts = cts;
         var token = cts.Token;
 
         _ = Task.Run(async () =>
         {
+            int backoffMs = 1000;
             try
             {
-                string lobbyQ = !string.IsNullOrEmpty(desiredLobbyId)
-                    ? $"&lobbyId={Uri.EscapeDataString(desiredLobbyId)}"
-                    : string.Empty;
-                using var req = new System.Net.Http.HttpRequestMessage(
-                    System.Net.Http.HttpMethod.Get,
-                    $"{baseUrl}/api/social/events?scope=global{lobbyQ}");
-                NameAuth.ApplyAuthHeaders(req);
-
-                using var resp = await HttpClientHub.SseClient.SendAsync(
-                    req, System.Net.Http.HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
-                if (!resp.IsSuccessStatusCode) return;
-
-                using var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
-                using var reader = new StreamReader(stream, Encoding.UTF8);
-                while (!token.IsCancellationRequested && !reader.EndOfStream)
+                while (!token.IsCancellationRequested)
                 {
-                    string line = await reader.ReadLineAsync().ConfigureAwait(false);
-                    if (string.IsNullOrEmpty(line) || !line.StartsWith("data:", StringComparison.Ordinal)) continue;
-                    string payload = line.Substring(5).Trim();
-                    if (!payload.StartsWith("{", StringComparison.Ordinal)) continue;
-
+                    bool receivedHealthyTraffic = false;
                     try
                     {
-                        var jo = JObject.Parse(payload);
-                        long id = (long?)(jo["id"] ?? jo["Id"]) ?? 0L;
-                        string ch = (string)(jo["channelType"] ?? jo["channel"]) ?? "system";
-                        string sender = (string)(jo["senderName"] ?? jo["sender"]) ?? "系统";
-                        string content = (string)(jo["content"] ?? jo["message"]) ?? string.Empty;
-                        if (string.IsNullOrWhiteSpace(content)) continue;
-
-                        BazaarLauncherPlugin.Host?.EventBus.Publish(new SocialChatReceivedModEvent(id, ch, sender, content));
-                        _pendingUpdates.Enqueue(() =>
+                        using var req = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get, sseUrl);
+                        NameAuth.ApplyAuthHeaders(req);
+                        long lastId = Interlocked.Read(ref _lastSocialEventId);
+                        if (lastId > 0)
                         {
-                            _socialMessages.Add((id, ch, sender, content));
-                            if (_socialMessages.Count > 40) _socialMessages.RemoveAt(0);
-                            if (_isOpen && _activeTab == UiTab.Social) RenderSocialChatLines();
-                        });
+                            req.Headers.TryAddWithoutValidation("Last-Event-ID", lastId.ToString());
+                        }
+
+                        using var resp = await HttpClientHub.SseClient.SendAsync(
+                            req, System.Net.Http.HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+                        if (!resp.IsSuccessStatusCode)
+                        {
+                            if ((int)resp.StatusCode == 404)
+                            {
+                                // 房间已解散或不存在，退避等待状态刷新而非高频轰炸
+                                backoffMs = Math.Min(15000, Math.Max(backoffMs * 2, 5000));
+                            }
+                            else
+                            {
+                                backoffMs = Math.Min(15000, backoffMs * 2);
+                            }
+                            await Task.Delay(backoffMs, token).ConfigureAwait(false);
+                            continue;
+                        }
+
+                        backoffMs = 1000;
+                        receivedHealthyTraffic = true;
+
+                        using var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
+                        using var reader = new StreamReader(stream, Encoding.UTF8);
+                        while (!token.IsCancellationRequested && !reader.EndOfStream)
+                        {
+                            string line = await reader.ReadLineAsync().ConfigureAwait(false);
+                            if (line == null) break;
+                            if (line.StartsWith("id:", StringComparison.Ordinal))
+                            {
+                                if (long.TryParse(line.Substring(3).Trim(), out long evId) && evId > 0)
+                                {
+                                    long curMax = Interlocked.Read(ref _lastSocialEventId);
+                                    if (evId > curMax) Interlocked.Exchange(ref _lastSocialEventId, evId);
+                                }
+                                continue;
+                            }
+                            if (string.IsNullOrEmpty(line) || !line.StartsWith("data:", StringComparison.Ordinal)) continue;
+                            string payload = line.Substring(5).Trim();
+                            if (!payload.StartsWith("{", StringComparison.Ordinal)) continue;
+
+                            try
+                            {
+                                var jo = JObject.Parse(payload);
+                                long id = (long?)(jo["id"] ?? jo["Id"]) ?? 0L;
+                                string ch = (string)(jo["channelType"] ?? jo["channel"]) ?? "system";
+                                string sender = (string)(jo["senderName"] ?? jo["sender"]) ?? "系统";
+                                string content = (string)(jo["content"] ?? jo["message"]) ?? string.Empty;
+                                if (string.IsNullOrWhiteSpace(content)) continue;
+
+                                if (id > 0)
+                                {
+                                    long curMax = Interlocked.Read(ref _lastSocialEventId);
+                                    if (id > curMax) Interlocked.Exchange(ref _lastSocialEventId, id);
+                                }
+
+                                BazaarLauncherPlugin.Host?.EventBus.Publish(new SocialChatReceivedModEvent(id, ch, sender, content));
+                                string capturedTopic = desiredKey;
+                                _pendingUpdates.Enqueue(() =>
+                                {
+                                    if (!string.Equals(_subscribedSseKey, capturedTopic, StringComparison.Ordinal))
+                                        return;
+                                    UpsertSocialMessageOnMain(id, ch, sender, content);
+                                    if (_isOpen && _activeTab == UiTab.Social) RenderSocialChatLines();
+                                });
+                            }
+                            catch { }
+                        }
                     }
-                    catch { }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch
+                    {
+                        // 网络闪断或服务端重启：按指数退避重连
+                    }
+
+                    if (token.IsCancellationRequested) break;
+                    if (!receivedHealthyTraffic)
+                    {
+                        backoffMs = Math.Min(15000, backoffMs * 2);
+                    }
+                    try
+                    {
+                        await Task.Delay(backoffMs, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
                 }
             }
-            catch { }
+            finally
+            {
+                // 若本循环因异常/取消退出且仍为当前活跃订阅句柄，释放并置空，杜绝后续订阅永久短路假死
+                if (Interlocked.CompareExchange(ref _socialSseCts, null, cts) == cts)
+                {
+                    _subscribedSseKey = string.Empty;
+                }
+                try { cts.Dispose(); } catch { }
+            }
         }, token);
     }
 
@@ -1284,9 +1484,9 @@ internal sealed partial class CustomGameplayUI
         AddPerfToggle(optCard.transform, "[A-1] 修复原版 PerformanceController -1 帧率恒负降频 Bug", () => PerfOptimizerModule.OptFixNegativeFpsBug, v => PerfOptimizerModule.OptFixNegativeFpsBug = v);
         AddPerfToggle(optCard.transform, "[A-2] 跳过高开销全屏弹窗高斯模糊（大幅降核显 GPU 占用）", () => PerfOptimizerModule.OptBlurDownsampleOrSkip, v => PerfOptimizerModule.OptBlurDownsampleOrSkip = v);
         AddPerfToggle(optCard.transform, "[A-3] 修复 CameraQualityController 切场景事件双倍订阅泄漏", () => PerfOptimizerModule.OptFixCameraLeak, v => PerfOptimizerModule.OptFixCameraLeak = v);
-        AddPerfToggle(optCard.transform, "[A-4] 战斗高倍速顺滑优化（默认关闭全帧审计 GC）", () => PerfOptimizerModule.OptCombatHighSpeedSmooth, v => PerfOptimizerModule.OptCombatHighSpeedSmooth = v);
+        AddPerfToggle(optCard.transform, "[A-4] 战斗高倍速读条 60/120+ FPS 丝滑线性插值优化", () => PerfOptimizerModule.OptCombatHighSpeedSmooth, v => PerfOptimizerModule.OptCombatHighSpeedSmooth = v);
         AddPerfToggle(optCard.transform, "[A-5] 战斗高并发 VFX / 飘字安全限流（防止后期连发流掉帧）", () => PerfOptimizerModule.OptVfxThrottle, v => PerfOptimizerModule.OptVfxThrottle = v);
-        AddPerfToggle(optCard.transform, "[A-6] SoundManager 音频句柄温和保护", () => PerfOptimizerModule.OptAudioHandleGuard, v => PerfOptimizerModule.OptAudioHandleGuard = v);
+        AddPerfToggle(optCard.transform, "[A-6] SoundManager 同音轨重复加载句柄防泄漏保护", () => PerfOptimizerModule.OptAudioHandleGuard, v => PerfOptimizerModule.OptAudioHandleGuard = v);
         AddPerfToggle(optCard.transform, "[A-7] AssetLoader.DoesAddressExist O(1) 缓存与切场景冷资产清理", () => PerfOptimizerModule.OptAssetLoaderCacheAndLru, v => PerfOptimizerModule.OptAssetLoaderCacheAndLru = v);
         AddPerfToggle(optCard.transform, "[A-8] MainMenuBaseView 主大厅导航节流（消除每帧 LINQ GC）", () => PerfOptimizerModule.OptMainMenuNavThrottle, v => PerfOptimizerModule.OptMainMenuNavThrottle = v);
         AddPerfToggle(optCard.transform, "[A-9] CardTooltipController 同帧布局脏重建合并节流", () => PerfOptimizerModule.OptTooltipLayoutThrottle, v => PerfOptimizerModule.OptTooltipLayoutThrottle = v);
@@ -1295,6 +1495,7 @@ internal sealed partial class CustomGameplayUI
             PerfOptimizerModule.OptSceneIncrementalGc = v;
             PerfOptimizerModule.OptMuteVerboseAppLogger = v;
         });
+        AddPerfToggle(optCard.transform, "[A-11] 拖拽悬停去重与 DOTween 补间状态守卫（降低棋盘拖拽掉帧）", () => PerfOptimizerModule.OptDragHoverGuard, v => PerfOptimizerModule.OptDragHoverGuard = v);
 
         // 3. 模块运行状态与 Harmony 降级/熔断诊断列表
         var healthCard = _ui.CreateCard("PerfHealthCard", _performanceTabRoot.transform, NativeUguiFactory.ColCardBg, NativeUguiFactory.ColGoldDim, padH: 14, padV: 10, spacing: 5f);

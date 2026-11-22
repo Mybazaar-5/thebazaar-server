@@ -869,8 +869,15 @@ public static class GameServerEndpoints
                     var handle = SessionRegistry.Get(sid);
                     if (handle != null)
                     {
-                        handle.Run.SnapshotDirty = false;
-                        try { db.FlushRunImmediate(handle.Run.RunId); } catch { }
+                        if (!Persistence.IsTerminalState(handle.Run.State))
+                        {
+                            try { SaveSnapshotImmediate(db, handle.Run, session, handle.Engine); } catch { }
+                        }
+                        else
+                        {
+                            handle.Run.SnapshotDirty = false;
+                            try { db.FlushRunImmediate(handle.Run.RunId); } catch { }
+                        }
                     }
                     session.CommandLog.Clear();
                     sessions.Remove(sid);

@@ -427,15 +427,83 @@ public sealed class EncounterStepEngine
                     (int)_run.Day,
                     (int)_run.Hour);
                 IReadOnlySet<string>? validAssetIds = _pool.WhitelistEnabled ? _pool.GetEffectiveValidAssetIds() : null;
-                IReadOnlyDictionary<string, CardTier>? ownedMaxTiers = IsCurrentEncounterMerchant()
+                bool isStepMerchant = IsCurrentEncounterMerchant();
+                IReadOnlyDictionary<string, CardTier>? ownedMaxTiers = isStepMerchant
                     ? ShopEngine.BuildOwnedMaxTiers(_run, ctx.SelfPlayer)
                     : null;
+                bool stepAllowPlayerDup = ShopEngine.HasAllowPlayerDuplicatesBehavior(action.SpawnContext);
+                bool stepIsFree = action.SelectionContextRules?.ExtensionData is { Count: > 0 } ruleExt
+                    ? GetExtBool(ruleExt, "SelectionIsFree", _run.SelectionRules.SelectionIsFree)
+                    : (string.Equals(action.SpawnMode ?? "Replace", "Replace", StringComparison.OrdinalIgnoreCase) && !isStepMerchant
+                        ? true
+                        : _run.SelectionRules.SelectionIsFree);
+                bool stepIsPaid = !stepIsFree;
+                bool stepIsReplace = string.Equals(action.SpawnMode ?? "Replace", "Replace", StringComparison.OrdinalIgnoreCase);
+                bool stepAllowDup = (stepIsFree && _run.SelectionRules.CanSelectMultiple)
+                                 || ShopEngine.HasAllowDuplicatesBehavior(action.SpawnContext);
+                if (action.SelectionContextRules?.ExtensionData is { Count: > 0 } dupRuleExt)
+                {
+                    bool stepCanMulti = GetExtBool(dupRuleExt, "CanSelectMultiple", _run.SelectionRules.CanSelectMultiple);
+                    if (stepIsFree && stepCanMulti)
+                        stepAllowDup = true;
+                }
+                var stepUsedTemplates = stepIsReplace
+                    ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    : new HashSet<string>(
+                        _run.SelectionSet
+                            .Where(sid => _run.Cards.ContainsKey(sid))
+                            .Select(sid => RunState.ResolveCoreTemplateId(_run.Cards[sid])),
+                        StringComparer.OrdinalIgnoreCase);
+                int stepUsedWidth = stepIsReplace
+                    ? 0
+                    : _run.SelectionSet.Sum(sid => _run.Cards.TryGetValue(sid, out var se) ? ShopEngine.GetShelfSlotWidth(se) : 0);
                 var dealt = SpawnQueryEngine.SpawnCards(
                     normalizedDealCtx,
                     ctx,
                     defaultCountOverride: null,
                     ownedMaxTiers: ownedMaxTiers,
-                    validAssetIds: validAssetIds);
+                    validAssetIds: validAssetIds,
+                    archetypeResolver: ResolveStepArchetypeResolver(),
+                    rules: _run.CustomRules,
+                    maxItemSlotWidthProvider: () => Math.Max(0, ShopEngine.MaxShelfSlotWidth - stepUsedWidth),
+                    spawnAppliesTiny: false,
+                    tryAcceptCard: inst =>
+                    {
+                        if (!_pool.IsPlayerSpawnableId(inst.Template.Id, allowGuidOnly: true))
+                            return false;
+                        if (CardPool.IsExpeditionTicketExpired(inst.Template.Id, (int)_run.Day, (int)_run.Hour))
+                            return false;
+                        var pTpl = _pool.Get(inst.Template.Id);
+                        if (string.Equals(inst.Template.Type, "EventEncounter", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (_run.ExclusionSet.Contains(inst.Template.Id)) return false;
+                            if (pTpl != null && CardPool.IsExcludedDevOrStoryTemplate(pTpl)) return false;
+                            if (inst.Template.InternalName is string en &&
+                                (en.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase) ||
+                                 en.Contains("Tutorial", StringComparison.OrdinalIgnoreCase) ||
+                                 en.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase)))
+                                return false;
+                        }
+                        if (inst.Template.Type is "EncounterStep" or "EventEncounter" or "PedestalEncounter" or "CombatEncounter" &&
+                            !ShopEngine.CheckChildOptionRunPrerequisites(pTpl, inst.Template, ctx))
+                            return false;
+                        if (stepIsPaid && inst.Template.Type is "Item" or "Skill" &&
+                            _shop.IsZeroBuyPriceOrFreePackage(pTpl, inst.Template, inst.Tier.ToString()))
+                            return false;
+                        if (isStepMerchant && !stepAllowPlayerDup && inst.Template.Type is "Item" or "Skill" &&
+                            ShopEngine.IsBlockedByOwnedMaxTiers(inst.Template.Id, inst.Tier, ownedMaxTiers))
+                            return false;
+                        if (!stepAllowDup && stepUsedTemplates.Contains(inst.Template.Id))
+                            return false;
+                        bool isItem = string.Equals(inst.Template.Type, "Item", StringComparison.OrdinalIgnoreCase);
+                        int w = isItem ? ShopEngine.GetShelfSlotWidth(inst) : 0;
+                        if (isItem && stepUsedWidth + w > ShopEngine.MaxShelfSlotWidth)
+                            return false;
+                        if (!stepAllowDup)
+                            stepUsedTemplates.Add(inst.Template.Id);
+                        if (isItem) stepUsedWidth += w;
+                        return true;
+                    });
                 ApplyDealtCardsToSelection(
                     dealt,
                     action.SpawnMode ?? "Replace",
@@ -593,6 +661,8 @@ public sealed class EncounterStepEngine
                 continue;
 
             var entry = _shop.CreateEntryFromCoreInstance(inst, _run.SelectionRules.SelectionIsFree);
+            // 同步应用模式与词条修正（万物附魔 / 五折商店 / 预设物价倍率 / 沙盒 0 元商店），避免步骤发牌旁路词条生效
+            _shop.ApplyModeAndMutatorModifiersToEntry(entry, _run.SelectionRules.SelectionIsFree, isMerchant, _rng);
             // P1-41：确保所有候选技能显式携带 BuyPrice 键（免费为 0），保证双端免费判定一致
             if (entry.Type == ECardType.Skill && !entry.Attributes.ContainsKey(ECardAttributeType.BuyPrice))
             {
@@ -600,7 +670,8 @@ public sealed class EncounterStepEngine
                     ? 0
                     : RunState.ComputeCardBuyPrice(entry, inst, _repo.GameMode.StandardPrices);
             }
-            if (isPaidContext && entry.Type is ECardType.Item or ECardType.Skill &&
+            bool allowZeroForSandbox = _run.CustomRules is { IsSandboxRun: true, SandboxZeroShopPrice: true };
+            if (isPaidContext && !allowZeroForSandbox && entry.Type is ECardType.Item or ECardType.Skill &&
                 entry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0) <= 0)
             {
                 continue;
@@ -1259,21 +1330,29 @@ public sealed class EncounterStepEngine
                         ? EInventorySection.Stash
                         : (ps.Skills.Contains(replacement) ? (EInventorySection?)null : EInventorySection.Hand);
                     var newEntry = RegisterNewOwnedCoreCard(replacement, sec, result, isTransform: true);
-                    result.TransformedCards.Add(newEntry);
-                    result.Events.Add(new GameSimEventCardTransformed(
-                        "step_" + entry.InstanceId,
-                        entry.InstanceId,
-                        new List<SimEventCardTransformation>
-                        {
-                            new SimEventCardTransformation(
-                                newEntry.InstanceId,
-                                newEntry.TemplateId.ToString(),
-                                newEntry.Type,
-                                ECombatantId.Player,
-                                newEntry.Section,
-                                newEntry.Socket)
-                        }));
-                    result.ChangeLogs.Add($"Transform:{entry.TemplateId}->{newEntry.TemplateId}");
+                    if (newEntry != null)
+                    {
+                        result.TransformedCards.Add(newEntry);
+                        result.Events.Add(new GameSimEventCardTransformed(
+                            "step_" + entry.InstanceId,
+                            entry.InstanceId,
+                            new List<SimEventCardTransformation>
+                            {
+                                new SimEventCardTransformation(
+                                    newEntry.InstanceId,
+                                    newEntry.TemplateId.ToString(),
+                                    newEntry.Type,
+                                    ECombatantId.Player,
+                                    newEntry.Section,
+                                    newEntry.Socket)
+                            }));
+                        result.ChangeLogs.Add($"Transform:{entry.TemplateId}->{newEntry.TemplateId}");
+                    }
+                    else
+                    {
+                        result.Events.Add(new GameSimEventCardDisposed(entry.InstanceId, ECardDisposalReason.Cleared));
+                        result.ChangeLogs.Add($"TransformOverflowAutoSold:{entry.TemplateId}");
+                    }
                 }
                 else
                 {
@@ -1340,28 +1419,32 @@ public sealed class EncounterStepEngine
         {
             if (ownedByCore.ContainsKey(c) || registeredNew.Contains(c)) continue;
             var newEntry = RegisterNewOwnedCoreCard(c, EInventorySection.Hand, result, isTransform: false);
-            result.SpawnedCards.Add(newEntry);
+            if (newEntry != null)
+                result.SpawnedCards.Add(newEntry);
             registeredNew.Add(c);
         }
         foreach (var c in ps.Stash.Cards)
         {
             if (ownedByCore.ContainsKey(c) || registeredNew.Contains(c)) continue;
             var newEntry = RegisterNewOwnedCoreCard(c, EInventorySection.Stash, result, isTransform: false);
-            result.SpawnedCards.Add(newEntry);
+            if (newEntry != null)
+                result.SpawnedCards.Add(newEntry);
             registeredNew.Add(c);
         }
         foreach (var s in ps.Skills)
         {
             if (ownedByCore.ContainsKey(s) || registeredNew.Contains(s)) continue;
             var newEntry = RegisterNewOwnedCoreCard(s, null, result, isTransform: false);
-            result.SpawnedCards.Add(newEntry);
+            if (newEntry != null)
+                result.SpawnedCards.Add(newEntry);
             registeredNew.Add(s);
         }
         foreach (var se in ps.SocketEffects)
         {
             if (ownedByCore.ContainsKey(se) || registeredNew.Contains(se)) continue;
             var newEntry = RegisterNewOwnedCoreCard(se, EInventorySection.Hand, result, isTransform: false);
-            result.SpawnedCards.Add(newEntry);
+            if (newEntry != null)
+                result.SpawnedCards.Add(newEntry);
             registeredNew.Add(se);
         }
     }
@@ -1400,7 +1483,7 @@ public sealed class EncounterStepEngine
         }
     }
 
-    private RunState.CardEntry RegisterNewOwnedCoreCard(
+    private RunState.CardEntry? RegisterNewOwnedCoreCard(
         CardInstance core,
         EInventorySection? section,
         EncounterStepResult result,
@@ -1418,6 +1501,7 @@ public sealed class EncounterStepEngine
             : _shop.NewId(prefix);
 
         EContainerSocketId? socket = null;
+        var displacedNeighbors = new List<(RunState.CardEntry Entry, EInventorySection Section, EContainerSocketId NewSocket)>();
         if (cardType == ECardType.SocketEffect)
         {
             // 客户端要求 SocketEffect 挂在 Owner=Player, Section=Hand 下，且必须有 0..9 有效 LeftSocketId（但不占 HandGrid）
@@ -1430,18 +1514,73 @@ public sealed class EncounterStepEngine
         }
         else if (cardType != ECardType.Skill && section.HasValue)
         {
-            var grid = section == EInventorySection.Stash ? _run.StashGrid : _run.HandGrid;
+            _run.HandGrid.UnlockedMask = _run.UnlockedSlots;
+            _run.StashGrid.UnlockedMask = 1023;
+            var primary = section == EInventorySection.Stash ? _run.StashGrid : _run.HandGrid;
+            var fallback = section == EInventorySection.Stash ? _run.HandGrid : _run.StashGrid;
+            BoardGrid placedGrid = primary;
+            bool placed = false;
+
+            // 非变形生成优先不挤位直接落位或自动寻空；变形或显式目标槽被占时才执行移位并同步邻卡新槽位
             if (core.StartSlot >= 0)
             {
-                if (!grid.TryPlaceOrShift(core, core.StartSlot))
-                    grid.TryAddAuto(core);
+                if (!isTransform && primary.CanFitAt(core, core.StartSlot))
+                {
+                    placed = primary.TryPlaceOrShift(core, core.StartSlot);
+                }
+                else if (isTransform)
+                {
+                    placed = primary.TryPlaceOrShift(core, core.StartSlot);
+                }
+                if (!placed)
+                    placed = primary.TryAddAuto(core);
+                if (!placed && !isTransform)
+                    placed = primary.TryPlaceOrShift(core, core.StartSlot);
             }
             else
             {
-                grid.TryAddAuto(core);
+                placed = primary.TryAddAuto(core);
             }
+
+            if (!placed && fallback.TryAddAuto(core))
+            {
+                placed = true;
+                placedGrid = fallback;
+                section = section == EInventorySection.Stash ? EInventorySection.Hand : EInventorySection.Stash;
+            }
+
+            if (!placed)
+            {
+                // 手牌与仓库全满时禁止注册 Section=Hand, Socket=null 的幽灵卡，按标准卖价折算金币并跳过注册
+                var (_, autoSellGold) = ShopEngine.PriceFor(
+                    ShopEngine.ParseSize(core.Template.Size),
+                    ShopEngine.ParseTier(core.Tier.ToString()),
+                    _repo.GameMode.StandardPrices);
+                if (autoSellGold > 0)
+                    _run.AddPlayerGold(autoSellGold);
+                result.ChangeLogs.Add($"OverflowAutoSell:{core.Template.Id}:+{autoSellGold}g");
+                return null;
+            }
+
             if (core.StartSlot >= 0)
+            {
                 socket = (EContainerSocketId)Math.Clamp(core.StartSlot, 0, 9);
+                // 同步因挤位而移动的同区已有邻卡坐标，确保 RunState.Cards 与客户端容器零漂移
+                foreach (var gridCard in placedGrid.Cards)
+                {
+                    if (ReferenceEquals(gridCard, core) || gridCard.StartSlot < 0) continue;
+                    var neighborEntry = _run.Cards.Values.FirstOrDefault(e =>
+                        ReferenceEquals(e.CoreCard, gridCard) || string.Equals(e.InstanceId, gridCard.InstanceId, StringComparison.Ordinal));
+                    if (neighborEntry == null) continue;
+                    var nextSock = (EContainerSocketId)Math.Clamp(gridCard.StartSlot, 0, 9);
+                    if (neighborEntry.Section != section.Value || neighborEntry.Socket != nextSock)
+                    {
+                        neighborEntry.Section = section.Value;
+                        neighborEntry.Socket = nextSock;
+                        displacedNeighbors.Add((neighborEntry, section.Value, nextSock));
+                    }
+                }
+            }
         }
 
         EEnchantmentType? ench = null;
@@ -1451,10 +1590,24 @@ public sealed class EncounterStepEngine
             ench = e;
         }
 
+        // 解析安全原版 Wire GUID，完整兼容 Mod 自定义非 GUID 模板并维护 CustomCardId，防止 FormatException 崩溃
+        string safeWireId = _pool.ResolveSafeWireTemplateId(core.Template.Id);
+        Guid wireGuid = Guid.TryParse(safeWireId, out var parsedWire)
+            ? parsedWire
+            : (Guid.TryParse(core.Template.Id, out var directGuid)
+                ? directGuid
+                : Guid.Parse("5e17cfc3-25c0-4a74-8a33-07ee972e6f6e"));
+        string? customCardId = !string.Equals(core.Template.Id, wireGuid.ToString(), StringComparison.OrdinalIgnoreCase)
+            ? core.Template.Id
+            : null;
+        if (customCardId != null)
+            _run.VisualBindingsRevision++;
+
         var entry = new RunState.CardEntry
         {
             InstanceId = instId,
-            TemplateId = Guid.Parse(core.Template.Id),
+            TemplateId = wireGuid,
+            CustomCardId = customCardId,
             Type = cardType,
             Size = ShopEngine.ParseSize(core.Template.Size),
             Tier = ShopEngine.ParseTier(core.Tier.ToString()),
@@ -1477,6 +1630,10 @@ public sealed class EncounterStepEngine
         }
 
         _run.Cards[instId] = entry;
+        foreach (var mv in displacedNeighbors)
+        {
+            result.Events.Add(new GameSimEventCardMoved(mv.Entry.InstanceId, ECombatantId.Player, mv.Section, mv.NewSocket));
+        }
         if (!isTransform)
         {
             result.Events.Add(new GameSimEventCardSpawned(

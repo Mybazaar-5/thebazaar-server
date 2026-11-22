@@ -371,8 +371,11 @@ public static class OutOfCombatController
 
     /// <summary>
     /// 出售或使用消耗品时调用。
-    /// 关键顺序：必须在将 <paramref name="card"/> 从 Hand/Stash 实际摘除之前携带其原始 StartSlot 触发 TTriggerOnCardSold，
-    /// 以确保针对左邻/右邻/相邻武器及 SelectionSet 货架（如 Dreampearl / Coupon）等位置条件精确命中；触发后再移除该卡并刷新局外光环。
+    /// 关键顺序：
+    ///   1. 先通过 SoldCardScope 记录 <paramref name="card"/> 的原始网格与 StartSlot，并在原位刷新一次局外光环（确保 Custom_0 / Value 等属性处于最新态）；
+    ///   2. 若 removeAfterTrigger 为 true，则在派发 TTriggerOnCardSold 之前提前将 <paramref name="card"/> 从 Hand/Stash 摘除腾出槽位，
+    ///      确保满手牌/满仓库卖出 Junkyard Club / Junkyard Repairbot / Pinata / Shipment 等产卡道具时能全额落入腾出的空位；
+    ///   3. 触发期间由 AbilityExecutor.SoldCardScope 为 SelfNeighbors / Positional / TriggerSource 等定位与主体条件临时保留原始站位。
     /// </summary>
     public static OutOfCombatBatchResult OnCardSoldOrConsumed(
         PlayerState player,
@@ -395,7 +398,7 @@ public static class OutOfCombatController
             selectionCards: selectionCards,
             extraCardsForTrigger: [card],
             activeEncounterCard: activeEncounterCard,
-            postDispatchAction: result =>
+            afterPreAuraBeforeDispatchAction: result =>
             {
                 if (!removeAfterTrigger) return;
                 bool removed = player.Hand.Remove(card)
@@ -851,6 +854,7 @@ public static class OutOfCombatController
         PlayerState? opponent = null,
         CardInstance? activeEncounterCard = null,
         Action? preDispatchAction = null,
+        Action<OutOfCombatBatchResult>? afterPreAuraBeforeDispatchAction = null,
         Action<OutOfCombatBatchResult>? postDispatchAction = null,
         IReadOnlyList<string>? secondaryEventTypes = null,
         CardInstance? secondarySourceCard = null,
@@ -1091,10 +1095,13 @@ public static class OutOfCombatController
 
         try
         {
-            // 在派发前先确保光环已处于最新状态
+            // 在派发前先确保光环已处于最新状态（被卖卡仍位于原槽位以锁定最新光环属性）
             var preTransitions = RecalculateAllOutOfCombatAuras(player, repo, activeEncounterCard, selectionCards);
             if (preTransitions.Count > 0)
                 DispatchAuraFlyingTransitions(preTransitions);
+
+            // 若需在派发前腾出被卖卡槽位（已由 SoldCardScope 保留原网格与原槽位），在此先摘除再触发
+            afterPreAuraBeforeDispatchAction?.Invoke(result);
 
             DispatchOutOfCombat(eventType, sourceCard, targetCard, subjectPlayer, changedAttr, prevVal, curVal);
             postDispatchAction?.Invoke(result);

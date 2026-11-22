@@ -91,11 +91,13 @@ internal sealed partial class CustomGameplayUI
     internal sealed class CustomRunRuleSet
     {
         [JsonProperty("selectedArchetypeMask")] public ulong SelectedArchetypeMask { get; set; }
+        [JsonProperty("archetypeWeightMultiplier")] public double ArchetypeWeightMultiplier { get; set; } = 2.0;
+        [JsonProperty("archetypeMultiMatchCap")] public double ArchetypeMultiMatchCap { get; set; } = 3.0;
         [JsonProperty("allowTendencySelection")] public bool AllowTendencySelection { get; set; } = true;
         [JsonProperty("promptTendencyBeforeRun")] public bool PromptTendencyBeforeRun { get; set; } = true;
         [JsonProperty("startingGold")] public int StartingGold { get; set; } = 15;
         [JsonProperty("startingIncome")] public int StartingIncome { get; set; } = 5;
-        [JsonProperty("startingExperience")] public int StartingExperience { get; set; } = 3;
+        [JsonProperty("startingExperience")] public int StartingExperience { get; set; } = 0;
         [JsonProperty("startingPrestige")] public int StartingPrestige { get; set; } = 20;
         [JsonProperty("startingHealth")] public int StartingHealth { get; set; } = 250;
         [JsonProperty("startingItems")] public List<StartingItemRule> StartingItems { get; set; } = new();
@@ -109,17 +111,24 @@ internal sealed partial class CustomGameplayUI
         [JsonProperty("lastHumanStandingMode")] public bool LastHumanStandingMode { get; set; } = true;
         [JsonProperty("isCustomPowerModified")] public bool IsCustomPowerModified { get; set; }
 
-        // Wave 2/3 新增：预设档位 + 7 大模式 + 14 突变词条向后兼容字段
+        // Wave 2/3 新增：预设档位 + 7 大模式 + 14 突变词条 + 经济/掉率/种子调参（完整对齐服务端 CustomRuleModels）
         [JsonProperty("presetId")] public string PresetId { get; set; } = "PureOfficial";
         [JsonProperty("specialModeId")] public string SpecialModeId { get; set; } = "Standard";
         [JsonProperty("mutatorIds")] public List<string> MutatorIds { get; set; } = new();
         [JsonProperty("dailyChallengeDate")] public string DailyChallengeDate { get; set; }
+        [JsonProperty("fixedRunSeed")] public int? FixedRunSeed { get; set; }
         [JsonProperty("endlessMaxDay")] public int EndlessMaxDay { get; set; } = 99;
         [JsonProperty("crossHeroOwnHeroBias")] public double CrossHeroOwnHeroBias { get; set; } = 0.40;
         [JsonProperty("bossRushTotalWaves")] public int BossRushTotalWaves { get; set; } = 10;
         [JsonProperty("bossRushIncludeMilestonePvp")] public bool BossRushIncludeMilestonePvp { get; set; } = true;
         [JsonProperty("sandboxFreeInfiniteReroll")] public bool SandboxFreeInfiniteReroll { get; set; } = true;
         [JsonProperty("sandboxZeroShopPrice")] public bool SandboxZeroShopPrice { get; set; } = false;
+        [JsonProperty("shopHighTierBonusPct")] public double ShopHighTierBonusPct { get; set; } = 0.0;
+        [JsonProperty("shopPriceMultiplier")] public double ShopPriceMultiplier { get; set; } = 1.0;
+        [JsonProperty("monsterLootBonusChoices")] public int MonsterLootBonusChoices { get; set; } = 0;
+        [JsonProperty("monsterLootTierBonus")] public int MonsterLootTierBonus { get; set; } = 0;
+        [JsonProperty("enemyStatMultiplier")] public double EnemyStatMultiplier { get; set; } = 1.0;
+        [JsonProperty("disableFatesRevive")] public bool DisableFatesRevive { get; set; } = false;
         [JsonProperty("selectedModIds")] public List<string> SelectedModIds { get; set; } = new();
 
         public void EnsureCollections()
@@ -145,11 +154,13 @@ internal sealed partial class CustomGameplayUI
             bool lastHuman = !preserveArchetypeAndLobbyFlags || LastHumanStandingMode;
 
             SelectedArchetypeMask = mask;
+            ArchetypeWeightMultiplier = 2.0;
+            ArchetypeMultiMatchCap = 3.0;
             AllowTendencySelection = allowTend;
             PromptTendencyBeforeRun = promptBefore;
             StartingGold = 15;
             StartingIncome = 5;
-            StartingExperience = 3;
+            StartingExperience = 0;
             StartingPrestige = 20;
             StartingHealth = 250;
             StartingItems = new List<StartingItemRule>();
@@ -165,12 +176,19 @@ internal sealed partial class CustomGameplayUI
             SpecialModeId = "Standard";
             MutatorIds = new List<string>();
             DailyChallengeDate = null;
+            FixedRunSeed = null;
             EndlessMaxDay = 99;
             CrossHeroOwnHeroBias = 0.40;
             BossRushTotalWaves = 10;
             BossRushIncludeMilestonePvp = true;
             SandboxFreeInfiniteReroll = true;
             SandboxZeroShopPrice = false;
+            ShopHighTierBonusPct = 0.0;
+            ShopPriceMultiplier = 1.0;
+            MonsterLootBonusChoices = 0;
+            MonsterLootTierBonus = 0;
+            EnemyStatMultiplier = 1.0;
+            DisableFatesRevive = false;
             SelectedModIds = new List<string>();
             IsCustomPowerModified = false;
         }
@@ -185,8 +203,14 @@ internal sealed partial class CustomGameplayUI
             {
                 return true;
             }
-            if (StartingGold != 15 || StartingIncome != 5 || StartingExperience != 3
-                || StartingPrestige != 20 || StartingHealth != 250)
+            if (StartingGold != 15 || StartingIncome != 5 || StartingExperience != 0
+                || StartingPrestige != 20 || StartingHealth != 250
+                || Math.Abs(ShopHighTierBonusPct) > 1e-6
+                || Math.Abs(ShopPriceMultiplier - 1.0) > 1e-6
+                || MonsterLootBonusChoices != 0
+                || MonsterLootTierBonus != 0
+                || Math.Abs(EnemyStatMultiplier - 1.0) > 1e-6
+                || DisableFatesRevive)
             {
                 return true;
             }
@@ -194,7 +218,7 @@ internal sealed partial class CustomGameplayUI
             if (BannedEncounterIds.Count > 0) return true;
             foreach (var kv in EncounterCategoryMultipliers)
             {
-                if (Math.Abs(kv.Value - 1.0) > 0.001) return true;
+                if (kv.Value < 0.8 || kv.Value > 1.25) return true;
             }
             return false;
         }
@@ -210,6 +234,8 @@ internal sealed partial class CustomGameplayUI
             var copy = new CustomRunRuleSet
             {
                 SelectedArchetypeMask = SelectedArchetypeMask,
+                ArchetypeWeightMultiplier = ArchetypeWeightMultiplier,
+                ArchetypeMultiMatchCap = ArchetypeMultiMatchCap,
                 AllowTendencySelection = AllowTendencySelection,
                 PromptTendencyBeforeRun = PromptTendencyBeforeRun,
                 StartingGold = StartingGold,
@@ -230,12 +256,19 @@ internal sealed partial class CustomGameplayUI
                 SpecialModeId = SpecialModeId,
                 MutatorIds = new List<string>(MutatorIds),
                 DailyChallengeDate = DailyChallengeDate,
+                FixedRunSeed = FixedRunSeed,
                 EndlessMaxDay = EndlessMaxDay,
                 CrossHeroOwnHeroBias = CrossHeroOwnHeroBias,
                 BossRushTotalWaves = BossRushTotalWaves,
                 BossRushIncludeMilestonePvp = BossRushIncludeMilestonePvp,
                 SandboxFreeInfiniteReroll = SandboxFreeInfiniteReroll,
                 SandboxZeroShopPrice = SandboxZeroShopPrice,
+                ShopHighTierBonusPct = ShopHighTierBonusPct,
+                ShopPriceMultiplier = ShopPriceMultiplier,
+                MonsterLootBonusChoices = MonsterLootBonusChoices,
+                MonsterLootTierBonus = MonsterLootTierBonus,
+                EnemyStatMultiplier = EnemyStatMultiplier,
+                DisableFatesRevive = DisableFatesRevive,
                 SelectedModIds = new List<string>(SelectedModIds),
             };
 
@@ -400,7 +433,7 @@ internal sealed partial class CustomGameplayUI
             tags.Add($"流派倾向×{archCount}");
         }
 
-        if (rules.StartingGold != 15 || rules.StartingIncome != 5 || rules.StartingExperience != 3
+        if (rules.StartingGold != 15 || rules.StartingIncome != 5 || rules.StartingExperience != 0
             || rules.StartingPrestige != 20 || rules.StartingHealth != 250)
         {
             tags.Add("开局预设");
@@ -495,15 +528,15 @@ internal sealed partial class CustomGameplayUI
 
     private static readonly List<EncounterCategoryEntry> FallbackEncounterCategories = new()
     {
-        new() { Key = "merchant_weapon", GroupZh = "商人", NameZh = "武器/战斗商人", DefaultMult = 1.0 },
-        new() { Key = "merchant_defense", GroupZh = "商人", NameZh = "护盾/回复商人", DefaultMult = 1.0 },
-        new() { Key = "merchant_element", GroupZh = "商人", NameZh = "灼烧/剧毒/元素商人", DefaultMult = 1.0 },
-        new() { Key = "merchant_special", GroupZh = "商人", NameZh = "特殊/藏品/综合商人", DefaultMult = 1.0 },
-        new() { Key = "event_economy", GroupZh = "奇遇事件", NameZh = "经济/宝箱/理财奇遇", DefaultMult = 1.0 },
-        new() { Key = "event_upgrade", GroupZh = "奇遇事件", NameZh = "升级/技能/成长奇遇", DefaultMult = 1.0 },
-        new() { Key = "event_special", GroupZh = "奇遇事件", NameZh = "命运/远征/特殊奇遇", DefaultMult = 1.0 },
-        new() { Key = "monster_pve", GroupZh = "野怪战斗", NameZh = "常规野怪战斗", DefaultMult = 1.0 },
-        new() { Key = "pedestal_enchant", GroupZh = "强化基座", NameZh = "附魔祭坛/附魔基座", DefaultMult = 1.0 },
-        new() { Key = "pedestal_upgrade", GroupZh = "强化基座", NameZh = "升级/打造强化基座", DefaultMult = 1.0 },
+        new() { Key = "PedestalEnchant", GroupZh = "祭坛强化", NameZh = "指定附魔祭坛", DefaultMult = 1.0 },
+        new() { Key = "PedestalEnchantRandom", GroupZh = "祭坛强化", NameZh = "随机附魔祭坛", DefaultMult = 1.0 },
+        new() { Key = "PedestalUpgrade", GroupZh = "祭坛强化", NameZh = "升阶改造祭坛", DefaultMult = 1.0 },
+        new() { Key = "EventCultAndMystery", GroupZh = "奇遇事件", NameZh = "邪教与神秘事件", DefaultMult = 1.0 },
+        new() { Key = "EventExpeditionAgent", GroupZh = "奇遇事件", NameZh = "探险与特工事件", DefaultMult = 1.0 },
+        new() { Key = "EventEconomyStats", GroupZh = "奇遇事件", NameZh = "经济与属性事件", DefaultMult = 1.0 },
+        new() { Key = "EventFreeDealTransform", GroupZh = "奇遇事件", NameZh = "免费交易与变形事件", DefaultMult = 1.0 },
+        new() { Key = "MerchantItems", GroupZh = "商店商人", NameZh = "常规物品商人", DefaultMult = 1.0 },
+        new() { Key = "MerchantSkillsRare", GroupZh = "商店商人", NameZh = "技能与稀有商人", DefaultMult = 1.0 },
+        new() { Key = "Monsters", GroupZh = "野怪战斗", NameZh = "PvE 野怪遭遇", DefaultMult = 1.0 },
     };
 }

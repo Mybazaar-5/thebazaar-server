@@ -423,39 +423,48 @@ public sealed class V12OfficialDayScheduleTests
                 $"Day 1 初始武器应稳定击败 {monster.InternalName} (HP={monster.HealthMax}), 实际胜者={simRes.WinnerPlayerId}");
         }
 
-        // 回退测试：禁用 Day 4 全部精选 GUID，必须回退到 MonsterPool 同级合法怪且依然产出 3 只不重复、非禁用怪
+        // 回退测试：禁用 Day 4 全部精选 GUID，循环多组确定性种子验证必须回退到 MonsterPool 同级合法怪，
+        // 且依然产出 3 只不重复、非禁用怪，并满足官方「品阶升序 + 等级升序 + 合法血量区间」（不再要求伪血量单调）
         var bannedDay4 = OfficialDaySchedule.GetRosterForDay(4).AllIds().ToHashSet(StringComparer.OrdinalIgnoreCase);
         var banRules = new CustomRunRuleSet
         {
             BannedEncounterIds = bannedDay4.ToList(),
         }.CloneNormalized();
-        var fallbackRun = new RunState
+        int[] fallbackSeeds = [120401, 120402, 120403, 120404, 120405, 120406, 120407, 120408];
+        foreach (int fbSeed in fallbackSeeds)
         {
-            RunId = "v12_fallback_d4",
-            GameModeId = fx.Pool.DefaultGameModeId,
-            Hero = EHero.Vanessa,
-            PlayMode = EPlayMode.Ranked,
-            Day = 4,
-            Hour = 3,
-            CustomRules = banRules,
-        };
-        var fallbackShop = new ShopEngine(fallbackRun, fx.Pool, fx.Repo, banRules);
-        fallbackShop.DealHourEncounters();
+            var fallbackRun = new RunState
+            {
+                RunId = $"v12_fallback_d4_{fbSeed}",
+                GameModeId = fx.Pool.DefaultGameModeId,
+                Hero = EHero.Vanessa,
+                PlayMode = EPlayMode.Ranked,
+                Day = 4,
+                Hour = 3,
+                RngSeed = fbSeed,
+                CustomRules = banRules,
+            };
+            var fallbackShop = new ShopEngine(fallbackRun, fx.Pool, fx.Repo, banRules);
+            fallbackShop.DealHourEncounters();
 
-        Assert.Equal(3, fallbackRun.SelectionSet.Count);
-        var fbEntries = fallbackRun.SelectionSet.Select(id => fallbackRun.Cards[id]).ToList();
-        Assert.Equal(3, fbEntries.Select(e => e.TemplateId).Distinct().Count());
-        foreach (var e in fbEntries)
-        {
-            string tid = e.TemplateId.ToString();
-            Assert.DoesNotContain(tid, bannedDay4);
-            Assert.True(MonsterPool.IsPlayableCombatEncounter(fx.Pool.Get(tid), fx.Pool, fx.Repo));
+            Assert.Equal(3, fallbackRun.SelectionSet.Count);
+            var fbEntries = fallbackRun.SelectionSet.Select(id => fallbackRun.Cards[id]).ToList();
+            Assert.Equal(3, fbEntries.Select(e => e.TemplateId).Distinct().Count());
+            foreach (var e in fbEntries)
+            {
+                string tid = e.TemplateId.ToString();
+                Assert.DoesNotContain(tid, bannedDay4);
+                Assert.True(MonsterPool.IsPlayableCombatEncounter(fx.Pool.Get(tid), fx.Pool, fx.Repo));
+            }
+            int[] fbHps = fbEntries.Select(e => MonsterPool.GetMonsterHealthMax(fx.Pool.Get(e.TemplateId.ToString()), fx.Repo)).ToArray();
+            int[] fbLvs = fbEntries.Select(e => MonsterPool.GetEffectiveMonsterLevel(fx.Pool.Get(e.TemplateId.ToString()), fx.Repo)).ToArray();
+            var fbTiers = fbEntries.Select(e => MonsterPool.GetMonsterTier(fx.Pool.Get(e.TemplateId.ToString()))).ToArray();
+            Assert.True(fbTiers[0] <= fbTiers[1] && fbTiers[1] <= fbTiers[2],
+                $"Day 4 fallback(seed={fbSeed}) 品阶倒挂: {fbTiers[0]}, {fbTiers[1]}, {fbTiers[2]}");
+            Assert.True(fbLvs[0] <= fbLvs[1] && fbLvs[1] <= fbLvs[2],
+                $"Day 4 fallback(seed={fbSeed}) Lv 倒挂: {fbLvs[0]}, {fbLvs[1]}, {fbLvs[2]}");
+            Assert.All(fbHps, hp => Assert.InRange(hp, 75, 9999));
         }
-        int[] fbHps = fbEntries.Select(e => MonsterPool.GetMonsterHealthMax(fx.Pool.Get(e.TemplateId.ToString()), fx.Repo)).ToArray();
-        var fbTiers = fbEntries.Select(e => MonsterPool.GetMonsterTier(fx.Pool.Get(e.TemplateId.ToString()))).ToArray();
-        Assert.True(fbTiers[0] <= fbTiers[1] && fbTiers[1] <= fbTiers[2],
-            $"Day 4 fallback 品阶倒挂: {fbTiers[0]}, {fbTiers[1]}, {fbTiers[2]}");
-        Assert.True(fbHps[0] <= fbHps[1] && fbHps[1] <= fbHps[2]);
     }
 
     // ── 3. Hour 1/2/4/5 三槽对齐、100 天同天不重复、TRunConditionalCurrentDay 与动态 ExclusionSet ──

@@ -484,7 +484,8 @@ internal sealed partial class ModContentSyncClient
 
         string[] activeTips = ReadStringArray(bo["activeTooltipsZh"] ?? bo["activeTooltips"]);
         string[] passiveTips = ReadStringArray(bo["passiveTooltipsZh"] ?? bo["passiveTooltips"]);
-        string[] extraTags = ReadStringArray(bo["extraDisplayTags"] ?? bo["displayTags"]);
+        // 对齐服务端 ModModels.cs [JsonPropertyName("tags")]，并兼容 extraDisplayTags / displayTags
+        string[] extraTags = ReadStringArray(bo["tags"] ?? bo["extraDisplayTags"] ?? bo["displayTags"]);
         Dictionary<string, string[]> enchantTips = null;
         if (bo["enchantTooltipsZh"] is JObject enchObj)
         {
@@ -506,7 +507,8 @@ internal sealed partial class ModContentSyncClient
                 var inner = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
                 foreach (var ap in attrMap.Properties())
                 {
-                    if (ap.Value != null && double.TryParse(ap.Value.ToString(), out double dv))
+                    if (ap.Value != null
+                        && double.TryParse(ap.Value.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double dv))
                         inner[ap.Name] = dv;
                 }
                 if (inner.Count > 0) tierAttrs[tp.Name] = inner;

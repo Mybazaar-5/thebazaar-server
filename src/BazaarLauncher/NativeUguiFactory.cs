@@ -209,9 +209,9 @@ internal sealed class NativeUguiFactory
         try
         {
             // P1-2 修复：彻底废除全场景 FindObjectsByType / FindObjectsOfTypeAll 扫描，
-            // 直接零开销读取原版 NotoFontFallbackRuntime 已加载的中文字库，且绝不篡改原版全局 TMP 回退表！
+            // 直接零开销读取原版 NotoFontFallbackRuntime 已加载的中文字库，且校验确含中文字形后再复用（英文模式/异步回退表未就绪时回退私有 OS 字体）。
             TMP_FontAsset notoFont = TryGetNativeNotoFontAsset();
-            if (notoFont != null)
+            if (notoFont != null && FontSupportsChineseReadOnly(notoFont))
             {
                 isVerifiedChinese = true;
                 isNativeChinese = true;

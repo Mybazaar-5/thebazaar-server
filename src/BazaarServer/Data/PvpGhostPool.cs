@@ -196,7 +196,7 @@ public sealed class PvpGhostPool
     /// </summary>
     public static (int MinHp, int MaxHp, int MaxLevel) GetSaneBoundsForDay(int day) => Math.Max(1, day) switch
     {
-        1 => (200, 380, 1),
+        1 => (200, 550, 2),
         2 => (300, 900, 3),
         3 => (400, 1500, 4),
         4 => (500, 2500, 5),
@@ -236,8 +236,8 @@ public sealed class PvpGhostPool
     }
 
     /// <summary>
-    /// 静态池加载期强力卫生过滤：剔除 Day 1 超血(>=400)/Lv2+、不支持英雄、异常同卡>=3件以及 Day 4/5+ 残缺未满编盘面，
-    /// 彻底杜绝 1,062 条 Day 1 脏样本与 197 条 Day 5 残缺样本常驻内存。
+    /// 静态池加载期强力卫生过滤：剔除 Day 1 超血(&gt;550)/Lv3+、不支持英雄、异常同卡>=3件以及 Day 4/5+ 残缺未满编盘面，
+    /// 彻底杜绝异常高阶脏样本与残缺样本常驻内存。
     /// </summary>
     private static bool IsCleanStaticGhostForLoad(GhostBoard ghost)
     {
@@ -247,7 +247,7 @@ public sealed class PvpGhostPool
 
         int totalWidth = GetTotalSlotWidth(ghost, repo: null);
         if (ghost.Day <= 1)
-            return ghost.Level <= 1 && ghost.HealthMax <= 320 && totalWidth >= 2;
+            return ghost.Level <= 2 && ghost.HealthMax <= 550 && totalWidth >= 2;
         if (ghost.Day == 2)
             return totalWidth >= 4;
         if (ghost.Day == 3)
@@ -326,19 +326,34 @@ public sealed class PvpGhostPool
             int width = Math.Clamp((int)entry.Size, 1, 3);
 
             var perm = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kv in entry.Attributes)
-            {
-                perm[kv.Key.ToString()] = kv.Value;
-            }
             if (entry.CoreCard != null)
             {
-                foreach (var kv in entry.CoreCard.PermanentAdd)
+                // 仅持久化 CoreCard 真实永久修改层（PermanentAdd / PermanentMult），绝不拷入含光环（Aura）/ 限时层（Hour/Day）
+                // 或已按 PercentCooldownReduction 折算后的 CooldownMax，彻底杜绝真人 PvP 镜像双倍光环叠算与双重冷却缩减
+                var permKeys = new HashSet<string>(entry.CoreCard.PermanentAdd.Keys, StringComparer.OrdinalIgnoreCase);
+                foreach (var mk in entry.CoreCard.PermanentMult.Keys)
+                    permKeys.Add(mk);
+
+                foreach (string key in permKeys)
                 {
-                    if (Math.Abs(kv.Value) < 0.001) continue;
-                    double baseVal = entry.CoreCard.BaseAttributes.GetValueOrDefault(kv.Key, 0);
-                    double mult = entry.CoreCard.PermanentMult.GetValueOrDefault(kv.Key, 1.0);
-                    int unscaled = (int)Math.Round((baseVal + kv.Value) * mult);
-                    perm[kv.Key] = unscaled;
+                    if (IsDerivedGhostAttributeKey(key))
+                        continue;
+                    double baseVal = entry.CoreCard.BaseAttributes.GetValueOrDefault(key, 0);
+                    double addVal = entry.CoreCard.PermanentAdd.GetValueOrDefault(key, 0);
+                    double mult = entry.CoreCard.PermanentMult.GetValueOrDefault(key, 1.0);
+                    int unscaled = (int)Math.Round((baseVal + addVal) * mult);
+                    if (Math.Abs(unscaled - baseVal) > 0.001)
+                        perm[key] = unscaled;
+                }
+            }
+            else
+            {
+                foreach (var kv in entry.Attributes)
+                {
+                    string key = kv.Key.ToString();
+                    if (IsDerivedGhostAttributeKey(key))
+                        continue;
+                    perm[key] = kv.Value;
                 }
             }
 
@@ -546,11 +561,11 @@ public sealed class PvpGhostPool
         var staticSource = bucket.StaticPreferred.Length > 0 ? bucket.StaticPreferred : bucket.All;
         if (staticSource.Length == 0) return null;
 
-        string[] preferredBuckets = (day <= 2 || playerLosses >= playerWins + 2)
+        string[] preferredBuckets = playerLosses >= playerWins + 2
             ? ["Weak", "Normal"]
-            : playerWins >= day - 1
+            : (day >= 3 && playerWins >= day - 1)
                 ? ["Strong", "Normal", "MetaBoss"]
-                : ["Normal", "Strong", "Weak"];
+                : ["Normal", "Strong"];
 
         var tier1 = new List<GhostBoard>();
         var tier2 = new List<GhostBoard>();
@@ -560,7 +575,7 @@ public sealed class PvpGhostPool
         {
             var b = staticSource[i];
             if (HasInvalidRepoItem(b, repo)) continue;
-            if (day <= 1 && (b.Level > 1 || b.HealthMax > 320)) continue;
+            if (day <= 1 && (b.Level > 2 || b.HealthMax > 550)) continue;
 
             fallback.Add(b);
             bool bucketHit = ContainsBucket(preferredBuckets, b.PowerBucket);
@@ -580,7 +595,7 @@ public sealed class PvpGhostPool
         {
             var p = bucket.PlayerGhosts[i];
             if (HasInvalidRepoItem(p, repo)) continue;
-            if (day <= 1 && (p.Level > 1 || p.HealthMax > 320)) continue;
+            if (day <= 1 && (p.Level > 2 || p.HealthMax > 550)) continue;
             anyPlayers.Add(p);
             if (Math.Abs(p.Wins - playerWins) <= 2)
                 closePlayers.Add(p);
@@ -1094,7 +1109,12 @@ public sealed class PvpGhostPool
             var card = new CardInstance(tpl, TierHelper.ParseTier(it.Tier), it.Enchantment, $"opp_{itemIdx++}_{it.Slot}_{prefix}");
             foreach (var (ak, av) in it.PermanentAttributes)
             {
-                card.PermanentAdd[ak] = av - card.BaseAttributes.GetValueOrDefault(ak, 0);
+                if (IsDerivedGhostAttributeKey(ak))
+                    continue;
+                double baseVal = card.BaseAttributes.GetValueOrDefault(ak, 0);
+                double delta = av - baseVal;
+                if (Math.Abs(delta) > 0.001)
+                    card.PermanentAdd[ak] = delta;
             }
             if (!ps.Hand.TryPlaceOrShift(card, Math.Clamp(it.Slot, 0, 9)))
                 ps.Hand.TryAddAuto(card);
@@ -1148,7 +1168,7 @@ public sealed class PvpGhostPool
             BoardId = $"fallback_d{clampedDay}",
             Day = clampedDay,
             Hero = hero,
-            Level = clampedDay,
+            Level = Math.Clamp(clampedDay + 1, 2, 20),
             HealthMax = hp,
             Prestige = 20,
             UnlockedSlotsMask = DefaultUnlockedMaskForDay(clampedDay),
@@ -1157,6 +1177,11 @@ public sealed class PvpGhostPool
             Items = items,
         };
     }
+
+    private static bool IsDerivedGhostAttributeKey(string key)
+        => string.Equals(key, "Ammo", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(key, "BuyPrice", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(key, "QuestCompletedCount", StringComparison.OrdinalIgnoreCase);
 
     private static string? GetStr(JsonElement el, string name)
         => el.ValueKind == JsonValueKind.Object && el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String

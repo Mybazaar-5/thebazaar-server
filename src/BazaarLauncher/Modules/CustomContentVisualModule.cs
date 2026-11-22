@@ -387,7 +387,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _encounterBackgroundRendererField = AccessTools.Field(encCtrl, "backgroundRenderer");
             _encounterInstancedBgMatField = AccessTools.Field(encCtrl, "instancedBackgroundMaterial");
 
-            var frameType = GameInspector.FindTypeSafe("CardFrameController", "TheBazaar.CardFrameController");
+            var frameType = GameInspector.FindTypeSafe(
+                "TheBazaar.Game.CardFrames.CardFrameController",
+                "CardFrameController",
+                "TheBazaar.CardFrameController");
             if (frameType != null)
             {
                 _cardFrameUpdateBgMethod = AccessTools.Method(frameType, "UpdateBackgroundMaterial", new[] { typeof(Texture) });

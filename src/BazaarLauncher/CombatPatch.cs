@@ -1492,6 +1492,7 @@ internal static class CombatPatch
     private static FieldInfo _itemIsFlyingField;
     private static FieldInfo _itemCanFlyHashField;
     private static MethodInfo _itemStopCardFlyMethod;
+    private static FieldInfo _itemAnimatorField;
     private static PropertyInfo _itemAnimatorProp;
     private static PropertyInfo _animControllerProp;
     private static PropertyInfo _animIsInitializedProp;
@@ -1571,7 +1572,7 @@ internal static class CombatPatch
             {
                 patcher.TryPatchMethod(
                     replayOnExit,
-                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(PostCombatVisualCleanupPostfix)),
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(ReplayOnExitVisualCleanupPostfix)),
                     optional: true,
                     label: "ReplayState.OnExit");
             }
@@ -1663,6 +1664,27 @@ internal static class CombatPatch
     {
         try { CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: false); }
         catch { }
+    }
+
+    /// <summary>
+    /// ReplayState.OnExit 为 async Task：立即清理一次，并在异步退出真正完成后回到主线程二次兜底清理。
+    /// </summary>
+    private static void ReplayOnExitVisualCleanupPostfix(Task __result)
+    {
+        try { CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: false); }
+        catch { }
+
+        if (__result != null && !__result.IsCompleted)
+        {
+            __result.ContinueWith(_ =>
+            {
+                BazaarLauncher.Core.MainThreadDispatcher.Enqueue(() =>
+                {
+                    try { CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: true); }
+                    catch { }
+                });
+            }, TaskScheduler.Default);
+        }
     }
 
     private static void StateChangedVisualCleanupPostfix(object obj)
@@ -1993,8 +2015,14 @@ internal static class CombatPatch
         }
 
         // 双重保险：若 Animator 布尔残留 true 但 _isFlying 为 false，仍强制拉回 false
-        _itemAnimatorProp ??= _itemControllerType.GetProperty("Animator", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
-        var animObj = _itemAnimatorProp?.GetValue(itemCtrl);
+        // 注意：CardController.Animator 为公有字段（非属性），优先按字段查找并保留属性兜底
+        _itemAnimatorField ??= AccessTools.Field(_itemControllerType, "Animator");
+        object animObj = _itemAnimatorField?.GetValue(itemCtrl);
+        if (animObj == null)
+        {
+            _itemAnimatorProp ??= _itemControllerType.GetProperty("Animator", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+            animObj = _itemAnimatorProp?.GetValue(itemCtrl);
+        }
         if (animObj != null && animObj is Behaviour animBhv && animBhv != null && animBhv.isActiveAndEnabled)
         {
             var animType = animObj.GetType();
@@ -2228,6 +2256,7 @@ internal static class CombatPatch
 
     private static void TickSmoothCooldownBars()
     {
+        if (!BazaarLauncher.Modules.PerfOptimizerModule.OptCombatHighSpeedSmooth) return;
         if (!_inSimulateLoop || _cdTracks.Count == 0) return;
         if (IsGameCurrentlyPaused()) return;
 

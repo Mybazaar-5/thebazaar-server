@@ -3102,11 +3102,23 @@ internal sealed class GameDriver : MonoBehaviour
         }
 
         var loaderType = AccessTools.TypeByName("SceneLoader");
-        var mLoad = loaderType?.GetMethod("LoadScene", BindingFlags.Public | BindingFlags.Static, null, new[] { sceneEnum }, null);
-        if (mLoad != null)
+        // SceneLoader.LoadScene 真实签名为 6 参静/异步方法（后 5 参带默认值），反射查找需精确匹配参数列表
+        var mLoad6 = loaderType?.GetMethod(
+            "LoadScene",
+            BindingFlags.Public | BindingFlags.Static,
+            null,
+            new[] { sceneEnum, typeof(bool), typeof(bool), typeof(Action), typeof(Action), typeof(CancellationToken) },
+            null);
+        if (mLoad6 != null)
         {
-            mLoad.Invoke(null, new[] { targetScene });
-            return new { ok = true, op = opName, targetScene = sceneIdName, via = "SceneLoader.LoadScene" };
+            mLoad6.Invoke(null, new object[] { targetScene, true, true, null, null, CancellationToken.None });
+            return new { ok = true, op = opName, targetScene = sceneIdName, via = "SceneLoader.LoadScene(6)" };
+        }
+        var mLoad1 = loaderType?.GetMethod("LoadScene", BindingFlags.Public | BindingFlags.Static, null, new[] { sceneEnum }, null);
+        if (mLoad1 != null)
+        {
+            mLoad1.Invoke(null, new[] { targetScene });
+            return new { ok = true, op = opName, targetScene = sceneIdName, via = "SceneLoader.LoadScene(1)" };
         }
         return new { ok = false, op = opName, error = "scene navigation handler not found" };
     }
