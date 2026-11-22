@@ -302,9 +302,6 @@ public sealed class RunEngine
         ClearTrackedPlayerTempModifiers(clearHour: true, clearDay: true, clearAura: true);
 
         _run.OpponentAttributes = RunState.CreateDefaultCombatantAttributes(100, 100, gold: 0, income: 5);
-        ApplyStartingStats(_run.CustomRules, o.Events);
-        if (IsTournamentRun())
-            _run.PlayerAttributes[EPlayerAttributeType.Custom_11] = 1;
 
         o.Events.Add(new GameSimEventPlayerInitialized
         {
@@ -317,14 +314,14 @@ public sealed class RunEngine
             Hero = EHero.Common,
         });
 
+        ApplyStartingStats(_run.CustomRules, o.Events);
+        if (IsTournamentRun())
+            _run.PlayerAttributes[EPlayerAttributeType.Custom_11] = 1;
+
         GrantStarterPresets(_run.CustomRules, o.Events);
 
-        // 接入官方多英雄多样化开局（直接进入 Day 1 Hour 1 Choice 并传入当日去重集合）
-        _run.SelectionsMadeInCurrentContext = 0;
-        o.Events.AddRange(DealHourEncountersAndClearActive());
-        StartSelectionDone = _run.State == ERunState.Choice;
-
-        // 派发开局生命周期触发与当前遭遇进入/发牌钩子（Q45：先注入官方开局 PlayerEffect 以触发 Jules 冰火插座 15d06ad8 等）
+        // 先派发开局生命周期触发（Q45：先注入官方开局 PlayerEffect 以触发 Jules 冰火插座 15d06ad8 等），
+        // 确保所有开局属性与经验变动全部结算后再决定首屏状态，避免同帧先发 Choice 遭遇再立刻销毁切 LevelUp 导致客户端残留僵尸事件！
         var p1Core = BuildCorePlayerFromRun();
         OutOfCombatController.InjectOfficialPlayerEffects(
             p1Core,
@@ -333,17 +330,30 @@ public sealed class RunEngine
             includeHeroRunStartSpawners: true);
         var startBatch = OutOfCombatController.OnRunStarted(p1Core, _repo, _rng);
         ApplyOutOfCombatBatch(p1Core, startBatch, o.Events, syncBoardDiffs: false);
-        if (_run.State is ERunState.Encounter or ERunState.Pedestal && !string.IsNullOrEmpty(_run.CurrentEncounterId))
-        {
-            _run.CurrentEncounterCoreCard = CreateEncounterCoreCard(_run.CurrentEncounterId);
-            ActivateEncounterCard(_run.CurrentEncounterId, selectedCard: null, o.Events, emitPurchaseIfSelected: false);
-        }
-        TriggerOnEncounterEnteredAndDealt(_run.CurrentEncounterId, o.Events);
 
-        if (_run.PendingLevelUp && _run.State == ERunState.Choice)
+        if (_run.PendingLevelUp)
         {
+            // 开局即满足升级条件（如自定义初始经验 >= 8）：压入空 Choice 快照直接进入 LevelUp，
+            // 升级选完后再由 AdvanceAfterSubState 正常发出 Day 1 Hour 1 的 3 个事件，绝不同帧双切发废卡
+            StartSelectionDone = true;
+            _run.SelectionsMadeInCurrentContext = 0;
             PushChoiceAndEnterLevelUp(o.Events);
         }
+        else
+        {
+            // 接入官方多英雄多样化开局（直接进入 Day 1 Hour 1 Choice 并传入当日去重集合）
+            _run.SelectionsMadeInCurrentContext = 0;
+            o.Events.AddRange(DealHourEncountersAndClearActive());
+            StartSelectionDone = _run.State == ERunState.Choice;
+
+            if (_run.State is ERunState.Encounter or ERunState.Pedestal && !string.IsNullOrEmpty(_run.CurrentEncounterId))
+            {
+                _run.CurrentEncounterCoreCard = CreateEncounterCoreCard(_run.CurrentEncounterId);
+                ActivateEncounterCard(_run.CurrentEncounterId, selectedCard: null, o.Events, emitPurchaseIfSelected: false);
+            }
+            TriggerOnEncounterEnteredAndDealt(_run.CurrentEncounterId, o.Events);
+        }
+
         ReconcileAndVerifyBoardInvariants("StartRun", o.DirtyCardIds, o.Events);
         _run.RngSeed = _rng.Next(1, int.MaxValue);
         return o;

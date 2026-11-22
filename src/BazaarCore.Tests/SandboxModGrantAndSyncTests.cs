@@ -205,6 +205,7 @@ public sealed class SandboxModGrantAndSyncTests
         MultiplayerEndpointModule.RegisterServices(builder.Services);
 
         var app = builder.Build();
+        CustomRuleEndpoints.Map(app, playerRules, accounts, () => new { archetypes = Array.Empty<object>() }, sessions, db);
         ModEndpoints.Map(app);
         CommunityModEndpoints.Map(app);
         MultiplayerEndpointModule.MapEndpoints(app);
@@ -436,5 +437,68 @@ public sealed class SandboxModGrantAndSyncTests
         Assert.True(normalized.ShouldSkipGhostPool);
         Assert.True(normalized.ShouldSkipCareerAndLeaderboard);
         Assert.Equal("none", normalized.ResolveGhostPoolPartition());
+    }
+
+    [Fact]
+    public async Task StartRunWithImmediateLevelUp_ShouldNotEmitGhostChoiceCards_AndModeSwitchRespectsRequestedPreset()
+    {
+        await using var h = await StartHarnessAsync();
+
+        // 1. 即使手动自定义 StartingExperience = 8 开局即升级，StartRun 绝不能同帧先发 Choice 再 Dispose 切 LevelUp（消灭同屏 6 事件僵尸卡）
+        var highXpRules = PresetCatalog.Create(EGameModePreset.PureOfficial, ESpecialModeId.EndlessTower);
+        highXpRules.StartingExperience = 8;
+        var run = new RunState
+        {
+            RunId = "lvl_start_" + Guid.NewGuid().ToString("N")[..8],
+            AccountId = "acc_lvl",
+            Username = "LvlTester",
+            GameModeId = h.CardPool.DefaultGameModeId,
+            Hero = EHero.Vanessa,
+            PlayMode = EPlayMode.Unranked,
+            RngSeed = 20261122,
+            CustomRules = highXpRules.CloneNormalized(),
+        };
+        var engine = new RunEngine(run, h.CardPool, h.Monsters, h.LevelUps, h.GameMode, h.ModHost.ActiveRepository, h.Ghosts);
+        var startOut = engine.StartRun();
+
+        Assert.Equal(ERunState.LevelUp, run.State);
+        Assert.DoesNotContain(startOut.Events, e => e is GameSimEventCardDisposed);
+        var transitions = startOut.Events.OfType<GameSimEventStateTransitioned>().ToList();
+        Assert.Single(transitions);
+        Assert.Equal(ERunState.LevelUp, transitions[0].ToState);
+        Assert.True(startOut.Events.FindIndex(e => e is GameSimEventPlayerInitialized) < startOut.Events.FindIndex(e => e is GameSimEventPlayerExperienceGained));
+
+        // 2. 爽玩增强（EnhancedFun）默认初始经验改为 6（< 8），开局直接进 Choice 显示 3 个事件，不再开局 0 秒弹升级
+        var enhancedRules = PresetCatalog.Create(EGameModePreset.EnhancedFun, ESpecialModeId.Standard);
+        Assert.Equal(6, enhancedRules.StartingExperience);
+        var enhancedRun = new RunState
+        {
+            RunId = "enh_start_" + Guid.NewGuid().ToString("N")[..8],
+            AccountId = "acc_enh",
+            Username = "EnhTester",
+            GameModeId = h.CardPool.DefaultGameModeId,
+            Hero = EHero.Vanessa,
+            PlayMode = EPlayMode.Unranked,
+            RngSeed = 20261122,
+            CustomRules = enhancedRules,
+        };
+        var enhancedEngine = new RunEngine(enhancedRun, h.CardPool, h.Monsters, h.LevelUps, h.GameMode, h.ModHost.ActiveRepository, h.Ghosts);
+        enhancedEngine.StartRun();
+        Assert.Equal(ERunState.Choice, enhancedRun.State);
+        Assert.Equal(1, enhancedRun.PlayerAttributes[EPlayerAttributeType.Level]);
+        Assert.Equal(6, enhancedRun.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(3, enhancedRun.SelectionSet.Count);
+
+        // 3. 先切到 EnhancedFun，再点无尽爬塔（带 presetId="PureOfficial"）：服务端必须尊重请求体里的 PureOfficial，不再串入旧 EnhancedFun
+        var acc = h.Accounts.GetOrCreateByName("ModeSwitchTester", "game");
+        var r1 = await h.Http.SendAsync(AuthedJson(HttpMethod.Post, "/custom-rules/me/preset/EnhancedFun", acc.AccessToken, new { presetId = "EnhancedFun", modeId = "Standard" }));
+        Assert.Equal(HttpStatusCode.OK, r1.StatusCode);
+
+        var r2 = await h.Http.SendAsync(AuthedJson(HttpMethod.Post, "/custom-rules/me/mode/EndlessTower", acc.AccessToken, new { presetId = "PureOfficial", modeId = "EndlessTower" }));
+        Assert.Equal(HttpStatusCode.OK, r2.StatusCode);
+        using var r2Doc = JsonDocument.Parse(await r2.Content.ReadAsStringAsync());
+        Assert.Equal("PureOfficial", r2Doc.RootElement.GetProperty("presetId").GetString());
+        Assert.Equal("EndlessTower", r2Doc.RootElement.GetProperty("specialModeId").GetString());
+        Assert.Equal(0, r2Doc.RootElement.GetProperty("rules").GetProperty("startingExperience").GetInt32());
     }
 }

@@ -11,7 +11,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <AssemblyName>BazaarHub</AssemblyName>
     <RootNamespace>BazaarHub</RootNamespace>
-    <Version>1.0.0</Version>
+    <Version>15.2.0</Version>
     <Authors>TheBazaar 自建服社区</Authors>
     <Product>大巴扎自建服启动器 (BazaarHub)</Product>
     <Description>《The Bazaar》独立图形化启动器、增量热更新器与一键可逆本体性能调优工具</Description>

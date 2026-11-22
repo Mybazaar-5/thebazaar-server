@@ -240,7 +240,7 @@ public static class PresetCatalog
             EGameModePreset.EnhancedFun,
             "EnhancedFun",
             "爽玩增强",
-            "初始资源更充裕（25金/7收/8经/25声/350血），祭坛奇遇 1.4x、白银+ 权重 +15%、野怪战利品选项 +1，严格隔离至娱乐镜像池",
+            "初始资源更充裕（25金/7收/6经/25声/350血），祭坛奇遇 1.4x、白银+ 权重 +15%、野怪战利品选项 +1，严格隔离至娱乐镜像池",
             0.8,
             AllowsStandardGhostPool: false),
         new(
@@ -273,7 +273,7 @@ public static class PresetCatalog
             case EGameModePreset.EnhancedFun:
                 rules.StartingGold = 25;
                 rules.StartingIncome = 7;
-                rules.StartingExperience = 8;
+                rules.StartingExperience = 6;
                 rules.StartingPrestige = 25;
                 rules.StartingHealth = 350;
                 rules.MonsterLootChooseOne = true;

@@ -76,7 +76,9 @@ public static class ClientUpdateEndpoints
             return Results.Json(new
             {
                 schemaVersion = 1,
-                serverVersion = "2.0.0",
+                serverVersion = "15.2.0",
+                launcherVersion = "15.2.0",
+                hubVersion = "15.2.0",
                 generatedAtUtc = DateTimeOffset.UtcNow,
                 payloadDirAvailable = Directory.Exists(activeDir),
                 manifestSha256,

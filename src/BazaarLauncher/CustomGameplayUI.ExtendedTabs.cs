@@ -229,7 +229,7 @@ internal sealed partial class CustomGameplayUI
         {
             rules.StartingGold = 25;
             rules.StartingIncome = 7;
-            rules.StartingExperience = 8;
+            rules.StartingExperience = 6;
             rules.StartingPrestige = 25;
             rules.StartingHealth = 350;
             rules.MonsterLootChooseOne = true;

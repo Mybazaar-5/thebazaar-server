@@ -15,7 +15,7 @@ namespace BazaarLauncher;
 ///   - 自动扫描 BepInEx/plugins/BazaarMods/*.dll 与 BepInEx/mods/ 热加载外部第三方 IBazaarClientMod 扩展；
 ///   - OnDestroy 统一回收全部 Harmony 补丁、HTTP 取消令牌与运行时宿主对象，零僵尸补丁泄漏。
 /// </summary>
-[BepInPlugin(Guid, "BazaarLauncher", "2.1.0")]
+[BepInPlugin(Guid, "BazaarLauncher", "15.2.0")]
 public sealed class BazaarLauncherPlugin : BaseUnityPlugin
 {
     public const string Guid = "local.thebazaar.bazaarlauncher";

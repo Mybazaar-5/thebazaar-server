@@ -196,7 +196,7 @@ public static class CustomRuleEndpoints
         });
 
         // ── 快捷切换预设档位（PureOfficial / EnhancedFun / ExtremeRoguelike / Custom）──
-        app.MapPost("/custom-rules/me/preset/{presetId}", (HttpContext ctx, string presetId) =>
+        app.MapPost("/custom-rules/me/preset/{presetId}", async (HttpContext ctx, string presetId) =>
         {
             if (!TryParsePresetId(presetId, out var parsedPreset))
             {
@@ -206,10 +206,29 @@ public static class CustomRuleEndpoints
                 });
             }
 
+            ESpecialModeId? requestedMode = null;
+            try
+            {
+                using var reader = new StreamReader(ctx.Request.Body, System.Text.Encoding.UTF8, leaveOpen: true);
+                string rawBody = await reader.ReadToEndAsync(ctx.RequestAborted);
+                if (!string.IsNullOrWhiteSpace(rawBody))
+                {
+                    using var doc = JsonDocument.Parse(rawBody);
+                    if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                        doc.RootElement.TryGetProperty("modeId", out var mEl) &&
+                        mEl.ValueKind == JsonValueKind.String &&
+                        TryParseSpecialModeId(mEl.GetString(), out var parsedMode))
+                    {
+                        requestedMode = parsedMode;
+                    }
+                }
+            }
+            catch { }
+
             string accountId = ResolveAccountId(ctx, accounts);
             var current = store.Get(accountId);
             bool resetMode = string.Equals(ctx.Request.Query["resetMode"].FirstOrDefault(), "true", StringComparison.OrdinalIgnoreCase);
-            var targetMode = resetMode ? ESpecialModeId.Standard : current.SpecialModeId;
+            var targetMode = requestedMode ?? (resetMode ? ESpecialModeId.Standard : current.SpecialModeId);
 
             CustomRunRuleSet next;
             if (parsedPreset == EGameModePreset.Custom)
@@ -228,6 +247,12 @@ public static class CustomRuleEndpoints
                 }
             }
 
+            if (current.SelectedModIds is { Count: > 0 })
+            {
+                next.SelectedModIds = new List<string>(current.SelectedModIds);
+                next = next.CloneNormalized();
+            }
+
             var updated = store.Set(accountId, next);
             return Results.Json(new
             {
@@ -240,7 +265,7 @@ public static class CustomRuleEndpoints
         });
 
         // ── 快捷切换玩法模式（Standard + 5 大新模式 + DailyChallenge）──
-        app.MapPost("/custom-rules/me/mode/{modeId}", (HttpContext ctx, string modeId) =>
+        app.MapPost("/custom-rules/me/mode/{modeId}", async (HttpContext ctx, string modeId) =>
         {
             if (!TryParseSpecialModeId(modeId, out var parsedMode))
             {
@@ -248,6 +273,30 @@ public static class CustomRuleEndpoints
                 {
                     error = $"未知的玩法模式：{modeId}，可选值：Standard、EndlessTower、CrossHeroMayhem、MutatorChallenge、DailyChallenge、BossRush、SandboxLab",
                 });
+            }
+
+            // 读取可选请求体中的 presetId（兼容 Content-Length 与 chunked 传输，例如主大厅点无尽爬塔显式传 PureOfficial）
+            EGameModePreset? requestedPreset = null;
+            try
+            {
+                using var reader = new StreamReader(ctx.Request.Body, System.Text.Encoding.UTF8, leaveOpen: true);
+                string rawBody = await reader.ReadToEndAsync(ctx.RequestAborted);
+                if (!string.IsNullOrWhiteSpace(rawBody))
+                {
+                    using var doc = JsonDocument.Parse(rawBody);
+                    if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                        doc.RootElement.TryGetProperty("presetId", out var pEl) &&
+                        pEl.ValueKind == JsonValueKind.String &&
+                        TryParsePresetId(pEl.GetString(), out var parsedPreset) &&
+                        parsedPreset != EGameModePreset.Custom)
+                    {
+                        requestedPreset = parsedPreset;
+                    }
+                }
+            }
+            catch
+            {
+                // 空体或非 JSON 时安全忽略，回退账号当前预设
             }
 
             string accountId = ResolveAccountId(ctx, accounts);
@@ -262,9 +311,8 @@ public static class CustomRuleEndpoints
             }
             else
             {
-                var basePreset = current.PresetId == EGameModePreset.Custom
-                    ? EGameModePreset.PureOfficial
-                    : current.PresetId;
+                var basePreset = requestedPreset
+                    ?? (current.PresetId == EGameModePreset.Custom ? EGameModePreset.PureOfficial : current.PresetId);
                 next = PresetCatalog.Create(basePreset, parsedMode);
                 next.SelectedArchetypeMask = current.SelectedArchetypeMask;
 
@@ -272,6 +320,13 @@ public static class CustomRuleEndpoints
                 {
                     next.MutatorIds = new List<string>(current.MutatorIds);
                 }
+            }
+
+            // 保留玩家勾选的单局/社区 Mod 列表，切模式不丢已选 Mod
+            if (current.SelectedModIds is { Count: > 0 })
+            {
+                next.SelectedModIds = new List<string>(current.SelectedModIds);
+                next = next.CloneNormalized();
             }
 
             var updated = store.Set(accountId, next);
