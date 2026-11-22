@@ -62,6 +62,9 @@ public sealed class CardTemplate
     // 音乐盒/插槽效果专有字段
     public System.Text.Json.JsonElement? MusicNote { get; set; }
 
+    /// <summary>V14 开放自定义沙盒机制挂载列表（由 Mod 卡牌或补丁声明，纯原版卡恒为 null）。</summary>
+    public List<BazaarCore.Mods.CardMechanicAttachment>? CustomMechanics { get; set; }
+
     public string DisplayTitle => Localization?.Title?.Text ?? InternalName;
 
     public CardSize CardSize => TierHelper.ParseSize(Size);

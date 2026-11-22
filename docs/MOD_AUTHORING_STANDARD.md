@@ -106,7 +106,7 @@ mods/<mod-id>/                     # <mod-id> 必须匹配 ^[a-z0-9][a-z0-9-]{1,
 | `tiers.*.abilityIds` / `auraIds` | 显式列出各阶激活的能力 ID，如 `["0", "1"]` | ❌ 留空导致旧版战斗 0 触发（V13.1 引擎已兜底，但仍建议显式填写） |
 | 玩家属性前置条件（如金币 ≥ 20） | `TPrerequisitePlayer` + `subject: TTargetPlayerAbsolute` + `conditions: TPlayerConditionalAttribute` | ❌ 写引擎不存在的 `TPrerequisitePlayerAttribute` |
 | 奇遇步骤选项（`EncounterStep`） | `attributes: { "BuyPrice": 6 }` + `abilities`（`TTriggerOnCardSelected`）+ `nextEncounterOnSelection` | ❌ 编造 `effects` 或 `costGold` 字段 |
-| 卡图格式与推荐尺寸 | **标准 PNG**：Small/Large 物品 `512×1024`，Medium 物品与技能 `512×512` | ❌ 传 WebP（Unity `LoadImage` 不解码）或超 1024px |
+| 卡图格式与推荐尺寸 | **标准 PNG**：Small（1格）竖图 `512×1024`，Medium（2格）/Skill 方图 `512×512`，Large（3格）横图 `768×512` | ❌ 传 WebP（Unity `LoadImage` 不解码）、超 1024px 或把 Large 裁成竖图 |
 | 动态文案占位符 | `{attr.DamageAmount}`、`{attr.HasteAmount}`、`{attr.Custom_0}` | ❌ 引用该品阶未定义的属性名导致渲染出 `"?"` |
 
 ---

@@ -19,16 +19,35 @@ public static class ModCombatStressTester
 
     /// <summary>
     /// 在隔离 Overlay 上执行真实战斗压力体检，产出结构化报告与闸门 #9 问题列表。
+    /// 支持注入候选开放自定义机制 <paramref name="candidateMechanics"/> 并对熔断/步数超预算执行硬阻断。
     /// </summary>
     public static (ModCombatStressReport Report, List<ModValidationIssue> Issues) RunStressTest(
         ModPackage targetPackage,
         GameDataRepository overlayRepo,
         int matches = 50,
-        int seedBase = 2026131)
+        int seedBase = 2026131,
+        IReadOnlyDictionary<string, MechanicDefinition>? candidateMechanics = null)
     {
         string modId = targetPackage.Manifest.Id;
         int actualMatches = Math.Clamp(matches, 1, 200);
         var issues = new List<ModValidationIssue>();
+
+        // 组装隔离沙盒机制表（合并已有已注册机制 + 外部候选 + 本包 mechanics/*.json，绝不污染全局运行态）
+        var effectiveMechanics = new Dictionary<string, MechanicDefinition>(StringComparer.OrdinalIgnoreCase);
+        var globalMechs = ModRuntimeHooks.GetRegisteredMechanics();
+        if (globalMechs != null)
+        {
+            foreach (var (k, v) in globalMechs) effectiveMechanics[k] = v;
+        }
+        if (candidateMechanics != null)
+        {
+            foreach (var (k, v) in candidateMechanics) effectiveMechanics[k] = v;
+        }
+        foreach (var m in targetPackage.Mechanics)
+        {
+            if (!string.IsNullOrWhiteSpace(m.Id))
+                effectiveMechanics[m.Id.Trim()] = m;
+        }
 
         // 收集本 Mod 涉及的全部可进战斗的物品与技能（含新建卡与原位 Patch）
         var modItems = new List<CardTemplate>();
@@ -81,7 +100,30 @@ public static class ModCombatStressTester
         int numericCorruptions = 0;
         int slowMatchesOver200ms = 0;
         int modSideWins = 0;
+        int mechanicBreakerTrips = 0;
+        int mechanicBudgetViolations = 0;
+        var mechanicDiagnostics = new List<MechanicDiagnostic>();
         double totalFightDurationSec = 0;
+
+        // 若本包或待测卡挂载了自定义沙盒机制，预筛选用于对抗测试的摧毁/修复/多段输出/DOT 原版卡
+        bool hasCustomMechanicsToStress = targetPackage.Mechanics.Count > 0
+            || modItems.Any(c => c.CustomMechanics is { Count: > 0 })
+            || modSkills.Any(c => c.CustomMechanics is { Count: > 0 });
+        List<CardTemplate>? adversarialOpponents = null;
+        List<CardTemplate>? adversarialAllies = null;
+        if (hasCustomMechanicsToStress)
+        {
+            adversarialOpponents = overlayRepo.AllItems
+                .Where(c => c.Type == "Item" && !seenTested.Contains(c.Id) && c.Abilities.Values.Any(a =>
+                    a.Action?.Type is "TActionCardDisable" or "TActionCardDestroy" or "TActionPlayerBurnApply" or "TActionPlayerPoisonApply" or "TActionPlayerDamage"))
+                .Take(24)
+                .ToList();
+            adversarialAllies = overlayRepo.AllItems
+                .Where(c => c.Type == "Item" && !seenTested.Contains(c.Id) && c.Abilities.Values.Any(a =>
+                    a.Action?.Type is "TActionCardRepair" or "TActionCardCharge" or "TActionCardHaste"))
+                .Take(24)
+                .ToList();
+        }
 
         CardTier[] tiers = [CardTier.Bronze, CardTier.Silver, CardTier.Gold, CardTier.Diamond];
         string[] heroes = HeroNames.PlayableHeroes;
@@ -187,6 +229,31 @@ public static class ModCombatStressTester
                 p2.Skills.Add(new CardInstance(vs2, PickValidTier(vs2, tier), null, $"vs2_{i}"));
             }
 
+            // 前 5 场含自定义机制对抗压测：为己方混入修复/充能卡、为敌方混入摧毁/禁用/高频伤害/DOT 卡，极限验证事前拦截与不变量
+            if (hasCustomMechanicsToStress && i < 5)
+            {
+                if (adversarialAllies is { Count: > 0 } && usedSlots <= 8)
+                {
+                    var allyTpl = adversarialAllies[i % adversarialAllies.Count];
+                    if (usedSlots + (int)allyTpl.CardSize <= 10)
+                    {
+                        var allyInst = new CardInstance(allyTpl, PickValidTier(allyTpl, tier), null, $"adv_a_{i}");
+                        if (p1.Hand.TryPlaceOrShift(allyInst, usedSlots))
+                            usedSlots += (int)allyTpl.CardSize;
+                    }
+                }
+                if (adversarialOpponents is { Count: > 0 } && p2Slots <= 8)
+                {
+                    var oppTpl = adversarialOpponents[i % adversarialOpponents.Count];
+                    if (p2Slots + (int)oppTpl.CardSize <= 10)
+                    {
+                        var oppInst = new CardInstance(oppTpl, PickValidTier(oppTpl, tier), null, $"adv_o_{i}");
+                        if (p2.Hand.TryPlaceOrShift(oppInst, p2Slots))
+                            p2Slots += (int)oppTpl.CardSize;
+                    }
+                }
+            }
+
             // 执行真实 CombatSimulator（关闭 timeline/events 录帧以测真实核心仿真性能）
             var sw = Stopwatch.StartNew();
             try
@@ -199,8 +266,20 @@ public static class ModCombatStressTester
                     combatType: "PVP",
                     recordTimeline: false,
                     recordEvents: false,
-                    syncPermanentChanges: false);
+                    syncPermanentChanges: false,
+                    modifiers: null,
+                    sandstormEnabled: true,
+                    timelineSampleIntervalMs: CombatSimulator.TickMs,
+                    mechanicDefinitionsOverride: effectiveMechanics.Count > 0 ? effectiveMechanics : null);
                 sw.Stop();
+
+                mechanicBreakerTrips += result.MechanicCircuitBreakerTrips;
+                mechanicBudgetViolations += result.MechanicBudgetViolations;
+                if (result.MechanicDiagnostics.Count > 0 && mechanicDiagnostics.Count < 30)
+                {
+                    for (int d = 0; d < result.MechanicDiagnostics.Count && mechanicDiagnostics.Count < 30; d++)
+                        mechanicDiagnostics.Add(result.MechanicDiagnostics[d]);
+                }
 
                 double elapsedMs = sw.Elapsed.TotalMilliseconds;
                 matchTimesMs.Add(elapsedMs);
@@ -275,6 +354,19 @@ public static class ModCombatStressTester
                 FixHintZh: "检查光环乘法倍率与属性增长公式，避免指数级溢出。"));
         }
 
+        if (mechanicBreakerTrips > 0 || mechanicBudgetViolations > 0)
+        {
+            string sampleDiag = mechanicDiagnostics.FirstOrDefault()?.MessageZh ?? "自定义机制触发熔断或递归步数超预算";
+            issues.Add(new ModValidationIssue(
+                ModValidationSeverity.Error,
+                modId,
+                "SIM_MECHANIC_SAFETY_TRIP",
+                $"对抗压力体检检测到自定义机制安全违规（熔断 {mechanicBreakerTrips} 次，超预算 {mechanicBudgetViolations} 次）：{sampleDiag}",
+                testedCardIds.FirstOrDefault(),
+                GateId: 9,
+                FixHintZh: "检查自定义机制是否存在互相触发死循环、缺少 maxTriggersPerCombat 上限或异常数值表达式。"));
+        }
+
         if (actualMatches > 0 && (double)maxDurationHits / actualMatches > MaxAllowedTimeoutRatio)
         {
             cascadeGuardTrips = maxDurationHits;
@@ -338,7 +430,10 @@ public static class ModCombatStressTester
             ModSideWinRatePct = winRatePct,
             AvgFightDurationSec = avgFightSec,
             TestedCardIds = testedCardIds,
-            BalanceHintZh = balanceHint
+            BalanceHintZh = balanceHint,
+            MechanicCircuitBreakerTrips = mechanicBreakerTrips,
+            MechanicBudgetViolations = mechanicBudgetViolations,
+            MechanicDiagnostics = mechanicDiagnostics
         };
 
         return (report, issues);

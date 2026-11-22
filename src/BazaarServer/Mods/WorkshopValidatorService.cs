@@ -33,6 +33,9 @@ public sealed class WorkshopModWorkspace
     [JsonPropertyName("modes")]
     public List<CustomModeDefinition> Modes { get; set; } = new();
 
+    [JsonPropertyName("mechanics")]
+    public List<MechanicDefinition> Mechanics { get; set; } = new();
+
     [JsonPropertyName("mutators")]
     public List<JsonElement> Mutators { get; set; } = new();
 
@@ -88,6 +91,7 @@ public sealed class WorkshopValidatorService
     private readonly ServerModHost _modHost;
     private readonly SemaphoreSlim _validationThrottle = new(2, 2);
     private readonly Lazy<List<BaseCardIndexEntry>> _baseCardIndex;
+    private readonly Lazy<List<string>> _knownVfxKeys;
     private readonly Lazy<string> _cachedRuleCatalogJson;
     private readonly Lazy<string> _cachedRuleCatalogEtag;
 
@@ -95,7 +99,18 @@ public sealed class WorkshopValidatorService
     {
         _modHost = modHost;
         _baseCardIndex = new Lazy<List<BaseCardIndexEntry>>(BuildBaseCardIndex);
-        _cachedRuleCatalogJson = new Lazy<string>(() => JsonSerializer.Serialize(ModRuleCatalog.BuildCatalogDto(), JsonOpts));
+        _knownVfxKeys = new Lazy<List<string>>(BuildKnownVfxKeys);
+        _cachedRuleCatalogJson = new Lazy<string>(() =>
+        {
+            var baseDto = ModRuleCatalog.BuildCatalogDto();
+            // 叠加全库 GameData.db 提取出的 131 种官方白名单 VFX 键，供工坊积木与自定义机制下拉选取
+            using var doc = JsonDocument.Parse(JsonSerializer.Serialize(baseDto, JsonOpts));
+            var merged = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (var prop in doc.RootElement.EnumerateObject())
+                merged[prop.Name] = prop.Value.Clone();
+            merged["vfxKeys"] = _knownVfxKeys.Value;
+            return JsonSerializer.Serialize(merged, JsonOpts);
+        });
         _cachedRuleCatalogEtag = new Lazy<string>(() =>
         {
             byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(_cachedRuleCatalogJson.Value));
@@ -105,6 +120,174 @@ public sealed class WorkshopValidatorService
 
     public string RuleCatalogJson => _cachedRuleCatalogJson.Value;
     public string RuleCatalogEtag => _cachedRuleCatalogEtag.Value;
+    public IReadOnlyList<string> KnownVfxKeys => _knownVfxKeys.Value;
+
+    private List<string> BuildKnownVfxKeys()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var card in _modHost.BaseRepository.CardsById.Values)
+        {
+            foreach (var ab in card.Abilities.Values)
+                if (!string.IsNullOrWhiteSpace(ab.VFXConfig?.VFXOverrideKey))
+                    set.Add(ab.VFXConfig!.VFXOverrideKey!.Trim());
+            if (card.Enchantments != null)
+            {
+                foreach (var ed in card.Enchantments.Values)
+                    foreach (var ab in ed.Abilities.Values)
+                        if (!string.IsNullOrWhiteSpace(ab.VFXConfig?.VFXOverrideKey))
+                            set.Add(ab.VFXConfig!.VFXOverrideKey!.Trim());
+            }
+        }
+        return set.OrderBy(k => k, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>列出服务端当前所有已加载及已发现 Mod 注册的开放自定义沙盒机制（供工坊动态生成参数表单）。</summary>
+    public object ListAllRegisteredMechanics()
+    {
+        var items = new List<object>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var pkg in _modHost.Registry.LoadedPackages)
+        {
+            foreach (var m in pkg.Mechanics)
+            {
+                if (string.IsNullOrWhiteSpace(m.Id) || !seen.Add(m.Id.Trim())) continue;
+                items.Add(new { modId = pkg.Manifest.Id, loaded = true, mechanic = m });
+            }
+        }
+        foreach (var pkg in _modHost.DiscoveredPackages)
+        {
+            foreach (var m in pkg.Mechanics)
+            {
+                if (string.IsNullOrWhiteSpace(m.Id) || !seen.Add(m.Id.Trim())) continue;
+                items.Add(new { modId = pkg.Manifest.Id, loaded = false, mechanic = m });
+            }
+        }
+
+        return new
+        {
+            ok = true,
+            count = items.Count,
+            mechanics = items,
+            schema = ModRuleCatalog.BuildMechanicSchemaDto()
+        };
+    }
+
+    /// <summary>针对单条草稿自定义机制执行独立隔离对抗压测（验证静态合规 + 20 场极限对抗战斗 0 异常/0 熔断/0 超预算）。</summary>
+    public async Task<object> StressTestMechanicAsync(
+        MechanicDefinition mechanic,
+        Dictionary<string, JsonElement>? sampleParams = null,
+        int matches = 20,
+        CancellationToken ct = default)
+    {
+        if (mechanic == null)
+            return new { ok = false, passed = false, error = "请求体缺少 mechanic 定义。" };
+
+        var staticIssues = new List<ModValidationIssue>();
+        MechanicSandboxInterpreter.ValidateStatic(mechanic, "mechanic-lab", staticIssues);
+        if (staticIssues.Any(i => i.Severity == ModValidationSeverity.Error))
+        {
+            return new
+            {
+                ok = true,
+                passed = false,
+                stage = "static",
+                summaryZh = $"静态沙盒审计未通过：发现 {staticIssues.Count(i => i.Severity == ModValidationSeverity.Error)} 处结构错误，请按提示修复后再压测。",
+                staticIssues
+            };
+        }
+
+        bool acquired = await _validationThrottle.WaitAsync(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
+        if (!acquired)
+            return new { ok = false, passed = false, error = "校验沙盒繁忙，请稍候 3 秒再试。" };
+
+        try
+        {
+            return await Task.Run<object>(() =>
+            {
+                var baseRepo = _modHost.BaseRepository;
+                var carrier = baseRepo.AlwaysSpawnableItems.FirstOrDefault(c => c.Type == "Item" && c.Size == "Medium")
+                    ?? baseRepo.AllItems.First();
+
+                var boundParams = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+                foreach (var p in mechanic.Parameters)
+                    if (!string.IsNullOrWhiteSpace(p.Key) && p.DefaultValue.HasValue)
+                        boundParams[p.Key] = p.DefaultValue.Value.Clone();
+                if (sampleParams != null)
+                    foreach (var (k, v) in sampleParams)
+                        boundParams[k] = v.Clone();
+
+                var testCardDef = new CustomCardDefinition
+                {
+                    CustomId = $"mechanic-lab:test_{MakeSlug(mechanic.Id)}",
+                    BaseVisualTemplateId = carrier.Id,
+                    Type = "Item",
+                    Size = carrier.Size,
+                    StartingTier = "Bronze",
+                    Heroes = [HeroNames.Common],
+                    Tags = ["Weapon", "Tool"],
+                    HiddenTags = ["Damage"],
+                    TitleZh = $"沙盒测试卡（{mechanic.NameZh}）",
+                    DescZh = mechanic.DescZh,
+                    ActiveTooltipsZh = [mechanic.RenderTooltip(new CardMechanicAttachment { MechanicId = mechanic.Id, Params = boundParams })],
+                    Tiers = new Dictionary<string, TierData>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["Bronze"] = new TierData { Attributes = new(StringComparer.OrdinalIgnoreCase) { ["BuyPrice"] = 4, ["SellPrice"] = 2, ["CooldownMax"] = 3000, ["DamageAmount"] = 20, ["Custom_0"] = 3 }, AbilityIds = ["0"] },
+                        ["Silver"] = new TierData { Attributes = new(StringComparer.OrdinalIgnoreCase) { ["BuyPrice"] = 8, ["SellPrice"] = 4, ["CooldownMax"] = 3000, ["DamageAmount"] = 40, ["Custom_0"] = 3 }, AbilityIds = ["0"] },
+                        ["Gold"] = new TierData { Attributes = new(StringComparer.OrdinalIgnoreCase) { ["BuyPrice"] = 16, ["SellPrice"] = 8, ["CooldownMax"] = 2500, ["DamageAmount"] = 80, ["Custom_0"] = 4 }, AbilityIds = ["0"] },
+                        ["Diamond"] = new TierData { Attributes = new(StringComparer.OrdinalIgnoreCase) { ["BuyPrice"] = 32, ["SellPrice"] = 16, ["CooldownMax"] = 2500, ["DamageAmount"] = 140, ["Custom_0"] = 5 }, AbilityIds = ["0"] }
+                    },
+                    Abilities = new Dictionary<string, AbilityDefinition>
+                    {
+                        ["0"] = new AbilityDefinition
+                        {
+                            Id = "0",
+                            ActiveIn = "HandOnly",
+                            Trigger = new RuleNode { Type = "TTriggerOnCardFired" },
+                            Action = new RuleNode { Type = "TActionPlayerDamage", Target = new RuleNode { Type = "TTargetPlayerRelative", TargetMode = "Opponent" } }
+                        }
+                    },
+                    CustomMechanics = [new CardMechanicAttachment { MechanicId = mechanic.Id, Params = boundParams, Enabled = true }]
+                };
+
+                var tmpPkg = new ModPackage
+                {
+                    Manifest = new ModManifest { Id = "mechanic-lab", Name = "机制工坊沙盒测试", Version = "1.0.0" },
+                    RootDirectory = Path.Combine(_modHost.ModsRootDirectory, "_mechanic_lab")
+                };
+                tmpPkg.Cards.Add(testCardDef);
+                tmpPkg.Mechanics.Add(mechanic);
+
+                var tpl = testCardDef.ToCardTemplate(carrier, "mechanic-lab");
+                var overlayRepo = baseRepo.CreateWithOverlay([tpl], [], null);
+                var candMechs = new Dictionary<string, MechanicDefinition>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [mechanic.Id.Trim()] = mechanic
+                };
+                var (stressReport, simIssues) = ModCombatStressTester.RunStressTest(tmpPkg, overlayRepo, Math.Clamp(matches, 5, 50), 2026140, candMechs);
+                bool passed = !simIssues.Any(i => i.Severity == ModValidationSeverity.Error)
+                    && stressReport.MechanicCircuitBreakerTrips == 0
+                    && stressReport.MechanicBudgetViolations == 0;
+
+                return new
+                {
+                    ok = true,
+                    passed,
+                    stage = "adversarial-combat",
+                    summaryZh = passed
+                        ? $"安全通过！已完成 {stressReport.MatchesRun} 场对抗压测（含高速伤害/DOT/摧毁/修复对手），0 异常、0 熔断、0 超预算，平均单场 {stressReport.AvgMatchMs:0.0}ms。"
+                        : $"对抗压测拦截：检测到 {stressReport.Exceptions} 异常、{stressReport.MechanicCircuitBreakerTrips} 次熔断、{stressReport.MechanicBudgetViolations} 次步数超预算，请修复后重试。",
+                    staticIssues,
+                    simIssues,
+                    combatStressReport = stressReport
+                };
+            }, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _validationThrottle.Release();
+        }
+    }
 
     // ── 1. 原版 3,368 白名单卡高速检索与单卡蓝图导出 ──────────────────────────
 
@@ -329,6 +512,7 @@ public sealed class WorkshopValidatorService
                 Events = pkg.Events,
                 Monsters = pkg.Monsters,
                 Modes = pkg.Modes,
+                Mechanics = pkg.Mechanics,
                 Mutators = mutators,
                 Localization = pkg.LocalizationOverlay
             },
@@ -389,6 +573,7 @@ public sealed class WorkshopValidatorService
             workspace.Manifest.ContentRoots.Patches = "patches/vanilla_patches.json";
             workspace.Manifest.ContentRoots.Events = "events/custom_events.json";
             workspace.Manifest.ContentRoots.Modes = "modes/*.json";
+            workspace.Manifest.ContentRoots.Mechanics = "mechanics/custom_mechanics.json";
             workspace.Manifest.ContentRoots.Localization = "localization/zh-CN.json";
             workspace.Manifest.ContentRoots.Assets = "assets/*.png";
             workspace.Manifest.ContentRoots.ArtManifest = "assets/art_manifest.json";
@@ -445,6 +630,16 @@ public sealed class WorkshopValidatorService
                 });
             }
 
+            if (workspace.Mechanics.Count > 0)
+            {
+                WriteJson(Path.Combine(stageDir, "mechanics", "custom_mechanics.json"), new
+                {
+                    schemaVersion = 1,
+                    modId,
+                    mechanics = workspace.Mechanics
+                });
+            }
+
             if (workspace.Mutators.Count > 0)
             {
                 WriteJson(Path.Combine(stageDir, "modes", "custom_mutators.json"), new
@@ -464,7 +659,7 @@ public sealed class WorkshopValidatorService
 
             // 原子同步落盘：移除旧 JSON 目录内容并用新 staged 目录覆盖（保留 assets）
             Directory.CreateDirectory(targetDir);
-            string[] managedSubdirs = ["cards", "patches", "events", "monsters", "modes", "localization"];
+            string[] managedSubdirs = ["cards", "patches", "events", "monsters", "modes", "mechanics", "localization"];
             foreach (var sub in managedSubdirs)
             {
                 string oldSub = Path.Combine(targetDir, sub);
@@ -690,6 +885,7 @@ public sealed class WorkshopValidatorService
         pkg.Events.AddRange(draft.Events ?? []);
         pkg.Monsters.AddRange(draft.Monsters ?? []);
         pkg.Modes.AddRange(draft.Modes ?? []);
+        pkg.Mechanics.AddRange(draft.Mechanics ?? []);
         pkg.LocalizationOverlay = draft.Localization;
 
         // 继承磁盘该 Mod 目录下已上传的资产，以便草稿态直接过 Gate #8

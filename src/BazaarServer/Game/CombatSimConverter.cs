@@ -853,7 +853,7 @@ public static class CombatSimConverter
             Source = new InstanceId(effectiveSrc.Entry.InstanceId),
             TriggerSource = new InstanceId(effectiveSrc.Entry.InstanceId),
             Target = target,
-            VfxIndex = ResolveVfxIndex(tpl, effectId, effectiveSrc.Entry.Enchantment, vfxKeyMap, vfxKeys),
+            VfxIndex = ResolveVfxIndex(tpl, effectId, effectiveSrc.Entry.Enchantment, vfxKeyMap, vfxKeys, ev.VfxKeyOverride),
         });
     }
 
@@ -918,7 +918,7 @@ public static class CombatSimConverter
             Source = new InstanceId(srcMeta.Entry.InstanceId),
             TriggerSource = new InstanceId(srcMeta.Entry.InstanceId),
             Target = target,
-            VfxIndex = ResolveVfxIndex(tpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys),
+            VfxIndex = ResolveVfxIndex(tpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys, ev.VfxKeyOverride),
         });
     }
 
@@ -1452,8 +1452,20 @@ public static class CombatSimConverter
         string effectId,
         EEnchantmentType? enchantment,
         Dictionary<string, int> vfxKeyMap,
-        List<string> vfxKeys)
+        List<string> vfxKeys,
+        string? explicitOverrideKey = null)
     {
+        if (!string.IsNullOrWhiteSpace(explicitOverrideKey))
+        {
+            string customKey = explicitOverrideKey.Trim();
+            if (!vfxKeyMap.TryGetValue(customKey, out int customIdx))
+            {
+                customIdx = vfxKeys.Count;
+                vfxKeys.Add(customKey);
+                vfxKeyMap[customKey] = customIdx;
+            }
+            return customIdx;
+        }
         if (tpl == null || string.IsNullOrEmpty(effectId)) return null;
 
         string? overrideKey = null;

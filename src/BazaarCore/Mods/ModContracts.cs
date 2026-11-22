@@ -54,10 +54,11 @@ public interface IModContentRegistry
     void RegisterActionHandler(ICustomActionHandler handler);
     void RegisterTriggerHandler(ICustomTriggerHandler handler);
     void RegisterGameModeHook(IGameModeHook hook);
+    void RegisterPipelineInterceptor(ICombatPipelineInterceptor interceptor);
 }
 
 /// <summary>
-/// 线程安全、无 Mod 时零性能损耗的运行时自定义规则钩子分发器（供 AbilityExecutor 在 default 分支按需查询）。
+/// 线程安全、无 Mod 时零性能损耗的运行时自定义规则钩子分发器（供 AbilityExecutor 与 CombatSimulator 按需查询）。
 /// </summary>
 public static class ModRuntimeHooks
 {
@@ -65,15 +66,23 @@ public static class ModRuntimeHooks
     private static volatile FrozenDictionary<string, ICustomActionHandler>? _actions;
     private static volatile FrozenDictionary<string, ICustomTriggerHandler>? _triggers;
     private static volatile FrozenDictionary<string, IGameModeHook>? _modeHooks;
+    private static volatile FrozenDictionary<string, MechanicDefinition>? _mechanics;
+    private static volatile IReadOnlyList<ICombatPipelineInterceptor>? _pipelineInterceptors;
 
     public static bool HasAnyCustomActions => _actions != null;
     public static bool HasAnyCustomTriggers => _triggers != null;
+    public static bool HasAnyCustomMechanics => _mechanics != null && _mechanics.Count > 0;
+    public static bool HasAnyPipelineInterceptors => _pipelineInterceptors != null && _pipelineInterceptors.Count > 0;
 
-    /// <summary>原子替换全部自定义动作/触发器/模式钩子（强校验 TActionMod_ / TTriggerMod_ 安全前缀）。</summary>
+    public static FrozenDictionary<string, MechanicDefinition>? GetRegisteredMechanics() => _mechanics;
+    public static IReadOnlyList<ICombatPipelineInterceptor>? GetPipelineInterceptors() => _pipelineInterceptors;
+
+    /// <summary>原子替换全部自定义动作/触发器/模式钩子/管线拦截器（强校验 TActionMod_ / TTriggerMod_ 安全前缀）。</summary>
     public static void SetHandlers(
         IEnumerable<ICustomActionHandler>? actions = null,
         IEnumerable<ICustomTriggerHandler>? triggers = null,
-        IEnumerable<IGameModeHook>? modeHooks = null)
+        IEnumerable<IGameModeHook>? modeHooks = null,
+        IEnumerable<ICombatPipelineInterceptor>? pipelineInterceptors = null)
     {
         var actDict = new Dictionary<string, ICustomActionHandler>(StringComparer.Ordinal);
         if (actions != null)
@@ -109,15 +118,44 @@ public static class ModRuntimeHooks
             }
         }
 
+        var interceptorList = new List<ICombatPipelineInterceptor>();
+        if (pipelineInterceptors != null)
+        {
+            foreach (var p in pipelineInterceptors)
+            {
+                if (p != null && !string.IsNullOrWhiteSpace(p.InterceptorId))
+                    interceptorList.Add(p);
+            }
+        }
+
         lock (LockObj)
         {
             _actions = actDict.Count > 0 ? actDict.ToFrozenDictionary(StringComparer.Ordinal) : null;
             _triggers = trgDict.Count > 0 ? trgDict.ToFrozenDictionary(StringComparer.Ordinal) : null;
             _modeHooks = modeDict.Count > 0 ? modeDict.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase) : null;
+            _pipelineInterceptors = interceptorList.Count > 0 ? interceptorList.ToArray() : null;
         }
     }
 
-    /// <summary>清空所有已注册的自定义钩子（回滚或测试清理用）。</summary>
+    /// <summary>原子发布全部已校验通过的声明式沙盒自定义机制表（由 ModRegistry 维护）。</summary>
+    public static void SetMechanics(IEnumerable<MechanicDefinition>? mechanics)
+    {
+        var dict = new Dictionary<string, MechanicDefinition>(StringComparer.OrdinalIgnoreCase);
+        if (mechanics != null)
+        {
+            foreach (var m in mechanics)
+            {
+                if (m != null && !string.IsNullOrWhiteSpace(m.Id))
+                    dict[m.Id.Trim()] = m;
+            }
+        }
+        lock (LockObj)
+        {
+            _mechanics = dict.Count > 0 ? dict.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase) : null;
+        }
+    }
+
+    /// <summary>清空所有已注册的自定义钩子与声明式机制（回滚或测试清理用）。</summary>
     public static void ClearAll()
     {
         lock (LockObj)
@@ -125,6 +163,8 @@ public static class ModRuntimeHooks
             _actions = null;
             _triggers = null;
             _modeHooks = null;
+            _mechanics = null;
+            _pipelineInterceptors = null;
         }
     }
 
@@ -137,7 +177,15 @@ public static class ModRuntimeHooks
             return false;
         }
         handled = true;
-        return handler.Execute(action, source, ctx);
+        try
+        {
+            return handler.Execute(action, source, ctx);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ModRuntimeHooks] 自定义动作 '{action.Type}' 抛出异常已熔断隔离：{ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
     }
 
     public static bool TryMatchCustomTrigger(RuleNode trigger, CardInstance listener, RuleExecutionContext ctx, string eventType, out bool handled)
@@ -149,7 +197,15 @@ public static class ModRuntimeHooks
             return false;
         }
         handled = true;
-        return handler.Matches(trigger, listener, ctx, eventType);
+        try
+        {
+            return handler.Matches(trigger, listener, ctx, eventType);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ModRuntimeHooks] 自定义触发器 '{trigger.Type}' 抛出异常已熔断隔离：{ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
     }
 
     public static bool TryGetGameModeHook(string? modeId, out IGameModeHook? hook)

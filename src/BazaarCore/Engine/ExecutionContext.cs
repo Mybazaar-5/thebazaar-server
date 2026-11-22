@@ -100,6 +100,11 @@ public sealed class RuleExecutionContext
     public Action<PlayerState, CardInstance>? OnCardDestroyed { get; set; }
     public Action<PlayerState, CardInstance>? OnCardUpgraded { get; set; }
     public Action<PlayerState, CardInstance>? OnCardEnchanted { get; set; }
+    /// <summary>
+    /// V14 通用卡牌状态变更事前拦截回调（参数：targetCard, sourceCard, changeKind[Disable/Destroy/Repair/Transform], reason）。
+    /// 返回 false 表示拦截并取消该次状态变更（例如拦截对不可复原卡牌的 Repair）。
+    /// </summary>
+    public Func<CardInstance, CardInstance?, string, string?, bool>? OnBeforeCardStateChange { get; set; }
 
     /// <summary>
     /// 可选未知规则节点遥测回调（依次传入分类 "TAction"/"TAuraAction"/"TTrigger" 与具体 $type 名称）；未设置时零开销。
@@ -204,6 +209,7 @@ public sealed class RuleExecutionContext
             OnCardDestroyed = OnCardDestroyed,
             OnCardUpgraded = OnCardUpgraded,
             OnCardEnchanted = OnCardEnchanted,
+            OnBeforeCardStateChange = OnBeforeCardStateChange,
             OnUnknownRuleType = OnUnknownRuleType
         };
     }

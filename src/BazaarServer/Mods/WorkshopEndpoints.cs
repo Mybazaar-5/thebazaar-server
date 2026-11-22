@@ -32,6 +32,13 @@ public static class WorkshopEndpoints
         public int? Seed { get; set; }
     }
 
+    private sealed class StressTestMechanicRequestBody
+    {
+        public MechanicDefinition? Mechanic { get; set; }
+        public Dictionary<string, JsonElement>? SampleParams { get; set; }
+        public int? Matches { get; set; }
+    }
+
     public static void Map(WebApplication app)
     {
         var modHost = app.Services.GetRequiredService<ServerModHost>();
@@ -79,9 +86,11 @@ public static class WorkshopEndpoints
                 mode = access.ModeLabel,
                 canWrite = access.CanWrite,
                 tokenConfigured = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BAZAAR_WORKSHOP_TOKEN")),
-                serverVersion = "2.1.0-v13.1",
+                serverVersion = "2.2.0-v14.0",
                 baseCardCount = modHost.BaseRepository.CardsById.Count,
                 whitelistedCardCount = modHost.ValidVisualWhitelist.Count,
+                registeredMechanicCount = modHost.Registry.MechanicsById.Count,
+                vfxKeyCount = service.KnownVfxKeys.Count,
                 enabledMods = modHost.EnabledModCount,
                 modSetHash = modHost.ModSetHash,
                 forcesGhostPoolIsolation = modHost.ForcesGhostPoolIsolation,
@@ -131,6 +140,30 @@ public static class WorkshopEndpoints
             ctx.Response.Headers[HeaderNames.ETag] = etag;
             ctx.Response.Headers[HeaderNames.CacheControl] = "public, max-age=3600";
             return Results.Content(service.RuleCatalogJson, "application/json; charset=utf-8", Encoding.UTF8);
+        });
+
+        // ── 3b. 开放自定义沙盒机制目录 & 单条草稿机制即时对抗压测 ─────────────
+        app.MapGet("/api/workshop/mechanics", () =>
+        {
+            return Results.Json(service.ListAllRegisteredMechanics(), JsonOpts);
+        });
+
+        app.MapPost("/api/workshop/mechanics/stress-test", async (HttpContext ctx) =>
+        {
+            StressTestMechanicRequestBody? body;
+            try
+            {
+                body = await JsonSerializer.DeserializeAsync<StressTestMechanicRequestBody>(ctx.Request.Body, JsonOpts, ctx.RequestAborted);
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { ok = false, passed = false, error = $"机制 JSON 格式错误：{ex.Message}" }, JsonOpts, statusCode: 400);
+            }
+            if (body?.Mechanic == null)
+                return Results.Json(new { ok = false, passed = false, error = "请求体缺少 mechanic 字段。" }, JsonOpts, statusCode: 400);
+
+            var res = await service.StressTestMechanicAsync(body.Mechanic, body.SampleParams, body.Matches ?? 20, ctx.RequestAborted);
+            return Results.Json(res, JsonOpts);
         });
 
         // ── 4. 全部已发现 Mod 列表 ────────────────────────────────────────────

@@ -22,6 +22,9 @@ public sealed class ModContentRoots
     [JsonPropertyName("modes")]
     public string Modes { get; set; } = "modes/*.json";
 
+    [JsonPropertyName("mechanics")]
+    public string Mechanics { get; set; } = "mechanics/*.json";
+
     [JsonPropertyName("localization")]
     public string Localization { get; set; } = "localization/zh-CN.json";
 
@@ -336,6 +339,10 @@ public sealed class CustomCardDefinition
     [JsonPropertyName("quests")]
     public List<QuestDefinition>? Quests { get; set; }
 
+    /// <summary>V14 挂载到本卡牌的开放自定义沙盒机制列表。</summary>
+    [JsonPropertyName("customMechanics")]
+    public List<CardMechanicAttachment>? CustomMechanics { get; set; }
+
     [JsonPropertyName("selectionContext")]
     public SelectionContextData? SelectionContext { get; set; }
 
@@ -501,7 +508,15 @@ public sealed class CustomCardDefinition
             RewardCombatGold = RewardCombatGold,
             RewardCombatXp = RewardCombatXp,
             RewardVictory = RewardVictory,
-            RewardDefeat = RewardDefeat
+            RewardDefeat = RewardDefeat,
+            CustomMechanics = CustomMechanics is { Count: > 0 }
+                ? CustomMechanics.Select(m => new CardMechanicAttachment
+                {
+                    MechanicId = m.MechanicId,
+                    Enabled = m.Enabled,
+                    Params = new Dictionary<string, JsonElement>(m.Params, StringComparer.OrdinalIgnoreCase)
+                }).ToList()
+                : null
         };
     }
 
@@ -811,6 +826,10 @@ public sealed class CardPatchDefinition
     [JsonPropertyName("aurasOverride")]
     public Dictionary<string, AuraDefinition>? AurasOverride { get; set; }
 
+    /// <summary>V14 为被魔改的原版卡牌挂载开放自定义沙盒机制列表。</summary>
+    [JsonPropertyName("customMechanicsOverride")]
+    public List<CardMechanicAttachment>? CustomMechanicsOverride { get; set; }
+
     [JsonPropertyName("titleZh")]
     public string? TitleZh { get; set; }
 
@@ -963,6 +982,18 @@ public sealed class CardPatchDefinition
             }
         }
 
+        if (CustomMechanicsOverride != null)
+        {
+            cloned.CustomMechanics = CustomMechanicsOverride.Count > 0
+                ? CustomMechanicsOverride.Select(m => new CardMechanicAttachment
+                {
+                    MechanicId = m.MechanicId,
+                    Enabled = m.Enabled,
+                    Params = new Dictionary<string, JsonElement>(m.Params, StringComparer.OrdinalIgnoreCase)
+                }).ToList()
+                : null;
+        }
+
         if (!string.IsNullOrWhiteSpace(TitleEn))
             cloned.InternalName = TitleEn.Trim();
 
@@ -1045,6 +1076,8 @@ public sealed class ModPackage
     public List<CustomEventDefinition> Events { get; } = new();
     public List<MonsterTemplate> Monsters { get; } = new();
     public List<CustomModeDefinition> Modes { get; } = new();
+    /// <summary>V14 本 Mod 注册的开放声明式沙盒自定义机制定义列表（来自 mechanics/*.json）。</summary>
+    public List<MechanicDefinition> Mechanics { get; } = new();
     public LocalizationOverlayDocument? LocalizationOverlay { get; set; }
     public Dictionary<string, ModAssetEntry> AssetsByLogicalPath { get; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>由 assets/art_manifest.json 读取的逻辑路径 -> 预期 SHA-256，用于 Gate #8 完整性比对。</summary>
@@ -1142,6 +1175,15 @@ public sealed class ModCombatStressReport
 
     [JsonPropertyName("balanceHintZh")]
     public string BalanceHintZh { get; set; } = string.Empty;
+
+    [JsonPropertyName("mechanicCircuitBreakerTrips")]
+    public int MechanicCircuitBreakerTrips { get; set; }
+
+    [JsonPropertyName("mechanicBudgetViolations")]
+    public int MechanicBudgetViolations { get; set; }
+
+    [JsonPropertyName("mechanicDiagnostics")]
+    public List<MechanicDiagnostic> MechanicDiagnostics { get; set; } = new();
 }
 
 /// <summary>V13.1 工业级 10 道防 Bug 铁闸完整诊断报告 DTO。</summary>
@@ -1193,6 +1235,7 @@ public sealed class ModLoadReport
     public int TotalCustomEvents { get; set; }
     public int TotalCustomMonsters { get; set; }
     public int TotalCustomModes { get; set; }
+    public int TotalCustomMechanics { get; set; }
     public int TotalAssets { get; set; }
     public string ModSetHash { get; set; } = string.Empty;
     public bool ForcesGhostPoolIsolation { get; set; }
@@ -1257,6 +1300,9 @@ public sealed class ModEntryDto
 
     [JsonPropertyName("customModeCount")]
     public int CustomModeCount { get; set; }
+
+    [JsonPropertyName("customMechanicCount")]
+    public int CustomMechanicCount { get; set; }
 
     [JsonPropertyName("assetCount")]
     public int AssetCount { get; set; }

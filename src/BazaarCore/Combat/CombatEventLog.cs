@@ -55,6 +55,8 @@ public sealed class CombatEvent
     public string? AbilityId { get; init; }
     public string? ActionType { get; init; }
     public bool IsSkillSource { get; init; }
+    /// <summary>可选白名单官方 VFXOverrideKey 覆盖（供自定义机制复用官方弹道/爆炸等视觉演出）。</summary>
+    public string? VfxKeyOverride { get; init; }
 
     // 供 UI 同步显示的快照（可选）
     public int Player1Health { get; init; }
@@ -173,5 +175,11 @@ public sealed class CombatResult
     public List<CombatEvent> Events { get; init; } = new();
     public List<CombatTickState> Timeline { get; init; } = new();
     public PostCombatPermanentSyncResult? PostCombatPermanentSync { get; set; }
+    /// <summary>V14 自定义机制经由受控门面登记的战后结转操作（由 RunEngine 统一校验并同步给客户端）。</summary>
+    public List<BazaarCore.Mods.PostCombatMutationOp> PostCombatOps { get; init; } = new();
+    /// <summary>V14 自定义机制运行时安全诊断与熔断日志。</summary>
+    public List<BazaarCore.Mods.MechanicDiagnostic> MechanicDiagnostics { get; init; } = new();
+    public int MechanicCircuitBreakerTrips { get; init; }
+    public int MechanicBudgetViolations { get; init; }
     internal PlayerState? SimPlayer1 { get; init; }
 }

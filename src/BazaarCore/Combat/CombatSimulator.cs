@@ -1,6 +1,8 @@
+using System.Collections.Frozen;
 using BazaarCore.Data;
 using BazaarCore.Engine;
 using BazaarCore.Models;
+using BazaarCore.Mods;
 using BazaarCore.Runtime;
 
 namespace BazaarCore.Combat;
@@ -114,12 +116,15 @@ public static class CombatSimulator
         bool syncPermanentChanges,
         CombatModifiers? modifiers,
         bool sandstormEnabled = true,
-        int timelineSampleIntervalMs = TickMs)
+        int timelineSampleIntervalMs = TickMs,
+        IReadOnlyDictionary<string, MechanicDefinition>? mechanicDefinitionsOverride = null,
+        IReadOnlyList<ICombatPipelineInterceptor>? pipelineInterceptorsOverride = null)
     {
         var rng = new Random(seed);
         var p1 = originalP1.CloneForCombat();
         var p2 = originalP2.CloneForCombat();
         var gm = repo.GameMode;
+        CombatMechanicRuntime? mechanicRuntime = null;
         p1.EnsureExclusionSetInitialized(gm);
         p2.EnsureExclusionSetInitialized(gm);
         EnsureCombatBasePlayerEffect(repo, p1);
@@ -335,6 +340,7 @@ public static class CombatSimulator
                 AbilityId = ev.AbilityId ?? activeExec.AbilityId,
                 ActionType = ev.ActionType ?? activeExec.ActionType,
                 IsSkillSource = ev.IsSkillSource || IsSkillCardId(ev.SourceCardInstanceId),
+                VfxKeyOverride = ev.VfxKeyOverride,
                 Player1Health = p1.CurrentHealth,
                 Player1Shield = p1.Shield,
                 Player1Burn = p1.Burn,
@@ -395,6 +401,57 @@ public static class CombatSimulator
             target.CurrentHealth = Math.Min(target.HealthMax, target.CurrentHealth + amount);
         }
 
+        /// <summary>返回 true 表示允许继续执行；仅当自定义机制显式调用 CancelHook 时返回 false（自然减免至 0 仍放行原版免疫回调）。</summary>
+        bool RunBeforeDamageHook(PlayerState attacker, PlayerState target, CardInstance? srcCard, string damageType, ref int amount)
+        {
+            if (mechanicRuntime == null || amount <= 0) return true;
+            var pipeEv = new CombatPipelineEvent
+            {
+                HookName = "BeforeDamage",
+                TimeMs = timeMs,
+                SourcePlayer = attacker,
+                TargetPlayer = target,
+                SourceCard = srcCard,
+                DamageType = damageType,
+                Amount = amount
+            };
+            mechanicRuntime.DispatchPipeline(pipeEv);
+            if (pipeEv.Cancelled)
+            {
+                amount = 0;
+                return false;
+            }
+            if (pipeEv.AmountModified)
+                amount = Math.Max(0, (int)Math.Round(pipeEv.Amount));
+            return true;
+        }
+
+        /// <summary>返回 true 表示允许继续执行；仅当自定义机制显式调用 CancelHook 时返回 false（Radiant 等自然减免至 0 仍放行 PerformedSlow/Freeze）。</summary>
+        bool RunBeforeStatusHook(PlayerState actor, PlayerState? targetPlayer, CardInstance? srcCard, CardInstance? targetCard, string statusType, ref int amount)
+        {
+            if (mechanicRuntime == null || amount <= 0) return true;
+            var pipeEv = new CombatPipelineEvent
+            {
+                HookName = "BeforeStatusApply",
+                TimeMs = timeMs,
+                SourcePlayer = actor,
+                TargetPlayer = targetPlayer,
+                SourceCard = srcCard,
+                TargetCard = targetCard,
+                StatusType = statusType,
+                Amount = amount
+            };
+            mechanicRuntime.DispatchPipeline(pipeEv);
+            if (pipeEv.Cancelled)
+            {
+                amount = 0;
+                return false;
+            }
+            if (pipeEv.AmountModified)
+                amount = Math.Max(0, (int)Math.Round(pipeEv.Amount));
+            return true;
+        }
+
         void ApplyCardStatusDuration(
             PlayerState actor,
             CardInstance targetCard,
@@ -413,6 +470,10 @@ public static class CombatSimulator
             double pctRed = isRadiant ? 100.0 : Math.Clamp(targetCard.GetAttribute(reductionAttr), 0, 100);
             double flyingMult = (checkRadiantAndFlying && IsCardFlying(targetCard)) ? 0.5 : 1.0;
             int actual = Math.Max(0, (int)Math.Round(ms * (1.0 - pctRed / 100.0) * flyingMult));
+            var targetCardOwner = (p1.Hand.Cards.Contains(targetCard) || p1.Skills.Contains(targetCard)) ? p1
+                                : ((p2.Hand.Cards.Contains(targetCard) || p2.Skills.Contains(targetCard)) ? p2 : null);
+            if (!RunBeforeStatusHook(actor, targetCardOwner, srcCard, targetCard, attrName, ref actual))
+                return;
             if (actual > 0)
             {
                 int prev = getMs(targetCard);
@@ -523,6 +584,8 @@ public static class CombatSimulator
                     // 对齐官方 PercentDamageReduction（0..100%，含 Memento Mori/Invulnerability Potion 100% 免伤）
                     var red = Math.Clamp(targetPlayer.GetAttribute("PercentDamageReduction"), 0, 100);
                     int actual = Math.Max(0, (int)Math.Clamp(Math.Round(scaledDmg * (1.0 - red / 100.0)), 0, 1_000_000_000));
+                    if (!RunBeforeDamageHook(attacker, targetPlayer, srcCard, "Direct", ref actual))
+                        return;
                     ApplyDirectDamage(targetPlayer, actual, bypassShield: false);
 
                     if (actual > 0 && srcCard != null && srcCard.GetAttribute("Lifesteal") > 0)
@@ -551,6 +614,7 @@ public static class CombatSimulator
                     if (amt <= 0) return;
                     double mult = mod.ShieldAndRegenMultiplier * (targetPlayer == p2 ? mod.OffenseMultiplierP2 : 1.0);
                     int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
+                    if (!RunBeforeStatusHook(targetPlayer, targetPlayer, srcCard, null, "Shield", ref finalAmt)) return;
                     if (finalAmt <= 0) return;
                     int prevShield = targetPlayer.Shield;
                     targetPlayer.Shield += finalAmt;
@@ -568,6 +632,7 @@ public static class CombatSimulator
                     var actor = targetPlayer == p1 ? p2 : p1;
                     double mult = mod.DamageAndDotMultiplier * (actor == p2 ? mod.OffenseMultiplierP2 : 1.0);
                     int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
+                    if (!RunBeforeStatusHook(actor, targetPlayer, srcCard, null, "Burn", ref finalAmt)) return;
                     if (finalAmt <= 0) return;
                     int prevBurn = targetPlayer.Burn;
                     targetPlayer.Burn += finalAmt;
@@ -583,6 +648,7 @@ public static class CombatSimulator
                     var actor = targetPlayer == p1 ? p2 : p1;
                     double mult = mod.DamageAndDotMultiplier * (actor == p2 ? mod.OffenseMultiplierP2 : 1.0);
                     int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
+                    if (!RunBeforeStatusHook(actor, targetPlayer, srcCard, null, "Poison", ref finalAmt)) return;
                     if (finalAmt <= 0) return;
                     int prevPoison = targetPlayer.Poison;
                     targetPlayer.Poison += finalAmt;
@@ -598,6 +664,7 @@ public static class CombatSimulator
                     int finalAmt = targetPlayer == p2 && Math.Abs(mod.OffenseMultiplierP2 - 1.0) > 1e-6
                         ? Math.Max(0, (int)Math.Clamp(Math.Round(amt * mod.OffenseMultiplierP2), 0, 1_000_000_000))
                         : amt;
+                    if (!RunBeforeStatusHook(targetPlayer, targetPlayer, srcCard, null, "Heal", ref finalAmt)) return;
                     if (finalAmt <= 0) return;
                     int prevHp = targetPlayer.CurrentHealth;
                     int overkill = targetPlayer == p1 ? p1Overkill : p2Overkill;
@@ -625,6 +692,7 @@ public static class CombatSimulator
                     if (amt <= 0) return;
                     double mult = mod.ShieldAndRegenMultiplier * (targetPlayer == p2 ? mod.OffenseMultiplierP2 : 1.0);
                     int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
+                    if (!RunBeforeStatusHook(targetPlayer, targetPlayer, srcCard, null, "Regen", ref finalAmt)) return;
                     if (finalAmt <= 0) return;
                     targetPlayer.ModifyAttribute("HealthRegen", "Add", finalAmt);
                     if (recordEvents)
@@ -642,9 +710,10 @@ public static class CombatSimulator
                     if (!targetCard.HasActiveCooldown || ms <= 0) return;
                     var pctRed = Math.Clamp(targetCard.GetAttribute("PercentChargeReduction"), 0, 90);
                     int actual = Math.Max(0, (int)Math.Round(ms * (1.0 - pctRed / 100.0)));
-                    if (actual <= 0) return;
                     var cardOwner = (p1.Hand.Cards.Contains(targetCard) || p1.Skills.Contains(targetCard)) ? p1
                                   : ((p2.Hand.Cards.Contains(targetCard) || p2.Skills.Contains(targetCard)) ? p2 : null);
+                    if (!RunBeforeStatusHook(self, cardOwner, srcCard, targetCard, "Charge", ref actual)) return;
+                    if (actual <= 0) return;
                     int cdMax = cardOwner != null ? GetEffectiveCardCooldownMaxMs(targetCard, cardOwner) : GetCardCooldownMaxMs(targetCard);
                     if (lastCooldownFireMs.TryGetValue(targetCard, out int prevCdMs) && timeMs - prevCdMs < icdMs)
                     {
@@ -766,12 +835,155 @@ public static class CombatSimulator
                             questDispatchDepth--;
                         }
                     }
+                },
+                OnBeforeCardStateChange = (targetCard, srcCard, changeKind, reason) =>
+                {
+                    if (mechanicRuntime == null) return true;
+                    var targetOwner = (p1.Hand.Cards.Contains(targetCard) || p1.Skills.Contains(targetCard) || p1.Stash.Cards.Contains(targetCard)) ? p1 : p2;
+                    var pipeEv = new CombatPipelineEvent
+                    {
+                        HookName = "BeforeCardStateChange",
+                        TimeMs = timeMs,
+                        SourcePlayer = self,
+                        TargetPlayer = targetOwner,
+                        SourceCard = srcCard,
+                        TargetCard = targetCard,
+                        ChangeKind = changeKind,
+                        Reason = reason
+                    };
+                    mechanicRuntime.DispatchPipeline(pipeEv);
+                    return !pipeEv.Cancelled;
                 }
             };
         }
 
         p1BaseCtx = CreateBaseContext(p1, p2);
         p2BaseCtx = CreateBaseContext(p2, p1);
+
+        // V14 开放沙盒机制按需激活（纯原版对局 0 分配、0 性能损耗）
+        var activeMechDefs = mechanicDefinitionsOverride ?? ModRuntimeHooks.GetRegisteredMechanics();
+        var activeInterceptors = pipelineInterceptorsOverride ?? ModRuntimeHooks.GetPipelineInterceptors();
+        if (CombatMechanicRuntime.ShouldActivate(p1, p2, activeMechDefs, activeInterceptors is { Count: > 0 }))
+        {
+            var frozenDefs = activeMechDefs is FrozenDictionary<string, MechanicDefinition> fd
+                ? fd
+                : (activeMechDefs != null ? activeMechDefs.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase) : FrozenDictionary<string, MechanicDefinition>.Empty);
+
+            mechanicRuntime = new CombatMechanicRuntime(
+                p1,
+                p2,
+                rng,
+                new CombatMechanicHostCallbacks
+                {
+                    GetTimeMs = () => timeMs,
+                    DealDamage = (targetPlayer, srcCard, dmg, bypassShield, vfxKey) =>
+                    {
+                        if (dmg <= 0) return;
+                        var attacker = targetPlayer == p1 ? p2 : p1;
+                        int actual = dmg;
+                        if (!RunBeforeDamageHook(attacker, targetPlayer, srcCard, "Direct", ref actual)) return;
+                        ApplyDirectDamage(targetPlayer, actual, bypassShield);
+                        if (targetPlayer == p2) p1DmgTotal += actual; else p2DmgTotal += actual;
+                        if (recordEvents)
+                            Emit(new CombatEvent
+                            {
+                                TimeMs = timeMs,
+                                Type = CombatEventType.DamageApplied,
+                                SourcePlayerId = attacker.PlayerId,
+                                TargetPlayerId = targetPlayer.PlayerId,
+                                SourceCardInstanceId = srcCard?.InstanceId,
+                                Value = actual,
+                                VfxKeyOverride = vfxKey
+                            });
+                        DispatchEvent("TTriggerOnCardPerformedDamage", attacker, srcCard, srcCard, targetPlayer);
+                        if (actual > 0)
+                            DispatchEvent("TTriggerOnPlayerDamaged", attacker, srcCard, srcCard, targetPlayer, null, 0, actual);
+                    },
+                    ApplyStatus = (status, actorPlayer, srcCard, targetCard, targetPlayer, amt) =>
+                    {
+                        var ctx = actorPlayer == p1 ? p1BaseCtx : p2BaseCtx;
+                        switch (status.ToLowerInvariant())
+                        {
+                            case "shield": if (targetPlayer != null) ctx.OnShieldApplied?.Invoke(targetPlayer, amt, srcCard); break;
+                            case "burn": if (targetPlayer != null) ctx.OnBurnApplied?.Invoke(targetPlayer, amt, srcCard); break;
+                            case "poison": if (targetPlayer != null) ctx.OnPoisonApplied?.Invoke(targetPlayer, amt, srcCard); break;
+                            case "heal": if (targetPlayer != null) ctx.OnHealApplied?.Invoke(targetPlayer, amt, srcCard); break;
+                            case "regen": if (targetPlayer != null) ctx.OnRegenApplied?.Invoke(targetPlayer, amt, srcCard); break;
+                            case "haste": if (targetCard != null) ctx.OnHasteApplied?.Invoke(targetCard, amt, srcCard); break;
+                            case "slow": if (targetCard != null) ctx.OnSlowApplied?.Invoke(targetCard, amt, srcCard); break;
+                            case "freeze": if (targetCard != null) ctx.OnFreezeApplied?.Invoke(targetCard, amt, srcCard); break;
+                            case "charge": if (targetCard != null) ctx.OnChargeApplied?.Invoke(targetCard, amt, srcCard); break;
+                        }
+                    },
+                    ChangeCardState = (targetCard, srcCard, changeKind, reason, suppressNormalDestroyTriggers, vfxKey) =>
+                    {
+                        var targetOwner = (p1.Hand.Cards.Contains(targetCard) || p1.Skills.Contains(targetCard) || p1.Stash.Cards.Contains(targetCard)) ? p1 : p2;
+                        var srcOwner = srcCard != null && (p1.Hand.Cards.Contains(srcCard) || p1.Skills.Contains(srcCard)) ? p1 : p2;
+                        var pipeEv = new CombatPipelineEvent
+                        {
+                            HookName = "BeforeCardStateChange",
+                            TimeMs = timeMs,
+                            SourcePlayer = srcOwner,
+                            TargetPlayer = targetOwner,
+                            SourceCard = srcCard,
+                            TargetCard = targetCard,
+                            ChangeKind = changeKind,
+                            Reason = reason
+                        };
+                        mechanicRuntime?.DispatchPipeline(pipeEv);
+                        if (pipeEv.Cancelled) return;
+
+                        if (changeKind.Equals("Repair", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (!targetCard.IsDisabled && !targetCard.IsDestroyed) return;
+                            targetCard.IsDisabled = false;
+                            targetCard.IsDestroyed = false;
+                            DispatchEvent("TTriggerOnCardRepaired", targetOwner, srcCard, targetCard, targetOwner);
+                        }
+                        else if (changeKind.Equals("Disable", StringComparison.OrdinalIgnoreCase)
+                                 || changeKind.Equals("Destroy", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (targetCard.IsDisabled || targetCard.IsDestroyed) return;
+                            if (!suppressNormalDestroyTriggers)
+                                DispatchEvent("TTriggerOnBeforeCardDestroyed", targetOwner, srcCard, targetCard, targetOwner);
+                            if (changeKind.Equals("Destroy", StringComparison.OrdinalIgnoreCase))
+                                targetCard.IsDestroyed = true;
+                            else
+                                targetCard.IsDisabled = true;
+                            if (recordEvents)
+                            {
+                                Emit(new CombatEvent
+                                {
+                                    TimeMs = timeMs,
+                                    Type = CombatEventType.CardDestroyed,
+                                    SourcePlayerId = srcOwner.PlayerId,
+                                    TargetPlayerId = targetOwner.PlayerId,
+                                    SourceCardInstanceId = srcCard?.InstanceId,
+                                    TargetCardInstanceId = targetCard.InstanceId,
+                                    Detail = reason ?? (targetCard.Template.Localization?.Title?.Text ?? targetCard.Template.Id),
+                                    VfxKeyOverride = vfxKey
+                                });
+                            }
+                            if (!suppressNormalDestroyTriggers)
+                            {
+                                if (changeKind.Equals("Disable", StringComparison.OrdinalIgnoreCase))
+                                    DispatchEvent("TTriggerOnCardDisabled", targetOwner, srcCard, targetCard, targetOwner);
+                                DispatchEvent("TTriggerOnCardPerformedDestruction", srcOwner, srcCard, targetCard, targetOwner);
+                            }
+                        }
+                        RecalculateCombatAuras();
+                    },
+                    ForceUseCard = (targetCard, srcCard) =>
+                    {
+                        var ctx = (p1.Hand.Cards.Contains(targetCard) || p1.Skills.Contains(targetCard)) ? p1BaseCtx : p2BaseCtx;
+                        ctx.OnForceUseRequested?.Invoke(targetCard, srcCard);
+                    },
+                    RecalculateAuras = () => RecalculateCombatAuras(),
+                    IsValidVfxKey = key => !string.IsNullOrWhiteSpace(key) && key.Length <= 80 && key.All(ch => char.IsLetterOrDigit(ch) || ch is '_' or '-' or ' ')
+                },
+                frozenDefs,
+                activeInterceptors);
+        }
 
         void EnsureTriggerIndex()
         {
@@ -1015,11 +1227,30 @@ public static class CombatSimulator
             EnsureTriggerIndex();
             p1TriggerIndex.TryGetValue(eventType, out var p1List);
             p2TriggerIndex.TryGetValue(eventType, out var p2List);
-            if ((p1List == null || p1List.Count == 0) && (p2List == null || p2List.Count == 0) && !p1HasQuests && !p2HasQuests)
-                return;
+            if ((p1List != null && p1List.Count > 0) || (p2List != null && p2List.Count > 0) || p1HasQuests || p2HasQuests)
+            {
+                DispatchSide(p1List, p1, p2, p1BaseCtx, eventType, sourceCard, targetCard, subjectPlayer, attrChanged, prev, cur);
+                DispatchSide(p2List, p2, p1, p2BaseCtx, eventType, sourceCard, targetCard, subjectPlayer, attrChanged, prev, cur);
+            }
 
-            DispatchSide(p1List, p1, p2, p1BaseCtx, eventType, sourceCard, targetCard, subjectPlayer, attrChanged, prev, cur);
-            DispatchSide(p2List, p2, p1, p2BaseCtx, eventType, sourceCard, targetCard, subjectPlayer, attrChanged, prev, cur);
+            if (mechanicRuntime != null)
+            {
+                mechanicRuntime.DispatchPipeline(new CombatPipelineEvent
+                {
+                    HookName = "OnTriggerEvent",
+                    TimeMs = timeMs,
+                    SourcePlayer = actorPlayer,
+                    TargetPlayer = subjectPlayer,
+                    SourceCard = sourceCard,
+                    TargetCard = targetCard,
+                    TriggerEventType = eventType,
+                    Amount = Math.Abs(cur - prev),
+                    PayloadValue = cur
+                });
+            }
+
+            if (!p1HasQuests && !p2HasQuests)
+                return;
 
             if ((p1HasQuests || p2HasQuests) && questDispatchDepth < 4)
             {
@@ -1194,6 +1425,29 @@ public static class CombatSimulator
             }
             DispatchEvent("TTriggerOnCardFired", owner, card, card, owner);
             DispatchEvent("TTriggerOnItemUsed", owner, card, card, owner);
+            if (mechanicRuntime != null)
+            {
+                mechanicRuntime.DispatchPipeline(new CombatPipelineEvent
+                {
+                    HookName = "OnCardFired",
+                    TimeMs = timeMs,
+                    SourcePlayer = owner,
+                    TargetPlayer = opp,
+                    SourceCard = card,
+                    TargetCard = card,
+                    PayloadValue = castNumber
+                });
+                mechanicRuntime.DispatchPipeline(new CombatPipelineEvent
+                {
+                    HookName = "AfterCardFire",
+                    TimeMs = timeMs,
+                    SourcePlayer = owner,
+                    TargetPlayer = opp,
+                    SourceCard = card,
+                    TargetCard = card,
+                    PayloadValue = castNumber
+                });
+            }
             // 若该卡具备 Haste 锁存清理能力但本轮无合法加速目标导致 PerformedHaste 未触发，主动清零 Custom_8 防止后续他源加速串台
             if (HasHasteLatchClearAbility(card) && card.GetAttribute("Custom_8") > 0)
             {
@@ -1263,6 +1517,21 @@ public static class CombatSimulator
 
                 DispatchEvent("TTriggerOnBeforeItemUsed", owner, card, card, owner);
                 if (card.IsDestroyed || card.IsDisabled) return;
+
+                if (mechanicRuntime != null)
+                {
+                    var beforeFireEv = new CombatPipelineEvent
+                    {
+                        HookName = "BeforeCardFire",
+                        TimeMs = timeMs,
+                        SourcePlayer = owner,
+                        TargetPlayer = opp,
+                        SourceCard = card,
+                        TargetCard = card
+                    };
+                    mechanicRuntime.DispatchPipeline(beforeFireEv);
+                    if (beforeFireEv.Cancelled || card.IsDestroyed || card.IsDisabled) return;
+                }
 
                 int ammoMax = card.EffectiveAmmoMax;
                 if (ammoMax > 0)
@@ -1341,6 +1610,13 @@ public static class CombatSimulator
         if (recordEvents)
             Emit(new CombatEvent { TimeMs = 0, Type = CombatEventType.FightStarted, SourcePlayerId = p1.PlayerId, TargetPlayerId = p2.PlayerId });
         DispatchEvent("TTriggerOnFightStarted", p1, null, null, p1);
+        mechanicRuntime?.DispatchPipeline(new CombatPipelineEvent
+        {
+            HookName = "OnFightStart",
+            TimeMs = 0,
+            SourcePlayer = p1,
+            TargetPlayer = p2
+        });
         ProcessIcdQueues();
         CheckEndOfTickDeath();
 
@@ -1348,14 +1624,16 @@ public static class CombatSimulator
         while (p1.IsAlive && p2.IsAlive && timeMs < MaxDurationMs)
         {
             tickCascadeFires = 0;
+            mechanicRuntime?.ResetTickBudget();
             if (tickCardFireCounts.Count > 0) tickCardFireCounts.Clear();
             p1Overkill = 0;
             p2Overkill = 0;
             bool p1AliveAtTickStart = p1.IsAlive;
             bool p2AliveAtTickStart = p2.IsAlive;
 
-            // 0. 撤销到期的 TCombatDuration 限时修饰
+            // 0. 撤销到期的 TCombatDuration 限时修饰 & 推进开放自定义机制到期延迟回调
             ProcessTimedExpiries();
+            mechanicRuntime?.TickDelayedCallbacks(timeMs);
 
             // 0b. 推进 Multicast 延迟连发（在冻结倒计时扣减前检查，保证冻结帧不推进连发计时）
             ProcessPendingMulticasts();
@@ -1428,8 +1706,10 @@ public static class CombatSimulator
                     double red2 = Math.Clamp(p2.GetAttribute("PercentDamageReduction"), 0, 100);
                     int sandDmg1 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red1 / 100.0)));
                     int sandDmg2 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red2 / 100.0)));
-                    ApplyDirectDamage(p1, sandDmg1, bypassShield: false);
-                    ApplyDirectDamage(p2, sandDmg2, bypassShield: false);
+                    if (RunBeforeDamageHook(p2, p1, null, "Sandstorm", ref sandDmg1) && sandDmg1 > 0)
+                        ApplyDirectDamage(p1, sandDmg1, bypassShield: false);
+                    if (RunBeforeDamageHook(p1, p2, null, "Sandstorm", ref sandDmg2) && sandDmg2 > 0)
+                        ApplyDirectDamage(p2, sandDmg2, bypassShield: false);
                     if (recordEvents)
                         Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.SandstormTick, Value = sandstormNextDmg });
 
@@ -1507,6 +1787,8 @@ public static class CombatSimulator
             });
         }
 
+        mechanicRuntime?.RunPostCombatCommit(p1Won);
+
         var result = new CombatResult
         {
             WinnerPlayerId = p1Won ? p1.PlayerId : p2.PlayerId,
@@ -1521,6 +1803,10 @@ public static class CombatSimulator
             Player2TotalShieldGained = p2ShieldTotal,
             Events = events,
             Timeline = timeline,
+            PostCombatOps = mechanicRuntime != null ? mechanicRuntime.PostCombatOps : new List<PostCombatMutationOp>(),
+            MechanicDiagnostics = mechanicRuntime != null ? mechanicRuntime.Diagnostics : new List<MechanicDiagnostic>(),
+            MechanicCircuitBreakerTrips = mechanicRuntime?.TrippedCircuitBreakersCount ?? 0,
+            MechanicBudgetViolations = mechanicRuntime?.BudgetViolationsCount ?? 0,
             SimPlayer1 = p1
         };
 
@@ -1636,14 +1922,18 @@ public static class CombatSimulator
         void TickBurn(PlayerState target)
         {
             if (target.Burn <= 0) return;
+            var attacker = target == p1 ? p2 : p1;
             // 8.5：护盾对 Burn 的减免上限受 target.Shield 约束（向上取半确保满盾时与 floor(Burn/2) 一致，同时防止 1 点护盾将 100 点 Burn 减半）
             int mitigation = target.Shield > 0 ? Math.Min(target.Shield, (target.Burn + 1) / 2) : 0;
             int dmg = Math.Max(1, target.Burn - mitigation);
-            ApplyDirectDamage(target, dmg, bypassShield: false);
-            if (target == p2) p1DmgTotal += dmg; else p2DmgTotal += dmg;
+            if (RunBeforeDamageHook(attacker, target, null, "Burn", ref dmg) && dmg > 0)
+            {
+                ApplyDirectDamage(target, dmg, bypassShield: false);
+                if (target == p2) p1DmgTotal += dmg; else p2DmgTotal += dmg;
 
-            if (recordEvents)
-                Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.BurnTick, TargetPlayerId = target.PlayerId, Value = dmg });
+                if (recordEvents)
+                    Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.BurnTick, TargetPlayerId = target.PlayerId, Value = dmg });
+            }
 
             int prevBurn = target.Burn;
             int decay = Math.Max(1, (int)Math.Floor(target.Burn * (gm.BurnDecrementByAsPercentage / 100.0)));
@@ -1655,7 +1945,9 @@ public static class CombatSimulator
         void TickPoison(PlayerState target)
         {
             if (target.Poison <= 0) return;
+            var attacker = target == p1 ? p2 : p1;
             int dmg = target.Poison;
+            if (!RunBeforeDamageHook(attacker, target, null, "Poison", ref dmg) || dmg <= 0) return;
             ApplyDirectDamage(target, dmg, bypassShield: true);
             if (target == p2) p1DmgTotal += dmg; else p2DmgTotal += dmg;
             if (recordEvents)
@@ -2597,7 +2889,7 @@ public static class CombatSimulator
                     IsFrozen = c.FreezeMs > 0,
                     // 修复 P1-6：使用 IsCardFlying 覆盖光环赋予的飞行态
                     IsFlying = IsCardFlying(c),
-                    IsDestroyed = c.IsDestroyed,
+                    IsDestroyed = c.IsDestroyed || c.IsDisabled,
                     Ammo = c.CurrentAmmo,
                     HasteMs = c.HasteMs,
                     SlowMs = c.SlowMs,

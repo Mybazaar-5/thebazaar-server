@@ -2747,6 +2747,8 @@ public sealed class RunEngine
         // 7a. 战后永久状态回写（永久伤害/护盾/价值/附魔/升阶/任务进度/变形/衍生卡/玩家永久属性）
         var permSync = CombatSimulator.SyncPermanentChangesBack(result, p1Core);
         ApplyPostCombatPermanentSync(p1Core, permSync, despawnEvents);
+        // 7a-1. V14 开放自定义机制战后受控结转（如永久碎裂移除或永久属性修正，统一走官方协议事件防客户端脱节）
+        ApplyPostCombatMechanicOps(p1Core, result.PostCombatOps, despawnEvents);
 
         // 7a-2. 记录官方 [PlayerAttributes] 战斗胜负追踪（Custom_5 总胜场 / Custom_6 总败场 / Custom_7 PvE 败 / Custom_8 PvP 败）
         // 并同步战中可能变更的 Gold / Custom_3 / Custom_9 到 p1Core，确保 OnFightEnded 光环重算读取最新值
@@ -4900,6 +4902,68 @@ public sealed class RunEngine
                     ps, _repo, activeEncounterCard: _run.CurrentEncounterCoreCard);
             }
             events.AddRange(_run.SyncAllEntriesFromCoreCardsAndDiff(_repo.GameMode.StandardPrices));
+        }
+    }
+
+    private void ApplyPostCombatMechanicOps(
+        PlayerState p1Core,
+        IReadOnlyList<BazaarCore.Mods.PostCombatMutationOp>? ops,
+        List<IGameSimEvent> events)
+    {
+        if (ops == null || ops.Count == 0) return;
+
+        for (int i = 0; i < ops.Count; i++)
+        {
+            var op = ops[i];
+            if (op == null || string.IsNullOrWhiteSpace(op.CardInstanceId)) continue;
+            if (!_run.Cards.TryGetValue(op.CardInstanceId, out var entry) || entry.Owner != ECombatantId.Player)
+                continue;
+
+            var coreCard = p1Core.Hand.Cards.FirstOrDefault(c => c.InstanceId == entry.InstanceId)
+                ?? p1Core.Stash.Cards.FirstOrDefault(c => c.InstanceId == entry.InstanceId)
+                ?? p1Core.Skills.FirstOrDefault(c => c.InstanceId == entry.InstanceId);
+
+            if (string.Equals(op.OpKind, "RemoveCard", StringComparison.OrdinalIgnoreCase))
+            {
+                RemoveOwnedEntryFromRun(entry);
+                if (coreCard != null)
+                {
+                    p1Core.Hand.Remove(coreCard);
+                    p1Core.Stash.Remove(coreCard);
+                    p1Core.Skills.Remove(coreCard);
+                    _run.HandGrid.Remove(coreCard);
+                    _run.StashGrid.Remove(coreCard);
+                }
+                events.Add(new GameSimEventCardDisposed(entry.InstanceId, ECardDisposalReason.Destroyed));
+                LogBoardAudit("MechanicPostCombatRemove", entry.InstanceId, entry.TemplateId.ToString(), $"{entry.Section}:{entry.Socket}", op.Reason ?? op.SourceMechanicId ?? "mechanic");
+            }
+            else if (string.Equals(op.OpKind, "ModifyCardPermanentAttribute", StringComparison.OrdinalIgnoreCase)
+                     && !string.IsNullOrWhiteSpace(op.Attribute)
+                     && coreCard != null)
+            {
+                double safeVal = double.IsFinite(op.Value) ? Math.Clamp(op.Value, -100000, 100000) : 0;
+                if (op.Attribute.Equals("CooldownMax", StringComparison.OrdinalIgnoreCase))
+                {
+                    double curCd = coreCard.GetAttribute("CooldownMax");
+                    double targetCd = (op.Operation ?? "Add").ToLowerInvariant() switch
+                    {
+                        "subtract" => curCd - safeVal,
+                        "multiply" => curCd * Math.Clamp(safeVal, 0.1, 10),
+                        "set" => safeVal,
+                        _ => curCd + safeVal
+                    };
+                    targetCd = Math.Clamp(targetCd, 1000.0, 60000.0);
+                    coreCard.ModifyAttribute("CooldownMax", "Add", targetCd - curCd, DurationTarget.Permanent);
+                }
+                else
+                {
+                    coreCard.ModifyAttribute(op.Attribute, op.Operation ?? "Add", safeVal, DurationTarget.Permanent);
+                }
+                if (Enum.TryParse<ECardAttributeType>(op.Attribute, true, out var attrEnum))
+                {
+                    entry.Attributes[attrEnum] = (int)Math.Round(coreCard.GetAttribute(op.Attribute));
+                }
+            }
         }
     }
 

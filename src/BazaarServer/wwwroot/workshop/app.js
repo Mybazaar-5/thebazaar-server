@@ -10,20 +10,108 @@
   const TIERS = ['Bronze', 'Silver', 'Gold', 'Diamond'];
   const DURATION_ATTRS = new Set(['CooldownMax', 'HasteAmount', 'SlowAmount', 'FreezeAmount', 'ChargeAmount']);
   const MATRIX_ATTRS = [
-    { key: 'CooldownMax', label: '冷却 (秒 → 自动×1000ms)', isSec: true },
-    { key: 'BuyPrice', label: '购买价 (金币)', isSec: false },
-    { key: 'SellPrice', label: '出售价 (金币)', isSec: false },
-    { key: 'DamageAmount', label: '伤害 (点)', isSec: false },
-    { key: 'ShieldApplyAmount', label: '护盾 (点)', isSec: false },
-    { key: 'BurnApplyAmount', label: '灼烧 (层)', isSec: false },
-    { key: 'PoisonApplyAmount', label: '剧毒 (层)', isSec: false },
-    { key: 'HealAmount', label: '治疗 (点)', isSec: false },
-    { key: 'CritChance', label: '暴击率 (%)', isSec: false },
-    { key: 'HasteAmount', label: '加速 (秒 → ms)', isSec: true },
-    { key: 'ChargeAmount', label: '充能 (秒 → ms)', isSec: true },
-    { key: 'Custom_0', label: '自定义数值 Custom_0', isSec: false },
-    { key: 'Custom_1', label: '自定义数值 Custom_1', isSec: false },
+    { key: 'CooldownMax', label: '冷却时间（填秒）', isSec: true },
+    { key: 'BuyPrice', label: '购买价格（金币）', isSec: false, isPrice: true },
+    { key: 'SellPrice', label: '出售价格（金币）', isSec: false, isPrice: true },
+    { key: 'DamageAmount', label: '伤害', isSec: false },
+    { key: 'ShieldApplyAmount', label: '护盾', isSec: false },
+    { key: 'BurnApplyAmount', label: '灼烧（层）', isSec: false },
+    { key: 'PoisonApplyAmount', label: '剧毒（层）', isSec: false },
+    { key: 'HealAmount', label: '治疗', isSec: false },
+    { key: 'CritChance', label: '暴击率（%）', isSec: false },
+    { key: 'HasteAmount', label: '加速（填秒）', isSec: true },
+    { key: 'ChargeAmount', label: '充能（填秒）', isSec: true },
+    { key: 'PercentCooldownReduction', label: '冷却缩减（%）', isSec: false },
+    { key: 'Custom_0', label: '特殊数值 1', isSec: false },
+    { key: 'Custom_1', label: '特殊数值 2', isSec: false },
   ];
+
+  // 官方标准买卖价表（严格对齐官方 gamemodes.json StandardPrices）
+  const STANDARD_PRICES = {
+    Small:  { Bronze: [2, 1], Silver: [4, 2],  Gold: [8, 4],  Diamond: [16, 8] },
+    Medium: { Bronze: [4, 2], Silver: [8, 4],  Gold: [16, 8], Diamond: [32, 16] },
+    Large:  { Bronze: [6, 3], Silver: [12, 6], Gold: [24, 12], Diamond: [48, 24] },
+    Skill:  { Bronze: [5, 2], Silver: [10, 5], Gold: [20, 10], Diamond: [40, 20] },
+  };
+  const SIZE_ZH_MAP = { Small: '小型(1格)', Medium: '中型(2格)', Large: '大型(3格)' };
+  const TYPE_ZH_MAP = {
+    Item: '物品', Skill: '技能', EventEncounter: '奇遇',
+    EncounterStep: '奇遇选项', CombatEncounter: '野怪', PedestalEncounter: '基座',
+  };
+
+  function getStandardPriceKey(card) {
+    if (!card) return 'Medium';
+    if (card.type === 'Skill') return 'Skill';
+    return STANDARD_PRICES[card.size] ? card.size : 'Medium';
+  }
+
+  function applyStandardPricesToCard(card) {
+    if (!card) return;
+    const key = getStandardPriceKey(card);
+    const table = STANDARD_PRICES[key];
+    card.tiers = card.tiers || {};
+    const abIds = Object.keys(card.abilities || {});
+    const auIds = Object.keys(card.auras || {});
+    TIERS.forEach((t) => {
+      if (!card.tiers[t]) card.tiers[t] = { attributes: {}, abilityIds: [...abIds], auraIds: [...auIds] };
+      card.tiers[t].attributes = card.tiers[t].attributes || {};
+      card.tiers[t].attributes.BuyPrice = table[t][0];
+      card.tiers[t].attributes.SellPrice = table[t][1];
+    });
+  }
+
+  function isCardUsingStandardPrices(card) {
+    if (!card?.tiers) return true;
+    const table = STANDARD_PRICES[getStandardPriceKey(card)];
+    for (const t of TIERS) {
+      const attrs = card.tiers[t]?.attributes;
+      if (!attrs) continue;
+      const bp = attrs.BuyPrice;
+      const sp = attrs.SellPrice;
+      if (bp !== undefined && bp !== null && Number(bp) !== table[t][0]) return false;
+      if (sp !== undefined && sp !== null && Number(sp) !== table[t][1]) return false;
+    }
+    return true;
+  }
+
+  function formatStandardPriceSummary(card) {
+    const key = getStandardPriceKey(card);
+    const table = STANDARD_PRICES[key];
+    const kindLabel = key === 'Skill' ? '技能' : (SIZE_ZH_MAP[key] || key);
+    return `当前自动定价（${kindLabel}）：青铜 买${table.Bronze[0]}/卖${table.Bronze[1]}金 · 白银 买${table.Silver[0]}/卖${table.Silver[1]}金 · 黄金 买${table.Gold[0]}/卖${table.Gold[1]}金 · 钻石 买${table.Diamond[0]}/卖${table.Diamond[1]}金`;
+  }
+
+  function randomBase36(len = 6) {
+    let s = '';
+    while (s.length < len) s += Math.random().toString(36).slice(2);
+    return s.slice(0, len);
+  }
+
+  // 自动预生成防撞车唯一编号：<扩展包ID>:<简短代号>_<6位随机防撞码>
+  function generateUniqueCardId(modId, slugHint = 'card') {
+    const safeMod = String(modId || 'my-mod').toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    let slug = String(slugHint || 'card').toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+    if (!slug) slug = 'card';
+    if (slug.length > 24) slug = slug.slice(0, 24).replace(/_+$/, '');
+    let candidate = `${safeMod}:${slug}_${randomBase36(6)}`;
+    while ((state.workspace?.cards || []).some((c) => c.customId === candidate)) {
+      candidate = `${safeMod}:${slug}_${randomBase36(6)}`;
+    }
+    return candidate;
+  }
+
+  function lookupZhName(list, id) {
+    const found = (list || []).find((x) => x.id === id);
+    return found ? found.nameZh : id;
+  }
+
+  function getArtSpecForCard(card) {
+    if (card && card.type === 'Item') {
+      if (card.size === 'Small') return { w: 512, h: 1024, desc: '小型 1 格竖图 512×1024' };
+      if (card.size === 'Large') return { w: 768, h: 512, desc: '大型 3 格横图 768×512' };
+    }
+    return { w: 512, h: 512, desc: '中型 / 技能方图 512×512' };
+  }
 
   // 默认合规原版白名单奇遇载体（经过 valid_card_ids.json 核验）
   const DEFAULT_EVENT_VISUAL = '11287697-dd45-4edc-9539-780a26001043';
@@ -43,7 +131,7 @@
     selectedEventIdx: -1,
     previewTier: 'Bronze',
     lastValidation: null,
-    token: sessionStorage.getItem('bazaar_workshop_token') || '',
+    token: localStorage.getItem('bazaar_workshop_token') || sessionStorage.getItem('bazaar_workshop_token') || '',
     searchTimer: null,
   };
 
@@ -90,6 +178,7 @@
     document.querySelectorAll('.tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.tab === tabName));
     document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('active', p.id === `tab-${tabName}`));
     if (tabName === 'events') renderEventDag();
+    window.WorkshopV14?.onTabSwitched?.(tabName);
   }
 
   // ── 初始化加载 ────────────────────────────────────────────────────────────
@@ -103,6 +192,7 @@
     if (state.mods.length > 0 && !state.currentModId) {
       await openMod(state.mods[0].id);
     }
+    window.WorkshopV14?.onReady?.();
   }
 
   async function loadMeta() {
@@ -199,6 +289,7 @@
     state.workspace.events = state.workspace.events || [];
     state.workspace.monsters = state.workspace.monsters || [];
     state.workspace.modes = state.workspace.modes || [];
+    state.workspace.mechanics = state.workspace.mechanics || [];
     state.workspace.mutators = state.workspace.mutators || [];
     state.assets = res.data.assets || [];
     state.selectedCardIdx = state.workspace.cards.length > 0 ? 0 : -1;
@@ -214,6 +305,7 @@
     renderEventList();
     renderEventEditor();
     renderEventDag();
+    window.WorkshopV14?.onWorkspaceLoaded?.();
   }
 
   function syncManifestForm() {
@@ -235,6 +327,7 @@
     if (!ws) return;
     $('cntCards').textContent = ws.cards.length;
     $('cntPatches').textContent = ws.patches.length;
+    if ($('cntMechanics')) $('cntMechanics').textContent = (ws.mechanics || []).length;
     $('cntEvents').textContent = ws.events.length;
     $('cntAssets').textContent = state.assets.length;
     $('mineCardNum').textContent = ws.cards.length;
@@ -290,22 +383,33 @@
       list.innerHTML = '<div class="empty-hint">未找到匹配原版卡，请更换关键词或放宽筛选。</div>';
       return;
     }
-    list.innerHTML = res.data.items.map((c) => `
+    list.innerHTML = res.data.items.map((c) => {
+      const heroNames = (c.heroes || []).map((h) => lookupZhName(state.catalog?.heroes, h)).join(' / ');
+      const tagNames = (c.tags || []).slice(0, 4).map((t) => lookupZhName(state.catalog?.tags, t)).join(' · ');
+      return `
       <div class="base-card-row">
         <div class="bcr-head">
           <span class="bcr-title">${escapeHtml(c.titleZh)}</span>
-          <span class="badge badge-blue">${escapeHtml(c.type)} · ${escapeHtml(c.size)}</span>
+          <span class="badge badge-blue">${escapeHtml(TYPE_ZH_MAP[c.type] || c.type)} · ${escapeHtml(SIZE_ZH_MAP[c.size] || c.size)}</span>
         </div>
-        <div class="bcr-sub">${escapeHtml(c.titleEn)} · ${(c.heroes || []).join('/')} · ${(c.tags || []).slice(0, 4).join(' / ')}</div>
+        <div class="bcr-sub">${escapeHtml(heroNames || '全英雄通用')}${tagNames ? ` · ${escapeHtml(tagNames)}` : ''}</div>
         <div class="bcr-actions">
-          <button class="btn btn-gold btn-xs" data-act="clone" data-id="${escapeHtml(c.templateId)}">📋 克隆为新卡</button>
-          <button class="btn btn-outline btn-xs" data-act="patch" data-id="${escapeHtml(c.templateId)}">🔧 原位改数值</button>
+          <button class="btn btn-gold btn-xs" data-act="clone" data-id="${escapeHtml(c.templateId)}">📋 复制为新卡</button>
+          <button class="btn btn-outline btn-xs" data-act="patch" data-id="${escapeHtml(c.templateId)}">🔧 直接改原版</button>
+          <button class="btn btn-subtle btn-xs" data-act="extract" data-id="${escapeHtml(c.templateId)}" title="查看并把这张原版卡的某条效果直接复制到正在编辑的卡牌里">🧲 提取效果</button>
         </div>
       </div>
-    `).join('');
+    `;
+    }).join('');
 
     list.querySelectorAll('button[data-act]').forEach((btn) => {
-      btn.addEventListener('click', () => handlePickBaseCard(btn.dataset.id, btn.dataset.act));
+      btn.addEventListener('click', () => {
+        if (btn.dataset.act === 'extract') {
+          window.WorkshopV14?.openVanillaAffixExtractor?.(btn.dataset.id);
+        } else {
+          handlePickBaseCard(btn.dataset.id, btn.dataset.act);
+        }
+      });
     });
   }
 
@@ -324,16 +428,12 @@
     if (action === 'clone') {
       const draft = res.data.cloneDraftTemplate;
       const slugBase = (draft.customId.split(':')[1] || 'custom_card').replace(/[^a-z0-9_]/gi, '_');
-      let uniqueId = `${modId}:${slugBase}`;
-      let seq = 2;
-      while (state.workspace.cards.some((c) => c.customId === uniqueId)) {
-        uniqueId = `${modId}:${slugBase}_${seq++}`;
-      }
-      draft.customId = uniqueId;
+      draft.customId = generateUniqueCardId(modId, slugBase);
+      draft.spawningEligibility = draft.spawningEligibility || 'Always';
       state.workspace.cards.push(draft);
       state.selectedCardIdx = state.workspace.cards.length - 1;
       state.selectedPatchIdx = -1;
-      toast(`已克隆「${res.data.titleZh}」并锁定合法白名单视觉载体！`);
+      toast(`已复制「${res.data.titleZh}」为新卡，并自动生成防撞编号！`);
     } else {
       const patch = res.data.patchDraftTemplate;
       const existing = state.workspace.patches.findIndex((p) => p.targetTemplateId === templateId);
@@ -364,12 +464,17 @@
     if (!ws) return;
     const cardBox = $('mineCardList');
     cardBox.innerHTML = ws.cards.length
-      ? ws.cards.map((c, idx) => `
+      ? ws.cards.map((c, idx) => {
+          const exclBadge = c.spawningEligibility === 'GuidOnly'
+            ? ' <span class="badge badge-blue">联动限定</span>'
+            : (c.spawningEligibility === 'Never' ? ' <span class="badge badge-yellow">暂不投放</span>' : '');
+          return `
           <div class="mine-row ${idx === state.selectedCardIdx ? 'active' : ''}" data-cidx="${idx}">
-            <strong>${escapeHtml(c.titleZh || c.customId)}</strong>
-            <div class="bcr-sub">${escapeHtml(c.customId)} · ${escapeHtml(c.type)}/${escapeHtml(c.size)}</div>
+            <strong>${escapeHtml(c.titleZh || c.customId)}${exclBadge}</strong>
+            <div class="bcr-sub">${escapeHtml(TYPE_ZH_MAP[c.type] || c.type)} · ${escapeHtml(SIZE_ZH_MAP[c.size] || c.size)}</div>
           </div>
-        `).join('')
+        `;
+        }).join('')
       : '<div class="empty-hint">暂无自定义新卡</div>';
 
     cardBox.querySelectorAll('.mine-row').forEach((el) => {
@@ -416,6 +521,7 @@
     } else {
       updateLivePreview(null);
     }
+    window.WorkshopV14?.onCardOrPatchRendered?.();
   }
 
   function populateCustomCardForm(card) {
@@ -427,12 +533,28 @@
     $('ceType').value = card.type || 'Item';
     $('ceSize').value = card.size || 'Medium';
     $('ceStartingTier').value = card.startingTier || 'Bronze';
+    const spawnMode = card.spawningEligibility || 'Always';
+    if ($('ceSpawnEligibility')) $('ceSpawnEligibility').value = spawnMode;
+    if ($('ceGuidOnlyBanner')) $('ceGuidOnlyBanner').classList.toggle('hidden', spawnMode !== 'GuidOnly');
     $('ceHeroes').value = (card.heroes || ['Common']).join(', ');
     $('ceTags').value = (card.tags || []).join(', ');
     $('ceHiddenTags').value = (card.hiddenTags || []).join(', ');
     $('ceDescZh').value = card.descZh || '';
     $('ceActiveTips').value = (card.activeTooltipsZh || []).join('\n');
     $('cePassiveTips').value = (card.passiveTooltipsZh || []).join('\n');
+
+    const useAutoPrice = isCardUsingStandardPrices(card);
+    if ($('ceAutoPriceChk')) $('ceAutoPriceChk').checked = useAutoPrice;
+    if (useAutoPrice) applyStandardPricesToCard(card);
+    if ($('ceAutoPriceSummary')) {
+      $('ceAutoPriceSummary').textContent = useAutoPrice
+        ? formatStandardPriceSummary(card)
+        : '已切换为手动自定义买卖价，请直接在下表中修改每阶金币价格。';
+    }
+    if ($('artHintText')) {
+      const spec = getArtSpecForCard(card);
+      $('artHintText').textContent = `当前卡牌自动裁切目标：${spec.desc}（直接拖入 PNG/JPG 即可自动对齐尺寸）。`;
+    }
 
     renderTierMatrix($('ceTierTableBody'), card.tiers || {}, (tier, attrKey, numVal) => {
       card.tiers = card.tiers || {};
@@ -444,7 +566,7 @@
       }
       markDirty(true);
       updateLivePreview(card);
-    });
+    }, useAutoPrice);
 
     renderAbilitiesSummary(card);
     $('ceAdvancedRulesJson').value = JSON.stringify({ abilities: card.abilities || {}, auras: card.auras || {} }, null, 2);
@@ -476,8 +598,9 @@
     updateLivePreviewFromPatch(patch);
   }
 
-  function renderTierMatrix(tbody, tiersMap, onChange) {
-    tbody.innerHTML = MATRIX_ATTRS.map((m) => {
+  function renderTierMatrix(tbody, tiersMap, onChange, hidePriceRows = false) {
+    const visibleAttrs = hidePriceRows ? MATRIX_ATTRS.filter((m) => !m.isPrice) : MATRIX_ATTRS;
+    tbody.innerHTML = visibleAttrs.map((m) => {
       const cells = TIERS.map((t) => {
         const raw = tiersMap?.[t]?.attributes?.[m.key];
         const disp = raw === undefined || raw === null ? '' : (m.isSec ? (raw / 1000) : raw);
@@ -514,13 +637,29 @@
       box.innerHTML = '<div class="muted">暂无战斗能力或光环，请从上方下拉框一键添加中文效果积木。</div>';
       return;
     }
-    box.innerHTML = items.map((it) => `
+    box.innerHTML = items.map((it) => {
+      const zhSummary = window.WorkshopV14?.summarizeAffixZh
+        ? window.WorkshopV14.summarizeAffixZh(it.kind, it.kind === 'aura' ? card.auras[it.key] : card.abilities[it.key])
+        : `${it.trig} → ${it.act}`;
+      return `
       <div class="ability-item">
-        <span><span class="badge ${it.kind === 'aura' ? 'badge-blue' : 'badge-green'}">${it.kind === 'aura' ? '光环' : '能力'} #${escapeHtml(it.key)}</span>
-          <code>${escapeHtml(it.trig)}</code> → <code>${escapeHtml(it.act)}</code></span>
-        <button class="btn btn-danger btn-xs" data-del-kind="${it.kind}" data-del-key="${escapeHtml(it.key)}">移除</button>
+        <div class="ab-summary-main">
+          <span class="badge ${it.kind === 'aura' ? 'badge-blue' : 'badge-green'}">${it.kind === 'aura' ? '常驻光环' : '战斗效果'} #${escapeHtml(it.key)}</span>
+          <span class="ab-zh-text">${escapeHtml(zhSummary)}</span>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-outline btn-xs" data-edit-kind="${it.kind}" data-edit-key="${escapeHtml(it.key)}">✏️ 修改</button>
+          <button class="btn btn-danger btn-xs" data-del-kind="${it.kind}" data-del-key="${escapeHtml(it.key)}">移除</button>
+        </div>
       </div>
-    `).join('');
+    `;
+    }).join('');
+
+    box.querySelectorAll('button[data-edit-kind]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        window.WorkshopV14?.openAffixEditorForActiveTarget?.(btn.dataset.editKind, btn.dataset.editKey);
+      });
+    });
 
     box.querySelectorAll('button[data-del-kind]').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -560,12 +699,13 @@
     }
 
     const attrs = mergeAttrsForTier(card, state.previewTier);
+    const exclNote = card.spawningEligibility === 'GuidOnly' ? ' · 联动限定' : (card.spawningEligibility === 'Never' ? ' · 暂不投放' : '');
     $('pvTitle').textContent = card.titleZh || card.customId;
-    $('pvSize').textContent = `${card.type} · ${card.size}`;
+    $('pvSize').textContent = `${TYPE_ZH_MAP[card.type] || card.type} · ${SIZE_ZH_MAP[card.size] || card.size}${exclNote}`;
     $('pvCooldown').textContent = attrs.CooldownMax ? `${(attrs.CooldownMax / 1000).toFixed(1)} 秒` : '被动';
-    $('pvBuyPrice').textContent = `买 ${attrs.BuyPrice ?? '-'}g / 卖 ${attrs.SellPrice ?? '-'}g`;
-    $('pvHero').textContent = (card.heroes || ['Common']).join(' / ');
-    $('pvTags').innerHTML = (card.tags || []).map((t) => `<span>${escapeHtml(t)}</span>`).join('');
+    $('pvBuyPrice').textContent = `买 ${attrs.BuyPrice ?? '-'}金 / 卖 ${attrs.SellPrice ?? '-'}金`;
+    $('pvHero').textContent = (card.heroes || ['Common']).map((h) => lookupZhName(state.catalog?.heroes, h)).join(' / ');
+    $('pvTags').innerHTML = (card.tags || []).map((t) => `<span>${escapeHtml(lookupZhName(state.catalog?.tags, t))}</span>`).join('');
 
     const lines = [
       ...(card.activeTooltipsZh || []).map((l) => `[主动] ${renderTooltipPreview(l, attrs)}`),
@@ -632,10 +772,10 @@
       return;
     }
 
-    // 使用浏览器 Canvas 自动裁切并转为合规 PNG（Small/Large 512x1024，Medium/Skill 512x512）
-    const isTall = card && card.type === 'Item' && (card.size === 'Small' || card.size === 'Large');
-    const targetW = 512;
-    const targetH = isTall ? 1024 : 512;
+    // 使用浏览器 Canvas 自动裁切并转为合规 PNG（Small 1格 512×1024 竖图；Large 3格 768×512 横图；Medium 2格 / Skill 512×512 方图）
+    const artSpec = getArtSpecForCard(card);
+    const targetW = artSpec.w;
+    const targetH = artSpec.h;
 
     try {
       const bitmap = await createImageBitmap(file);
@@ -723,29 +863,64 @@
 
     const stepsBox = $('eventStepsContainer');
     const allEventIds = (state.workspace.events || []).map((e) => e.eventId);
+    const modCards = state.workspace.cards || [];
+
+    const summarizeStepAction = (st) => {
+      const act = st.abilities?.['0']?.action;
+      if (!act) return '尚未设置奖励效果（请点上方按钮或下方选择奖励卡牌）';
+      if (act.$type === 'TActionGameSpawnCards') {
+        const ids = act.spawnContext?.groups?.[0]?.filters?.[0]?.ids || act.ids || (act.id ? [act.id] : []);
+        const cid = ids[0] || '';
+        const found = modCards.find((c) => c.customId === cid);
+        return `🎁 玩家选择此项后，直接获得指定卡牌「${found ? found.titleZh : cid}」`;
+      }
+      if (act.$type === 'TActionPlayerModifyAttribute' && act.attributeType === 'Gold') {
+        return `🪙 玩家选择此项后，获得 ${act.value?.value ?? 0} 金币`;
+      }
+      if (act.$type === 'TActionCardUpgrade') {
+        return '⬆️ 玩家选择此项后，升级最左侧的一张卡牌';
+      }
+      return `✨ 执行效果：${window.WorkshopV14?.summarizeAffixZh ? window.WorkshopV14.summarizeAffixZh('ability', st.abilities['0']) : act.$type}`;
+    };
+
+    const cardPickerOptions = modCards.length
+      ? modCards.map((c) => {
+          const tag = c.spawningEligibility === 'GuidOnly' ? '[联动限定] ' : '';
+          return `<option value="${escapeHtml(c.customId)}">${tag}${escapeHtml(c.titleZh || c.customId)}</option>`;
+        }).join('')
+      : '<option value="">（当前扩展包还没有自定义新卡，先去第 2 步做一张卡吧）</option>';
 
     stepsBox.innerHTML = (ev.steps || []).map((st, idx) => {
       const nextTarget = st.nextEncounterOnSelection?.[0]?.id || '';
       const buyPrice = st.attributes?.BuyPrice ?? 0;
-      const optionsHtml = ['<option value="">（无后续跳转，直接结束奇遇）</option>']
-        .concat(allEventIds.map((eid) => `<option value="${escapeHtml(eid)}" ${eid === nextTarget ? 'selected' : ''}>跳转 → ${escapeHtml(eid)}</option>`))
+      const optionsHtml = ['<option value="">（选完直接结束本次奇遇）</option>']
+        .concat(allEventIds.map((eid) => {
+          const targetEv = (state.workspace.events || []).find((x) => x.eventId === eid);
+          return `<option value="${escapeHtml(eid)}" ${eid === nextTarget ? 'selected' : ''}>选完进入下一个奇遇 → ${escapeHtml(targetEv?.titleZh || eid)}</option>`;
+        }))
         .join('');
       return `
         <div class="step-card" data-sidx="${idx}">
           <div class="panel-header compact">
-            <strong>选项 #${idx + 1}：<code>${escapeHtml(st.customId)}</code></strong>
+            <strong>奇遇选项 #${idx + 1}</strong>
             <div class="btn-row">
-              <button class="btn btn-outline btn-xs" data-sact="gold" data-sidx="${idx}">+给 6 金币动作</button>
-              <button class="btn btn-outline btn-xs" data-sact="upgrade" data-sidx="${idx}">+升级最左卡动作</button>
+              <button class="btn btn-outline btn-xs" data-sact="gold" data-sidx="${idx}">🪙 设为给 6 金币</button>
+              <button class="btn btn-outline btn-xs" data-sact="upgrade" data-sidx="${idx}">⬆️ 设为升级最左卡</button>
               <button class="btn btn-danger btn-xs" data-sact="del" data-sidx="${idx}">删除</button>
             </div>
           </div>
           <div class="form-grid">
             <label class="field"><span>选项标题 *</span><input type="text" class="st-title" value="${escapeHtml(st.titleZh || '')}" /></label>
-            <label class="field"><span>花费金币（BuyPrice）</span><input type="number" class="st-price" min="0" value="${buyPrice}" /></label>
+            <label class="field"><span>需要花费金币（0 表示免费）</span><input type="number" class="st-price" min="0" value="${buyPrice}" /></label>
             <label class="field span-2"><span>选项说明 *</span><input type="text" class="st-desc" value="${escapeHtml(st.descZh || '')}" /></label>
-            <label class="field span-2"><span>选中后跳转至下一事件（DAG 防环）</span><select class="st-next">${optionsHtml}</select></label>
+            <label class="field span-2"><span>选完后的流程</span><select class="st-next">${optionsHtml}</select></label>
           </div>
+          <div class="step-reward-bar">
+            <span class="muted">联动发卡：</span>
+            <select class="st-reward-card-sel" data-sidx="${idx}">${cardPickerOptions}</select>
+            <button type="button" class="btn btn-gold btn-xs" data-sact="spawnCard" data-sidx="${idx}" ${modCards.length ? '' : 'disabled'}>🎁 设为奖励这张卡</button>
+          </div>
+          <div class="step-action-badge">${escapeHtml(summarizeStepAction(st))}</div>
         </div>
       `;
     }).join('');
@@ -789,7 +964,7 @@
               },
             },
           };
-          toast('已写入标准 TTriggerOnCardSelected → 获得 6 金币动作！');
+          toast('已设为「选择后获得 6 金币」！');
         } else if (act === 'upgrade') {
           st.abilities = {
             '0': {
@@ -801,13 +976,50 @@
               },
             },
           };
-          toast('已写入标准 TTriggerOnCardSelected → 升级最左侧卡牌动作！');
+          toast('已设为「选择后升级最左侧卡牌」！');
+        } else if (act === 'spawnCard') {
+          const cardEl = btn.closest('.step-card');
+          const pickedId = cardEl?.querySelector('.st-reward-card-sel')?.value;
+          const pickedCard = modCards.find((c) => c.customId === pickedId);
+          if (!pickedId || !pickedCard) {
+            toast('请先选择一张要奖励的卡牌。', 'err');
+            return;
+          }
+          st.abilities = {
+            '0': {
+              id: '0',
+              trigger: { $type: 'TTriggerOnCardSelected' },
+              action: {
+                $type: 'TActionGameSpawnCards',
+                targetPlayer: { $type: 'TTargetPlayerAbsolute', targetMode: 'Player' },
+                spawnCount: 1,
+                spawnContext: {
+                  $type: 'TSpawnContextQuery',
+                  groups: [
+                    {
+                      $type: 'TSpawnGroup',
+                      filters: [{ $type: 'TSpawnFilterIdList', ids: [pickedId] }],
+                    },
+                  ],
+                },
+              },
+            },
+          };
+          if (!st.titleZh || st.titleZh.startsWith('奇遇选项') || st.titleZh === '领取 6 金币补给') {
+            st.titleZh = `获得「${pickedCard.titleZh || pickedId}」`;
+          }
+          if (!st.descZh || st.descZh.includes('金币')) {
+            st.descZh = `直接获得专属卡牌「${pickedCard.titleZh || pickedId}」。`;
+          }
+          toast(`已将选项 #${idx + 1} 设为奖励「${pickedCard.titleZh || pickedId}」！`);
         }
         markDirty(true);
         renderEventEditor();
         renderEventDag();
       });
     });
+
+    window.WorkshopV14?.onEventEditorRendered?.();
   }
 
   function renderEventDag() {
@@ -982,9 +1194,10 @@
 
     $('btnApplyToken').addEventListener('click', async () => {
       state.token = $('workshopTokenInput').value.trim();
+      localStorage.setItem('bazaar_workshop_token', state.token);
       sessionStorage.setItem('bazaar_workshop_token', state.token);
       await loadMeta();
-      toast(state.meta?.canWrite ? '已解锁写权限！' : '口令未匹配或服务端未开启 Token 写权限。', state.meta?.canWrite ? 'ok' : 'err');
+      toast(state.meta?.canWrite ? '已解锁公网写权限（已持久化记住）！' : '口令未匹配或服务端未开启 Token 写权限。', state.meta?.canWrite ? 'ok' : 'err');
     });
 
     $('btnQuickSave').addEventListener('click', saveDraft);
@@ -1014,7 +1227,7 @@
           scope: 'multiplayer-safe', affectsGhostPool: false, enabledByDefault: false, loadOrder: 100,
           dependencies: [], contentRoots: {}
         },
-        cards: [], patches: [], events: [], monsters: [], modes: [], mutators: [], localization: null
+        cards: [], patches: [], events: [], monsters: [], modes: [], mechanics: [], mutators: [], localization: null
       };
       state.assets = [];
       state.selectedCardIdx = -1;
@@ -1082,20 +1295,20 @@
       if (!state.workspace) return;
       const modId = state.workspace.manifest.id;
       const idx = state.workspace.cards.length + 1;
-      state.workspace.cards.push({
-        customId: `${modId}:custom_weapon_${idx}`,
+      const newCard = {
+        customId: generateUniqueCardId(modId, `custom_item_${idx}`),
         baseVisualTemplateId: DEFAULT_ITEM_SMALL_VISUAL,
         type: 'Item', size: 'Small', startingTier: 'Bronze', spawningEligibility: 'Always',
         heroes: ['Common'], tags: ['Weapon'], hiddenTags: ['Damage'],
         titleZh: `原创星港短刃 #${idx}`, titleEn: `Custom Blade ${idx}`,
-        descZh: '使用零代码工坊打造的原创武器。',
+        descZh: '使用全中文创意工坊打造的原创武器。',
         activeTooltipsZh: ['造成 {attr.DamageAmount} 点伤害'],
         passiveTooltipsZh: [],
         tiers: {
-          Bronze: { attributes: { BuyPrice: 2, SellPrice: 1, CooldownMax: 4000, DamageAmount: 15 }, abilityIds: ['0'], auraIds: [] },
-          Silver: { attributes: { BuyPrice: 4, SellPrice: 2, CooldownMax: 4000, DamageAmount: 30 }, abilityIds: ['0'], auraIds: [] },
-          Gold: { attributes: { BuyPrice: 8, SellPrice: 4, CooldownMax: 3500, DamageAmount: 60 }, abilityIds: ['0'], auraIds: [] },
-          Diamond: { attributes: { BuyPrice: 16, SellPrice: 8, CooldownMax: 3500, DamageAmount: 120 }, abilityIds: ['0'], auraIds: [] },
+          Bronze: { attributes: { CooldownMax: 4000, DamageAmount: 15 }, abilityIds: ['0'], auraIds: [] },
+          Silver: { attributes: { CooldownMax: 4000, DamageAmount: 30 }, abilityIds: ['0'], auraIds: [] },
+          Gold: { attributes: { CooldownMax: 3500, DamageAmount: 60 }, abilityIds: ['0'], auraIds: [] },
+          Diamond: { attributes: { CooldownMax: 3500, DamageAmount: 120 }, abilityIds: ['0'], auraIds: [] },
         },
         abilities: {
           '0': {
@@ -1106,7 +1319,9 @@
           }
         },
         auras: {}
-      });
+      };
+      applyStandardPricesToCard(newCard);
+      state.workspace.cards.push(newCard);
       state.selectedCardIdx = state.workspace.cards.length - 1;
       state.selectedPatchIdx = -1;
       markDirty(true);
@@ -1116,7 +1331,7 @@
     });
 
     // 自定义新卡表单双向同步
-    const bindCe = (id, fn) => $(id).addEventListener('input', () => {
+    const bindCe = (id, fn) => $(id)?.addEventListener('input', () => {
       const card = state.workspace?.cards[state.selectedCardIdx];
       if (!card) return;
       fn(card, $(id).value);
@@ -1128,9 +1343,55 @@
     bindCe('ceBaseVisualId', (c, v) => { c.baseVisualTemplateId = v.trim(); });
     bindCe('ceTitleZh', (c, v) => { c.titleZh = v; $('ceHeading').textContent = v || c.customId; });
     bindCe('ceTitleEn', (c, v) => { c.titleEn = v; });
-    bindCe('ceType', (c, v) => { c.type = v; });
-    bindCe('ceSize', (c, v) => { c.size = v; });
+    bindCe('ceType', (c, v) => {
+      c.type = v;
+      if ($('ceAutoPriceChk')?.checked) applyStandardPricesToCard(c);
+      populateCustomCardForm(c);
+    });
+    bindCe('ceSize', (c, v) => {
+      c.size = v;
+      if ($('ceAutoPriceChk')?.checked) applyStandardPricesToCard(c);
+      populateCustomCardForm(c);
+    });
     bindCe('ceStartingTier', (c, v) => { c.startingTier = v; });
+    $('ceSpawnEligibility')?.addEventListener('change', () => {
+      const card = state.workspace?.cards[state.selectedCardIdx];
+      if (!card) return;
+      card.spawningEligibility = $('ceSpawnEligibility').value || 'Always';
+      $('ceGuidOnlyBanner')?.classList.toggle('hidden', card.spawningEligibility !== 'GuidOnly');
+      markDirty(true);
+      renderMineLists();
+      updateLivePreview(card);
+    });
+    $('btnGoLinkInEvent')?.addEventListener('click', () => {
+      switchTab('events');
+      if (state.workspace && (!state.workspace.events || state.workspace.events.length === 0)) {
+        $('btnNewEvent')?.click();
+        toast('已为你新建一个联动奇遇草稿，在下方选项点「🎁 设为奖励这张卡」即可完成联动！');
+      } else {
+        renderEventEditor();
+        toast('在右侧任意奇遇选项里选择你的限定卡并点「🎁 设为奖励这张卡」即可完成联动！');
+      }
+    });
+    $('ceAutoPriceChk')?.addEventListener('change', () => {
+      const card = state.workspace?.cards[state.selectedCardIdx];
+      if (!card) return;
+      const checked = $('ceAutoPriceChk').checked;
+      if (checked) applyStandardPricesToCard(card);
+      markDirty(true);
+      populateCustomCardForm(card);
+      toast(checked ? '已恢复按官方标准买卖价自动计算。' : '已开启手动改价，可在下表自由填写每阶购买与出售金币。');
+    });
+    $('btnRegenCardId')?.addEventListener('click', () => {
+      const card = state.workspace?.cards[state.selectedCardIdx];
+      if (!card || !state.workspace) return;
+      const hint = (card.customId.split(':')[1] || 'card').replace(/_[a-z0-9]{6}$/i, '');
+      card.customId = generateUniqueCardId(state.workspace.manifest.id, hint);
+      $('ceCustomId').value = card.customId;
+      markDirty(true);
+      renderMineLists();
+      toast(`已重新生成防撞编号：${card.customId}`);
+    });
     bindCe('ceHeroes', (c, v) => { c.heroes = v.split(',').map((s) => s.trim()).filter(Boolean); });
     bindCe('ceTags', (c, v) => { c.tags = v.split(',').map((s) => s.trim()).filter(Boolean); });
     bindCe('ceHiddenTags', (c, v) => { c.hiddenTags = v.split(',').map((s) => s.trim()).filter(Boolean); });
@@ -1156,14 +1417,17 @@
       }
       const b = card.tiers.Bronze.attributes;
       const mults = { Silver: 2, Gold: 4, Diamond: 8 };
+      const keepAutoPrice = $('ceAutoPriceChk')?.checked;
       Object.entries(mults).forEach(([t, mult]) => {
         card.tiers[t] = card.tiers[t] || { attributes: {}, abilityIds: Object.keys(card.abilities || {}), auraIds: Object.keys(card.auras || {}) };
         Object.entries(b).forEach(([k, v]) => {
+          if (keepAutoPrice && (k === 'BuyPrice' || k === 'SellPrice')) return;
           if (k === 'CooldownMax') card.tiers[t].attributes[k] = Math.max(1000, v - (mult >= 4 ? 500 : 0));
           else if (k === 'HasteAmount' || k === 'ChargeAmount') card.tiers[t].attributes[k] = v + (mult === 2 ? 200 : mult === 4 ? 500 : 1000);
           else card.tiers[t].attributes[k] = Math.round(v * mult);
         });
       });
+      if (keepAutoPrice) applyStandardPricesToCard(card);
       markDirty(true);
       populateCustomCardForm(card);
       toast('已按标准 1x/2x/4x/8x 阶梯自动推算四阶数值！');
@@ -1424,6 +1688,29 @@
     await loadModsList();
     if (res.data.modId) await openMod(res.data.modId);
   }
+
+  window.WorkshopBridge = {
+    state,
+    $,
+    apiFetch,
+    apiUrl,
+    toast,
+    escapeHtml,
+    markDirty,
+    switchTab,
+    updateCounts,
+    syncCardTierAbilityRefs,
+    renderCardOrPatchEditor,
+    renderMineLists,
+    renderEventEditor,
+    populateCustomCardForm,
+    populatePatchCardForm,
+    updateLivePreview,
+    updateLivePreviewFromPatch,
+    saveDraft,
+    loadMeta,
+    generateUniqueCardId,
+  };
 
   document.addEventListener('DOMContentLoaded', init);
 })();

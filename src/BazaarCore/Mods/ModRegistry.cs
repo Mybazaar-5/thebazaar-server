@@ -34,6 +34,7 @@ public sealed class ModRegistry : IModContentRegistry
         public required IReadOnlyList<ModPackage> LoadedPackages { get; init; }
         public required ModLoadReport Report { get; init; }
         public required FrozenDictionary<string, CustomModeDefinition> CustomModesById { get; init; }
+        public required FrozenDictionary<string, MechanicDefinition> MechanicsById { get; init; }
         public required FrozenDictionary<string, CustomCardVisualBinding> VisualBindingsByCustomId { get; init; }
         public required FrozenDictionary<string, ModAssetEntry> AssetsBySha256 { get; init; }
         public required FrozenDictionary<string, ModAssetEntry> AssetsByModAndPath { get; init; }
@@ -47,6 +48,7 @@ public sealed class ModRegistry : IModContentRegistry
     private readonly List<ICustomActionHandler> _actionHandlers = new();
     private readonly List<ICustomTriggerHandler> _triggerHandlers = new();
     private readonly List<IGameModeHook> _modeHooks = new();
+    private readonly List<ICombatPipelineInterceptor> _pipelineInterceptors = new();
 
     private IReadOnlySet<string>? _validVisualWhitelist;
     private string? _lastModsRoot;
@@ -78,6 +80,9 @@ public sealed class ModRegistry : IModContentRegistry
 
     /// <summary>已注册的自定义游戏模式表。</summary>
     public IReadOnlyDictionary<string, CustomModeDefinition> CustomModesById => _snapshot.CustomModesById;
+
+    /// <summary>已注册的开放声明式沙盒自定义机制表（来自全部已加载 Mod 的 mechanics/*.json）。</summary>
+    public IReadOnlyDictionary<string, MechanicDefinition> MechanicsById => _snapshot.MechanicsById;
 
     /// <summary>全部自定义卡牌/事件的模板级视觉绑定字典。</summary>
     public IReadOnlyDictionary<string, CustomCardVisualBinding> VisualBindingsByCustomId => _snapshot.VisualBindingsByCustomId;
@@ -122,12 +127,20 @@ public sealed class ModRegistry : IModContentRegistry
         lock (_syncLock) _modeHooks.Add(hook);
     }
 
-    /// <summary>将本注册表内登记的全部自定义动作/触发器/模式钩子同步发布到全局 <see cref="ModRuntimeHooks"/>。</summary>
+    /// <inheritdoc />
+    public void RegisterPipelineInterceptor(ICombatPipelineInterceptor interceptor)
+    {
+        ArgumentNullException.ThrowIfNull(interceptor);
+        lock (_syncLock) _pipelineInterceptors.Add(interceptor);
+    }
+
+    /// <summary>将本注册表内登记的全部自定义动作/触发器/模式钩子/管线拦截器同步发布到全局 <see cref="ModRuntimeHooks"/>。</summary>
     public void ApplyRuntimeHooks()
     {
         lock (_syncLock)
         {
-            ModRuntimeHooks.SetHandlers(_actionHandlers, _triggerHandlers, _modeHooks);
+            ModRuntimeHooks.SetHandlers(_actionHandlers, _triggerHandlers, _modeHooks, _pipelineInterceptors);
+            ModRuntimeHooks.SetMechanics(_snapshot.MechanicsById.Values);
         }
     }
 
@@ -323,6 +336,7 @@ public sealed class ModRegistry : IModContentRegistry
         var mergedMonsters = new List<MonsterTemplate>();
         var modLocDocs = new List<LocalizationOverlayDocument>();
         var modesMap = new Dictionary<string, CustomModeDefinition>(StringComparer.OrdinalIgnoreCase);
+        var mechanicsMap = new Dictionary<string, MechanicDefinition>(StringComparer.OrdinalIgnoreCase);
         var visualBindingsMap = new Dictionary<string, CustomCardVisualBinding>(StringComparer.OrdinalIgnoreCase);
         var assetsBySha = new Dictionary<string, ModAssetEntry>(StringComparer.OrdinalIgnoreCase);
         var assetsByModPath = new Dictionary<string, ModAssetEntry>(StringComparer.OrdinalIgnoreCase);
@@ -407,6 +421,16 @@ public sealed class ModRegistry : IModContentRegistry
                     forcesIsolation = true;
             }
 
+            // V14 开放声明式沙盒机制定义
+            foreach (var mech in pkg.Mechanics)
+            {
+                if (!string.IsNullOrWhiteSpace(mech.Id))
+                {
+                    mechanicsMap[mech.Id.Trim()] = mech;
+                    forcesIsolation = true;
+                }
+            }
+
             // 视觉绑定与资产索引（原位 Patch 若有视觉覆盖也一并补齐 CardType/Size）
             foreach (var (cid, binding) in pkg.VisualBindingsByCustomId)
             {
@@ -483,6 +507,7 @@ public sealed class ModRegistry : IModContentRegistry
         report.TotalCustomEvents = totalEvents;
         report.TotalCustomMonsters = mergedMonsters.Count;
         report.TotalCustomModes = modesMap.Count;
+        report.TotalCustomMechanics = mechanicsMap.Count;
         report.TotalAssets = assetsBySha.Count;
         report.ModSetHash = modSetHash;
         report.ForcesGhostPoolIsolation = forcesIsolation;
@@ -497,6 +522,7 @@ public sealed class ModRegistry : IModContentRegistry
             LoadedPackages = validOrdered.AsReadOnly(),
             Report = report,
             CustomModesById = modesMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
+            MechanicsById = mechanicsMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
             VisualBindingsByCustomId = visualBindingsMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
             AssetsBySha256 = assetsBySha.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
             AssetsByModAndPath = assetsByModPath.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
@@ -505,7 +531,8 @@ public sealed class ModRegistry : IModContentRegistry
             ManifestDto = manifestDto
         };
 
-        ModRuntimeHooks.SetHandlers(_actionHandlers, _triggerHandlers, _modeHooks);
+        ModRuntimeHooks.SetHandlers(_actionHandlers, _triggerHandlers, _modeHooks, _pipelineInterceptors);
+        ModRuntimeHooks.SetMechanics(mechanicsMap.Values);
         return report;
     }
 
@@ -537,6 +564,7 @@ public sealed class ModRegistry : IModContentRegistry
             LoadedPackages = Array.Empty<ModPackage>(),
             Report = report,
             CustomModesById = FrozenDictionary<string, CustomModeDefinition>.Empty,
+            MechanicsById = FrozenDictionary<string, MechanicDefinition>.Empty,
             VisualBindingsByCustomId = FrozenDictionary<string, CustomCardVisualBinding>.Empty,
             AssetsBySha256 = FrozenDictionary<string, ModAssetEntry>.Empty,
             AssetsByModAndPath = FrozenDictionary<string, ModAssetEntry>.Empty,

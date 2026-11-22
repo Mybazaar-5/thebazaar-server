@@ -174,7 +174,7 @@ public static partial class ModValidator
             RunGate1Schema(pkg, pkgIssues);
             RunGate2IdsAndNamespace(pkg, baseRepo, globalCustomCardIds, globalCustomModeIds, globalCustomMonsterIds, localCardIds, localModeIds, localMonsterIds, pkgIssues);
             RunGate3VisualWhitelist(pkg, baseRepo, validVisualWhitelist, pkgIssues);
-            RunGate4RuleTypeWhitelist(pkg, pkgIssues);
+            RunGate4RuleTypeWhitelist(pkg, pkgIssues, validPackages);
             RunGate5NumericAndLoopSafety(pkg, baseRepo, pkgIssues);
             RunGate6EncounterDag(pkg, baseRepo, localCardIds, pkgIssues);
             RunGate7LocalizationAndTooltips(pkg, baseRepo, pkgIssues);
@@ -323,10 +323,10 @@ public static partial class ModValidator
             RunGate3VisualWhitelist(targetPkg, baseRepo, validVisualWhitelist, list);
         }));
 
-        // Gate #4: 全量 $type / Trigger / Prerequisite / 属性名递归白名单
-        gates.Add(ExecuteGate(4, "rule_type_whitelist", "闸门 4：全量 $type / 触发器 / 前置条件递归白名单", list =>
+        // Gate #4: 全量 $type / Trigger / Prerequisite / 属性名递归白名单 + 开放自定义沙盒机制审计
+        gates.Add(ExecuteGate(4, "rule_type_whitelist", "闸门 4：全量 $type / 触发器 / 前置条件与自定义机制白名单", list =>
         {
-            RunGate4RuleTypeWhitelist(targetPkg, list);
+            RunGate4RuleTypeWhitelist(targetPkg, list, otherPackages);
         }));
 
         // Gate #5: 冷却 / 数值 / 倍率 / 自充能死循环安全边界
@@ -388,7 +388,13 @@ public static partial class ModValidator
                 gates.Add(ExecuteGate(9, "combat_simulator_stress", "闸门 9：50 场真实 CombatSimulator 压力体检", list =>
                 {
                     var overlayRepo = BuildIsolatedOverlayForPackage(targetPkg, baseRepo);
-                    var (sr, simIssues) = ModCombatStressTester.RunStressTest(targetPkg, overlayRepo, combatMatches, combatSeed);
+                    var candidateMechs = new Dictionary<string, MechanicDefinition>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var op in otherPackages)
+                        foreach (var om in op.Mechanics)
+                            if (!string.IsNullOrWhiteSpace(om.Id)) candidateMechs[om.Id.Trim()] = om;
+                    foreach (var tm in targetPkg.Mechanics)
+                        if (!string.IsNullOrWhiteSpace(tm.Id)) candidateMechs[tm.Id.Trim()] = tm;
+                    var (sr, simIssues) = ModCombatStressTester.RunStressTest(targetPkg, overlayRepo, combatMatches, combatSeed, candidateMechs);
                     stressReport = sr;
                     list.AddRange(simIssues);
                 }));
@@ -787,7 +793,7 @@ public static partial class ModValidator
         }
     }
 
-    private static void RunGate4RuleTypeWhitelist(ModPackage pkg, List<ModValidationIssue> issues)
+    private static void RunGate4RuleTypeWhitelist(ModPackage pkg, List<ModValidationIssue> issues, IReadOnlyList<ModPackage>? contextPackages = null)
     {
         string modId = pkg.Manifest.Id;
         var jsonOpts = GameDatabaseLoader.JsonOptions;
@@ -895,6 +901,60 @@ public static partial class ModValidator
                 }
             }
         }
+
+        // V14 开放自定义沙盒机制静态审计与卡牌引用检查（所有静态问题归入闸门 #4）
+        var knownMechanicIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var globalMechs = ModRuntimeHooks.GetRegisteredMechanics();
+        if (globalMechs != null)
+            foreach (var k in globalMechs.Keys) knownMechanicIds.Add(k);
+        if (contextPackages != null)
+            foreach (var cp in contextPackages)
+                foreach (var cm in cp.Mechanics)
+                    if (!string.IsNullOrWhiteSpace(cm.Id)) knownMechanicIds.Add(cm.Id.Trim());
+
+        var localMechIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int mi = 0; mi < pkg.Mechanics.Count; mi++)
+        {
+            var mech = pkg.Mechanics[mi];
+            if (mech == null) continue;
+            var mechIssues = new List<ModValidationIssue>();
+            MechanicSandboxInterpreter.ValidateStatic(mech, modId, mechIssues);
+            foreach (var iss in mechIssues)
+                issues.Add(iss with { GateId = 4 });
+
+            if (!string.IsNullOrWhiteSpace(mech.Id))
+            {
+                string trimmed = mech.Id.Trim();
+                if (!localMechIds.Add(trimmed))
+                {
+                    issues.Add(new ModValidationIssue(
+                        ModValidationSeverity.Error, modId, "MECHANIC_DUPLICATE_ID",
+                        $"Mod 内存在重复的自定义机制 ID '{trimmed}'。", trimmed, GateId: 4));
+                }
+                knownMechanicIds.Add(trimmed);
+            }
+        }
+
+        void CheckAttachments(string ownerId, List<CardMechanicAttachment>? attachments)
+        {
+            if (attachments == null) return;
+            for (int ai = 0; ai < attachments.Count; ai++)
+            {
+                var att = attachments[ai];
+                if (att == null || !att.Enabled) continue;
+                if (string.IsNullOrWhiteSpace(att.MechanicId) || !knownMechanicIds.Contains(att.MechanicId.Trim()))
+                {
+                    issues.Add(new ModValidationIssue(
+                        ModValidationSeverity.Error, modId, "MECHANIC_REFERENCE_NOT_FOUND",
+                        $"卡牌 '{ownerId}' 挂载了未注册的自定义机制 '{att.MechanicId}'。",
+                        ownerId, GateId: 4,
+                        FixHintZh: "请先在 mechanics/*.json 或工坊「机制工坊」中定义该机制，或确认依赖 Mod 已注册该 ID。"));
+                }
+            }
+        }
+
+        foreach (var c in pkg.Cards) CheckAttachments(c.CustomId, c.CustomMechanics);
+        foreach (var p in pkg.Patches) CheckAttachments(p.TargetTemplateId, p.CustomMechanicsOverride);
     }
 
     private static void CheckPrerequisites(

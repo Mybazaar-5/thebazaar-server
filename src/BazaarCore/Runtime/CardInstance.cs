@@ -125,6 +125,10 @@ public sealed class CardInstance
     public int TimesFiredThisFight { get; set; }
     public bool HasFiredOnce => TimesFiredThisFight > 0;
 
+    /// <summary>V14 开放沙盒机制单场战斗隔离黑板（战后自动清空，零原版副作用）。</summary>
+    public HashSet<string> CombatCustomFlags { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> CombatCustomCounters { get; } = new(StringComparer.OrdinalIgnoreCase);
+
     private static readonly CardTier[] AllCardTiers = Enum.GetValues<CardTier>();
 
     /// <summary>单调递增的属性与光环变更版本号，供战斗快照复用无变动属性以消除热路径重复查表。</summary>
@@ -1088,6 +1092,8 @@ public sealed class CardInstance
         IsDisabled = false;
         IsDestroyed = false;
         TimesFiredThisFight = 0;
+        CombatCustomFlags.Clear();
+        CombatCustomCounters.Clear();
         RefillAmmoToMax();
     }
 

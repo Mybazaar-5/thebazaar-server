@@ -126,6 +126,7 @@ public static class ModLoader
         LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Events, "events"), pkg.Events, "EVENT_JSON_ERROR", "events", issues);
         LoadJsonEntries(pkg, Path.Combine(fullDir, "monsters"), pkg.Monsters, "MONSTER_JSON_ERROR", "monsters", issues);
         LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Modes, "modes"), pkg.Modes, "MODE_JSON_ERROR", "modes", issues, skipMutatorOnlyFiles: true);
+        LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Mechanics, "mechanics"), pkg.Mechanics, "MECHANIC_JSON_ERROR", "mechanics", issues);
 
         // 3. 加载 Mod 自定义中文词典（localization/zh-CN.json）
         LoadLocalizationOverlay(pkg, issues);
@@ -284,6 +285,13 @@ public static class ModLoader
             sb.Append("G:").Append(mode.ModeId).Append('|')
               .Append(mode.BasePreset).Append('|')
               .Append(mode.BaseSpecialMode).Append('\n');
+        }
+
+        foreach (var mech in pkg.Mechanics.OrderBy(m => m.Id, StringComparer.OrdinalIgnoreCase))
+        {
+            string mechRaw = JsonSerializer.Serialize(mech, ModJsonOptions);
+            sb.Append("X:").Append(mech.Id).Append('=')
+              .Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(mechRaw))).ToLowerInvariant()).Append('\n');
         }
 
         foreach (var kv in pkg.AssetsByLogicalPath.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))

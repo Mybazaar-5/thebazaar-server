@@ -1318,6 +1318,7 @@ public static class AbilityExecutor
                         var rawOwner = TargetResolver.FindOwner(rawCard, ctx);
                         var card = ResolveAbsorbTarget(rawCard, rawOwner, ctx.SelfPlayer, "AbsorbDestroy");
                         if (card.GetAttribute("DestroyImmunity") > 0 || IsLegacySyntheticRadiantImmunity(card, ctx) || card.IsDestroyed) continue;
+                        if (ctx.OnBeforeCardStateChange != null && !ctx.OnBeforeCardStateChange(card, sourceCard, "Destroy", "destroy")) continue;
                         var cardOwner = TargetResolver.FindOwner(card, ctx);
                         DispatchDetailed(ctx, "TTriggerOnBeforeCardDestroyed", cardOwner, sourceCard, card, cardOwner);
                         card.IsDestroyed = true;
@@ -1354,6 +1355,8 @@ public static class AbilityExecutor
                         var rawOwner = TargetResolver.FindOwner(rawCard, ctx);
                         var card = ResolveAbsorbTarget(rawCard, rawOwner, ctx.SelfPlayer, "AbsorbDestroy");
                         if (card.GetAttribute("DestroyImmunity") > 0 || IsLegacySyntheticRadiantImmunity(card, ctx) || card.IsDestroyed || card.IsDisabled)
+                            continue;
+                        if (ctx.OnBeforeCardStateChange != null && !ctx.OnBeforeCardStateChange(card, sourceCard, "Disable", "disable"))
                             continue;
                         var cardOwner = TargetResolver.FindOwner(card, ctx);
                         // 战内禁用即官服摧毁语义：先触发 BeforeDestroyed，再置 IsDisabled 并派发 Disabled / PerformedDestruction
@@ -1406,6 +1409,8 @@ public static class AbilityExecutor
                     }
                     foreach (var card in damaged)
                     {
+                        if (ctx.OnBeforeCardStateChange != null && !ctx.OnBeforeCardStateChange(card, sourceCard, "Repair", "repair"))
+                            continue;
                         card.IsDestroyed = false;
                         card.IsDisabled = false;
                         var cardOwner = TargetResolver.FindOwner(card, ctx);
