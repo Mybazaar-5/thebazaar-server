@@ -25,8 +25,9 @@
         "Tool"
       ],
       "hiddenTags": [
-        "Burn",
         "Damage",
+        "Haste",
+        "Charge",
         "Cooldown"
       ],
       "titleZh": "过载蓄能炉",
@@ -455,15 +456,30 @@
           "hasAuras": false
         },
         "Shiny": {
-          "attributes": {
-            "Multicast": 1
-          },
+          "attributes": {},
           "abilities": {},
-          "auras": {},
+          "auras": {
+            "ea0": {
+              "id": "ea0",
+              "activeIn": "HandAndStash",
+              "action": {
+                "$type": "TAuraActionCardModifyAttribute",
+                "attributeType": "Multicast",
+                "operation": "Add",
+                "Value": {
+                  "$type": "TFixedValue",
+                  "value": 1
+                },
+                "target": {
+                  "$type": "TTargetCardSelf"
+                }
+              }
+            }
+          },
           "tags": [],
           "hiddenTags": [],
           "hasAbilities": false,
-          "hasAuras": false
+          "hasAuras": true
         },
         "Deadly": {
           "attributes": {
@@ -481,7 +497,8 @@
         "Radiant": {
           "attributes": {
             "PercentFreezeReduction": 100,
-            "PercentSlowReduction": 100
+            "PercentSlowReduction": 100,
+            "DestroyImmunity": 1
           },
           "abilities": {},
           "auras": {},

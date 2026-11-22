@@ -1529,6 +1529,13 @@ public static partial class ModValidator
                     GateId: 7,
                     FixHintZh: "若希望常规商店正常刷出，请在「所属英雄」中勾选目标英雄或点击「全英雄常规店通用」。"));
             }
+
+            // V14.4 防呆提示：物品勾选了 Burn/Poison/Shield/Heal/Regen 等效果分类隐藏标签，但本体属性/原生动作/自定义机制均无对应施加效果
+            if (string.Equals(card.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                && card.HiddenTags is { Count: > 0 })
+            {
+                CheckItemHiddenTagConsistency(pkg, modId, card, issues);
+            }
         }
 
         foreach (var ev in pkg.Events)
@@ -1573,6 +1580,95 @@ public static partial class ModValidator
         for (int i = 0; i < renderedLine.Length; i++)
         {
             if (renderedLine[i] == '?')
+                return true;
+        }
+        return false;
+    }
+
+    private static readonly (string HiddenTag, string LabelZh, string AttrKey, string[] ActionTypes, string MechanicStatus)[] ItemEffectHiddenTagSpecs =
+    [
+        ("Burn", "灼烧", "BurnApplyAmount", ["TActionPlayerBurnApply"], "Burn"),
+        ("Poison", "剧毒", "PoisonApplyAmount", ["TActionPlayerPoisonApply"], "Poison"),
+        ("Shield", "护盾", "ShieldApplyAmount", ["TActionPlayerShieldApply"], "Shield"),
+        ("Heal", "治疗", "HealAmount", ["TActionPlayerHeal", "TActionPlayerReviveHeal"], "Heal"),
+        ("Regen", "再生", "RegenApplyAmount", ["TActionPlayerRegenApply"], "Regen"),
+    ];
+
+    private static void CheckItemHiddenTagConsistency(
+        ModPackage pkg,
+        string modId,
+        CustomCardDefinition card,
+        List<ModValidationIssue> issues)
+    {
+        foreach (var (hiddenTag, labelZh, attrKey, actionTypes, mechStatus) in ItemEffectHiddenTagSpecs)
+        {
+            if (!card.HiddenTags.Any(t => string.Equals(t, hiddenTag, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            bool hasAttr = (card.Attributes != null && card.Attributes.TryGetValue(attrKey, out var topV) && topV > 0)
+                || (card.Tiers != null && card.Tiers.Values.Any(td => td?.Attributes != null && td.Attributes.TryGetValue(attrKey, out var tv) && tv > 0));
+            if (hasAttr) continue;
+
+            bool hasAction = card.Abilities.Values.Any(ab => RuleNodeContainsAnyType(ab?.Action, actionTypes));
+            if (hasAction) continue;
+
+            bool hasMechanicStatus = false;
+            if (card.CustomMechanics is { Count: > 0 })
+            {
+                var globalMechs = ModRuntimeHooks.GetRegisteredMechanics();
+                foreach (var att in card.CustomMechanics)
+                {
+                    if (att == null || !att.Enabled || string.IsNullOrWhiteSpace(att.MechanicId)) continue;
+                    string mid = att.MechanicId.Trim();
+                    var def = pkg.Mechanics.FirstOrDefault(m => string.Equals(m.Id?.Trim(), mid, StringComparison.OrdinalIgnoreCase))
+                        ?? (globalMechs != null && globalMechs.TryGetValue(mid, out var gm) ? gm : null);
+                    if (def?.Hooks != null && def.Hooks.Any(h => MechanicStepsApplyStatus(h?.Steps, mechStatus)))
+                    {
+                        hasMechanicStatus = true;
+                        break;
+                    }
+                }
+            }
+            if (hasMechanicStatus) continue;
+
+            issues.Add(new ModValidationIssue(
+                ModValidationSeverity.Warning,
+                modId,
+                "HIDDEN_TAG_WITHOUT_MATCHING_EFFECT",
+                $"物品 '{card.CustomId}' 的效果分类勾选了 {hiddenTag}（{labelZh}），但卡牌基础属性、原生技能与自定义机制均未施加{labelZh}效果，局内会被误判为{labelZh}物品并白吃无效加成。",
+                card.CustomId,
+                GateId: 7,
+                FixHintZh: $"若本卡本身不施加{labelZh}，请从 hiddenTags 中移除 \"{hiddenTag}\"（附魔带出的{labelZh}由附魔定义自动提供，无需在本体勾选）。"));
+        }
+    }
+
+    private static bool RuleNodeContainsAnyType(RuleNode? node, string[] targetTypes, int depth = 0)
+    {
+        if (node == null || depth > 8) return false;
+        if (!string.IsNullOrEmpty(node.Type) && targetTypes.Any(t => string.Equals(t, node.Type, StringComparison.OrdinalIgnoreCase)))
+            return true;
+        if (node.Actions is { Count: > 0 })
+        {
+            for (int i = 0; i < node.Actions.Count; i++)
+                if (RuleNodeContainsAnyType(node.Actions[i], targetTypes, depth + 1))
+                    return true;
+        }
+        return false;
+    }
+
+    private static bool MechanicStepsApplyStatus(List<MechanicStep>? steps, string status, int depth = 0)
+    {
+        if (steps == null || depth > 8) return false;
+        for (int i = 0; i < steps.Count; i++)
+        {
+            var s = steps[i];
+            if (s == null) continue;
+            if (string.Equals(s.Op, "ApplyStatus", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(s.Status, status, StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (MechanicStepsApplyStatus(s.Then, status, depth + 1)
+                || MechanicStepsApplyStatus(s.Else, status, depth + 1)
+                || MechanicStepsApplyStatus(s.Steps, status, depth + 1))
                 return true;
         }
         return false;

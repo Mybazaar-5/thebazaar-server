@@ -1966,7 +1966,22 @@
         return {
           tooltipZh: '获得 +1 多重施放（每次冷却连发两轮）',
           data: {
-            attributes: { Multicast: 1 },
+            attributes: {},
+            abilities: {},
+            hasAuras: true,
+            auras: {
+              ea0: {
+                id: 'ea0',
+                activeIn: 'HandAndStash',
+                action: {
+                  $type: 'TAuraActionCardModifyAttribute',
+                  target: { $type: 'TTargetCardSelf' },
+                  attributeType: 'Multicast',
+                  operation: 'Add',
+                  value: { $type: 'TFixedValue', value: 1 },
+                },
+              },
+            },
           },
         };
       case 'Radiant':
@@ -1974,7 +1989,7 @@
           tooltipZh: '免疫冻结、减速与摧毁',
           data: {
             tags: ['Radiant'],
-            attributes: { PercentFreezeReduction: 100, PercentSlowReduction: 100 },
+            attributes: { PercentFreezeReduction: 100, PercentSlowReduction: 100, DestroyImmunity: 1 },
           },
         };
       case 'Golden':

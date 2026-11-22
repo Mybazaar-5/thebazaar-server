@@ -640,4 +640,97 @@ public sealed class V14_2_ModPlatformFixesTests
         union.UnionWith(page1Tpls);
         Assert.Equal(6, union.Count); // 全部 6 件（12 格）战利品 0 丢失！
     }
+
+    [Fact]
+    public void Fix10_ShinyMulticastDefaultBase_CompoundActionCanCrit_AndHiddenTagMismatchWarning()
+    {
+        var fx = Shared.Value;
+        var registry = LoadWorkspaceMods(fx);
+        var overloadTpl = registry.ActiveRepository.GetCard(OverloadCardId)!;
+
+        // 1. 《过载蓄能炉》本体不应再误带 Burn 隐藏标签；附魔 Fiery 后才自动带上 Burn
+        var plainFurnace = new CardInstance(overloadTpl, CardTier.Diamond, null, "itm_plain");
+        Assert.False(plainFurnace.HasHiddenTag("Burn"), "本体不含灼烧动作，不应误带 Burn 隐藏标签");
+        var fieryFurnace = new CardInstance(overloadTpl, CardTier.Diamond, "Fiery", "itm_fiery");
+        Assert.True(fieryFurnace.HasHiddenTag("Burn"), "附魔 Fiery 后应自动携带 Burn 隐藏标签");
+
+        // 2. 闪亮（Shiny）附魔在未显式声明基础 Multicast=1 的自定义卡上必须真正生效为 Multicast=2
+        var shinyFurnace = new CardInstance(overloadTpl, CardTier.Diamond, "Shiny", "itm_shiny");
+        var p1 = new PlayerState("p1", "P1", "Vanessa", 2000, 20, 10, 10);
+        var p2 = new PlayerState("p2", "P2", "Common", 2000, 20, 10, 10);
+        p1.Hand.TryPlaceWithDisplaceOrSwap(shinyFurnace, 2);
+
+        // 同时挂上 Keen Eye（b49dd22b）验证复合动作 TActionAnd 能被 EvaluateCanCrit 正确识别并获得 +8% 暴击
+        var keenEyeTpl = registry.ActiveRepository.GetCard("b49dd22b-ef95-4f7e-954e-556e1e431d4a")!;
+        p1.Skills.Add(new CardInstance(keenEyeTpl, CardTier.Silver, null, "skl_keen_eye"));
+        OutOfCombatController.RecalculateOutOfCombatAuras(p1, registry.ActiveRepository);
+
+        Assert.Equal(2, (int)Math.Round(shinyFurnace.GetAttribute("Multicast")));
+        Assert.True(shinyFurnace.GetAttribute("CritChance") >= 8, $"闪亮过载蓄能炉应能吃到 Keen Eye 暴击光环，实际 CritChance={shinyFurnace.GetAttribute("CritChance")}");
+
+        // 3. 兼容旧版 attributes: { Multicast: 1 } 写法（含原版 Combat Core）同样必须得到 1+1=2
+        var legacyShinyTpl = new CardTemplate
+        {
+            Id = "test:legacy_shiny_item",
+            Type = "Item",
+            Size = "Medium",
+            StartingTier = "Bronze",
+            Tiers = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Bronze"] = new TierData { Attributes = new(StringComparer.OrdinalIgnoreCase) { ["CooldownMax"] = 4000, ["DamageAmount"] = 20 } }
+            },
+            Enchantments = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Shiny"] = new EnchantmentData { Attributes = new(StringComparer.OrdinalIgnoreCase) { ["Multicast"] = 1 } }
+            }
+        };
+        var legacyShinyCard = new CardInstance(legacyShinyTpl, CardTier.Bronze, "Shiny", "itm_legacy_shiny");
+        Assert.Equal(2, (int)Math.Round(legacyShinyCard.GetAttribute("Multicast")));
+
+        // 4. 真实战斗中闪亮钻石过载蓄能炉（3.5s CD）在首次开火时应触发 2 次开火事件（Multicast=2）
+        var simRes = CombatSimulator.Simulate(
+            registry.ActiveRepository,
+            p1,
+            p2,
+            seed: 42,
+            combatType: "PVP",
+            recordTimeline: false,
+            recordEvents: true,
+            syncPermanentChanges: false,
+            modifiers: null,
+            mechanicDefinitionsOverride: registry.MechanicsById);
+        int firstCycleFires = simRes.Events.Count(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == "itm_shiny" && e.TimeMs <= 5000);
+        Assert.True(firstCycleFires >= 2, $"闪亮过载蓄能炉首个冷却周期内应连发 2 次，实际={firstCycleFires}");
+
+        // 5. ModValidator 门禁 7：真实工作区 Mod（含 clockwork-forge）无误勾告警；故意勾错 Burn 且无灼烧动作时给出 HIDDEN_TAG_WITHOUT_MATCHING_EFFECT 告警
+        var realReport = new ModRegistry(fx.BaseRepo, fx.Whitelist).LoadFromDirectory(fx.ModsRoot);
+        Assert.True(realReport.Succeeded);
+        Assert.DoesNotContain(realReport.Issues, i => i.Code == "HIDDEN_TAG_WITHOUT_MATCHING_EFFECT");
+
+        var bogusPkg = new ModPackage
+        {
+            RootDirectory = "<in-memory>",
+            Manifest = new ModManifest { Id = "test-htag-warn", Name = "HiddenTag Warn", Version = "1.0.0" },
+        };
+        bogusPkg.Cards.Add(new CustomCardDefinition
+        {
+            CustomId = "test-htag-warn:fake_burn_sword",
+            BaseVisualTemplateId = ZSwordDonorId,
+            Type = "Item",
+            Size = "Medium",
+            StartingTier = "Bronze",
+            SpawningEligibility = "Always",
+            Heroes = [HeroNames.Vanessa],
+            Tags = ["Weapon"],
+            HiddenTags = ["Burn", "Damage"],
+            TitleZh = "假火刃",
+            DescZh = "测试误勾灼烧效果标签",
+            Tiers = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Bronze"] = new TierData { Attributes = new(StringComparer.OrdinalIgnoreCase) { ["CooldownMax"] = 4000, ["DamageAmount"] = 10, ["BuyPrice"] = 4, ["SellPrice"] = 2 } }
+            }
+        });
+        var bogusReport = new ModRegistry(fx.BaseRepo, fx.Whitelist).LoadPackages([bogusPkg]);
+        Assert.Contains(bogusReport.Issues, i => i.Code == "HIDDEN_TAG_WITHOUT_MATCHING_EFFECT" && i.Severity == ModValidationSeverity.Warning);
+    }
 }

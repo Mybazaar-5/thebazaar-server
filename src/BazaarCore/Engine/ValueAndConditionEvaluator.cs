@@ -624,10 +624,7 @@ public static class ValueAndConditionEvaluator
         if (!string.Equals(card.Template.Type, "Item", StringComparison.OrdinalIgnoreCase)) return false;
         foreach (var ab in card.ActiveAbilities)
         {
-            if (ab.Trigger?.Type == "TTriggerOnCardFired" &&
-                ab.Action?.Type is "TActionPlayerDamage" or "TActionPlayerShieldApply" or "TActionPlayerHeal"
-                    or "TActionPlayerReviveHeal" or "TActionPlayerBurnApply" or "TActionPlayerPoisonApply"
-                    or "TActionPlayerRegenApply")
+            if (ab.Trigger?.Type == "TTriggerOnCardFired" && ActionContainsCritCapableEffect(ab.Action))
             {
                 return true;
             }
@@ -645,6 +642,27 @@ public static class ValueAndConditionEvaluator
                 || card.BaseAttributes.GetValueOrDefault("PoisonApplyAmount", 0) > 0;
         }
 
+        return false;
+    }
+
+    /// <summary>递归检测动作节点（含 TActionAnd 等复合动作容器）是否包含可暴击的攻防/状态数值动作。</summary>
+    private static bool ActionContainsCritCapableEffect(RuleNode? action, int depth = 0)
+    {
+        if (action == null || depth > 8) return false;
+        if (action.Type is "TActionPlayerDamage" or "TActionPlayerShieldApply" or "TActionPlayerHeal"
+            or "TActionPlayerReviveHeal" or "TActionPlayerBurnApply" or "TActionPlayerPoisonApply"
+            or "TActionPlayerRegenApply")
+        {
+            return true;
+        }
+        if (action.Actions is { Count: > 0 })
+        {
+            for (int i = 0; i < action.Actions.Count; i++)
+            {
+                if (ActionContainsCritCapableEffect(action.Actions[i], depth + 1))
+                    return true;
+            }
+        }
         return false;
     }
 

@@ -590,7 +590,18 @@ public sealed class CardInstance
             Template.Enchantments.TryGetValue(Enchantment, out var ench))
         {
             foreach (var (k, v) in ench.Attributes)
-                BaseAttributes[k] = BaseAttributes.GetValueOrDefault(k, 0) + v;
+            {
+                // 物品若未在 Tiers 显式写 "Multicast": 1（如自定义卡或原版 Combat Core），其隐含基础施放次数为 1 而非 0，
+                // 否则 Shiny 附魔写入 attributes.Multicast=+1 会变成 0+1=1 彻底失效。
+                double curBase = BaseAttributes.TryGetValue(k, out var existingBase)
+                    ? existingBase
+                    : (k.Equals("Multicast", StringComparison.OrdinalIgnoreCase)
+                       && string.Equals(Template.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                       && v > 0
+                        ? 1.0
+                        : 0.0);
+                BaseAttributes[k] = curBase + v;
+            }
             foreach (var ab in ench.Abilities.Values)
                 ActiveAbilities.Add(ab);
             foreach (var au in ench.Auras.Values)
@@ -731,21 +742,7 @@ public sealed class CardInstance
                 return SlowMs > 0 ? SlowMs : Math.Max(0, GetRawScalar("Slow"));
         }
 
-        double baseVal;
-        if (c0 is 'S' or 's'
-            && attr.Equals("SellPrice", StringComparison.OrdinalIgnoreCase)
-            && !BaseAttributes.ContainsKey("SellPrice")
-            && Template.Type is "Item" or "Skill")
-        {
-            var effectivePrices = prices ?? DefaultStandardPrices;
-            baseVal = Template.Type == "Skill"
-                ? effectivePrices.GetSkillSellPrice(Tier)
-                : effectivePrices.GetItemSellPrice(Template.CardSize, Tier);
-        }
-        else
-        {
-            baseVal = BaseAttributes.Count > 0 && BaseAttributes.TryGetValue(attr, out var bv) ? bv : 0;
-        }
+        double baseVal = GetEffectiveBaseAttribute(attr, prices);
 
         var sum = baseVal;
         if (PermanentAdd.Count > 0 && PermanentAdd.TryGetValue(attr, out var pa)) sum += pa;
@@ -788,11 +785,42 @@ public sealed class CardInstance
         return value;
     }
 
+    /// <summary>
+    /// 计算属性的纯基线值（由 GetAttribute 与 GetAttributeRaw / ModifyAttribute("Set") 共享，严格不依赖修改层，确保 Add/Set/Multiply 幂等）。
+    /// </summary>
+    private double GetEffectiveBaseAttribute(string attr, StandardPricesSettings? prices = null)
+    {
+        if (BaseAttributes.Count > 0 && BaseAttributes.TryGetValue(attr, out var bv))
+            return bv;
+
+        char c0 = attr[0];
+        if (c0 is 'S' or 's'
+            && attr.Equals("SellPrice", StringComparison.OrdinalIgnoreCase)
+            && Template.Type is "Item" or "Skill")
+        {
+            var effectivePrices = prices ?? DefaultStandardPrices;
+            return Template.Type == "Skill"
+                ? effectivePrices.GetSkillSellPrice(Tier)
+                : effectivePrices.GetItemSellPrice(Template.CardSize, Tier);
+        }
+
+        if (c0 is 'M' or 'm'
+            && attr.Equals("Multicast", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(Template.Type, "Item", StringComparison.OrdinalIgnoreCase)
+            && BaseAttributes.GetValueOrDefault("CooldownMax", 0) > 0)
+        {
+            // 主动冷却物品（含未显式写 Multicast:1 的 53+ 张原版卡与自定义卡）隐含基础施放次数恒为 1
+            return 1.0;
+        }
+
+        return 0;
+    }
+
     private double GetRawScalar(string attr) => GetAttributeRaw(attr);
 
     private double GetAttributeRaw(string attr)
     {
-        double sum = BaseAttributes.Count > 0 ? BaseAttributes.GetValueOrDefault(attr, 0) : 0;
+        double sum = GetEffectiveBaseAttribute(attr);
         if (PermanentAdd.Count > 0 && PermanentAdd.TryGetValue(attr, out var pa)) sum += pa;
         if (HourAdd.Count > 0 && HourAdd.TryGetValue(attr, out var ha)) sum += ha;
         if (DayAdd.Count > 0 && DayAdd.TryGetValue(attr, out var da)) sum += da;
