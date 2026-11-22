@@ -1907,7 +1907,7 @@ public sealed class ShopEngine
         {
             if (entry.Owner != ECombatantId.Player || entry.Type is not (ECardType.Item or ECardType.Skill)) continue;
             if (entry.CoreCard is { IsDestroyed: true }) continue;
-            Record(entry.TemplateId.ToString(), ToCoreTier(entry.Tier));
+            Record(RunState.ResolveCoreTemplateId(entry), ToCoreTier(entry.Tier));
         }
 
         if (playerState != null)
@@ -1959,7 +1959,7 @@ public sealed class ShopEngine
         {
             if (entry.Owner != ECombatantId.Player || entry.Type != ECardType.Skill) continue;
             if (entry.CoreCard is { IsDestroyed: true }) continue;
-            Record(entry.TemplateId.ToString(), entry.Tier);
+            Record(RunState.ResolveCoreTemplateId(entry), entry.Tier);
         }
 
         if (playerState != null)
@@ -2391,6 +2391,9 @@ public sealed class ShopEngine
         if (_monsterLootPages.Count > 0)
             DealMonsterLootPage(0, events);
 
+        if (hasMultiplePages)
+            events.Add(new GameSimEventRunRerollCostChanged(_run.RerollCost));
+
         events.Add(new GameSimEventStateTransitioned(ERunState.Loot, _run.CurrentEncounterId));
         return events;
     }
@@ -2458,10 +2461,12 @@ public sealed class ShopEngine
         events = ClearShelfInternal(clearMonsterLootPages: false);
         CurrentMonsterLootPageIndex = (CurrentMonsterLootPageIndex + 1) % _monsterLootPages.Count;
         _run.MonsterLootPageIndex = CurrentMonsterLootPageIndex;
-        CurrentMaxSelections = 1;
+        if (CurrentMaxSelections <= 0)
+            CurrentMaxSelections = 1;
         _run.RerollCost = 0;
         _run.RerollsRemaining = UnlimitedRerollsCount;
         DealMonsterLootPage(CurrentMonsterLootPageIndex, events);
+        events.Add(new GameSimEventRunRerollCostChanged(_run.RerollCost));
         return true;
     }
 

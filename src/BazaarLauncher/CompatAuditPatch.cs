@@ -226,6 +226,7 @@ internal static partial class CompatAuditPatch
 
         PatchEncounterController(harmony);
         PatchPrizePassChallengesGuard(harmony);
+        PatchLootPaginatedReroll(harmony);
     }
 
     internal static void Apply(Harmony harmony)

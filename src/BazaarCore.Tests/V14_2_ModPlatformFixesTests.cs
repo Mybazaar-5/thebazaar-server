@@ -11,6 +11,7 @@ using BazaarGameShared.Domain.Core.Types;
 using BazaarGameShared.Domain.Runs;
 using BazaarGameShared.Infra.Commands;
 using BazaarGameShared.Infra.Messages.CombatSimEvents;
+using BazaarGameShared.Infra.Messages.GameSimEvents;
 using BazaarServer.Data;
 using BazaarServer.Game;
 
@@ -513,5 +514,130 @@ public sealed class V14_2_ModPlatformFixesTests
         Assert.Equal(24, furnaceEntry.Attributes[ECardAttributeType.DamageAmount]);
         Assert.Equal(24, furnaceEntry.PendingForceSyncAttributes[ECardAttributeType.DamageAmount]);
         Assert.Contains(furnaceEntry.InstanceId, fuseOutcome.DirtyCardIds);
+    }
+
+    [Fact]
+    public void Fix8_CustomCardShopSpawnRateIsFairUnownedAndRespectsOwnedTier_AndDonorIsolated()
+    {
+        var fx = Shared.Value;
+        var registry = LoadWorkspaceMods(fx);
+        var modPool = CardPool.FromRepository(registry.ActiveRepository, fx.DataDir, fx.Whitelist, registry.VisualBindingsByCustomId);
+
+        const string jayJayId = "85db60ee-3619-4e39-bfb2-2f4ac56f172b";
+        var run = new RunState
+        {
+            RunId = "test_spawn_rate",
+            Hero = EHero.Vanessa,
+            Day = 1,
+            Hour = 1,
+            State = ERunState.Encounter,
+            CurrentEncounterId = jayJayId,
+        };
+        var shop = new ShopEngine(run, modPool, registry.ActiveRepository);
+
+        // 1. Day 1 未持有时：模拟 600 次 Jay Jay 商店抽卡，核验自定义卡《过载蓄能炉》与同级别原版中卡享有完全公平的出现概率
+        int day1OverloadHits = 0;
+        int day1CutlassHits = 0;
+        for (int i = 0; i < 600; i++)
+        {
+            shop.DealEncounterShelf(jayJayId, isReroll: i > 0);
+            foreach (var iid in run.SelectionSet)
+            {
+                if (!run.Cards.TryGetValue(iid, out var ce)) continue;
+                string coreId = RunState.ResolveCoreTemplateId(ce);
+                if (string.Equals(coreId, OverloadCardId, StringComparison.OrdinalIgnoreCase))
+                    day1OverloadHits++;
+                else if (string.Equals(coreId, CutlassId, StringComparison.OrdinalIgnoreCase))
+                    day1CutlassHits++;
+            }
+        }
+        // Day 1 瓦妮莎青铜合法池约 58 张，每滚 3 格理论均值 ≈ 31 次/600 滚，统计下界保守取 >= 12 次
+        Assert.True(
+            day1OverloadHits >= 12,
+            $"Day 1 未持有《过载蓄能炉》600 次 Jay Jay 商店刷新命中次数偏低: overload={day1OverloadHits}, cutlass={day1CutlassHits}");
+
+        // 2. BuildOwnedMaxTiers 必须记录 CustomCardId 而非原版载体 GUID（防止持有自定义卡误封锁原版 Z-Sword）
+        var overloadTpl = registry.ActiveRepository.GetCard(OverloadCardId)!;
+        var ownedDiamondCustom = new RunState.CardEntry
+        {
+            InstanceId = "itm_owned_diamond_overload",
+            TemplateId = Guid.Parse(ZSwordDonorId),
+            CustomCardId = OverloadCardId,
+            Type = ECardType.Item,
+            Size = ECardSize.Medium,
+            Tier = ETier.Diamond,
+            Owner = ECombatantId.Player,
+            Section = EInventorySection.Hand,
+            Socket = EContainerSocketId.Socket_3,
+            CoreCard = new CardInstance(overloadTpl, CardTier.Diamond, null, "itm_owned_diamond_overload"),
+        };
+        run.Cards[ownedDiamondCustom.InstanceId] = ownedDiamondCustom;
+        var ownedTiers = ShopEngine.BuildOwnedMaxTiers(run);
+        Assert.True(ownedTiers.TryGetValue(OverloadCardId, out var recordedCustomTier));
+        Assert.Equal(CardTier.Diamond, recordedCustomTier);
+        Assert.False(ownedTiers.ContainsKey(ZSwordDonorId), "持有自定义卡绝不应在 BuildOwnedMaxTiers 中污染原版载体 GUID");
+    }
+
+    [Fact]
+    public void Fix9_PaginatedMonsterLootOver10Slots_EmitsRerollCostChangedAndCyclesAllPages()
+    {
+        var fx = Shared.Value;
+        var registry = LoadWorkspaceMods(fx);
+        var modPool = CardPool.FromRepository(registry.ActiveRepository, fx.DataDir, fx.Whitelist, registry.VisualBindingsByCustomId);
+        var engine = CreateEngine(fx, registry.ActiveRepository, modPool, out var run);
+        run.CustomRules.MonsterLootChooseOne = true;
+        run.CustomRules.MonsterLootBonusChoices = 1; // 允许 2 选，验证翻页不覆盖多选次数
+
+        // 构造一只总掉落超过 10 格（6 件 Medium = 12 格）的野怪，验证自动分页 + 下发免费刷新事件 + 翻页完整呈现第 2 页奖励
+        var medItems = modPool.OfType("Item")
+            .Where(t => modPool.IsPlayerSpawnable(t, allowGuidOnly: false)
+                     && string.Equals(t.Size, "Medium", StringComparison.OrdinalIgnoreCase))
+            .Take(6)
+            .ToList();
+        Assert.Equal(6, medItems.Count);
+
+        var bigMonster = new BazaarServer.Data.MonsterTemplate
+        {
+            Id = "test_big_loot_monster",
+            InternalName = "Test Big Loot Monster",
+            Level = 5,
+            Items = medItems.Select((t, idx) => new BazaarServer.Data.MonsterTemplate.MonsterItem
+            {
+                SocketId = $"Socket_{idx}",
+                TemplateId = t.Id,
+                Tier = t.StartingTier,
+            }).ToList(),
+        };
+
+        var shopField = typeof(RunEngine).GetField("_shop", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var shop = (ShopEngine)shopField.GetValue(engine)!;
+
+        var dealEvents = shop.PreparePaginatedMonsterLoot(bigMonster, combatEncounterTpl: null, p1Core: null);
+        Assert.True(shop.MonsterLootPages.Count >= 2, $"12 格战利品应拆分为至少 2 页，实际={shop.MonsterLootPages.Count}");
+        Assert.Equal(ERunState.Loot, run.State);
+        Assert.Equal(0u, run.RerollCost);
+        Assert.Equal(ShopEngine.UnlimitedRerollsCount, run.RerollsRemaining);
+        Assert.Equal(2, shop.CurrentMaxSelections);
+        Assert.Contains(dealEvents, e => e is GameSimEventRunRerollCostChanged rc && rc.NewCost == 0);
+
+        var page0Tpls = run.SelectionSet
+            .Select(id => run.Cards[id].TemplateId.ToString())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // 点击免费刷新翻页至第 2 页
+        var rerollOutcome = engine.Handle(new RerollCommand());
+        Assert.Null(rerollOutcome.Error);
+        Assert.Equal(1, shop.CurrentMonsterLootPageIndex);
+        Assert.Equal(2, shop.CurrentMaxSelections); // 翻页后保留多选次数
+        Assert.Contains(rerollOutcome.Events, e => e is GameSimEventRunRerollCostChanged rc && rc.NewCost == 0);
+
+        var page1Tpls = run.SelectionSet
+            .Select(id => run.Cards[id].TemplateId.ToString())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        Assert.NotEmpty(page1Tpls);
+        var union = new HashSet<string>(page0Tpls, StringComparer.OrdinalIgnoreCase);
+        union.UnionWith(page1Tpls);
+        Assert.Equal(6, union.Count); // 全部 6 件（12 格）战利品 0 丢失！
     }
 }

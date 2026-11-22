@@ -1987,7 +1987,7 @@ public sealed class RunEngine
         if (_runEnded)
             return NotAllowed($"对局已结束（{_run.State}），无法刷新");
 
-        if (_run.State == ERunState.Loot && _run.CustomRules.MonsterLootChooseOne)
+        if (_run.State == ERunState.Loot && (_run.CustomRules.MonsterLootChooseOne || _shop.MonsterLootPages.Count > 1 || _run.MonsterLootPages.Count > 1))
         {
             if (!_shop.TryCycleMonsterLootPage(out var pageEvents))
                 return NotAllowed("当前野怪战利品没有更多可翻页的选项");
