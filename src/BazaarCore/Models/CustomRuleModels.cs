@@ -629,6 +629,10 @@ public sealed class CustomRunRuleSet
     [JsonPropertyName("disableFatesRevive")]
     public bool DisableFatesRevive { get; set; } = false;
 
+    /// <summary>本局或锦标赛房间额外选用的服务器/社区 Mod ID 列表（仅在本局/本房生效，不污染他人标准对局与标准幽灵池）。</summary>
+    [JsonPropertyName("selectedModIds")]
+    public List<string> SelectedModIds { get; set; } = new();
+
     [JsonIgnore]
     public GamePlayMode PlayModeCategory => PresetCatalog.ToGamePlayMode(SpecialModeId);
 
@@ -702,7 +706,8 @@ public sealed class CustomRunRuleSet
             (StartingSkills == null || StartingSkills.Count == 0);
 
         bool noLootOrBanMods =
-            BannedEncounterIds == null || BannedEncounterIds.Count == 0;
+            (BannedEncounterIds == null || BannedEncounterIds.Count == 0) &&
+            (SelectedModIds == null || SelectedModIds.Count == 0);
 
         bool multipliersInStandardRange =
             EncounterCategoryMultipliers == null ||
@@ -785,7 +790,8 @@ public sealed class CustomRunRuleSet
             MonsterLootBonusChoices = Math.Clamp(MonsterLootBonusChoices, 0, 5),
             MonsterLootTierBonus = Math.Clamp(MonsterLootTierBonus, 0, 3),
             EnemyStatMultiplier = ClampFinite(EnemyStatMultiplier, 0.25, 10.0, 1.0),
-            DisableFatesRevive = DisableFatesRevive
+            DisableFatesRevive = DisableFatesRevive,
+            SelectedModIds = CloneDistinctIds(SelectedModIds, maxCount: 16)
         };
 
         return normalized;
@@ -837,7 +843,7 @@ public sealed class CustomRunRuleSet
         return result;
     }
 
-    private static List<string> CloneDistinctIds(List<string>? source)
+    private static List<string> CloneDistinctIds(List<string>? source, int maxCount = 64)
     {
         var result = new List<string>();
         if (source == null)
@@ -851,7 +857,11 @@ public sealed class CustomRunRuleSet
 
             var trimmed = id.Trim();
             if (seen.Add(trimmed))
+            {
                 result.Add(trimmed);
+                if (result.Count >= maxCount)
+                    break;
+            }
         }
 
         return result;

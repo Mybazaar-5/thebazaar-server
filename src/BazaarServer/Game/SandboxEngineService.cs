@@ -3,8 +3,10 @@ using BazaarCore.Combat;
 using BazaarCore.Data;
 using BazaarCore.Engine;
 using BazaarCore.Models;
+using BazaarCore.Mods;
 using BazaarCore.Runtime;
 using BazaarGameShared.Domain.Core.Types;
+using BazaarGameShared.Infra.Messages.GameSimEvents;
 using BazaarServer.Data;
 using BazaarServer.Endpoints;
 using BazaarServer.Mods;
@@ -58,10 +60,10 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         try
         {
             var run = handle.Run;
-            var repo = _modHost.ActiveRepository;
+            var (repo, pool) = ResolveSandboxContext(handle);
             var coreTpl = ResolveCardTemplate(repo, req.TemplateId);
             if (coreTpl == null)
-                return new SandboxOpResult(false, $"未找到卡牌模板：{req.TemplateId}");
+                return new SandboxOpResult(false, BuildTemplateNotFoundMessage(req.TemplateId));
 
             if (!string.Equals(coreTpl.Type, "Item", StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(coreTpl.Type, "Skill", StringComparison.OrdinalIgnoreCase))
@@ -69,11 +71,23 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
                 return new SandboxOpResult(false, $"沙盒直发仅支持 Item 或 Skill 类型，当前模板类型为 {coreTpl.Type}");
             }
 
-            var (granted, grantErr, entry) = GrantCoreCardIntoRun(run, repo, coreTpl, req);
+            ushort slotsBefore = run.UnlockedSlots;
+            var (granted, grantErr, entry, displacedOthers) = GrantCoreCardIntoRun(run, repo, pool, coreTpl, req);
             if (!granted || entry == null)
                 return new SandboxOpResult(false, grantErr ?? "发放卡牌失败");
 
-            handle.Engine.SyncAfterExternalMutation();
+            if (run.UnlockedSlots != slotsBefore)
+            {
+                run.PendingExternalSyncEvents.Add(new GameSimEventSocketsUnlocked(
+                    new HashSet<EContainerSocketId>(Enum.GetValues<EContainerSocketId>()),
+                    run.UnlockedSlots,
+                    EInventorySection.Hand));
+            }
+            AppendSpawnEvents(run.PendingExternalSyncEvents, entry);
+            if (displacedOthers)
+                run.PendingExternalForceStateSync = true;
+
+            handle.Engine.SyncAfterExternalMutation(run.PendingExternalSyncEvents);
             PersistSandboxRun(run, accountId);
 
             return new SandboxOpResult(
@@ -99,14 +113,15 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         try
         {
             var run = handle.Run;
-            var repo = _modHost.ActiveRepository;
+            var (repo, _) = ResolveSandboxContext(handle);
             if (!run.Cards.TryGetValue(req.InstanceId.Trim(), out var entry) || entry.Owner != ECombatantId.Player)
                 return new SandboxOpResult(false, $"未找到玩家持有的卡牌实例：{req.InstanceId}");
 
             if (req.RemoveCard)
             {
                 RemoveOwnedCardFromRun(run, entry);
-                handle.Engine.SyncAfterExternalMutation();
+                run.PendingExternalSyncEvents.Add(new GameSimEventCardDisposed(entry.InstanceId, ECardDisposalReason.Cleared));
+                handle.Engine.SyncAfterExternalMutation(run.PendingExternalSyncEvents);
                 PersistSandboxRun(run, accountId);
                 return new SandboxOpResult(true, $"已移除卡牌 {entry.InstanceId}", BuildBoardSnapshotDto(run, repo));
             }
@@ -156,7 +171,8 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             }
 
             run.SyncEntryFromCoreCardAndDiff(entry, repo.GameMode.StandardPrices, emitAuraRefreshEvent: false);
-            handle.Engine.SyncAfterExternalMutation();
+            run.PendingExternalForceStateSync = true;
+            handle.Engine.SyncAfterExternalMutation(run.PendingExternalSyncEvents);
             PersistSandboxRun(run, accountId);
 
             return new SandboxOpResult(
@@ -179,9 +195,18 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         try
         {
             var run = handle.Run;
-            var repo = _modHost.ActiveRepository;
+            var (repo, _) = ResolveSandboxContext(handle);
+            ushort slotsBefore = run.UnlockedSlots;
             ApplyStatsToRun(run, req);
-            handle.Engine.SyncAfterExternalMutation();
+            if (run.UnlockedSlots != slotsBefore)
+            {
+                run.PendingExternalSyncEvents.Add(new GameSimEventSocketsUnlocked(
+                    new HashSet<EContainerSocketId>(Enum.GetValues<EContainerSocketId>()),
+                    run.UnlockedSlots,
+                    EInventorySection.Hand));
+            }
+            run.PendingExternalForceStateSync = true;
+            handle.Engine.SyncAfterExternalMutation(run.PendingExternalSyncEvents);
             PersistSandboxRun(run, accountId);
 
             return new SandboxOpResult(true, "已更新沙盒玩家数值状态", BuildBoardSnapshotDto(run, repo));
@@ -201,7 +226,7 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         try
         {
             var run = handle.Run;
-            var repo = _modHost.ActiveRepository;
+            var (repo, _) = ResolveSandboxContext(handle);
             int seed = req.Seed is int s && s != 0 ? s : Random.Shared.Next(1, int.MaxValue);
             string source = string.IsNullOrWhiteSpace(req.OpponentSource)
                 ? "self_mirror"
@@ -351,7 +376,8 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         try
         {
             var run = handle.Run;
-            var repo = _modHost.ActiveRepository;
+            var (repo, pool) = ResolveSandboxContext(handle);
+            ushort slotsBefore = run.UnlockedSlots;
 
             // 清空现有玩家卡牌与网格，强制开放全部 10 格手牌位
             var ownedIds = run.Cards.Values
@@ -359,12 +385,22 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
                 .Select(c => c.InstanceId)
                 .ToList();
             foreach (string oid in ownedIds)
+            {
                 run.Cards.Remove(oid);
+                run.PendingExternalSyncEvents.Add(new GameSimEventCardDisposed(oid, ECardDisposalReason.Cleared));
+            }
             run.HandGrid.Cards.Clear();
             run.StashGrid.Cards.Clear();
             run.UnlockedSlots = 0b11_1111_1111;
             run.HandGrid.UnlockedMask = run.UnlockedSlots;
             run.StashGrid.UnlockedMask = 0b11_1111_1111;
+            if (run.UnlockedSlots != slotsBefore)
+            {
+                run.PendingExternalSyncEvents.Add(new GameSimEventSocketsUnlocked(
+                    new HashSet<EContainerSocketId>(Enum.GetValues<EContainerSocketId>()),
+                    run.UnlockedSlots,
+                    EInventorySection.Hand));
+            }
 
             if (req.Stats != null)
                 ApplyStatsToRun(run, req.Stats);
@@ -376,16 +412,21 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
                 {
                     var tpl = ResolveCardTemplate(repo, cardReq.TemplateId);
                     if (tpl == null) continue;
-                    var (gOk, _, _) = GrantCoreCardIntoRun(run, repo, tpl, cardReq);
-                    if (gOk) grantedCount++;
+                    var (gOk, _, gEntry, _) = GrantCoreCardIntoRun(run, repo, pool, tpl, cardReq);
+                    if (gOk && gEntry != null)
+                    {
+                        AppendSpawnEvents(run.PendingExternalSyncEvents, gEntry);
+                        grantedCount++;
+                    }
                 }
             }
             else
             {
-                grantedCount = PopulateBuiltInPresetBoard(run, repo, req.PresetName);
+                grantedCount = PopulateBuiltInPresetBoard(run, repo, pool, req.PresetName, run.PendingExternalSyncEvents);
             }
 
-            handle.Engine.SyncAfterExternalMutation();
+            run.PendingExternalForceStateSync = true;
+            handle.Engine.SyncAfterExternalMutation(run.PendingExternalSyncEvents);
             PersistSandboxRun(run, accountId);
 
             return new SandboxOpResult(
@@ -429,22 +470,131 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         return (true, null, session, handle);
     }
 
+    private (GameDataRepository Repo, CardPool Pool) ResolveSandboxContext(SessionRegistry.Handle handle)
+    {
+        var run = handle.Run;
+        var selected = run.CustomRules?.SelectedModIds;
+        if (selected is { Count: > 0 })
+        {
+            var ctx = _modHost.ResolveRunModContext(
+                selected,
+                _pool,
+                handle.Engine.ActiveMonsters,
+                handle.Engine.ActiveArchetypeIndex ?? CardArchetypeIndex.Build(_pool, _modHost.ActiveRepository));
+            return (ctx.Repository, ctx.Pool);
+        }
+
+        // 未勾选额外 Mod 时优先复用当前热重载后的全局上下文，同时兼容引擎自身注入的隔离仓库
+        var activeRepo = _modHost.ActiveRepository;
+        var engineRepo = handle.Engine.ActiveRepository;
+        if (engineRepo != null && engineRepo.CardsById.Count > activeRepo.CardsById.Count)
+            return (engineRepo, handle.Engine.ActivePool);
+        return (activeRepo, _pool);
+    }
+
+    private static void AppendSpawnEvents(List<IGameSimEvent> events, RunState.CardEntry entry)
+    {
+        events.Add(new GameSimEventCardSpawned(
+            entry.InstanceId,
+            entry.TemplateId.ToString(),
+            entry.Type,
+            ECombatantId.Player,
+            entry.Section,
+            entry.Socket));
+
+        if (entry.Type == ECardType.Skill)
+        {
+            events.Add(new GameSimEventPlayerSkillEquipped(entry.InstanceId, ECombatantId.Player));
+        }
+    }
+
     private static BazaarCore.Models.CardTemplate? ResolveCardTemplate(GameDataRepository repo, string idOrName)
     {
         string key = idOrName.Trim();
+        if (string.IsNullOrEmpty(key)) return null;
+
+        // 1. 完整 ID 精确匹配（包含原版 GUID 与 modId:itemId）
         var exact = repo.GetCard(key);
         if (exact != null) return exact;
 
-        return repo.CardsById.Values.FirstOrDefault(c =>
-            (string.Equals(c.Type, "Item", StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(c.Type, "Skill", StringComparison.OrdinalIgnoreCase)) &&
-            (string.Equals(c.InternalName, key, StringComparison.OrdinalIgnoreCase) ||
-             c.InternalName.Contains(key, StringComparison.OrdinalIgnoreCase)));
+        var candidates = repo.CardsById.Values
+            .Where(c => string.Equals(c.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(c.Type, "Skill", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        // 2. 去掉命名空间前缀后的短 ID 精确匹配（如 starport_compass_blade / z_sword_custom_d83alo）
+        string suffix = ":" + key;
+        var byShortId = candidates.FirstOrDefault(c =>
+            c.Id.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+        if (byShortId != null) return byShortId;
+
+        // 3. 本地化中文名精确匹配，其次包含匹配
+        BazaarCore.Models.CardTemplate? byLocalizedContains = null;
+        foreach (var c in candidates)
+        {
+            string? title = repo.Localization.GetLocalizedText(c.Localization?.Title)?.Trim();
+            if (string.IsNullOrWhiteSpace(title)) continue;
+            if (string.Equals(title, key, StringComparison.OrdinalIgnoreCase))
+                return c;
+            if (byLocalizedContains == null && title.Contains(key, StringComparison.OrdinalIgnoreCase))
+                byLocalizedContains = c;
+        }
+        if (byLocalizedContains != null) return byLocalizedContains;
+
+        // 4. InternalName 精确匹配，其次包含匹配
+        return candidates.FirstOrDefault(c => string.Equals(c.InternalName, key, StringComparison.OrdinalIgnoreCase))
+            ?? candidates.FirstOrDefault(c => !string.IsNullOrWhiteSpace(c.InternalName) && c.InternalName.Contains(key, StringComparison.OrdinalIgnoreCase));
     }
 
-    private (bool Ok, string? Error, RunState.CardEntry? Entry) GrantCoreCardIntoRun(
+    private string BuildTemplateNotFoundMessage(string idOrName)
+    {
+        string key = idOrName.Trim();
+        string suffix = ":" + key;
+
+        // 检查已发现但未启用的服务器 Mod 包与社区库 Mod 包，给出直接可操作的中文提示
+        var candidatePackages = new List<ModPackage>();
+        var seenPkgIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var pkg in _modHost.DiscoveredPackages)
+        {
+            if (seenPkgIds.Add(pkg.Manifest.Id))
+                candidatePackages.Add(pkg);
+        }
+        if (_modHost.CommunityStore != null)
+        {
+            foreach (var item in _modHost.CommunityStore.ListCatalog(null, isAdmin: false))
+            {
+                if (!seenPkgIds.Add(item.ModId)) continue;
+                var pkg = _modHost.CommunityStore.ResolvePackage(item.ModId);
+                if (pkg != null) candidatePackages.Add(pkg);
+            }
+        }
+
+        foreach (var pkg in candidatePackages)
+        {
+            foreach (var card in pkg.Cards)
+            {
+                string cid = card.CustomId?.Trim() ?? string.Empty;
+                string titleZh = card.TitleZh?.Trim() ?? string.Empty;
+                bool matched = string.Equals(cid, key, StringComparison.OrdinalIgnoreCase)
+                    || (!string.IsNullOrEmpty(cid) && cid.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                    || (!string.IsNullOrEmpty(titleZh) && (string.Equals(titleZh, key, StringComparison.OrdinalIgnoreCase) || titleZh.Contains(key, StringComparison.OrdinalIgnoreCase)));
+                if (matched)
+                {
+                    string modName = string.IsNullOrWhiteSpace(pkg.Manifest.Name) ? pkg.Manifest.Id : pkg.Manifest.Name;
+                    string cardLabel = !string.IsNullOrWhiteSpace(titleZh) ? titleZh : cid;
+                    return $"未找到卡牌「{key}」：该卡「{cardLabel}」属于未在本局启用的 Mod「{modName}（{pkg.Manifest.Id}）」，请先在工坊/Mod 中心启用该 Mod 或在开局勾选后再发卡。";
+                }
+            }
+        }
+
+        return $"未找到卡牌模板：{idOrName}";
+    }
+
+    private static (bool Ok, string? Error, RunState.CardEntry? Entry, bool DisplacedOthers) GrantCoreCardIntoRun(
         RunState run,
         GameDataRepository repo,
+        CardPool pool,
         BazaarCore.Models.CardTemplate coreTpl,
         SandboxGrantCardRequest req)
     {
@@ -459,12 +609,12 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             enchName = parsedEnch.ToString();
         }
 
-        string safeWireId = _pool.ResolveSafeWireTemplateId(coreTpl.Id);
+        string safeWireId = pool.ResolveSafeWireTemplateId(coreTpl.Id);
         if (!Guid.TryParse(safeWireId, out var wireGuid) || wireGuid == Guid.Empty)
         {
-            var fallback = isSkill ? _pool.AllSkills.FirstOrDefault() : _pool.AllItems.FirstOrDefault();
-            if (fallback == null || !Guid.TryParse(_pool.ResolveSafeWireTemplateId(fallback.Id), out wireGuid))
-                return (false, "无法为该卡牌解析合法的客户端视觉载体模板", null);
+            var fallback = isSkill ? pool.AllSkills.FirstOrDefault() : pool.AllItems.FirstOrDefault();
+            if (fallback == null || !Guid.TryParse(pool.ResolveSafeWireTemplateId(fallback.Id), out wireGuid))
+                return (false, "无法为该卡牌解析合法的客户端视觉载体模板", null, false);
         }
 
         string? customCardId = !string.Equals(coreTpl.Id, wireGuid.ToString(), StringComparison.OrdinalIgnoreCase)
@@ -478,6 +628,7 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
 
         EInventorySection? section = null;
         EContainerSocketId? socket = null;
+        bool displacedOthers = false;
 
         if (!isSkill)
         {
@@ -490,6 +641,8 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             var secondary = preferStash ? run.HandGrid : run.StashGrid;
             EInventorySection primarySec = preferStash ? EInventorySection.Stash : EInventorySection.Hand;
             EInventorySection secondarySec = preferStash ? EInventorySection.Hand : EInventorySection.Stash;
+
+            var beforeSlots = primary.Cards.ToDictionary(c => c.InstanceId, c => c.StartSlot, StringComparer.Ordinal);
 
             bool placed = false;
             if (req.PreferredSlot is int slot && slot is >= 0 and <= 9 && primary.CountFreeUnlockedSlots() >= coreCard.SlotWidth)
@@ -504,6 +657,17 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             {
                 section = primarySec;
                 socket = (EContainerSocketId)Math.Clamp(coreCard.StartSlot, 0, 9);
+                // 同步因挤位/换位发生槽位变化的已有卡牌，避免 RunState 与 Grid 失配
+                foreach (var moved in primary.Cards)
+                {
+                    if (moved.InstanceId == instId) continue;
+                    if (beforeSlots.TryGetValue(moved.InstanceId, out int oldSlot) && oldSlot != moved.StartSlot)
+                    {
+                        displacedOthers = true;
+                        if (run.Cards.TryGetValue(moved.InstanceId, out var movedEntry))
+                            movedEntry.Socket = (EContainerSocketId)Math.Clamp(moved.StartSlot, 0, 9);
+                    }
+                }
             }
             else if (secondary.CountFreeUnlockedSlots() >= coreCard.SlotWidth && secondary.TryAddAuto(coreCard))
             {
@@ -512,7 +676,7 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             }
             else
             {
-                return (false, "手牌区与储藏箱均无足够空间，请先移除或调整已有物品", null);
+                return (false, "手牌区与储藏箱均无足够空间，请先移除或调整已有物品", null, false);
             }
         }
 
@@ -530,10 +694,10 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             Socket = socket,
             CoreCard = coreCard,
         };
-        RunState.PopulateMetaFromTemplate(entry, _pool.Get(coreTpl.Id), coreTpl);
+        RunState.PopulateMetaFromTemplate(entry, pool.Get(coreTpl.Id), coreTpl);
         run.SyncEntryFromCoreCardAndDiff(entry, repo.GameMode.StandardPrices, emitAuraRefreshEvent: false);
         run.Cards[instId] = entry;
-        return (true, null, entry);
+        return (true, null, entry, displacedOthers);
     }
 
     private static CardInstance EnsureSandboxCoreCard(RunState.CardEntry entry, GameDataRepository repo)
@@ -605,7 +769,12 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         }
     }
 
-    private int PopulateBuiltInPresetBoard(RunState run, GameDataRepository repo, string? presetName)
+    private static int PopulateBuiltInPresetBoard(
+        RunState run,
+        GameDataRepository repo,
+        CardPool pool,
+        string? presetName,
+        List<IGameSimEvent> syncEvents)
     {
         string key = (presetName ?? "default").Trim().ToLowerInvariant();
         string targetHero = key switch
@@ -627,15 +796,15 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             _ => null,
         };
 
-        var itemCandidates = _pool.AllItems
-            .Where(c => _pool.IsPlayerSpawnable(c) &&
+        var itemCandidates = pool.AllItems
+            .Where(c => pool.IsPlayerSpawnable(c) &&
                         (c.Heroes.Length == 0 || c.Heroes.Contains(targetHero, StringComparer.OrdinalIgnoreCase)) &&
                         (keywordTag == null || c.Tags.Contains(keywordTag, StringComparer.OrdinalIgnoreCase) || c.HiddenTags.Contains(keywordTag, StringComparer.OrdinalIgnoreCase)))
             .ToList();
         if (itemCandidates.Count < 4)
         {
-            itemCandidates = _pool.AllItems
-                .Where(c => _pool.IsPlayerSpawnable(c) &&
+            itemCandidates = pool.AllItems
+                .Where(c => pool.IsPlayerSpawnable(c) &&
                             (c.Heroes.Length == 0 || c.Heroes.Contains(targetHero, StringComparer.OrdinalIgnoreCase)))
                 .ToList();
         }
@@ -650,13 +819,15 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             if (usedSlots + width > 10) continue;
             var coreTpl = repo.GetCard(item.Id);
             if (coreTpl == null) continue;
-            var (ok, _, _) = GrantCoreCardIntoRun(
+            var (ok, _, gEntry, _) = GrantCoreCardIntoRun(
                 run,
                 repo,
+                pool,
                 coreTpl,
                 new SandboxGrantCardRequest(item.Id, Section: "Hand", Tier: "Diamond"));
-            if (ok)
+            if (ok && gEntry != null)
             {
+                AppendSpawnEvents(syncEvents, gEntry);
                 usedSlots += width;
                 count++;
                 if (usedSlots >= 9 || count >= 6) break;
@@ -664,8 +835,8 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         }
 
         // 附加 2 个同英雄 Gold 技能
-        var skills = _pool.AllSkills
-            .Where(s => _pool.IsPlayerSpawnable(s) &&
+        var skills = pool.AllSkills
+            .Where(s => pool.IsPlayerSpawnable(s) &&
                         (s.Heroes.Length == 0 || s.Heroes.Contains(targetHero, StringComparer.OrdinalIgnoreCase)))
             .OrderBy(_ => rng.Next())
             .Take(2);
@@ -673,12 +844,17 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         {
             var coreTpl = repo.GetCard(sk.Id);
             if (coreTpl == null) continue;
-            var (ok, _, _) = GrantCoreCardIntoRun(
+            var (ok, _, gEntry, _) = GrantCoreCardIntoRun(
                 run,
                 repo,
+                pool,
                 coreTpl,
                 new SandboxGrantCardRequest(sk.Id, Section: "Hand", Tier: "Gold"));
-            if (ok) count++;
+            if (ok && gEntry != null)
+            {
+                AppendSpawnEvents(syncEvents, gEntry);
+                count++;
+            }
         }
 
         return count;

@@ -120,6 +120,7 @@ internal sealed partial class CustomGameplayUI
         [JsonProperty("bossRushIncludeMilestonePvp")] public bool BossRushIncludeMilestonePvp { get; set; } = true;
         [JsonProperty("sandboxFreeInfiniteReroll")] public bool SandboxFreeInfiniteReroll { get; set; } = true;
         [JsonProperty("sandboxZeroShopPrice")] public bool SandboxZeroShopPrice { get; set; } = false;
+        [JsonProperty("selectedModIds")] public List<string> SelectedModIds { get; set; } = new();
 
         public void EnsureCollections()
         {
@@ -128,6 +129,7 @@ internal sealed partial class CustomGameplayUI
             EncounterCategoryMultipliers ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
             BannedEncounterIds ??= new List<string>();
             MutatorIds ??= new List<string>();
+            SelectedModIds ??= new List<string>();
             if (string.IsNullOrWhiteSpace(PresetId)) PresetId = "PureOfficial";
             if (string.IsNullOrWhiteSpace(SpecialModeId)) SpecialModeId = "Standard";
         }
@@ -169,6 +171,7 @@ internal sealed partial class CustomGameplayUI
             BossRushIncludeMilestonePvp = true;
             SandboxFreeInfiniteReroll = true;
             SandboxZeroShopPrice = false;
+            SelectedModIds = new List<string>();
             IsCustomPowerModified = false;
         }
 
@@ -177,7 +180,8 @@ internal sealed partial class CustomGameplayUI
             EnsureCollections();
             if (!string.Equals(SpecialModeId, "Standard", StringComparison.OrdinalIgnoreCase)
                 || !string.Equals(PresetId, "PureOfficial", StringComparison.OrdinalIgnoreCase)
-                || MutatorIds.Count > 0)
+                || MutatorIds.Count > 0
+                || SelectedModIds.Count > 0)
             {
                 return true;
             }
@@ -232,6 +236,7 @@ internal sealed partial class CustomGameplayUI
                 BossRushIncludeMilestonePvp = BossRushIncludeMilestonePvp,
                 SandboxFreeInfiniteReroll = SandboxFreeInfiniteReroll,
                 SandboxZeroShopPrice = SandboxZeroShopPrice,
+                SelectedModIds = new List<string>(SelectedModIds),
             };
 
             for (int i = 0; i < StartingItems.Count; i++)
@@ -275,6 +280,19 @@ internal sealed partial class CustomGameplayUI
         public bool IsAi { get; set; }
     }
 
+    internal sealed class RequiredModEntry
+    {
+        public string ModId { get; set; } = string.Empty;
+        public string Name { get; set; } = string.Empty;
+        public string Version { get; set; } = string.Empty;
+        public string Author { get; set; } = string.Empty;
+        public int CustomCardCount { get; set; }
+        public int CustomEventCount { get; set; }
+        public int AssetCount { get; set; }
+        public bool AvailableOnServer { get; set; } = true;
+        public string DownloadUrl { get; set; } = string.Empty;
+    }
+
     internal sealed class LobbyDetailSnapshot
     {
         public string LobbyId { get; set; } = string.Empty;
@@ -283,6 +301,7 @@ internal sealed partial class CustomGameplayUI
         public string HostAccountId { get; set; } = string.Empty;
         public int PlayerCap { get; set; } = 8;
         public List<LobbyMemberSummary> Members { get; set; } = new();
+        public List<RequiredModEntry> RequiredMods { get; set; } = new();
         public CustomRunRuleSet Rules { get; set; }
     }
 

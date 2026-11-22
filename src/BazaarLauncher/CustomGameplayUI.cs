@@ -859,6 +859,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                         _lobbyBuf.SyncFromRules(_lobbyRules);
                         _lobbyDirty = false;
                     }
+                    AutoSyncCurrentLobbyModsIfNeeded(detail);
                     RefreshHudOverlays(force: true);
                     RefreshModalContentsIfOpen();
                 });
@@ -1864,6 +1865,28 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                     Hero = (string)(mo["Hero"] ?? mo["hero"]) ?? "",
                     State = (string)(mo["State"] ?? mo["state"]) ?? "",
                     IsAi = isAi,
+                });
+            }
+        }
+
+        if (obj["RequiredMods"] is JArray rmArr || (obj["requiredMods"] is JArray rmArr2 && (rmArr = rmArr2) != null))
+        {
+            foreach (var tok in rmArr)
+            {
+                if (tok is not JObject mo) continue;
+                string mid = (string)(mo["ModId"] ?? mo["modId"]) ?? "";
+                if (string.IsNullOrWhiteSpace(mid)) continue;
+                lobby.RequiredMods.Add(new RequiredModEntry
+                {
+                    ModId = mid,
+                    Name = (string)(mo["Name"] ?? mo["name"]) ?? mid,
+                    Version = (string)(mo["Version"] ?? mo["version"]) ?? "-",
+                    Author = (string)(mo["Author"] ?? mo["author"]) ?? "-",
+                    CustomCardCount = (int?)(mo["CustomCardCount"] ?? mo["customCardCount"]) ?? 0,
+                    CustomEventCount = (int?)(mo["CustomEventCount"] ?? mo["customEventCount"]) ?? 0,
+                    AssetCount = (int?)(mo["AssetCount"] ?? mo["assetCount"]) ?? 0,
+                    AvailableOnServer = (bool?)(mo["AvailableOnServer"] ?? mo["availableOnServer"]) ?? true,
+                    DownloadUrl = (string)(mo["DownloadUrl"] ?? mo["downloadUrl"]) ?? "",
                 });
             }
         }

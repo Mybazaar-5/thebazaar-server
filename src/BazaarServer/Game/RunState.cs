@@ -168,6 +168,35 @@ public sealed class RunState
     [System.Text.Json.Serialization.JsonIgnore]
     public List<CardEntry> PendingTransientSimCards { get; } = new();
 
+    /// <summary>外部沙盒修改后挂起的待同步事件队列（纯内存态，不落盘，由 sandbox_sync 或下一条命令消费）。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public List<IGameSimEvent> PendingExternalSyncEvents { get; } = new();
+
+    /// <summary>外部沙盒复杂修改后标记下一次命令响应需追加全量 GameStateSync（纯内存态，不落盘）。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool PendingExternalForceStateSync { get; set; }
+
+    /// <summary>
+    /// 消费并清空挂起的外部沙盒同步事件与强制同步标记，合并到目标事件列表头部。
+    /// </summary>
+    public bool ConsumePendingExternalSync(List<IGameSimEvent> targetEvents, ref bool forceStateSync)
+    {
+        bool hadAny = PendingExternalSyncEvents.Count > 0 || PendingExternalForceStateSync;
+        if (!hadAny) return false;
+
+        if (PendingExternalSyncEvents.Count > 0)
+        {
+            targetEvents.InsertRange(0, PendingExternalSyncEvents);
+            PendingExternalSyncEvents.Clear();
+        }
+        if (PendingExternalForceStateSync)
+        {
+            forceStateSync = true;
+            PendingExternalForceStateSync = false;
+        }
+        return true;
+    }
+
     /// <summary>单局运行期随机种子（供快照序列化/恢复保持随机序列衔接）。</summary>
     public int RngSeed { get; set; }
 

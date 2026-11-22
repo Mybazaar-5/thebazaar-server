@@ -1044,6 +1044,9 @@ internal sealed partial class CustomGameplayUI
             fontStyle: FontStyles.Bold);
         NativeUguiFactory.SetLayout(_btnSaveLobbyHeader.Root, minW: 214f, prefW: 220f, minH: 32f);
 
+        // 房间本场 Mod 横幅（房主与所有成员均可见，支持一键同步/全部下载到本地）
+        BuildTournamentRoomModBanner(_tourneyLobbyActiveCard.transform);
+
         // 房主编辑体
         _tourneyHostBody = _ui.CreateVerticalGroup("TourneyHostBody", _tourneyLobbyActiveCard.transform, spacing: 8f);
         BuildTournamentHostControls(_tourneyHostBody.transform);
@@ -1159,6 +1162,9 @@ internal sealed partial class CustomGameplayUI
             _lobbyDirty = true;
             RefreshSummaryIndicators();
         });
+
+        // 房主选择本房使用的社区/服务器 Mod
+        BuildTournamentHostModPickerCard(parent);
     }
 
     // ── 共享规则区块构建器（流派倾向 / 野怪 / 开局数值 / 固定卡牌 / 事件倍率）──
@@ -2418,6 +2424,11 @@ internal sealed partial class CustomGameplayUI
 
         _tourneyHostBody.SetActive(isHost);
         _tourneyMemberBody.SetActive(!isHost);
+        RefreshTournamentRoomModsUi();
+        if (isHost && Core.ModContentSyncClient.Instance.GetCommunityModsSnapshot().Count == 0 && !_communityFetchInFlight)
+        {
+            RefreshCommunityModsAsync(force: false);
+        }
 
         if (isHost)
         {
@@ -2476,6 +2487,13 @@ internal sealed partial class CustomGameplayUI
             if (multDiffs.Count > 0)
             {
                 sb.AppendLine("- 事件倍率调整：" + string.Join("，", multDiffs));
+            }
+            if (r.SelectedModIds != null && r.SelectedModIds.Count > 0)
+            {
+                var names = _currentLobby.RequiredMods?.Count > 0
+                    ? _currentLobby.RequiredMods.Select(m => $"{m.Name}({m.ModId})")
+                    : r.SelectedModIds;
+                sb.AppendLine("- 本房 Mod：" + string.Join("、", names));
             }
             _tourneyMemberSummaryText.text = sb.ToString();
         }

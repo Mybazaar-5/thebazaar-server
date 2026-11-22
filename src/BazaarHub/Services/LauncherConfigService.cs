@@ -114,6 +114,7 @@ public sealed class LauncherConfigService
         {
             Enabled = doc.GetBool("General", "Enabled", true),
             ServerBase = doc.GetValue("General", "ServerBase") ?? LauncherConstants.CloudTencentUrl,
+            AcceptServerMods = doc.GetBool("General", "AcceptServerMods", true),
             ConfigPlayerName = doc.GetValue("General", "PlayerName") ?? string.Empty,
             PlayerNameFileValue = nameFromFile,
             BypassSteam = doc.GetBool("General", "BypassSteam", true),
@@ -135,12 +136,18 @@ public sealed class LauncherConfigService
         string? customServerUrl,
         string? playerName,
         bool? bypassSteam = null,
-        bool? unlockEverything = null)
+        bool? unlockEverything = null,
+        bool? acceptServerMods = null)
     {
         string cfgPath = GetLauncherConfigPath(gameDir);
         IniDocument doc = File.Exists(cfgPath)
             ? IniDocument.LoadOrEmpty(cfgPath)
             : CreateDefaultLauncherIni();
+
+        if (acceptServerMods.HasValue)
+        {
+            doc.SetValue("General", "AcceptServerMods", acceptServerMods.Value ? "true" : "false");
+        }
 
         switch (mode)
         {

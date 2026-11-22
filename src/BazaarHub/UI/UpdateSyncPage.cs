@@ -23,6 +23,9 @@ public sealed class UpdateSyncPage : UserControl
     public event Action<bool>? SyncRequested; // true = 下载同步, false = 仅检查
     public event Action? OpenModCacheRequested;
     public event Action? OpenWorkshopRequested;
+    public event Action? RefreshCommunityModsRequested;
+    public event Action<string>? DownloadCommunityModRequested;
+    public event Action? UploadLocalModRequested;
 
     public UpdateSyncPage()
     {
@@ -158,33 +161,80 @@ public sealed class UpdateSyncPage : UserControl
         filesCard.Controls.Add(filesHeader);
         root.Controls.Add(filesCard, 0, 3);
 
-        // 服务器启用 Mod 列表
+        // 服务器与社区 Mod 列表
         var modsCard = new GoldCardPanel { Dock = DockStyle.Fill, Padding = new Padding(12, 10, 12, 12), Margin = new Padding(0) };
+        var modsTopBar = new Panel { Dock = DockStyle.Top, Height = 32 };
         var modsHeader = new Label
         {
-            Text = "服务器启用 Mod 扩展包列表",
+            Text = "服务器与社区 Mod 列表（选中后可下载到本地，或上传本地 Mod 分享）",
             Font = HubTheme.FontSectionTitle,
             ForeColor = HubTheme.TextPrimary,
-            Dock = DockStyle.Top,
-            Height = 24
+            AutoSize = true,
+            Location = new Point(0, 5)
         };
+        var btnUploadMod = new GoldButton
+        {
+            Text = "上传本地 Mod",
+            Variant = GoldButtonVariant.PrimaryGold,
+            Size = new Size(116, 28),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            Location = new Point(modsTopBar.Width - 118, 1)
+        };
+        btnUploadMod.Click += (_, _) => UploadLocalModRequested?.Invoke();
+
+        var btnDownloadMod = new GoldButton
+        {
+            Text = "下载选中 Mod",
+            Variant = GoldButtonVariant.OutlineGold,
+            Size = new Size(116, 28),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            Location = new Point(modsTopBar.Width - 242, 1)
+        };
+        btnDownloadMod.Click += (_, _) =>
+        {
+            if (_gridMods == null) return;
+            var row = _gridMods.SelectedRows.Count > 0 ? _gridMods.SelectedRows[0] : _gridMods.CurrentRow;
+            string? modId = row?.Cells[0].Value?.ToString();
+            if (string.IsNullOrWhiteSpace(modId))
+            {
+                MessageBox.Show(this, "请先在下方列表里点选一个要下载的 Mod。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            DownloadCommunityModRequested?.Invoke(modId);
+        };
+
+        var btnRefreshCommunity = new GoldButton
+        {
+            Text = "刷新社区列表",
+            Variant = GoldButtonVariant.SubtleDark,
+            Size = new Size(106, 28),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            Location = new Point(modsTopBar.Width - 356, 1)
+        };
+        btnRefreshCommunity.Click += (_, _) => RefreshCommunityModsRequested?.Invoke();
+
+        modsTopBar.Controls.Add(modsHeader);
+        modsTopBar.Controls.Add(btnRefreshCommunity);
+        modsTopBar.Controls.Add(btnDownloadMod);
+        modsTopBar.Controls.Add(btnUploadMod);
+
         _gridMods = new DataGridView { Dock = DockStyle.Fill };
         HubTheme.StyleDataGridView(_gridMods);
         _gridMods.Columns.Add("Id", "Mod ID");
-        _gridMods.Columns.Add("Name", "中文名称");
+        _gridMods.Columns.Add("Name", "名称");
         _gridMods.Columns.Add("Version", "版本");
-        _gridMods.Columns.Add("Scope", "作用域");
-        _gridMods.Columns.Add("Assets", "PNG 资产数");
+        _gridMods.Columns.Add("Scope", "状态 / 作者");
+        _gridMods.Columns.Add("Assets", "卡 / 贴图 / 下载");
         _gridMods.Columns.Add("Desc", "说明");
         _gridMods.Columns[0].FillWeight = 18;
-        _gridMods.Columns[1].FillWeight = 22;
-        _gridMods.Columns[2].FillWeight = 10;
-        _gridMods.Columns[3].FillWeight = 15;
-        _gridMods.Columns[4].FillWeight = 10;
-        _gridMods.Columns[5].FillWeight = 25;
+        _gridMods.Columns[1].FillWeight = 20;
+        _gridMods.Columns[2].FillWeight = 9;
+        _gridMods.Columns[3].FillWeight = 17;
+        _gridMods.Columns[4].FillWeight = 14;
+        _gridMods.Columns[5].FillWeight = 22;
 
         modsCard.Controls.Add(_gridMods);
-        modsCard.Controls.Add(modsHeader);
+        modsCard.Controls.Add(modsTopBar);
         root.Controls.Add(modsCard, 0, 4);
 
         Controls.Add(root);
@@ -258,10 +308,29 @@ public sealed class UpdateSyncPage : UserControl
                     mod.Id,
                     mod.Name,
                     mod.Version,
-                    mod.Scope,
-                    $"{modAssets} 张",
+                    $"全服启用 / {mod.Scope}",
+                    $"{modAssets} 贴图",
                     string.IsNullOrWhiteSpace(mod.Description) ? "-" : mod.Description);
             }
+        }
+    }
+
+    public void RenderCommunityMods(IReadOnlyList<HubCommunityModItem> mods, string statusMessage, bool ok)
+    {
+        _lblSyncSummary.Text = statusMessage;
+        _lblSyncSummary.ForeColor = ok ? HubTheme.StatusGreen : HubTheme.StatusRed;
+        _gridMods.Rows.Clear();
+        foreach (var m in mods)
+        {
+            string tag = m.IsServerDefault ? "全服启用" : "社区";
+            string author = string.IsNullOrWhiteSpace(m.UploaderName) ? m.Author : m.UploaderName;
+            _gridMods.Rows.Add(
+                m.ModId,
+                m.Name,
+                m.Version,
+                $"{tag} · {author}",
+                $"卡{m.CustomCardCount} / 图{m.AssetCount} / ↓{m.DownloadCount}",
+                string.IsNullOrWhiteSpace(m.Description) ? "-" : m.Description);
         }
     }
 

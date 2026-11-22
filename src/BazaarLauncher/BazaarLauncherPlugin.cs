@@ -25,6 +25,7 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
 
     internal static ConfigEntry<bool> Enabled;
     internal static ConfigEntry<string> ServerBase;
+    internal static ConfigEntry<bool> AcceptServerMods;
     internal static ConfigEntry<string> PlayerName;
     internal static ConfigEntry<bool> BypassSteam;
     internal static ConfigEntry<bool> UnlockEverything;
@@ -114,6 +115,8 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
             "总开关。false = 完全按原版行为运行（连官方服）。");
         ServerBase = Config.Bind("General", "ServerBase", "http://127.0.0.1:8080",
             "自建服基址。单机默认 http://127.0.0.1:8080；远程自建服请改为 http://<你的服务器IP>:8080");
+        AcceptServerMods = Config.Bind("General", "AcceptServerMods", true,
+            "是否允许接收当前服务器下发的 Mod 贴图与文案（关闭后不加载服务器下发的 Mod 资源）。");
         PlayerName = Config.Bind("General", "PlayerName", "",
             "玩家名（账号名）。留空则读游戏目录 player-name.txt，再退回系统用户名。");
         BypassSteam = Config.Bind("General", "BypassSteam", true,
@@ -152,6 +155,64 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
             "把 /sessions、/commands 的原始字节落盘（差分测试用）。");
         DumpDir = Config.Bind("Debug", "DumpDir", "",
             "抓包输出目录。");
+    }
+
+    // ── 运行时切换服务器地址与接收开关 ────────────────────────────────────────
+
+    internal static bool TrySwitchServerBase(string rawUrl, out string normalizedUrl, out string error)
+    {
+        normalizedUrl = string.Empty;
+        error = string.Empty;
+        if (string.IsNullOrWhiteSpace(rawUrl))
+        {
+            error = "服务器地址不能为空";
+            return false;
+        }
+        string trimmed = rawUrl.Trim().TrimEnd('/');
+        if (!trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && !trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            trimmed = "http://" + trimmed;
+        }
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            || string.IsNullOrWhiteSpace(uri.Host))
+        {
+            error = "服务器地址格式不正确（示例：http://127.0.0.1:8080）";
+            return false;
+        }
+
+        normalizedUrl = trimmed;
+        if (ServerBase != null)
+        {
+            ServerBase.Value = normalizedUrl;
+            try { ServerBase.ConfigFile?.Save(); } catch { }
+        }
+        if (Enabled != null && !Enabled.Value)
+        {
+            Enabled.Value = true;
+            try { Enabled.ConfigFile?.Save(); } catch { }
+        }
+
+        ModContentSyncClient.Instance.OnServerChanged();
+        return true;
+    }
+
+    internal static void SetAcceptServerMods(bool accept)
+    {
+        if (AcceptServerMods != null)
+        {
+            AcceptServerMods.Value = accept;
+            try { AcceptServerMods.ConfigFile?.Save(); } catch { }
+        }
+        if (!accept)
+        {
+            ModContentSyncClient.Instance.ClearSyncedServerMods();
+        }
+        else
+        {
+            ModContentSyncClient.Instance.TriggerFullSyncInBackground(forceDownload: false);
+        }
     }
 
     // ── URL 覆盖（由 Core.NetworkRedirectModule 沙箱化调用）───────────────────

@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -285,6 +286,9 @@ internal sealed partial class CustomGameplayUI
     {
         _workshopTabRoot = _ui.CreateVerticalGroup("WorkshopTabRoot", parent, spacing: 10f);
 
+        // 0. 服务器切换、接收开关、社区 Mod 下载与本地 Mod 上传
+        BuildServerAndCommunitySections(_workshopTabRoot.transform);
+
         // 1. 顶部 7 模式快速切换卡 + Mod 同步控制栏
         var syncCard = _ui.CreateCard("WorkshopSyncCard", _workshopTabRoot.transform, NativeUguiFactory.ColCardBg, NativeUguiFactory.ColGoldDim, padH: 14, padV: 10, spacing: 8f);
         _ui.CreateText("Title", syncCard.transform, "自建工坊 & Mod 扩展中心", 16f, NativeUguiFactory.ColGold, FontStyles.Bold);
@@ -343,15 +347,20 @@ internal sealed partial class CustomGameplayUI
         _ui.CreateText("Title", _sandboxSectionGo.transform, "沙盒实验室快捷控制台（仅沙盒局激活 · 严格三禁隔离不污染榜单/镜像）", 15f, NativeUguiFactory.ColGold, FontStyles.Bold);
 
         var sbRow1 = _ui.CreateHorizontalRow("SandboxGrantRow", _sandboxSectionGo.transform, spacing: 8f);
-        _sandboxCardIdInput = _ui.CreateInputField("SandboxCardId", sbRow1.transform, "输入卡牌/技能 TemplateId 或自定义 ID...", "", fontSize: 13.5f, charLimit: 80);
+        _sandboxCardIdInput = _ui.CreateInputField("SandboxCardId", sbRow1.transform, "输入卡牌 ID、短 ID 或中文名...", "", fontSize: 13.5f, charLimit: 80);
         NativeUguiFactory.SetLayout(_sandboxCardIdInput.gameObject, minW: 240f, flexW: 1f, minH: 30f, prefH: 30f);
 
         var btnGrantCard = _ui.CreateButton("BtnGrantCard", sbRow1.transform, "发到手牌 (黄金)", 13f,
             NativeUguiFactory.ColGoldBtn, NativeUguiFactory.ColGoldBtnHover, Color.white, () =>
             {
                 string cid = _sandboxCardIdInput?.text?.Trim() ?? string.Empty;
-                if (string.IsNullOrEmpty(cid)) { SetStatus("请先输入要发放的卡牌 TemplateId", true); return; }
-                SendSandboxApi("/api/sandbox/grant-card", new { templateId = cid, tier = "Gold", section = "Hand" }, "已发放自定义测试卡牌");
+                if (string.IsNullOrEmpty(cid))
+                {
+                    SetStatus("请先输入要发放的卡牌 ID、短 ID 或中文名", true);
+                    ShowToastBanner("请先输入要发放的卡牌 ID、短 ID 或中文名", isError: true);
+                    return;
+                }
+                SendSandboxApi("/api/sandbox/grant-card", new { templateId = cid, tier = "Gold", section = "Hand" }, "已发放测试卡牌");
             }, NativeUguiFactory.ColGold);
         NativeUguiFactory.SetLayout(btnGrantCard.Root, minW: 140f, prefW: 150f, minH: 30f);
 
@@ -397,25 +406,107 @@ internal sealed partial class CustomGameplayUI
         _ = Task.Run(async () =>
         {
             var resp = await NameAuth.PostJsonAsync(endpoint, payload).ConfigureAwait(false);
+            JObject obj = null;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(resp.Body))
+                    obj = JObject.Parse(resp.Body);
+            }
+            catch { }
+
+            bool forceSyncRequired = resp.Ok && ((bool?)obj?["forceSyncRequired"] ?? false);
+            string runId = (string)obj?["data"]?["runId"];
+            string msgZh = (string)obj?["messageZh"];
+            string errZh = (string)obj?["error"] ?? msgZh ?? resp.Error;
+
+            // 先同步最新的实例视觉绑定，确保新生成的 Mod 卡实例能立即套上自定义 PNG 与中文文案
+            if (forceSyncRequired)
+            {
+                try
+                {
+                    await ModContentSyncClient.Instance
+                        .SyncActiveBindingsAsync(runId, HttpClientHub.ShutdownToken)
+                        .ConfigureAwait(false);
+                }
+                catch { }
+            }
+
             _pendingUpdates.Enqueue(() =>
             {
                 if (resp.Ok)
                 {
-                    if (_sandboxResultText != null) _sandboxResultText.text = $"{okMsg}：{Truncate(resp.Body, 140)}";
-                    SetStatus(okMsg, false);
+                    string displayMsg = !string.IsNullOrWhiteSpace(msgZh) ? msgZh : okMsg;
+                    if (forceSyncRequired)
+                    {
+                        bool inRun = GameInspector.IsActiveInRunState(
+                            GameInspector.GetActiveSceneName(),
+                            GameInspector.GetAppStateName());
+
+                        if (!inRun)
+                        {
+                            displayMsg += "（当前未处于局内，进局后会自动同步）";
+                        }
+                        else if (IsInActiveCombatPlayback())
+                        {
+                            displayMsg += "（正在播战斗，战后或下次操作会自动同步到棋盘）";
+                        }
+                        else if (TrySendSandboxSyncCheatOnMainThread())
+                        {
+                            StartCoroutine(ReapplySandboxVisualsDelayedCoroutine());
+                        }
+                        else
+                        {
+                            displayMsg += "（已写入对局，下次任意操作将自动同步到棋盘）";
+                        }
+                    }
+
+                    if (_sandboxResultText != null) _sandboxResultText.text = displayMsg;
+                    SetStatus(displayMsg, false);
+                    ShowToastBanner(Truncate(displayMsg, 64), isError: false);
                 }
                 else
                 {
-                    if (_sandboxResultText != null) _sandboxResultText.text = $"沙盒接口返回：{resp.Error}";
-                    SetStatus("沙盒调用未生效：" + Truncate(resp.Error, 60), true);
+                    string displayErr = !string.IsNullOrWhiteSpace(errZh) ? errZh : "沙盒请求失败";
+                    if (_sandboxResultText != null) _sandboxResultText.text = $"沙盒提示：{displayErr}";
+                    SetStatus("沙盒调用未生效：" + Truncate(displayErr, 72), true);
+                    ShowToastBanner(Truncate(displayErr, 64), isError: true);
                 }
             });
         });
     }
 
+    private static bool TrySendSandboxSyncCheatOnMainThread()
+    {
+        try
+        {
+            var cmd = GameInspector.GetCmdCached();
+            if (cmd == null) return false;
+            var sendCheat = cmd.GetType().GetMethod("SendCheat");
+            if (sendCheat == null) return false;
+            sendCheat.Invoke(cmd, new object[] { new List<string> { "sandbox_sync" } });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"[SandboxSync] 发送 sandbox_sync 失败：{ex.Message}");
+            return false;
+        }
+    }
+
+    private IEnumerator ReapplySandboxVisualsDelayedCoroutine()
+    {
+        CustomContentVisualModule.Instance?.ReapplyActiveVisualsOnMainThread();
+        yield return new WaitForSecondsRealtime(0.35f);
+        CustomContentVisualModule.Instance?.ReapplyActiveVisualsOnMainThread();
+        yield return new WaitForSecondsRealtime(0.65f);
+        CustomContentVisualModule.Instance?.ReapplyActiveVisualsOnMainThread();
+    }
+
     private void RefreshWorkshopTabUi()
     {
         if (_workshopTabRoot == null) return;
+
+        RefreshServerAndCommunityUi();
 
         var sync = ModContentSyncClient.Instance;
         int boundVisuals = CustomContentVisualModule.Instance?.GetRegisteredBindingCount() ?? 0;
@@ -490,14 +581,39 @@ internal sealed partial class CustomGameplayUI
                 int show = Math.Min(contents.Count, 24);
                 for (int i = 0; i < show; i++)
                 {
-                    var c = contents[i];
-                    string artMark = string.IsNullOrEmpty(c.LocalArtPath) ? "原版底座图" : "自定义PNG已缓存";
-                    _ui.CreateText(
-                        "Item_" + i,
-                        _customContentListContainer,
-                        $"• [{c.CardType}/{c.Size}] {c.NameZh}（{c.CustomId}）— {artMark} {Truncate(c.DescZh, 44)}",
+                    var captured = contents[i];
+                    string artMark = string.IsNullOrEmpty(captured.LocalArtPath) ? "原版底座图" : "自定义PNG已缓存";
+                    var itemRow = _ui.CreateHorizontalRow("Item_" + i, _customContentListContainer, spacing: 6f);
+                    var itemLbl = _ui.CreateText(
+                        "Lbl",
+                        itemRow.transform,
+                        $"• [{captured.CardType}/{captured.Size}] {captured.NameZh}（{captured.CustomId}）— {artMark} {Truncate(captured.DescZh, 32)}",
                         12.5f,
                         NativeUguiFactory.ColCream);
+                    NativeUguiFactory.SetLayout(itemLbl.gameObject, flexW: 1f, minH: 24f);
+
+                    bool canGrant = string.Equals(captured.CardType, "Item", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(captured.CardType, "Skill", StringComparison.OrdinalIgnoreCase);
+                    if (canGrant)
+                    {
+                        var fillBtn = _ui.CreateButton("BtnFill", itemRow.transform, "填入沙盒", 11.5f,
+                            NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
+                            {
+                                if (_sandboxCardIdInput != null) _sandboxCardIdInput.text = captured.CustomId;
+                                ShowToastBanner($"已填入沙盒输入框：{captured.NameZh}");
+                            }, NativeUguiFactory.ColGoldDim, padH: 6, padV: 2);
+                        NativeUguiFactory.SetLayout(fillBtn.Root, minW: 68f, prefW: 72f, minH: 24f);
+
+                        var grantBtn = _ui.CreateButton("BtnGrant", itemRow.transform, "发到手牌", 11.5f,
+                            NativeUguiFactory.ColGoldBtn, NativeUguiFactory.ColGoldBtnHover, Color.white, () =>
+                            {
+                                if (_sandboxCardIdInput != null) _sandboxCardIdInput.text = captured.CustomId;
+                                SendSandboxApi("/api/sandbox/grant-card",
+                                    new { templateId = captured.CustomId, tier = "Gold", section = "Hand" },
+                                    $"已发放 {captured.NameZh}");
+                            }, NativeUguiFactory.ColGold, padH: 6, padV: 2);
+                        NativeUguiFactory.SetLayout(grantBtn.Root, minW: 68f, prefW: 72f, minH: 24f);
+                    }
                 }
                 if (contents.Count > show)
                 {
@@ -702,6 +818,7 @@ internal sealed partial class CustomGameplayUI
                 modeId = _normalRules?.SpecialModeId ?? "Standard",
                 presetId = _normalRules?.PresetId ?? "PureOfficial",
                 mutatorIds = _normalRules?.MutatorIds ?? new List<string>(),
+                selectedModIds = _lobbyRules?.SelectedModIds ?? new List<string>(),
             };
             var resp = await NameAuth.PostJsonAsync("/lobbies", payload).ConfigureAwait(false);
             _pendingUpdates.Enqueue(() =>

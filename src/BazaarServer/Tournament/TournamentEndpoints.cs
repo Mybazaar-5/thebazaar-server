@@ -2149,9 +2149,11 @@ public static class TournamentEndpoints
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = null };
     private static readonly JsonSerializerOptions CaseInsensitiveJson = new() { PropertyNameCaseInsensitive = true };
+    private static BazaarServer.Mods.CommunityModStore? _communityModStore;
 
     public static void Map(WebApplication app, LobbyStore lobbies)
     {
+        _communityModStore = app.Services.GetService<BazaarServer.Mods.CommunityModStore>();
         // ── 建房（支持密码房、仅限邀请、预设档位、新模式与突变词条）───────────
         app.MapPost("/lobbies", async (HttpContext ctx, AccountStore accounts) =>
         {
@@ -2174,6 +2176,7 @@ public static class TournamentEndpoints
             int? acceleratedRoundCountdownSeconds = null;
             List<string>? bannedEncounterIds = null;
             List<string>? mutatorIds = null;
+            List<string>? selectedModIds = null;
             CustomRunRuleSet? parsedRules = null;
             try
             {
@@ -2191,6 +2194,7 @@ public static class TournamentEndpoints
                 if (TryGetIntCaseInsensitive(r, "acceleratedRoundCountdownSeconds", out int arcs)) acceleratedRoundCountdownSeconds = arcs;
                 if (TryGetStringArrayCaseInsensitive(r, "bannedEncounterIds", out var banned)) bannedEncounterIds = banned;
                 if (TryGetStringArrayCaseInsensitive(r, "mutatorIds", out var muts)) mutatorIds = muts;
+                if (TryGetStringArrayCaseInsensitive(r, "selectedModIds", out var smods)) selectedModIds = smods;
                 if (TryGetPropertyCaseInsensitive(r, "rules", out var rulesEl) && rulesEl.ValueKind == JsonValueKind.Object)
                 {
                     parsedRules = JsonSerializer.Deserialize<CustomRunRuleSet>(rulesEl.GetRawText(), CaseInsensitiveJson);
@@ -2206,7 +2210,7 @@ public static class TournamentEndpoints
             if (!string.IsNullOrEmpty(password) && (password.Trim().Length < 4 || password.Trim().Length > 32))
                 return Results.Json(new { error = "房间密码长度必须在 4 到 32 位之间。", code = "INVALID_PASSWORD_LENGTH" }, Json, statusCode: 400);
 
-            if (parsedRules == null && (!string.IsNullOrWhiteSpace(presetId) || !string.IsNullOrWhiteSpace(modeId) || mutatorIds is { Count: > 0 }))
+            if (parsedRules == null && (!string.IsNullOrWhiteSpace(presetId) || !string.IsNullOrWhiteSpace(modeId) || mutatorIds is { Count: > 0 } || selectedModIds is { Count: > 0 }))
             {
                 var pEnum = !string.IsNullOrWhiteSpace(presetId) && Enum.TryParse<EGameModePreset>(presetId.Trim(), true, out var pe)
                     ? pe : EGameModePreset.PureOfficial;
@@ -2216,6 +2220,10 @@ public static class TournamentEndpoints
             if (parsedRules != null && mutatorIds is { Count: > 0 })
             {
                 parsedRules.MutatorIds = MutatorCatalog.NormalizeAndResolveConflicts(mutatorIds);
+            }
+            if (parsedRules != null && selectedModIds is { Count: > 0 })
+            {
+                parsedRules.SelectedModIds = selectedModIds;
             }
 
             // 修复 16 人爆房：未携带房主自定义 rules.PlayerCap 时，无视原版客户端硬编码发来的 playerCap=16，统一默认 8 人
@@ -2261,6 +2269,7 @@ public static class TournamentEndpoints
             int? roundCountdownSeconds = null;
             int? acceleratedRoundCountdownSeconds = null;
             List<string>? bannedEncounterIds = null;
+            List<string>? topSelectedModIds = null;
             string? modeId = null;
             string? presetId = null;
 
@@ -2271,6 +2280,7 @@ public static class TournamentEndpoints
                 if (TryGetIntCaseInsensitive(r, "roundCountdownSeconds", out int rcs)) roundCountdownSeconds = rcs;
                 if (TryGetIntCaseInsensitive(r, "acceleratedRoundCountdownSeconds", out int arcs)) acceleratedRoundCountdownSeconds = arcs;
                 if (TryGetStringArrayCaseInsensitive(r, "bannedEncounterIds", out var banned)) bannedEncounterIds = banned;
+                if (TryGetStringArrayCaseInsensitive(r, "selectedModIds", out var smods)) topSelectedModIds = smods;
                 if (TryGetStringCaseInsensitive(r, "modeId", out var mid)) modeId = mid;
                 if (TryGetStringCaseInsensitive(r, "presetId", out var pid)) presetId = pid;
 
@@ -2278,6 +2288,8 @@ public static class TournamentEndpoints
                     ? wrapped.GetRawText()
                     : r.GetRawText();
                 incoming = JsonSerializer.Deserialize<CustomRunRuleSet>(rulesJson, CaseInsensitiveJson);
+                if (incoming != null && topSelectedModIds != null && (incoming.SelectedModIds == null || incoming.SelectedModIds.Count == 0))
+                    incoming.SelectedModIds = topSelectedModIds;
             }
             catch
             {
@@ -3009,6 +3021,13 @@ public static class TournamentEndpoints
             RoundCountdownSeconds = roundCountdown,
             AcceleratedRoundCountdownSeconds = accelCountdown,
             BannedEncounterIds = bannedSnapshot,
+            SelectedModIds = (rulesSnapshot.SelectedModIds ?? new List<string>()).ToArray(),
+            RequiredMods = _communityModStore?.DescribeRequiredMods(rulesSnapshot.SelectedModIds)
+                ?? (rulesSnapshot.SelectedModIds ?? new List<string>())
+                    .Select(id => new BazaarServer.Mods.RequiredModSummary(
+                        id, id, "-", "-", string.Empty, 0, 0, 0, false,
+                        $"/api/community/mods/{Uri.EscapeDataString(id)}/download"))
+                    .ToList(),
             Rules = rulesSnapshot,
             Members = snapshot.Select(m => new
             {

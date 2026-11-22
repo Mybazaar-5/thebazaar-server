@@ -62,6 +62,19 @@ public sealed class ServerModHost
 
     private CardPool? _boundCardPool;
     private List<Data.MonsterTemplate>? _boundMonsters;
+    private CommunityModStore? _communityStore;
+    private readonly Dictionary<string, RunModContext> _runModContextCache = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>单局或锦标赛房间专用的独立 Mod 运行上下文（不影响服务器全局默认池）。</summary>
+    public sealed record RunModContext(
+        string ContextKey,
+        GameDataRepository Repository,
+        CardPool Pool,
+        List<Data.MonsterTemplate> Monsters,
+        CardArchetypeIndex ArchetypeIndex,
+        IReadOnlyDictionary<string, CustomCardVisualBinding> VisualBindingsByCustomId,
+        IReadOnlyList<string> ActiveModIds,
+        ModRegistry? IsolatedRegistry = null);
 
     private Dictionary<string, bool> _enabledOverrides = new(StringComparer.OrdinalIgnoreCase);
     private volatile IReadOnlyList<ModPackage> _discoveredPackages = Array.Empty<ModPackage>();
@@ -108,6 +121,26 @@ public sealed class ServerModHost
     public IReadOnlySet<string> ValidVisualWhitelist => _validVisualWhitelist;
     public IReadOnlyList<ModPackage> DiscoveredPackages => _discoveredPackages;
     public int EnabledModCount => _registry.LoadedPackages.Count;
+    public CommunityModStore? CommunityStore => _communityStore;
+
+    /// <summary>绑定社区 Mod 仓库，使按房间加载、实例绑定与 PNG 资产下载自动涵盖社区上传的 Mod。</summary>
+    public void AttachCommunityStore(CommunityModStore communityStore)
+    {
+        lock (_gate)
+        {
+            _communityStore = communityStore;
+            _runModContextCache.Clear();
+        }
+    }
+
+    /// <summary>清空按房/按局隔离 Mod 上下文缓存（在全局重载或社区 Mod 变动时调用）。</summary>
+    public void InvalidateRunModContextCache()
+    {
+        lock (_gate)
+        {
+            _runModContextCache.Clear();
+        }
+    }
 
     /// <summary>绑定运行期活动卡池与野怪池，每次 Mod 热重载/启停后自动无锁刷新。</summary>
     public void BindPools(CardPool cardPool, List<Data.MonsterTemplate>? monsters = null)
@@ -161,7 +194,8 @@ public sealed class ServerModHost
             // 4. 解析已加载 Mod 中的扩展自定义突变词条（如 modes/custom_mutators.json）
             _modCustomMutators = ExtractModCustomMutators(_registry.LoadedPackages);
 
-            // 5. 同步刷新运行期 CardPool 与野怪池
+            // 5. 同步刷新运行期 CardPool 与野怪池，并清空按房隔离缓存
+            _runModContextCache.Clear();
             SyncBoundPoolsLocked();
 
             Console.WriteLine(
@@ -287,12 +321,122 @@ public sealed class ServerModHost
         }
     }
 
-    /// <summary>收集指定对局内全部活跃实例对应的 Mod 自定义卡视觉与文本绑定。</summary>
+    /// <summary>
+    /// 按单局或锦标赛房间选中的 Mod ID 列表解析独立运行上下文：
+    /// 未选用额外 Mod 时零开销直接复用全局默认池；选中额外社区/未默认启用的 Mod 时，
+    /// 合并全局已启用 Mod + 选中 Mod 构建隔离副本并按组合键缓存，绝不污染其他玩家的普通对局。
+    /// </summary>
+    public RunModContext ResolveRunModContext(
+        IReadOnlyList<string>? selectedModIds,
+        CardPool defaultPool,
+        List<Data.MonsterTemplate> defaultMonsters,
+        CardArchetypeIndex defaultArchetypeIndex)
+    {
+        if (selectedModIds == null || selectedModIds.Count == 0)
+        {
+            return new RunModContext(
+                ContextKey: "default",
+                Repository: ActiveRepository,
+                Pool: defaultPool,
+                Monsters: defaultMonsters,
+                ArchetypeIndex: defaultArchetypeIndex,
+                VisualBindingsByCustomId: VisualBindingsByCustomId,
+                ActiveModIds: _registry.LoadedPackages.Select(p => p.Manifest.Id).ToList(),
+                IsolatedRegistry: null);
+        }
+
+        lock (_gate)
+        {
+            var requested = new List<string>();
+            var seenReq = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string raw in selectedModIds)
+            {
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                string id = raw.Trim();
+                if (seenReq.Add(id)) requested.Add(id);
+            }
+
+            var extraPackages = new List<ModPackage>();
+            var globalLoadedIds = new HashSet<string>(_registry.LoadedPackages.Select(p => p.Manifest.Id), StringComparer.OrdinalIgnoreCase);
+            foreach (string id in requested)
+            {
+                if (globalLoadedIds.Contains(id)) continue;
+                var pkg = _communityStore?.ResolvePackage(id) ?? FindDiscoveredPackage(id);
+                if (pkg != null)
+                    extraPackages.Add(pkg);
+            }
+
+            if (extraPackages.Count == 0)
+            {
+                return new RunModContext(
+                    ContextKey: "default",
+                    Repository: ActiveRepository,
+                    Pool: defaultPool,
+                    Monsters: defaultMonsters,
+                    ArchetypeIndex: defaultArchetypeIndex,
+                    VisualBindingsByCustomId: VisualBindingsByCustomId,
+                    ActiveModIds: _registry.LoadedPackages.Select(p => p.Manifest.Id).ToList(),
+                    IsolatedRegistry: null);
+            }
+
+            // 组合全部需加载的 Mod（全局已启用 + 房间/本局额外选中），按包哈希构建稳定缓存键
+            var combined = new List<ModPackage>(_registry.LoadedPackages.Count + extraPackages.Count);
+            var combinedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var gp in _registry.LoadedPackages)
+            {
+                if (combinedIds.Add(gp.Manifest.Id))
+                    combined.Add(gp);
+            }
+            foreach (var ep in extraPackages)
+            {
+                if (combinedIds.Add(ep.Manifest.Id))
+                    combined.Add(ep);
+            }
+
+            string cacheKey = ModSetHash + "|" + string.Join(",",
+                combined.OrderBy(p => p.Manifest.Id, StringComparer.OrdinalIgnoreCase)
+                        .Select(p => $"{p.Manifest.Id}:{p.PackageHash}"));
+
+            if (_runModContextCache.TryGetValue(cacheKey, out var cached))
+                return cached;
+
+            var isoRegistry = new ModRegistry(_baseRepoWithOverlay, _validVisualWhitelist);
+            isoRegistry.LoadPackages(
+                combined,
+                sourceLabel: "room-isolated",
+                baseRepositoryOverride: _baseRepoWithOverlay,
+                validVisualWhitelistOverride: _validVisualWhitelist,
+                keepPreviousOnError: false);
+
+            var isoRepo = isoRegistry.ActiveRepository;
+            var isoPool = defaultPool.CreateIsolatedOverlay(isoRepo, isoRegistry.VisualBindingsByCustomId);
+            var isoMonsters = MonsterPool.FromRepository(isoRepo);
+            var isoArchetypes = CardArchetypeIndex.Build(isoPool, isoRepo);
+
+            var ctx = new RunModContext(
+                ContextKey: cacheKey,
+                Repository: isoRepo,
+                Pool: isoPool,
+                Monsters: isoMonsters,
+                ArchetypeIndex: isoArchetypes,
+                VisualBindingsByCustomId: isoRegistry.VisualBindingsByCustomId,
+                ActiveModIds: isoRegistry.LoadedPackages.Select(p => p.Manifest.Id).ToList(),
+                IsolatedRegistry: isoRegistry);
+
+            if (_runModContextCache.Count >= 16)
+                _runModContextCache.Clear();
+            _runModContextCache[cacheKey] = ctx;
+            return ctx;
+        }
+    }
+
+    /// <summary>收集指定对局内全部活跃实例对应的 Mod 自定义卡视觉与文本绑定（兼容房间/单局额外选中的社区 Mod）。</summary>
     public Dictionary<string, CustomCardVisualBinding> CollectActiveVisualBindings(RunState? run)
     {
         var result = new Dictionary<string, CustomCardVisualBinding>(StringComparer.Ordinal);
         if (run == null) return result;
 
+        var extraCatalog = CollectExtraVisualCatalogForRun(run);
         foreach (var entry in run.Cards.Values)
         {
             string? customId = entry.CustomCardId;
@@ -302,14 +446,55 @@ public sealed class ServerModHost
             {
                 result[entry.InstanceId] = binding;
             }
+            else if (extraCatalog != null && extraCatalog.TryGetValue(customId, out var extraBinding))
+            {
+                result[entry.InstanceId] = extraBinding;
+            }
         }
         return result;
+    }
+
+    /// <summary>返回指定对局有效的全量自定义卡模板视觉目录（合并全局已启用 Mod + 本局/本房额外选中的社区 Mod）。</summary>
+    public IReadOnlyDictionary<string, CustomCardVisualBinding> GetVisualCatalogForRun(RunState? run)
+    {
+        var extra = CollectExtraVisualCatalogForRun(run);
+        if (extra == null || extra.Count == 0)
+            return _registry.VisualBindingsByCustomId;
+
+        var merged = new Dictionary<string, CustomCardVisualBinding>(_registry.VisualBindingsByCustomId, StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, v) in extra)
+            merged[k] = v;
+        return merged;
+    }
+
+    private Dictionary<string, CustomCardVisualBinding>? CollectExtraVisualCatalogForRun(RunState? run)
+    {
+        var modIds = run?.CustomRules?.SelectedModIds;
+        if (modIds == null || modIds.Count == 0) return null;
+
+        Dictionary<string, CustomCardVisualBinding>? extra = null;
+        foreach (string id in modIds)
+        {
+            var pkg = _communityStore?.ResolvePackage(id) ?? FindDiscoveredPackage(id);
+            if (pkg == null || pkg.VisualBindingsByCustomId.Count == 0) continue;
+            extra ??= new Dictionary<string, CustomCardVisualBinding>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (cid, binding) in pkg.VisualBindingsByCustomId)
+                extra[cid] = binding;
+        }
+        return extra;
     }
 
     public MergedLocalizationExport ExportMergedLocalization() => _registry.ExportMergedLocalization();
 
     public bool TryResolveAssetBySha256(string? sha256, out ModAssetEntry? asset)
-        => _registry.TryResolveAssetBySha256(sha256, out asset);
+    {
+        if (_registry.TryResolveAssetBySha256(sha256, out asset))
+            return true;
+        if (!string.IsNullOrWhiteSpace(sha256) && _communityStore != null && _communityStore.TryResolveAssetBySha256(sha256, out asset))
+            return true;
+        asset = null;
+        return false;
+    }
 
     // ── 内部工具方法 ────────────────────────────────────────────────────────
 

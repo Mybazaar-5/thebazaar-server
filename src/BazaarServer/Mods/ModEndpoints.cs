@@ -325,7 +325,7 @@ public static class ModEndpoints
             modSetHash = modHost.ModSetHash,
             bindingCount = bindings.Count,
             bindings,
-            templateCatalog = modHost.VisualBindingsByCustomId,
+            templateCatalog = modHost.GetVisualCatalogForRun(handle?.Run),
         }, JsonOpts);
     }
 

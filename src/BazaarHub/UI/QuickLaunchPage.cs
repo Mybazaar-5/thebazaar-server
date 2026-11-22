@@ -18,9 +18,11 @@ public sealed class QuickLaunchPage : UserControl
     private readonly ServerModeCard _cardCustom;
     private readonly ServerModeCard _cardOfficial;
     private readonly Panel _customUrlRow;
+    private readonly ComboBox _cmbSavedServers;
     private readonly TextBox _txtCustomUrl;
     private readonly TextBox _txtPlayerName;
     private readonly CheckBox _chkAutoSync;
+    private readonly CheckBox _chkAcceptServerMods;
     private readonly CheckBox _chkBypassSteam;
     private readonly CheckBox _chkUnlockAll;
     private readonly GoldButton _btnLaunch;
@@ -206,11 +208,34 @@ public sealed class QuickLaunchPage : UserControl
         HubTheme.StyleTextBox(_txtCustomUrl);
         _txtCustomUrl.TextChanged += (_, _) => _cardCustom.CardSubtitle = string.IsNullOrWhiteSpace(_txtCustomUrl.Text) ? "请输入 http:// 地址" : _txtCustomUrl.Text.Trim();
 
+        _cmbSavedServers = new ComboBox
+        {
+            Dock = DockStyle.Fill,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            BackColor = HubTheme.BgInput,
+            ForeColor = HubTheme.TextPrimary,
+            FlatStyle = FlatStyle.Flat,
+            Margin = new Padding(0, 5, 8, 0)
+        };
+        _cmbSavedServers.SelectedIndexChanged += (_, _) =>
+        {
+            if (_cmbSavedServers.SelectedItem is string picked && !string.IsNullOrWhiteSpace(picked))
+                _txtCustomUrl.Text = picked;
+        };
+
         var btnTestCustom = new GoldButton { Text = "测试连接", Variant = GoldButtonVariant.OutlineGold, Dock = DockStyle.Fill, Margin = new Padding(0, 1, 0, 1) };
         btnTestCustom.Click += (_, _) => ProbeRefreshRequested?.Invoke();
 
+        customUrlLayout.ColumnCount = 4;
+        customUrlLayout.ColumnStyles.Clear();
+        customUrlLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 108));
+        customUrlLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
+        customUrlLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
+        customUrlLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+
         customUrlLayout.Controls.Add(_txtCustomUrl, 1, 0);
-        customUrlLayout.Controls.Add(btnTestCustom, 2, 0);
+        customUrlLayout.Controls.Add(_cmbSavedServers, 2, 0);
+        customUrlLayout.Controls.Add(btnTestCustom, 3, 0);
         _customUrlRow.Controls.Add(customUrlLayout);
         serverLayout.Controls.Add(_customUrlRow);
 
@@ -260,13 +285,15 @@ public sealed class QuickLaunchPage : UserControl
             BackColor = Color.Transparent,
             Padding = new Padding(0, 6, 0, 0)
         };
-        _chkAutoSync = new CheckBox { Text = "启动前自动增量检查并同步插件 / 汉化 / Mod", Checked = true, Margin = new Padding(0, 0, 18, 0) };
-        _chkBypassSteam = new CheckBox { Text = "脱离 Steam 依赖", Checked = true, Margin = new Padding(0, 0, 18, 0) };
+        _chkAutoSync = new CheckBox { Text = "启动前自动同步", Checked = true, Margin = new Padding(0, 0, 14, 0) };
+        _chkAcceptServerMods = new CheckBox { Text = "允许接收服务器下发的 Mod", Checked = true, Margin = new Padding(0, 0, 14, 0) };
+        _chkBypassSteam = new CheckBox { Text = "脱离 Steam 依赖", Checked = true, Margin = new Padding(0, 0, 14, 0) };
         _chkUnlockAll = new CheckBox { Text = "解锁全英雄与藏品", Checked = true, Margin = new Padding(0) };
         HubTheme.StyleCheckBox(_chkAutoSync);
+        HubTheme.StyleCheckBox(_chkAcceptServerMods);
         HubTheme.StyleCheckBox(_chkBypassSteam);
         HubTheme.StyleCheckBox(_chkUnlockAll);
-        optsFlow.Controls.AddRange(new Control[] { _chkAutoSync, _chkBypassSteam, _chkUnlockAll });
+        optsFlow.Controls.AddRange(new Control[] { _chkAutoSync, _chkAcceptServerMods, _chkBypassSteam, _chkUnlockAll });
         playerLayout.Controls.Add(optsFlow, 0, 2);
 
         playerCard.Controls.Add(playerLayout);
@@ -317,6 +344,7 @@ public sealed class QuickLaunchPage : UserControl
     public string CustomServerUrl => _txtCustomUrl.Text.Trim();
     public string PlayerNameInput => _txtPlayerName.Text.Trim();
     public bool AutoSyncBeforeLaunch => _chkAutoSync.Checked;
+    public bool AcceptServerMods => _chkAcceptServerMods.Checked;
     public bool BypassSteam => _chkBypassSteam.Checked;
     public bool UnlockEverything => _chkUnlockAll.Checked;
 
@@ -350,10 +378,28 @@ public sealed class QuickLaunchPage : UserControl
         _txtPlayerName.Text = name;
 
         _chkAutoSync.Checked = prefs.AutoSyncBeforeLaunch;
+        _chkAcceptServerMods.Checked = snapshot.AcceptServerMods;
         _chkBypassSteam.Checked = snapshot.BypassSteam;
         _chkUnlockAll.Checked = snapshot.UnlockEverything;
 
+        UpdateSavedServerDropdown(prefs.SavedCustomServers, _txtCustomUrl.Text);
+
         SelectServerMode(snapshot.InferServerMode(), notify: false);
+    }
+
+    public void UpdateSavedServerDropdown(IEnumerable<string>? servers, string? currentUrl)
+    {
+        _cmbSavedServers.Items.Clear();
+        if (servers != null)
+        {
+            foreach (string s in servers)
+            {
+                if (!string.IsNullOrWhiteSpace(s) && !_cmbSavedServers.Items.Contains(s))
+                    _cmbSavedServers.Items.Add(s);
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(currentUrl) && !_cmbSavedServers.Items.Contains(currentUrl))
+            _cmbSavedServers.Items.Add(currentUrl);
     }
 
     public void SelectServerMode(ServerMode mode, bool notify)

@@ -123,6 +123,7 @@
     meta: null,
     catalog: null,
     mods: [],
+    communityMods: [],
     currentModId: null,
     workspace: null,
     assets: [],
@@ -186,9 +187,11 @@
   // ── 初始化加载 ────────────────────────────────────────────────────────────
   async function init() {
     $('workshopTokenInput').value = state.token;
+    const savedPlayer = localStorage.getItem('bazaar_community_player_name') || '';
+    if ($('communityPlayerName')) $('communityPlayerName').value = savedPlayer;
     bindGlobalEvents();
 
-    await Promise.all([loadMeta(), loadRuleCatalog(), loadModsList()]);
+    await Promise.all([loadMeta(), loadRuleCatalog(), loadModsList(), loadCommunityMods()]);
     await searchBaseCards();
 
     if (state.mods.length > 0 && !state.currentModId) {
@@ -1294,7 +1297,148 @@
       return;
     }
     toast(res.data.messageZh || '发布并热重载成功！', 'ok');
-    await Promise.all([loadMeta(), loadModsList()]);
+    await Promise.all([loadMeta(), loadModsList(), loadCommunityMods()]);
+  }
+
+  // ── 社区 Mod 列表、上传、下载与服主全服开关 ─────────────────────────────────
+  function getCommunityPlayerName() {
+    const val = ($('communityPlayerName')?.value || '').trim();
+    if (val) localStorage.setItem('bazaar_community_player_name', val);
+    return val;
+  }
+
+  async function loadCommunityMods() {
+    const grid = $('communityModGrid');
+    if (!grid) return;
+    const playerName = getCommunityPlayerName();
+    const headers = playerName ? { 'X-Player-Name': playerName } : {};
+    const res = await apiFetch('/api/community/mods', { headers });
+    if (!res.ok) {
+      grid.innerHTML = `<div class="empty-hint">加载社区 Mod 列表失败（HTTP ${res.status}）</div>`;
+      return;
+    }
+    state.communityMods = res.data.mods || [];
+    const stats = $('communityStatsText');
+    if (stats) {
+      stats.textContent = `当前共 ${state.communityMods.length} 个可用 Mod（含全服启用与社区上传）；上传自动经过 10 项安全检测与 25 场模拟对战`;
+    }
+    renderCommunityMods();
+  }
+
+  function renderCommunityMods() {
+    const grid = $('communityModGrid');
+    if (!grid) return;
+    if (!state.communityMods.length) {
+      grid.innerHTML = '<div class="empty-hint">目前还没有社区 Mod，点击右上角「上传本地 Mod」就可以分享你的 .bazaarmod.zip。</div>';
+      return;
+    }
+    const isAdmin = !!state.meta?.canWrite;
+    grid.innerHTML = state.communityMods.map((m) => {
+      const badge = m.isServerDefault
+        ? '<span class="badge badge-green">全服启用</span>'
+        : '<span class="badge badge-blue">社区</span>';
+      const authorText = m.uploaderName || m.author || '玩家';
+      const dlHref = apiUrl(`/api/community/mods/${encodeURIComponent(m.modId)}/download`);
+      const canDelete = !!m.canDelete;
+      let adminToggleBtn = '';
+      if (isAdmin || m.canToggleServerDefault) {
+        if (m.isServerDefault) {
+          adminToggleBtn = `<button class="btn btn-subtle btn-xs" data-comm-act="server-off" data-id="${escapeHtml(m.modId)}">取消全服启用</button>`;
+        } else if (m.isInCommunityStore || m.canToggleServerDefault) {
+          adminToggleBtn = `<button class="btn btn-gold btn-xs" data-comm-act="server-on" data-id="${escapeHtml(m.modId)}">设为全服启用</button>`;
+        }
+      }
+      const delBtn = canDelete
+        ? `<button class="btn btn-danger btn-xs" data-comm-act="delete" data-id="${escapeHtml(m.modId)}">删除</button>`
+        : '';
+      return `
+        <div class="community-card">
+          <div class="mod-item-head">
+            <span class="mod-item-title">${escapeHtml(m.name || m.modId)} <small class="muted">(${escapeHtml(m.modId)})</small></span>
+            ${badge}
+          </div>
+          <div class="mod-item-meta">
+            <span>v${escapeHtml(m.version || '1.0.0')}</span>
+            <span>作者：${escapeHtml(authorText)}</span>
+            <span>新卡 ${m.customCardCount || 0}</span>
+            <span>奇遇 ${m.customEventCount || 0}</span>
+            <span>卡图 ${m.assetCount || 0}</span>
+            <span>下载 ${m.downloadCount || 0}</span>
+          </div>
+          <div class="community-desc">${escapeHtml(m.description || '暂无简介')}</div>
+          <div class="community-actions">
+            <a class="btn btn-outline btn-xs" href="${dlHref}" download>⬇ 下载到本地</a>
+            ${adminToggleBtn}
+            ${delBtn}
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    grid.querySelectorAll('button[data-comm-act]').forEach((btn) => {
+      btn.addEventListener('click', () => handleCommunityModAction(btn.dataset.commAct, btn.dataset.id));
+    });
+  }
+
+  async function uploadCommunityZipFile(file) {
+    let playerName = getCommunityPlayerName();
+    if (!playerName) {
+      const entered = prompt('请输入你的上传昵称（用来标记作者，之后只有你和服主能删除这个包）：', '玩家');
+      if (entered === null) return;
+      playerName = entered.trim() || '玩家';
+      if ($('communityPlayerName')) $('communityPlayerName').value = playerName;
+      localStorage.setItem('bazaar_community_player_name', playerName);
+    }
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    toast('正在上传并执行安全检测与 25 场模拟对战，请稍候...');
+    const res = await apiFetch('/api/community/mods/upload', {
+      method: 'POST',
+      headers: { 'X-Player-Name': playerName },
+      body: fd
+    });
+    if (!res.ok) {
+      toast(res.data?.messageZh || res.data?.error || `上传未通过（HTTP ${res.status}）`, 'err');
+      if (res.data?.validation) {
+        switchTab('validate');
+        renderValidationReport(res.data.validation);
+      }
+      return;
+    }
+    toast(res.data?.messageZh || '上传成功！现在大家都可以下载或开房选用了。', 'ok');
+    await loadCommunityMods();
+  }
+
+  async function handleCommunityModAction(action, modId) {
+    if (!modId) return;
+    const playerName = getCommunityPlayerName();
+    const headers = playerName ? { 'X-Player-Name': playerName } : {};
+
+    if (action === 'delete') {
+      if (!confirm(`确定删除社区 Mod「${modId}」吗？`)) return;
+      const res = await apiFetch(`/api/community/mods/${encodeURIComponent(modId)}`, { method: 'DELETE', headers });
+      if (!res.ok) {
+        toast(res.data?.messageZh || res.data?.error || `删除失败（HTTP ${res.status}）`, 'err');
+        return;
+      }
+      toast(res.data?.messageZh || '已删除。', 'ok');
+      await loadCommunityMods();
+      return;
+    }
+
+    if (action === 'server-on' || action === 'server-off') {
+      const enabled = action === 'server-on';
+      const res = await apiFetch(`/api/community/mods/${encodeURIComponent(modId)}/server-default`, {
+        method: 'POST',
+        json: { enabled }
+      });
+      if (!res.ok) {
+        toast(res.data?.messageZh || res.data?.error || `操作失败（HTTP ${res.status}）`, 'err');
+        return;
+      }
+      toast(res.data?.messageZh || (enabled ? '已设为全服启用' : '已取消全服启用'), 'ok');
+      await Promise.all([loadMeta(), loadModsList(), loadCommunityMods()]);
+    }
   }
 
   // ── 事件绑定 ──────────────────────────────────────────────────────────────
@@ -1310,7 +1454,7 @@
       state.token = $('workshopTokenInput').value.trim();
       localStorage.setItem('bazaar_workshop_token', state.token);
       sessionStorage.setItem('bazaar_workshop_token', state.token);
-      await loadMeta();
+      await Promise.all([loadMeta(), loadCommunityMods()]);
       toast(state.meta?.canWrite ? '已解锁公网写权限（已持久化记住）！' : '口令未匹配或服务端未开启 Token 写权限。', state.meta?.canWrite ? 'ok' : 'err');
     });
 
@@ -1321,6 +1465,19 @@
     $('btnPublishReload').addEventListener('click', publishAndReload);
     $('btnGoToCards').addEventListener('click', () => switchTab('cards'));
     $('btnRefreshMods').addEventListener('click', loadModsList);
+
+    // 社区 Mod 列表与上传
+    $('btnCommunityRefresh')?.addEventListener('click', loadCommunityMods);
+    $('btnCommunityUpload')?.addEventListener('click', () => $('communityZipInput')?.click());
+    $('communityZipInput')?.addEventListener('change', (e) => {
+      const f = e.target.files?.[0];
+      e.target.value = '';
+      if (f) uploadCommunityZipFile(f);
+    });
+    $('communityPlayerName')?.addEventListener('change', () => {
+      getCommunityPlayerName();
+      loadCommunityMods();
+    });
 
     // 新建空白 Mod
     $('btnNewMod').addEventListener('click', () => $('newModModal').classList.remove('hidden'));

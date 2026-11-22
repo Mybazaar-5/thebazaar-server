@@ -16,7 +16,7 @@ namespace BazaarLauncher.Core;
 /// 服务端 Mod 清单、自定义 PNG 卡图资产（SHA-256 增量下载）、四层中文词典与活跃对局视觉绑定的联机自动同步客户端。
 /// 本地缓存路径：BepInEx/config/BazaarModCache/
 /// </summary>
-internal sealed class ModContentSyncClient
+internal sealed partial class ModContentSyncClient
 {
     internal sealed class ServerModEntry
     {
@@ -48,6 +48,8 @@ internal sealed class ModContentSyncClient
     private readonly object _sync = new();
     private readonly List<IDisposable> _syncedVisualHandles = new();
     private readonly List<IDisposable> _syncedActiveBindingHandles = new();
+    private readonly List<IDisposable> _syncedRoomBundleVisualHandles = new();
+    private readonly List<IDisposable> _syncedRoomBundleTextHandles = new();
     private readonly List<IDisposable> _syncedCardTextHandles = new();
     private List<ServerModEntry> _serverMods = new();
     private List<ServerCustomContentItem> _customContents = new();
@@ -68,17 +70,31 @@ internal sealed class ModContentSyncClient
     internal string LastSyncSummary => _lastSyncSummary;
     internal DateTime LastSyncUtc => _lastSyncUtc;
 
-    internal string AssetsCacheDir
+    internal string CurrentServerCacheDir
     {
         get
         {
-            string dir = Path.Combine(ModuleHost.CacheDirectory, "assets");
+            string baseUrl = NameAuth.GetServerBaseUrl();
+            string key = string.IsNullOrWhiteSpace(baseUrl)
+                ? "default"
+                : ComputeSha256Hex(Encoding.UTF8.GetBytes(baseUrl.ToLowerInvariant())).Substring(0, 12);
+            string dir = Path.Combine(ModuleHost.CacheDirectory, "srv_" + key);
             try { Directory.CreateDirectory(dir); } catch { }
             return dir;
         }
     }
 
-    internal string OverlayCachePath => Path.Combine(ModuleHost.CacheDirectory, "custom_zh_overlay.json");
+    internal string AssetsCacheDir
+    {
+        get
+        {
+            string dir = Path.Combine(CurrentServerCacheDir, "assets");
+            try { Directory.CreateDirectory(dir); } catch { }
+            return dir;
+        }
+    }
+
+    internal string OverlayCachePath => Path.Combine(CurrentServerCacheDir, "custom_zh_overlay.json");
 
     internal IReadOnlyList<ServerModEntry> GetServerModsSnapshot()
     {
@@ -190,6 +206,15 @@ internal sealed class ModContentSyncClient
 
         // 1. 拉取外挂四层中文词典 /api/localization/overlay（回退 /api/localization/zh-overlay）
         await SyncLocalizationOverlayAsync(forceRefresh, ct).ConfigureAwait(false);
+
+        // 若用户关闭「允许接收服务器下发的 Mod」，清掉已注册的服务端 Mod 贴图与文案并直接结束
+        if (BazaarLauncherPlugin.AcceptServerMods != null && !BazaarLauncherPlugin.AcceptServerMods.Value)
+        {
+            ClearSyncedServerMods();
+            _lastSyncSummary = "已关闭接收服务器 Mod（仅同步中文词典）";
+            _lastSyncUtc = DateTime.UtcNow;
+            return true;
+        }
 
         // 2. 拉取服务端 Mod 清单 /api/mods/manifest
         var manifestResp = await NameAuth.GetJsonAsync("/api/mods/manifest", ct).ConfigureAwait(false);

@@ -8,6 +8,7 @@ using BazaarGameShared.Domain.Core.Types;
 using BazaarGameShared.Domain.Runs;
 using BazaarGameShared.Infra.Commands;
 using BazaarGameShared.Infra.Messages;
+using BazaarGameShared.Infra.Messages.GameSimEvents;
 using BazaarServer.Accounts;
 using BazaarServer.Data;
 using BazaarServer.Game;
@@ -283,13 +284,20 @@ public static class GameServerEndpoints
             });
         }
 
+        bool hasStructuralEvent = outcome.Events.Any(e =>
+            e is GameSimEventCardSpawned
+            or GameSimEventCardDisposed
+            or GameSimEventSocketsUnlocked
+            or GameSimEventPlayerSkillEquipped);
+
         isPureBoardMove = (cmd is MoveItemCommand || isOwnedSelectMove) &&
             run.State == stateBefore &&
             !Persistence.IsTerminalState(run.State) &&
             outcome.CombatSpawnSim == null &&
             outcome.Combat == null &&
             !outcome.ForceStateSync &&
-            !outcome.AppendStateSyncAtTail;
+            !outcome.AppendStateSyncAtTail &&
+            !hasStructuralEvent;
 
         if (isPureBoardMove)
         {
@@ -402,10 +410,14 @@ public static class GameServerEndpoints
                 return;
             }
 
-            var activeRepo = modHost?.ActiveRepository ?? fallbackRepo;
             var account = ResolveAccount(ctx, accounts);
             string accountIdKey = account.AccountId.ToString("N");
             var desiredRules = ResolveDesiredRulesForAccount(accountIdKey, init, playerRules, lobbies);
+            var runModCtx = modHost?.ResolveRunModContext(desiredRules.SelectedModIds, pool, monsters, archetypeIndex);
+            var activeRepo = runModCtx?.Repository ?? modHost?.ActiveRepository ?? fallbackRepo;
+            var runPool = runModCtx?.Pool ?? pool;
+            var runMonsters = runModCtx?.Monsters ?? monsters;
+            var runArchetypeIndex = runModCtx?.ArchetypeIndex ?? archetypeIndex;
             var challengeService = app.Services.GetService<ChallengeService>() ?? TempoNetEndpoints.SharedChallengeService;
 
             // P1-37：账号级互斥锁串行化 /sessions 与 /runs/active/concede（加锁顺序恒为 AccountLock → Session.Gate）
@@ -476,9 +488,16 @@ public static class GameServerEndpoints
                     bool starterDone = resumedStarterDone ?? resumedRun.StartSelectionDone;
                     resumedRun.StartSelectionDone = starterDone;
 
+                    var resumedModCtx = modHost?.ResolveRunModContext(resumedRun.CustomRules?.SelectedModIds, pool, monsters, archetypeIndex);
                     var resumedEngine = new RunEngine(
-                        resumedRun, pool, monsters, levelUps, mode, activeRepo, ghosts,
-                        archetypeIndex, playerRules, lobbies, diSessions ?? sessions,
+                        resumedRun,
+                        resumedModCtx?.Pool ?? runPool,
+                        resumedModCtx?.Monsters ?? runMonsters,
+                        levelUps, mode,
+                        resumedModCtx?.Repository ?? activeRepo,
+                        ghosts,
+                        resumedModCtx?.ArchetypeIndex ?? runArchetypeIndex,
+                        playerRules, lobbies, diSessions ?? sessions,
                         pvpCoordinator, socialSink, accounts, challengeService, db);
                     if (starterDone)
                     {
@@ -536,8 +555,8 @@ public static class GameServerEndpoints
                     CustomRules = desiredRules.CloneNormalized(),
                 };
                 var engine = new RunEngine(
-                    run, pool, monsters, levelUps, mode, activeRepo, ghosts,
-                    archetypeIndex, playerRules, lobbies, diSessions ?? sessions,
+                    run, runPool, runMonsters, levelUps, mode, activeRepo, ghosts,
+                    runArchetypeIndex, playerRules, lobbies, diSessions ?? sessions,
                     pvpCoordinator, socialSink, accounts, challengeService, db);
 
                 // 开局：发起始技能三选一 / Day 1 Hour 1 遭遇
@@ -651,7 +670,7 @@ public static class GameServerEndpoints
                     targetEntry.Owner == ECombatantId.Player;
 
                 RunEngine.Outcome outcome;
-                if (cmd is CheatCommand && IsHttpCheatBlocked(handle.Run))
+                if (cmd is CheatCommand cheatCmd && IsHttpCheatBlocked(handle.Run, cheatCmd))
                 {
                     outcome = new RunEngine.Outcome
                     {
@@ -729,6 +748,16 @@ public static class GameServerEndpoints
                     {
                         try { RecordInRunCareerDeltas(accounts, acc, cmd, handle.Run, outcome, goldBefore); } catch { }
                     }
+                }
+
+                // 兜底消费沙盒外部修改挂起的同步事件与全量同步标记（若玩家在播战斗跳过 sandbox_sync，下一次任意命令自动合并下发）
+                if (outcome.Error == null &&
+                    (handle.Run.PendingExternalSyncEvents.Count > 0 || handle.Run.PendingExternalForceStateSync))
+                {
+                    bool extForce = outcome.ForceStateSync;
+                    handle.Run.ConsumePendingExternalSync(outcome.Events, ref extForce);
+                    if (extForce)
+                        outcome.ForceStateSync = true;
                 }
 
                 INetMessage reply = BuildCommandReply(
@@ -1225,8 +1254,15 @@ public static class GameServerEndpoints
         return ms.ToArray();
     }
 
-    private static bool IsHttpCheatBlocked(RunState run)
+    private static bool IsHttpCheatBlocked(RunState run, CheatCommand? cmd = null)
     {
+        // 沙盒对局的 sandbox_sync 是零副作用状态同步通道，不受通用调试开关限制
+        if (run.IsSandboxRun &&
+            cmd?.Args is { Count: > 0 } &&
+            string.Equals(cmd.Args[0], "sandbox_sync", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
         if (string.Equals(Environment.GetEnvironmentVariable("BAZAAR_DISABLE_CHEATS"), "1", StringComparison.Ordinal))
             return true;
         if (run.CustomRules?.SpecialModeId == ESpecialModeId.DailyChallenge)

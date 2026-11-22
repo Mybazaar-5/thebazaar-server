@@ -118,9 +118,11 @@ var rawCoreRepo = GameDatabaseLoader.Load(
     File.Exists(zhPath) ? zhPath : null);
 var validVisualWhitelist = TryLoadValidAssetWhitelist(dataRoot);
 
-// 2. 启动服务端 Mod 热加载主机与四层 OverlayLocalizationStore
+// 2. 启动服务端 Mod 热加载主机、社区 Mod 仓库与四层 OverlayLocalizationStore
 var modHost = new ServerModHost(rawCoreRepo, dataRoot, stateDir, validVisualWhitelist);
+var communityModStore = new CommunityModStore(modHost, stateDir);
 builder.Services.AddSingleton(modHost);
+builder.Services.AddSingleton(communityModStore);
 builder.Services.AddSingleton<WorkshopValidatorService>();
 builder.Services.AddSingleton<OverlayLocalizationStore>(sp => sp.GetRequiredService<ServerModHost>().ActiveLocalization);
 builder.Services.AddSingleton<GameDataRepository>(modHost.BaseRepository);
@@ -216,6 +218,7 @@ BazaarServer.Tournament.TournamentEndpoints.Map(app, lobbyStore);
 CustomRuleEndpoints.Map(app, playerRuleStore, accountsStore, GetCurrentCatalog, sessionStore, persistence);
 ModEndpoints.Map(app);
 WorkshopEndpoints.Map(app);
+CommunityModEndpoints.Map(app);
 ClientUpdateEndpoints.Map(app, dataRoot);
 MultiplayerEndpointModule.MapEndpoints(app);
 
@@ -280,6 +283,7 @@ app.MapGet("/healthz", () => Results.Json(new
     loadedCards = cardPool.TotalCards,
     totalTemplates = modHost.ActiveRepository.CardsById.Count,
     enabledMods = modHost.EnabledModCount,
+    communityMods = communityModStore.Count,
     modSetHash = modHost.ModSetHash,
     localizationEntries = modHost.ActiveLocalization.EntryCount,
     activeSessions = SessionRegistry.ActiveCount,

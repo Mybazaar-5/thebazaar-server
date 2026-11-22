@@ -68,6 +68,7 @@ public sealed class LauncherConfigSnapshot
 {
     public bool Enabled { get; set; } = true;
     public string ServerBase { get; set; } = LauncherConstants.CloudTencentUrl;
+    public bool AcceptServerMods { get; set; } = true;
     public string ConfigPlayerName { get; set; } = string.Empty;
     public string PlayerNameFileValue { get; set; } = string.Empty;
     public bool BypassSteam { get; set; } = true;
@@ -119,6 +120,7 @@ public sealed class HubPreferences
     public string LastGameDirectory { get; set; } = string.Empty;
     public ServerMode SelectedMode { get; set; } = ServerMode.CloudTencent;
     public string CustomServerUrl { get; set; } = "http://127.0.0.1:8080";
+    public List<string> SavedCustomServers { get; set; } = new();
     public bool AutoSyncBeforeLaunch { get; set; } = true;
     public PerformanceTuningOptions PerformanceOptions { get; set; } = PerformanceTuningOptions.CreateRecommended();
 }

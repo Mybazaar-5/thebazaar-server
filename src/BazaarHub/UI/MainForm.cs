@@ -18,6 +18,7 @@ public sealed class MainForm : Form
     private readonly PerformanceTunerService _perfService = new();
     private readonly StandaloneServerHost _standaloneHost = new();
     private readonly DiagnosticsExportService _diagService = new();
+    private readonly CommunityModClient _communityClient = new();
 
     private readonly NavSidebarButton _navLaunch;
     private readonly NavSidebarButton _navSync;
@@ -36,6 +37,7 @@ public sealed class MainForm : Form
     private GameInstallInfo? _gameInstall;
     private bool _isLaunching;
     private bool _isSyncing;
+    private bool _communityModsLoadedOnce;
 
     public MainForm()
     {
@@ -191,6 +193,9 @@ public sealed class MainForm : Form
         // 标签页 2 事件
         _syncPage.SyncRequested += async applyDownloads => await RunManualSyncAsync(applyDownloads);
         _syncPage.OpenWorkshopRequested += async () => await OpenWorkshopInBrowserAsync();
+        _syncPage.RefreshCommunityModsRequested += async () => await RefreshHubCommunityModsAsync();
+        _syncPage.DownloadCommunityModRequested += async modId => await DownloadHubCommunityModAsync(modId);
+        _syncPage.UploadLocalModRequested += async () => await UploadHubLocalModAsync();
         _syncPage.OpenModCacheRequested += () =>
         {
             if (_gameInstall?.IsValidGameInstall == true)
@@ -255,6 +260,12 @@ public sealed class MainForm : Form
         target.Dock = DockStyle.Fill;
         _contentHost.Controls.Add(target);
         _contentHost.ResumeLayout();
+
+        if (index == 1 && !_communityModsLoadedOnce)
+        {
+            _communityModsLoadedOnce = true;
+            _ = RefreshHubCommunityModsAsync();
+        }
     }
 
     private async Task InitializeOnStartupAsync()
@@ -383,19 +394,29 @@ public sealed class MainForm : Form
                 customUrl,
                 playerName,
                 bypassSteam: _launchPage.BypassSteam,
-                unlockEverything: _launchPage.UnlockEverything);
+                unlockEverything: _launchPage.UnlockEverything,
+                acceptServerMods: _launchPage.AcceptServerMods);
 
             _preferences.SelectedMode = mode;
             if (!string.IsNullOrWhiteSpace(customUrl))
             {
-                _preferences.CustomServerUrl = LauncherConfigService.NormalizeServerUrl(customUrl);
+                string normalizedCustom = LauncherConfigService.NormalizeServerUrl(customUrl);
+                _preferences.CustomServerUrl = normalizedCustom;
+                _preferences.SavedCustomServers ??= new List<string>();
+                if (!_preferences.SavedCustomServers.Any(s => string.Equals(s, normalizedCustom, StringComparison.OrdinalIgnoreCase)))
+                {
+                    _preferences.SavedCustomServers.Insert(0, normalizedCustom);
+                    if (_preferences.SavedCustomServers.Count > 12)
+                        _preferences.SavedCustomServers.RemoveRange(12, _preferences.SavedCustomServers.Count - 12);
+                }
+                _launchPage.UpdateSavedServerDropdown(_preferences.SavedCustomServers, normalizedCustom);
             }
             _preferences.AutoSyncBeforeLaunch = _launchPage.AutoSyncBeforeLaunch;
             _preferences.PerformanceOptions = _perfPage.CollectOptions();
             SavePreferencesQuietly();
 
             UpdateSidebarSummary();
-            AppendLog($"[成功] 配置已无损保存：模式={FormatModeName(mode)}，地址={snap.ServerBase}，昵称={snap.EffectivePlayerName}");
+            AppendLog($"[成功] 配置已保存：模式={FormatModeName(mode)}，地址={snap.ServerBase}，昵称={snap.EffectivePlayerName}，接收服务器 Mod={(snap.AcceptServerMods ? "开" : "关")}");
 
             if (showFeedback)
             {
@@ -528,6 +549,144 @@ public sealed class MainForm : Form
         {
             _isSyncing = false;
             _syncPage.SetBusy(false, "同步流程已结束，可查看上方明细。", 100);
+        }
+    }
+
+    private string? ResolveServerBaseForCommunity(bool showWarningIfNone)
+    {
+        string serverBase = LauncherConfigService.ResolveServerBase(_launchPage.SelectedMode, _launchPage.CustomServerUrl);
+        if (string.IsNullOrWhiteSpace(serverBase))
+        {
+            if (showWarningIfNone)
+            {
+                MessageBox.Show(this, "当前处于「纯净官方原版」模式，请先切到线上服、本地服或自定义服务器。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            return null;
+        }
+        return serverBase;
+    }
+
+    private async Task RefreshHubCommunityModsAsync()
+    {
+        string? serverBase = ResolveServerBaseForCommunity(showWarningIfNone: false);
+        if (string.IsNullOrWhiteSpace(serverBase))
+        {
+            _syncPage.RenderCommunityMods(Array.Empty<HubCommunityModItem>(), "当前为纯净原版模式，未连接社区 Mod 服务器。", false);
+            return;
+        }
+
+        _syncPage.SetBusy(true, "正在拉取服务器和社区 Mod 列表...", 30);
+        string finalStatus = "社区 Mod 列表已刷新。";
+        bool finalOk = true;
+        try
+        {
+            var (ok, mods, msg) = await _communityClient.FetchListAsync(serverBase, _launchPage.PlayerNameInput);
+            finalStatus = msg;
+            finalOk = ok;
+            _syncPage.RenderCommunityMods(mods, msg, ok);
+            AppendLog($"[社区 Mod] {msg}");
+        }
+        catch (Exception ex)
+        {
+            finalStatus = $"拉取失败：{ex.Message}";
+            finalOk = false;
+            AppendLog($"[错误] 拉取社区 Mod 列表失败：{ex.Message}");
+            _syncPage.RenderCommunityMods(Array.Empty<HubCommunityModItem>(), finalStatus, false);
+        }
+        finally
+        {
+            _syncPage.SetBusy(false, finalStatus, finalOk ? 100 : 0);
+        }
+    }
+
+    private async Task DownloadHubCommunityModAsync(string modId)
+    {
+        if (_gameInstall == null || !_gameInstall.IsValidGameInstall)
+        {
+            MessageBox.Show(this, "请先在「快速启动与选服」定位有效的游戏目录。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        string? serverBase = ResolveServerBaseForCommunity(showWarningIfNone: true);
+        if (string.IsNullOrWhiteSpace(serverBase)) return;
+
+        _syncPage.SetBusy(true, $"正在下载 {modId} 到本地 BepInEx\\mods\\...", 40);
+        try
+        {
+            var (ok, msg, savedDir) = await _communityClient.DownloadToLocalAsync(serverBase, modId, _gameInstall.GameDirectory);
+            AppendLog($"[社区 Mod] 下载 {modId}：{msg}");
+            if (ok)
+            {
+                MessageBox.Show(this, $"{msg}\n\n以后开单机或离线也能直接用，也可以重新上传分享给别的服务器。", "下载完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                await RefreshHubCommunityModsAsync();
+            }
+            else
+            {
+                MessageBox.Show(this, msg, "下载失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[错误] 下载 {modId} 异常：{ex.Message}");
+            MessageBox.Show(this, $"下载出错：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _syncPage.SetBusy(false, "操作已完成。", 100);
+        }
+    }
+
+    private async Task UploadHubLocalModAsync()
+    {
+        string? serverBase = ResolveServerBaseForCommunity(showWarningIfNone: true);
+        if (string.IsNullOrWhiteSpace(serverBase)) return;
+
+        using var ofd = new OpenFileDialog
+        {
+            Title = "选择要上传的 .bazaarmod.zip，或选择本地 Mod 文件夹里的 mod.json",
+            Filter = "Mod 包或配置 (*.bazaarmod.zip;mod.json)|*.bazaarmod.zip;mod.json|ZIP 压缩包 (*.zip)|*.zip",
+            CheckFileExists = true
+        };
+        if (_gameInstall?.IsValidGameInstall == true)
+        {
+            string localModsDir = Path.Combine(_gameInstall.GameDirectory, "BepInEx", "mods");
+            if (Directory.Exists(localModsDir))
+                ofd.InitialDirectory = localModsDir;
+        }
+
+        if (ofd.ShowDialog(this) != DialogResult.OK) return;
+
+        string selected = ofd.FileName;
+        string targetPath = string.Equals(Path.GetFileName(selected), "mod.json", StringComparison.OrdinalIgnoreCase)
+            ? (Path.GetDirectoryName(selected) ?? selected)
+            : selected;
+
+        _syncPage.SetBusy(true, "正在上传并等待服务器做安全校验和模拟对战检验...", 35);
+        try
+        {
+            string playerName = string.IsNullOrWhiteSpace(_launchPage.PlayerNameInput)
+                ? Environment.UserName
+                : _launchPage.PlayerNameInput;
+            var (ok, msg) = await _communityClient.UploadModAsync(serverBase, targetPath, playerName);
+            AppendLog($"[社区 Mod] 上传 {Path.GetFileName(targetPath)}：{msg}");
+            if (ok)
+            {
+                MessageBox.Show(this, $"{msg}\n\n现在大家都能在列表里下载，锦标赛房主也可以勾选它开赛。", "上传成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                await RefreshHubCommunityModsAsync();
+            }
+            else
+            {
+                MessageBox.Show(this, msg, "上传未通过", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[错误] 上传本地 Mod 异常：{ex.Message}");
+            MessageBox.Show(this, $"上传出错：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _syncPage.SetBusy(false, "操作已完成。", 100);
         }
     }
 
@@ -790,5 +949,6 @@ public sealed class MainForm : Form
         _standaloneHost.Dispose();
         _probeService.Dispose();
         _syncService.Dispose();
+        _communityClient.Dispose();
     }
 }

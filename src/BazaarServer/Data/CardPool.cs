@@ -302,6 +302,33 @@ public sealed class CardPool
     }
 
     /// <summary>
+    /// 基于当前卡池的资产白名单、中文词库与价格/品阶表，在内存中直接派生一个独立叠加指定仓库与 Mod 的新卡池（零 SQLite I/O，用于锦标赛按房隔离加载 Mod）。
+    /// </summary>
+    public CardPool CreateIsolatedOverlay(
+        GameDataRepository activeRepo,
+        IReadOnlyDictionary<string, CustomCardVisualBinding>? visualBindings = null)
+    {
+        ArgumentNullException.ThrowIfNull(activeRepo);
+        var clone = new CardPool
+        {
+            DefaultGameModeId = DefaultGameModeId,
+            TierChancesByDay = TierChancesByDay,
+            StandardPrices = StandardPrices,
+            LoadedFrom = LoadedFrom,
+            WhitelistEnabled = WhitelistEnabled,
+            WhitelistLoadedFrom = WhitelistLoadedFrom,
+            ZhTranslationLoaded = ZhTranslationLoaded,
+            ZhTranslationLoadedFrom = ZhTranslationLoadedFrom,
+        };
+        foreach (string id in _validCardIds)
+            clone._validCardIds.Add(id);
+        foreach (string k in _zhTranslatedKeys)
+            clone._zhTranslatedKeys.Add(k);
+        clone.ApplyRepositoryOverlay(activeRepo, visualBindings);
+        return clone;
+    }
+
+    /// <summary>
     /// 原子热刷新卡池快照（用于服务端 Mod 热重载/运行时启停，读路径全程无锁无撕裂）。
     /// </summary>
     public void ApplyRepositoryOverlay(

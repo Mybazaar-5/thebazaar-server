@@ -73,6 +73,14 @@ public sealed class RunEngine
     }
     public IReadOnlyList<string> BoardAuditLogs => _boardAuditLogs;
     public RunState State => _run;
+    /// <summary>本局活跃的核心数据仓库（包含本局生效的全局/社区/按房隔离 Mod）。</summary>
+    public GameDataRepository ActiveRepository => _repo;
+    /// <summary>本局活跃的卡池实例（与 ActiveRepository 对齐）。</summary>
+    public CardPool ActivePool => _pool;
+    /// <summary>本局活跃的野怪模板列表。</summary>
+    public List<Data.MonsterTemplate> ActiveMonsters => _monsters;
+    /// <summary>本局活跃的流派索引。</summary>
+    public CardArchetypeIndex? ActiveArchetypeIndex => _archetypeIndex;
     /// <summary>P1-13：记录本局最近一次完赛通行证 XP 实际落盘的赛季 ID（用于隔离并发环境变量波动）。</summary>
     public int LastAwardedPassSeasonId { get; private set; } = 1;
 
@@ -4898,6 +4906,18 @@ public sealed class RunEngine
                 foreach (string dirtyId in restarted.DirtyCardIds)
                     o.DirtyCardIds.Add(dirtyId);
                 o.ForceStateSync = true;
+                break;
+            }
+            case "sandbox_sync":
+            {
+                // 仅限沙盒模式执行：零副作用消费沙盒外部修改挂起的事件与全量同步标记，把新卡/数值即时刷给 Unity 客户端
+                if (!_run.IsSandboxRun)
+                    return NotAllowed("仅沙盒实验室模式允许执行 sandbox_sync 同步指令");
+
+                bool extForce = false;
+                _run.ConsumePendingExternalSync(o.Events, ref extForce);
+                if (extForce)
+                    o.ForceStateSync = true;
                 break;
             }
             default:
