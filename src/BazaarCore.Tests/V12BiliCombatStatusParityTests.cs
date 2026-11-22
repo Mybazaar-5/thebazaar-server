@@ -318,7 +318,7 @@ public sealed class V12BiliCombatStatusParityTests
     public void Q03_Q05_Q07_TickIcdCooldownFloorHasteAndSandstormBoundaries()
     {
         var repo = Repo.Value;
-        Assert.Equal(20, CombatSimulator.TickMs);
+        Assert.Equal(50, CombatSimulator.TickMs);
         // 注：按用户需求放开超 2 分钟沙尘暴长局结算上限至 300_000ms（原官方常量为 120_000ms）
         Assert.Equal(300_000, CombatSimulator.MaxDurationMs);
         Assert.Equal(16, CombatSimulator.MaxForceUseDepth);
@@ -328,7 +328,7 @@ public sealed class V12BiliCombatStatusParityTests
         var fastCard = MakeSyntheticItem("floor_cd", 2000, extraAttrs: new() { ["FlatCooldownReduction"] = 1800, ["PercentCooldownReduction"] = 80 });
         Assert.Equal(1000, fastCard.GetAttribute("CooldownMax"));
 
-        // 2. 2x 加速 + 20ms 步长 + 20s 沙暴预警 + 30s 沙暴开吹
+        // 2. 2x 加速 + 50ms 步长 + 20s 沙暴预警 + 30s 沙暴开吹
         var p1 = CreatePlayer("p1", HeroNames.Vanessa, 5000);
         var p2 = CreatePlayer("p2", HeroNames.Vanessa, 5000);
         var hastedWpn = MakeSyntheticItem("hasted_wpn", 4000, new RuleNode { Type = "TActionPlayerDamage", Target = new RuleNode { Type = "TTargetPlayerRelative", TargetMode = "Opponent" }, ReferenceValue = Fixed(1) });
@@ -347,8 +347,8 @@ public sealed class V12BiliCombatStatusParityTests
 
         var res = CombatSimulator.Simulate(repo, p1, p2, seed: 303);
         var firstFire = res.Events.First(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == hastedWpn.InstanceId);
-        // 4000ms 在全程 2x Haste 下，第 100 tick (t=1980ms) 到达 4000ms 触发开火
-        Assert.InRange(firstFire.TimeMs, 1980, 2000);
+        // 4000ms 在全程 2x Haste 下，第 40 tick (t=1950ms) 到达 4000ms 触发开火
+        Assert.InRange(firstFire.TimeMs, 1950, 2000);
 
         var warnEv = res.Events.First(e => e.Type == CombatEventType.SandstormWarning);
         var firstSandTick = res.Events.First(e => e.Type == CombatEventType.SandstormTick);
@@ -391,8 +391,8 @@ public sealed class V12BiliCombatStatusParityTests
 
         var freezeEv = res.Events.First(e => e.Type == CombatEventType.FreezeApplied && e.TargetCardInstanceId == oppWpn.InstanceId);
         var oppFirstFire = res.Events.First(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == oppWpn.InstanceId);
-        // 3900ms 前绝未开火，冻结 2000ms 后延至 ~5980ms 才首次开火
-        Assert.InRange(freezeEv.TimeMs, 3880, 3920);
+        // 3900ms 冻结器于 3850ms 触发，冻结 2000ms 后延至 ~5950ms 才首次开火
+        Assert.InRange(freezeEv.TimeMs, 3850, 3920);
         Assert.True(oppFirstFire.TimeMs >= 5800, $"差 0.1s 满条时先挂 FreezeMs 必须完整阻断发射至解冻后，实际 {oppFirstFire.TimeMs}ms");
     }
 

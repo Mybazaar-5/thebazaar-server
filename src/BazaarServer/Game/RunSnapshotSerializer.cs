@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using BazaarCore.Data;
+using BazaarCore.Engine;
 using BazaarCore.Models;
 using BazaarCore.Runtime;
 using BazaarGameShared.Domain.Core;
@@ -38,6 +39,7 @@ public static class RunSnapshotSerializer
         public EHero Hero { get; set; }
         public EPlayMode PlayMode { get; set; }
         public string? AccountId { get; set; }
+        public string? Username { get; set; }
         public Guid? TournamentSessionId { get; set; }
         public CustomRunRuleSet? CustomRules { get; set; }
         public bool TendencyLocked { get; set; }
@@ -57,6 +59,7 @@ public static class RunSnapshotSerializer
         public string? ParentEncounterTemplateId { get; set; }
         public string? ActiveEncounterCardInstanceId { get; set; }
         public uint RerollCost { get; set; } = 2;
+        public uint? BaseRerollCost { get; set; }
         public uint RerollsRemaining { get; set; } = 3;
         public List<string> SelectionSet { get; set; } = new();
         public SelectionRulesSnapshotDto SelectionRules { get; set; } = new();
@@ -69,6 +72,10 @@ public static class RunSnapshotSerializer
         public bool GainedHourXpThisHour { get; set; }
         public bool GainedAdvanceHourXpThisHour { get; set; }
         public int SelectionsMadeInCurrentContext { get; set; }
+        public int? CurrentMaxSelections { get; set; }
+        public Dictionary<string, int> ActiveShelfDiscounts { get; set; } = new();
+        public Dictionary<string, double>? TakeoverChanceBonuses { get; set; }
+        public bool PendingClearExpeditionAfterLoot { get; set; }
         public int RngSeed { get; set; }
         public int BossRushWavesCleared { get; set; }
         public bool EndlessTenWinCelebrated { get; set; }
@@ -83,9 +90,11 @@ public static class RunSnapshotSerializer
         public Dictionary<string, double> PlayerAuraMult { get; set; } = new();
         public List<string> VisitedSingleSpawnEncounterIds { get; set; } = new();
         public List<string> VisitedDayEncounterIds { get; set; } = new();
+        public string? ActiveReplacementSetId { get; set; }
         public string? ActiveExpeditionId { get; set; }
         public string? ActiveExpeditionVariant { get; set; }
         public List<string> ExpeditionVisitedRoomIds { get; set; } = new();
+        public string? CurrentBoardId { get; set; }
         public List<string> ExclusionSet { get; set; } = new();
         public bool ExclusionSetInitialized { get; set; }
         public Dictionary<string, int> OpponentAttributes { get; set; } = new();
@@ -134,9 +143,34 @@ public static class RunSnapshotSerializer
         public List<string> SelectionSet { get; set; } = new();
         public SelectionRulesSnapshotDto? SelectionRules { get; set; }
         public uint RerollCost { get; set; }
+        public uint? BaseRerollCost { get; set; }
         public uint RerollsRemaining { get; set; }
         public int SelectionsMadeInCurrentContext { get; set; }
+        public int? CurrentMaxSelections { get; set; }
+        public Dictionary<string, int> ActiveShelfDiscounts { get; set; } = new();
+        public int PendingEncounterExitXp { get; set; }
         public List<CardSnapshotEntryDto> SuspendedCards { get; set; } = new();
+    }
+
+    public sealed class PvpOpponentLoadoutSnapshotDto
+    {
+        public string? AccountId { get; set; }
+        public string? BoardId { get; set; }
+        public string? CarpetId { get; set; }
+        public string? CardBackId { get; set; }
+        public string? ToyId { get; set; }
+        public string? StashId { get; set; }
+        public string? BankId { get; set; }
+        public string? AlbumId { get; set; }
+        public List<string>? HeroSkinIds { get; set; }
+        public List<string>? CardSkinIds { get; set; }
+    }
+
+    public sealed class PvpOpponentCollectionItemDto
+    {
+        public Guid Id { get; set; }
+        public Guid ItemId { get; set; }
+        public int? MintNumber { get; set; }
     }
 
     public sealed class PvpOpponentSnapshotDto
@@ -152,6 +186,8 @@ public static class RunSnapshotSerializer
         public int Level { get; set; }
         public EHero Hero { get; set; }
         public string? AccountId { get; set; }
+        public PvpOpponentLoadoutSnapshotDto? PlayerLoadout { get; set; }
+        public List<PvpOpponentCollectionItemDto>? PlayerCollection { get; set; }
     }
 
     public sealed class CardSnapshotEntryDto
@@ -172,10 +208,15 @@ public static class RunSnapshotSerializer
         public List<EHiddenTag> HiddenTags { get; set; } = new();
         public Dictionary<string, int> Attributes { get; set; } = new();
 
-        // CardInstance 持久态字段
+        // CardInstance 持久态与临时附魔/品阶分层字段（P1-30）
         public bool HasCoreCard { get; set; }
         public int StartSlot { get; set; } = -1;
         public string? CoreEnchantment { get; set; }
+        public ETier? PermanentTier { get; set; }
+        public bool HasEnchantmentLayers { get; set; }
+        public string? PermanentEnchantment { get; set; }
+        public string? DayEnchantment { get; set; }
+        public string? HourEnchantment { get; set; }
         public Dictionary<string, double> PermanentAdd { get; set; } = new();
         public Dictionary<string, double> PermanentMult { get; set; } = new();
         public Dictionary<string, double> HourAdd { get; set; } = new();
@@ -220,6 +261,7 @@ public static class RunSnapshotSerializer
             Hero = run.Hero,
             PlayMode = run.PlayMode,
             AccountId = run.AccountId,
+            Username = string.IsNullOrEmpty(run.Username) ? null : run.Username,
             TournamentSessionId = run.TournamentSessionId,
             CustomRules = (run.CustomRules ?? new CustomRunRuleSet()).CloneNormalized(),
             TendencyLocked = run.TendencyLocked,
@@ -236,25 +278,39 @@ public static class RunSnapshotSerializer
             ParentEncounterTemplateId = run.ParentEncounterTemplateId,
             ActiveEncounterCardInstanceId = run.ActiveEncounterCardInstanceId,
             RerollCost = run.RerollCost,
+            BaseRerollCost = run.BaseRerollCost,
             RerollsRemaining = run.RerollsRemaining,
             SelectionSet = new List<string>(run.SelectionSet),
             SelectionRules = ToRulesDto(run.SelectionRules),
             UnlockedSlots = run.UnlockedSlots,
-            StartSelectionDone = startSelectionDone ?? InferStartSelectionDone(run),
+            StartSelectionDone = startSelectionDone ?? (run.StartSelectionDone || run.Day > 1 || run.Hour > 1),
             PendingLevelUp = effectivePendingLevelUps > 0,
             PendingLevelUps = effectivePendingLevelUps,
             PendingEncounterExitXp = Math.Max(0, run.PendingEncounterExitXp),
             GainedHourXpThisHour = run.GainedHourXpThisHour,
             GainedAdvanceHourXpThisHour = run.GainedAdvanceHourXpThisHour,
             SelectionsMadeInCurrentContext = run.SelectionsMadeInCurrentContext,
+            CurrentMaxSelections = run.CurrentMaxSelections,
+            PendingClearExpeditionAfterLoot = run.PendingClearExpeditionAfterLoot,
             RngSeed = run.RngSeed,
             BossRushWavesCleared = run.BossRushWavesCleared,
             EndlessTenWinCelebrated = run.EndlessTenWinCelebrated,
             DailyRerollSequence = run.DailyRerollSequence,
             PendingPvpGhost = run.PendingPvpGhost,
+            ActiveReplacementSetId = run.ActiveReplacementSetId,
             ActiveExpeditionId = run.ActiveExpeditionId,
             ActiveExpeditionVariant = run.ActiveExpeditionVariant,
+            CurrentBoardId = run.CurrentBoardId,
         };
+
+        foreach (var kv in run.ActiveShelfDiscounts)
+            dto.ActiveShelfDiscounts[kv.Key] = kv.Value;
+        if (run.TakeoverChanceBonuses.Count > 0)
+        {
+            dto.TakeoverChanceBonuses = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in run.TakeoverChanceBonuses)
+                dto.TakeoverChanceBonuses[kv.Key] = kv.Value;
+        }
 
         foreach (string expRoomId in run.ExpeditionVisitedRoomIds)
             dto.ExpeditionVisitedRoomIds.Add(expRoomId);
@@ -288,19 +344,52 @@ public static class RunSnapshotSerializer
 
         if (run.CurrentPvpOpponent != null)
         {
+            var opp = run.CurrentPvpOpponent;
+            PvpOpponentLoadoutSnapshotDto? loadoutDto = null;
+            if (opp.PlayerLoadout != null)
+            {
+                loadoutDto = new PvpOpponentLoadoutSnapshotDto
+                {
+                    AccountId = opp.PlayerLoadout.accountId,
+                    BoardId = opp.PlayerLoadout.boardId,
+                    CarpetId = opp.PlayerLoadout.carpetId,
+                    CardBackId = opp.PlayerLoadout.cardBackId,
+                    ToyId = opp.PlayerLoadout.toyId,
+                    StashId = opp.PlayerLoadout.stashId,
+                    BankId = opp.PlayerLoadout.bankId,
+                    AlbumId = opp.PlayerLoadout.albumId,
+                    HeroSkinIds = opp.PlayerLoadout.heroSkinIds != null ? new List<string>(opp.PlayerLoadout.heroSkinIds) : null,
+                    CardSkinIds = opp.PlayerLoadout.cardSkinIds != null ? new List<string>(opp.PlayerLoadout.cardSkinIds) : null,
+                };
+            }
+            List<PvpOpponentCollectionItemDto>? collectionDto = null;
+            if (opp.PlayerCollection is { Count: > 0 })
+            {
+                collectionDto = opp.PlayerCollection
+                    .Select(ci => new PvpOpponentCollectionItemDto
+                    {
+                        Id = ci.Id,
+                        ItemId = ci.ItemId,
+                        MintNumber = ci.MintNumber,
+                    })
+                    .ToList();
+            }
+
             dto.CurrentPvpOpponent = new PvpOpponentSnapshotDto
             {
-                Name = run.CurrentPvpOpponent.Name,
-                TitlePrefix = run.CurrentPvpOpponent.TitlePrefix,
-                TitleSuffix = run.CurrentPvpOpponent.TitleSuffix,
-                Rank = run.CurrentPvpOpponent.Rank,
-                Rating = run.CurrentPvpOpponent.Rating,
-                Division = run.CurrentPvpOpponent.Division,
-                Victories = run.CurrentPvpOpponent.Victories,
-                Prestige = run.CurrentPvpOpponent.Prestige,
-                Level = run.CurrentPvpOpponent.Level,
-                Hero = run.CurrentPvpOpponent.Hero,
-                AccountId = run.CurrentPvpOpponent.PlayerLoadout?.accountId,
+                Name = opp.Name,
+                TitlePrefix = opp.TitlePrefix,
+                TitleSuffix = opp.TitleSuffix,
+                Rank = opp.Rank,
+                Rating = opp.Rating,
+                Division = opp.Division,
+                Victories = opp.Victories,
+                Prestige = opp.Prestige,
+                Level = opp.Level,
+                Hero = opp.Hero,
+                AccountId = opp.PlayerLoadout?.accountId,
+                PlayerLoadout = loadoutDto,
+                PlayerCollection = collectionDto,
             };
         }
 
@@ -323,9 +412,14 @@ public static class RunSnapshotSerializer
                     SelectionSet = new List<string>(s.SelectionSet),
                     SelectionRules = ToRulesDto(s.SelectionRules),
                     RerollCost = s.RerollCost,
+                    BaseRerollCost = s.BaseRerollCost,
                     RerollsRemaining = s.RerollsRemaining,
                     SelectionsMadeInCurrentContext = s.SelectionsMadeInCurrentContext,
+                    CurrentMaxSelections = s.CurrentMaxSelections,
+                    PendingEncounterExitXp = Math.Max(0, s.PendingEncounterExitXp),
                 };
+                foreach (var kv in s.ActiveShelfDiscounts)
+                    sDto.ActiveShelfDiscounts[kv.Key] = kv.Value;
                 foreach (var sc in s.SuspendedCards)
                     sDto.SuspendedCards.Add(ToCardDto(sc));
                 dto.SuspendedStateStack.Add(sDto);
@@ -406,6 +500,7 @@ public static class RunSnapshotSerializer
             Hero = dto.Hero,
             PlayMode = dto.PlayMode,
             AccountId = dto.AccountId,
+            Username = dto.Username ?? string.Empty,
             TournamentSessionId = dto.TournamentSessionId,
             CustomRules = (dto.CustomRules ?? new CustomRunRuleSet()).CloneNormalized(),
             TendencyLocked = dto.TendencyLocked
@@ -426,6 +521,7 @@ public static class RunSnapshotSerializer
             ActiveEncounterCardInstanceId = dto.ActiveEncounterCardInstanceId,
             ExclusionSetInitialized = dto.ExclusionSetInitialized,
             RerollCost = dto.RerollCost,
+            BaseRerollCost = dto.BaseRerollCost,
             RerollsRemaining = dto.RerollsRemaining,
             UnlockedSlots = dto.UnlockedSlots == 0 ? (ushort)0b00_0111_1000 : dto.UnlockedSlots,
             PendingLevelUps = restoredPendingLevelUps,
@@ -433,14 +529,38 @@ public static class RunSnapshotSerializer
             GainedHourXpThisHour = dto.GainedHourXpThisHour,
             GainedAdvanceHourXpThisHour = dto.GainedAdvanceHourXpThisHour,
             SelectionsMadeInCurrentContext = Math.Max(0, dto.SelectionsMadeInCurrentContext),
+            CurrentMaxSelections = dto.CurrentMaxSelections.HasValue ? Math.Max(1, dto.CurrentMaxSelections.Value) : null,
+            StartSelectionDone = dto.StartSelectionDone,
+            PendingClearExpeditionAfterLoot = dto.PendingClearExpeditionAfterLoot,
             RngSeed = dto.RngSeed,
             BossRushWavesCleared = Math.Max(0, dto.BossRushWavesCleared),
             EndlessTenWinCelebrated = dto.EndlessTenWinCelebrated,
             DailyRerollSequence = Math.Max(0, dto.DailyRerollSequence),
             PendingPvpGhost = dto.PendingPvpGhost,
+            ActiveReplacementSetId = dto.ActiveReplacementSetId
+                ?? ShopEngine.TryResolveReplacementSetIdForExpedition(dto.ActiveExpeditionId, dto.ActiveExpeditionVariant),
             ActiveExpeditionId = dto.ActiveExpeditionId,
             ActiveExpeditionVariant = dto.ActiveExpeditionVariant,
+            CurrentBoardId = dto.CurrentBoardId,
         };
+
+        if (dto.ActiveShelfDiscounts != null)
+        {
+            foreach (var kv in dto.ActiveShelfDiscounts)
+            {
+                if (!string.IsNullOrWhiteSpace(kv.Key))
+                    run.ActiveShelfDiscounts[kv.Key] = Math.Max(0, kv.Value);
+            }
+        }
+
+        if (dto.TakeoverChanceBonuses != null)
+        {
+            foreach (var kv in dto.TakeoverChanceBonuses)
+            {
+                if (!string.IsNullOrWhiteSpace(kv.Key) && double.IsFinite(kv.Value) && kv.Value > 0)
+                    run.TakeoverChanceBonuses[kv.Key] = Math.Min(1.0, kv.Value);
+            }
+        }
 
         if (dto.ExpeditionVisitedRoomIds != null)
         {
@@ -543,23 +663,59 @@ public static class RunSnapshotSerializer
 
         if (dto.CurrentPvpOpponent != null)
         {
+            var oppDto = dto.CurrentPvpOpponent;
+            BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout? loadout = null;
+            if (oppDto.PlayerLoadout != null)
+            {
+                loadout = new BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout
+                {
+                    accountId = oppDto.PlayerLoadout.AccountId ?? oppDto.AccountId,
+                    boardId = oppDto.PlayerLoadout.BoardId,
+                    carpetId = oppDto.PlayerLoadout.CarpetId,
+                    cardBackId = oppDto.PlayerLoadout.CardBackId,
+                    toyId = oppDto.PlayerLoadout.ToyId,
+                    stashId = oppDto.PlayerLoadout.StashId,
+                    bankId = oppDto.PlayerLoadout.BankId,
+                    albumId = oppDto.PlayerLoadout.AlbumId,
+                    heroSkinIds = oppDto.PlayerLoadout.HeroSkinIds?.ToArray(),
+                    cardSkinIds = oppDto.PlayerLoadout.CardSkinIds?.ToArray(),
+                };
+            }
+            else if (!string.IsNullOrWhiteSpace(oppDto.AccountId))
+            {
+                loadout = new BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout { accountId = oppDto.AccountId };
+            }
+            else if (dto.PendingPvpGhost != null && !string.IsNullOrWhiteSpace(dto.PendingPvpGhost.BoardId))
+            {
+                loadout = new BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout { accountId = $"ghost_{dto.PendingPvpGhost.BoardId}" };
+            }
+
+            List<BazaarGameShared.TempoNet.Responses.CollectionItemInstanceResponse>? collection = null;
+            if (oppDto.PlayerCollection is { Count: > 0 })
+            {
+                collection = oppDto.PlayerCollection
+                    .Select(ci => new BazaarGameShared.TempoNet.Responses.CollectionItemInstanceResponse
+                    {
+                        Id = ci.Id,
+                        ItemId = ci.ItemId,
+                        MintNumber = ci.MintNumber,
+                    })
+                    .ToList();
+            }
+
             run.CurrentPvpOpponent = new SimPvpOpponent(
-                dto.CurrentPvpOpponent.Name,
-                dto.CurrentPvpOpponent.TitlePrefix,
-                dto.CurrentPvpOpponent.TitleSuffix,
-                dto.CurrentPvpOpponent.Rank,
-                dto.CurrentPvpOpponent.Rating,
-                dto.CurrentPvpOpponent.Division,
-                dto.CurrentPvpOpponent.Victories,
-                dto.CurrentPvpOpponent.Prestige,
-                dto.CurrentPvpOpponent.Level,
-                dto.CurrentPvpOpponent.Hero,
-                !string.IsNullOrWhiteSpace(dto.CurrentPvpOpponent.AccountId)
-                    ? new BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout { accountId = dto.CurrentPvpOpponent.AccountId }
-                    : (dto.PendingPvpGhost != null && !string.IsNullOrWhiteSpace(dto.PendingPvpGhost.BoardId)
-                        ? new BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout { accountId = $"ghost_{dto.PendingPvpGhost.BoardId}" }
-                        : null),
-                null);
+                oppDto.Name,
+                oppDto.TitlePrefix,
+                oppDto.TitleSuffix,
+                oppDto.Rank,
+                oppDto.Rating,
+                oppDto.Division,
+                oppDto.Victories,
+                oppDto.Prestige,
+                oppDto.Level,
+                oppDto.Hero,
+                loadout,
+                collection);
         }
 
         if (dto.SuspendedStateStack != null)
@@ -576,9 +732,20 @@ public static class RunSnapshotSerializer
                     SelectionSet = sDto.SelectionSet != null ? new List<string>(sDto.SelectionSet) : new List<string>(),
                     SelectionRules = sDto.SelectionRules != null ? FromRulesDto(sDto.SelectionRules) : new TSelectionContextRules(),
                     RerollCost = sDto.RerollCost,
+                    BaseRerollCost = sDto.BaseRerollCost,
                     RerollsRemaining = sDto.RerollsRemaining,
                     SelectionsMadeInCurrentContext = Math.Max(0, sDto.SelectionsMadeInCurrentContext),
+                    CurrentMaxSelections = sDto.CurrentMaxSelections.HasValue ? Math.Max(1, sDto.CurrentMaxSelections.Value) : null,
+                    PendingEncounterExitXp = Math.Max(0, sDto.PendingEncounterExitXp),
                 };
+                if (sDto.ActiveShelfDiscounts != null)
+                {
+                    foreach (var kv in sDto.ActiveShelfDiscounts)
+                    {
+                        if (!string.IsNullOrWhiteSpace(kv.Key))
+                            snap.ActiveShelfDiscounts[kv.Key] = Math.Max(0, kv.Value);
+                    }
+                }
                 if (sDto.SuspendedCards != null)
                 {
                     foreach (var scDto in sDto.SuspendedCards)
@@ -684,6 +851,12 @@ public static class RunSnapshotSerializer
             cDto.HasCoreCard = true;
             cDto.StartSlot = core.StartSlot;
             cDto.CoreEnchantment = core.Enchantment;
+            // P1-30：显式持久化永久品质与永久/当日/本小时三层附魔，防止重连后临时附魔永久转正
+            cDto.PermanentTier = RunState.MapCoreTier(core.PermanentTier);
+            cDto.HasEnchantmentLayers = true;
+            cDto.PermanentEnchantment = core.PermanentEnchantment;
+            cDto.DayEnchantment = core.DayEnchantment;
+            cDto.HourEnchantment = core.HourEnchantment;
 
             CopyDoubleDict(core.PermanentAdd, cDto.PermanentAdd);
             CopyDoubleDict(core.PermanentMult, cDto.PermanentMult);
@@ -757,8 +930,13 @@ public static class RunSnapshotSerializer
 
     /// <summary>
     /// 将服务端 CardEntry（含 CoreCard 动态附魔/光环重算后的 HiddenTags 与权威槽位）转换为客户端消费的 SimUpdateCard。
+    /// 当 <paramref name="omitPlacement"/> 为 true 时（本帧存在对该现存卡的 GameSimEventCardMoved），
+    /// 将 Placement 置 null，避免 Data.UpdateFromGameSimAsync 提前覆写坐标导致观战态吞掉 ProcessCardMovedEvents 移位动画。
     /// </summary>
-    public static SimUpdateCard ToSimCard(RunState.CardEntry c, bool clearPendingForceSync = false)
+    public static SimUpdateCard ToSimCard(
+        RunState.CardEntry c,
+        bool clearPendingForceSync = false,
+        bool omitPlacement = false)
     {
         ArgumentNullException.ThrowIfNull(c);
 
@@ -793,13 +971,26 @@ public static class RunSnapshotSerializer
             Tags = c.Tags.Count > 0 ? new HashSet<ECardTag>(c.Tags) : null,
             HiddenTags = hiddenTags,
             Heroes = c.Heroes.Count > 0 ? new HashSet<EHero>(c.Heroes) : null,
-            Placement = new CardDeltaPlacement
-            {
-                Owner = c.Owner,
-                Socket = c.Socket,
-                Section = c.Section,
-            },
+            Placement = omitPlacement
+                ? null
+                : new CardDeltaPlacement
+                {
+                    Owner = c.Owner,
+                    Socket = c.Socket,
+                    Section = c.Section,
+                },
         };
+        // P1-11：若上次已下发的属性键集合中有键已从当前 Attributes 移除，发射 EAttributeDeltaType.Delete 消除客户端 0 值幽灵宝石/价签
+        if (c.LastEmittedAttributeKeys != null)
+        {
+            foreach (var prevKey in c.LastEmittedAttributeKeys)
+            {
+                if (!c.Attributes.ContainsKey(prevKey) && !c.PendingForceSyncAttributes.ContainsKey(prevKey))
+                {
+                    delta.Attributes[prevKey] = new AttributeDelta { DeltaType = EAttributeDeltaType.Delete, Value = 0 };
+                }
+            }
+        }
         foreach (var kv in c.Attributes)
         {
             delta.Attributes[kv.Key] = new AttributeDelta { DeltaType = EAttributeDeltaType.Update, Value = kv.Value };
@@ -812,6 +1003,16 @@ public static class RunSnapshotSerializer
             }
             if (clearPendingForceSync)
                 c.PendingForceSyncAttributes.Clear();
+        }
+        if (clearPendingForceSync)
+        {
+            var emittedNow = new HashSet<ECardAttributeType>(c.Attributes.Keys);
+            foreach (var kv in delta.Attributes)
+            {
+                if (kv.Value.DeltaType == EAttributeDeltaType.Update)
+                    emittedNow.Add(kv.Key);
+            }
+            c.LastEmittedAttributeKeys = emittedNow;
         }
         return delta;
     }
@@ -869,7 +1070,20 @@ public static class RunSnapshotSerializer
             }
         }
 
-        // 2. 恢复当前待选货架/遭遇/战利品/升级候选卡（优先按 SelectionSet 顺序，跳过已保留在顶栏的 ActiveEncounterCard）
+        // 2. P2-35：仅下发 SelectionSet 内的合法无主候选卡（跳过顶栏 ActiveEncounterCard），并启动清理不在 SelectionSet 中的孤儿无主卡，
+        //    防止客户端 GameStateHandler 将残留孤儿脏卡错误渲染到货架上变成不可点击的幽灵卡。
+        var activeSelectionSet = new HashSet<string>(run.SelectionSet, StringComparer.Ordinal);
+        var orphanOwnerlessIds = run.Cards.Values
+            .Where(c => c.Owner == null &&
+                        !string.Equals(c.InstanceId, run.ActiveEncounterCardInstanceId, StringComparison.Ordinal) &&
+                        !activeSelectionSet.Contains(c.InstanceId))
+            .Select(c => c.InstanceId)
+            .ToList();
+        foreach (string orphanId in orphanOwnerlessIds)
+        {
+            run.Cards.Remove(orphanId);
+        }
+
         var dealtIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (string selId in run.SelectionSet)
         {
@@ -880,30 +1094,17 @@ public static class RunSnapshotSerializer
                 events.Add(new GameSimEventCardDealt(cand.InstanceId, cand.TemplateId.ToString(), cand.Type));
             }
         }
-        foreach (var cand in run.Cards.Values.Where(c => c.Owner == null))
-        {
-            if (string.Equals(cand.InstanceId, run.ActiveEncounterCardInstanceId, StringComparison.Ordinal))
-                continue;
-            if (dealtIds.Add(cand.InstanceId))
-            {
-                events.Add(new GameSimEventCardDealt(cand.InstanceId, cand.TemplateId.ToString(), cand.Type));
-            }
-        }
 
-        // 3. 恢复当前真实状态与当前遭遇（不再将 Combat/PVPCombat 盲目回退到战前 Choice）；
-        //    若当前正处于多步奇遇的 EncounterStep 子步，则对外向客户端同步父级遭遇 ID（#19 保证顶栏肖像挂载）
-        string? resumeEncounterId = run.CurrentEncounterId;
-        if (run.State == ERunState.Encounter &&
-            !string.IsNullOrWhiteSpace(run.ParentEncounterTemplateId) &&
-            !string.Equals(run.CurrentEncounterId, run.ParentEncounterTemplateId, StringComparison.OrdinalIgnoreCase) &&
-            !string.IsNullOrEmpty(run.ActiveEncounterCardInstanceId) &&
-            run.Cards.TryGetValue(run.ActiveEncounterCardInstanceId, out var activeParent) &&
-            activeParent.Type is ECardType.EventEncounter or ECardType.PedestalEncounter &&
-            string.Equals(activeParent.TemplateId.ToString(), run.ParentEncounterTemplateId, StringComparison.OrdinalIgnoreCase))
-        {
-            resumeEncounterId = run.ParentEncounterTemplateId;
-        }
+        // 3. 恢复当前真实状态与当前遭遇（P1-28：统一复用 RunState.ResolveWireCurrentEncounterId，防止空串/子步/非 GUID Mod 遭遇崩溃）
+        string? resumeEncounterId = run.ResolveWireCurrentEncounterId();
         events.Add(new GameSimEventStateTransitioned(run.State, resumeEncounterId));
+
+        // 4. P1-35：若断线恢复结算中断战斗直接进入终局，补发终局结算事件使客户端弹出 RunCompleted 结算面板
+        if (run.PendingResumeRunCompletedEvent != null)
+        {
+            events.Add(run.PendingResumeRunCompletedEvent);
+            run.PendingResumeRunCompletedEvent = null;
+        }
 
         return events;
     }
@@ -923,8 +1124,24 @@ public static class RunSnapshotSerializer
             };
         }
 
-        string? ench = cDto.Enchantment?.ToString() ?? cDto.CoreEnchantment;
-        var core = new CardInstance(coreTpl, ShopEngine.ToCoreTier(cDto.Tier), ench, cDto.InstanceId);
+        // P1-30：按永久品阶与持久/当日/本小时三层附魔无损重建 CoreCard（向后兼容未含分层字段的旧快照）
+        bool hasLayers = cDto.HasEnchantmentLayers || cDto.DayEnchantment != null || cDto.HourEnchantment != null;
+        CardTier permTier = cDto.PermanentTier.HasValue
+            ? ShopEngine.ToCoreTier(cDto.PermanentTier.Value)
+            : ShopEngine.ToCoreTier(cDto.Tier);
+        string? permEnch = hasLayers
+            ? cDto.PermanentEnchantment
+            : (cDto.Enchantment?.ToString() ?? cDto.CoreEnchantment);
+
+        var core = new CardInstance(coreTpl, permTier, permEnch, cDto.InstanceId);
+
+        if (ShopEngine.ToCoreTier(cDto.Tier) != core.Tier)
+            core.SetTier(ShopEngine.ToCoreTier(cDto.Tier), isTemporary: true);
+
+        if (!string.IsNullOrWhiteSpace(cDto.DayEnchantment))
+            core.ApplyEnchantment(cDto.DayEnchantment, preventOverride: false, DurationTarget.Day);
+        if (!string.IsNullOrWhiteSpace(cDto.HourEnchantment))
+            core.ApplyEnchantment(cDto.HourEnchantment, preventOverride: false, DurationTarget.Hour);
 
         if (cDto.CompletedQuests is { Count: > 0 })
         {

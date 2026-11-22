@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
+using BazaarCore.Data;
+using BazaarCore.Models;
 using BazaarGameShared.Domain.Core.Types;
 using BazaarServer.Accounts;
 using BazaarServer.Endpoints;
@@ -16,7 +19,41 @@ public static class TempoNetEndpoints
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.Never,
     };
 
+    /// <summary>官方公示宝箱稀有度掉率权重（Bronze 55% / Silver 25% / Gold 13% / Diamond 5% / Legendary 2%）。</summary>
+    public static readonly (string Rarity, int Weight)[] OfficialChestRarityWeights =
+    [
+        ("Bronze", 55),
+        ("Silver", 25),
+        ("Gold", 13),
+        ("Diamond", 5),
+        ("Legendary", 2),
+    ];
+
+    /// <summary>
+    /// 赛季详情响应 DTO：完整兼容官方 SeasonResponse 全部 5 字段，并附带 GameData.db seasons 表的真实资产 ID。
+    /// </summary>
+    public sealed class SeasonDetailDto
+    {
+        public int id { get; set; }
+        public string name { get; set; } = "";
+        public string title { get; set; } = "";
+        public DateTime start { get; set; }
+        public int allowBundleChestAfterSeasonId { get; set; }
+        public string version { get; set; } = "";
+        public string textSeasonalAssetId { get; set; } = "";
+        public string spriteSeasonalAssetId { get; set; } = "";
+        public string chestSeasonalAssetId { get; set; } = "";
+    }
+
     private static readonly ConcurrentDictionary<Guid, Queue<long>> ChestGrantRateMap = new();
+    private static readonly ConditionalWeakTable<GameDataRepository, CollectibleCatalogSnapshot> CatalogByRepo = new();
+    private static readonly Lazy<GameDataRepository?> FallbackRepoLazy = new(TryLoadFallbackRepository, LazyThreadSafetyMode.ExecutionAndPublication);
+
+    /// <summary>P1-02：暴露已初始化的 ChallengeService 单例供 GameServerEndpoints/RunEngine 局内事件实时驱动。</summary>
+    internal static ChallengeService? SharedChallengeService { get; private set; }
+
+    /// <summary>P1-13：当前激活赛季 ID，供 RunEngine 完赛结算通行证 XP 时落盘。</summary>
+    internal static int ActiveSeasonId { get; private set; } = 1;
 
     private static readonly string[] ReservedExtendedPrefixes =
     [
@@ -26,6 +63,16 @@ public static class TempoNetEndpoints
 
     public static void Map(WebApplication app)
     {
+        var repo = app.Services.GetService<GameDataRepository>() ?? FallbackRepoLazy.Value;
+        var persistence = app.Services.GetRequiredService<Persistence>();
+        var accountStore = app.Services.GetService<AccountStore>();
+        var challengeService = app.Services.GetService<ChallengeService>()
+            ?? (repo != null ? new ChallengeService(persistence, repo, accountStore) : null);
+        SharedChallengeService = challengeService;
+        var configuration = app.Configuration;
+        CollectibleCatalogSnapshot ResolveCatalog() => GetCollectibleCatalog(repo);
+        int ResolveSeasonId() => ResolveCurrentSeasonId(repo, overrideSeasonId: null, configuration: configuration);
+        ActiveSeasonId = ResolveSeasonId();
         // ── 时间 ─────────────────────────────────────────────────────────────
         // 客户端把响应体当裸字符串喂给 DateTime.Parse()，这里必须返回纯文本 ISO-8601。
         app.MapGet("/api/time", () =>
@@ -197,24 +244,24 @@ public static class TempoNetEndpoints
         {
             if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
             log.LogInformation("Bootstrap/app (GET) for {user}", acc!.Username);
-            return Results.Json(BuildBootstrap(acc, sessions, db, accounts), Json);
+            return Results.Json(BuildBootstrap(acc, sessions, db, accounts, repo, challengeService, ResolveCatalog(), ResolveSeasonId()), Json);
         });
         app.MapPost("/api/Bootstrap/app", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db, ILogger<Program> log) =>
         {
             if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
             log.LogInformation("Bootstrap/app (POST) for {user}", acc!.Username);
-            return Results.Json(BuildBootstrap(acc, sessions, db, accounts), Json);
+            return Results.Json(BuildBootstrap(acc, sessions, db, accounts, repo, challengeService, ResolveCatalog(), ResolveSeasonId()), Json);
         });
 
         app.MapGet("/api/Bootstrap/post-run", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
         {
             if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
-            return Results.Json(BuildPostRunBootstrap(acc!, sessions, db, accounts), Json);
+            return Results.Json(BuildPostRunBootstrap(acc!, sessions, db, accounts, repo, challengeService, ResolveSeasonId()), Json);
         });
         app.MapPost("/api/Bootstrap/post-run", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
         {
             if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
-            return Results.Json(BuildPostRunBootstrap(acc!, sessions, db, accounts), Json);
+            return Results.Json(BuildPostRunBootstrap(acc!, sessions, db, accounts, repo, challengeService, ResolveSeasonId()), Json);
         });
 
         // ── 账号 ─────────────────────────────────────────────────────────────
@@ -243,13 +290,14 @@ public static class TempoNetEndpoints
         app.MapGet("/api/PlayerProfiles/me", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
         {
             if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            int curSeasonId = ResolveSeasonId();
             return Results.Json(new PlayerProfileDto
             {
                 AccountId = acc!.AccountId,
                 Username = acc.Username,
                 TitlePrefix = "",
                 TitleSuffix = "",
-                SeasonRank = new RankDto(),
+                SeasonRank = new RankDto { SeasonId = curSeasonId.ToString() },
                 ActiveRun = BuildActiveRunDto(acc, sessions, db),
             }, Json);
         });
@@ -319,7 +367,7 @@ public static class TempoNetEndpoints
         app.MapGet("/api/PlayerRanks/me", (HttpContext ctx, AccountStore accounts) =>
         {
             if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
-            return Results.Json(new PlayerRankDto { AccountId = acc!.AccountId }, Json);
+            return Results.Json(new PlayerRankDto { AccountId = acc!.AccountId, SeasonID = ResolveSeasonId() }, Json);
         });
 
         app.MapGet("/api/Wallets/me", (HttpContext ctx, AccountStore accounts) =>
@@ -328,34 +376,88 @@ public static class TempoNetEndpoints
             return Results.Json(BuildWallet(acc!, accounts), Json);
         });
 
-        // ── 赛季 ─────────────────────────────────────────────────────────────
-        app.MapGet("/api/Seasons", () => Results.Json(new[] { Season(1), Season(2) }, Json));
-        app.MapGet("/api/Seasons/current", () => Results.Json(Season(2), Json));
-        app.MapGet("/api/Seasons/{id:int}", (int id) => Results.Json(Season(id), Json));
+        // ── 赛季（P1-06：由 GameDataRepository.SeasonsById 21 个赛季与当前赛季配置驱动）──
+        app.MapGet("/api/Seasons", () => Results.Json(BuildAllSeasonDetails(repo), Json));
+        app.MapGet("/api/Seasons/current", () => Results.Json(BuildSeasonDetail(ResolveSeasonId(), repo), Json));
+        app.MapGet("/api/Seasons/{id:int}", (int id) =>
+        {
+            if (repo?.SeasonsById is { Count: > 0 } && !repo.SeasonsById.ContainsKey(id))
+                return Results.Json(new { error = $"未找到赛季 {id}。", id }, Json, statusCode: 404);
+            return Results.Json(BuildSeasonDetail(id, repo), Json);
+        });
         app.MapGet("/api/SeasonTracks/{id:int}", (int id) => Results.Json(BuildSeasonTrack(id), Json));
         app.MapGet("/api/SeasonTrackProgressions/me", (HttpContext ctx, AccountStore accounts) =>
         {
             if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
-            int seasonId = int.TryParse(ctx.Request.Query["seasonId"], out int qid) ? qid : 2;
-            return Results.Json(new SeasonTrackProgressionDto
-            {
-                accountId = acc!.AccountId,
-                seasonId = seasonId,
-                isPaid = true,
-                experience = 1000,
-                claimedFreeRewardTiers = Array.Empty<int>(),
-                claimedPaidRewardTiers = Array.Empty<int>(),
-                claimedFreeInfiniteTierCount = 0,
-                claimedPaidInfiniteTierCount = 0,
-            }, Json);
+            int seasonId = int.TryParse(ctx.Request.Query["seasonId"], out int qid) && qid > 0 ? qid : ResolveSeasonId();
+            return Results.Json(BuildSeasonTrackProgressionDto(acc!, accounts, seasonId), Json);
         });
         app.MapGet("/api/SeasonRankRewards", () => Results.Json(Array.Empty<object>(), Json));
 
-        // ── 挑战 ─────────────────────────────────────────────────────────────
-        app.MapGet("/api/Challenges/me", () => Results.Json(new ChallengesDto(), Json));
-        app.MapPost("/api/Challenges/acknowledge/{id}", () => Results.Json(new { ok = true }, Json));
-        app.MapPost("/api/Challenges/daily/reroll", () => Results.Json(new ChallengesDto(), Json));
-        app.MapPost("/api/Challenges/weekly/reroll", () => Results.Json(new ChallengesDto(), Json));
+        // ── 挑战（P1-02：由 GameData.db challenges 80 条 + ChallengeService 持久化驱动全部 5 接口）──
+        app.MapGet("/api/Challenges/me", (HttpContext ctx, AccountStore accounts) =>
+        {
+            if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
+            return Results.Json(challengeService?.GetChallenges(acc!.AccountId) ?? new ChallengesDto(), Json);
+        });
+        app.MapPost("/api/Challenges/acknowledge/{id}", (string id, HttpContext ctx, AccountStore accounts) =>
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            if (!Guid.TryParse(id, out var challengeGuid) || challengeGuid == Guid.Empty)
+                return Results.Json(new { error = "无效的挑战 ID。", id }, Json, statusCode: 400);
+            if (challengeService == null)
+                return Results.Json(new { ok = true }, Json);
+
+            int curSeasonId = ResolveSeasonId();
+            var res = challengeService.AcknowledgeChallenge(auth.Account!.AccountId, challengeGuid, curSeasonId);
+            if (!res.Ok)
+                return Results.Json(new { error = res.Error ?? "无法领取该挑战奖励。", challengeId = challengeGuid }, Json, statusCode: 400);
+
+            return Results.Json(new
+            {
+                ok = true,
+                acknowledged = true,
+                challengeId = challengeGuid,
+                xpGranted = res.XpGranted,
+                seasonId = curSeasonId,
+                seasonExperience = res.NewSeasonExperience,
+            }, Json);
+        });
+        app.MapPost("/api/Challenges/daily/reroll", async (HttpContext ctx, AccountStore accounts) =>
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            string raw = await ReadBoundedBodyAsync(ctx, 4 * 1024);
+            string? idStr = ExtractStringProperty(raw, "dailyChallengeId", "DailyChallengeId", "challengeId", "ChallengeId", "id", "Id");
+            if (!Guid.TryParse(idStr, out var challengeGuid) || challengeGuid == Guid.Empty)
+                return Results.Json(new { error = "请提供有效的 dailyChallengeId。" }, Json, statusCode: 400);
+            if (challengeService == null)
+                return Results.Json(new ChallengesDto(), Json);
+
+            var res = challengeService.RerollDaily(auth.Account!.AccountId, challengeGuid);
+            if (!res.Ok)
+                return Results.Json(new { error = res.Error ?? "每日挑战重随失败。", challenges = res.Snapshot }, Json, statusCode: 400);
+
+            return Results.Json(res.Snapshot, Json);
+        });
+        app.MapPost("/api/Challenges/weekly/reroll", async (HttpContext ctx, AccountStore accounts) =>
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            string raw = await ReadBoundedBodyAsync(ctx, 4 * 1024);
+            string? idStr = ExtractStringProperty(raw, "weeklyChallengeId", "WeeklyChallengeId", "challengeId", "ChallengeId", "id", "Id");
+            if (!Guid.TryParse(idStr, out var challengeGuid) || challengeGuid == Guid.Empty)
+                return Results.Json(new { error = "请提供有效的 weeklyChallengeId。" }, Json, statusCode: 400);
+            if (challengeService == null)
+                return Results.Json(new ChallengesDto(), Json);
+
+            var res = challengeService.RerollWeekly(auth.Account!.AccountId, challengeGuid);
+            if (!res.Ok)
+                return Results.Json(new { error = res.Error ?? "每周挑战重随失败。", challenges = res.Snapshot }, Json, statusCode: 400);
+
+            return Results.Json(res.Snapshot, Json);
+        });
 
         // ── 英雄（全部拥有）─────────────────────────────────────────────────
         app.MapGet("/api/Heroes/owned", () => Results.Json(AllHeroes(), Json));
@@ -371,7 +473,7 @@ public static class TempoNetEndpoints
         app.MapGet("/api/CollectionItems", (HttpContext ctx, AccountStore accounts) =>
         {
             if (!TryResolveForRead(ctx, accounts, out var acc, out var err)) return err!;
-            return Results.Json(GetOwnedCollectionGuids(acc!, accounts), Json);
+            return Results.Json(GetOwnedCollectionGuids(acc!, accounts, ResolveCatalog()), Json);
         });
         app.MapGet("/api/collectionitems/duplicate-rates", () => Results.Json(new Dictionary<string, int>
         {
@@ -397,10 +499,10 @@ public static class TempoNetEndpoints
         {
             var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
             if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
-            var entry = FindCollectible(collectibleId);
+            var entry = FindCollectible(collectibleId, ResolveCatalog());
             if (entry == null)
             {
-                return Results.Json(new { error = "藏品不在有效资产白名单中。", collectibleId }, Json, statusCode: 404);
+                return Results.Json(new { error = "藏品不在有效资产目录中。", collectibleId }, Json, statusCode: 404);
             }
             var state = accounts.EquipCollectible(auth.Account!, heroId, entry.Id, entry.Type);
             return Results.Json(ToHeroLoadoutDto(auth.Account!, state), Json);
@@ -477,14 +579,14 @@ public static class TempoNetEndpoints
                 State = new StateDeltaResponseDto
                 {
                     Wallet = BuildWallet(auth.Account, accounts),
-                    BundledChestsGranted = new BundledChestsGrantDto { count = qty, seasonId = 2 },
+                    BundledChestsGranted = new BundledChestsGrantDto { count = qty, seasonId = ResolveSeasonId() },
                 },
             }, Json);
         });
         app.MapPost("/api/app/chests/open", async (HttpContext ctx, AccountStore accounts) =>
-            await HandleOpenChestsAsync(ctx, accounts));
+            await HandleOpenChestsAsync(ctx, accounts, ResolveCatalog(), ResolveSeasonId()));
         app.MapPost("/api/app/chests/open-bundled", async (HttpContext ctx, AccountStore accounts) =>
-            await HandleOpenChestsAsync(ctx, accounts));
+            await HandleOpenChestsAsync(ctx, accounts, ResolveCatalog(), ResolveSeasonId()));
         app.MapGet("/api/PendingRewards/me", () => Results.Json(Array.Empty<object>(), Json));
         app.MapGet("/api/RunRewardLevels", () => Results.Json(BuildRunRewardLevels(), Json));
         app.MapGet("/api/MarketplaceListings/specials/daily/me", () => Results.Json(new DailySpecialsDto(), Json));
@@ -534,7 +636,22 @@ public static class TempoNetEndpoints
         // ── 遥测 / 存档兼容 / 受控兜底路由 ──────────────────────────────────
         app.MapPost("/api/telemetry", () => Results.Json(new { ok = true }, Json));
         app.MapPost("/api/game/feedback", () => Results.Json(new { ok = true }, Json));
-        app.MapPost("/api/app/challenges/progress", () => Results.Json(new { ok = true }, Json));
+        app.MapPost("/api/app/challenges/progress", async (HttpContext ctx, AccountStore accounts) =>
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+            if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
+            int curSeasonId = ResolveSeasonId();
+            if (challengeService == null)
+                return Results.Json(new StateDeltaResponseDto { Challenges = new ChallengesDto() }, Json);
+
+            string raw = await ReadBoundedBodyAsync(ctx, 16 * 1024);
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                ApplyExternalChallengeProgressPayload(challengeService, auth.Account!.AccountId, raw);
+            }
+
+            return Results.Json(challengeService.BuildProgressStateDelta(auth.Account!.AccountId, curSeasonId), Json);
+        });
         app.MapGet("/api/game/loadgame", () => Results.Json(new { ok = true, save = (object?)null }, Json));
         app.MapPost("/api/game/savegame", () => Results.Json(new { ok = true }, Json));
         app.MapDelete("/api/game/deleteactivesave", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
@@ -781,6 +898,199 @@ public static class TempoNetEndpoints
         subscriptions = true,
     };
 
+    private static GameDataRepository? TryLoadFallbackRepository()
+    {
+        try
+        {
+            return GameDatabaseLoader.Load();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsUnlockAllNonCardSkinsEnabled()
+    {
+        string? raw = Environment.GetEnvironmentVariable("BAZAAR_UNLOCK_ALL_NON_CARD_SKINS");
+        if (string.IsNullOrWhiteSpace(raw)) return true;
+        return !string.Equals(raw.Trim(), "0", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(raw.Trim(), "false", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// 解析当前活跃赛季 ID：优先取显式覆盖参数，其次读取配置项（IConfiguration["BAZAAR_CURRENT_SEASON_ID" / "CurrentSeasonId"]）
+    /// 与环境变量 BAZAAR_CURRENT_SEASON_ID / BAZAAR_SEASON_ID，未配置或非法时默认回退 Season 2（"Season 1"），100% 兼容既有行为。
+    /// </summary>
+    public static int ResolveCurrentSeasonId(
+        GameDataRepository? repo = null,
+        int? overrideSeasonId = null,
+        IConfiguration? configuration = null)
+    {
+        int? candidate = overrideSeasonId;
+        if (!candidate.HasValue)
+        {
+            string? cfgVal = configuration?["BAZAAR_CURRENT_SEASON_ID"]
+                ?? configuration?["BAZAAR_SEASON_ID"]
+                ?? configuration?["CurrentSeasonId"]
+                ?? Environment.GetEnvironmentVariable("BAZAAR_CURRENT_SEASON_ID")
+                ?? Environment.GetEnvironmentVariable("BAZAAR_SEASON_ID");
+            if (!string.IsNullOrWhiteSpace(cfgVal) && int.TryParse(cfgVal.Trim(), out int parsed) && parsed > 0)
+                candidate = parsed;
+        }
+
+        if (candidate.HasValue && candidate.Value > 0)
+        {
+            if (repo?.SeasonsById is { Count: > 0 })
+            {
+                if (repo.SeasonsById.ContainsKey(candidate.Value))
+                    return candidate.Value;
+            }
+            else
+            {
+                return candidate.Value;
+            }
+        }
+
+        if (repo?.SeasonsById is { Count: > 0 })
+        {
+            if (repo.SeasonsById.ContainsKey(2)) return 2;
+            return repo.SeasonsById.Keys.OrderBy(k => k).First();
+        }
+        return 2;
+    }
+
+    private static void ApplyExternalChallengeProgressPayload(ChallengeService service, Guid accountId, string raw)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return;
+            var root = doc.RootElement;
+
+            int delta = ExtractIntProperty(raw, 1, "delta", "Delta", "amount", "Amount", "increment", "Increment");
+            string? challengeIdStr = ExtractStringProperty(raw, "challengeId", "ChallengeId", "id", "Id");
+            if (Guid.TryParse(challengeIdStr, out var cid) && cid != Guid.Empty)
+            {
+                service.RecordChallengeProgressById(accountId, cid, delta);
+                return;
+            }
+
+            string? triggerType = ExtractStringProperty(raw, "triggerType", "TriggerType", "trigger", "Trigger");
+            if (!string.IsNullOrWhiteSpace(triggerType))
+            {
+                var ctx = new ChallengeProgressContext
+                {
+                    CardType = ExtractStringProperty(raw, "cardType", "CardType"),
+                    CardSize = ExtractStringProperty(raw, "cardSize", "CardSize"),
+                    CardTier = ExtractStringProperty(raw, "cardTier", "CardTier"),
+                    AttributeType = ExtractStringProperty(raw, "attributeType", "AttributeType"),
+                    ChangeType = ExtractStringProperty(raw, "changeType", "ChangeType"),
+                    CombatType = ExtractStringProperty(raw, "combatType", "CombatType"),
+                    CombatOutcome = ExtractStringProperty(raw, "combatOutcome", "CombatOutcome"),
+                    RunOutcome = ExtractStringProperty(raw, "runOutcome", "RunOutcome", "outcome", "Outcome"),
+                    NewLevel = root.TryGetProperty("newLevel", out var nlEl) && nlEl.TryGetInt32(out int nl) ? nl : null,
+                    Amount = delta,
+                };
+                service.RecordChallengeProgress(accountId, triggerType, delta, ctx);
+            }
+        }
+        catch { }
+    }
+
+    private static DateTime DeriveSeasonStartUtc(int seasonId) => seasonId switch
+    {
+        <= 1 => new DateTime(2024, 10, 30, 0, 0, 0, DateTimeKind.Utc),
+        2 => new DateTime(2025, 4, 1, 0, 0, 0, DateTimeKind.Utc),
+        _ => new DateTime(2025, 4, 1, 0, 0, 0, DateTimeKind.Utc).AddMonths(seasonId - 2),
+    };
+
+    private static SeasonDetailDto BuildSeasonDetail(int id, GameDataRepository? repo)
+    {
+        if (repo?.SeasonsById != null && repo.SeasonsById.TryGetValue(id, out var tpl))
+        {
+            string name = string.IsNullOrWhiteSpace(tpl.InternalName) ? $"Season {Math.Max(1, id - 1)}" : tpl.InternalName;
+            return new SeasonDetailDto
+            {
+                id = tpl.Id,
+                name = name,
+                title = name,
+                start = DeriveSeasonStartUtc(tpl.Id),
+                allowBundleChestAfterSeasonId = 0,
+                version = tpl.Version ?? "",
+                textSeasonalAssetId = tpl.TextSeasonalAssetId ?? "",
+                spriteSeasonalAssetId = tpl.SpriteSeasonalAssetId ?? "",
+                chestSeasonalAssetId = tpl.ChestSeasonalAssetId ?? "",
+            };
+        }
+
+        var fallback = Season(id);
+        return new SeasonDetailDto
+        {
+            id = fallback.id,
+            name = fallback.name,
+            title = fallback.title,
+            start = fallback.start,
+            allowBundleChestAfterSeasonId = fallback.allowBundleChestAfterSeasonId,
+        };
+    }
+
+    private static SeasonDetailDto[] BuildAllSeasonDetails(GameDataRepository? repo)
+    {
+        if (repo?.SeasonsById is { Count: > 0 })
+        {
+            return repo.SeasonsById.Values
+                .OrderBy(s => s.Id)
+                .Select(s => BuildSeasonDetail(s.Id, repo))
+                .ToArray();
+        }
+        return [BuildSeasonDetail(1, null), BuildSeasonDetail(2, null)];
+    }
+
+    private static SeasonDto BuildSeasonDto(int id, GameDataRepository? repo)
+    {
+        var detail = BuildSeasonDetail(id, repo);
+        return new SeasonDto
+        {
+            id = detail.id,
+            name = detail.name,
+            title = detail.title,
+            start = detail.start,
+            allowBundleChestAfterSeasonId = detail.allowBundleChestAfterSeasonId,
+        };
+    }
+
+    private static SeasonDto[] BuildAllSeasonDtos(GameDataRepository? repo)
+    {
+        if (repo?.SeasonsById is { Count: > 0 })
+        {
+            return repo.SeasonsById.Values
+                .OrderBy(s => s.Id)
+                .Select(s => BuildSeasonDto(s.Id, repo))
+                .ToArray();
+        }
+        return [Season(1), Season(2)];
+    }
+
+    private static SeasonTrackProgressionDto BuildSeasonTrackProgressionDto(
+        AccountStore.Account acc,
+        AccountStore accounts,
+        int seasonId)
+    {
+        var row = accounts.GetSeasonTrackProgress(acc, seasonId);
+        return new SeasonTrackProgressionDto
+        {
+            accountId = acc.AccountId,
+            seasonId = row.SeasonId,
+            isPaid = row.IsPaid,
+            experience = row.Experience,
+            claimedFreeRewardTiers = row.ClaimedFreeRewardTiers,
+            claimedPaidRewardTiers = row.ClaimedPaidRewardTiers,
+            claimedFreeInfiniteTierCount = row.ClaimedFreeInfiniteTierCount,
+            claimedPaidInfiniteTierCount = row.ClaimedPaidInfiniteTierCount,
+        };
+    }
+
     private static SeasonDto Season(int id)
     {
         string name = id switch
@@ -794,7 +1104,7 @@ public static class TempoNetEndpoints
             id = id,
             name = name,
             title = name,
-            start = new DateTime(2025, 4, 1, 0, 0, 0, DateTimeKind.Utc),
+            start = DeriveSeasonStartUtc(id),
             allowBundleChestAfterSeasonId = 0,
         };
     }
@@ -877,6 +1187,10 @@ public static class TempoNetEndpoints
         public string Name { get; set; } = "";
         public string HeroId { get; set; } = "";
         public string SeasonId { get; set; } = "";
+        public string Rarity { get; set; } = "";
+        public bool IsFoundInChests { get; set; }
+        public bool InStore { get; set; } = true;
+        public bool InClientWhitelist { get; set; } = true;
     }
 
     private sealed class CollectibleCatalogSnapshot
@@ -884,11 +1198,20 @@ public static class TempoNetEndpoints
         public List<ValidCollectibleEntry> All { get; init; } = new();
         public Dictionary<string, ValidCollectibleEntry> ByNormalizedId { get; init; } = new(StringComparer.OrdinalIgnoreCase);
         public Guid[] NonCardSkinGuids { get; init; } = Array.Empty<Guid>();
+        public HashSet<string> NonCardSkinNormIds { get; init; } = new(StringComparer.OrdinalIgnoreCase);
         public List<(ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)> CardSkinEntries { get; init; } = new();
+        public List<(ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)> ChestEntries { get; init; } = new();
         public List<(ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)> AllGuidEntries { get; init; } = new();
     }
 
-    private static readonly Lazy<CollectibleCatalogSnapshot> CatalogLazy = new(LoadCollectibleCatalog, LazyThreadSafetyMode.ExecutionAndPublication);
+    private static readonly Lazy<CollectibleCatalogSnapshot> WhitelistOnlyCatalogLazy =
+        new(() => BuildCollectibleCatalog(null), LazyThreadSafetyMode.ExecutionAndPublication);
+
+    private static CollectibleCatalogSnapshot GetCollectibleCatalog(GameDataRepository? repo)
+    {
+        if (repo == null) return WhitelistOnlyCatalogLazy.Value;
+        return CatalogByRepo.GetValue(repo, r => BuildCollectibleCatalog(r));
+    }
 
     private static string? FindWhitelistPath()
     {
@@ -928,71 +1251,170 @@ public static class TempoNetEndpoints
         return null;
     }
 
-    private static CollectibleCatalogSnapshot LoadCollectibleCatalog()
+    private static Dictionary<string, ValidCollectibleEntry> TryLoadClientWhitelistMap()
     {
+        var map = new Dictionary<string, ValidCollectibleEntry>(StringComparer.OrdinalIgnoreCase);
         string? path = FindWhitelistPath();
-        if (string.IsNullOrEmpty(path)) return new CollectibleCatalogSnapshot();
+        if (string.IsNullOrEmpty(path)) return map;
 
         try
         {
             string raw = File.ReadAllText(path);
-            var list = JsonSerializer.Deserialize<List<ValidCollectibleEntry>>(raw, CaseInsensitiveJson) ?? new();
-            var byNorm = new Dictionary<string, ValidCollectibleEntry>(StringComparer.OrdinalIgnoreCase);
-            var nonCardGuids = new List<Guid>();
-            var cardSkins = new List<(ValidCollectibleEntry, Guid, string)>();
-            var allGuids = new List<(ValidCollectibleEntry, Guid, string)>();
-            var seenNonCard = new HashSet<Guid>();
-
+            var list = JsonSerializer.Deserialize<List<ValidCollectibleEntry>>(raw, CaseInsensitiveJson);
+            if (list == null) return map;
             foreach (var e in list)
             {
                 if (e == null || !Guid.TryParse(e.Id, out var g)) continue;
-                string norm = g.ToString("N");
-                byNorm[norm] = e;
-                allGuids.Add((e, g, norm));
-                if (string.Equals(e.Type, "card_skin", StringComparison.OrdinalIgnoreCase))
-                {
-                    cardSkins.Add((e, g, norm));
-                }
-                else if (seenNonCard.Add(g))
-                {
-                    nonCardGuids.Add(g);
-                }
+                map[g.ToString("N")] = e;
             }
-
-            Console.WriteLine($"[CollectibleCatalog] 已加载 {list.Count} 条藏品白名单（非皮肤 {nonCardGuids.Count}，卡牌皮肤 {cardSkins.Count}）");
-            return new CollectibleCatalogSnapshot
-            {
-                All = list,
-                ByNormalizedId = byNorm,
-                NonCardSkinGuids = nonCardGuids.ToArray(),
-                CardSkinEntries = cardSkins,
-                AllGuidEntries = allGuids,
-            };
         }
         catch (Exception ex)
         {
-            Console.WriteLine("[CollectibleCatalog] 加载藏品白名单失败: " + ex.Message);
-            return new CollectibleCatalogSnapshot();
+            Console.WriteLine("[CollectibleCatalog] 加载客户端藏品白名单失败: " + ex.Message);
         }
+        return map;
     }
 
-    private static ValidCollectibleEntry? FindCollectible(string? collectibleId)
+    private static CollectibleCatalogSnapshot BuildCollectibleCatalog(GameDataRepository? repo)
+    {
+        var whitelistMap = TryLoadClientWhitelistMap();
+        bool hasWhitelist = whitelistMap.Count > 0;
+
+        var merged = new List<ValidCollectibleEntry>();
+        var byNorm = new Dictionary<string, ValidCollectibleEntry>(StringComparer.OrdinalIgnoreCase);
+        var nonCardGuids = new List<Guid>();
+        var nonCardNorms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var cardSkins = new List<(ValidCollectibleEntry, Guid, string)>();
+        var chestEntries = new List<(ValidCollectibleEntry, Guid, string)>();
+        var allGuids = new List<(ValidCollectibleEntry, Guid, string)>();
+        var seenNonCard = new HashSet<Guid>();
+
+        void RegisterEntry(ValidCollectibleEntry entry, Guid parsedGuid, string norm)
+        {
+            merged.Add(entry);
+            byNorm[norm] = entry;
+            allGuids.Add((entry, parsedGuid, norm));
+
+            bool isCardSkin = string.Equals(entry.Type, "card_skin", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(entry.Type, "CardSkin", StringComparison.OrdinalIgnoreCase);
+            if (isCardSkin)
+            {
+                cardSkins.Add((entry, parsedGuid, norm));
+            }
+            else if (entry.InClientWhitelist && seenNonCard.Add(parsedGuid))
+            {
+                nonCardGuids.Add(parsedGuid);
+                nonCardNorms.Add(norm);
+            }
+
+            if (entry.IsFoundInChests && entry.InClientWhitelist)
+            {
+                chestEntries.Add((entry, parsedGuid, norm));
+            }
+        }
+
+        if (repo?.CollectiblesById is { Count: > 0 })
+        {
+            foreach (var tpl in repo.CollectiblesById.Values)
+            {
+                if (tpl == null || !Guid.TryParse(tpl.Id, out var g)) continue;
+                string norm = g.ToString("N");
+                bool inWl = !hasWhitelist || whitelistMap.ContainsKey(norm);
+                var entry = new ValidCollectibleEntry
+                {
+                    Id = tpl.Id,
+                    Type = tpl.GetCanonicalCategoryKey(),
+                    InternalName = tpl.InternalName ?? "",
+                    Name = tpl.Name ?? "",
+                    HeroId = tpl.HeroId ?? "",
+                    SeasonId = tpl.SeasonId ?? "",
+                    Rarity = string.IsNullOrWhiteSpace(tpl.Rarity) ? "Bronze" : tpl.Rarity,
+                    IsFoundInChests = tpl.IsFoundInChests,
+                    InStore = tpl.InStore,
+                    InClientWhitelist = inWl,
+                };
+                RegisterEntry(entry, g, norm);
+            }
+
+            // 兼容补入仅存在于白名单中的边缘条目（热更差集防御）
+            foreach (var kv in whitelistMap)
+            {
+                if (byNorm.ContainsKey(kv.Key) || !Guid.TryParse(kv.Value.Id, out var g)) continue;
+                var extra = new ValidCollectibleEntry
+                {
+                    Id = kv.Value.Id,
+                    Type = kv.Value.Type ?? "",
+                    InternalName = kv.Value.InternalName ?? "",
+                    Name = kv.Value.Name ?? "",
+                    HeroId = kv.Value.HeroId ?? "",
+                    SeasonId = kv.Value.SeasonId ?? "",
+                    Rarity = string.IsNullOrWhiteSpace(kv.Value.Rarity) ? "Bronze" : kv.Value.Rarity,
+                    IsFoundInChests = kv.Value.IsFoundInChests,
+                    InStore = kv.Value.InStore,
+                    InClientWhitelist = true,
+                };
+                RegisterEntry(extra, g, kv.Key);
+            }
+
+            Console.WriteLine(
+                $"[CollectibleCatalog] 已融合 DB 藏品 {repo.CollectiblesById.Count} 条与客户端白名单 {whitelistMap.Count} 条" +
+                $"（总计 {merged.Count}，宝箱可开 {chestEntries.Count}，客户端有效非皮肤 {nonCardGuids.Count}，卡牌皮肤 {cardSkins.Count}）");
+        }
+        else if (hasWhitelist)
+        {
+            foreach (var kv in whitelistMap)
+            {
+                if (!Guid.TryParse(kv.Value.Id, out var g)) continue;
+                var entry = new ValidCollectibleEntry
+                {
+                    Id = kv.Value.Id,
+                    Type = kv.Value.Type ?? "",
+                    InternalName = kv.Value.InternalName ?? "",
+                    Name = kv.Value.Name ?? "",
+                    HeroId = kv.Value.HeroId ?? "",
+                    SeasonId = kv.Value.SeasonId ?? "",
+                    Rarity = string.IsNullOrWhiteSpace(kv.Value.Rarity) ? "Bronze" : kv.Value.Rarity,
+                    IsFoundInChests = true, // 无 DB 兜底时维持旧兼容池
+                    InStore = true,
+                    InClientWhitelist = true,
+                };
+                RegisterEntry(entry, g, kv.Key);
+            }
+            Console.WriteLine($"[CollectibleCatalog] 回退白名单加载 {merged.Count} 条藏品（非皮肤 {nonCardGuids.Count}，卡牌皮肤 {cardSkins.Count}）");
+        }
+
+        return new CollectibleCatalogSnapshot
+        {
+            All = merged,
+            ByNormalizedId = byNorm,
+            NonCardSkinGuids = nonCardGuids.ToArray(),
+            NonCardSkinNormIds = nonCardNorms,
+            CardSkinEntries = cardSkins,
+            ChestEntries = chestEntries,
+            AllGuidEntries = allGuids,
+        };
+    }
+
+    private static ValidCollectibleEntry? FindCollectible(string? collectibleId, CollectibleCatalogSnapshot snap)
     {
         string norm = AccountStore.NormalizeCollectibleId(collectibleId);
         if (string.IsNullOrEmpty(norm)) return null;
-        return CatalogLazy.Value.ByNormalizedId.TryGetValue(norm, out var entry) ? entry : null;
+        return snap.ByNormalizedId.TryGetValue(norm, out var entry) ? entry : null;
     }
 
-    private static Guid[] GetOwnedCollectionGuids(AccountStore.Account acc, AccountStore accounts)
+    private static Guid[] GetOwnedCollectionGuids(AccountStore.Account acc, AccountStore accounts, CollectibleCatalogSnapshot snap)
     {
-        var snap = CatalogLazy.Value;
         var opened = accounts.GetOpenedCardSkinIds(acc);
-        if (opened.Count == 0) return snap.NonCardSkinGuids;
+        bool unlockNonCards = IsUnlockAllNonCardSkinsEnabled();
+        if (opened.Count == 0)
+            return unlockNonCards ? snap.NonCardSkinGuids : Array.Empty<Guid>();
 
-        var set = new HashSet<Guid>(snap.NonCardSkinGuids);
+        var set = unlockNonCards ? new HashSet<Guid>(snap.NonCardSkinGuids) : new HashSet<Guid>();
         foreach (string sid in opened)
         {
-            if (snap.ByNormalizedId.ContainsKey(sid) && Guid.TryParseExact(sid, "N", out var g))
+            if (snap.ByNormalizedId.TryGetValue(sid, out var entry) &&
+                entry.InClientWhitelist &&
+                Guid.TryParseExact(sid, "N", out var g))
             {
                 set.Add(g);
             }
@@ -1074,7 +1496,101 @@ public static class TempoNetEndpoints
         lootTables = new Dictionary<string, object[]>(),
     };
 
-    private static async Task<IResult> HandleOpenChestsAsync(HttpContext ctx, AccountStore accounts)
+    /// <summary>
+    /// 按官方公示掉率权重（Bronze 55% / Silver 25% / Gold 13% / Diamond 5% / Legendary 2%）从严格过滤
+    /// <see cref="ValidCollectibleEntry.IsFoundInChests"/> == true 的宝箱池中分桶抽取 1 件藏品。
+    /// </summary>
+    public static (ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId, bool IsDuplicate)? RollChestCollectible(
+        IReadOnlyList<(ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)> candidatePool,
+        IReadOnlySet<string>? ownedNormalizedIds = null,
+        Random? rng = null,
+        bool preferUnowned = true)
+    {
+        if (candidatePool == null || candidatePool.Count == 0)
+            return null;
+
+        rng ??= Random.Shared;
+        var allBuckets = new Dictionary<string, List<(ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)>>(StringComparer.OrdinalIgnoreCase);
+        var unownedBuckets = new Dictionary<string, List<(ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)>>(StringComparer.OrdinalIgnoreCase);
+
+        for (int i = 0; i < candidatePool.Count; i++)
+        {
+            var item = candidatePool[i];
+            if (item.Entry == null || !item.Entry.IsFoundInChests) continue;
+
+            string rarity = string.IsNullOrWhiteSpace(item.Entry.Rarity) ? "Bronze" : item.Entry.Rarity;
+            if (!allBuckets.TryGetValue(rarity, out var allList))
+            {
+                allList = new List<(ValidCollectibleEntry, Guid, string)>();
+                allBuckets[rarity] = allList;
+            }
+            allList.Add(item);
+
+            bool owned = ownedNormalizedIds != null && ownedNormalizedIds.Contains(item.NormId);
+            if (!owned)
+            {
+                if (!unownedBuckets.TryGetValue(rarity, out var unownedList))
+                {
+                    unownedList = new List<(ValidCollectibleEntry, Guid, string)>();
+                    unownedBuckets[rarity] = unownedList;
+                }
+                unownedList.Add(item);
+            }
+        }
+
+        if (allBuckets.Count == 0)
+            return null;
+
+        static (ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)? PickWeightedFromBuckets(
+            Dictionary<string, List<(ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)>> buckets,
+            Random random)
+        {
+            int totalWeight = 0;
+            for (int i = 0; i < OfficialChestRarityWeights.Length; i++)
+            {
+                var (rarity, weight) = OfficialChestRarityWeights[i];
+                if (weight > 0 && buckets.TryGetValue(rarity, out var list) && list.Count > 0)
+                    totalWeight += weight;
+            }
+
+            if (totalWeight > 0)
+            {
+                int roll = random.Next(totalWeight);
+                int acc = 0;
+                for (int i = 0; i < OfficialChestRarityWeights.Length; i++)
+                {
+                    var (rarity, weight) = OfficialChestRarityWeights[i];
+                    if (weight <= 0 || !buckets.TryGetValue(rarity, out var list) || list.Count == 0)
+                        continue;
+                    acc += weight;
+                    if (roll < acc)
+                        return list[random.Next(list.Count)];
+                }
+            }
+
+            // 兜底：存在未知稀有度名时等权抽取
+            var fallback = buckets.Values.SelectMany(v => v).ToList();
+            return fallback.Count > 0 ? fallback[random.Next(fallback.Count)] : null;
+        }
+
+        if (preferUnowned && unownedBuckets.Count > 0)
+        {
+            var pick = PickWeightedFromBuckets(unownedBuckets, rng);
+            if (pick.HasValue)
+                return (pick.Value.Entry, pick.Value.ParsedGuid, pick.Value.NormId, IsDuplicate: false);
+        }
+
+        var rawPick = PickWeightedFromBuckets(allBuckets, rng);
+        if (!rawPick.HasValue) return null;
+        bool isDup = ownedNormalizedIds != null && ownedNormalizedIds.Contains(rawPick.Value.NormId);
+        return (rawPick.Value.Entry, rawPick.Value.ParsedGuid, rawPick.Value.NormId, IsDuplicate: isDup);
+    }
+
+    private static async Task<IResult> HandleOpenChestsAsync(
+        HttpContext ctx,
+        AccountStore accounts,
+        CollectibleCatalogSnapshot snap,
+        int currentSeasonId)
     {
         var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
         if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
@@ -1083,32 +1599,38 @@ public static class TempoNetEndpoints
         string raw = await ReadBoundedBodyAsync(ctx, 8 * 1024);
         int requested = ExtractOpenChestCount(raw);
 
-        var snap = CatalogLazy.Value;
-        var pool = snap.CardSkinEntries.Count > 0 ? snap.CardSkinEntries : snap.AllGuidEntries;
-        if (pool.Count == 0)
+        // P1-03：严格使用 IsFoundInChests == true 的宝箱可开池（彻底排除 561 张非宝箱皮肤与全部非宝箱限定藏品）
+        var chestPool = snap.ChestEntries;
+        if (chestPool.Count == 0)
         {
-            return Results.Json(new { error = "藏品白名单暂不可用，请稍后重试。" }, Json, statusCode: 400);
+            return Results.Json(new { error = "宝箱奖池暂不可用，请稍后重试。" }, Json, statusCode: 400);
         }
 
-        var (ok, draws, _, _) = accounts.TryOpenChests(acc, requested, ownedCardSkins =>
+        bool unlockAllNonCards = IsUnlockAllNonCardSkinsEnabled();
+        var (ok, draws, _, _) = accounts.TryOpenChests(acc, requested, ownedOpenedIds =>
         {
-            var unowned = new List<(ValidCollectibleEntry Entry, Guid ParsedGuid, string NormId)>();
-            foreach (var item in pool)
+            var effectiveOwned = new HashSet<string>(ownedOpenedIds, StringComparer.OrdinalIgnoreCase);
+            if (unlockAllNonCards)
             {
-                bool alreadyOwned = string.Equals(item.Entry.Type, "card_skin", StringComparison.OrdinalIgnoreCase)
-                    ? ownedCardSkins.Contains(item.NormId)
-                    : true;
-                if (!alreadyOwned) unowned.Add(item);
+                foreach (string nonCardNorm in snap.NonCardSkinNormIds)
+                    effectiveOwned.Add(nonCardNorm);
             }
 
-            if (unowned.Count > 0)
+            var rolled = RollChestCollectible(chestPool, effectiveOwned, Random.Shared, preferUnowned: true);
+            if (rolled.HasValue)
             {
-                var pick = unowned[Random.Shared.Next(unowned.Count)];
-                return new AccountStore.ChestOpenDraw(pick.ParsedGuid, pick.NormId, IsCardSkin: true, IsDuplicate: false, GemsAwarded: 0);
+                bool isCardSkin = string.Equals(rolled.Value.Entry.Type, "card_skin", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(rolled.Value.Entry.Type, "CardSkin", StringComparison.OrdinalIgnoreCase);
+                return new AccountStore.ChestOpenDraw(
+                    rolled.Value.ParsedGuid,
+                    rolled.Value.NormId,
+                    IsCardSkin: isCardSkin,
+                    IsDuplicate: rolled.Value.IsDuplicate,
+                    GemsAwarded: rolled.Value.IsDuplicate ? 50 : 0);
             }
 
-            var dup = pool[Random.Shared.Next(pool.Count)];
-            return new AccountStore.ChestOpenDraw(dup.ParsedGuid, dup.NormId, IsCardSkin: false, IsDuplicate: true, GemsAwarded: 50);
+            var fallback = chestPool[Random.Shared.Next(chestPool.Count)];
+            return new AccountStore.ChestOpenDraw(fallback.ParsedGuid, fallback.NormId, IsCardSkin: false, IsDuplicate: true, GemsAwarded: 50);
         });
 
         if (!ok || draws.Count == 0)
@@ -1121,7 +1643,7 @@ public static class TempoNetEndpoints
         {
             id = Guid.NewGuid(),
             ownerId = acc.AccountId,
-            seasonId = 2,
+            seasonId = currentSeasonId,
             collectionItemId = d.CollectibleGuid,
             openedAt = now,
             isDuplicate = d.IsDuplicate,
@@ -1224,19 +1746,25 @@ public static class TempoNetEndpoints
     };
 
     private static PostRunBootstrapResponseDto BuildPostRunBootstrap(
-        AccountStore.Account acc, SessionStore sessions, Persistence db, AccountStore accounts)
+        AccountStore.Account acc,
+        SessionStore sessions,
+        Persistence db,
+        AccountStore accounts,
+        GameDataRepository? repo,
+        ChallengeService? challengeService,
+        int curSeasonId)
     {
         return new PostRunBootstrapResponseDto
         {
             wallet = BuildWallet(acc, accounts),
-            challenges = new ChallengesDto(),
+            challenges = challengeService?.GetChallenges(acc.AccountId) ?? new ChallengesDto(),
             profile = new PlayerProfileDto
             {
                 AccountId = acc.AccountId,
                 Username = acc.Username,
                 TitlePrefix = "",
                 TitleSuffix = "",
-                SeasonRank = new RankDto { SeasonId = "2" },
+                SeasonRank = new RankDto { SeasonId = curSeasonId.ToString() },
                 ActiveRun = BuildActiveRunDto(acc, sessions, db),
             },
             featureAccess = AllAccess(acc),
@@ -1249,28 +1777,26 @@ public static class TempoNetEndpoints
                 AccountId = acc.AccountId,
                 CountryCode = "CN",
             },
-            seasonTrack = BuildSeasonTrack(2),
-            seasonTrackProgression = new SeasonTrackProgressionDto
-            {
-                accountId = acc.AccountId,
-                seasonId = 2,
-                isPaid = true,
-                experience = 1000,
-                claimedFreeRewardTiers = Array.Empty<int>(),
-                claimedPaidRewardTiers = Array.Empty<int>(),
-                claimedFreeInfiniteTierCount = 0,
-                claimedPaidInfiniteTierCount = 0,
-            },
+            seasonTrack = BuildSeasonTrack(curSeasonId),
+            seasonTrackProgression = BuildSeasonTrackProgressionDto(acc, accounts, curSeasonId),
             chests = BuildUnopenedChests(acc, accounts),
             errors = Array.Empty<object>(),
             hasErrors = false,
         };
     }
 
-    private static BootstrapResponseDto BuildBootstrap(AccountStore.Account acc, SessionStore sessions, Persistence db, AccountStore accounts)
+    private static BootstrapResponseDto BuildBootstrap(
+        AccountStore.Account acc,
+        SessionStore sessions,
+        Persistence db,
+        AccountStore accounts,
+        GameDataRepository? repo,
+        ChallengeService? challengeService,
+        CollectibleCatalogSnapshot catalog,
+        int curSeasonId)
     {
-        var season1 = Season(1);
-        var season2 = Season(2);
+        var currentSeason = BuildSeasonDto(curSeasonId, repo);
+        var allSeasons = BuildAllSeasonDtos(repo);
         return new BootstrapResponseDto
         {
             serverTime = DateTime.UtcNow,
@@ -1295,30 +1821,20 @@ public static class TempoNetEndpoints
                     Username = acc.Username,
                     TitlePrefix = "",
                     TitleSuffix = "",
-                    SeasonRank = new RankDto { SeasonId = "2" },
+                    SeasonRank = new RankDto { SeasonId = curSeasonId.ToString() },
                     ActiveRun = BuildActiveRunDto(acc, sessions, db),
                 },
             },
             wallet = BuildWallet(acc, accounts),
-            playerRank = new PlayerRankDto { AccountId = acc.AccountId, SeasonID = 2 },
+            playerRank = new PlayerRankDto { AccountId = acc.AccountId, SeasonID = curSeasonId },
             season = new BootstrapSeasonDto
             {
-                current = season2,
-                all = new[] { season1, season2 },
-                track = BuildSeasonTrack(2),
-                trackProgression = new SeasonTrackProgressionDto
-                {
-                    accountId = acc.AccountId,
-                    seasonId = 2,
-                    isPaid = true,
-                    experience = 1000,
-                    claimedFreeRewardTiers = Array.Empty<int>(),
-                    claimedPaidRewardTiers = Array.Empty<int>(),
-                    claimedFreeInfiniteTierCount = 0,
-                    claimedPaidInfiniteTierCount = 0,
-                },
+                current = currentSeason,
+                all = allSeasons,
+                track = BuildSeasonTrack(curSeasonId),
+                trackProgression = BuildSeasonTrackProgressionDto(acc, accounts, curSeasonId),
             },
-            challenges = new ChallengesDto(),
+            challenges = challengeService?.GetChallenges(acc.AccountId) ?? new ChallengesDto(),
             heroes = new BootstrapHeroesDto
             {
                 owned = AllHeroes(),
@@ -1327,7 +1843,7 @@ public static class TempoNetEndpoints
             },
             collection = new BootstrapCollectionDto
             {
-                items = GetOwnedCollectionGuids(acc, accounts),
+                items = GetOwnedCollectionGuids(acc, accounts, catalog),
                 loadouts = BuildHeroLoadoutsResponse(acc, accounts),
             },
             chests = BuildUnopenedChests(acc, accounts),

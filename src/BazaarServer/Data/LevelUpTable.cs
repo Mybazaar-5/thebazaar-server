@@ -35,6 +35,21 @@ public sealed class LevelUpTable
         public RuleNode? RewardsNode { get; init; }
         public string SelectionMethod { get; init; } = "Sequential";
         public int? TotalLimit { get; init; }
+
+        /// <summary>已预编译的新手教程升级奖励节点（GameData.db 中 Lv1~Lv3 非空，其余等级为 null）。</summary>
+        public RuleNode? TutorialRewardsNode { get; init; }
+        public List<RewardGroup> TutorialGroups { get; init; } = new();
+        public string TutorialSelectionMethod { get; init; } = "Sequential";
+        public int? TutorialTotalLimit { get; init; }
+
+        /// <summary>当前等级是否配置了独立的新手教程奖励池。</summary>
+        public bool HasTutorialRewards => TutorialRewardsNode != null;
+
+        /// <summary>
+        /// 按运行模式返回应消费的升级奖励规则节点：教程模式优先返回 <see cref="TutorialRewardsNode"/>，常规模式或缺失时回退 <see cref="RewardsNode"/>。
+        /// </summary>
+        public RuleNode? GetRewardsNode(bool isTutorial)
+            => isTutorial && TutorialRewardsNode != null ? TutorialRewardsNode : RewardsNode;
     }
 
     public sealed class RewardGroup
@@ -79,6 +94,30 @@ public sealed class LevelUpTable
     {
         int level = tpl.Level > 0 ? tpl.Level : fallbackLevel;
         var rewardsNode = tpl.Rewards;
+        var tutorialRewardsNode = tpl.TutorialRewards;
+
+        var (groups, selectionMethod, totalLimit) = ExtractRewardsFromNode(rewardsNode, applyKarnokFix: true);
+        var (tutGroups, tutMethod, tutTotalLimit) = ExtractRewardsFromNode(tutorialRewardsNode, applyKarnokFix: false);
+
+        return new LevelUpEntry
+        {
+            Level = level,
+            HealthIncrease = tpl.HealthIncrease,
+            Groups = groups,
+            RewardsNode = rewardsNode,
+            SelectionMethod = selectionMethod,
+            TotalLimit = totalLimit,
+            TutorialRewardsNode = tutorialRewardsNode,
+            TutorialGroups = tutGroups,
+            TutorialSelectionMethod = tutMethod,
+            TutorialTotalLimit = tutTotalLimit,
+        };
+    }
+
+    private static (List<RewardGroup> Groups, string SelectionMethod, int? TotalLimit) ExtractRewardsFromNode(
+        RuleNode? rewardsNode,
+        bool applyKarnokFix)
+    {
         string selectionMethod = string.IsNullOrWhiteSpace(rewardsNode?.SelectionMethod)
             ? "Sequential"
             : rewardsNode.SelectionMethod!;
@@ -118,7 +157,7 @@ public sealed class LevelUpTable
 
                 var grpNode = g;
                 // 保持与 Load(dbPath) 一致的官服 DB 原生 Bug 超越修复：Inspired by Karnok 互斥检查改为 Inspired Rage
-                if (ids.Contains(inspiredByKarnokId, StringComparer.OrdinalIgnoreCase))
+                if (applyKarnokFix && ids.Contains(inspiredByKarnokId, StringComparer.OrdinalIgnoreCase))
                 {
                     try
                     {
@@ -148,15 +187,7 @@ public sealed class LevelUpTable
             }
         }
 
-        return new LevelUpEntry
-        {
-            Level = level,
-            HealthIncrease = tpl.HealthIncrease,
-            Groups = groups,
-            RewardsNode = rewardsNode,
-            SelectionMethod = selectionMethod,
-            TotalLimit = totalLimit,
-        };
+        return (groups, selectionMethod, totalLimit);
     }
 
     public static LevelUpTable Load(string dbPath)
@@ -307,6 +338,20 @@ public sealed class LevelUpTable
                 }
             }
 
+            RuleNode? tutorialRewardsNode = null;
+            if (root.TryGetProperty("TutorialRewards", out var tutRewards) && tutRewards.ValueKind == JsonValueKind.Object)
+            {
+                try
+                {
+                    tutorialRewardsNode = tutRewards.Deserialize<RuleNode>(GameDatabaseLoader.JsonOptions);
+                }
+                catch
+                {
+                    tutorialRewardsNode = null;
+                }
+            }
+            var (tutGroups, tutSelectionMethod, tutTotalLimit) = ExtractRewardsFromNode(tutorialRewardsNode, applyKarnokFix: false);
+
             return new LevelUpEntry
             {
                 Level = level,
@@ -315,6 +360,10 @@ public sealed class LevelUpTable
                 RewardsNode = rewardsNode,
                 SelectionMethod = selectionMethod,
                 TotalLimit = totalLimit,
+                TutorialRewardsNode = tutorialRewardsNode,
+                TutorialGroups = tutGroups,
+                TutorialSelectionMethod = tutSelectionMethod,
+                TutorialTotalLimit = tutTotalLimit,
             };
         }
         catch { return null; }
@@ -362,6 +411,14 @@ public sealed class LevelUpTable
         return result;
     }
 
+    /// <summary>按 DB 主键等级（1..30）读取升级表条目。</summary>
+    public LevelUpEntry? GetEntryByDbId(int levelId)
+        => _byLevel.TryGetValue(levelId, out var e) ? e : null;
+
+    /// <summary>按玩家升级目标新等级（如 Lv1->Lv2 传 2）解析对应升级表条目。</summary>
+    public LevelUpEntry? GetEntryForTargetLevel(int targetNewLevel)
+        => ResolveLevelEntry(targetNewLevel);
+
     /// <summary>
     /// 官方完整规则升级奖励抽取（兼容返回纯模板 ID 列表，内部委托给 <see cref="RollRewardsWithTier"/>）。
     /// </summary>
@@ -370,8 +427,19 @@ public sealed class LevelUpTable
         RuleExecutionContext ctx,
         Func<string, bool>? isAssetValid = null,
         int? pickCountOverride = null)
+        => RollRewards(level, ctx, isTutorial: false, isAssetValid, pickCountOverride);
+
+    /// <summary>
+    /// 官方完整规则升级奖励抽取（支持教程模式优先消费 TutorialRewards，否则回退常规 Rewards）。
+    /// </summary>
+    public List<string> RollRewards(
+        int level,
+        RuleExecutionContext ctx,
+        bool isTutorial,
+        Func<string, bool>? isAssetValid = null,
+        int? pickCountOverride = null)
     {
-        var withTiers = RollRewardsWithTier(level, ctx, isAssetValid, pickCountOverride);
+        var withTiers = RollRewardsWithTier(level, ctx, isTutorial, isAssetValid, pickCountOverride);
         var ids = new List<string>(withTiers.Count);
         for (int i = 0; i < withTiers.Count; i++)
             ids.Add(withTiers[i].TemplateId);
@@ -389,23 +457,41 @@ public sealed class LevelUpTable
         RuleExecutionContext ctx,
         Func<string, bool>? isAssetValid = null,
         int? pickCountOverride = null)
+        => RollRewardsWithTier(level, ctx, isTutorial: false, isAssetValid, pickCountOverride);
+
+    /// <summary>
+    /// 官方完整规则升级奖励抽取（支持新手教程模式优先消费 <see cref="LevelUpEntry.TutorialRewardsNode"/>，常规模式或缺失时自动回退 <see cref="LevelUpEntry.RewardsNode"/>）。
+    /// </summary>
+    public List<(string TemplateId, CardTier Tier)> RollRewardsWithTier(
+        int level,
+        RuleExecutionContext ctx,
+        bool isTutorial,
+        Func<string, bool>? isAssetValid = null,
+        int? pickCountOverride = null)
     {
         ArgumentNullException.ThrowIfNull(ctx);
 
         var result = new List<(string TemplateId, CardTier Tier)>();
         var entry = ResolveLevelEntry(level);
-        if (entry == null || entry.Groups.Count == 0) return result;
+        if (entry == null) return result;
+
+        bool useTutorial = isTutorial && entry.TutorialRewardsNode != null && entry.TutorialGroups.Count > 0;
+        var activeNode = entry.GetRewardsNode(useTutorial);
+        var activeGroups = useTutorial ? entry.TutorialGroups : entry.Groups;
+        var activeSelectionMethod = useTutorial ? entry.TutorialSelectionMethod : entry.SelectionMethod;
+        var activeTotalLimit = useTutorial ? entry.TutorialTotalLimit : entry.TotalLimit;
+        if (activeGroups.Count == 0) return result;
 
         var rng = ctx.Rng ?? Random.Shared;
-        var topBehaviors = entry.RewardsNode?.Behaviors ?? [];
-        int totalLimit = pickCountOverride ?? entry.TotalLimit ?? 0;
-        if (totalLimit <= 0 && entry.RewardsNode?.Limit != null)
-            totalLimit = (int)Math.Round(ValueAndConditionEvaluator.EvaluateValue(entry.RewardsNode.Limit, ctx, 3));
+        var topBehaviors = activeNode?.Behaviors ?? [];
+        int totalLimit = pickCountOverride ?? activeTotalLimit ?? 0;
+        if (totalLimit <= 0 && activeNode?.Limit != null)
+            totalLimit = (int)Math.Round(ValueAndConditionEvaluator.EvaluateValue(activeNode.Limit, ctx, 3));
         if (totalLimit <= 0)
             totalLimit = 3;
 
         var groupStates = new List<GroupDrawState>();
-        foreach (var grp in entry.Groups)
+        foreach (var grp in activeGroups)
         {
             if (grp.GroupNode?.Prerequisites is { Count: > 0 } &&
                 !ValueAndConditionEvaluator.EvaluatePrerequisites(grp.GroupNode.Prerequisites, ctx))
@@ -436,7 +522,7 @@ public sealed class LevelUpTable
 
         if (groupStates.Count == 0) return result;
 
-        bool isRandomTop = string.Equals(entry.SelectionMethod, "Random", StringComparison.OrdinalIgnoreCase);
+        bool isRandomTop = string.Equals(activeSelectionMethod, "Random", StringComparison.OrdinalIgnoreCase);
 
         if (!isRandomTop)
         {

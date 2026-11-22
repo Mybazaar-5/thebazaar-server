@@ -311,8 +311,13 @@ public sealed class V6UserReportedBugsTests
             {
                 var e = run.Cards[id];
                 Assert.Equal(ECardType.EventEncounter, e.Type);
-                // V13.1 官方 Day 1 遭遇允许 Bronze 与 Silver（商店物品仍严守 100% Bronze），严禁 Gold/Diamond/Legendary
-                Assert.True(e.Tier is ETier.Bronze or ETier.Silver, $"Day 1 Hour 1 遭遇 {e.TemplateId} 品阶={e.Tier} 违规越阶");
+                // Patch 20.2 官方 Day 1 遭遇允许 Bronze/Silver，及 3 个实测 All Days 金阶奇遇（Wishing Fountain / Finn's Big Bite / Piano），
+                // 严禁其余金阶及任意 Diamond/Legendary 遭遇越阶出现
+                var tpl = fx.Pool.Get(e.TemplateId.ToString());
+                string nk = OfficialEncounterSchedule.NormalizeKey(tpl?.InternalName);
+                bool isOfficialDay1GoldEvent = e.Tier == ETier.Gold && nk is "wishingfountain" or "finnsbigbite" or "piano";
+                Assert.True(e.Tier is ETier.Bronze or ETier.Silver || isOfficialDay1GoldEvent,
+                    $"Day 1 Hour 1 遭遇 {e.TemplateId} ({tpl?.InternalName}) 品阶={e.Tier} 违规越阶");
             });
             Assert.DoesNotContain(run.Cards.Values, c => c.Owner == ECombatantId.Player && c.Type == ECardType.Skill);
 
@@ -388,10 +393,14 @@ public sealed class V6UserReportedBugsTests
                     foreach (string id in run.SelectionSet)
                     {
                         var e = run.Cards[id];
-                        // V13.1 官方 Day 1 遭遇开放 Bronze/Silver（且 Hour 2/4/5 仅允许 B1&B2 基座），严禁 Gold/Diamond 越阶与 Salvage Yard 泄露
-                        Assert.True(e.Tier is ETier.Bronze or ETier.Silver, $"Day 1 Hour {hour} 遭遇 {e.TemplateId} 品阶={e.Tier} 越阶");
-                        if (e.Type == ECardType.PedestalEncounter)
-                            Assert.Equal(Guid.Parse(CardPool.PedestalB1B2Id), e.TemplateId);
+                        var tpl = fx.Pool.Get(e.TemplateId.ToString());
+                        string normKey = OfficialEncounterSchedule.NormalizeKey(tpl?.InternalName);
+                        // Patch 20.2：Day 1 开放 Bronze/Silver + 官方明文 All Days 金奇遇（Wishing Fountain / Finn's Big Bite / Piano），
+                        // 严禁任何 Gold/Diamond 商人、Gunpowder Cache (Gold)、基座与 Salvage Yard 泄露
+                        bool isOfficialDay1GoldEvent = normKey is "wishingfountain" or "finnsbigbite" or "piano";
+                        Assert.True(e.Tier is ETier.Bronze or ETier.Silver || isOfficialDay1GoldEvent,
+                            $"Day 1 Hour {hour} 遭遇 {e.TemplateId} ({tpl?.InternalName}) 品阶={e.Tier} 越阶");
+                        Assert.NotEqual(ECardType.PedestalEncounter, e.Type);
                         Assert.NotEqual(Guid.Parse(SalvageYardEncounterId), e.TemplateId);
                     }
                 }
@@ -1387,7 +1396,7 @@ public sealed class V6UserReportedBugsTests
         Assert.Empty(sell3.Events.OfType<GameSimEventCardSpawned>());
     }
 
-    // ── Bug #13：非融合 Skill 选择保留原 InstanceId，不销毁，发射 CardPurchased + CardMoved + PlayerSkillEquipped ──
+    // ── Bug #13 & P2-12：非融合 Skill 选择保留原 InstanceId，不销毁，通过 SimUpdateCard(Owner=Player) + CardPurchased(null, null, Player) + PlayerSkillEquipped 装备（无冗余 Hand/Socket_0 CardMoved） ──
 
     [Fact]
     public void Bug13_EquipCandidateSkill_NonFusionPreservesInstanceIdAndEmitsEquipEvents()
@@ -1406,10 +1415,20 @@ public sealed class V6UserReportedBugsTests
 
         Assert.True(run.Cards.TryGetValue(chosenSkillId, out var ownedSkill));
         Assert.Equal(ECombatantId.Player, ownedSkill.Owner);
+        Assert.Null(ownedSkill.Socket);
+        Assert.Null(ownedSkill.Section);
         Assert.DoesNotContain(pickOut.Events.OfType<GameSimEventCardDisposed>(), e => e.InstanceId == chosenSkillId);
-        Assert.Contains(pickOut.Events.OfType<GameSimEventCardPurchased>(), e => e.InstanceId == chosenSkillId);
-        Assert.Contains(pickOut.Events.OfType<GameSimEventCardMoved>(), e => e.InstanceId == chosenSkillId);
+        var purchased = Assert.Single(pickOut.Events.OfType<GameSimEventCardPurchased>(), e => e.InstanceId == chosenSkillId);
+        Assert.Null(purchased.LeftSocketId);
+        Assert.Null(purchased.Section);
+        Assert.Equal(ECombatantId.Player, purchased.CombatantId);
+        Assert.DoesNotContain(pickOut.Events.OfType<GameSimEventCardMoved>(), e => e.InstanceId == chosenSkillId);
         Assert.Contains(pickOut.Events.OfType<GameSimEventPlayerSkillEquipped>(), e => e.InstanceId == chosenSkillId);
+        var sim = run.BuildFullGameSim(pickOut.Events);
+        Assert.True(sim.Cards.TryGetValue(chosenSkillId, out var simSkill));
+        Assert.Equal(ECombatantId.Player, simSkill.Placement?.Owner);
+        Assert.Null(simSkill.Placement?.Socket);
+        Assert.Null(simSkill.Placement?.Section);
     }
 
     // ── Bug #14 保留项：野怪 PvE 胜利进入 Loot 并保持 CanExit=true 直到显式 ExitCurrentStateCommand ──

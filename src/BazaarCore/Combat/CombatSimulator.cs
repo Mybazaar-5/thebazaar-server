@@ -8,17 +8,18 @@ using BazaarCore.Runtime;
 namespace BazaarCore.Combat;
 
 /// <summary>
-/// 确定性战斗引擎：20ms 固定步长、250ms ICD 触发队列、Burn/Poison/Regen/Sandstorm 完整结算，
-/// 既可给 Bot 毫秒级 Headless 演算，也可输出完整帧时间轴给 Godot 播放 1:1 战斗演出。
+/// 确定性战斗引擎：50ms 固定步长（1:1 对齐官方模拟与前端帧率）、250ms 单能力 ICD 触发队列、Burn/Poison/Regen/Sandstorm 完整结算，
+/// 既可给 Bot 毫秒级 Headless 演算，也可输出完整帧时间轴给客户端播放 1:1 战斗演出。
 /// </summary>
 public static class CombatSimulator
 {
-    public const int TickMs = 20;
+    public const int TickMs = 50;
     public const int MaxDurationMs = 300_000;
     public const int MaxForceUseDepth = 16;
     public const int MaxTickCascadeFires = 32;
     public const int MaxSameTickCardFires = 2;
     public const int MaxDispatchDepth = 24;
+    public const int MaxTickImmediateExecs = 64;
 
     private static readonly string[] CustomAttrNames =
     [
@@ -26,8 +27,23 @@ public static class CombatSimulator
         "Custom_5", "Custom_6", "Custom_7", "Custom_8"
     ];
 
-    private readonly record struct TriggerQueueKey(string PlayerId, string CardId);
+    private readonly record struct TriggerQueueKey(string PlayerId, string CardId, string AbilityId);
     private readonly record struct IndexedAbility(CardInstance Card, AbilityDefinition Ability, int ActiveOrder);
+
+    /// <summary>战斗动态光环依赖位掩码（P0-07）：按实时状态分类精准触发光环脏标记与即时重算，无动态光环对局零额外开销。</summary>
+    [Flags]
+    private enum CombatAuraDependencyMask
+    {
+        None       = 0,
+        Health     = 1 << 0,
+        Shield     = 1 << 1,
+        Burn       = 1 << 2,
+        Poison     = 1 << 3,
+        Regen      = 1 << 4,
+        Tempo      = 1 << 5,
+        CardStatus = 1 << 6,
+        CardAmmo   = 1 << 7
+    }
 
     private sealed class PendingMulticastBatch
     {
@@ -63,6 +79,16 @@ public static class CombatSimulator
         public double Value { get; init; }
     }
 
+    private sealed class TimedTransformExpiry
+    {
+        public int ExpireTimeMs { get; init; }
+        public PlayerState Owner { get; init; } = null!;
+        public CardInstance OriginalCard { get; init; } = null!;
+        public List<CardInstance> Replacements { get; init; } = new();
+        public string OriginalSection { get; init; } = "Hand";
+        public int OriginalSlot { get; init; }
+    }
+
     private sealed class CachedCardSnapshotAttrs
     {
         public int Version = -1;
@@ -80,6 +106,9 @@ public static class CombatSimulator
         public int SellPrice;
         public bool AuraHeated;
         public bool AuraChilled;
+        public IReadOnlyList<string>? Tags;
+        public IReadOnlyList<string>? HiddenTags;
+        public IReadOnlyList<string>? Heroes;
         public int[]? CustomAttrs;
     }
 
@@ -161,15 +190,17 @@ public static class CombatSimulator
 
         var events = recordEvents ? new List<CombatEvent>() : new List<CombatEvent>(0);
         var timeline = recordTimeline ? new List<CombatTickState>() : new List<CombatTickState>(0);
+        int execChainSeq = 0;
+        var frameReadyCards = new List<(PlayerState Owner, PlayerState Opp, CardInstance Card, int PriorityRank, int SideIndex)>(16);
         var snapshotAttrCache = recordTimeline ? new Dictionary<CardInstance, CachedCardSnapshotAttrs>(ReferenceEqualityComparer.Instance) : null;
         double p1DmgTotal = 0, p2DmgTotal = 0;
         double p1ShieldTotal = 0, p2ShieldTotal = 0;
 
         var icdReadyTime = new Dictionary<TriggerQueueKey, int>();
         var triggerQueues = new Dictionary<TriggerQueueKey, Queue<QueuedTrigger>>();
-        var readyBatch = new List<(TriggerQueueKey Key, QueuedTrigger Item)>();
+        var readyBatch = new List<(TriggerQueueKey Key, QueuedTrigger Item, int PrevReadyAt)>();
         // 修复 P0-6：跨卡牌同步触发必须先按 Ability.Priority（Immediate > Highest > High > Medium > Low > Lowest）排序，再按 StartSlot / InstanceId 稳定决胜
-        Comparison<(TriggerQueueKey Key, QueuedTrigger Item)> readyBatchComparison = (a, b) =>
+        Comparison<(TriggerQueueKey Key, QueuedTrigger Item, int PrevReadyAt)> readyBatchComparison = (a, b) =>
         {
             int sideCmp = (a.Item.Owner == p1 ? 0 : 1).CompareTo(b.Item.Owner == p1 ? 0 : 1);
             if (sideCmp != 0) return sideCmp;
@@ -184,6 +215,11 @@ public static class CombatSimulator
         var pendingMulticasts = new List<PendingMulticastBatch>();
         var handSnapshot = new List<CardInstance>(16);
         var timedExpiries = new List<TimedAttributeExpiry>();
+        var timedTransformExpiries = new List<TimedTransformExpiry>();
+        var temporaryTransforms = new List<CombatTemporaryTransformRecord>();
+        var prevAuraTargets = recordEvents
+            ? new Dictionary<(string SourceCardId, string AuraId), (HashSet<string> CardIds, HashSet<string> PlayerIds)>()
+            : null;
         var activeExec = new ActiveExecutionState();
 
         var p1TriggerIndex = new Dictionary<string, List<IndexedAbility>>(StringComparer.Ordinal);
@@ -196,7 +232,10 @@ public static class CombatSimulator
         int forceUseDepth = 0;
         int dispatchDepth = 0;
         int tickCascadeFires = 0;
+        int tickImmediateExecs = 0;
         int auraRecalcDepth = 0;
+        CombatAuraDependencyMask combatAuraDepMask = CombatAuraDependencyMask.None;
+        bool auraDirty = false;
         var activeFiringCards = new HashSet<CardInstance>(ReferenceEqualityComparer.Instance);
         var tickCardFireCounts = new Dictionary<CardInstance, int>(ReferenceEqualityComparer.Instance);
         var lastCooldownFireMs = new Dictionary<CardInstance, int>(ReferenceEqualityComparer.Instance);
@@ -206,11 +245,13 @@ public static class CombatSimulator
         bool sandstormWarned = false;
         bool sandstormActive = false;
         bool sandstormForceStarted = false;
+        bool sandstormPendingImmediateTick = false;
         int sandstormWarnMs = Math.Max(0, gm.Sandstorm.CountdownStartTime + mod.SandstormStartOffsetMs);
         int sandstormStartMs = Math.Max(0, gm.Sandstorm.CountdownStartTime + gm.Sandstorm.CountdownDuration + mod.SandstormStartOffsetMs); // 默认 30,000ms
-        int sandstormNextTickMs = sandstormStartMs;
+        int sandstormElapsedMs = 0;
         int sandstormCurrentRate = gm.Sandstorm.BaseTickRate; // 250ms
         int sandstormNextDmg = gm.Sandstorm.BaseDamage;       // 1
+        int effectiveMinCooldownFloorMs = Math.Clamp(mod.MinCooldownFloorMs, 200, 1000);
 
         int nextBurnTickMs = 500;
         int nextPoisonTickMs = 1000;
@@ -246,8 +287,37 @@ public static class CombatSimulator
 
         static void SyncEnragedState(PlayerState side)
         {
-            side.Attributes["Enraged"] = side.EnragedRemainingMs > 0 ? 1.0 : 0.0;
-            side.Attributes["EnragedDuration"] = side.EnragedRemainingMs;
+            // 修复 P0-03：狂暴态仅写入战斗临时层 CombatAdd（PlayerState.GetAttribute 同时直接派生 EnragedRemainingMs），绝不污染永久 Attributes
+            if (side.EnragedRemainingMs > 0)
+            {
+                side.CombatAdd["Enraged"] = 1.0;
+                side.CombatAdd["EnragedDuration"] = side.EnragedRemainingMs;
+            }
+            else
+            {
+                side.CombatAdd.Remove("Enraged");
+                side.CombatAdd.Remove("EnragedDuration");
+            }
+        }
+
+        void RefreshCombatAuraDependencyMask()
+        {
+            combatAuraDepMask = ScanSideAuraDependencies(p1) | ScanSideAuraDependencies(p2);
+        }
+
+        void MarkAuraDirty(CombatAuraDependencyMask changedBits)
+        {
+            if (changedBits != CombatAuraDependencyMask.None && (combatAuraDepMask & changedBits) != 0)
+                auraDirty = true;
+        }
+
+        void FlushDirtyAurasIfNeeded(bool emitFlyingTriggers = true)
+        {
+            if (!auraDirty) return;
+            auraDirty = false;
+            RecalculateCombatAuras(emitFlyingTriggers);
+            ClampSideAmmo(p1);
+            ClampSideAmmo(p2);
         }
 
         int GetEffectiveCardCooldownMaxMs(CardInstance card, PlayerState owner)
@@ -290,10 +360,118 @@ public static class CombatSimulator
             }
         }
 
+        void HandleAuraSnapshot(IReadOnlyList<AuraEngine.AuraEffectTargetsSnapshot> snapshots)
+        {
+            if (prevAuraTargets == null) return;
+            var currentMap = new Dictionary<(string SourceCardId, string AuraId), (HashSet<string> CardIds, HashSet<string> PlayerIds)>(snapshots.Count);
+            for (int i = 0; i < snapshots.Count; i++)
+            {
+                var snap = snapshots[i];
+                var key = (snap.SourceCardInstanceId, snap.AuraId);
+                if (!currentMap.TryGetValue(key, out var bag))
+                {
+                    bag = (new HashSet<string>(StringComparer.Ordinal), new HashSet<string>(StringComparer.Ordinal));
+                    currentMap[key] = bag;
+                }
+                for (int c = 0; c < snap.TargetCardInstanceIds.Count; c++)
+                    bag.CardIds.Add(snap.TargetCardInstanceIds[c]);
+                for (int p = 0; p < snap.TargetPlayerIds.Count; p++)
+                    bag.PlayerIds.Add(snap.TargetPlayerIds[p]);
+            }
+
+            // 1. 检测消失或目标减少的光环
+            List<(string SourceCardId, string AuraId)>? keysToRemove = null;
+            foreach (var (key, prevBag) in prevAuraTargets)
+            {
+                if (!currentMap.TryGetValue(key, out var curBag))
+                {
+                    if (prevBag.CardIds.Count > 0 || prevBag.PlayerIds.Count > 0)
+                    {
+                        Emit(new CombatEvent
+                        {
+                            TimeMs = timeMs,
+                            Type = CombatEventType.AuraExecuted,
+                            SourceCardInstanceId = key.SourceCardId,
+                            TriggerSourceCardInstanceId = activeExec.TriggerSourceCardInstanceId ?? key.SourceCardId,
+                            AbilityId = key.AuraId,
+                            AuraRemovedCardIds = prevBag.CardIds.Count > 0 ? new List<string>(prevBag.CardIds) : null,
+                            AuraRemovedPlayerIds = prevBag.PlayerIds.Count > 0 ? new List<string>(prevBag.PlayerIds) : null
+                        });
+                    }
+                    keysToRemove ??= new List<(string, string)>();
+                    keysToRemove.Add(key);
+                }
+                else
+                {
+                    List<string>? addedCards = null;
+                    List<string>? removedCards = null;
+                    List<string>? addedPlayers = null;
+                    List<string>? removedPlayers = null;
+
+                    foreach (var cid in curBag.CardIds)
+                        if (!prevBag.CardIds.Contains(cid)) (addedCards ??= new List<string>()).Add(cid);
+                    foreach (var cid in prevBag.CardIds)
+                        if (!curBag.CardIds.Contains(cid)) (removedCards ??= new List<string>()).Add(cid);
+                    foreach (var pid in curBag.PlayerIds)
+                        if (!prevBag.PlayerIds.Contains(pid)) (addedPlayers ??= new List<string>()).Add(pid);
+                    foreach (var pid in prevBag.PlayerIds)
+                        if (!curBag.PlayerIds.Contains(pid)) (removedPlayers ??= new List<string>()).Add(pid);
+
+                    if (addedCards != null || removedCards != null || addedPlayers != null || removedPlayers != null)
+                    {
+                        Emit(new CombatEvent
+                        {
+                            TimeMs = timeMs,
+                            Type = CombatEventType.AuraExecuted,
+                            SourceCardInstanceId = key.SourceCardId,
+                            TriggerSourceCardInstanceId = activeExec.TriggerSourceCardInstanceId ?? key.SourceCardId,
+                            AbilityId = key.AuraId,
+                            AuraAppliedCardIds = addedCards,
+                            AuraRemovedCardIds = removedCards,
+                            AuraAppliedPlayerIds = addedPlayers,
+                            AuraRemovedPlayerIds = removedPlayers
+                        });
+                        prevBag.CardIds.Clear();
+                        foreach (var cid in curBag.CardIds) prevBag.CardIds.Add(cid);
+                        prevBag.PlayerIds.Clear();
+                        foreach (var pid in curBag.PlayerIds) prevBag.PlayerIds.Add(pid);
+                    }
+                }
+            }
+
+            if (keysToRemove != null)
+            {
+                for (int i = 0; i < keysToRemove.Count; i++)
+                    prevAuraTargets.Remove(keysToRemove[i]);
+            }
+
+            // 2. 检测全新激活的光环
+            foreach (var (key, curBag) in currentMap)
+            {
+                if (prevAuraTargets.ContainsKey(key)) continue;
+                prevAuraTargets[key] = (new HashSet<string>(curBag.CardIds, StringComparer.Ordinal), new HashSet<string>(curBag.PlayerIds, StringComparer.Ordinal));
+                if (curBag.CardIds.Count > 0 || curBag.PlayerIds.Count > 0)
+                {
+                    Emit(new CombatEvent
+                    {
+                        TimeMs = timeMs,
+                        Type = CombatEventType.AuraExecuted,
+                        SourceCardInstanceId = key.SourceCardId,
+                        TriggerSourceCardInstanceId = activeExec.TriggerSourceCardInstanceId ?? key.SourceCardId,
+                        AbilityId = key.AuraId,
+                        AuraAppliedCardIds = curBag.CardIds.Count > 0 ? new List<string>(curBag.CardIds) : null,
+                        AuraAppliedPlayerIds = curBag.PlayerIds.Count > 0 ? new List<string>(curBag.PlayerIds) : null
+                    });
+                }
+            }
+        }
+
         void RecalculateCombatAuras(bool emitFlyingTriggers = true)
         {
+            auraDirty = false;
             if (auraRecalcDepth >= 4) return;
-            if (!AuraEngine.HasAnyAuraSource(p1, p2) && !AuraEngine.HasAnyAppliedAuraModifiers(p1, p2))
+            bool hasPrevTrackedAuras = prevAuraTargets != null && prevAuraTargets.Count > 0;
+            if (!AuraEngine.HasAnyAuraSource(p1, p2) && !AuraEngine.HasAnyAppliedAuraModifiers(p1, p2) && !hasPrevTrackedAuras)
                 return;
             auraRecalcDepth++;
             try
@@ -306,7 +484,8 @@ public static class CombatSimulator
                     p1.Hour,
                     repo,
                     selectionCards: null,
-                    onFlyingTransition: emitFlyingTriggers ? HandleAuraFlyingTransition : null);
+                    onFlyingTransition: emitFlyingTriggers ? HandleAuraFlyingTransition : null,
+                    onAuraSnapshot: recordEvents ? HandleAuraSnapshot : null);
             }
             finally
             {
@@ -314,7 +493,19 @@ public static class CombatSimulator
             }
         }
 
+        RefreshCombatAuraDependencyMask();
+        int preAuraHp1 = p1.CurrentHealth;
+        int preAuraHp2 = p2.CurrentHealth;
         RecalculateCombatAuras(emitFlyingTriggers: false);
+        // 修复 P0-04：首次光环结算后立即将开战当前生命同步至光环后上限（避免 Belt/Pawn Shop 等 HealthMax 光环导致半血开局）
+        p1.CurrentHealth = p1.HealthMax;
+        p2.CurrentHealth = p2.HealthMax;
+        if (p1.CurrentHealth != preAuraHp1 || p2.CurrentHealth != preAuraHp2)
+        {
+            RecalculateCombatAuras(emitFlyingTriggers: false);
+            p1.CurrentHealth = p1.HealthMax;
+            p2.CurrentHealth = p2.HealthMax;
+        }
         ClampSideAmmo(p1);
         ClampSideAmmo(p2);
         SyncEnragedState(p1);
@@ -340,14 +531,25 @@ public static class CombatSimulator
                 SourcePlayerId = ev.SourcePlayerId,
                 TargetPlayerId = ev.TargetPlayerId,
                 SourceCardInstanceId = ev.SourceCardInstanceId,
+                TriggerSourceCardInstanceId = ev.TriggerSourceCardInstanceId ?? activeExec.TriggerSourceCardInstanceId,
                 TargetCardInstanceId = ev.TargetCardInstanceId,
                 Value = ev.Value,
+                ShieldAbsorbed = ev.ShieldAbsorbed,
+                HpDamage = ev.HpDamage,
+                EffectiveHpRestored = ev.EffectiveHpRestored,
                 IsCrit = ev.IsCrit,
                 Detail = ev.Detail,
                 AbilityId = ev.AbilityId ?? activeExec.AbilityId,
                 ActionType = ev.ActionType ?? activeExec.ActionType,
+                ExecutionContextId = ev.ExecutionContextId ?? activeExec.ExecutionContextId,
+                IsReverted = ev.IsReverted,
                 IsSkillSource = ev.IsSkillSource || IsSkillCardId(ev.SourceCardInstanceId),
                 VfxKeyOverride = ev.VfxKeyOverride,
+                AuraAppliedCardIds = ev.AuraAppliedCardIds,
+                AuraRemovedCardIds = ev.AuraRemovedCardIds,
+                AuraAppliedPlayerIds = ev.AuraAppliedPlayerIds,
+                AuraRemovedPlayerIds = ev.AuraRemovedPlayerIds,
+                RevertedTransformedInstanceIds = ev.RevertedTransformedInstanceIds,
                 Player1Health = p1.CurrentHealth,
                 Player1Shield = p1.Shield,
                 Player1Burn = p1.Burn,
@@ -359,18 +561,20 @@ public static class CombatSimulator
             });
         }
 
-        void ApplyDirectDamage(PlayerState target, int amount, bool bypassShield)
+        (int ShieldAbsorbed, int HpDamage) ApplyDirectDamage(PlayerState target, int amount, bool bypassShield)
         {
-            if (amount <= 0) return;
+            if (amount <= 0) return (0, 0);
             int prevShield = target.Shield;
             int prevHp = target.CurrentHealth;
             int remaining = amount;
+            int absorbed = 0;
             if (!bypassShield && target.Shield > 0)
             {
-                int absorbed = Math.Min(target.Shield, remaining);
+                absorbed = Math.Min(target.Shield, remaining);
                 target.Shield -= absorbed;
                 remaining -= absorbed;
             }
+            int hpDamage = remaining;
             if (remaining > 0)
             {
                 if (remaining > target.CurrentHealth)
@@ -385,27 +589,38 @@ public static class CombatSimulator
                     target.CurrentHealth -= remaining;
                 }
             }
+            CombatAuraDependencyMask changedMask = CombatAuraDependencyMask.None;
+            if (target.Shield < prevShield) changedMask |= CombatAuraDependencyMask.Shield;
+            if (target.CurrentHealth < prevHp) changedMask |= CombatAuraDependencyMask.Health;
+            if (changedMask != CombatAuraDependencyMask.None)
+            {
+                MarkAuraDirty(changedMask);
+                FlushDirtyAurasIfNeeded();
+            }
             if (target.Shield < prevShield)
                 DispatchEvent("TTriggerOnPlayerAttributeChanged", target, null, null, target, "Shield", prevShield, target.Shield);
             if (target.CurrentHealth < prevHp)
                 DispatchEvent("TTriggerOnPlayerAttributeChanged", target, null, null, target, "Health", prevHp, target.CurrentHealth);
+            return (absorbed, hpDamage);
         }
 
-        void ApplyHealthGain(PlayerState target, int amount)
+        int ApplyHealthGain(PlayerState target, int amount)
         {
-            if (amount <= 0) return;
+            if (amount <= 0) return 0;
             ref int overkill = ref (target == p1 ? ref p1Overkill : ref p2Overkill);
+            int prevSignedHp = target.CurrentHealth - overkill;
             if (overkill > 0)
             {
                 if (amount <= overkill)
                 {
                     overkill -= amount;
-                    return;
+                    return Math.Max(0, (target.CurrentHealth - overkill) - prevSignedHp);
                 }
                 amount -= overkill;
                 overkill = 0;
             }
             target.CurrentHealth = Math.Min(target.HealthMax, target.CurrentHealth + amount);
+            return Math.Max(0, (target.CurrentHealth - overkill) - prevSignedHp);
         }
 
         /// <summary>返回 true 表示允许继续执行；仅当自定义机制显式调用 CancelHook 时返回 false（自然减免至 0 仍放行原版免疫回调）。</summary>
@@ -486,6 +701,8 @@ public static class CombatSimulator
                 int prev = getMs(targetCard);
                 int next = prev + actual;
                 setMs(targetCard, next);
+                MarkAuraDirty(CombatAuraDependencyMask.CardStatus);
+                FlushDirtyAurasIfNeeded();
                 if (recordEvents)
                     Emit(new CombatEvent { TimeMs = timeMs, Type = evType, SourceCardInstanceId = srcCard?.InstanceId, TargetCardInstanceId = targetCard.InstanceId, Value = actual });
                 // 先派发属性变化触发器，确保 Photo Booth / Beast Call 等自锁存（Custom_8）能在 PerformedHaste 清零前捕获归属
@@ -499,11 +716,11 @@ public static class CombatSimulator
             }
         }
 
-        void CompleteReadyCooldowns(PlayerState cardOwner, PlayerState cardOpp, CardInstance targetCard, bool countFirstAsDepth)
+        void CompleteReadyCooldowns(PlayerState cardOwner, PlayerState cardOpp, CardInstance targetCard, bool countFirstAsDepth, bool allowIfFrozenThisTick = false)
         {
             if (targetCard.IsDestroyed || targetCard.IsDisabled
                 || !targetCard.HasActiveCooldown
-                || targetCard.FreezeMs > 0)
+                || (!allowIfFrozenThisTick && targetCard.FreezeMs > 0))
             {
                 return;
             }
@@ -521,9 +738,8 @@ public static class CombatSimulator
             int cdMax = GetEffectiveCardCooldownMaxMs(targetCard, cardOwner);
             if (targetCard.CooldownProgressMs < cdMax) return;
 
-            targetCard.CooldownProgressMs -= cdMax;
-            if (targetCard.CooldownProgressMs > cdMax)
-                targetCard.CooldownProgressMs = cdMax;
+            // 修复 P1-54：对齐官方 BazaarCardDealer.cs:4156-4172，满冷却触发后进度直接归零，不向下一轮结转溢出进度
+            targetCard.CooldownProgressMs = 0;
 
             lastCooldownFireMs[targetCard] = timeMs;
             if (countFirstAsDepth)
@@ -547,6 +763,81 @@ public static class CombatSimulator
                 targetCard.CooldownProgressMs = 0;
         }
 
+        void HandleShieldApplied(PlayerState targetPlayer, int amt, bool isCrit, CardInstance? srcCard)
+        {
+            if (amt <= 0) return;
+            double mult = mod.ShieldAndRegenMultiplier * (targetPlayer == p2 ? mod.OffenseMultiplierP2 : 1.0);
+            int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
+            if (!RunBeforeStatusHook(targetPlayer, targetPlayer, srcCard, null, "Shield", ref finalAmt)) return;
+            if (finalAmt <= 0) return;
+            int prevShield = targetPlayer.Shield;
+            targetPlayer.Shield += finalAmt;
+            MarkAuraDirty(CombatAuraDependencyMask.Shield);
+            FlushDirtyAurasIfNeeded();
+            if (targetPlayer == p1) p1ShieldTotal += finalAmt; else p2ShieldTotal += finalAmt;
+            if (recordEvents)
+                Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.ShieldApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt, IsCrit = isCrit });
+            DispatchEvent("TTriggerOnCardPerformedShield", targetPlayer, srcCard, srcCard, targetPlayer);
+            DispatchEvent("TTriggerOnPlayerShielded", targetPlayer, srcCard, srcCard, targetPlayer, "Shield", prevShield, finalAmt);
+            if (targetPlayer.Shield != prevShield)
+                DispatchEvent("TTriggerOnPlayerAttributeChanged", targetPlayer, srcCard, srcCard, targetPlayer, "Shield", prevShield, targetPlayer.Shield);
+        }
+
+        void HandleHealApplied(PlayerState targetPlayer, int amt, bool isCrit, CardInstance? srcCard)
+        {
+            if (amt <= 0) return;
+            int finalAmt = targetPlayer == p2 && Math.Abs(mod.OffenseMultiplierP2 - 1.0) > 1e-6
+                ? Math.Max(0, (int)Math.Clamp(Math.Round(amt * mod.OffenseMultiplierP2), 0, 1_000_000_000))
+                : amt;
+            if (!RunBeforeStatusHook(targetPlayer, targetPlayer, srcCard, null, "Heal", ref finalAmt)) return;
+            if (finalAmt <= 0) return;
+            int prevHp = targetPlayer.CurrentHealth;
+            int prevBurn = targetPlayer.Burn;
+            int prevPoison = targetPlayer.Poison;
+            int overkill = targetPlayer == p1 ? p1Overkill : p2Overkill;
+            int missing = Math.Max(0, targetPlayer.HealthMax - targetPlayer.CurrentHealth) + overkill;
+            // 对齐官方 OverHeal：在满血状态下治疗或本次治疗恰好达到/溢出 HealthMax 均触发 OverHeal
+            bool overheal = finalAmt >= missing;
+            int effectiveRestored = ApplyHealthGain(targetPlayer, finalAmt);
+            // 8.4 官方规则：普通/小额治疗按治疗量的 5%（向下取整，至少 1 点）各自净化 Burn 与 Poison
+            int cleanse = Math.Max(1, (int)Math.Floor(finalAmt * 0.05));
+            if (targetPlayer.Burn > 0)
+                targetPlayer.Burn = Math.Max(0, targetPlayer.Burn - cleanse);
+            if (targetPlayer.Poison > 0)
+                targetPlayer.Poison = Math.Max(0, targetPlayer.Poison - cleanse);
+
+            CombatAuraDependencyMask healMask = CombatAuraDependencyMask.None;
+            if (targetPlayer.CurrentHealth != prevHp) healMask |= CombatAuraDependencyMask.Health;
+            if (targetPlayer.Burn != prevBurn) healMask |= CombatAuraDependencyMask.Burn;
+            if (targetPlayer.Poison != prevPoison) healMask |= CombatAuraDependencyMask.Poison;
+            if (healMask != CombatAuraDependencyMask.None)
+            {
+                MarkAuraDirty(healMask);
+                FlushDirtyAurasIfNeeded();
+            }
+
+            if (recordEvents)
+            {
+                Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.HealApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt, EffectiveHpRestored = effectiveRestored, IsCrit = isCrit });
+                // P2-20：治疗净化扣减灼烧/剧毒时补发战报清理明细
+                int burnCleaned = prevBurn - targetPlayer.Burn;
+                if (burnCleaned > 0)
+                    Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.BurnRemoved, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = burnCleaned, Detail = "HealCleanse" });
+                int poisonCleaned = prevPoison - targetPlayer.Poison;
+                if (poisonCleaned > 0)
+                    Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.PoisonRemoved, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = poisonCleaned, Detail = "HealCleanse" });
+            }
+            DispatchEvent("TTriggerOnCardPerformedHeal", targetPlayer, srcCard, srcCard, targetPlayer);
+            if (overheal)
+                DispatchEvent("TTriggerOnCardPerformedOverHeal", targetPlayer, srcCard, srcCard, targetPlayer);
+            if (targetPlayer.CurrentHealth != prevHp)
+                DispatchEvent("TTriggerOnPlayerAttributeChanged", targetPlayer, srcCard, srcCard, targetPlayer, "Health", prevHp, targetPlayer.CurrentHealth);
+            if (targetPlayer.Burn != prevBurn)
+                DispatchEvent("TTriggerOnPlayerAttributeChanged", targetPlayer, srcCard, srcCard, targetPlayer, "Burn", prevBurn, targetPlayer.Burn);
+            if (targetPlayer.Poison != prevPoison)
+                DispatchEvent("TTriggerOnPlayerAttributeChanged", targetPlayer, srcCard, srcCard, targetPlayer, "Poison", prevPoison, targetPlayer.Poison);
+        }
+
         RuleExecutionContext CreateBaseContext(PlayerState self, PlayerState opp)
         {
             return new RuleExecutionContext(repo, RuleScope.InCombat, self, opp, rng)
@@ -561,7 +852,7 @@ public static class CombatSimulator
                 EmitCombatEvent = recordEvents ? Emit : null,
                 OnTimedCardAttributeModifierApplied = (targetCard, attr, op, val, durationMs) =>
                 {
-                    if (op == "Multiply" && Math.Abs(val) < 1e-9) return;
+                    // 修复 P0-08：不再跳过 Multiply 0.0（由 CombatZeroMultCount 引用计数承载），到期正常无损恢复
                     timedExpiries.Add(new TimedAttributeExpiry
                     {
                         ExpireTimeMs = timeMs + durationMs,
@@ -573,7 +864,6 @@ public static class CombatSimulator
                 },
                 OnTimedPlayerAttributeModifierApplied = (targetPlayer, attr, op, val, durationMs) =>
                 {
-                    if (op == "Multiply" && Math.Abs(val) < 1e-9) return;
                     timedExpiries.Add(new TimedAttributeExpiry
                     {
                         ExpireTimeMs = timeMs + durationMs,
@@ -582,6 +872,38 @@ public static class CombatSimulator
                         Operation = op,
                         Value = val
                     });
+                },
+                OnCardTransformBatch = (owner, origCard, replacements, isTemporary, timedDurationMs, origSection, origSlot) =>
+                {
+                    if (!isTemporary || replacements.Count == 0) return;
+                    if (timedDurationMs is > 0)
+                    {
+                        timedTransformExpiries.Add(new TimedTransformExpiry
+                        {
+                            ExpireTimeMs = timeMs + timedDurationMs.Value,
+                            Owner = owner,
+                            OriginalCard = origCard,
+                            Replacements = new List<CardInstance>(replacements),
+                            OriginalSection = origSection,
+                            OriginalSlot = origSlot
+                        });
+                    }
+                    else
+                    {
+                        var ids = new List<string>(replacements.Count);
+                        for (int r = 0; r < replacements.Count; r++)
+                            ids.Add(replacements[r].InstanceId);
+                        temporaryTransforms.Add(new CombatTemporaryTransformRecord
+                        {
+                            OwnerPlayerId = owner.PlayerId,
+                            OriginalCardInstanceId = origCard.InstanceId,
+                            OriginalTemplateId = origCard.Template.Id,
+                            OriginalCardType = origCard.Template.Type,
+                            OriginalSection = origSection,
+                            OriginalSlot = origSlot,
+                            TransformedInstanceIds = ids
+                        });
+                    }
                 },
                 OnDamageApplied = (targetPlayer, dmg, isCrit, srcCard) =>
                 {
@@ -593,15 +915,20 @@ public static class CombatSimulator
                     int actual = Math.Max(0, (int)Math.Clamp(Math.Round(scaledDmg * (1.0 - red / 100.0)), 0, 1_000_000_000));
                     if (!RunBeforeDamageHook(attacker, targetPlayer, srcCard, "Direct", ref actual))
                         return;
-                    ApplyDirectDamage(targetPlayer, actual, bypassShield: false);
+                    var dmgSplit = ApplyDirectDamage(targetPlayer, actual, bypassShield: false);
 
                     if (actual > 0 && srcCard != null && srcCard.GetAttribute("Lifesteal") > 0)
                     {
                         int prevAttackerHp = attacker.CurrentHealth;
-                        ApplyHealthGain(attacker, actual);
+                        int effectiveRestored = ApplyHealthGain(attacker, actual);
                         int healed = attacker.CurrentHealth - prevAttackerHp;
+                        if (healed > 0)
+                        {
+                            MarkAuraDirty(CombatAuraDependencyMask.Health);
+                            FlushDirtyAurasIfNeeded();
+                        }
                         if (recordEvents)
-                            Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.HealApplied, SourcePlayerId = attacker.PlayerId, TargetPlayerId = attacker.PlayerId, SourceCardInstanceId = srcCard.InstanceId, Value = actual, Detail = "Lifesteal" });
+                            Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.HealApplied, SourcePlayerId = attacker.PlayerId, TargetPlayerId = attacker.PlayerId, SourceCardInstanceId = srcCard.InstanceId, Value = actual, EffectiveHpRestored = effectiveRestored, Detail = "Lifesteal" });
                         if (healed > 0)
                         {
                             DispatchEvent("TTriggerOnPlayerAttributeChanged", attacker, srcCard, srcCard, attacker, "Health", prevAttackerHp, attacker.CurrentHealth);
@@ -611,28 +938,14 @@ public static class CombatSimulator
 
                     if (targetPlayer == p2) p1DmgTotal += actual; else p2DmgTotal += actual;
                     if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.DamageApplied, SourcePlayerId = attacker.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = actual, IsCrit = isCrit });
+                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.DamageApplied, SourcePlayerId = attacker.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = actual, ShieldAbsorbed = dmgSplit.ShieldAbsorbed, HpDamage = dmgSplit.HpDamage, IsCrit = isCrit });
+                    FlushDirtyAurasIfNeeded();
                     DispatchEvent("TTriggerOnCardPerformedDamage", attacker, srcCard, srcCard, targetPlayer);
                     if (actual > 0)
                         DispatchEvent("TTriggerOnPlayerDamaged", attacker, srcCard, srcCard, targetPlayer, null, 0, actual);
                 },
-                OnShieldApplied = (targetPlayer, amt, srcCard) =>
-                {
-                    if (amt <= 0) return;
-                    double mult = mod.ShieldAndRegenMultiplier * (targetPlayer == p2 ? mod.OffenseMultiplierP2 : 1.0);
-                    int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
-                    if (!RunBeforeStatusHook(targetPlayer, targetPlayer, srcCard, null, "Shield", ref finalAmt)) return;
-                    if (finalAmt <= 0) return;
-                    int prevShield = targetPlayer.Shield;
-                    targetPlayer.Shield += finalAmt;
-                    if (targetPlayer == p1) p1ShieldTotal += finalAmt; else p2ShieldTotal += finalAmt;
-                    if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.ShieldApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt });
-                    DispatchEvent("TTriggerOnCardPerformedShield", targetPlayer, srcCard, srcCard, targetPlayer);
-                    DispatchEvent("TTriggerOnPlayerShielded", targetPlayer, srcCard, srcCard, targetPlayer, "Shield", prevShield, finalAmt);
-                    if (targetPlayer.Shield != prevShield)
-                        DispatchEvent("TTriggerOnPlayerAttributeChanged", targetPlayer, srcCard, srcCard, targetPlayer, "Shield", prevShield, targetPlayer.Shield);
-                },
+                OnShieldApplied = (targetPlayer, amt, srcCard) => HandleShieldApplied(targetPlayer, amt, isCrit: false, srcCard),
+                OnShieldAppliedWithCrit = HandleShieldApplied,
                 OnBurnApplied = (targetPlayer, amt, srcCard) =>
                 {
                     if (amt <= 0) return;
@@ -643,6 +956,8 @@ public static class CombatSimulator
                     if (finalAmt <= 0) return;
                     int prevBurn = targetPlayer.Burn;
                     targetPlayer.Burn += finalAmt;
+                    MarkAuraDirty(CombatAuraDependencyMask.Burn);
+                    FlushDirtyAurasIfNeeded();
                     if (recordEvents)
                         Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.BurnApplied, SourcePlayerId = actor.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt });
                     DispatchEvent("TTriggerOnCardPerformedBurn", actor, srcCard, srcCard, targetPlayer);
@@ -659,52 +974,35 @@ public static class CombatSimulator
                     if (finalAmt <= 0) return;
                     int prevPoison = targetPlayer.Poison;
                     targetPlayer.Poison += finalAmt;
+                    MarkAuraDirty(CombatAuraDependencyMask.Poison);
+                    FlushDirtyAurasIfNeeded();
                     if (recordEvents)
                         Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.PoisonApplied, SourcePlayerId = actor.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt });
                     DispatchEvent("TTriggerOnCardPerformedPoison", actor, srcCard, srcCard, targetPlayer);
                     if (targetPlayer.Poison != prevPoison)
                         DispatchEvent("TTriggerOnPlayerAttributeChanged", actor, srcCard, srcCard, targetPlayer, "Poison", prevPoison, targetPlayer.Poison);
                 },
-                OnHealApplied = (targetPlayer, amt, srcCard) =>
-                {
-                    if (amt <= 0) return;
-                    int finalAmt = targetPlayer == p2 && Math.Abs(mod.OffenseMultiplierP2 - 1.0) > 1e-6
-                        ? Math.Max(0, (int)Math.Clamp(Math.Round(amt * mod.OffenseMultiplierP2), 0, 1_000_000_000))
-                        : amt;
-                    if (!RunBeforeStatusHook(targetPlayer, targetPlayer, srcCard, null, "Heal", ref finalAmt)) return;
-                    if (finalAmt <= 0) return;
-                    int prevHp = targetPlayer.CurrentHealth;
-                    int overkill = targetPlayer == p1 ? p1Overkill : p2Overkill;
-                    int missing = Math.Max(0, targetPlayer.HealthMax - targetPlayer.CurrentHealth) + overkill;
-                    // 对齐官方 OverHeal：在满血状态下治疗或本次治疗恰好达到/溢出 HealthMax 均触发 OverHeal
-                    bool overheal = finalAmt >= missing;
-                    ApplyHealthGain(targetPlayer, finalAmt);
-                    // 8.4 官方规则：普通/小额治疗按治疗量的 5%（向下取整，至少 1 点）各自净化 Burn 与 Poison
-                    int cleanse = Math.Max(1, (int)Math.Floor(finalAmt * 0.05));
-                    if (targetPlayer.Burn > 0)
-                        targetPlayer.Burn = Math.Max(0, targetPlayer.Burn - cleanse);
-                    if (targetPlayer.Poison > 0)
-                        targetPlayer.Poison = Math.Max(0, targetPlayer.Poison - cleanse);
-
-                    if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.HealApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt });
-                    DispatchEvent("TTriggerOnCardPerformedHeal", targetPlayer, srcCard, srcCard, targetPlayer);
-                    if (overheal)
-                        DispatchEvent("TTriggerOnCardPerformedOverHeal", targetPlayer, srcCard, srcCard, targetPlayer);
-                    if (targetPlayer.CurrentHealth != prevHp)
-                        DispatchEvent("TTriggerOnPlayerAttributeChanged", targetPlayer, srcCard, srcCard, targetPlayer, "Health", prevHp, targetPlayer.CurrentHealth);
-                },
-                OnRegenApplied = (targetPlayer, amt, srcCard) =>
+                OnHealApplied = (targetPlayer, amt, srcCard) => HandleHealApplied(targetPlayer, amt, isCrit: false, srcCard),
+                OnHealAppliedWithCrit = HandleHealApplied,
+                OnRegenApplied = (targetPlayer, amt, srcCard, durationTarget) =>
                 {
                     if (amt <= 0) return;
                     double mult = mod.ShieldAndRegenMultiplier * (targetPlayer == p2 ? mod.OffenseMultiplierP2 : 1.0);
                     int finalAmt = Math.Max(0, (int)Math.Clamp(Math.Round(amt * mult), 0, 1_000_000_000));
                     if (!RunBeforeStatusHook(targetPlayer, targetPlayer, srcCard, null, "Regen", ref finalAmt)) return;
                     if (finalAmt <= 0) return;
-                    targetPlayer.ModifyAttribute("HealthRegen", "Add", finalAmt);
+                    double prevRegen = targetPlayer.GetAttribute("HealthRegen");
+                    // 修复 P0-03：严格按 ResolveDurationTarget 写入对应持久域（UntilEndOfCombat -> CombatAdd，仅 Duration==null 写 Permanent）
+                    targetPlayer.ModifyAttribute("HealthRegen", "Add", finalAmt, durationTarget);
+                    double curRegen = targetPlayer.GetAttribute("HealthRegen");
+                    MarkAuraDirty(CombatAuraDependencyMask.Regen);
+                    FlushDirtyAurasIfNeeded();
+                    // 修复 P0-09：切发独立 CombatEventType.RegenApplied，与 HealApplied 彻底解耦
                     if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.HealApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt, Detail = "RegenGain" });
+                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.RegenApplied, SourcePlayerId = targetPlayer.PlayerId, TargetPlayerId = targetPlayer.PlayerId, SourceCardInstanceId = srcCard?.InstanceId, Value = finalAmt, Detail = "RegenGain" });
                     DispatchEvent("TTriggerOnCardPerformedRegen", targetPlayer, srcCard, srcCard, targetPlayer);
+                    if (Math.Abs(curRegen - prevRegen) > 1e-6)
+                        DispatchEvent("TTriggerOnPlayerAttributeChanged", targetPlayer, srcCard, srcCard, targetPlayer, "HealthRegen", prevRegen, curRegen);
                 },
                 OnHasteApplied = (targetCard, ms, srcCard) =>
                     ApplyCardStatusDuration(self, targetCard, ms, srcCard, "PercentHasteReduction", checkRadiantAndFlying: false, CombatEventType.HasteApplied, "TTriggerOnCardPerformedHaste", "Haste", static c => c.HasteMs, static (c, v) => c.HasteMs = v),
@@ -722,26 +1020,25 @@ public static class CombatSimulator
                     if (!RunBeforeStatusHook(self, cardOwner, srcCard, targetCard, "Charge", ref actual)) return;
                     if (actual <= 0) return;
                     int cdMax = cardOwner != null ? GetEffectiveCardCooldownMaxMs(targetCard, cardOwner) : GetCardCooldownMaxMs(targetCard);
-                    if (lastCooldownFireMs.TryGetValue(targetCard, out int prevCdMs) && timeMs - prevCdMs < icdMs)
-                    {
-                        targetCard.CooldownProgressMs = Math.Min(cdMax, targetCard.CooldownProgressMs + actual);
-                    }
-                    else
-                    {
-                        int overflowCap = Math.Max(cdMax * 2, 2000);
-                        targetCard.CooldownProgressMs = Math.Min(overflowCap, targetCard.CooldownProgressMs + actual);
-                    }
+                    // 修复 P1-54：单次充能严格钳制至 cdMax（对齐官方 Value = Min(ValueMax, Value + amount)），超额充能不溢出至下一周期
+                    targetCard.CooldownProgressMs = Math.Min(cdMax, targetCard.CooldownProgressMs + actual);
                     if (recordEvents)
                         Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.ChargeApplied, SourceCardInstanceId = srcCard?.InstanceId, TargetCardInstanceId = targetCard.InstanceId, Value = actual });
                     DispatchEvent("TTriggerOnCardCharged", self, srcCard, targetCard, self);
                     DispatchEvent("TTriggerOnCardPerformedCharge", self, srcCard, targetCard, self);
 
-                    // 7.5：Charge 满冷却时保留溢出并在当前 20ms tick 立即开火（受单卡内置冷却与防死循环帧预算约束）
+                    // 7.5：Charge 推满冷却时在当前 50ms tick 立即触发（受单卡内置冷却与防死循环帧预算约束）
                     if (cardOwner == null) return;
                     CompleteReadyCooldowns(cardOwner, cardOwner == p1 ? p2 : p1, targetCard, countFirstAsDepth: true);
                 },
                 OnActionCostSpent = (srcCard, attr, amt) =>
                 {
+                    var costMask = MapAttributeToDependencyMask(attr);
+                    if (costMask != CombatAuraDependencyMask.None)
+                    {
+                        MarkAuraDirty(costMask);
+                        FlushDirtyAurasIfNeeded();
+                    }
                     if (recordEvents && srcCard != null)
                         Emit(new CombatEvent
                         {
@@ -789,15 +1086,16 @@ public static class CombatSimulator
                     {
                         sandstormForceStarted = true;
                         sandstormActive = true;
-                        sandstormNextTickMs = timeMs;
+                        sandstormPendingImmediateTick = true;
+                        sandstormElapsedMs = 0;
                         if (!sandstormWarned)
                         {
                             sandstormWarned = true;
                             if (recordEvents)
                                 Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.SandstormWarning, Detail = "ForcedSandstorm" });
                         }
-                        // 沙暴提前开启时仅在启动瞬间派发一次 TTriggerOnSandstorm
-                        DispatchEvent("TTriggerOnSandstorm", p1, null, null, p1);
+                        // P2-44：沙暴为全局环境事件，subjectPlayer 规范化为 null 避免对 P2 侧误传 p1
+                        DispatchEvent("TTriggerOnSandstorm", p1, null, null, null);
                     }
                 },
                 OnCardTriggeredEvent = (evName, subjOwner, subjOpp, srcCard) =>
@@ -821,6 +1119,16 @@ public static class CombatSimulator
                         SyncEnragedState(p1);
                         SyncEnragedState(p2);
                         RecalculateCombatAuras();
+                    }
+                    else if (!string.IsNullOrEmpty(attr)
+                        && (evName == "TTriggerOnPlayerAttributeChanged" || evName == "TTriggerOnCardAttributeChanged"))
+                    {
+                        var depBit = MapAttributeToDependencyMask(attr);
+                        if (depBit != CombatAuraDependencyMask.None)
+                        {
+                            MarkAuraDirty(depBit);
+                            FlushDirtyAurasIfNeeded();
+                        }
                     }
                     DispatchEvent(evName, actor, src, tgt, subj, attr, prev, cur);
                 },
@@ -889,7 +1197,7 @@ public static class CombatSimulator
                         var attacker = targetPlayer == p1 ? p2 : p1;
                         int actual = dmg;
                         if (!RunBeforeDamageHook(attacker, targetPlayer, srcCard, "Direct", ref actual)) return;
-                        ApplyDirectDamage(targetPlayer, actual, bypassShield);
+                        var dmgSplit = ApplyDirectDamage(targetPlayer, actual, bypassShield);
                         if (targetPlayer == p2) p1DmgTotal += actual; else p2DmgTotal += actual;
                         if (recordEvents)
                             Emit(new CombatEvent
@@ -900,6 +1208,8 @@ public static class CombatSimulator
                                 TargetPlayerId = targetPlayer.PlayerId,
                                 SourceCardInstanceId = srcCard?.InstanceId,
                                 Value = actual,
+                                ShieldAbsorbed = dmgSplit.ShieldAbsorbed,
+                                HpDamage = dmgSplit.HpDamage,
                                 VfxKeyOverride = vfxKey
                             });
                         DispatchEvent("TTriggerOnCardPerformedDamage", attacker, srcCard, srcCard, targetPlayer);
@@ -915,7 +1225,7 @@ public static class CombatSimulator
                             case "burn": if (targetPlayer != null) ctx.OnBurnApplied?.Invoke(targetPlayer, amt, srcCard); break;
                             case "poison": if (targetPlayer != null) ctx.OnPoisonApplied?.Invoke(targetPlayer, amt, srcCard); break;
                             case "heal": if (targetPlayer != null) ctx.OnHealApplied?.Invoke(targetPlayer, amt, srcCard); break;
-                            case "regen": if (targetPlayer != null) ctx.OnRegenApplied?.Invoke(targetPlayer, amt, srcCard); break;
+                            case "regen": if (targetPlayer != null) ctx.OnRegenApplied?.Invoke(targetPlayer, amt, srcCard, DurationTarget.Combat); break;
                             case "haste": if (targetCard != null) ctx.OnHasteApplied?.Invoke(targetCard, amt, srcCard); break;
                             case "slow": if (targetCard != null) ctx.OnSlowApplied?.Invoke(targetCard, amt, srcCard); break;
                             case "freeze": if (targetCard != null) ctx.OnFreezeApplied?.Invoke(targetCard, amt, srcCard); break;
@@ -1024,6 +1334,7 @@ public static class CombatSimulator
             p2TriggerIndex = BuildSideTriggerIndex(p2);
             p1HasQuests = HasAnyQuests(p1);
             p2HasQuests = HasAnyQuests(p2);
+            RefreshCombatAuraDependencyMask();
             indexedCardTotal = curTotal;
             triggerIndexDirty = false;
         }
@@ -1090,8 +1401,11 @@ public static class CombatSimulator
                         if (!ValueAndConditionEvaluator.EvaluatePrerequisites(ab.Prerequisites, abCtx))
                             continue;
                         // 先序 Immediate 状态修改（如 Grabinator 0/1/6）立即执行，供后续联动能力（2）实时读取最新 Custom_*
+                        FlushDirtyAurasIfNeeded();
                         var prevAb = activeExec.AbilityId;
+                        var prevTrigSrc = activeExec.TriggerSourceCardInstanceId;
                         activeExec.AbilityId = ab.Id;
+                        activeExec.TriggerSourceCardInstanceId = (sourceCard ?? targetCard)?.InstanceId;
                         try
                         {
                             AbilityExecutor.ExecuteAction(ab.Action, card, abCtx);
@@ -1099,6 +1413,7 @@ public static class CombatSimulator
                         finally
                         {
                             activeExec.AbilityId = prevAb;
+                            activeExec.TriggerSourceCardInstanceId = prevTrigSrc;
                         }
                         SyncEnragedState(p1);
                         SyncEnragedState(p2);
@@ -1131,15 +1446,24 @@ public static class CombatSimulator
                     localDeferredCounters ??= new List<(CardInstance, AbilityDefinition, RuleExecutionContext)>(2);
                     localDeferredCounters.Add((card, ab, abCtx));
                 }
-                else if (string.Equals(card.Template.Type, "PlayerEffect", StringComparison.OrdinalIgnoreCase) || IsStatGainAbility(ab))
+                else if (string.Equals(card.Template.Type, "PlayerEffect", StringComparison.OrdinalIgnoreCase)
+                    || IsStatGainAbility(ab)
+                    || (string.Equals(ab.Priority, "Immediate", StringComparison.OrdinalIgnoreCase) && tickImmediateExecs < MaxTickImmediateExecs))
                 {
-                    // 系统级 PlayerEffect（如 Base Rage Effect 同卡兄弟驱散 Reset Slow + Reset Freeze）与数值成长类效果（Stat Gains）豁免 250ms ICD 节流
+                    // 系统级 PlayerEffect、数值成长类效果（Stat Gains）与 Priority == "Immediate" 触发豁免 250ms ICD 节流（P1-21：带单帧熔断上限防死循环）
+                    if (string.Equals(ab.Priority, "Immediate", StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(card.Template.Type, "PlayerEffect", StringComparison.OrdinalIgnoreCase)
+                        && !IsStatGainAbility(ab))
+                    {
+                        tickImmediateExecs++;
+                    }
                     localImmediate ??= new List<(CardInstance, AbilityDefinition, RuleExecutionContext)>(4);
                     localImmediate.Add((card, ab, abCtx));
                 }
                 else
                 {
-                    var key = new TriggerQueueKey(owner.PlayerId, card.InstanceId);
+                    // 修复 P1-21：单能力粒度 ICD 队列键，避免同卡多触发能力共用 250ms 槽位彼此挤占
+                    var key = new TriggerQueueKey(owner.PlayerId, card.InstanceId, ab.Id ?? string.Empty);
                     if (!triggerQueues.TryGetValue(key, out var q))
                     {
                         q = new Queue<QueuedTrigger>();
@@ -1170,27 +1494,46 @@ public static class CombatSimulator
 
             if (!executeAllImmediate && localImmediate != null)
             {
-                bool ranStatGain = false;
+                bool ranNonCardFiredImmediate = false;
                 for (int i = 0; i < localImmediate.Count; i++)
                 {
+                    FlushDirtyAurasIfNeeded();
                     var (card, ab, abCtx) = localImmediate[i];
                     if (card.IsDestroyed || card.IsDisabled) continue;
+                    if (i > 0 && eventType != "TTriggerOnCardFired"
+                        && !ValueAndConditionEvaluator.EvaluatePrerequisites(ab.Prerequisites, abCtx))
+                    {
+                        continue;
+                    }
                     var prevAb = activeExec.AbilityId;
+                    var prevTrigSrc = activeExec.TriggerSourceCardInstanceId;
+                    bool prevInCardFired = activeExec.InCardFiredExecution;
                     activeExec.AbilityId = ab.Id;
+                    activeExec.TriggerSourceCardInstanceId = eventType == "TTriggerOnCardFired"
+                        ? card.InstanceId
+                        : (sourceCard ?? targetCard)?.InstanceId;
+                    activeExec.InCardFiredExecution = eventType == "TTriggerOnCardFired"
+                        && ReferenceEquals(card, activeExec.CurrentCastCard);
                     try
                     {
                         AbilityExecutor.ExecuteAction(ab.Action, card, abCtx);
-                        if (eventType != "TTriggerOnCardFired" && IsStatGainAbility(ab))
-                            ranStatGain = true;
+                        if (eventType != "TTriggerOnCardFired"
+                            && (IsStatGainAbility(ab) || string.Equals(ab.Priority, "Immediate", StringComparison.OrdinalIgnoreCase)))
+                            ranNonCardFiredImmediate = true;
                     }
                     finally
                     {
                         activeExec.AbilityId = prevAb;
+                        activeExec.TriggerSourceCardInstanceId = prevTrigSrc;
+                        activeExec.InCardFiredExecution = prevInCardFired;
                     }
                     SyncEnragedState(p1);
                     SyncEnragedState(p2);
+                    // 修复 P0-07：同卡多条 TTriggerOnCardFired 兄弟能力之间若产生状态/属性变动，在下一条能力前即时重算动态光环
+                    if (eventType == "TTriggerOnCardFired" && i + 1 < localImmediate.Count)
+                        FlushDirtyAurasIfNeeded();
                 }
-                if (ranStatGain)
+                if (ranNonCardFiredImmediate)
                 {
                     RecalculateCombatAuras();
                     ClampSideAmmo(p1);
@@ -1206,7 +1549,9 @@ public static class CombatSimulator
                     if (card.IsDestroyed || card.IsDisabled) continue;
                     if (!ValueAndConditionEvaluator.EvaluatePrerequisites(ab.Prerequisites, abCtx)) continue;
                     var prevAb = activeExec.AbilityId;
+                    var prevTrigSrc = activeExec.TriggerSourceCardInstanceId;
                     activeExec.AbilityId = ab.Id;
+                    activeExec.TriggerSourceCardInstanceId = (sourceCard ?? targetCard)?.InstanceId;
                     try
                     {
                         AbilityExecutor.ExecuteAction(ab.Action, card, abCtx);
@@ -1214,6 +1559,7 @@ public static class CombatSimulator
                     finally
                     {
                         activeExec.AbilityId = prevAb;
+                        activeExec.TriggerSourceCardInstanceId = prevTrigSrc;
                     }
                     SyncEnragedState(p1);
                     SyncEnragedState(p2);
@@ -1234,7 +1580,9 @@ public static class CombatSimulator
                     var (card, ab, abCtx) = localDeferredCounters[i];
                     if (!executeAllImmediate && (card.IsDestroyed || card.IsDisabled)) continue;
                     var prevAb = activeExec.AbilityId;
+                    var prevTrigSrc = activeExec.TriggerSourceCardInstanceId;
                     activeExec.AbilityId = ab.Id;
+                    activeExec.TriggerSourceCardInstanceId = (sourceCard ?? targetCard)?.InstanceId;
                     try
                     {
                         AbilityExecutor.ExecuteAction(ab.Action, card, abCtx);
@@ -1242,6 +1590,7 @@ public static class CombatSimulator
                     finally
                     {
                         activeExec.AbilityId = prevAb;
+                        activeExec.TriggerSourceCardInstanceId = prevTrigSrc;
                     }
                 }
             }
@@ -1250,6 +1599,10 @@ public static class CombatSimulator
         void DispatchEvent(string eventType, PlayerState actorPlayer, CardInstance? sourceCard, CardInstance? targetCard, PlayerState? subjectPlayer, string? attrChanged = null, double prev = 0, double cur = 0)
         {
             if (dispatchDepth >= MaxDispatchDepth) return;
+            bool startedChain = dispatchDepth == 0 && string.IsNullOrEmpty(activeExec.ExecutionContextId);
+            string? prevChainId = activeExec.ExecutionContextId;
+            if (startedChain)
+                activeExec.ExecutionContextId = $"chain_{timeMs}_{++execChainSeq}";
             dispatchDepth++;
             try
             {
@@ -1317,6 +1670,8 @@ public static class CombatSimulator
             finally
             {
                 dispatchDepth--;
+                if (startedChain)
+                    activeExec.ExecutionContextId = prevChainId;
             }
         }
 
@@ -1336,7 +1691,7 @@ public static class CombatSimulator
                     int readyAt = icdReadyTime.GetValueOrDefault(key, 0);
                     if (timeMs < readyAt) continue;
 
-                    readyBatch.Add((key, q.Dequeue()));
+                    readyBatch.Add((key, q.Dequeue(), readyAt));
                     icdReadyTime[key] = timeMs + icdMs;
                 }
 
@@ -1347,8 +1702,13 @@ public static class CombatSimulator
 
                 for (int i = 0; i < readyBatch.Count; i++)
                 {
-                    var item = readyBatch[i].Item;
-                    if ((item.OwnerCard.IsDestroyed || item.OwnerCard.IsDisabled) && !item.AllowWhenDestroyed) continue;
+                    var batchEntry = readyBatch[i];
+                    var item = batchEntry.Item;
+                    if ((item.OwnerCard.IsDestroyed || item.OwnerCard.IsDisabled) && !item.AllowWhenDestroyed)
+                    {
+                        icdReadyTime[batchEntry.Key] = batchEntry.PrevReadyAt;
+                        continue;
+                    }
 
                     var baseCtx = item.Owner == p1 ? p1BaseCtx : p2BaseCtx;
                     baseCtx.TimeMs = timeMs;
@@ -1356,8 +1716,21 @@ public static class CombatSimulator
                     var abCtx = baseCtx.WithCards(item.OwnerCard, item.SourceCard, item.TargetCard);
                     if (sandstormForceStarted)
                         ValueAndConditionEvaluator.SetSandstormActive(abCtx, true);
+                    FlushDirtyAurasIfNeeded();
+                    // 修复 P1-21：出队执行前实时重检 Prerequisites，过滤 250ms 等待期内已失效的触发项并退还 ICD
+                    // （同时放行已在入队门控消费并被同卡 Immediate 兄弟能力推进/清零的自控 Self.Custom_* 限次计数器与 Haste 锁存条件）
+                    if (!EvaluateQueuedPrerequisites(item.OwnerCard, item.Ability.Prerequisites, abCtx))
+                    {
+                        icdReadyTime[batchEntry.Key] = batchEntry.PrevReadyAt;
+                        continue;
+                    }
                     var prevAb = activeExec.AbilityId;
+                    var prevTrigSrc = activeExec.TriggerSourceCardInstanceId;
+                    var prevExecCtxId = activeExec.ExecutionContextId;
                     activeExec.AbilityId = item.Ability.Id;
+                    activeExec.TriggerSourceCardInstanceId = (item.SourceCard ?? item.TargetCard)?.InstanceId;
+                    if (string.IsNullOrEmpty(activeExec.ExecutionContextId))
+                        activeExec.ExecutionContextId = $"chain_{timeMs}_{++execChainSeq}";
                     try
                     {
                         AbilityExecutor.ExecuteAction(item.Ability.Action, item.OwnerCard, abCtx);
@@ -1365,6 +1738,8 @@ public static class CombatSimulator
                     finally
                     {
                         activeExec.AbilityId = prevAb;
+                        activeExec.TriggerSourceCardInstanceId = prevTrigSrc;
+                        activeExec.ExecutionContextId = prevExecCtxId;
                     }
                     SyncEnragedState(p1);
                     SyncEnragedState(p2);
@@ -1377,7 +1752,7 @@ public static class CombatSimulator
 
         void ProcessTimedExpiries()
         {
-            if (timedExpiries.Count == 0) return;
+            if (timedExpiries.Count == 0 && timedTransformExpiries.Count == 0) return;
             bool anyExpired = false;
             for (int i = timedExpiries.Count - 1; i >= 0; i--)
             {
@@ -1388,15 +1763,16 @@ public static class CombatSimulator
 
                 if (exp.Card != null)
                 {
+                    bool hadKeyBefore = exp.Card.HasAnyAttributeKey(exp.Attribute);
                     double prev = exp.Card.GetAttribute(exp.Attribute);
-                    RevertCombatModifier(exp.Card.CombatAdd, exp.Card.CombatMult, exp.Attribute, exp.Operation, exp.Value);
-                    exp.Card.MarkAttributeDirty();
+                    exp.Card.RevertCombatAttributeModifier(exp.Attribute, exp.Operation, exp.Value);
                     double cur = exp.Card.GetAttribute(exp.Attribute);
-                    if (Math.Abs(cur - prev) > 1e-6)
+                    bool keyDeleted = hadKeyBefore && !exp.Card.HasAnyAttributeKey(exp.Attribute);
+                    if (Math.Abs(cur - prev) > 1e-6 || keyDeleted)
                     {
                         var owner = (p1.Hand.Cards.Contains(exp.Card) || p1.Stash.Cards.Contains(exp.Card) || p1.Skills.Contains(exp.Card) || p1.SocketEffects.Contains(exp.Card))
                             ? p1 : p2;
-                        if (recordEvents)
+                        if (recordEvents && Math.Abs(cur - prev) > 1e-6)
                         {
                             Emit(new CombatEvent
                             {
@@ -1410,13 +1786,27 @@ public static class CombatSimulator
                                 ActionType = "TCombatDurationExpired"
                             });
                         }
-                        DispatchEvent("TTriggerOnCardAttributeChanged", owner, exp.Card, exp.Card, owner, exp.Attribute, prev, cur);
+                        if (recordEvents && keyDeleted)
+                        {
+                            Emit(new CombatEvent
+                            {
+                                TimeMs = timeMs,
+                                Type = CombatEventType.CardAttributeDeleted,
+                                SourcePlayerId = owner.PlayerId,
+                                TargetPlayerId = owner.PlayerId,
+                                TargetCardInstanceId = exp.Card.InstanceId,
+                                Detail = exp.Attribute,
+                                ActionType = "TCombatDurationExpired"
+                            });
+                        }
+                        if (Math.Abs(cur - prev) > 1e-6)
+                            DispatchEvent("TTriggerOnCardAttributeChanged", owner, exp.Card, exp.Card, owner, exp.Attribute, prev, cur);
                     }
                 }
                 else if (exp.Player != null)
                 {
                     double prev = exp.Player.GetAttribute(exp.Attribute);
-                    RevertCombatModifier(exp.Player.CombatAdd, exp.Player.CombatMult, exp.Attribute, exp.Operation, exp.Value);
+                    exp.Player.RevertCombatAttributeModifier(exp.Attribute, exp.Operation, exp.Value);
                     if (exp.Attribute.Equals("HealthMax", StringComparison.OrdinalIgnoreCase))
                         exp.Player.CurrentHealth = Math.Min(exp.Player.CurrentHealth, exp.Player.HealthMax);
                     double cur = exp.Player.GetAttribute(exp.Attribute);
@@ -1424,6 +1814,67 @@ public static class CombatSimulator
                         DispatchEvent("TTriggerOnPlayerAttributeChanged", exp.Player, null, null, exp.Player, exp.Attribute, prev, cur);
                 }
             }
+
+            // P1-10：战内限时变形到期还原（移除临时产物、恢复原卡并播报 CardTransformReverted）
+            for (int i = timedTransformExpiries.Count - 1; i >= 0; i--)
+            {
+                var texp = timedTransformExpiries[i];
+                if (timeMs < texp.ExpireTimeMs) continue;
+                timedTransformExpiries.RemoveAt(i);
+                anyExpired = true;
+                triggerIndexDirty = true;
+
+                var owner = texp.Owner;
+                var orig = texp.OriginalCard;
+                var revertedIds = new List<string>(texp.Replacements.Count);
+                for (int r = 0; r < texp.Replacements.Count; r++)
+                {
+                    var rep = texp.Replacements[r];
+                    revertedIds.Add(rep.InstanceId);
+                    rep.IsDestroyed = true;
+                    owner.Hand.Remove(rep);
+                    owner.Stash.Remove(rep);
+                    owner.Skills.Remove(rep);
+                    owner.SocketEffects.Remove(rep);
+                }
+
+                orig.IsDestroyed = false;
+                orig.IsDisabled = false;
+                switch (texp.OriginalSection)
+                {
+                    case "Stash":
+                        if (texp.OriginalSlot < 0 || !owner.Stash.TryPlaceWithDisplaceOrSwap(orig, texp.OriginalSlot))
+                            owner.Stash.TryAddAuto(orig);
+                        break;
+                    case "Skill":
+                        if (!owner.Skills.Contains(orig)) owner.Skills.Add(orig);
+                        break;
+                    case "SocketEffect":
+                        orig.StartSlot = texp.OriginalSlot;
+                        if (!owner.SocketEffects.Contains(orig)) owner.SocketEffects.Add(orig);
+                        break;
+                    default:
+                        if (texp.OriginalSlot < 0 || !owner.Hand.TryPlaceWithDisplaceOrSwap(orig, texp.OriginalSlot))
+                            owner.Hand.TryAddAuto(orig);
+                        break;
+                }
+
+                if (recordEvents)
+                {
+                    Emit(new CombatEvent
+                    {
+                        TimeMs = timeMs,
+                        Type = CombatEventType.CardTransformReverted,
+                        SourcePlayerId = owner.PlayerId,
+                        TargetPlayerId = owner.PlayerId,
+                        TargetCardInstanceId = orig.InstanceId,
+                        Detail = orig.Template.Id,
+                        RevertedTransformedInstanceIds = revertedIds,
+                        ActionType = "TCombatDurationExpired"
+                    });
+                }
+            }
+
             if (anyExpired)
             {
                 RecalculateCombatAuras();
@@ -1436,6 +1887,13 @@ public static class CombatSimulator
         {
             if (card.IsDestroyed || card.IsDisabled) return;
 
+            // P2-10：同一单次施放及其同步派发出的所有动作/联动事件共享同一个 ExecutionContextId
+            string? prevCastExecCtxId = activeExec.ExecutionContextId;
+            if (string.IsNullOrEmpty(activeExec.ExecutionContextId))
+                activeExec.ExecutionContextId = $"chain_{timeMs}_{++execChainSeq}";
+            try
+            {
+            FlushDirtyAurasIfNeeded();
             card.TimesFiredThisFight++;
             if (recordEvents)
             {
@@ -1452,7 +1910,32 @@ public static class CombatSimulator
                     IsSkillSource = card.Template.Type == "Skill"
                 });
             }
-            DispatchEvent("TTriggerOnCardFired", owner, card, card, owner);
+
+            // 修复 P0-05：对齐官方 BazaarCardDealer.cs:1183-1235，同次 TTriggerOnCardFired 内全部可暴击动作共享 1 次暴击 Roll，
+            // 且在整次施放循环结束后仅派发 1 次 TTriggerOnCardCritted（嵌套 ForceUse 独立保存/恢复栈帧）。
+            var prevCastCard = activeExec.CurrentCastCard;
+            var prevInCardFired = activeExec.InCardFiredExecution;
+            var prevCastCritRoll = activeExec.CurrentCastCritRoll;
+            var prevCastDidCrit = activeExec.CurrentCastDidCrit;
+            activeExec.CurrentCastCard = card;
+            activeExec.InCardFiredExecution = false;
+            activeExec.CurrentCastCritRoll = null;
+            activeExec.CurrentCastDidCrit = false;
+            bool thisCastDidCrit = false;
+            try
+            {
+                DispatchEvent("TTriggerOnCardFired", owner, card, card, owner);
+                thisCastDidCrit = activeExec.CurrentCastDidCrit;
+            }
+            finally
+            {
+                activeExec.CurrentCastCard = prevCastCard;
+                activeExec.InCardFiredExecution = prevInCardFired;
+                activeExec.CurrentCastCritRoll = prevCastCritRoll;
+                activeExec.CurrentCastDidCrit = prevCastDidCrit;
+            }
+            if (thisCastDidCrit)
+                DispatchEvent("TTriggerOnCardCritted", owner, card, card, owner);
             DispatchEvent("TTriggerOnItemUsed", owner, card, card, owner);
             if (mechanicRuntime != null)
             {
@@ -1494,6 +1977,11 @@ public static class CombatSimulator
             RecalculateCombatAuras();
             ClampSideAmmo(p1);
             ClampSideAmmo(p2);
+            }
+            finally
+            {
+                activeExec.ExecutionContextId = prevCastExecCtxId;
+            }
         }
 
         void ProcessPendingMulticasts()
@@ -1562,20 +2050,27 @@ public static class CombatSimulator
                     if (beforeFireEv.Cancelled || card.IsDestroyed || card.IsDisabled) return;
                 }
 
+                // 先按激活瞬间（扣弹前）的当前状态采样本轮 Multicast（保障 Shuriken 等 Multicast=CurrentAmmo 卡完整连发），
+                // 随后扣弹并立即刷新 CardAmmo 动态光环，使 ExecuteCardCast 内依赖空弹药/当前弹药的增伤光环读取扣弹后最新值。
+                FlushDirtyAurasIfNeeded();
+                int baseMulticast = Math.Max(1, (int)Math.Round(card.GetAttribute("Multicast")));
+                int bonusMulticast = (mod.BonusMulticastAll > 0 && card.HasActiveCooldown)
+                    ? Math.Min(mod.BonusMulticastAll, mod.MaxBonusMulticastCap)
+                    : 0;
+                int multicast = Math.Clamp(baseMulticast + bonusMulticast, 1, 10);
+
                 int ammoMax = card.EffectiveAmmoMax;
                 if (ammoMax > 0)
                 {
                     if (card.CurrentAmmo <= 0) return;
                     int prevAmmo = card.CurrentAmmo;
                     card.CurrentAmmo = Math.Clamp(card.CurrentAmmo - 1, 0, Math.Max(0, ammoMax));
+                    // 修复 P0-07：扣弹后立即按掩码刷新依赖弹药/空弹药的动态光环，确保当次 ExecuteCardCast 读到最新值
+                    MarkAuraDirty(CombatAuraDependencyMask.CardAmmo);
+                    FlushDirtyAurasIfNeeded();
                     DispatchEvent("TTriggerOnCardAttributeChanged", owner, card, card, owner, "Ammo", prevAmmo, card.CurrentAmmo);
                 }
-
-                int baseMulticast = Math.Max(1, (int)Math.Round(card.GetAttribute("Multicast")));
-                int bonusMulticast = (mod.BonusMulticastAll > 0 && card.HasActiveCooldown)
-                    ? Math.Min(mod.BonusMulticastAll, mod.MaxBonusMulticastCap)
-                    : 0;
-                int multicast = Math.Clamp(baseMulticast + bonusMulticast, 1, 10);
+                FlushDirtyAurasIfNeeded();
 
                 var primaryFiredAb = ResolvePrimaryFiredAbility(card);
 
@@ -1649,10 +2144,37 @@ public static class CombatSimulator
         ProcessIcdQueues();
         CheckEndOfTickDeath();
 
-        // 主循环：20ms 步进
+        void ExecuteSandstormTick()
+        {
+            // P2-44 语义留档：严格对齐官方 BazaarCardDealer.TakeSandstormDamage（bazaarEffectEventContext = null），
+            // 沙暴伤害通过 ApplyDirectDamage 仅触发 Shield/Health 属性变更（OnPlayerAttributeLost），不派发 TTriggerOnPlayerDamaged（如 Flamberge）。
+            double red1 = Math.Clamp(p1.GetAttribute("PercentDamageReduction"), 0, 100);
+            double red2 = Math.Clamp(p2.GetAttribute("PercentDamageReduction"), 0, 100);
+            int sandDmg1 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red1 / 100.0)));
+            int sandDmg2 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red2 / 100.0)));
+            var sandSplit1 = (ShieldAbsorbed: 0, HpDamage: 0);
+            var sandSplit2 = (ShieldAbsorbed: 0, HpDamage: 0);
+            if (RunBeforeDamageHook(p2, p1, null, "Sandstorm", ref sandDmg1) && sandDmg1 > 0)
+                sandSplit1 = ApplyDirectDamage(p1, sandDmg1, bypassShield: false);
+            if (RunBeforeDamageHook(p1, p2, null, "Sandstorm", ref sandDmg2) && sandDmg2 > 0)
+                sandSplit2 = ApplyDirectDamage(p2, sandDmg2, bypassShield: false);
+            FlushDirtyAurasIfNeeded();
+            if (recordEvents)
+                Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.SandstormTick, Value = sandstormNextDmg, ShieldAbsorbed = sandSplit1.ShieldAbsorbed + sandSplit2.ShieldAbsorbed, HpDamage = sandSplit1.HpDamage + sandSplit2.HpDamage });
+
+            // 修复 P1-50（严格对齐官方 BazaarCardDealer.cs:4243-4274 顺序双 if，严禁改为 else）：
+            // 先减间隔至 TickRateFloor(150ms)，触底同跳立即按 AdditiveScalar(+2) 递增伤害，确保 t <= 35,000ms 精确 30 跳 / 累计 450 伤。
+            if (sandstormCurrentRate > gm.Sandstorm.TickRateFloor)
+                sandstormCurrentRate = Math.Max(gm.Sandstorm.TickRateFloor, sandstormCurrentRate - gm.Sandstorm.TickRateDecrement);
+            if (sandstormCurrentRate <= gm.Sandstorm.TickRateFloor)
+                sandstormNextDmg += gm.Sandstorm.AdditiveScalar;
+        }
+
+        // 主循环：50ms 固定步进（1:1 对齐官方 BazaarCardDealer.cs:4061）
         while (p1.IsAlive && p2.IsAlive && timeMs < MaxDurationMs)
         {
             tickCascadeFires = 0;
+            tickImmediateExecs = 0;
             mechanicRuntime?.ResetTickBudget();
             if (tickCardFireCounts.Count > 0) tickCardFireCounts.Clear();
             p1Overkill = 0;
@@ -1671,9 +2193,36 @@ public static class CombatSimulator
             TickEnraged(p1);
             TickEnraged(p2);
 
-            // 1. 推进物品冷却与状态计时
-            AdvanceSideCards(p1, p2, FireCard);
-            AdvanceSideCards(p2, p1, FireCard);
+            // 1. 推进双方物品冷却与状态计时，并将同帧双方就绪物品汇总至统一队列排序结算（P2-47：先按主开火能力 Priority，同优先级由 seed+帧号确定性破平）
+            frameReadyCards.Clear();
+            AdvanceSideCards(p1, p2, sideIndex: 0, frameReadyCards);
+            AdvanceSideCards(p2, p1, sideIndex: 1, frameReadyCards);
+            if (frameReadyCards.Count > 1)
+            {
+                bool p1FirstThisTick = IsP1FirstForTick(seed, timeMs);
+                frameReadyCards.Sort((a, b) =>
+                {
+                    int prioCmp = a.PriorityRank.CompareTo(b.PriorityRank);
+                    if (prioCmp != 0) return prioCmp;
+                    if (a.SideIndex != b.SideIndex)
+                        return p1FirstThisTick ? a.SideIndex.CompareTo(b.SideIndex) : b.SideIndex.CompareTo(a.SideIndex);
+                    int slotCmp = a.Card.StartSlot.CompareTo(b.Card.StartSlot);
+                    return slotCmp != 0 ? slotCmp : string.CompareOrdinal(a.Card.InstanceId, b.Card.InstanceId);
+                });
+            }
+            for (int rIdx = 0; rIdx < frameReadyCards.Count; rIdx++)
+            {
+                var ready = frameReadyCards[rIdx];
+                if (ready.Card.IsDestroyed || ready.Card.IsDisabled) continue;
+                int readyAmmoMax = ready.Card.EffectiveAmmoMax;
+                if (readyAmmoMax > 0 && ready.Card.CurrentAmmo <= 0)
+                {
+                    ready.Card.CooldownProgressMs = 0;
+                    continue;
+                }
+                // P2-47：同帧已读条完毕进入统一队列的卡不因同帧先手冻结被截断第 1 发（冻结仍会阻止后续连发与下一轮冷却）
+                CompleteReadyCooldowns(ready.Owner, ready.Opp, ready.Card, countFirstAsDepth: false, allowIfFrozenThisTick: true);
+            }
 
             // 2. 处理被动 Tempo 节奏获能周期
             TickPassiveTempo(p1, p1AliveAtTickStart, ref p1TempoElapsedMs);
@@ -1682,15 +2231,7 @@ public static class CombatSimulator
             // 3. 处理 ICD 触发队列
             ProcessIcdQueues();
 
-            // 4. Burn (500ms/跳, 有盾伤害减半，后衰减 3% 至少 1 点)
-            if (timeMs >= nextBurnTickMs)
-            {
-                nextBurnTickMs += 500;
-                TickBurn(p1);
-                TickBurn(p2);
-            }
-
-            // 5. Poison (1000ms/跳, 穿盾直接扣血) & Regen (1000ms/跳)
+            // 4. DoT 周期结算（修复 P1-52：严格对齐官方 BazaarCardDealer.cs:4202-4234 顺序 Poison -> Regen -> Burn）
             if (timeMs >= nextPoisonTickMs)
             {
                 nextPoisonTickMs += 1000;
@@ -1703,6 +2244,12 @@ public static class CombatSimulator
                 TickRegen(p1, p1AliveAtTickStart);
                 TickRegen(p2, p2AliveAtTickStart);
             }
+            if (timeMs >= nextBurnTickMs)
+            {
+                nextBurnTickMs += 500;
+                TickBurn(p1);
+                TickBurn(p2);
+            }
 
             // 5b. 突变词条：冰霜荒原（每 PeriodicFreezeIntervalMs 随机冻结双方各 1 件未冻结物品）
             if (timeMs >= nextPeriodicFreezeMs && nextPeriodicFreezeMs != int.MaxValue)
@@ -1712,7 +2259,7 @@ public static class CombatSimulator
                 ApplyPeriodicEnvironmentalFreeze(p2);
             }
 
-            // 6. Sandstorm（严格对齐官方 BazaarCardDealer.cs:4243-4274：先按 TickRateDecrement 递减至 TickRateFloor，触底后再每跳 +AdditiveScalar）
+            // 6. Sandstorm（修复 P1-50：严格对齐官方 BazaarCardDealer.cs:4235-4274 sandstormElapsedMs += 50 累加器，启动帧首跳后同帧累加 50ms）
             if (effectiveSandstormEnabled || sandstormForceStarted)
             {
                 if (!sandstormWarned && !sandstormForceStarted && timeMs >= sandstormWarnMs)
@@ -1724,36 +2271,28 @@ public static class CombatSimulator
                 if (!sandstormActive && timeMs >= sandstormStartMs)
                 {
                     sandstormActive = true;
-                    sandstormNextTickMs = timeMs;
-                    // 自然启动瞬间仅派发一次 TTriggerOnSandstorm，并在首跳沙暴伤害前先结算对应被动/光环
-                    DispatchEvent("TTriggerOnSandstorm", p1, null, null, p1);
+                    sandstormElapsedMs = 0;
+                    // P2-44：自然启动瞬间仅派发一次 TTriggerOnSandstorm（subjectPlayer 规范为 null 避免对 P2 误传 p1），并在首跳沙暴伤害前先结算对应被动/光环
+                    DispatchEvent("TTriggerOnSandstorm", p1, null, null, null);
                     ProcessIcdQueues();
+                    ExecuteSandstormTick();
+                    sandstormElapsedMs += TickMs;
                 }
-                if (sandstormActive && timeMs >= sandstormNextTickMs)
+                else if (sandstormPendingImmediateTick)
                 {
-                    double red1 = Math.Clamp(p1.GetAttribute("PercentDamageReduction"), 0, 100);
-                    double red2 = Math.Clamp(p2.GetAttribute("PercentDamageReduction"), 0, 100);
-                    int sandDmg1 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red1 / 100.0)));
-                    int sandDmg2 = Math.Max(0, (int)Math.Round(sandstormNextDmg * (1.0 - red2 / 100.0)));
-                    if (RunBeforeDamageHook(p2, p1, null, "Sandstorm", ref sandDmg1) && sandDmg1 > 0)
-                        ApplyDirectDamage(p1, sandDmg1, bypassShield: false);
-                    if (RunBeforeDamageHook(p1, p2, null, "Sandstorm", ref sandDmg2) && sandDmg2 > 0)
-                        ApplyDirectDamage(p2, sandDmg2, bypassShield: false);
-                    if (recordEvents)
-                        Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.SandstormTick, Value = sandstormNextDmg });
-
-                    bool hadReachedFloor = sandstormCurrentRate <= gm.Sandstorm.TickRateFloor;
-                    if (sandstormCurrentRate > gm.Sandstorm.TickRateFloor)
+                    sandstormPendingImmediateTick = false;
+                    sandstormElapsedMs = 0;
+                    ExecuteSandstormTick();
+                    sandstormElapsedMs += TickMs;
+                }
+                else if (sandstormActive)
+                {
+                    sandstormElapsedMs += TickMs;
+                    if (sandstormElapsedMs >= sandstormCurrentRate)
                     {
-                        sandstormCurrentRate = Math.Max(gm.Sandstorm.TickRateFloor, sandstormCurrentRate - gm.Sandstorm.TickRateDecrement);
-                        if (sandstormCurrentRate <= gm.Sandstorm.TickRateFloor)
-                            sandstormNextDmg += gm.Sandstorm.AdditiveScalar;
+                        ExecuteSandstormTick();
+                        sandstormElapsedMs = 0;
                     }
-                    else if (hadReachedFloor)
-                    {
-                        sandstormNextDmg += gm.Sandstorm.AdditiveScalar;
-                    }
-                    sandstormNextTickMs += Math.Max(TickMs, sandstormCurrentRate);
                 }
             }
 
@@ -1768,7 +2307,7 @@ public static class CombatSimulator
                     || (timeMs + TickMs) > nextSnapshotWindowEndMs;
                 if (shouldCapture)
                 {
-                    timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache, p1Overkill, p2Overkill));
+                    timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache, p1Overkill, p2Overkill, effectiveMinCooldownFloorMs));
                     while (nextSnapshotWindowEndMs <= timeMs + TickMs)
                         nextSnapshotWindowEndMs += effectiveSampleInterval;
                 }
@@ -1784,7 +2323,9 @@ public static class CombatSimulator
             CheckEndOfTickDeath();
         }
 
-        // 决定胜负
+        // 决定胜负（P1-55：精准记录同帧双杀 IsSimultaneousDeath 与超时双存 IsTimeout，保持官方异步规则双赢语义）
+        bool isSimultaneousDeath = !p1.IsAlive && !p2.IsAlive;
+        bool isTimeout = p1.IsAlive && p2.IsAlive;
         bool p1Won;
         bool isDraw = false;
         if (!p2.IsAlive)
@@ -1803,7 +2344,7 @@ public static class CombatSimulator
         }
 
         if (recordTimeline)
-            timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache, p1Overkill, p2Overkill));
+            timeline.Add(CaptureSnapshot(timeMs, p1, p2, sandstormActive, sandstormNextDmg, gm.StandardPrices, snapshotAttrCache, p1Overkill, p2Overkill, effectiveMinCooldownFloorMs));
 
         if (recordEvents)
         {
@@ -1822,7 +2363,11 @@ public static class CombatSimulator
         {
             WinnerPlayerId = p1Won ? p1.PlayerId : p2.PlayerId,
             LoserPlayerId = p1Won ? p2.PlayerId : p1.PlayerId,
+            Player1Hero = p1.Hero,
+            Player2Hero = p2.Hero,
             IsDraw = isDraw,
+            IsSimultaneousDeath = isSimultaneousDeath,
+            IsTimeout = isTimeout,
             DurationMs = timeMs,
             Player1RemainingHp = p1.CurrentHealth,
             Player2RemainingHp = p2.CurrentHealth,
@@ -1832,6 +2377,7 @@ public static class CombatSimulator
             Player2TotalShieldGained = p2ShieldTotal,
             Events = events,
             Timeline = timeline,
+            TemporaryTransforms = temporaryTransforms,
             PostCombatOps = mechanicRuntime != null ? mechanicRuntime.PostCombatOps : new List<PostCombatMutationOp>(),
             MechanicDiagnostics = mechanicRuntime != null ? mechanicRuntime.Diagnostics : new List<MechanicDiagnostic>(),
             MechanicCircuitBreakerTrips = mechanicRuntime?.TrippedCircuitBreakersCount ?? 0,
@@ -1851,7 +2397,11 @@ public static class CombatSimulator
 
         return result;
 
-        void AdvanceSideCards(PlayerState owner, PlayerState opp, Action<PlayerState, PlayerState, CardInstance, bool> onReady)
+        void AdvanceSideCards(
+            PlayerState owner,
+            PlayerState opp,
+            int sideIndex,
+            List<(PlayerState Owner, PlayerState Opp, CardInstance Card, int PriorityRank, int SideIndex)> readySink)
         {
             if (owner.Hand.Cards.Count == 0) return;
 
@@ -1870,19 +2420,40 @@ public static class CombatSimulator
             for (int i = 0; i < handSnapshot.Count; i++)
             {
                 var card = handSnapshot[i];
-                if (card.IsDestroyed || card.IsDisabled || !card.HasActiveCooldown) continue;
+                if (card.IsDestroyed || card.IsDisabled) continue;
 
-                int ammoMax = card.EffectiveAmmoMax;
-                bool outOfAmmo = ammoMax > 0 && card.CurrentAmmo <= 0;
-
-                // 对齐 BazaarCardDealer.cs:4110-4151 & 4401-4406：Freeze/Haste/Slow 三计时器每帧独立递减，再检查冻结与缺弹阻断
+                // 修复 P1-53（对齐 BazaarCardDealer.cs:4110-4152 & 4401-4406）：
+                // 先对所有存活在场卡独立递减 Freeze/Haste/Slow 三计时器，再跳过无有效冷却的被动/禁用冷却卡
                 bool hasted = card.HasteMs > 0;
                 bool slowed = card.SlowMs > 0;
                 bool frozen = card.FreezeMs > 0;
 
-                if (card.HasteMs > 0) card.HasteMs = Math.Max(0, card.HasteMs - TickMs);
-                if (card.SlowMs > 0) card.SlowMs = Math.Max(0, card.SlowMs - TickMs);
-                if (card.FreezeMs > 0) card.FreezeMs = Math.Max(0, card.FreezeMs - TickMs);
+                bool statusExpired = false;
+                if (card.HasteMs > 0)
+                {
+                    card.HasteMs = Math.Max(0, card.HasteMs - TickMs);
+                    if (card.HasteMs == 0) statusExpired = true;
+                }
+                if (card.SlowMs > 0)
+                {
+                    card.SlowMs = Math.Max(0, card.SlowMs - TickMs);
+                    if (card.SlowMs == 0) statusExpired = true;
+                }
+                if (card.FreezeMs > 0)
+                {
+                    card.FreezeMs = Math.Max(0, card.FreezeMs - TickMs);
+                    if (card.FreezeMs == 0) statusExpired = true;
+                }
+                if (statusExpired)
+                {
+                    MarkAuraDirty(CombatAuraDependencyMask.CardStatus);
+                    FlushDirtyAurasIfNeeded();
+                }
+
+                if (!card.HasActiveCooldown) continue;
+
+                int ammoMax = card.EffectiveAmmoMax;
+                bool outOfAmmo = ammoMax > 0 && card.CurrentAmmo <= 0;
 
                 if (frozen)
                 {
@@ -1902,7 +2473,8 @@ public static class CombatSimulator
 
                 int cdMax = GetEffectiveCardCooldownMaxMs(card, owner);
                 double rawStep = TickMs * speed;
-                double minCycleCapStep = TickMs * (cdMax / 1000.0);
+                // 修复 P1-56：单帧推进上限与 MinCooldownFloorMs（200..1000ms）动态对齐，避免 TurboFrenzy(500ms) 被硬编码 1000ms 腰斩
+                double minCycleCapStep = TickMs * (cdMax / (double)effectiveMinCooldownFloorMs);
                 card.CooldownProgressMs += Math.Max(1, (int)Math.Round(Math.Min(rawStep, minCycleCapStep)));
                 if (lastCooldownFireMs.TryGetValue(card, out int prevCdMs) && timeMs - prevCdMs < icdMs)
                 {
@@ -1910,7 +2482,8 @@ public static class CombatSimulator
                     continue;
                 }
                 if (card.CooldownProgressMs < cdMax) continue;
-                CompleteReadyCooldowns(owner, opp, card, countFirstAsDepth: false);
+                int prioRank = GetAbilityPriorityRank(ResolvePrimaryFiredAbility(card)?.Priority);
+                readySink.Add((owner, opp, card, prioRank, sideIndex));
             }
         }
 
@@ -1933,7 +2506,7 @@ public static class CombatSimulator
         {
             if (p.EnragedRemainingMs <= 0)
             {
-                if (p.Attributes.GetValueOrDefault("Enraged", 0) != 0)
+                if (p.CombatAdd.ContainsKey("Enraged") || p.CombatAdd.ContainsKey("EnragedDuration"))
                     SyncEnragedState(p);
                 return;
             }
@@ -1957,18 +2530,22 @@ public static class CombatSimulator
             int dmg = Math.Max(1, target.Burn - mitigation);
             if (RunBeforeDamageHook(attacker, target, null, "Burn", ref dmg) && dmg > 0)
             {
-                ApplyDirectDamage(target, dmg, bypassShield: false);
+                var burnSplit = ApplyDirectDamage(target, dmg, bypassShield: false);
                 if (target == p2) p1DmgTotal += dmg; else p2DmgTotal += dmg;
 
                 if (recordEvents)
-                    Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.BurnTick, TargetPlayerId = target.PlayerId, Value = dmg });
+                    Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.BurnTick, TargetPlayerId = target.PlayerId, Value = dmg, ShieldAbsorbed = burnSplit.ShieldAbsorbed, HpDamage = burnSplit.HpDamage });
             }
 
             int prevBurn = target.Burn;
             int decay = Math.Max(1, (int)Math.Floor(target.Burn * (gm.BurnDecrementByAsPercentage / 100.0)));
             target.Burn = Math.Max(0, target.Burn - decay);
             if (target.Burn != prevBurn)
+            {
+                MarkAuraDirty(CombatAuraDependencyMask.Burn);
+                FlushDirtyAurasIfNeeded();
                 DispatchEvent("TTriggerOnPlayerAttributeChanged", target, null, null, target, "Burn", prevBurn, target.Burn);
+            }
         }
 
         void TickPoison(PlayerState target)
@@ -1977,10 +2554,11 @@ public static class CombatSimulator
             var attacker = target == p1 ? p2 : p1;
             int dmg = target.Poison;
             if (!RunBeforeDamageHook(attacker, target, null, "Poison", ref dmg) || dmg <= 0) return;
-            ApplyDirectDamage(target, dmg, bypassShield: true);
+            var poisonSplit = ApplyDirectDamage(target, dmg, bypassShield: true);
             if (target == p2) p1DmgTotal += dmg; else p2DmgTotal += dmg;
             if (recordEvents)
-                Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.PoisonTick, TargetPlayerId = target.PlayerId, Value = dmg });
+                Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.PoisonTick, TargetPlayerId = target.PlayerId, Value = dmg, ShieldAbsorbed = poisonSplit.ShieldAbsorbed, HpDamage = poisonSplit.HpDamage });
+            FlushDirtyAurasIfNeeded();
         }
 
         void TickRegen(PlayerState target, bool wasAliveAtTickStart)
@@ -1988,34 +2566,15 @@ public static class CombatSimulator
             int regen = (int)Math.Round(target.GetAttribute("HealthRegen"));
             if (regen <= 0 || !wasAliveAtTickStart) return;
             int prevHp = target.CurrentHealth;
-            ApplyHealthGain(target, regen);
+            int effectiveRestored = ApplyHealthGain(target, regen);
             if (target.CurrentHealth != prevHp)
+            {
+                MarkAuraDirty(CombatAuraDependencyMask.Health);
+                FlushDirtyAurasIfNeeded();
                 DispatchEvent("TTriggerOnPlayerAttributeChanged", target, null, null, target, "Health", prevHp, target.CurrentHealth);
+            }
             if (recordEvents)
-                Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.RegenTick, TargetPlayerId = target.PlayerId, Value = regen });
-        }
-
-        static bool HasTempoSystemCards(PlayerState side)
-        {
-            foreach (var c in side.Hand.Cards)
-            {
-                if (c.IsDestroyed || c.IsDisabled) continue;
-                if (c.Template.HiddenTags.Contains("Tempo") ||
-                    c.Template.HiddenTags.Contains("TempoReference") ||
-                    c.GetAttribute("TempoCost") > 0 ||
-                    (c.Template.Attributes != null && c.Template.Attributes.GetValueOrDefault("TempoCost", 0) > 0))
-                    return true;
-            }
-            foreach (var s in side.Skills)
-            {
-                if (s.IsDestroyed || s.IsDisabled) continue;
-                if (s.Template.HiddenTags.Contains("Tempo") ||
-                    s.Template.HiddenTags.Contains("TempoReference") ||
-                    s.GetAttribute("TempoCost") > 0 ||
-                    (s.Template.Attributes != null && s.Template.Attributes.GetValueOrDefault("TempoCost", 0) > 0))
-                    return true;
-            }
-            return false;
+                Emit(new CombatEvent { TimeMs = timeMs, Type = CombatEventType.RegenTick, TargetPlayerId = target.PlayerId, Value = regen, EffectiveHpRestored = effectiveRestored });
         }
 
         static int GetEffectiveTempoGainIntervalMs(PlayerState side)
@@ -2033,20 +2592,35 @@ public static class CombatSimulator
 
         void TickPassiveTempo(PlayerState side, bool wasAliveAtTickStart, ref int elapsedMs)
         {
-            if (!wasAliveAtTickStart || !side.IsAlive || !HasTempoSystemCards(side))
+            if (!wasAliveAtTickStart || !side.IsAlive)
+            {
+                elapsedMs = 0;
+                return;
+            }
+            // P2-46：优先由注入的 Base Tempo Gain Cooldown Effect 光环数据驱动抑制（无 Tempo 卡时 FlatTempoGainCooldownReduction -= 1e15 -> int.MaxValue）；
+            // 仅在无该系统卡的轻量合成环境下回退 HasTempoSystemCards 判定。
+            if (!HasBaseTempoPlayerEffect(side) && !HasTempoSystemCards(side))
             {
                 elapsedMs = 0;
                 return;
             }
             int intervalMs = GetEffectiveTempoGainIntervalMs(side);
-            if (intervalMs == int.MaxValue) return;
+            if (intervalMs == int.MaxValue)
+            {
+                elapsedMs = 0;
+                return;
+            }
             elapsedMs += TickMs;
             if (elapsedMs < intervalMs) return;
             elapsedMs -= intervalMs;
             int prevTempo = side.Tempo;
             side.ModifyAttribute("Tempo", "Add", 1);
             if (side.Tempo != prevTempo)
+            {
+                MarkAuraDirty(CombatAuraDependencyMask.Tempo);
+                FlushDirtyAurasIfNeeded();
                 DispatchEvent("TTriggerOnPlayerAttributeChanged", side, null, null, side, "Tempo", prevTempo, side.Tempo);
+            }
         }
     }
 
@@ -2411,14 +2985,14 @@ public static class CombatSimulator
             }
         }
 
-        // 3. 同步 P1 永久玩家属性增量（Gold, Income, HealthMax, Experience 等）
+        // 3. 同步 P1 永久玩家属性增量（修复 P0-03：改为显式跨战持久化属性白名单，防止临时 Regen 与战末 Enraged/EnragedDuration 泄漏）
         var baselineAttrs = simP1.CombatSourcePlayerAttributes ?? originalP1.Attributes;
         var playerAttrKeys = new HashSet<string>(simP1.Attributes.Keys, StringComparer.OrdinalIgnoreCase);
         foreach (var k in baselineAttrs.Keys) playerAttrKeys.Add(k);
 
         foreach (var k in playerAttrKeys)
         {
-            if (k.Equals("Health", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!IsCrossCombatPersistentPlayerAttribute(k)) continue;
             double simVal = simP1.Attributes.GetValueOrDefault(k, 0);
             double baseVal = baselineAttrs.GetValueOrDefault(k, 0);
             double diff = simVal - baseVal;
@@ -2500,47 +3074,138 @@ public static class CombatSimulator
         }
     }
 
-    private static void RevertCombatModifier(
-        Dictionary<string, double> addDict,
-        Dictionary<string, double> multDict,
-        string attr,
-        string operation,
-        double value)
+    /// <summary>
+    /// 跨战允许回写至局外 PlayerState.Attributes 的显式持久属性白名单（修复 P0-03）：
+    /// 临时 HealthRegen 已隔离于 CombatAdd，此处仅在明确 Duration==null 写入 simP1.Attributes 时才产生 HealthRegen 永久差量；
+    /// Enraged / EnragedDuration 等战内瞬态属性被彻底拒之门外。
+    /// </summary>
+    private static bool IsCrossCombatPersistentPlayerAttribute(string key)
+        => key.Equals("Gold", StringComparison.OrdinalIgnoreCase)
+        || key.Equals("Income", StringComparison.OrdinalIgnoreCase)
+        || key.Equals("HealthMax", StringComparison.OrdinalIgnoreCase)
+        || key.Equals("Experience", StringComparison.OrdinalIgnoreCase)
+        || key.Equals("Prestige", StringComparison.OrdinalIgnoreCase)
+        || key.Equals("HealthRegen", StringComparison.OrdinalIgnoreCase)
+        || key.StartsWith("Custom_", StringComparison.OrdinalIgnoreCase);
+
+    private static CombatAuraDependencyMask MapAttributeToDependencyMask(string? attr)
     {
-        switch (operation)
+        if (string.IsNullOrEmpty(attr)) return CombatAuraDependencyMask.None;
+        if (attr.Equals("Health", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("HealthMax", StringComparison.OrdinalIgnoreCase))
+            return CombatAuraDependencyMask.Health;
+        if (attr.Equals("Shield", StringComparison.OrdinalIgnoreCase))
+            return CombatAuraDependencyMask.Shield;
+        if (attr.Equals("Burn", StringComparison.OrdinalIgnoreCase))
+            return CombatAuraDependencyMask.Burn;
+        if (attr.Equals("Poison", StringComparison.OrdinalIgnoreCase))
+            return CombatAuraDependencyMask.Poison;
+        if (attr.Equals("HealthRegen", StringComparison.OrdinalIgnoreCase))
+            return CombatAuraDependencyMask.Regen;
+        if (attr.Equals("Tempo", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("Rage", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("Enraged", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("EnragedDuration", StringComparison.OrdinalIgnoreCase))
+            return CombatAuraDependencyMask.Tempo;
+        if (attr.Equals("Haste", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("Slow", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("Freeze", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("Flying", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("Heated", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("Chilled", StringComparison.OrdinalIgnoreCase))
+            return CombatAuraDependencyMask.CardStatus;
+        if (attr.Equals("Ammo", StringComparison.OrdinalIgnoreCase)
+            || attr.Equals("AmmoMax", StringComparison.OrdinalIgnoreCase))
+            return CombatAuraDependencyMask.CardAmmo;
+        return CombatAuraDependencyMask.None;
+    }
+
+    private static CombatAuraDependencyMask ScanSideAuraDependencies(PlayerState side)
+        => ScanAuraListDependencies(side.Hand.Cards)
+         | ScanAuraListDependencies(side.Skills)
+         | ScanAuraListDependencies(side.SocketEffects)
+         | ScanAuraListDependencies(side.PlayerEffects)
+         | ScanAuraListDependencies(side.Stash.Cards);
+
+    private static CombatAuraDependencyMask ScanAuraListDependencies(List<CardInstance> cards)
+    {
+        CombatAuraDependencyMask mask = CombatAuraDependencyMask.None;
+        for (int i = 0; i < cards.Count; i++)
         {
-            case "Subtract":
+            var c = cards[i];
+            if (c.IsDestroyed || c.IsDisabled || c.ActiveAuras.Count == 0) continue;
+            for (int j = 0; j < c.ActiveAuras.Count; j++)
             {
-                double next = addDict.GetValueOrDefault(attr, 0) + value;
-                if (Math.Abs(next) < 1e-9) addDict.Remove(attr);
-                else addDict[attr] = next;
-                break;
-            }
-            case "Multiply":
-            {
-                if (Math.Abs(value) > 1e-9)
+                var aura = c.ActiveAuras[j];
+                if (string.Equals(aura.WorksIn, "OutOfCombatOnly", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (aura.Prerequisites != null)
                 {
-                    double next = multDict.GetValueOrDefault(attr, 1.0) / value;
-                    if (Math.Abs(next - 1.0) < 1e-9) multDict.Remove(attr);
-                    else multDict[attr] = next;
+                    for (int k = 0; k < aura.Prerequisites.Count; k++)
+                        mask |= ScanAuraNodeDependencies(aura.Prerequisites[k], 0);
                 }
-                break;
-            }
-            case "AdditiveMultiply":
-            {
-                double next = multDict.GetValueOrDefault(attr, 1.0) - value;
-                if (Math.Abs(next - 1.0) < 1e-9) multDict.Remove(attr);
-                else multDict[attr] = next;
-                break;
-            }
-            default: // Add
-            {
-                double next = addDict.GetValueOrDefault(attr, 0) - value;
-                if (Math.Abs(next) < 1e-9) addDict.Remove(attr);
-                else addDict[attr] = next;
-                break;
+                var act = aura.Action;
+                if (act != null)
+                {
+                    // 仅扫描光环动作的输入依赖（Target/Source/Value/Conditions），避免把被写入的目标属性误标为输入依赖
+                    mask |= ScanAuraNodeDependencies(act.Target, 0);
+                    mask |= ScanAuraNodeDependencies(act.TargetPlayer, 0);
+                    mask |= ScanAuraNodeDependencies(act.Source, 0);
+                    mask |= ScanAuraNodeDependencies(act.ReferenceValue, 0);
+                    mask |= ScanAuraNodeDependencies(act.GetValueNode(GameDatabaseLoader.JsonOptions), 0);
+                    mask |= ScanAuraNodeDependencies(act.GetSingleCondition(GameDatabaseLoader.JsonOptions), 0);
+                    foreach (var cond in act.GetConditionList(GameDatabaseLoader.JsonOptions))
+                        mask |= ScanAuraNodeDependencies(cond, 0);
+                }
             }
         }
+        return mask;
+    }
+
+    private static CombatAuraDependencyMask ScanAuraNodeDependencies(RuleNode? node, int depth)
+    {
+        if (node == null || depth > 12) return CombatAuraDependencyMask.None;
+        CombatAuraDependencyMask mask = CombatAuraDependencyMask.None;
+
+        mask |= MapAttributeToDependencyMask(node.AttributeType);
+        mask |= MapAttributeToDependencyMask(node.Attribute);
+        mask |= MapAttributeToDependencyMask(node.AttributeOther);
+        mask |= MapAttributeToDependencyMask(node.PlayerAttributeType);
+        mask |= MapAttributeToDependencyMask(node.AttributeChanged);
+
+        if (node.Type is "TCardConditionalTag" or "TCardConditionalHiddenTag")
+        {
+            if (node.Tags != null && node.Tags.Contains("Flying", StringComparer.OrdinalIgnoreCase))
+                mask |= CombatAuraDependencyMask.CardStatus;
+            if (node.HiddenTags != null && node.HiddenTags.Contains("Flying", StringComparer.OrdinalIgnoreCase))
+                mask |= CombatAuraDependencyMask.CardStatus;
+        }
+
+        mask |= ScanAuraNodeDependencies(node.Target, depth + 1);
+        mask |= ScanAuraNodeDependencies(node.TargetPlayer, depth + 1);
+        mask |= ScanAuraNodeDependencies(node.TargetCount, depth + 1);
+        mask |= ScanAuraNodeDependencies(node.Source, depth + 1);
+        mask |= ScanAuraNodeDependencies(node.Subject, depth + 1);
+        mask |= ScanAuraNodeDependencies(node.SubjectOther, depth + 1);
+        mask |= ScanAuraNodeDependencies(node.ReferenceValue, depth + 1);
+        mask |= ScanAuraNodeDependencies(node.GetValueNode(GameDatabaseLoader.JsonOptions), depth + 1);
+        mask |= ScanAuraNodeDependencies(node.GetComparisonValueNode(GameDatabaseLoader.JsonOptions), depth + 1);
+        if (node.Modifier?.Value != null)
+            mask |= ScanAuraNodeDependencies(node.Modifier.Value, depth + 1);
+        mask |= ScanAuraNodeDependencies(node.GetSingleCondition(GameDatabaseLoader.JsonOptions), depth + 1);
+        foreach (var sub in node.GetConditionList(GameDatabaseLoader.JsonOptions))
+            mask |= ScanAuraNodeDependencies(sub, depth + 1);
+        if (node.Actions != null)
+        {
+            for (int i = 0; i < node.Actions.Count; i++)
+                mask |= ScanAuraNodeDependencies(node.Actions[i], depth + 1);
+        }
+        if (node.Prerequisites != null)
+        {
+            for (int i = 0; i < node.Prerequisites.Count; i++)
+                mask |= ScanAuraNodeDependencies(node.Prerequisites[i], depth + 1);
+        }
+        return mask;
     }
 
     private static bool IsCardFlying(CardInstance card)
@@ -2613,10 +3278,48 @@ public static class CombatSimulator
             }
         }
 
+        void IndexStashList(List<CardInstance> stashCards)
+        {
+            // 修复 P1-20：为 Stash 中带有 HandAndStash / StashOnly 且非 OutOfCombatOnly 的被动触发建立独立战斗索引
+            // （严格排除 TTriggerOnCardFired，且绝不动 AuraEngine 战中跳过背包位置光环的隔离边界）
+            for (int c = 0; c < stashCards.Count; c++)
+            {
+                var card = stashCards[c];
+                for (int a = 0; a < card.ActiveAbilities.Count; a++)
+                {
+                    var ab = card.ActiveAbilities[a];
+                    if (ab.Trigger == null) continue;
+                    if (string.Equals(ab.WorksIn, "OutOfCombatOnly", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!string.Equals(ab.ActiveIn, "HandAndStash", StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(ab.ActiveIn, "StashOnly", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    seenTypes.Clear();
+                    CollectTriggerTypes(ab.Trigger, seenTypes);
+                    foreach (var triggerType in seenTypes)
+                    {
+                        if (string.Equals(triggerType, "TTriggerOnCardFired", StringComparison.Ordinal))
+                            continue;
+                        if (RuleExecutionContext.HasUnknownRuleTypeObserver && !AbilityExecutor.IsKnownTriggerType(triggerType))
+                            RuleExecutionContext.NotifyUnknownRuleType(null, "TTrigger", triggerType);
+                        if (!index.TryGetValue(triggerType, out var list))
+                        {
+                            list = new List<IndexedAbility>(4);
+                            index[triggerType] = list;
+                        }
+                        list.Add(new IndexedAbility(card, ab, a));
+                    }
+                }
+            }
+        }
+
         IndexList(owner.Hand.Cards);
         IndexList(owner.Skills);
         IndexList(owner.SocketEffects);
         IndexList(owner.PlayerEffects);
+        IndexStashList(owner.Stash.Cards);
 
         foreach (var list in index.Values)
         {
@@ -2649,17 +3352,54 @@ public static class CombatSimulator
         _ => 3
     };
 
+    private const string BaseTempoGainCooldownEffectId = "e8478722-1851-4b05-9749-1480352ff710";
+
+    /// <summary>
+    /// P2-47：基于本局随机种子与当前帧号生成确定性破平位，消除同步 PvP 同帧就绪时固定 P1 先手的系统偏置。
+    /// </summary>
+    internal static bool IsP1FirstForTick(int combatSeed, int tickTimeMs)
+    {
+        uint h = unchecked((uint)combatSeed * 2654435761u ^ (uint)(tickTimeMs / TickMs) * 2246822519u);
+        h ^= h >> 16;
+        h = unchecked(h * 0x7feb352du);
+        h ^= h >> 15;
+        h = unchecked(h * 0x846ca68bu);
+        h ^= h >> 16;
+        return (h & 1u) == 0u;
+    }
+
+    private static bool HasBaseTempoPlayerEffect(PlayerState side)
+    {
+        for (int i = 0; i < side.PlayerEffects.Count; i++)
+        {
+            if (string.Equals(side.PlayerEffects[i].Template.Id, BaseTempoGainCooldownEffectId, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     private static void EnsureCombatBasePlayerEffect(GameDataRepository repo, PlayerState side)
     {
         const string BaseRageEffectId = "4472da8a-26a3-4e10-bd9a-e93c2e22f19c";
-        if (side.Skills.Any(s => string.Equals(s.Template.Id, BaseRageEffectId, StringComparison.OrdinalIgnoreCase))
-            || side.PlayerEffects.Any(pe => string.Equals(pe.Template.Id, BaseRageEffectId, StringComparison.OrdinalIgnoreCase)))
+        const string EnragePortraitUpdateId = "d2ba43c2-0ba9-4299-b737-7594caa507ea";
+
+        static void EnsurePlayerEffect(GameDataRepository r, PlayerState s, string effectId)
         {
-            return;
+            if (s.Skills.Any(sk => string.Equals(sk.Template.Id, effectId, StringComparison.OrdinalIgnoreCase))
+                || s.PlayerEffects.Any(pe => string.Equals(pe.Template.Id, effectId, StringComparison.OrdinalIgnoreCase)))
+            {
+                return;
+            }
+            var tpl = r.GetCard(effectId);
+            if (tpl != null)
+                s.PlayerEffects.Add(new CardInstance(tpl, instanceId: $"sys_pe_{s.PlayerId}_{effectId}"));
         }
-        var baseRageTpl = repo.GetCard(BaseRageEffectId);
-        if (baseRageTpl != null)
-            side.PlayerEffects.Add(new CardInstance(baseRageTpl));
+
+        EnsurePlayerEffect(repo, side, BaseRageEffectId);
+        // P0-11：自动挂载官方 Enrage portrait update（TTriggerOnPlayerEnraged -> PortraitNext / EnrageEnded -> PortraitReset）
+        EnsurePlayerEffect(repo, side, EnragePortraitUpdateId);
+        // P2-46：自动挂载官方 Base Tempo Gain Cooldown Effect，由 AuraEngine 数据驱动无 Tempo 卡时的被动获能抑制
+        EnsurePlayerEffect(repo, side, BaseTempoGainCooldownEffectId);
     }
 
     private static bool HasHasteLatchClearAbility(CardInstance card)
@@ -2750,6 +3490,62 @@ public static class CombatSimulator
             || attr.StartsWith("Custom_", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool EvaluateQueuedPrerequisites(CardInstance card, List<RuleNode>? prerequisites, RuleExecutionContext ctx)
+    {
+        if (prerequisites == null || prerequisites.Count == 0) return true;
+        for (int i = 0; i < prerequisites.Count; i++)
+        {
+            var prereq = prerequisites[i];
+            if (ShouldSkipQueuedSelfCustomPrereq(card, prereq))
+                continue;
+            if (!ValueAndConditionEvaluator.EvaluatePrerequisite(prereq, ctx))
+                return false;
+        }
+        return true;
+    }
+
+    private static bool ShouldSkipQueuedSelfCustomPrereq(CardInstance card, RuleNode prereq)
+    {
+        if (!TryExtractSingleSelfCustomAttr(prereq, out var customAttr))
+            return false;
+        return CardHasImmediateSelfCustomModifier(card, customAttr);
+    }
+
+    private static bool TryExtractSingleSelfCustomAttr(RuleNode node, out string customAttr)
+    {
+        customAttr = string.Empty;
+        if (!string.Equals(node.Type, "TPrerequisiteCardCount", StringComparison.Ordinal))
+            return false;
+        if (node.Subject == null || !string.Equals(node.Subject.Type, "TTargetCardSelf", StringComparison.Ordinal))
+            return false;
+        var cond = node.Subject.GetSingleCondition(GameDatabaseLoader.JsonOptions);
+        if (cond == null || !string.Equals(cond.Type, "TCardConditionalAttribute", StringComparison.Ordinal))
+            return false;
+        if (string.IsNullOrEmpty(cond.Attribute) || !cond.Attribute.StartsWith("Custom_", StringComparison.OrdinalIgnoreCase))
+            return false;
+        customAttr = cond.Attribute;
+        return true;
+    }
+
+    private static bool CardHasImmediateSelfCustomModifier(CardInstance card, string customAttr)
+    {
+        for (int i = 0; i < card.ActiveAbilities.Count; i++)
+        {
+            var ab = card.ActiveAbilities[i];
+            var act = ab.Action;
+            if (act == null) continue;
+            if (!string.Equals(act.Type, "TActionCardModifyAttribute", StringComparison.Ordinal)) continue;
+            if (!string.Equals(act.Target?.Type, "TTargetCardSelf", StringComparison.Ordinal)) continue;
+            if (!string.Equals(act.AttributeType, customAttr, StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.Equals(ab.Priority, "Immediate", StringComparison.OrdinalIgnoreCase)
+                || (ab.InternalName != null && ab.InternalName.Contains("Counter", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static bool IsSelfCounterIncrementAbility(AbilityDefinition ab)
         => ab.Action != null
         && string.Equals(ab.Action.Type, "TActionCardModifyAttribute", StringComparison.Ordinal)
@@ -2822,6 +3618,29 @@ public static class CombatSimulator
             types.Add(trigger.Type);
     }
 
+    private static bool HasTempoSystemCards(PlayerState side)
+    {
+        foreach (var c in side.Hand.Cards)
+        {
+            if (c.IsDestroyed || c.IsDisabled) continue;
+            if (c.Template.HiddenTags.Contains("Tempo") ||
+                c.Template.HiddenTags.Contains("TempoReference") ||
+                c.GetAttribute("TempoCost") > 0 ||
+                (c.Template.Attributes != null && c.Template.Attributes.GetValueOrDefault("TempoCost", 0) > 0))
+                return true;
+        }
+        foreach (var s in side.Skills)
+        {
+            if (s.IsDestroyed || s.IsDisabled) continue;
+            if (s.Template.HiddenTags.Contains("Tempo") ||
+                s.Template.HiddenTags.Contains("TempoReference") ||
+                s.GetAttribute("TempoCost") > 0 ||
+                (s.Template.Attributes != null && s.Template.Attributes.GetValueOrDefault("TempoCost", 0) > 0))
+                return true;
+        }
+        return false;
+    }
+
     private static bool HasAnyQuests(PlayerState owner)
     {
         foreach (var c in owner.Hand.Cards)
@@ -2844,7 +3663,8 @@ public static class CombatSimulator
         StandardPricesSettings prices,
         Dictionary<CardInstance, CachedCardSnapshotAttrs>? attrCache = null,
         int p1Overkill = 0,
-        int p2Overkill = 0)
+        int p2Overkill = 0,
+        int minCooldownFloorMs = 1000)
     {
         static int ReadIntAttr(CardInstance c, string attr)
         {
@@ -2908,6 +3728,9 @@ public static class CombatSimulator
                         cached.SellPrice = c.GetSellPrice(prices);
                         cached.AuraHeated = c.GetAttribute("Heated") > 0;
                         cached.AuraChilled = c.GetAttribute("Chilled") > 0;
+                        cached.Tags = c.GetAllTags().ToArray();
+                        cached.HiddenTags = c.GetAllHiddenTags().ToArray();
+                        cached.Heroes = c.GetAllHeroes().ToArray();
                         cached.CustomAttrs = ReadCustomAttrsSparse(c);
                     }
                 }
@@ -2929,11 +3752,14 @@ public static class CombatSimulator
                         SellPrice = c.GetSellPrice(prices),
                         AuraHeated = c.GetAttribute("Heated") > 0,
                         AuraChilled = c.GetAttribute("Chilled") > 0,
+                        Tags = c.GetAllTags().ToArray(),
+                        HiddenTags = c.GetAllHiddenTags().ToArray(),
+                        Heroes = c.GetAllHeroes().ToArray(),
                         CustomAttrs = ReadCustomAttrsSparse(c)
                     };
                 }
 
-                double cd = Math.Max(1000, cached.CooldownMaxMs > 0 ? cached.CooldownMaxMs : c.EffectiveCooldownMs);
+                double cd = Math.Max(minCooldownFloorMs, cached.CooldownMaxMs > 0 ? cached.CooldownMaxMs : c.EffectiveCooldownMs);
                 cards.Add(new CardCooldownFrame
                 {
                     InstanceId = c.InstanceId,
@@ -2963,6 +3789,9 @@ public static class CombatSimulator
                     Lifesteal = cached.Lifesteal,
                     SellPrice = cached.SellPrice,
                     Counter = c.TimesFiredThisFight,
+                    Tags = cached.Tags,
+                    HiddenTags = cached.HiddenTags,
+                    Heroes = cached.Heroes,
                     CustomAttrs = cached.CustomAttrs
                 });
             }
@@ -2970,6 +3799,22 @@ public static class CombatSimulator
 
         AppendHandFrames(p1.Hand.Cards);
         AppendHandFrames(p2.Hand.Cards);
+
+        static int ReadPlayerIntAttr(PlayerState p, string attr, int fallback = 0)
+        {
+            double v = p.GetAttribute(attr);
+            if (double.IsNaN(v) || double.IsInfinity(v)) return fallback;
+            return (int)Math.Round(v);
+        }
+
+        int p1TempoCdMax = ReadPlayerIntAttr(p1, "TempoGainCooldownMax");
+        int p2TempoCdMax = ReadPlayerIntAttr(p2, "TempoGainCooldownMax");
+        bool p1TempoActive = HasBaseTempoPlayerEffect(p1)
+            ? p1.GetAttribute("FlatTempoGainCooldownReduction") > -1_000_000.0
+            : HasTempoSystemCards(p1);
+        bool p2TempoActive = HasBaseTempoPlayerEffect(p2)
+            ? p2.GetAttribute("FlatTempoGainCooldownReduction") > -1_000_000.0
+            : HasTempoSystemCards(p2);
 
         return new CombatTickState
         {
@@ -2979,19 +3824,31 @@ public static class CombatSimulator
             P1Shield = p1.Shield,
             P1Burn = p1.Burn,
             P1Poison = p1.Poison,
-            P1Regen = (int)Math.Round(p1.GetAttribute("HealthRegen")),
+            P1Regen = ReadPlayerIntAttr(p1, "HealthRegen"),
             P1Rage = p1.Rage,
+            P1RageMax = Math.Max(0, ReadPlayerIntAttr(p1, "RageMax", 100)),
             P1Enraged = p1.IsEnraged,
+            P1EnragedDuration = p1.EnragedRemainingMs,
+            P1EnragedDurationMax = Math.Max(0, ReadPlayerIntAttr(p1, "EnragedDurationMax", 5000)),
             P1Tempo = p1.Tempo,
+            P1TempoGainCooldownMax = p1TempoActive ? (p1TempoCdMax > 0 ? p1TempoCdMax : 2000) : 0,
+            P1Joy = Math.Max(0, ReadPlayerIntAttr(p1, "Joy")),
+            P1PortraitIndex = p1.PortraitIndex,
             P2Hp = p2.CurrentHealth > 0 ? p2.CurrentHealth : -Math.Max(0, p2Overkill),
             P2MaxHp = p2.HealthMax,
             P2Shield = p2.Shield,
             P2Burn = p2.Burn,
             P2Poison = p2.Poison,
-            P2Regen = (int)Math.Round(p2.GetAttribute("HealthRegen")),
+            P2Regen = ReadPlayerIntAttr(p2, "HealthRegen"),
             P2Rage = p2.Rage,
+            P2RageMax = Math.Max(0, ReadPlayerIntAttr(p2, "RageMax", 100)),
             P2Enraged = p2.IsEnraged,
+            P2EnragedDuration = p2.EnragedRemainingMs,
+            P2EnragedDurationMax = Math.Max(0, ReadPlayerIntAttr(p2, "EnragedDurationMax", 5000)),
             P2Tempo = p2.Tempo,
+            P2TempoGainCooldownMax = p2TempoActive ? (p2TempoCdMax > 0 ? p2TempoCdMax : 2000) : 0,
+            P2Joy = Math.Max(0, ReadPlayerIntAttr(p2, "Joy")),
+            P2PortraitIndex = p2.PortraitIndex,
             SandstormActive = sandstormActive,
             SandstormNextDamage = nextSandstormDmg,
             Cards = cards
@@ -3057,7 +3914,7 @@ public static class CombatSimulator
             if (tpl == null) continue;
             state.Skills.Add(new CardInstance(tpl, TierHelper.ParseTier(skillEntry.Tier), null, skillEntry.InstanceId));
         }
-        foreach (var seEntry in monster.Player.SocketEffects)
+        foreach (var seEntry in monster.Player.GetEffectiveSocketEffects())
         {
             var tpl = repo.GetCard(seEntry.TemplateId);
             if (tpl == null) continue;

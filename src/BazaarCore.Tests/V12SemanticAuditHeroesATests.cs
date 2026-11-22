@@ -1198,9 +1198,9 @@ public sealed class V12SemanticAuditHeroesATests
                 if (amt > 0) target.CurrentHealth = Math.Min(target.HealthMax, target.CurrentHealth + amt);
                 probe.HealEvents++;
             },
-            OnRegenApplied = (target, amt, _) =>
+            OnRegenApplied = (target, amt, _, duration) =>
             {
-                if (amt > 0) target.ModifyAttribute("HealthRegen", "Add", amt);
+                if (amt > 0) target.ModifyAttribute("HealthRegen", "Add", amt, duration);
                 probe.RegenEvents++;
             },
             OnHasteApplied = (c, ms, _) =>

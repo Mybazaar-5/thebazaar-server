@@ -257,8 +257,14 @@ public static class TargetResolver
                     if (c.StartSlot < 0 || (activeSold != null && ReferenceEquals(c, activeSold)))
                         pairs.RemoveAt(i);
                 }
-                // 先滤后取最左/最右（经官方反编译 TTargetCardXMost.cs:42-53 核验）
+                // 先滤条件 -> 按官方 TargetingPriorities 筛选最高非空优先级桶（P1-19）-> 再取最左/最右（对齐 TTargetCardXMost.cs:42-84）
                 FilterCandidatePairs(pairs, cond, ctx, result);
+                if (result.Count > 0 && HasTargetingPriorities(ctx.ActiveExecution.ActionType))
+                {
+                    var prioritized = FilterHighestPriorityBucketForXMost(result, ctx.ActiveExecution.ActionType!);
+                    result.Clear();
+                    result.AddRange(prioritized);
+                }
                 if (result.Count > 1)
                 {
                     bool leftMost = string.Equals(target.TargetMode, "LeftMostCard", StringComparison.Ordinal)
@@ -300,6 +306,11 @@ public static class TargetResolver
                     ? maxCount.Value
                     : (ctx.ActiveExecution.ActionType != null ? 1 : null);
 
+                if (result.Count > 0 && effectiveTake.HasValue && HasTargetingPriorities(ctx.ActiveExecution.ActionType))
+                {
+                    return SelectRandomByTargetingPriorities(result, ctx.ActiveExecution.ActionType!, effectiveTake.Value, ctx.Rng);
+                }
+
                 if (effectiveTake.HasValue && effectiveTake.Value > 0 && effectiveTake.Value < result.Count)
                 {
                     // 对齐官方 TTargetCardRandom.SelectRandomCards：按 SeedManager.GetNumber(cards.Count) 依次抽取并移除
@@ -320,6 +331,101 @@ public static class TargetResolver
             result.RemoveRange(maxCount.Value, result.Count - maxCount.Value);
 
         return result;
+    }
+
+    /// <summary>判断是否属于官方声明 TargetingPriorities 的 7 类卡牌动作（P1-19：含 Upgrade 与 ForceUse）。</summary>
+    public static bool HasTargetingPriorities(string? actionType) => actionType is
+        "TActionCardReload" or
+        "TActionCardCharge" or
+        "TActionCardHaste" or
+        "TActionCardSlow" or
+        "TActionCardFreeze" or
+        "TActionCardUpgrade" or
+        "TActionCardForceUse";
+
+    /// <summary>按官方 7 类动作 TargetingPriorities 计算候选卡优先级桶（0 最高，数值越大优先级越低）。</summary>
+    public static int GetTargetingPriorityTier(CardInstance card, string actionType) => actionType switch
+    {
+        // Conditionals.CanBeReloaded: Ammo < AmmoMax
+        "TActionCardReload" => (card.EffectiveAmmoMax > 0 && card.CurrentAmmo < card.EffectiveAmmoMax) ? 0 : 1,
+        // Conditionals.ChargePriorities: [(HasCooldown && (NotAnAmmoItem || UsesAndHasAmmo)), HasCooldown]（不回落至 tier 2 无冷却卡）
+        "TActionCardCharge" => card.HasActiveCooldown
+            ? ((card.EffectiveAmmoMax <= 0 || card.CurrentAmmo > 0) ? 0 : 1)
+            : 2,
+        // TActionCardUpgrade: Conditionals.CanUpgrade（含 5 阶特例卡 Maker's Mark）
+        "TActionCardUpgrade" => card.CanUpgrade() ? 0 : 1,
+        // TActionCardForceUse: Conditionals.NotFrozen + 可激活冷却（优先非冻结且有冷却有弹药，次选非冻结有冷却，不回落至冻结/无冷却卡）
+        "TActionCardForceUse" => (card.FreezeMs <= 0 && card.HasActiveCooldown)
+            ? ((card.EffectiveAmmoMax <= 0 || card.CurrentAmmo > 0) ? 0 : 1)
+            : 2,
+        // Haste / Slow / Freeze: Conditionals.Priorities [HasCooldown, HasNoCooldown]
+        _ => card.HasActiveCooldown ? 0 : 1
+    };
+
+    private static List<CardInstance> FilterHighestPriorityBucketForXMost(List<CardInstance> pool, string actionType)
+    {
+        var tier0 = new List<CardInstance>(pool.Count);
+        var tier1 = new List<CardInstance>(pool.Count);
+        var tier2 = new List<CardInstance>();
+        for (int i = 0; i < pool.Count; i++)
+        {
+            var c = pool[i];
+            int t = GetTargetingPriorityTier(c, actionType);
+            if (t == 0) tier0.Add(c);
+            else if (t == 1) tier1.Add(c);
+            else tier2.Add(c);
+        }
+
+        if (tier0.Count > 0) return tier0;
+        if (tier1.Count > 0) return tier1;
+        if (actionType is "TActionCardCharge" or "TActionCardForceUse") return [];
+        return tier2;
+    }
+
+    private static List<CardInstance> SelectRandomByTargetingPriorities(
+        List<CardInstance> pool,
+        string actionType,
+        int effectiveTake,
+        Random rng)
+    {
+        if (effectiveTake <= 0 || pool.Count == 0) return [];
+
+        var tier0 = new List<CardInstance>(pool.Count);
+        var tier1 = new List<CardInstance>(pool.Count);
+        var tier2 = new List<CardInstance>();
+        for (int i = 0; i < pool.Count; i++)
+        {
+            var c = pool[i];
+            int t = GetTargetingPriorityTier(c, actionType);
+            if (t == 0) tier0.Add(c);
+            else if (t == 1) tier1.Add(c);
+            else tier2.Add(c);
+        }
+
+        var picked = new List<CardInstance>(Math.Min(effectiveTake, pool.Count));
+        void DrawFromTier(List<CardInstance> bucket)
+        {
+            if (bucket.Count == 0 || picked.Count >= effectiveTake) return;
+            int need = effectiveTake - picked.Count;
+            if (need >= bucket.Count)
+            {
+                picked.AddRange(bucket);
+                bucket.Clear();
+                return;
+            }
+            for (int i = 0; i < need; i++)
+            {
+                int idx = rng.Next(bucket.Count);
+                picked.Add(bucket[idx]);
+                bucket.RemoveAt(idx);
+            }
+        }
+
+        DrawFromTier(tier0);
+        DrawFromTier(tier1);
+        if (actionType is not ("TActionCardCharge" or "TActionCardForceUse"))
+            DrawFromTier(tier2);
+        return picked;
     }
 
     /// <summary>

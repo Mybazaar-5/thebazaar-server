@@ -74,7 +74,7 @@ public static partial class TooltipFormatter
             }
         }
 
-        // 附加 Quest 进度
+        // 附加 Quest 进度（P2-02：优先渲染任务条目本地化目标与 Reward.Localization，缺省再回退 AttributeType）
         if (card.Template.Quests != null)
         {
             foreach (var q in card.Template.Quests)
@@ -83,14 +83,64 @@ public static partial class TooltipFormatter
                 {
                     double prog = card.QuestProgress.GetValueOrDefault(entry.AttributeType, 0);
                     bool done = card.CompletedQuests.Contains(entry.AttributeType);
-                    lines.Add(done
-                        ? $"[任务已完成] {entry.AttributeType} ({prog:0}/{entry.Target:0})"
-                        : $"[任务进度] {entry.AttributeType}: {prog:0}/{entry.Target:0}");
+
+                    string? goalText = RenderLocalizedBlockFirstLine(entry.Localization, loc, card, ctx);
+                    string? rewardText = RenderLocalizedBlockFirstLine(entry.Reward?.Localization, loc, card, ctx);
+
+                    if (!string.IsNullOrWhiteSpace(goalText))
+                    {
+                        string progressTag = done
+                            ? $"[任务已完成] {goalText} ({prog:0}/{entry.Target:0})"
+                            : $"[任务进度] {goalText} ({prog:0}/{entry.Target:0})";
+                        lines.Add(!string.IsNullOrWhiteSpace(rewardText)
+                            ? $"{progressTag} → {rewardText}"
+                            : progressTag);
+                    }
+                    else
+                    {
+                        string fallback = done
+                            ? $"[任务已完成] {entry.AttributeType} ({prog:0}/{entry.Target:0})"
+                            : $"[任务进度] {entry.AttributeType}: {prog:0}/{entry.Target:0}";
+                        lines.Add(!string.IsNullOrWhiteSpace(rewardText)
+                            ? $"{fallback} → {rewardText}"
+                            : fallback);
+                    }
                 }
             }
         }
 
         return lines;
+    }
+
+    private static string? RenderLocalizedBlockFirstLine(
+        LocalizationBlock? block,
+        ILocalizationStore? loc,
+        CardInstance card,
+        RuleExecutionContext? ctx)
+    {
+        if (block == null) return null;
+        if (block.Tooltips is { Count: > 0 })
+        {
+            var renderedParts = new List<string>(block.Tooltips.Count);
+            for (int i = 0; i < block.Tooltips.Count; i++)
+            {
+                var raw = loc?.GetLocalizedText(block.Tooltips[i].Content) ?? block.Tooltips[i].Content?.Text;
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                renderedParts.Add(RenderTemplate(raw, card, ctx, ContainsCjk(raw)));
+            }
+            if (renderedParts.Count > 0)
+                return string.Join(" ", renderedParts);
+        }
+
+        var desc = loc?.GetLocalizedText(block.Description) ?? block.Description?.Text;
+        if (!string.IsNullOrWhiteSpace(desc))
+            return RenderTemplate(desc, card, ctx, ContainsCjk(desc));
+
+        var title = loc?.GetLocalizedText(block.Title) ?? block.Title?.Text;
+        if (!string.IsNullOrWhiteSpace(title))
+            return RenderTemplate(title, card, ctx, ContainsCjk(title));
+
+        return null;
     }
 
     private static string RenderTemplate(string raw, CardInstance card, RuleExecutionContext? ctx, bool isZh)

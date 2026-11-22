@@ -73,8 +73,28 @@ public sealed class CardInstance
     internal StandardPricesSettings? AttachedStandardPrices { get; set; }
     private static readonly StandardPricesSettings DefaultStandardPrices = new();
 
-    /// <summary>基础属性（来自当前 Tier 合并 + 附魔基础属性）。</summary>
+    /// <summary>基础属性（来自当前 Tier 合并 + 全局修饰型/无冲突附魔属性）。</summary>
     public Dictionary<string, double> BaseAttributes { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 附魔独立动作参数隔离域（P1-51）：当基础 Tiers 已含同名非零动作参数（*Amount/*Targets）且附魔自带专属 Abilities/Auras 时，
+    /// 附魔同名动作参数存于此隔离域而不累加污染 BaseAttributes（消除 Icebreaker/Tantius Carrier/Magnifying Glass 等全部 15 张可达卡污染）。
+    /// </summary>
+    public Dictionary<string, double> EnchantmentBaseAttributes { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> EnchantmentAuraAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> EnchantmentAuraMult { get; } = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _enchantmentAbilityIds = new(StringComparer.Ordinal);
+    private readonly HashSet<AuraDefinition> _enchantmentAuras = new(ReferenceEqualityComparer.Instance);
+
+    private static readonly HashSet<string> EnchantmentActionParamAttributes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "DamageAmount", "ShieldApplyAmount", "BurnApplyAmount", "PoisonApplyAmount",
+        "HealAmount", "RegenApplyAmount", "RageApplyAmount", "TempoApplyAmount", "JoyApplyAmount",
+        "HasteAmount", "HasteTargets", "SlowAmount", "SlowTargets",
+        "FreezeAmount", "FreezeTargets", "ChargeAmount", "ChargeTargets",
+        "ReloadAmount", "ReloadTargets", "FlyingTargets", "ForceUseTargets",
+        "UpgradeTargets", "DestroyTargets", "DisableTargets", "EnchantTargets", "TransformTargets"
+    };
 
     /// <summary>局内永久属性修正（商店/事件/卖牌/永久成长）。</summary>
     public Dictionary<string, double> PermanentAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -91,6 +111,8 @@ public sealed class CardInstance
     /// <summary>单场战斗临时属性修正（UntilEndOfCombat / TCombatDuration）。</summary>
     public Dictionary<string, double> CombatAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> CombatMult { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>单场战斗零乘数（Multiply 0.0）引用计数，避免覆写破坏 CombatMult 非零连乘值，到期减 1 无损恢复（修复 P0-08 Trail Markers）。</summary>
+    public Dictionary<string, int> CombatZeroMultCount { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>光环动态加成（由 AuraEngine 刷新重写）。</summary>
     public Dictionary<string, double> AuraAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -394,6 +416,56 @@ public sealed class CardInstance
         }
     }
 
+    /// <summary>返回卡牌所属的全部英雄标签（P1-12，供战斗帧差分回写 CombatSimCardUpdate.Heroes）。</summary>
+    public IEnumerable<string> GetAllHeroes()
+    {
+        if (Template.Heroes == null) yield break;
+        for (int i = 0; i < Template.Heroes.Count; i++)
+            yield return Template.Heroes[i];
+    }
+
+    /// <summary>
+    /// 收集当前在该卡牌任一属性层中存在的全部属性键集合（P1-11，用于精确判定附魔移除或限时修饰到期后彻底消失的属性键）。
+    /// </summary>
+    public HashSet<string> GetActiveAttributeKeys()
+    {
+        var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var k in BaseAttributes.Keys) keys.Add(k);
+        foreach (var k in PermanentAdd.Keys) keys.Add(k);
+        foreach (var k in PermanentMult.Keys) keys.Add(k);
+        foreach (var k in HourAdd.Keys) keys.Add(k);
+        foreach (var k in HourMult.Keys) keys.Add(k);
+        foreach (var k in DayAdd.Keys) keys.Add(k);
+        foreach (var k in DayMult.Keys) keys.Add(k);
+        foreach (var k in CombatAdd.Keys) keys.Add(k);
+        foreach (var k in CombatMult.Keys) keys.Add(k);
+        foreach (var k in CombatZeroMultCount.Keys) keys.Add(k);
+        foreach (var k in AuraAdd.Keys) keys.Add(k);
+        foreach (var k in AuraMult.Keys) keys.Add(k);
+        foreach (var k in EnchantmentBaseAttributes.Keys) keys.Add(k);
+        foreach (var k in EnchantmentAuraAdd.Keys) keys.Add(k);
+        foreach (var k in EnchantmentAuraMult.Keys) keys.Add(k);
+        return keys;
+    }
+
+    /// <summary>判断指定属性键当前是否仍存在于该卡牌任一属性层中（P1-11）。</summary>
+    public bool HasAnyAttributeKey(string attr)
+        => BaseAttributes.ContainsKey(attr)
+        || PermanentAdd.ContainsKey(attr)
+        || PermanentMult.ContainsKey(attr)
+        || HourAdd.ContainsKey(attr)
+        || HourMult.ContainsKey(attr)
+        || DayAdd.ContainsKey(attr)
+        || DayMult.ContainsKey(attr)
+        || CombatAdd.ContainsKey(attr)
+        || CombatMult.ContainsKey(attr)
+        || CombatZeroMultCount.ContainsKey(attr)
+        || AuraAdd.ContainsKey(attr)
+        || AuraMult.ContainsKey(attr)
+        || EnchantmentBaseAttributes.ContainsKey(attr)
+        || EnchantmentAuraAdd.ContainsKey(attr)
+        || EnchantmentAuraMult.ContainsKey(attr);
+
     public void SetTier(CardTier newTier) => SetTier(newTier, isTemporary: false);
 
     public void SetTier(CardTier newTier, bool isTemporary)
@@ -412,14 +484,31 @@ public sealed class CardInstance
             RefillAmmoToMax();
     }
 
-    public bool CanUpgrade() => Tier < CardTier.Diamond && Template.Tiers != null && Template.Tiers.ContainsKey(Tier.NextTier().ToString());
+    /// <summary>
+    /// 返回卡牌下一可升品质（P1-19：放行 Diamond → Legendary 以支持全库唯一 5 阶特例卡 Maker's Mark；
+    /// 普通 4 阶卡因 Template.Tiers 不含 Legendary 键，在 CanUpgrade() 中自然拦截）。
+    /// </summary>
+    public static CardTier GetNextUpgradeTier(CardTier tier) => tier switch
+    {
+        CardTier.Bronze => CardTier.Silver,
+        CardTier.Silver => CardTier.Gold,
+        CardTier.Gold => CardTier.Diamond,
+        CardTier.Diamond => CardTier.Legendary,
+        _ => tier
+    };
+
+    public bool CanUpgrade()
+    {
+        var next = GetNextUpgradeTier(Tier);
+        return next != Tier && Template.Tiers != null && Template.Tiers.ContainsKey(next.ToString());
+    }
 
     public bool TryUpgrade() => TryUpgrade(isTemporary: false);
 
     public bool TryUpgrade(bool isTemporary)
     {
         if (!CanUpgrade()) return false;
-        Tier = Tier.NextTier();
+        Tier = GetNextUpgradeTier(Tier);
         if (!isTemporary) PermanentTier = Tier;
         RebuildTierAndEnchantmentData();
         if (!isTemporary && CombatSourceCard == null)
@@ -494,6 +583,11 @@ public sealed class CardInstance
         AttributeVersion++;
         _cachedDynamicEffectMask = -1;
         BaseAttributes.Clear();
+        EnchantmentBaseAttributes.Clear();
+        EnchantmentAuraAdd.Clear();
+        EnchantmentAuraMult.Clear();
+        _enchantmentAbilityIds.Clear();
+        _enchantmentAuras.Clear();
         ActiveAbilities.Clear();
         ActiveAuras.Clear();
         _questRewardTags.Clear();
@@ -584,28 +678,48 @@ public sealed class CardInstance
             }
         }
 
-        // 叠加附魔
+        // 叠加附魔（P1-51：区分全局修饰型/无冲突属性与同名动作参数冲突，隔离全部 15 张可达卡附魔参数污染）
         if (!string.IsNullOrEmpty(Enchantment) &&
             Template.Enchantments != null &&
             Template.Enchantments.TryGetValue(Enchantment, out var ench))
         {
+            bool enchHasOwnEffects = ench.Abilities.Count > 0 || ench.Auras.Count > 0;
             foreach (var (k, v) in ench.Attributes)
             {
-                // 物品若未在 Tiers 显式写 "Multicast": 1（如自定义卡或原版 Combat Core），其隐含基础施放次数为 1 而非 0，
-                // 否则 Shiny 附魔写入 attributes.Multicast=+1 会变成 0+1=1 彻底失效。
-                double curBase = BaseAttributes.TryGetValue(k, out var existingBase)
-                    ? existingBase
-                    : (k.Equals("Multicast", StringComparison.OrdinalIgnoreCase)
-                       && string.Equals(Template.Type, "Item", StringComparison.OrdinalIgnoreCase)
-                       && v > 0
-                        ? 1.0
-                        : 0.0);
-                BaseAttributes[k] = curBase + v;
+                bool hasExisting = BaseAttributes.TryGetValue(k, out double existingBase);
+                bool isolateToEnchantDomain = enchHasOwnEffects
+                    && EnchantmentActionParamAttributes.Contains(k)
+                    && hasExisting
+                    && Math.Abs(existingBase) > 1e-9;
+                if (isolateToEnchantDomain)
+                {
+                    EnchantmentBaseAttributes[k] = v;
+                }
+                else
+                {
+                    // 物品若未在 Tiers 显式写 "Multicast": 1（如自定义卡或原版 Combat Core），其隐含基础施放次数为 1 而非 0，
+                    // 否则 Shiny 附魔写入 attributes.Multicast=+1 会变成 0+1=1 彻底失效。
+                    double curBase = hasExisting
+                        ? existingBase
+                        : (k.Equals("Multicast", StringComparison.OrdinalIgnoreCase)
+                           && string.Equals(Template.Type, "Item", StringComparison.OrdinalIgnoreCase)
+                           && v > 0
+                            ? 1.0
+                            : 0.0);
+                    BaseAttributes[k] = curBase + v;
+                }
             }
             foreach (var ab in ench.Abilities.Values)
+            {
                 ActiveAbilities.Add(ab);
+                if (!string.IsNullOrEmpty(ab.Id))
+                    _enchantmentAbilityIds.Add(ab.Id);
+            }
             foreach (var au in ench.Auras.Values)
+            {
                 ActiveAuras.Add(au);
+                _enchantmentAuras.Add(au);
+            }
         }
 
         // 叠加已完成 Quest 奖励（兼容直接 Attributes 与按 Tier 缩放的 Reward.Tiers）
@@ -708,6 +822,21 @@ public sealed class CardInstance
             if (attr.Equals("Counter", StringComparison.OrdinalIgnoreCase))
                 return TimesFiredThisFight;
         }
+        else if (c0 is 'Q' or 'q')
+        {
+            // 修复 P2-19：规则公式直接查询 Quest_X 属性时，若各属性层无显式声明值则回退读取 QuestProgress 实时进度
+            if (attr.StartsWith("Quest_", StringComparison.OrdinalIgnoreCase))
+            {
+                bool hasExplicitAttr = BaseAttributes.ContainsKey(attr)
+                    || PermanentAdd.ContainsKey(attr)
+                    || HourAdd.ContainsKey(attr)
+                    || DayAdd.ContainsKey(attr)
+                    || CombatAdd.ContainsKey(attr)
+                    || AuraAdd.ContainsKey(attr);
+                if (!hasExplicitAttr && QuestProgress.TryGetValue(attr, out double qProg))
+                    return qProg;
+            }
+        }
         else if (c0 is 'T' or 't')
         {
             if (attr.Equals("Tiny", StringComparison.OrdinalIgnoreCase))
@@ -751,13 +880,20 @@ public sealed class CardInstance
         if (CombatAdd.Count > 0 && CombatAdd.TryGetValue(attr, out var ca)) sum += ca;
         if (AuraAdd.Count > 0 && AuraAdd.TryGetValue(attr, out var aa)) sum += aa;
 
-        // 若采用乘法直乘（如 Golden 双倍价值）
+        // 若采用乘法直乘（如 Golden 双倍价值）；若存在 Combat 零乘数引用计数则直接取 0.0 而不污染 CombatMult 连乘
         double totalMult = 1.0;
-        if (PermanentMult.Count > 0 && PermanentMult.TryGetValue(attr, out var pm)) totalMult *= pm;
-        if (HourMult.Count > 0 && HourMult.TryGetValue(attr, out var hm)) totalMult *= hm;
-        if (DayMult.Count > 0 && DayMult.TryGetValue(attr, out var dm)) totalMult *= dm;
-        if (CombatMult.Count > 0 && CombatMult.TryGetValue(attr, out var cm)) totalMult *= cm;
-        if (AuraMult.Count > 0 && AuraMult.TryGetValue(attr, out var am)) totalMult *= am;
+        if (CombatZeroMultCount.Count > 0 && CombatZeroMultCount.GetValueOrDefault(attr, 0) > 0)
+        {
+            totalMult = 0.0;
+        }
+        else
+        {
+            if (PermanentMult.Count > 0 && PermanentMult.TryGetValue(attr, out var pm)) totalMult *= pm;
+            if (HourMult.Count > 0 && HourMult.TryGetValue(attr, out var hm)) totalMult *= hm;
+            if (DayMult.Count > 0 && DayMult.TryGetValue(attr, out var dm)) totalMult *= dm;
+            if (CombatMult.Count > 0 && CombatMult.TryGetValue(attr, out var cm)) totalMult *= cm;
+            if (AuraMult.Count > 0 && AuraMult.TryGetValue(attr, out var am)) totalMult *= am;
+        }
 
         var value = sum * totalMult;
 
@@ -857,6 +993,7 @@ public sealed class CardInstance
 
             CombatAdd.Remove(attr);
             CombatMult.Remove(attr);
+            CombatZeroMultCount.Remove(attr);
             if (nextMs <= 0)
             {
                 PermanentAdd.Remove(attr);
@@ -877,7 +1014,7 @@ public sealed class CardInstance
             if (!IsFlying)
             {
                 PermanentAdd.Remove(attr); PermanentMult.Remove(attr);
-                CombatAdd.Remove(attr); CombatMult.Remove(attr);
+                CombatAdd.Remove(attr); CombatMult.Remove(attr); CombatZeroMultCount.Remove(attr);
                 HourAdd.Remove(attr); HourMult.Remove(attr);
                 DayAdd.Remove(attr); DayMult.Remove(attr);
                 // 若存在光环赋予的 Flying，则通过 CombatAdd 压制抵消，确保 FlyingStop/Set 0 立即落地生效
@@ -925,7 +1062,14 @@ public sealed class CardInstance
                 addDict[attr] = addDict.GetValueOrDefault(attr, 0) - value;
                 break;
             case "Multiply":
-                multDict[attr] = multDict.GetValueOrDefault(attr, 1.0) * value;
+                if (target == DurationTarget.Combat && Math.Abs(value) < 1e-9)
+                {
+                    CombatZeroMultCount[attr] = CombatZeroMultCount.GetValueOrDefault(attr, 0) + 1;
+                }
+                else
+                {
+                    multDict[attr] = multDict.GetValueOrDefault(attr, 1.0) * value;
+                }
                 break;
             case "AdditiveMultiply":
                 // 如 +50%（传入 0.5 或 50？DB 里通常存小数如 1.0 代表 +100%，这里稳妥按增量系数处理）
@@ -934,8 +1078,11 @@ public sealed class CardInstance
             case "Set":
             {
                 multDict.Remove(attr);
+                if (target == DurationTarget.Combat)
+                    CombatZeroMultCount.Remove(attr);
                 // 计算其余有效乘区并在赋值时精确抵消，避免 PermanentMult / AuraMult 等放大或歪曲 Set 目标值
                 double otherMult = 1.0;
+                if (CombatZeroMultCount.GetValueOrDefault(attr, 0) > 0) otherMult = 0.0;
                 if (!ReferenceEquals(multDict, PermanentMult) && PermanentMult.TryGetValue(attr, out var pm)) otherMult *= pm;
                 if (!ReferenceEquals(multDict, HourMult) && HourMult.TryGetValue(attr, out var hm)) otherMult *= hm;
                 if (!ReferenceEquals(multDict, DayMult) && DayMult.TryGetValue(attr, out var dm)) otherMult *= dm;
@@ -949,6 +1096,7 @@ public sealed class CardInstance
                     if (HourMult.TryGetValue(attr, out var hm0) && Math.Abs(hm0) < 1e-9) HourMult.Remove(attr);
                     if (DayMult.TryGetValue(attr, out var dm0) && Math.Abs(dm0) < 1e-9) DayMult.Remove(attr);
                     if (CombatMult.TryGetValue(attr, out var cm0) && Math.Abs(cm0) < 1e-9) CombatMult.Remove(attr);
+                    CombatZeroMultCount.Remove(attr);
                     if (AuraMult.TryGetValue(attr, out var am0) && Math.Abs(am0) < 1e-9) AuraMult.Remove(attr);
                     otherMult = 1.0;
                 }
@@ -1027,13 +1175,60 @@ public sealed class CardInstance
         }
     }
 
+    public bool IsEnchantmentAbility(string? abilityId)
+        => !string.IsNullOrEmpty(abilityId) && _enchantmentAbilityIds.Contains(abilityId);
+
+    public bool IsEnchantmentAura(AuraDefinition? aura)
+        => aura != null && _enchantmentAuras.Contains(aura);
+
+    public bool HasIsolatedEnchantmentAttribute(string attr)
+        => EnchantmentBaseAttributes.ContainsKey(attr);
+
+    /// <summary>读取附魔隔离域内的最终动作参数值（P1-51，结合 EnchantmentBaseAttributes 与附魔专属光环输出）。</summary>
+    public double GetEnchantmentAttribute(string attr)
+    {
+        double baseVal = EnchantmentBaseAttributes.GetValueOrDefault(attr, 0)
+                       + EnchantmentAuraAdd.GetValueOrDefault(attr, 0);
+        double mult = EnchantmentAuraMult.GetValueOrDefault(attr, 1.0);
+        return baseVal * mult;
+    }
+
+    /// <summary>按当前执行能力归属读取对应域的属性值（P1-51：附魔能力对同名冲突参数读附魔域，基础能力读共享基础域）。</summary>
+    public double GetAttributeForAbility(string attr, string? abilityId)
+        => (IsEnchantmentAbility(abilityId) && HasIsolatedEnchantmentAttribute(attr))
+            ? GetEnchantmentAttribute(attr)
+            : GetAttribute(attr);
+
+    public void ApplyEnchantmentAuraAttribute(string attr, string operation, double value)
+    {
+        AttributeVersion++;
+        switch (operation)
+        {
+            case "Subtract":
+                EnchantmentAuraAdd[attr] = EnchantmentAuraAdd.GetValueOrDefault(attr, 0) - value;
+                break;
+            case "Multiply":
+                EnchantmentAuraMult[attr] = EnchantmentAuraMult.GetValueOrDefault(attr, 1.0) * value;
+                break;
+            case "AdditiveMultiply":
+                EnchantmentAuraMult[attr] = EnchantmentAuraMult.GetValueOrDefault(attr, 1.0) + value;
+                break;
+            default:
+                EnchantmentAuraAdd[attr] = EnchantmentAuraAdd.GetValueOrDefault(attr, 0) + value;
+                break;
+        }
+    }
+
     public void ClearAuraModifiers()
     {
-        if (AuraAdd.Count > 0 || AuraMult.Count > 0 || AuraTags.Count > 0)
+        if (AuraAdd.Count > 0 || AuraMult.Count > 0 || AuraTags.Count > 0
+            || EnchantmentAuraAdd.Count > 0 || EnchantmentAuraMult.Count > 0)
             AttributeVersion++;
         AuraAdd.Clear();
         AuraMult.Clear();
         AuraTags.Clear();
+        EnchantmentAuraAdd.Clear();
+        EnchantmentAuraMult.Clear();
     }
 
     public void ClearEndOfHourModifiers()
@@ -1091,6 +1286,53 @@ public sealed class CardInstance
     /// <summary>将当前弹药补满为最新有效弹药上限（供非战斗升阶及脱战复位调用）。</summary>
     public void RefillAmmoToMax() => CurrentAmmo = EffectiveAmmoMax;
 
+    public void RevertCombatAttributeModifier(string attr, string operation, double value)
+    {
+        AttributeVersion++;
+        switch (operation)
+        {
+            case "Subtract":
+            {
+                double next = CombatAdd.GetValueOrDefault(attr, 0) + value;
+                if (Math.Abs(next) < 1e-9) CombatAdd.Remove(attr);
+                else CombatAdd[attr] = next;
+                break;
+            }
+            case "Multiply":
+            {
+                if (Math.Abs(value) < 1e-9)
+                {
+                    if (CombatZeroMultCount.TryGetValue(attr, out int cnt))
+                    {
+                        if (cnt <= 1) CombatZeroMultCount.Remove(attr);
+                        else CombatZeroMultCount[attr] = cnt - 1;
+                    }
+                }
+                else
+                {
+                    double next = CombatMult.GetValueOrDefault(attr, 1.0) / value;
+                    if (Math.Abs(next - 1.0) < 1e-9) CombatMult.Remove(attr);
+                    else CombatMult[attr] = next;
+                }
+                break;
+            }
+            case "AdditiveMultiply":
+            {
+                double next = CombatMult.GetValueOrDefault(attr, 1.0) - value;
+                if (Math.Abs(next - 1.0) < 1e-9) CombatMult.Remove(attr);
+                else CombatMult[attr] = next;
+                break;
+            }
+            default: // Add
+            {
+                double next = CombatAdd.GetValueOrDefault(attr, 0) - value;
+                if (Math.Abs(next) < 1e-9) CombatAdd.Remove(attr);
+                else CombatAdd[attr] = next;
+                break;
+            }
+        }
+    }
+
     public void ResetForCombat(GameDataRepository? repo)
     {
         bool needRebuild = false;
@@ -1109,6 +1351,7 @@ public sealed class CardInstance
 
         CombatAdd.Clear();
         CombatMult.Clear();
+        CombatZeroMultCount.Clear();
         CombatTags.Clear();
         CooldownProgressMs = 0;
         HasteMs = 0;

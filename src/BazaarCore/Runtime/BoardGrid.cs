@@ -349,8 +349,8 @@ public sealed class BoardGrid
         if (!Cards.Contains(card) || card.StartSlot < 0) return false;
 
         int width = card.SlotWidth;
-        var sockets = BuildAndModifyOfficialSockets(desiredSockets, width);
-        if (sockets == null || sockets.Count < width) return false;
+        var sockets = BuildAndModifyOfficialSockets(desiredSockets, width, excludeCard: card);
+        if (sockets == null || sockets.Count == 0) return false;
 
         int curStart = card.StartSlot;
         if (curStart == sockets[0])
@@ -396,8 +396,8 @@ public sealed class BoardGrid
         int freeSlots = CountFreeUnlockedSlots() + (alreadyInGrid ? width : 0);
         if (freeSlots < width) return false;
 
-        var sockets = BuildAndModifyOfficialSockets(desiredSockets, width);
-        if (sockets == null || sockets.Count < width) return false;
+        var sockets = BuildAndModifyOfficialSockets(desiredSockets, width, excludeCard: alreadyInGrid ? card : null);
+        if (sockets == null || sockets.Count == 0) return false;
 
         var arrWithoutCard = BuildSocketArray(excludeCard: alreadyInGrid ? card : null);
         var list = new LinkedList<OfficialSocketNode>();
@@ -411,7 +411,28 @@ public sealed class BoardGrid
         return true;
     }
 
-    private List<int>? BuildAndModifyOfficialSockets(IReadOnlyList<int>? rawSockets, int width)
+    /// <summary>
+    /// 1:1 对齐官方 <c>SocketOperations.MoveItemToContainer</c> 截断与 <c>ModifySockets</c> 边界平移规则：
+    /// 不对短列表排序、不补齐缺失槽位、不附加额外锁槽拒绝，仅在超出已解锁区间时按最大偏移量整体平移。
+    /// </summary>
+    public List<int>? ModifyOfficialSockets(IReadOnlyList<int>? rawSockets, int width)
+        => BuildAndModifyOfficialSockets(rawSockets, width, excludeCard: null);
+
+    /// <summary>
+    /// 直接将卡牌落入最左现成连续已解锁空槽，绝不挤位或重排源棋盘既有卡牌
+    /// （对齐官方 <c>SocketOperations.AddItemToContainer(item, fromInventory, null)</c> 回填语义）。
+    /// </summary>
+    public bool TryPlaceAtFirstContiguousEmptySlot(CardInstance card)
+    {
+        int slot = FindFirstAvailableSlot(card);
+        if (slot < 0) return false;
+        if (!Cards.Contains(card)) Cards.Add(card);
+        card.StartSlot = slot;
+        SortCards();
+        return true;
+    }
+
+    private List<int>? BuildAndModifyOfficialSockets(IReadOnlyList<int>? rawSockets, int width, CardInstance? excludeCard = null)
     {
         if (width <= 0 || width > Capacity) return null;
 
@@ -425,22 +446,42 @@ public sealed class BoardGrid
                 highest = s;
             }
         }
-        if (lowest < 0 || highest - lowest + 1 < width) return null;
+        if (lowest < 0) return null;
 
         var sockets = new List<int>(width);
         if (rawSockets is { Count: > 0 })
         {
+            // 对齐官方 SocketOperations.MoveItemToContainer：超宽时截断至 size，短列表原样保留（不排序、不补齐）
             int take = Math.Min(width, rawSockets.Count);
             for (int i = 0; i < take; i++)
                 sockets.Add(rawSockets[i]);
-            sockets.Sort();
-            while (sockets.Count < width)
-                sockets.Add(sockets[^1] + 1);
         }
         else
         {
+            // 对齐官方 SocketedContainer.GetSocketsForItem：未指定槽位时仅查找最左现成连续已解锁空槽
+            int runLen = 0;
+            int foundStart = -1;
+            var arr = BuildSocketArray(excludeCard);
+            for (int s = 0; s < Capacity; s++)
+            {
+                if (IsSlotUnlocked(s) && arr[s] == null)
+                {
+                    runLen++;
+                    if (runLen == width)
+                    {
+                        foundStart = s - width + 1;
+                        break;
+                    }
+                }
+                else
+                {
+                    runLen = 0;
+                }
+            }
+            if (foundStart < 0) return null;
             for (int i = 0; i < width; i++)
-                sockets.Add(lowest + i);
+                sockets.Add(foundStart + i);
+            return sockets;
         }
 
         // 对齐官方 SocketOperations.ModifySockets：按最大越界偏移整体平移至已解锁区间
@@ -463,10 +504,10 @@ public sealed class BoardGrid
                 sockets[i] += shift;
         }
 
-        // 校验全部目标槽位合法且已解锁
+        // 仅校验数组下标合法，不附加官方不存在的 !IsSlotUnlocked 额外拒绝
         for (int i = 0; i < sockets.Count; i++)
         {
-            if (sockets[i] < 0 || sockets[i] >= Capacity || !IsSlotUnlocked(sockets[i]))
+            if (sockets[i] < 0 || sockets[i] >= Capacity)
                 return null;
         }
         return sockets;
@@ -605,8 +646,7 @@ public sealed class BoardGrid
 
         bool IsRangeUnlocked(int start, int size)
         {
-            int len = Math.Max(1, size);
-            for (int j = start; j < start + len && j < Capacity; j++)
+            for (int j = start; j < start + size && j < Capacity; j++)
             {
                 if (!IsSlotUnlocked(j)) return false;
             }
@@ -723,7 +763,7 @@ public sealed class BoardGrid
         }
     }
 
-    private CardInstance?[]? BuildSocketsFromOfficialLinkedList(LinkedList<OfficialSocketNode> list)
+    private static CardInstance?[]? BuildSocketsFromOfficialLinkedList(LinkedList<OfficialSocketNode> list)
     {
         var arr = new CardInstance?[Capacity];
         int cursor = 0;
@@ -733,14 +773,10 @@ public sealed class BoardGrid
             if (cursor + w > Capacity) return null;
             for (int k = 0; k < w; k++)
             {
-                int slot = cursor + k;
-                if (n.Value.Card != null && !IsSlotUnlocked(slot))
-                    return null;
-                arr[slot] = n.Value.Card;
+                arr[cursor + k] = n.Value.Card;
             }
             cursor += w;
         }
-        if (cursor != Capacity) return null;
         return arr;
     }
 

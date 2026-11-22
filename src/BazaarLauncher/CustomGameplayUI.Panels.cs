@@ -2082,7 +2082,9 @@ internal sealed partial class CustomGameplayUI
         // 5. 隐藏画布与射线检测彻底休眠（消除空转 Overdraw 与 EventSystem 射线扫描损耗）
         if (_hudCanvas != null)
         {
-            bool anyHud = showPill || showInRunBadge || showSpeedChip || showTourneyWait;
+            // P1-49：将活跃 Toast 纳入 anyHud，避免弹窗打开或主菜单关闭胶囊时被定时 RefreshHudOverlays 误熄灭
+            bool showToast = _toastGo != null && _toastGo.activeSelf;
+            bool anyHud = showPill || showInRunBadge || showSpeedChip || showTourneyWait || showToast;
             if (_hudCanvas.enabled != anyHud) _hudCanvas.enabled = anyHud;
             if (_hudRaycaster != null)
             {
@@ -2748,11 +2750,24 @@ internal sealed partial class CustomGameplayUI
                     rules.EnsureCollections();
                     if (isSkill)
                     {
-                        rules.StartingSkills.Add(new StartingSkillRule
+                        string selectedTier = Tiers[Math.Clamp(buf.SkillTierIdx, 0, Tiers.Length - 1)];
+                        // P1-44：技能按 TemplateId 去重，避免重复添加同一技能导致客户端 SkillPresentationManager._skillProxyLookup 抛键冲突异常
+                        var existing = rules.StartingSkills.FirstOrDefault(
+                            s => s != null && string.Equals(s.TemplateId, cap.Id, StringComparison.OrdinalIgnoreCase));
+                        if (existing != null)
                         {
-                            TemplateId = cap.Id,
-                            Tier = Tiers[Math.Clamp(buf.SkillTierIdx, 0, Tiers.Length - 1)],
-                        });
+                            existing.Tier = selectedTier;
+                            SetStatus($"技能「{cap.NameZh}」已在开局技能列表中，已更新为 {selectedTier} 品质（同技能不可重复添加）。", isError: false);
+                            ShowToastBanner($"已更新开局技能「{cap.NameZh}」为 {selectedTier}（自动去重）");
+                        }
+                        else
+                        {
+                            rules.StartingSkills.Add(new StartingSkillRule
+                            {
+                                TemplateId = cap.Id,
+                                Tier = selectedTier,
+                            });
+                        }
                     }
                     else
                     {
@@ -2773,12 +2788,31 @@ internal sealed partial class CustomGameplayUI
         return true;
     }
 
+    private static void DeduplicateStartingSkillsInPlace(CustomRunRuleSet rules)
+    {
+        if (rules?.StartingSkills == null || rules.StartingSkills.Count <= 1) return;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < rules.StartingSkills.Count;)
+        {
+            var entry = rules.StartingSkills[i];
+            if (entry == null || string.IsNullOrWhiteSpace(entry.TemplateId) || !seen.Add(entry.TemplateId.Trim()))
+            {
+                rules.StartingSkills.RemoveAt(i);
+            }
+            else
+            {
+                i++;
+            }
+        }
+    }
+
     private bool RebuildSelectedCards(RuleEditorWidgets w, bool isSkill, CustomRunRuleSet rules, Action onChanged)
     {
         rules.EnsureCollections();
         string fp;
         if (isSkill)
         {
+            DeduplicateStartingSkillsInPlace(rules);
             fp = $"{_catalogLoaded}|{rules.StartingSkills.Count}:{string.Join(",", rules.StartingSkills.Select(s => $"{s.TemplateId}/{s.Tier}"))}";
             if (string.Equals(w.BuiltSelectedSkillsFingerprint, fp, StringComparison.Ordinal))
             {

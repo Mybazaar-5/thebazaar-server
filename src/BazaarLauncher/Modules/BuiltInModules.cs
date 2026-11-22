@@ -139,15 +139,15 @@ internal sealed class CompatGameSimModule : BuiltInModuleBase
 {
     public CompatGameSimModule()
         : base("bazaar.compat.gamesim", "协议与战斗事件兼容防护", "Compat",
-            "保护 CombatSimHandler / VFXManager / GameSimHandler / Quest / 结算与 PvP 对手同步，缓存热路径反射并兼容只读事件列表。", defaultEnabled: true, supportsHotReload: true)
+            "保护 CombatSimHandler / VFXManager / GameSimHandler / SkillPresentationManager / Quest / 结算与 PvP 对手同步，缓存热路径反射并兼容只读事件列表。", defaultEnabled: true, supportsHotReload: true)
     { }
 
     protected override void OnEnableWithPatcher(SafeHarmonyPatcher patcher)
     {
-        CompatAuditPatch.ApplyGameSimGroup(patcher.RawHarmony);
+        CompatAuditPatch.ApplyGameSimGroup(patcher);
     }
 
-    protected override void OnDisableCore() => CompatAuditPatch.ResetAppliedFlag();
+    protected override void OnDisableCore() => CompatAuditPatch.ResetGameSimAppliedFlag();
 }
 
 /// <summary>模块 6：强化基座与悬停高亮兼容组（Compat.HintEnchantModule）。</summary>
@@ -160,10 +160,10 @@ internal sealed class CompatHintEnchantModule : BuiltInModuleBase
 
     protected override void OnEnableWithPatcher(SafeHarmonyPatcher patcher)
     {
-        CompatAuditPatch.ApplyPedestalAndHintGroup(patcher.RawHarmony);
+        CompatAuditPatch.ApplyPedestalAndHintGroup(patcher);
     }
 
-    protected override void OnDisableCore() => CompatAuditPatch.ResetAppliedFlag();
+    protected override void OnDisableCore() => CompatAuditPatch.ResetHintEnchantAppliedFlag();
 }
 
 /// <summary>模块 7：遭遇立绘补全与挑战空安全组（Compat.EncounterAssetModule）。</summary>
@@ -171,15 +171,15 @@ internal sealed class CompatEncounterAssetModule : BuiltInModuleBase
 {
     public CompatEncounterAssetModule()
         : base("bazaar.compat.encounter_assets", "遭遇立绘与挑战防崩溃防护", "Compat",
-            "为子事件/EncounterStep 自动回退父事件立绘与 Tooltip，防止结算页 PrizePassChallengesView 空引用崩溃。", defaultEnabled: true, supportsHotReload: true)
+            "为子事件/EncounterStep 自动回退父事件立绘与 Tooltip，防止结算页 PrizePassChallengesView 与 EndOfRunChallengesController 空引用崩溃。", defaultEnabled: true, supportsHotReload: true)
     { }
 
     protected override void OnEnableWithPatcher(SafeHarmonyPatcher patcher)
     {
-        CompatAuditPatch.ApplyEncounterAndChallengeGroup(patcher.RawHarmony);
+        CompatAuditPatch.ApplyEncounterAndChallengeGroup(patcher);
     }
 
-    protected override void OnDisableCore() => CompatAuditPatch.ResetAppliedFlag();
+    protected override void OnDisableCore() => CompatAuditPatch.ResetEncounterAssetAppliedFlag();
 }
 
 /// <summary>模块 8：原生工坊、规则预设与多人社交综合面板（Gameplay.WorkshopUiModule）。</summary>

@@ -16,6 +16,7 @@ public sealed class GameModeData
 
     public Dictionary<string, double> EncounterSpawnTierPercentages { get; set; } = new();
     public Dictionary<string, Dictionary<string, double>> ItemSkillSpawnTierPercantagesByDay { get; set; } = new();
+    /// <summary>官方 game_modes 表保留字段（5.0.0 DB 中四阶均为 0.0，保留反序列化兼容性）。</summary>
     public Dictionary<string, double> RewardSpawnTierPercentages { get; set; } = new();
 
     public int VictoriesToWin { get; set; } = 10;
@@ -26,6 +27,7 @@ public sealed class GameModeData
     public int HoursInADay { get; set; } = 6;
     public int ExperiencePerLevel { get; set; } = 8;
     public int ExperiencePerHour { get; set; } = 1;
+    /// <summary>自建服兼容扩展字段（官方 DB 无该键，恒默认 0，供测试与自定义规则覆写）。</summary>
     public int StartingExperience { get; set; } = 0;
     public int MaxLevel { get; set; } = 999;
     public int BurnDecrementByAsPercentage { get; set; } = 3;
@@ -174,7 +176,47 @@ public sealed class MonsterPlayerData
     public MonsterHandData Hand { get; set; } = new();
     public MonsterHandData? Stash { get; set; }
     public List<MonsterCardEntry> Skills { get; set; } = new();
+    /// <summary>官方 GameData.db monsters 表使用的嵌套结构 Player.Socket.Effects。</summary>
+    public MonsterSocketInventoryData? Socket { get; set; }
+    /// <summary>兼容旧版扁平字段 SocketEffects（若同时存在则与 Socket.Effects 去重合并）。</summary>
     public List<MonsterCardEntry> SocketEffects { get; set; } = new();
+
+    /// <summary>获取野怪生效的全部插槽效果（优先读取官方 Socket.Effects，并兼容合并遗留扁平 SocketEffects）。</summary>
+    public IReadOnlyList<MonsterCardEntry> GetEffectiveSocketEffects()
+    {
+        var nested = Socket?.Effects;
+        if (nested is { Count: > 0 })
+        {
+            if (SocketEffects.Count == 0)
+                return nested;
+
+            var merged = new List<MonsterCardEntry>(nested.Count + SocketEffects.Count);
+            merged.AddRange(nested);
+            for (int i = 0; i < SocketEffects.Count; i++)
+            {
+                var legacy = SocketEffects[i];
+                bool duplicate = false;
+                for (int j = 0; j < merged.Count; j++)
+                {
+                    if (string.Equals(merged[j].SocketId, legacy.SocketId, StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(merged[j].TemplateId, legacy.TemplateId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) merged.Add(legacy);
+            }
+            return merged;
+        }
+        return SocketEffects;
+    }
+}
+
+/// <summary>对应官方 TPlayerSocketInventory（monsters 表中 Player.Socket 节点）。</summary>
+public sealed class MonsterSocketInventoryData
+{
+    public List<MonsterCardEntry> Effects { get; set; } = new();
 }
 
 public sealed class MonsterHandData

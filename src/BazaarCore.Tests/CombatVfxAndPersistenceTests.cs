@@ -265,12 +265,14 @@ public sealed class CombatVfxAndPersistenceTests
         var cardTarget = Assert.IsType<EffectTargetCard>(freezeExec!.Target);
         Assert.Equal("ent_tgt", cardTarget.Target.Value);
 
-        // 2. 技能触发脉冲：必须包含 CombatSimEventEffectTriggered 与 EffectTargetCard -> ent_src
-        var skillPulse = allEvents.OfType<CombatSimEventEffectTriggered>().FirstOrDefault();
-        Assert.NotNull(skillPulse);
-        Assert.Equal("ent_skl", skillPulse!.Source!.Value.Value);
-        var pulseTarget = Assert.IsType<EffectTargetCard>(Assert.Single(skillPulse.Targets));
-        Assert.Equal("ent_src", pulseTarget.Target.Value);
+        // 2. P2-09：不再冗余发射客户端 0 消费的 CombatSimEventEffectTriggered，技能的 Haste 执行由 CombatSimEventEffectExecuted 完整驱动
+        Assert.DoesNotContain(allEvents, e => e is CombatSimEventEffectTriggered);
+        var skillExec = allEvents
+            .OfType<CombatSimEventEffectExecuted>()
+            .FirstOrDefault(e => e.Source == new InstanceId("ent_skl"));
+        Assert.NotNull(skillExec);
+        var skillTarget = Assert.IsType<EffectTargetCard>(skillExec!.Target);
+        Assert.Equal("ent_src", skillTarget.Target.Value);
     }
 
     [Fact]

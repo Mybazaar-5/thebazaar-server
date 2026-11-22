@@ -70,6 +70,9 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     private float _tendencySyncDueTime;
     private static bool _hooksApplied;
     private static BazaarLauncher.Core.SafeHarmonyPatcher _hostPatcher;
+    private static BazaarLauncher.Core.SafeHarmonyPatcher _fallbackPatcher;
+    private static int _lastEscConsumedFrame = -1;
+    private readonly List<IDisposable> _eventSubscriptions = new();
     private int _rulesVersion;
     private bool _hudDirty = true;
     private string _lastObservedAppState = "";
@@ -131,6 +134,12 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     {
         _hooksApplied = false;
         _hostPatcher = null;
+        _lastEscConsumedFrame = -1;
+        if (_fallbackPatcher != null)
+        {
+            try { _fallbackPatcher.UnpatchAll(); } catch { }
+            _fallbackPatcher = null;
+        }
         if (Instance != null)
         {
             var go = Instance.gameObject;
@@ -160,21 +169,25 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         InstallHarmonyHooksOnce();
         SceneManager.activeSceneChanged += OnActiveSceneChanged;
 
-        // 订阅事件总线实现事件驱动按需刷新（彻底取代 0.15s 高频轮询，修复 P1-1）
-        BazaarLauncherPlugin.Host?.EventBus.Subscribe<BazaarModSdk.RunStateChangedModEvent>(_ => MarkHudDirty());
-        BazaarLauncherPlugin.Host?.EventBus.Subscribe<BazaarModSdk.CombatLifecycleModEvent>(_ => MarkHudDirty());
-        BazaarLauncherPlugin.Host?.EventBus.Subscribe<BazaarModSdk.ActiveRulesUpdatedModEvent>(_ =>
+        // P1-49：保存所有 EventBus 订阅句柄并在 OnDestroy() 中全量释放，彻底杜绝热重载销毁实例泄漏
+        var bus = BazaarLauncherPlugin.Host?.EventBus;
+        if (bus != null)
         {
-            MarkHudDirty();
-            if (_isOpen) RefreshModalContentsIfOpen();
-        });
-        BazaarLauncherPlugin.Host?.EventBus.Subscribe<BazaarModSdk.ModAssetsSyncedModEvent>(_ =>
-        {
-            _pendingUpdates.Enqueue(() =>
+            _eventSubscriptions.Add(bus.Subscribe<BazaarModSdk.RunStateChangedModEvent>(_ => MarkHudDirty()));
+            _eventSubscriptions.Add(bus.Subscribe<BazaarModSdk.CombatLifecycleModEvent>(_ => MarkHudDirty()));
+            _eventSubscriptions.Add(bus.Subscribe<BazaarModSdk.ActiveRulesUpdatedModEvent>(_ =>
             {
-                if (_isOpen && _activeTab == UiTab.Workshop) RefreshWorkshopTabUi();
-            });
-        });
+                MarkHudDirty();
+                if (_isOpen) RefreshModalContentsIfOpen();
+            }));
+            _eventSubscriptions.Add(bus.Subscribe<BazaarModSdk.ModAssetsSyncedModEvent>(_ =>
+            {
+                _pendingUpdates.Enqueue(() =>
+                {
+                    if (_isOpen && _activeTab == UiTab.Workshop) RefreshWorkshopTabUi();
+                });
+            }));
+        }
     }
 
     private void Start()
@@ -186,8 +199,13 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
 
     private void OnDestroy()
     {
-        try { _socialSseCts?.Cancel(); _socialSseCts?.Dispose(); } catch { }
-        _socialSseCts = null;
+        for (int i = 0; i < _eventSubscriptions.Count; i++)
+        {
+            try { _eventSubscriptions[i]?.Dispose(); } catch { }
+        }
+        _eventSubscriptions.Clear();
+
+        StopSocialSse();
         if (Instance == this) Instance = null;
         SceneManager.activeSceneChanged -= OnActiveSceneChanged;
         if (_uiRootGo != null) Destroy(_uiRootGo);
@@ -196,6 +214,16 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
 
     private void OnActiveSceneChanged(Scene prev, Scene next)
     {
+        // P2-41：切场景时自动收起弹窗/开场提示防止遮挡场景过渡
+        if (_isOpen)
+        {
+            ClosePanel();
+        }
+        if (_showPreRunPrompt)
+        {
+            DismissOpeningPromptOnly();
+        }
+
         _lastPillKey = "";
         _lastInRunBadgeKey = "";
         _lastSpeedTenths = -1;
@@ -206,6 +234,12 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             _latestTourneyStatus = null;
             _tourneyWaitErrorNotice = "";
             _tourneyWaitErrorUntil = 0f;
+            // P2-41：返回主菜单清空跨局残留缓存并停用闲置 SSE 长连接
+            _lastOpeningPromptedRunId = "";
+            _autoAppliedLobbyIds.Clear();
+            _activeRunLockedMask = 0UL;
+            _activeRunFetchInFlight = false;
+            StopSocialSse();
         }
         _lastViewportScreenW = -1;
         _lastViewportScreenH = -1;
@@ -244,21 +278,14 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             SavePersonalTendencyDraftAsync(_normalRules.SelectedArchetypeMask);
         }
 
-        // 热键 F8 打开/收起，Esc 关闭弹窗（零分配检查）
+        // 热键 F8 打开/收起，Esc 关闭弹窗（零分配检查 + P1-49 同帧 FightMenuDialog 互斥防穿透）
         if (WasKeyPressedThisFrame(isEscape: false) && !IsInActiveCombatPlayback())
         {
             ToggleOpen();
         }
-        else if ((_isOpen || _showPreRunPrompt) && WasKeyPressedThisFrame(isEscape: true))
+        else if ((_isOpen || _showPreRunPrompt) && _lastEscConsumedFrame != Time.frameCount && WasKeyPressedThisFrame(isEscape: true))
         {
-            if (_showPreRunPrompt)
-            {
-                DismissOpeningPromptOnly();
-            }
-            else if (_isOpen)
-            {
-                ClosePanel();
-            }
+            TryConsumeEscapeForCustomModal();
         }
 
         // 事件驱动按需刷新（修复 P1-1 & 拖拽 Top 10）：将 AppState 反射轮询降频至 0.25s，避免每帧反射开销
@@ -392,6 +419,8 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         }
         catch { }
         RefreshHudOverlays(force: true);
+        // P2-41：弹窗关闭且非活跃锦标赛局/大厅上下文时停止闲置 SSE 长连接
+        SyncSocialSseForLobbyOrPanelState();
     }
 
     internal void SetOpenFromDriver(bool open, string tab)
@@ -732,6 +761,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                     {
                         _lobbyPollInFlight = false;
                         _currentLobby = null;
+                        SyncSocialSseForLobbyOrPanelState();
                         RefreshHudOverlays(force: true);
                         RefreshModalContentsIfOpen();
                     });
@@ -747,6 +777,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                         _lobbyPollInFlight = false;
                         _currentLobby = null;
                         _lobbyDirty = false;
+                        SyncSocialSseForLobbyOrPanelState();
                         RefreshHudOverlays(force: true);
                         RefreshModalContentsIfOpen();
                     });
@@ -777,6 +808,10 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                     _currentLobby = detail;
 
                     bool switchedLobby = !string.Equals(prevId, detail.LobbyId, StringComparison.OrdinalIgnoreCase);
+                    if (switchedLobby)
+                    {
+                        SyncSocialSseForLobbyOrPanelState();
+                    }
                     bool isHost = IsLocalPlayerLobbyHost(detail);
                     SyncNativeLobbyDtoPlayerCap(detail.PlayerCap);
 
@@ -1176,6 +1211,8 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         _showPreRunPrompt = false;
         if (_preRunPromptRoot != null) _preRunPromptRoot.SetActive(false);
         RefreshHudOverlays(force: true);
+        // P2-41：弹窗关闭且非活跃锦标赛局/大厅上下文时停止闲置 SSE 长连接
+        SyncSocialSseForLobbyOrPanelState();
     }
 
     private void LockOpeningTendencyOnActiveRunAsync(ulong rawMask, bool closePromptAfter)
@@ -1238,7 +1275,24 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         });
     }
 
-    // ── Harmony Hooks：原生锦标赛入厅自动加载记忆规则 & 同步提示 ──────────
+    private bool TryConsumeEscapeForCustomModal()
+    {
+        if (_showPreRunPrompt)
+        {
+            _lastEscConsumedFrame = Time.frameCount;
+            DismissOpeningPromptOnly();
+            return true;
+        }
+        if (_isOpen)
+        {
+            _lastEscConsumedFrame = Time.frameCount;
+            ClosePanel();
+            return true;
+        }
+        return false;
+    }
+
+    // ── Harmony Hooks：原生锦标赛入厅自动加载记忆规则、Esc 互斥与精确等待提示 ──
 
     private static void InstallHarmonyHooksOnce()
     {
@@ -1246,22 +1300,31 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         _hooksApplied = true;
         try
         {
-            // P0-6 修复：优先复用 ModuleHost 托管的 SafeHarmonyPatcher，确保禁用/卸载时 100% UnpatchAll 无僵尸补丁
-            var h = _hostPatcher?.RawHarmony ?? new Harmony("local.thebazaar.bazaarlauncher.customuihooks");
+            // P0-6 / P1-46：统一走 SafeHarmonyPatcher.TryPatchMethod（优先复用 ModuleHost 托管实例，兜底创建可卸载实例），彻底消灭 RawHarmony.Patch
+            var patcher = _hostPatcher
+                ?? (_fallbackPatcher ??= new BazaarLauncher.Core.SafeHarmonyPatcher("local.thebazaar.bazaarlauncher.customuihooks"));
 
             // 监听锦标赛大厅进入：房主建房/入厅时自动加载并应用 lastTournamentRules
             var lobbyStateType = AccessTools.TypeByName("TheBazaar.UI.Tournaments.TournamentLobbyState");
             var lobbyOnEnter = lobbyStateType == null ? null : AccessTools.Method(lobbyStateType, "OnEnter");
             if (lobbyOnEnter != null)
             {
-                h.Patch(lobbyOnEnter, postfix: new HarmonyMethod(typeof(CustomGameplayUI), nameof(OnNativeTournamentLobbyEnteredPostfix)));
+                patcher.TryPatchMethod(
+                    lobbyOnEnter,
+                    postfix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnNativeTournamentLobbyEnteredPostfix)),
+                    optional: true,
+                    label: "CustomUI.TournamentLobbyState.OnEnter");
             }
 
             var smType = AccessTools.TypeByName("TheBazaar.UI.Tournaments.TournamentPanelStateMachineController");
             var setLobby = smType == null ? null : AccessTools.Method(smType, "SetLobby");
             if (setLobby != null)
             {
-                h.Patch(setLobby, postfix: new HarmonyMethod(typeof(CustomGameplayUI), nameof(OnTournamentPanelSetLobbyPostfix)));
+                patcher.TryPatchMethod(
+                    setLobby,
+                    postfix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnTournamentPanelSetLobbyPostfix)),
+                    optional: true,
+                    label: "CustomUI.TournamentPanelStateMachineController.SetLobby");
             }
 
             // #13 拦截原生锦标赛建房流程，严格对齐记忆预设人数（8 / 10，绝不回落 16 / 1000）
@@ -1271,12 +1334,20 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 var hostOnEnable = AccessTools.Method(hostViewType, "OnEnable");
                 if (hostOnEnable != null)
                 {
-                    h.Patch(hostOnEnable, postfix: new HarmonyMethod(typeof(CustomGameplayUI), nameof(OnHostSettingsViewOnEnablePostfix)));
+                    patcher.TryPatchMethod(
+                        hostOnEnable,
+                        postfix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnHostSettingsViewOnEnablePostfix)),
+                        optional: true,
+                        label: "CustomUI.TournamentHostSettingsView.OnEnable");
                 }
                 var getCap = AccessTools.Method(hostViewType, "GetRequestedPlayerCap");
                 if (getCap != null)
                 {
-                    h.Patch(getCap, postfix: new HarmonyMethod(typeof(CustomGameplayUI), nameof(OnGetRequestedPlayerCapPostfix)));
+                    patcher.TryPatchMethod(
+                        getCap,
+                        postfix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnGetRequestedPlayerCapPostfix)),
+                        optional: true,
+                        label: "CustomUI.TournamentHostSettingsView.GetRequestedPlayerCap");
                 }
             }
 
@@ -1284,10 +1355,12 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             var createLobby = tourneyHttpType == null ? null : AccessTools.Method(tourneyHttpType, "CreateLobby");
             if (createLobby != null)
             {
-                h.Patch(
+                patcher.TryPatchMethod(
                     createLobby,
-                    prefix: new HarmonyMethod(typeof(CustomGameplayUI), nameof(OnCreateTournamentLobbyPrefix)),
-                    postfix: new HarmonyMethod(typeof(CustomGameplayUI), nameof(OnCreateTournamentLobbyPostfix)));
+                    prefix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnCreateTournamentLobbyPrefix)),
+                    postfix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnCreateTournamentLobbyPostfix)),
+                    optional: true,
+                    label: "CustomUI.TournamentHttpClient.CreateLobby");
             }
 
             // #16 监听锦标赛实时状态与等待对手 PvP 错误包，提供清晰简体中文状态提示
@@ -1298,7 +1371,11 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 var applyStatus = AccessTools.Method(_cachedTssType, "ApplyStatus");
                 if (applyStatus != null)
                 {
-                    h.Patch(applyStatus, postfix: new HarmonyMethod(typeof(CustomGameplayUI), nameof(OnTournamentApplyStatusPostfix)));
+                    patcher.TryPatchMethod(
+                        applyStatus,
+                        postfix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnTournamentApplyStatusPostfix)),
+                        optional: true,
+                        label: "CustomUI.TournamentStatusService.ApplyStatus");
                 }
             }
 
@@ -1306,13 +1383,51 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             var handleCmdErr = netMgrType == null ? null : AccessTools.Method(netMgrType, "HandleCommandErrorMessage");
             if (handleCmdErr != null)
             {
-                h.Patch(handleCmdErr, prefix: new HarmonyMethod(typeof(CustomGameplayUI), nameof(OnNetworkCommandErrorPrefix)));
+                patcher.TryPatchMethod(
+                    handleCmdErr,
+                    prefix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnNetworkCommandErrorPrefix)),
+                    optional: true,
+                    label: "CustomUI.NetworkManager.HandleCommandErrorMessage");
+            }
+
+            // P1-49：FightMenuDialog.OpenMenu 仅由 PopupManager.HandleEscape 调用（右上角齿轮按钮直接走 ShowDialogs），
+            // 挂载同帧 Esc 互斥 Prefix 彻底防止按 Esc 关自定义弹窗时穿透拉起原生暂停菜单
+            var fightMenuType = GameInspector.FindTypeSafe("FightMenuDialog", "TheBazaar.FightMenuDialog");
+            var openMenuMethod = fightMenuType == null ? null : AccessTools.Method(fightMenuType, "OpenMenu", Type.EmptyTypes);
+            if (openMenuMethod != null)
+            {
+                patcher.TryPatchMethod(
+                    openMenuMethod,
+                    prefix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnFightMenuOpenMenuPrefix)),
+                    optional: true,
+                    label: "CustomUI.FightMenuDialog.OpenMenu");
             }
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("InstallHarmonyHooksOnce: " + ex.Message);
         }
+    }
+
+    private static bool OnFightMenuOpenMenuPrefix()
+    {
+        try
+        {
+            int frame = Time.frameCount;
+            // 顺序 1：CustomGameplayUI.Update() 本帧已消费 Esc 关闭自定义弹窗
+            if (_lastEscConsumedFrame == frame)
+                return false;
+
+            // 顺序 2：PopupManager.HandleEscape 先于 CustomGameplayUI.Update() 执行，立即消费 Esc 关闭自定义弹窗并拦截原生暂停菜单
+            var inst = Instance;
+            if (inst != null && (inst._isOpen || inst._showPreRunPrompt))
+            {
+                inst.TryConsumeEscapeForCustomModal();
+                return false;
+            }
+        }
+        catch { }
+        return true;
     }
 
     private static int ResolvePreferredHostPlayerCap()
@@ -1468,9 +1583,11 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         {
             if (message == null) return true;
             string raw = GameInspector.GetMember(message, "Message") as string;
-            if (string.IsNullOrWhiteSpace(raw)) return true;
+            string msgId = GameInspector.GetMember(message, "MessageId") as string;
+            string errType = GameInspector.GetMember(message, "ErrorType")?.ToString() ?? "";
+            if (string.IsNullOrWhiteSpace(raw) && string.IsNullOrWhiteSpace(msgId)) return true;
 
-            if (!TryMapTournamentWaitingErrorZh(raw, out string zhNotice))
+            if (!TryMapTournamentWaitingErrorZh(raw, msgId, errType, out string zhNotice))
                 return true;
 
             // 触发原生 Events.CombatBlocked 让状态机保持备战一致，并用右上角简体中文横幅代替英文弹窗阻塞
@@ -1505,40 +1622,50 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         }
     }
 
-    private static bool TryMapTournamentWaitingErrorZh(string raw, out string zhNotice)
+    private const string TournamentPvpWaitSyncCode = "TOURNAMENT_PVP_WAIT_SYNC";
+
+    private static bool TryMapTournamentWaitingErrorZh(string raw, string messageId, string errorType, out string zhNotice)
     {
         zhNotice = "";
-        if (string.IsNullOrWhiteSpace(raw)) return false;
+        string trimmed = (raw ?? "").Trim();
+        string trimmedId = (messageId ?? "").Trim();
 
-        bool tourneyContext = IsActiveRunTournamentMode() || _latestTourneyStatus != null;
-        bool looksLikeWait = raw.IndexOf("Combat will begin shortly", StringComparison.OrdinalIgnoreCase) >= 0
-            || raw.IndexOf("Waiting for other", StringComparison.OrdinalIgnoreCase) >= 0
-            || raw.IndexOf("Waiting for player", StringComparison.OrdinalIgnoreCase) >= 0
-            || raw.IndexOf("Hour 6", StringComparison.OrdinalIgnoreCase) >= 0
-            || raw.IndexOf("reach day", StringComparison.OrdinalIgnoreCase) >= 0
-            || raw.IndexOf("waiting for human", StringComparison.OrdinalIgnoreCase) >= 0
-            || raw.IndexOf("PvP", StringComparison.OrdinalIgnoreCase) >= 0 && raw.IndexOf("wait", StringComparison.OrdinalIgnoreCase) >= 0
-            || raw.IndexOf("等待", StringComparison.Ordinal) >= 0;
+        // P1-49：彻底移除宽泛子串匹配（如 "等待" / "Hour 6" / "reach day" 等），仅匹配精确错误码或官方/自建服务端锚定屏障文案
+        bool isExactWaitCode = string.Equals(trimmedId, TournamentPvpWaitSyncCode, StringComparison.Ordinal)
+            || string.Equals(trimmed, TournamentPvpWaitSyncCode, StringComparison.Ordinal)
+            || trimmed.StartsWith("[" + TournamentPvpWaitSyncCode + "]", StringComparison.Ordinal)
+            || trimmed.StartsWith(TournamentPvpWaitSyncCode + ":", StringComparison.Ordinal);
 
-        if (!looksLikeWait) return false;
-        if (!tourneyContext && !raw.Equals("Combat will begin shortly.", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        if (raw.IndexOf("Hour 6", StringComparison.OrdinalIgnoreCase) >= 0
-            || raw.IndexOf("第6小时", StringComparison.Ordinal) >= 0
-            || raw.IndexOf("第 6 小时", StringComparison.Ordinal) >= 0)
-        {
-            zhNotice = "已到达第 6 小时备战区，正在等待其余真人选手抵达第 6 小时...";
-        }
-        else if (raw.IndexOf("day", StringComparison.OrdinalIgnoreCase) >= 0)
-        {
-            zhNotice = "正在等待其余锦标赛选手同步进入新的一天...";
-        }
-        else
+        if (isExactWaitCode)
         {
             zhNotice = "已提交备战，正在等待其余选手就位后开启 PvP 对决...";
+            return true;
         }
-        return true;
+
+        if (string.Equals(trimmed, "Combat will begin shortly.", StringComparison.Ordinal)
+            || string.Equals(trimmed, "Waiting for the remaining tournament players to finish PvP.", StringComparison.Ordinal))
+        {
+            zhNotice = "已提交备战，正在等待其余选手就位后开启 PvP 对决...";
+            return true;
+        }
+
+        // 自建服务端锦标赛 Hour 6 屏障（RunEngine / TournamentEndpoints 明确下发的 NotAllowed 锚定前缀），且严格限定当前处于锦标赛对局内
+        if (IsActiveRunTournamentMode()
+            && string.Equals(errorType, "NotAllowed", StringComparison.Ordinal))
+        {
+            if (trimmed.StartsWith("需等待同房真人玩家到达第 ", StringComparison.Ordinal))
+            {
+                zhNotice = "已到达第 6 小时备战区，正在等待其余真人选手抵达第 6 小时...";
+                return true;
+            }
+            if (trimmed.StartsWith("正在等待其他真人玩家完成第 ", StringComparison.Ordinal))
+            {
+                zhNotice = "已提交备战，正在等待其余选手就位后开启 PvP 对决...";
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static void OnNativeTournamentLobbyEnteredPostfix(object __instance)

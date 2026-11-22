@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using BazaarCore.Data;
 using BazaarCore.Engine;
 using BazaarCore.Models;
@@ -40,6 +42,8 @@ public sealed class CardPool
         public bool ShouldProgressHour { get; init; } = true;
         public bool IsReselectable { get; init; }
         public string? NewSetIdOnExit { get; init; }
+        public string? BoardOverride { get; init; }
+        public string? Presentation { get; init; }
 
         /// <summary>事件/商店/开局选择上下文（含 SpawnContext 与 Rules）。</summary>
         public SelectionContextData? SelectionContext { get; init; }
@@ -80,6 +84,12 @@ public sealed class CardPool
         public string? BaseVisualTemplateId { get; init; }
         /// <summary>所属 Mod ID（官方原生卡为 null）。</summary>
         public string? ModId { get; init; }
+        /// <summary>Mod 自定义遭遇相对抽签权重（纯原版卡为 null）。</summary>
+        public double? ModSpawnWeight { get; init; }
+        /// <summary>Mod 自定义遭遇最早允许出现天数（纯原版卡为 null）。</summary>
+        public int? ModMinDay { get; init; }
+        /// <summary>Mod 自定义遭遇最晚允许出现天数（纯原版卡为 null）。</summary>
+        public int? ModMaxDay { get; init; }
         /// <summary>是否为 Mod 自定义卡。</summary>
         public bool IsCustomModCard => !string.IsNullOrWhiteSpace(BaseVisualTemplateId);
     }
@@ -91,6 +101,26 @@ public sealed class CardPool
     public const string JungleExpeditionRoomId = "91287d25-7f63-4826-8c42-06ed1bf83213";
     public const string CrashSiteExpeditionRoomId = "ead0a1ed-703e-445e-ba43-9a7df5d64f54";
     public const string TinyWorldExpeditionRoomId = "42db3205-58d5-4cfe-b537-14091b518ff6";
+
+    // P1-01：官方 GameData.db cards.NewSetIdOnExit 全部 5 个替换遭遇集（Replacement Set）GUID
+    public const string ReplacementSetCrashSiteId = "bc2ca2fe-2958-4cff-8c5a-ff30592d2b76";
+    public const string ReplacementSetJungleFieryId = "ffc6b072-d9e1-4a1c-b0e7-6d0a9da5c591";
+    public const string ReplacementSetJungleToxicId = "fc9adb79-acc7-4021-800c-358853eae91f";
+    public const string ReplacementSetJungleObsidianId = "3e44be75-cf74-489f-9c9c-a5a1d64bd172";
+    public const string ReplacementSetTinyWorldId = "e40c7e1f-6c6c-4a13-ad28-7bcd0d1af531";
+
+    // P0-15 / P0-16：全局联动 Takeover 与特殊 GuidOnly 事件常量
+    public const string StarChartItemId = "5abf3441-11cb-4dbd-8d69-d4829f8df687";
+    public const string StarChartTreasureEncounterId = "34c27d0d-2aa2-40a1-8276-791ee7086da1";
+    public const string GrandOpeningEncounterId = "39e4aeb6-06f8-45af-a5d1-7e0ca01bd194";
+
+    /// <summary>P0-16：须剔除的 2 张任务残留 GuidOnly 事件（The Financial District - Blacksmith Investment / Furry Return）。</summary>
+    public static readonly IReadOnlySet<string> ExcludedQuestRemnantEncounterIds =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "7676de25-e0eb-4aa2-a33c-0570ddf4777a",
+            "be759478-d828-4bc2-8268-0596f2c731aa",
+        };
 
     // 官方 4 座常规白昼地图基座 GUID（V13.1 问题 #2 天数门禁与单局唯一调度）
     public const string PedestalB1B2Id = "2e1e5a86-3ace-4f78-8b73-6641ca59e834";
@@ -171,6 +201,10 @@ public sealed class CardPool
         public required Dictionary<string, string> CustomToBaseVisualId { get; init; }
         public required int AssetValidCount { get; init; }
         public ILocalizationStore? Localization { get; init; }
+        public HashSet<string> ReferencedCardIds { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        public GuidOnlyHourlyEncounterCatalog? GuidOnlyCatalog { get; set; }
+        public ConcurrentDictionary<string, List<CardTemplate>> HourlyEncountersCache { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public ConcurrentDictionary<string, List<CardTemplate>> HeroTakeoverCache { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     private volatile PoolSnapshot _snap = new()
@@ -254,7 +288,9 @@ public sealed class CardPool
         if (Guid.TryParse(repo.GameMode.Id, out var gmGuid))
             pool.DefaultGameModeId = gmGuid;
         if (repo.GameMode.ItemSkillSpawnTierPercantagesByDay is { Count: > 0 })
-            pool.TierChancesByDay = TierChances.FromGameModeMap(repo.GameMode.ItemSkillSpawnTierPercantagesByDay);
+            pool.TierChancesByDay = TierChances.FromGameModeMap(
+                repo.GameMode.ItemSkillSpawnTierPercantagesByDay,
+                repo.GameMode.NumberOfDays > 0 ? repo.GameMode.NumberOfDays : 10);
         if (repo.GameMode.StandardPrices != null)
             pool.StandardPrices = repo.GameMode.StandardPrices;
 
@@ -318,6 +354,7 @@ public sealed class CardPool
             ZhTranslationLoadedFrom ??= activeRepo.Localization?.SourcePath ?? "<overlay>";
         }
 
+        var referencedIds = CollectRepositoryReferencedCardIds(activeRepo);
         _snap = new PoolSnapshot
         {
             All = all,
@@ -326,6 +363,7 @@ public sealed class CardPool
             CustomToBaseVisualId = customMap,
             AssetValidCount = validCount,
             Localization = activeRepo.Localization,
+            ReferencedCardIds = referencedIds,
         };
     }
 
@@ -418,6 +456,8 @@ public sealed class CardPool
             ShouldProgressHour = core.ShouldProgressHour ?? true,
             IsReselectable = core.IsReselectable ?? false,
             NewSetIdOnExit = core.NewSetIdOnExit,
+            BoardOverride = core.BoardOverride,
+            Presentation = core.Presentation,
             SelectionContext = core.SelectionContext,
             NextEncounterOnSelection = core.NextEncounterOnSelection != null
                 ? new List<NextEncounterOption>(core.NextEncounterOnSelection)
@@ -442,6 +482,9 @@ public sealed class CardPool
             RewardDefeat = core.RewardDefeat,
             BaseVisualTemplateId = binding?.BaseVisualTemplateId,
             ModId = binding?.ModId ?? (core.Version?.StartsWith("mod:", StringComparison.OrdinalIgnoreCase) == true ? core.Version[4..] : null),
+            ModSpawnWeight = core.ModSpawnWeight,
+            ModMinDay = core.ModMinDay,
+            ModMaxDay = core.ModMaxDay,
         };
     }
 
@@ -493,7 +536,9 @@ public sealed class CardPool
                         if (gmData != null)
                         {
                             if (gmData.ItemSkillSpawnTierPercantagesByDay is { Count: > 0 })
-                                pool.TierChancesByDay = TierChances.FromGameModeMap(gmData.ItemSkillSpawnTierPercantagesByDay);
+                                pool.TierChancesByDay = TierChances.FromGameModeMap(
+                                    gmData.ItemSkillSpawnTierPercantagesByDay,
+                                    gmData.NumberOfDays > 0 ? gmData.NumberOfDays : 10);
                             if (gmData.StandardPrices != null)
                                 pool.StandardPrices = gmData.StandardPrices;
                         }
@@ -509,6 +554,7 @@ public sealed class CardPool
         var all = new List<CardTemplate>(3600);
         var byId = new Dictionary<string, CardTemplate>(3600, StringComparer.OrdinalIgnoreCase);
         var byType = new Dictionary<string, List<CardTemplate>>(StringComparer.OrdinalIgnoreCase);
+        var referencedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         int validCount = 0;
 
         using var cmd = conn.CreateCommand();
@@ -519,6 +565,7 @@ public sealed class CardPool
             string id = reader.GetString(0);
             byte[] blob = (byte[])reader.GetValue(1);
             string json = System.Text.Encoding.UTF8.GetString(blob);
+            CollectJsonGuidRefs(json, id, referencedIds);
             var t = Parse(id, json);
             if (t == null) continue;
             all.Add(t);
@@ -533,6 +580,23 @@ public sealed class CardPool
                 validCount++;
         }
 
+        // 同步扫描 level_ups 表引用的遭遇/步骤 GUID，防止升级池专用卡被误纳入白昼常规 GuidOnly 目录
+        try
+        {
+            using var luCmd = conn.CreateCommand();
+            luCmd.CommandText = "SELECT Data FROM level_ups";
+            using var luReader = luCmd.ExecuteReader();
+            while (luReader.Read())
+            {
+                if (luReader.IsDBNull(0)) continue;
+                string luJson = luReader.GetValue(0) is byte[] b
+                    ? System.Text.Encoding.UTF8.GetString(b)
+                    : luReader.GetString(0);
+                CollectJsonGuidRefs(luJson, selfId: null, referencedIds);
+            }
+        }
+        catch { }
+
         pool._snap = new PoolSnapshot
         {
             All = all,
@@ -540,6 +604,7 @@ public sealed class CardPool
             ByType = byType,
             CustomToBaseVisualId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
             AssetValidCount = validCount,
+            ReferencedCardIds = referencedIds,
         };
         pool.LoadedFrom = dbPath;
         Console.WriteLine(
@@ -908,6 +973,10 @@ public sealed class CardPool
                 IsReselectable = Bool(r, "IsReselectable", false),
                 NewSetIdOnExit = r.TryGetProperty("NewSetIdOnExit", out var nse) && nse.ValueKind == JsonValueKind.String
                     ? nse.GetString() : null,
+                BoardOverride = r.TryGetProperty("BoardOverride", out var bo) && bo.ValueKind == JsonValueKind.String
+                    ? bo.GetString() : null,
+                Presentation = r.TryGetProperty("Presentation", out var pres) && pres.ValueKind == JsonValueKind.String
+                    ? pres.GetString() : null,
                 SelectionContext = selectionContext,
                 NextEncounterOnSelection = nextEncounters,
                 SelectionRequirements = selReqs,
@@ -1011,11 +1080,17 @@ public sealed class CardPool
     /// 且排除 Tutorial / DEFUNCT / [DEBUG] / (Level Up) / (Start Run) / (Start Skill) / Greenheart 的遭遇。
     /// </summary>
     public List<CardTemplate> HourlyEncounters(string hero, string kind)
-        => OfType(kind)
-            .Where(t => IsPlayerSpawnable(t, allowGuidOnly: false))
-            .Where(t => t.Heroes.Contains(hero, StringComparer.OrdinalIgnoreCase) || t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase))
-            .Where(t => !IsNonHourlySystemEncounter(t))
-            .ToList();
+    {
+        var snap = _snap;
+        string cacheKey = $"{hero}|{kind}";
+        var cached = snap.HourlyEncountersCache.GetOrAdd(cacheKey, _ =>
+            OfType(kind)
+                .Where(t => IsPlayerSpawnable(t, allowGuidOnly: false))
+                .Where(t => t.Heroes.Contains(hero, StringComparer.OrdinalIgnoreCase) || t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase))
+                .Where(t => !IsNonHourlySystemEncounter(t))
+                .ToList());
+        return new List<CardTemplate>(cached);
+    }
 
     private static bool IsNonHourlySystemEncounter(CardTemplate t)
     {
@@ -1094,6 +1169,196 @@ public sealed class CardPool
         }
         ticketTemplateId = null;
         return false;
+    }
+
+    /// <summary>P1-25：返回官方三张探险门票对应的探险开放日（CrashSite=6 / Jungle=9 / TinyWorld=10，非门票返回 0）。</summary>
+    public static int GetScheduledDayForExpeditionTicket(string? ticketTemplateId)
+    {
+        if (string.IsNullOrWhiteSpace(ticketTemplateId)) return 0;
+        if (ticketTemplateId.Equals(CrashSiteExpeditionTicketId, StringComparison.OrdinalIgnoreCase)) return 6;
+        if (ticketTemplateId.Equals(JungleExpeditionTicketId, StringComparison.OrdinalIgnoreCase)) return 9;
+        if (ticketTemplateId.Equals(TinyWorldExpeditionTicketId, StringComparison.OrdinalIgnoreCase)) return 10;
+        return 0;
+    }
+
+    /// <summary>
+    /// P1-25：判断探险门票在给定 (day, hour) 下是否已过期（官方门票仅在对应探险日 Hour 1 开放，
+    /// 因此未过期条件严格为 <c>day &lt; scheduledDay || (day == scheduledDay &amp;&amp; hour == 0)</c>）。
+    /// </summary>
+    public static bool IsExpeditionTicketExpired(string? ticketTemplateId, int day, int hour)
+    {
+        int scheduledDay = GetScheduledDayForExpeditionTicket(ticketTemplateId);
+        if (scheduledDay <= 0) return false;
+        return !(day < scheduledDay || (day == scheduledDay && hour == 0));
+    }
+
+    /// <summary>P0-15：返回当前英雄全部合法的 GuidOnly + IsTakeover 专属传奇单次奇遇。</summary>
+    public List<CardTemplate> GetHeroTakeoverEncounters(string hero)
+    {
+        var snap = _snap;
+        var cached = snap.HeroTakeoverCache.GetOrAdd(hero, h =>
+            OfType("EventEncounter")
+                .Where(t => t.IsTakeover
+                         && string.Equals(t.SpawningEligibility, "GuidOnly", StringComparison.OrdinalIgnoreCase)
+                         && !t.Id.Equals(StarChartTreasureEncounterId, StringComparison.OrdinalIgnoreCase)
+                         && IsPlayerSpawnable(t, allowGuidOnly: true)
+                         && !IsNonHourlySystemEncounter(t)
+                         && t.Heroes.Contains(h, StringComparer.OrdinalIgnoreCase)
+                         && !t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase))
+                .ToList());
+        return new List<CardTemplate>(cached);
+    }
+
+    /// <summary>P0-15：返回全局联动 IsTakeover 奇遇 Star Chart Treasure（34c27d0d）。</summary>
+    public CardTemplate? GetStarChartTreasureEncounter()
+    {
+        var tpl = GetIfAssetValid(StarChartTreasureEncounterId);
+        if (tpl == null || !tpl.IsTakeover || !IsPlayerSpawnable(tpl, allowGuidOnly: true))
+            return null;
+        return tpl;
+    }
+
+    /// <summary>P0-16：获取当前卡池快照对应的数据驱动 GuidOnly 白昼奇遇目录（按需构建并随快照缓存）。</summary>
+    public GuidOnlyHourlyEncounterCatalog GetGuidOnlyHourlyCatalog()
+    {
+        var snap = _snap;
+        var existing = snap.GuidOnlyCatalog;
+        if (existing != null) return existing;
+
+        var built = GuidOnlyHourlyEncounterCatalog.Build(this, snap.All, snap.ReferencedCardIds);
+        snap.GuidOnlyCatalog = built;
+        return built;
+    }
+
+    private static readonly Regex GuidRefRegex = new(
+        @"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        RegexOptions.Compiled);
+
+    private static void CollectJsonGuidRefs(string? json, string? selfId, HashSet<string> referencedIds)
+    {
+        if (string.IsNullOrEmpty(json)) return;
+        foreach (Match m in GuidRefRegex.Matches(json))
+        {
+            string g = m.Value;
+            if (!string.IsNullOrEmpty(selfId) && g.Equals(selfId, StringComparison.OrdinalIgnoreCase))
+                continue;
+            referencedIds.Add(g);
+        }
+    }
+
+    private static HashSet<string> CollectRepositoryReferencedCardIds(GameDataRepository repo)
+    {
+        var refs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var card in repo.CardsById.Values)
+        {
+            if (card == null) continue;
+            string selfId = card.Id;
+            if (card.SelectionContext?.SpawnContext != null)
+                CollectRuleNodeGuidRefs(card.SelectionContext.SpawnContext, selfId, refs);
+            if (card.SelectionContext?.Rules?.NextEncounterOnExit is { } exitElem)
+            {
+                CollectJsonGuidRefs(exitElem.GetRawText(), selfId, refs);
+            }
+            if (card.NextEncounterOnSelection != null)
+            {
+                foreach (var opt in card.NextEncounterOnSelection)
+                {
+                    if (!string.IsNullOrWhiteSpace(opt.Id) && !opt.Id.Equals(selfId, StringComparison.OrdinalIgnoreCase))
+                        refs.Add(opt.Id);
+                }
+            }
+            if (card.RewardVictory?.SpawnContext != null)
+                CollectRuleNodeGuidRefs(card.RewardVictory.SpawnContext, selfId, refs);
+            if (card.RewardDefeat?.SpawnContext != null)
+                CollectRuleNodeGuidRefs(card.RewardDefeat.SpawnContext, selfId, refs);
+            if (card.Abilities != null)
+            {
+                foreach (var ab in card.Abilities.Values)
+                {
+                    CollectRuleNodeGuidRefs(ab.Trigger, selfId, refs);
+                    CollectRuleNodeGuidRefs(ab.Action, selfId, refs);
+                    if (ab.Prerequisites != null)
+                    {
+                        foreach (var p in ab.Prerequisites)
+                            CollectRuleNodeGuidRefs(p, selfId, refs);
+                    }
+                }
+            }
+            if (card.Auras != null)
+            {
+                foreach (var au in card.Auras.Values)
+                {
+                    CollectRuleNodeGuidRefs(au.Action, selfId, refs);
+                    if (au.Prerequisites != null)
+                    {
+                        foreach (var p in au.Prerequisites)
+                            CollectRuleNodeGuidRefs(p, selfId, refs);
+                    }
+                }
+            }
+        }
+        return refs;
+    }
+
+    private static void CollectRuleNodeGuidRefs(RuleNode? node, string selfId, HashSet<string> refs)
+    {
+        if (node == null) return;
+
+        void AddIfGuid(string? candidate)
+        {
+            if (string.IsNullOrWhiteSpace(candidate)) return;
+            if (candidate.Length == 36 && Guid.TryParse(candidate, out _) &&
+                !candidate.Equals(selfId, StringComparison.OrdinalIgnoreCase))
+            {
+                refs.Add(candidate);
+            }
+        }
+
+        AddIfGuid(node.Id);
+        AddIfGuid(node.EncounterId);
+        AddIfGuid(node.MonsterTemplateId);
+        if (node.Ids != null)
+        {
+            foreach (string id in node.Ids) AddIfGuid(id);
+        }
+        if (node.EncounterIds != null)
+        {
+            foreach (string id in node.EncounterIds) AddIfGuid(id);
+        }
+
+        CollectRuleNodeGuidRefs(node.ReferenceValue, selfId, refs);
+        CollectRuleNodeGuidRefs(node.Target, selfId, refs);
+        CollectRuleNodeGuidRefs(node.TargetPlayer, selfId, refs);
+        CollectRuleNodeGuidRefs(node.TargetCount, selfId, refs);
+        CollectRuleNodeGuidRefs(node.Source, selfId, refs);
+        CollectRuleNodeGuidRefs(node.Subject, selfId, refs);
+        CollectRuleNodeGuidRefs(node.SubjectOther, selfId, refs);
+        CollectRuleNodeGuidRefs(node.Duration, selfId, refs);
+        CollectRuleNodeGuidRefs(node.Cost, selfId, refs);
+        CollectRuleNodeGuidRefs(node.Limit, selfId, refs);
+        CollectRuleNodeGuidRefs(node.SpawnContext, selfId, refs);
+        CollectRuleNodeGuidRefs(node.SelectionContextRules, selfId, refs);
+
+        if (node.Groups != null)
+        {
+            foreach (var g in node.Groups) CollectRuleNodeGuidRefs(g, selfId, refs);
+        }
+        if (node.Filters != null)
+        {
+            foreach (var f in node.Filters) CollectRuleNodeGuidRefs(f, selfId, refs);
+        }
+        if (node.Prerequisites != null)
+        {
+            foreach (var p in node.Prerequisites) CollectRuleNodeGuidRefs(p, selfId, refs);
+        }
+        if (node.Behaviors != null)
+        {
+            foreach (var b in node.Behaviors) CollectRuleNodeGuidRefs(b, selfId, refs);
+        }
+        if (node.RawConditionsElement.HasValue)
+            CollectJsonGuidRefs(node.RawConditionsElement.Value.GetRawText(), selfId, refs);
+        if (node.RawConstraintsElement.HasValue)
+            CollectJsonGuidRefs(node.RawConstraintsElement.Value.GetRawText(), selfId, refs);
     }
 
     /// <summary>返回门票对应的有效 Expedition 房间模板（若缺失资产或未找到则返回 null）。</summary>
@@ -1322,8 +1587,9 @@ public sealed class CardPool
                 double mult = weightMultiplier(t);
                 if (!double.IsFinite(mult) || mult <= 0.0)
                     continue;
-                double baseW = t.SpawningChance > 0 ? t.SpawningChance : 1.0;
-                double w = baseW * mult;
+                // P2-26：SpawningChance / SpawningChanceIncrement 专用于 IsTakeover 独立掷骰与局内递增表，
+                // 不再误作普通池相对权重（防止 Star Chart Treasure 等 0.1 独立概率卡被降权 10 倍）
+                double w = mult;
                 if (w > 0.0)
                 {
                     weighted.Add((t, w));
@@ -1350,28 +1616,10 @@ public sealed class CardPool
             return fallbackLast;
         }
 
-        double totalWeight = candidates.Sum(t => t.SpawningChance > 0 ? t.SpawningChance : 1.0);
-        if (totalWeight <= 0)
-        {
-            var pickedFallback = candidates[rng.Next(candidates.Count)];
-            excludedIds?.Add(pickedFallback.Id);
-            return pickedFallback;
-        }
-
-        double roll = rng.NextDouble() * totalWeight;
-        double acc = 0;
-        foreach (var t in candidates)
-        {
-            acc += t.SpawningChance > 0 ? t.SpawningChance : 1.0;
-            if (roll <= acc)
-            {
-                excludedIds?.Add(t.Id);
-                return t;
-            }
-        }
-        var last = candidates[^1];
-        excludedIds?.Add(last.Id);
-        return last;
+        // P2-26：普通池内各候选遭遇等权抽取，SpawningChance 仅用于 IsTakeover 独立掷骰
+        var picked = candidates[rng.Next(candidates.Count)];
+        excludedIds?.Add(picked.Id);
+        return picked;
     }
 
     public CardTemplate RollSkill(string hero)
@@ -1390,11 +1638,13 @@ public sealed class CardPool
 }
 
 /// <summary>
-/// 品质概率表。优先从 GameData.db 的 game_modes.ItemSkillSpawnTierPercantagesByDay 加载（Day1..Day20）。
+/// 品质概率表。优先从 GameData.db 的 game_modes.ItemSkillSpawnTierPercantagesByDay 加载，
+/// 并对齐 Patch 20.2 官服按 NumberOfDays（标准局 10 天）钳制 Day 10+ 稳态（Silver 20% / Gold 70% / Diamond 10%）；
+/// 若自定义 Mode 配置了 NumberOfDays &gt; 10 与独立高天品阶表，则通过 clampMaxDay 自动放行读取。
 /// </summary>
 public sealed class TierChances
 {
-    // [day] -> (Bronze, Silver, Gold, Diamond) 默认兜底表（仅在未加载 DB 时使用）
+    // [day] -> (Bronze, Silver, Gold, Diamond) 默认兜底表（对齐 Patch 20.2 BazaarDB /shop-odds Day 1–16 实测）
     internal static readonly (double Bronze, double Silver, double Gold, double Diamond)[] DefaultTable =
     {
         (1.00, 0.00, 0.00, 0.00), // 1
@@ -1406,17 +1656,17 @@ public sealed class TierChances
         (0.00, 0.80, 0.20, 0.00), // 7
         (0.00, 0.60, 0.40, 0.00), // 8
         (0.00, 0.35, 0.60, 0.05), // 9
-        (0.00, 0.20, 0.70, 0.10), // 10
-        (0.00, 0.25, 0.55, 0.20), // 11
-        (0.00, 0.20, 0.55, 0.05), // 12（原始数据 Day12 为 0.2/0.55/0.05，此处按官方值）
-        (0.00, 0.10, 0.60, 0.30), // 13
-        (0.00, 0.10, 0.60, 0.30), // 14
-        (0.00, 0.30, 0.50, 0.20), // 15
-        (0.00, 0.10, 0.60, 0.30), // 16
-        (0.00, 0.10, 0.60, 0.30), // 17
-        (0.00, 0.30, 0.50, 0.20), // 18
-        (0.00, 0.10, 0.60, 0.30), // 19
-        (0.00, 0.10, 0.60, 0.30), // 20
+        (0.00, 0.20, 0.70, 0.10), // 10（Day 10+ 官服实测稳态：Silver 20% / Gold 70% / Diamond 10%）
+        (0.00, 0.20, 0.70, 0.10), // 11
+        (0.00, 0.20, 0.70, 0.10), // 12
+        (0.00, 0.20, 0.70, 0.10), // 13
+        (0.00, 0.20, 0.70, 0.10), // 14
+        (0.00, 0.20, 0.70, 0.10), // 15
+        (0.00, 0.20, 0.70, 0.10), // 16
+        (0.00, 0.20, 0.70, 0.10), // 17
+        (0.00, 0.20, 0.70, 0.10), // 18
+        (0.00, 0.20, 0.70, 0.10), // 19
+        (0.00, 0.20, 0.70, 0.10), // 20
     };
 
     private readonly IReadOnlyList<(double Bronze, double Silver, double Gold, double Diamond)> _table;
@@ -1428,9 +1678,14 @@ public sealed class TierChances
         _table = table is { Count: > 0 } ? table : DefaultTable;
     }
 
-    /// <summary>从 GameData.db 的 game_modes.ItemSkillSpawnTierPercantagesByDay 构建每日权重表。</summary>
+    /// <summary>
+    /// 从 GameData.db 的 game_modes.ItemSkillSpawnTierPercantagesByDay 构建每日权重表。
+    /// <paramref name="clampMaxDay"/> 默认 10（对应官方 Base GameMode.NumberOfDays=10，使 Day 11+ 收敛于 Day 10 稳态）；
+    /// 自定义 Mode 传入其 NumberOfDays（或 ≤0 表示不钳制）即可读取完整自定义高天品阶表。
+    /// </summary>
     public static (double Bronze, double Silver, double Gold, double Diamond)[] FromGameModeMap(
-        IReadOnlyDictionary<string, Dictionary<string, double>>? map)
+        IReadOnlyDictionary<string, Dictionary<string, double>>? map,
+        int clampMaxDay = 10)
     {
         if (map == null || map.Count == 0)
             return DefaultTable;
@@ -1441,21 +1696,36 @@ public sealed class TierChances
             if (int.TryParse(key, out int d) && d > maxDay && d <= 50)
                 maxDay = d;
         }
+        if (clampMaxDay > 0 && clampMaxDay > maxDay)
+            maxDay = Math.Min(clampMaxDay, 50);
 
         var rows = new (double Bronze, double Silver, double Gold, double Diamond)[maxDay];
         for (int day = 1; day <= maxDay; day++)
         {
-            if (map.TryGetValue(day.ToString(), out var w) && w != null)
+            int lookupDay = clampMaxDay > 0 ? Math.Min(day, clampMaxDay) : day;
+            if (map.TryGetValue(lookupDay.ToString(), out var w) && w != null)
             {
                 w.TryGetValue("Bronze", out double b);
                 w.TryGetValue("Silver", out double s);
                 w.TryGetValue("Gold", out double g);
                 w.TryGetValue("Diamond", out double dm);
-                rows[day - 1] = (Math.Max(0, b), Math.Max(0, s), Math.Max(0, g), Math.Max(0, dm));
+                b = Math.Max(0, b);
+                s = Math.Max(0, s);
+                g = Math.Max(0, g);
+                dm = Math.Max(0, dm);
+                // 防呆保留（P2-30）：若自定义 Mode 设 clampMaxDay>=12 并沿用旧 DB Day 12（总和 0.80），平滑补齐 Diamond=0.25
+                double rawSum = b + s + g + dm;
+                if (lookupDay == 12
+                    && Math.Abs(rawSum - 0.80) < 1e-6
+                    && Math.Abs(dm - 0.05) < 1e-6)
+                {
+                    dm = 0.25;
+                }
+                rows[day - 1] = (b, s, g, dm);
             }
             else
             {
-                int fallbackIdx = Math.Clamp(day, 1, DefaultTable.Length) - 1;
+                int fallbackIdx = Math.Clamp(lookupDay, 1, DefaultTable.Length) - 1;
                 rows[day - 1] = DefaultTable[fallbackIdx];
             }
         }
@@ -1510,4 +1780,339 @@ public sealed class TierChances
     }
 
     public int CurrentDay { get; set; } = 1;
+}
+
+/// <summary>P0-16：数据驱动的 GuidOnly 白昼奇遇角色分类。</summary>
+public enum GuidOnlyEncounterRole
+{
+    RegularNonMerchant = 0,
+    BonusCombatChallenge = 1,
+    RareOrSkillMerchant = 2,
+}
+
+/// <summary>
+/// P0-16：数据驱动的 GuidOnly 白昼遭遇目录。
+/// 自动从 DB 聚合：
+/// - 41 套（157 张，含 Workshop (Silver)）按品阶/天数拆分的常规白昼奇遇与额外野怪挑战（Deadly Duel / Epic Battle）；
+/// - 独立有效特殊事件（Mystery Box / Aerodrome / Sprout / Study / Borrow / Rest / Snack Time / Regenerative Tincture / Bjorn's Gift Exchange / Gulch's Dive / Underground Resistance 等）；
+/// - 稀缺/技能商人分流（Statia 3 金重随技能商 / Advanced Training 8 金重随技能商）；
+/// 并自动剔除已有 DB 入度引用的子遭遇、Takeover 奇遇、专用调度事件（Travel Agent / The Cult / Mysterious Portal / Futura / Grand Opening）及 2 张任务残留卡。
+/// </summary>
+public sealed class GuidOnlyHourlyEncounterCatalog
+{
+    public sealed record TieredSuite(
+        string BaseName,
+        GuidOnlyEncounterRole Role,
+        IReadOnlyDictionary<string, CardPool.CardTemplate> VariantsByTier);
+
+    public sealed record DayRangeVariant(
+        int MinDay,
+        int MaxDay,
+        CardPool.CardTemplate Card);
+
+    public sealed record DayRangeSuite(
+        string BaseName,
+        GuidOnlyEncounterRole Role,
+        IReadOnlyList<DayRangeVariant> Variants);
+
+    public sealed record StandaloneEntry(
+        CardPool.CardTemplate Card,
+        GuidOnlyEncounterRole Role,
+        int MinDay,
+        int MaxDay,
+        bool ExemptFromMaxDayTier);
+
+    private static readonly Regex TierSuffixRegex = new(
+        @"\s*\((Bronze|Silver|Gold|Diamond|Legendary)\)\s*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly Regex DayRangeSuffixRegex = new(
+        @"\s*\(Day\s+(\d+)(?:(?:\s*-\s*|\s+to\s+)(\d+)|(\+))?\)\s*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly string[] TierOrder = ["Bronze", "Silver", "Gold", "Diamond", "Legendary"];
+
+    public IReadOnlyList<TieredSuite> TieredSuites { get; }
+    public IReadOnlyList<DayRangeSuite> DayRangeSuites { get; }
+    public IReadOnlyList<StandaloneEntry> StandaloneEntries { get; }
+    private readonly ConcurrentDictionary<(string Hero, int Day), List<(CardPool.CardTemplate Card, GuidOnlyEncounterRole Role, bool ExemptFromMaxDayTier)>> _resolveCache = new();
+
+    public int TotalSuiteCount => TieredSuites.Count + DayRangeSuites.Count;
+    public int TotalSuiteCardCount =>
+        TieredSuites.Sum(s => s.VariantsByTier.Count) + DayRangeSuites.Sum(s => s.Variants.Count);
+
+    private GuidOnlyHourlyEncounterCatalog(
+        List<TieredSuite> tieredSuites,
+        List<DayRangeSuite> dayRangeSuites,
+        List<StandaloneEntry> standaloneEntries)
+    {
+        TieredSuites = tieredSuites;
+        DayRangeSuites = dayRangeSuites;
+        StandaloneEntries = standaloneEntries;
+    }
+
+    public static GuidOnlyHourlyEncounterCatalog Build(
+        CardPool pool,
+        IReadOnlyList<CardPool.CardTemplate> allCards,
+        IReadOnlySet<string> referencedIds)
+    {
+        var tieredBuckets = new Dictionary<string, Dictionary<string, CardPool.CardTemplate>>(StringComparer.OrdinalIgnoreCase);
+        var dayRangeBuckets = new Dictionary<string, List<DayRangeVariant>>(StringComparer.OrdinalIgnoreCase);
+        var standalones = new List<StandaloneEntry>();
+
+        foreach (var card in allCards)
+        {
+            if (!string.Equals(card.Type, "EventEncounter", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.Equals(card.SpawningEligibility, "GuidOnly", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!pool.IsPlayerSpawnable(card, allowGuidOnly: true))
+                continue;
+            if (card.IsTakeover)
+                continue;
+            if (referencedIds.Contains(card.Id))
+                continue;
+            if (IsExcludedFromGuidOnlyHourlyCatalog(card))
+                continue;
+
+            string name = card.InternalName ?? string.Empty;
+
+            var dayMatch = DayRangeSuffixRegex.Match(name);
+            if (dayMatch.Success)
+            {
+                int minDay = int.Parse(dayMatch.Groups[1].Value);
+                int maxDay = dayMatch.Groups[2].Success
+                    ? int.Parse(dayMatch.Groups[2].Value)
+                    : (dayMatch.Groups[3].Success || minDay >= 10 ? int.MaxValue : minDay);
+                string baseName = name[..dayMatch.Index].Trim();
+                if (!dayRangeBuckets.TryGetValue(baseName, out var list))
+                {
+                    list = new List<DayRangeVariant>();
+                    dayRangeBuckets[baseName] = list;
+                }
+                list.Add(new DayRangeVariant(minDay, maxDay, card));
+                continue;
+            }
+
+            var tierMatch = TierSuffixRegex.Match(name);
+            if (tierMatch.Success)
+            {
+                string tierName = NormalizeTierName(tierMatch.Groups[1].Value);
+                string baseName = name[..tierMatch.Index].Trim();
+                if (!tieredBuckets.TryGetValue(baseName, out var byTier))
+                {
+                    byTier = new Dictionary<string, CardPool.CardTemplate>(StringComparer.OrdinalIgnoreCase);
+                    tieredBuckets[baseName] = byTier;
+                }
+                byTier[tierName] = card;
+                continue;
+            }
+
+            // 独立单卡 GuidOnly 特殊事件分类分流
+            var role = ClassifyStandaloneRole(card);
+            int minD = role == GuidOnlyEncounterRole.RareOrSkillMerchant ? 7 : 1;
+            bool exempt = card.Id.Equals(CardArchetypeIndex.StatiaEncounterId, StringComparison.OrdinalIgnoreCase);
+            standalones.Add(new StandaloneEntry(card, role, minD, int.MaxValue, exempt));
+        }
+
+        var tieredSuites = new List<TieredSuite>(tieredBuckets.Count);
+        foreach (var (baseName, byTier) in tieredBuckets.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            if (byTier.Count >= 2)
+            {
+                tieredSuites.Add(new TieredSuite(baseName, GuidOnlyEncounterRole.RegularNonMerchant, byTier));
+            }
+            else
+            {
+                var single = byTier.Values.First();
+                standalones.Add(new StandaloneEntry(single, ClassifyStandaloneRole(single), 1, int.MaxValue, false));
+            }
+        }
+
+        var dayRangeSuites = new List<DayRangeSuite>(dayRangeBuckets.Count);
+        foreach (var (baseName, variants) in dayRangeBuckets.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            variants.Sort((a, b) => a.MinDay.CompareTo(b.MinDay));
+            var role = IsBonusCombatChallengeBaseName(baseName)
+                ? GuidOnlyEncounterRole.BonusCombatChallenge
+                : GuidOnlyEncounterRole.RegularNonMerchant;
+            if (variants.Count >= 2)
+            {
+                dayRangeSuites.Add(new DayRangeSuite(baseName, role, variants));
+            }
+            else
+            {
+                var only = variants[0];
+                standalones.Add(new StandaloneEntry(only.Card, role, only.MinDay, only.MaxDay, ExemptFromMaxDayTier: true));
+            }
+        }
+
+        return new GuidOnlyHourlyEncounterCatalog(tieredSuites, dayRangeSuites, standalones);
+    }
+
+    /// <summary>
+    /// 按当前英雄与有效天数投影出当日匹配的 GuidOnly 候选遭遇（每套按阶事件至多投影最匹配的 1 个单阶版本，绝不重复堆叠）。
+    /// </summary>
+    public List<(CardPool.CardTemplate Card, GuidOnlyEncounterRole Role, bool ExemptFromMaxDayTier)> ResolveForHeroAndDay(
+        string hero,
+        int effectiveDay)
+    {
+        var key = ((hero ?? string.Empty).ToUpperInvariant(), effectiveDay);
+        var cached = _resolveCache.GetOrAdd(key, _ => ComputeResolveForHeroAndDay(hero ?? string.Empty, effectiveDay));
+        return new List<(CardPool.CardTemplate, GuidOnlyEncounterRole, bool)>(cached);
+    }
+
+    private List<(CardPool.CardTemplate Card, GuidOnlyEncounterRole Role, bool ExemptFromMaxDayTier)> ComputeResolveForHeroAndDay(
+        string hero,
+        int effectiveDay)
+    {
+        var results = new List<(CardPool.CardTemplate, GuidOnlyEncounterRole, bool)>();
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        static bool MatchesHero(CardPool.CardTemplate c, string h)
+            => c.Heroes.Contains(h, StringComparer.OrdinalIgnoreCase)
+            || c.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase);
+
+        // 1. 按阶拆分常规白昼右槽免费物品遭遇（Patch 16.0 Right Side Options）：
+        //    按 BazaarDB Patch 20.2 实测分阶窗口精准投射唯一最匹配品阶版本，并豁免中槽 maxDayTier 误杀。
+        foreach (var suite in TieredSuites)
+        {
+            bool silverStartsDay1 = OfficialEncounterSchedule.IsSilverDay1RightFreeSuite(suite.BaseName);
+            int targetTierIdx = silverStartsDay1
+                ? effectiveDay switch
+                {
+                    <= 4 => 1, // Silver (Days 1–5 实测)
+                    <= 7 => 2, // Gold   (Days 5–10+ 实测)
+                    _ => 3,    // Diamond (Days 8–10+ 实测)
+                }
+                : effectiveDay switch
+                {
+                    <= 2 => 0, // Bronze (Days 1–2 实测)
+                    <= 5 => 1, // Silver (Days 2–6 实测)
+                    <= 8 => 2, // Gold   (Days 6–10+ 实测)
+                    _ => 3,    // Diamond (Days 9–10+ 实测)
+                };
+
+            CardPool.CardTemplate? chosen = null;
+            for (int tIdx = targetTierIdx; tIdx >= 0; tIdx--)
+            {
+                if (suite.VariantsByTier.TryGetValue(TierOrder[tIdx], out var cand) &&
+                    MatchesHero(cand, hero) &&
+                    OfficialEncounterSchedule.IsWithinWindow(cand, effectiveDay, hour: 1, hero))
+                {
+                    chosen = cand;
+                    break;
+                }
+            }
+            // 若该套奇遇起阶高于 Bronze（如 Freezer Day 2+ / Dino Trapping Day 3+ 仅含 Silver/Gold/Diamond），
+            // 在满足官方 MinDay 窗口的前提下放行最低可用阶
+            if (chosen == null)
+            {
+                for (int tIdx = targetTierIdx + 1; tIdx < TierOrder.Length; tIdx++)
+                {
+                    if (suite.VariantsByTier.TryGetValue(TierOrder[tIdx], out var cand) &&
+                        MatchesHero(cand, hero) &&
+                        OfficialEncounterSchedule.IsWithinWindow(cand, effectiveDay, hour: 1, hero))
+                    {
+                        if (tIdx <= targetTierIdx + 1)
+                            chosen = cand;
+                        break;
+                    }
+                }
+            }
+            if (chosen != null && seenIds.Add(chosen.Id))
+            {
+                // Patch 16.0：右槽免费物品事件自带品阶且平均高于同天商店，标记 ExemptFromMaxDayTier=true
+                results.Add((chosen, suite.Role, true));
+            }
+        }
+
+        // 2. 分天拆分白昼奇遇（Invest in Yourself / Trophy Hunt / Deadly Duel / Epic Battle）：严格按 (MinDay..MaxDay) 精确匹配
+        foreach (var suite in DayRangeSuites)
+        {
+            foreach (var v in suite.Variants)
+            {
+                if (effectiveDay >= v.MinDay && effectiveDay <= v.MaxDay && MatchesHero(v.Card, hero))
+                {
+                    if (seenIds.Add(v.Card.Id))
+                    {
+                        // 已由 (Day X-Y) 精确门控（如 Day 1-2 银阶 Invest in Yourself、Day 5-7 金阶 Deadly Duel），豁免 maxDayTier 误杀
+                        results.Add((v.Card, suite.Role, true));
+                    }
+                }
+            }
+        }
+
+        // 3. 独立有效特殊事件（含 Statia / Advanced Training / Borrow (Day 1-2) / Mystery Box / Study / Snack Time / Rest 等）
+        foreach (var entry in StandaloneEntries)
+        {
+            if (effectiveDay < entry.MinDay || effectiveDay > entry.MaxDay)
+                continue;
+            if (!MatchesHero(entry.Card, hero))
+                continue;
+            if (seenIds.Add(entry.Card.Id))
+            {
+                results.Add((entry.Card, entry.Role, entry.ExemptFromMaxDayTier));
+            }
+        }
+
+        return results;
+    }
+
+    private static bool IsExcludedFromGuidOnlyHourlyCatalog(CardPool.CardTemplate card)
+    {
+        if (CardPool.IsExcludedDevOrStoryTemplate(card))
+            return true;
+        if (CardPool.ExcludedQuestRemnantEncounterIds.Contains(card.Id))
+            return true;
+        if (card.Id.Equals(CardPool.TravelAgentEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            card.Id.Equals(CardArchetypeIndex.TheCultEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            card.Id.Equals(CardArchetypeIndex.MysteriousPortalEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            card.Id.Equals(CardArchetypeIndex.FuturaEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            card.Id.Equals(CardPool.GrandOpeningEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            CardPool.IsExpeditionRoomTemplate(card.Id))
+        {
+            return true;
+        }
+
+        string name = card.InternalName ?? string.Empty;
+        if (name.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("(Level Up)", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("(Start Run", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("(Start Skill", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("(Start)", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("Expedition", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("Fates", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static GuidOnlyEncounterRole ClassifyStandaloneRole(CardPool.CardTemplate card)
+    {
+        if (card.Id.Equals(CardArchetypeIndex.StatiaEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            card.Id.Equals(CardArchetypeIndex.AdvancedTrainingEncounterId, StringComparison.OrdinalIgnoreCase))
+        {
+            return GuidOnlyEncounterRole.RareOrSkillMerchant;
+        }
+        return GuidOnlyEncounterRole.RegularNonMerchant;
+    }
+
+    private static bool IsBonusCombatChallengeBaseName(string baseName)
+        => baseName.Equals("Deadly Duel", StringComparison.OrdinalIgnoreCase)
+        || baseName.Equals("Epic Battle", StringComparison.OrdinalIgnoreCase);
+
+    private static string NormalizeTierName(string raw)
+        => raw.ToLowerInvariant() switch
+        {
+            "bronze" => "Bronze",
+            "silver" => "Silver",
+            "gold" => "Gold",
+            "diamond" => "Diamond",
+            "legendary" => "Legendary",
+            _ => raw,
+        };
 }

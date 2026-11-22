@@ -107,6 +107,12 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
     // A-9 副 Tooltip 重复 Canvas.ForceUpdateCanvases 防抖缓存（主线程访问）
     private static PropertyInfo _tooltipPositioningRectProp;
     private static PropertyInfo _tooltipIsPositioningSecondaryProp;
+    private static PropertyInfo _tooltipSecondaryAnimatorProp;
+    private static MethodInfo _tooltipSetPositioningSideMethod;
+    private static MethodInfo _secondaryAnimatorShowArrowsMethod;
+    private static FieldInfo _desktopOnPositioningCompleteField;
+    private static object _tooltipSideNoneValue;
+    private static readonly Dictionary<int, object> _lastSecTipValidSideByCtrlId = new(8);
     private static int _lastSecTipCtrlId;
     private static int _lastSecTipPrimaryId;
     private static int _lastSecTipFrame = -100;
@@ -120,6 +126,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         public bool IsHovered;
         public int Section;
         public Vector3 SocketOffset;
+        public Vector3 ScaleDestination;
     }
 
     private static readonly Dictionary<int, ItemHoverVisualState> _itemHoverVisualStates = new(32);
@@ -132,10 +139,13 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
     private static Func<object, bool> _cardGetMovementEnabled;
     private static Func<object, int> _cardGetBoardSection;
     private static Func<object, Vector3> _cardGetSocketOffset;
+    private static Func<object, Vector3> _cardGetScaleDestination;
+    private static Func<object, bool> _cardGetIsHovering;
     private static Func<object, object> _cardGetMoveSequence;
     private static FieldInfo _tweenStringIdField;
 
     private IModContext _ctx;
+    private readonly List<IDisposable> _eventSubscriptions = new();
     private PerfRuntimeBehaviour _behaviour;
 
     public double CurrentFps => _currentFps;
@@ -160,8 +170,12 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
 
         ApplyQualityTweaksNow();
 
-        _ctx?.EventBus.Subscribe<CombatLifecycleModEvent>(OnCombatLifecycle);
-        _ctx?.EventBus.Subscribe<SceneChangedModEvent>(OnSceneChanged);
+        DisposeEventSubscriptions();
+        if (_ctx?.EventBus != null)
+        {
+            _eventSubscriptions.Add(_ctx.EventBus.Subscribe<CombatLifecycleModEvent>(OnCombatLifecycle));
+            _eventSubscriptions.Add(_ctx.EventBus.Subscribe<SceneChangedModEvent>(OnSceneChanged));
+        }
 
         EnsureBehaviourInstalled();
         BazaarLauncherPlugin.Log?.LogInfo(
@@ -170,6 +184,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
 
     public void OnDisable()
     {
+        DisposeEventSubscriptions();
         FrameRateGuard.ResetAppliedFlag();
         FrameRateGuard.Shutdown();
         DestroyBehaviour();
@@ -177,6 +192,15 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         _addressExistsCache.Clear();
         _cameraSubscribedIds.Clear();
         ResetDragHoverCaches();
+    }
+
+    private void DisposeEventSubscriptions()
+    {
+        for (int i = 0; i < _eventSubscriptions.Count; i++)
+        {
+            try { _eventSubscriptions[i]?.Dispose(); } catch { }
+        }
+        _eventSubscriptions.Clear();
     }
 
     internal static void ResetDragHoverCaches()
@@ -187,6 +211,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         _lastHoverSocketsHash = 0;
         _lastHoverSocketsLen = -1;
         _itemHoverVisualStates.Clear();
+        _lastSecTipValidSideByCtrlId.Clear();
         _lastSecTipCtrlId = 0;
         _lastSecTipPrimaryId = 0;
         _lastSecTipFrame = -100;
@@ -384,8 +409,19 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
     public IReadOnlyList<ModHealthSnapshot> GetModuleHealthSnapshots()
         => BazaarLauncherPlugin.Host?.GetHealthSnapshots() ?? Array.Empty<ModHealthSnapshot>();
 
-    /// <summary>供 CompatAuditPatch / VFXManager 钩子调用的战斗高并发 VFX 限流判定（A-5）。</summary>
-    internal static bool ShouldThrottleCombatVfx()
+    /// <summary>P2-15 (O-5)：战斗 VFX 分级保留优先级，彻底替代全局一刀切限流。</summary>
+    internal enum CombatVfxPriority
+    {
+        /// <summary>关键演出（暴击、致死、摧毁/变形/升级/禁用、任务完成、头像切换或自定义 VFXOverrideKey）：永不节流。</summary>
+        Critical = 0,
+        /// <summary>核心战斗主激活（伤害、护盾、治疗、灼烧/剧毒/再生/快乐/节奏、冻结、飞行等）：高预算优先保留。</summary>
+        Core = 1,
+        /// <summary>高频辅助小粒子（光环/属性微调、充能/加速/减速/装填、移除类特效等）：拥堵时优先节流。</summary>
+        Minor = 2,
+    }
+
+    /// <summary>供 CompatAuditPatch / VFXManager 钩子调用的战斗高并发 VFX 分级限流判定（A-5 + P2-15 O-5）。</summary>
+    internal static bool ShouldThrottleCombatVfx(CombatVfxPriority priority = CombatVfxPriority.Minor)
     {
         var inst = Instance;
         if (inst == null || !OptVfxThrottle) return false;
@@ -397,23 +433,31 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             inst._vfxSpawnedThisSecond = 0;
         }
 
-        int limit = Math.Max(12, OptMaxConcurrentVfx);
+        int baseLimit = Math.Max(12, OptMaxConcurrentVfx);
         // 高倍速战斗 (>= 4x) 收紧并发上限防止满屏粒子雪崩
         if (CombatPatch.GetDisplayCombatSpeed() >= 3.9f)
         {
-            limit = Math.Max(10, limit / 2);
+            baseLimit = Math.Max(10, baseLimit / 2);
         }
 
-        inst._vfxSpawnedThisSecond++;
-        inst._activeVfxEstimate = Math.Min(limit, inst._vfxSpawnedThisSecond);
+        // P2-15 (O-5)：分级配额——Critical 永不丢弃；Minor 在达到基础配额 2/3 时率先节流，把余量留给 Core 主激活演出
+        int tierLimit = priority switch
+        {
+            CombatVfxPriority.Critical => int.MaxValue,
+            CombatVfxPriority.Core => Math.Max(baseLimit, (baseLimit * 3) / 2),
+            _ => Math.Max(8, (baseLimit * 2) / 3),
+        };
+
         inst._lastVfxFrameTime = Time.unscaledTime;
 
-        if (inst._vfxSpawnedThisSecond > limit)
+        if (priority != CombatVfxPriority.Critical && inst._vfxSpawnedThisSecond >= tierLimit)
         {
             Interlocked.Increment(ref inst._throttledVfxCount);
             return true;
         }
 
+        inst._vfxSpawnedThisSecond++;
+        inst._activeVfxEstimate = Math.Min(Math.Max(baseLimit, (baseLimit * 3) / 2), inst._vfxSpawnedThisSecond);
         return false;
     }
 
@@ -494,6 +538,29 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         {
             _tooltipPositioningRectProp = cardTooltipType.GetProperty("PositioningRectTransform", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             _tooltipIsPositioningSecondaryProp = cardTooltipType.GetProperty("IsPositioningSecondaryTooltip", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            _tooltipSecondaryAnimatorProp = cardTooltipType.GetProperty("SecondaryTooltipAnimator", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (_tooltipSecondaryAnimatorProp != null)
+            {
+                _secondaryAnimatorShowArrowsMethod = _tooltipSecondaryAnimatorProp.PropertyType.GetMethod(
+                    "ShowArrowsWithLayoutWait", BindingFlags.Public | BindingFlags.Instance);
+            }
+
+            _tooltipSetPositioningSideMethod = cardTooltipType.GetMethod(
+                "SetPositioningSide", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (_tooltipSetPositioningSideMethod != null)
+            {
+                var sideParams = _tooltipSetPositioningSideMethod.GetParameters();
+                if (sideParams.Length == 1 && sideParams[0].ParameterType.IsEnum)
+                {
+                    try { _tooltipSideNoneValue = Enum.Parse(sideParams[0].ParameterType, "None"); } catch { }
+                    patcher.TryPatchMethod(
+                        _tooltipSetPositioningSideMethod,
+                        postfix: AccessTools.Method(typeof(PerfOptimizerModule), nameof(CardTooltipSetPositioningSidePostfix)),
+                        optional: true,
+                        label: "Perf.A9.CardTooltipController.SetPositioningSide");
+                }
+            }
+
             patcher.TryPatch(
                 cardTooltipType,
                 "RebuildLayoutForArrows",
@@ -507,6 +574,8 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         var desktopTipPosType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.DesktopTooltipPositioningStrategy");
         if (desktopTipPosType != null && cardTooltipType != null)
         {
+            _desktopOnPositioningCompleteField = desktopTipPosType.GetField(
+                "OnPositioningComplete", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             patcher.TryPatch(
                 desktopTipPosType,
                 "SecondaryPositioningCoroutine",
@@ -559,6 +628,8 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                 var moveEnField = cardCtrlType.GetField("movementEnabled", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 var sectionField = cardCtrlType.GetField("boardSection", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 var offsetField = cardCtrlType.GetField("socketOffset", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var scaleDestField = cardCtrlType.GetField("scaleDestination", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var isHoveringProp = cardCtrlType.GetProperty("IsHovering", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 var seqField = cardCtrlType.GetField("MoveSequence", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
 
                 if (moveEnField != null)
@@ -577,6 +648,14 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                 if (offsetField != null)
                 {
                     _cardGetSocketOffset = CompileInstanceFieldGetter<Vector3>(cardCtrlType, offsetField);
+                }
+                if (scaleDestField != null)
+                {
+                    _cardGetScaleDestination = CompileInstanceFieldGetter<Vector3>(cardCtrlType, scaleDestField);
+                }
+                if (isHoveringProp != null)
+                {
+                    _cardGetIsHovering = CompileInstancePropertyGetter<bool>(cardCtrlType, isHoveringProp);
                 }
                 if (seqField != null)
                 {
@@ -642,6 +721,21 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         catch
         {
             return obj => (T)field.GetValue(obj);
+        }
+    }
+
+    private static Func<object, T> CompileInstancePropertyGetter<T>(Type declaringType, PropertyInfo prop)
+    {
+        try
+        {
+            var p = Expression.Parameter(typeof(object), "inst");
+            var access = Expression.Property(Expression.Convert(p, declaringType), prop);
+            Expression body = typeof(T) == prop.PropertyType ? access : Expression.Convert(access, typeof(T));
+            return Expression.Lambda<Func<object, T>>(body, p).Compile();
+        }
+        catch
+        {
+            return obj => (T)prop.GetValue(obj);
         }
     }
 
@@ -848,8 +942,55 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         yield break;
     }
 
-    /// <summary>A-9 补充：短时间内对同一对主副升级 Tooltip 且尺寸与锚点未发生显著变化时，跳过重复的全局 Canvas.ForceUpdateCanvases。</summary>
-    private static bool SecondaryPositioningCoroutinePrefix(object controller, object primary, ref IEnumerator __result)
+    private static void CardTooltipSetPositioningSidePostfix(object __instance, object side)
+    {
+        try
+        {
+            if (__instance is not UnityEngine.Object uo || uo == null || side == null)
+                return;
+            if (_tooltipSideNoneValue != null && Equals(side, _tooltipSideNoneValue))
+                return;
+            if (_lastSecTipValidSideByCtrlId.Count > 32)
+            {
+                _lastSecTipValidSideByCtrlId.Clear();
+            }
+            _lastSecTipValidSideByCtrlId[uo.GetInstanceID()] = side;
+        }
+        catch { }
+    }
+
+    /// <summary>P1-47：节流跳过副 Tooltip 重建时，恢复 ResetPositioningSide() 清空的侧向并补发箭头动画与 OnPositioningComplete 回调。</summary>
+    private static IEnumerator SkippedSecondaryPositioningEnumerator(object strategy, object controller, object primary, object cachedSide)
+    {
+        try
+        {
+            if (controller is Component ctrlComp && ctrlComp != null
+                && primary is Component priComp && priComp != null
+                && priComp.gameObject.activeInHierarchy)
+            {
+                _tooltipSetPositioningSideMethod?.Invoke(controller, new[] { cachedSide });
+
+                var secAnim = _tooltipSecondaryAnimatorProp?.GetValue(primary);
+                if (secAnim != null && _secondaryAnimatorShowArrowsMethod != null)
+                {
+                    _secondaryAnimatorShowArrowsMethod.Invoke(secAnim, new[] { cachedSide });
+                }
+
+                if (strategy != null && _desktopOnPositioningCompleteField?.GetValue(strategy) is Delegate onComplete)
+                {
+                    onComplete.DynamicInvoke(controller);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogPerfHookErrorThrottled(nameof(SkippedSecondaryPositioningEnumerator), ex);
+        }
+        yield break;
+    }
+
+    /// <summary>A-9 补充 + P1-47：短时间内对同一对主副升级 Tooltip 且尺寸与锚点未发生显著变化时，跳过重复的全局 Canvas.ForceUpdateCanvases，并补发 ShowArrowsWithLayoutWait 与 OnPositioningComplete。</summary>
+    private static bool SecondaryPositioningCoroutinePrefix(object __instance, object controller, object primary, ref IEnumerator __result)
     {
         try
         {
@@ -884,9 +1025,14 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                 && Mathf.Abs(ctrlSize.x - _lastSecTipCtrlSize.x) < 0.5f
                 && Mathf.Abs(ctrlSize.y - _lastSecTipCtrlSize.y) < 0.5f
                 && Mathf.Abs(priPos.x - _lastSecTipPrimaryAnchoredPos.x) < 0.5f
-                && Mathf.Abs(priPos.y - _lastSecTipPrimaryAnchoredPos.y) < 0.5f)
+                && Mathf.Abs(priPos.y - _lastSecTipPrimaryAnchoredPos.y) < 0.5f
+                && _tooltipSetPositioningSideMethod != null
+                && _desktopOnPositioningCompleteField != null
+                && _lastSecTipValidSideByCtrlId.TryGetValue(ctrlId, out var cachedSide)
+                && cachedSide != null
+                && (_tooltipSideNoneValue == null || !Equals(cachedSide, _tooltipSideNoneValue)))
             {
-                __result = EmptyEnumerator();
+                __result = SkippedSecondaryPositioningEnumerator(__instance, controller, primary, cachedSide);
                 return false;
             }
 
@@ -1011,12 +1157,14 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                 }
             }
 
+            Vector3 curScaleDest = _cardGetScaleDestination != null ? _cardGetScaleDestination(__instance) : __instance.transform.localScale;
             if (_itemHoverVisualStates.Count > 128) _itemHoverVisualStates.Clear();
             _itemHoverVisualStates[id] = new ItemHoverVisualState
             {
                 IsHovered = true,
                 Section = curSection,
                 SocketOffset = curOffset,
+                ScaleDestination = curScaleDest,
             };
         }
         catch (Exception ex)
@@ -1026,12 +1174,17 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         return true;
     }
 
-    /// <summary>拖拽 Top 2：ItemController.MoveBack 状态守卫，对本来就稳停原位或已在回位动画中的卡牌直接跳过，消除每帧全场 DOTween 重建。</summary>
+    /// <summary>拖拽 Top 2 + P1-47：ItemController.MoveBack 状态守卫，严格核查位置、localScale == scaleDestination 与 !IsHovering 后再跳过，消除每帧全场 DOTween 重建同时绝不卡住缩放/悬停复位。</summary>
     private static bool ItemMoveBackPrefix(Component __instance)
     {
         try
         {
-            if (!OptDragHoverGuard || __instance == null || _cardGetMovementEnabled == null || _cardGetBoardSection == null || _cardGetSocketOffset == null)
+            if (!OptDragHoverGuard || __instance == null
+                || _cardGetMovementEnabled == null
+                || _cardGetBoardSection == null
+                || _cardGetSocketOffset == null
+                || _cardGetScaleDestination == null
+                || _cardGetIsHovering == null)
                 return true;
 
             if (!_cardGetMovementEnabled(__instance)) return true;
@@ -1039,6 +1192,8 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             int id = __instance.GetInstanceID();
             int curSection = _cardGetBoardSection(__instance);
             Vector3 curOffset = _cardGetSocketOffset(__instance);
+            Vector3 scaleDest = _cardGetScaleDestination(__instance);
+            bool isHovering = _cardGetIsHovering(__instance);
             object moveSeq = _cardGetMoveSequence?.Invoke(__instance);
             string seqId = moveSeq != null ? (_tweenStringIdField?.GetValue(moveSeq) as string) : null;
 
@@ -1046,8 +1201,11 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                 ? curOffset + new Vector3(0f, 0.08f, 0f)
                 : curOffset;
 
-            // 1. 若无活跃位移序列且本来就已在精确原位，无需无意义重建 MoveBack DOTween
-            if (moveSeq == null && (__instance.transform.localPosition - targetBackPos).sqrMagnitude < 1e-5f)
+            // 1. 仅当无活跃序列、位置已在精确原位、缩放已等于 scaleDestination 且未处于 IsHovering 态时才跳过 MoveBack DOTween
+            if (moveSeq == null
+                && !isHovering
+                && (__instance.transform.localPosition - targetBackPos).sqrMagnitude < 1e-5f
+                && (__instance.transform.localScale - scaleDest).sqrMagnitude < 1e-5f)
             {
                 if (_itemHoverVisualStates.Count > 128) _itemHoverVisualStates.Clear();
                 _itemHoverVisualStates[id] = new ItemHoverVisualState
@@ -1055,15 +1213,18 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                     IsHovered = false,
                     Section = curSection,
                     SocketOffset = curOffset,
+                    ScaleDestination = scaleDest,
                 };
                 return false;
             }
 
-            // 2. 若已处于回位动画中且目标位置未变，直接放行当前动画继续平滑播放
+            // 2. 若已处于 MoveBack 回位动画中且目标位置/目标缩放未变、且 IsHovering 已复位，则放行当前动画平滑播完
             if (_itemHoverVisualStates.TryGetValue(id, out var prev)
                 && !prev.IsHovered
+                && !isHovering
                 && prev.Section == curSection
                 && (prev.SocketOffset - curOffset).sqrMagnitude < 1e-6f
+                && (prev.ScaleDestination - scaleDest).sqrMagnitude < 1e-6f
                 && string.Equals(seqId, "MoveBack", StringComparison.Ordinal))
             {
                 return false;
@@ -1075,6 +1236,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                 IsHovered = false,
                 Section = curSection,
                 SocketOffset = curOffset,
+                ScaleDestination = scaleDest,
             };
         }
         catch (Exception ex)
@@ -1096,7 +1258,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
     {
         _inCombat = false;
         ResetDragHoverCaches();
-        CompatAuditPatch.ClearRunScopedCaches("SceneChanged:" + evt.SceneName);
+        // P1-43：CompatAuditPatch 已自主监听 SceneManager.activeSceneChanged 与局生命周期，此处不再耦合触发 ClearRunScopedCaches
         MainThreadDispatcher.Enqueue(() =>
         {
             ApplyIncrementalGcSlice(inCombat: false);

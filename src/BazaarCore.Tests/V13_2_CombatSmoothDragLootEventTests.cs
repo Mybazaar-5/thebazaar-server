@@ -322,7 +322,7 @@ public sealed class V13_2_CombatSmoothDragLootEventTests
         var fx = Fx.Value;
         int day1NonMerchantTotal = 0;
         int day1BronzeTwoCount = 0; // Jungle Ruins + A Strange Mushroom
-        int day1CurioCount = 0;
+        int day1NeutralSilverMerchantCount = 0;
         int day3PlusPedestals = 0;
         int day5PlusGoldMerchants = 0;
 
@@ -363,16 +363,20 @@ public sealed class V13_2_CombatSmoothDragLootEventTests
 
                         bool isMerchant = tpl.Tags != null && tpl.Tags.Any(t => string.Equals(t, "Merchant", StringComparison.OrdinalIgnoreCase));
 
-                        // Day 1 严格门控：无基座、无 Mountain Pass、无金/钻遭遇、银商仅允许 Curio
+                        // Day 1 严格门控（Patch 20.2）：无基座、无 Mountain Pass、无金/钻商人、非商金阶仅允许官方 All Days 事件（Wishing Fountain / Finn's Big Bite / Piano），
+                        // 银商仅允许 10 名官方 Day 1 银商（Valpak/Herma/Nautica/Colt/Eli/Tinker 等），严禁 Curio/Midsworth/Barkun 提前泄露
                         if (d == 1)
                         {
                             Assert.NotEqual(ECardType.PedestalEncounter, ce.Type);
-                            Assert.DoesNotContain(tpl.StartingTier, new[] { "Gold", "Diamond", "Legendary" });
+                            string nk = OfficialEncounterSchedule.NormalizeKey(tpl.InternalName);
+                            bool isOfficialDay1GoldEvent = !isMerchant && nk is "wishingfountain" or "finnsbigbite" or "piano";
+                            if (!isOfficialDay1GoldEvent)
+                                Assert.DoesNotContain(tpl.StartingTier, new[] { "Gold", "Diamond", "Legendary" });
                             Assert.NotEqual(MountainPassId, tid, StringComparer.OrdinalIgnoreCase);
                             if (isMerchant && string.Equals(tpl.StartingTier, "Silver", StringComparison.OrdinalIgnoreCase))
                             {
-                                Assert.Equal(CurioId, tid, StringComparer.OrdinalIgnoreCase);
-                                day1CurioCount++;
+                                Assert.Contains(tid, ShopEngine.Day1AllowedSilverMerchantIds);
+                                day1NeutralSilverMerchantCount++;
                             }
                             if (!isMerchant)
                             {
@@ -385,7 +389,7 @@ public sealed class V13_2_CombatSmoothDragLootEventTests
                             }
                         }
 
-                        // Day 2–3 严格门控：不刷出金商（Goldie/Aimbot 等）与 Mountain Pass（DB Day 4+）
+                        // Day 2–3 严格门控：不刷出金商（Goldie/Aimbot 等）与 Mountain Pass（Days 4–7）
                         if (d <= 3)
                         {
                             Assert.NotEqual(MountainPassId, tid, StringComparer.OrdinalIgnoreCase);
@@ -393,15 +397,13 @@ public sealed class V13_2_CombatSmoothDragLootEventTests
                                 Assert.DoesNotContain(tpl.StartingTier, new[] { "Gold", "Diamond", "Legendary" });
                         }
 
-                        // Day 1–4 禁止 Farai（DB Day 5+）与金商
-                        if (d <= 4)
-                        {
+                        // Day 1 禁止 Farai（Patch 15.0 官方 Day 2+），Day 1–5 禁止金商（Patch 7.0/16.0 官方 Day 6+）
+                        if (d == 1)
                             Assert.NotEqual(FaraiId, tid, StringComparer.OrdinalIgnoreCase);
-                            if (isMerchant)
-                                Assert.DoesNotContain(tpl.StartingTier, new[] { "Gold", "Diamond", "Legendary" });
-                        }
+                        if (d <= 5 && isMerchant)
+                            Assert.DoesNotContain(tpl.StartingTier, new[] { "Gold", "Diamond", "Legendary" });
 
-                        // Day 1–2 禁止过早刷出 B1&B2 / Sterling 基座
+                        // Day 1–2 禁止刷出基座（B1&B2 仅 Day 3/5、Sterling Day 6–8）
                         if (d <= 2)
                         {
                             Assert.NotEqual(ECardType.PedestalEncounter, ce.Type);
@@ -411,7 +413,7 @@ public sealed class V13_2_CombatSmoothDragLootEventTests
                             day3PlusPedestals++;
                         }
 
-                        if (d >= 5 && isMerchant && string.Equals(tpl.StartingTier, "Gold", StringComparison.OrdinalIgnoreCase))
+                        if (d >= 6 && isMerchant && string.Equals(tpl.StartingTier, "Gold", StringComparison.OrdinalIgnoreCase))
                             day5PlusGoldMerchants++;
 
                         run.VisitedDayEncounterIds.Add(tid);
@@ -424,7 +426,7 @@ public sealed class V13_2_CombatSmoothDragLootEventTests
         double bronzeTwoRatio = (double)day1BronzeTwoCount / Math.Max(1, day1NonMerchantTotal);
         Assert.True(bronzeTwoRatio <= 0.48,
             $"Day 1 丛林遗迹+奇怪蘑菇合计占比过高（{bronzeTwoRatio:P1}），说明池容平滑未生效！");
-        Assert.True(day1CurioCount > 0, "Day 1 应能合法刷出官方银商 Curio");
+        Assert.True(day1NeutralSilverMerchantCount > 0, "Day 1 应能合法刷出早期中立银商（如 Curio / Midsworth）");
         Assert.True(day3PlusPedestals > 0, "Day 3+ 应能合法刷出合规地图基座（B1&B2 / Sterling / Forja / The Artist）");
         Assert.True(day5PlusGoldMerchants > 0, "Day 5+ 应开始解锁金阶商人");
     }

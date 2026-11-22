@@ -66,6 +66,12 @@ public static partial class ModValidator
     [GeneratedRegex(@"\{([^}]+)\}", RegexOptions.CultureInvariant)]
     private static partial Regex PlaceholderTokenRegex();
 
+    [GeneratedRegex(@"<sprite(?:\s+name)?\s*=\s*(?:""([^""]+)""|'([^']+)'|([^\s>/]+))[^>]*>", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    private static partial Regex TooltipSpriteTagRegex();
+
+    [GeneratedRegex(@"<link\s*=\s*(?:""([^""]+)""|'([^']+)'|([^\s>/]+))[^>]*>", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    private static partial Regex TooltipLinkTagRegex();
+
     public static bool IsValidModId(string? modId)
         => !string.IsNullOrWhiteSpace(modId) && ModIdRegex().IsMatch(modId.Trim());
 
@@ -527,6 +533,18 @@ public static partial class ModValidator
         {
             string evId = string.IsNullOrWhiteSpace(ev.EventId) ? "<unnamed-event>" : ev.EventId.Trim();
             CheckLegacyExtensionFields(modId, evId, ev.ExtensionData, issues);
+            if (!double.IsFinite(ev.Weight) || ev.Weight < 0.0)
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "INVALID_EVENT_WEIGHT",
+                    $"自定义奇遇 '{evId}' 的 weight={ev.Weight} 非法（必须为 >= 0 的有限数值）。",
+                    evId, GateId: 1, FixHintZh: "设置 weight > 0 作为常规白昼抽签相对权重，或设为 0 表示仅由前置奇遇跳转进入。"));
+            }
+            if (ev.MinDay < 1 || ev.MaxDay < 1 || ev.MinDay > ev.MaxDay)
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "INVALID_EVENT_DAY_WINDOW",
+                    $"自定义奇遇 '{evId}' 的天数窗 [{ev.MinDay}, {ev.MaxDay}] 非法（必须满足 1 <= minDay <= maxDay）。",
+                    evId, GateId: 1, FixHintZh: "将 minDay/maxDay 调整为合法范围，例如 minDay=1, maxDay=99。"));
+            }
             CheckCardSchema(ev.ToCardDefinition());
             foreach (var step in ev.Steps)
                 CheckCardSchema(step);
@@ -1469,6 +1487,17 @@ public static partial class ModValidator
                             targetId, GateId: 7, FixHintZh: "请改用如 {attr.DamageAmount} 或 {item.CooldownMax} 的标准占位符。"));
                     }
                 }
+
+                // P2-03：基于 GameData.db 官方 tooltips 表（136 条 TTooltipSymbol）校验富文本 <sprite> 图标名与 <link> 词条标识
+                if (baseRepo.TooltipSymbolsById is { Count: > 0 })
+                {
+                    issues.AddRange(ValidateTooltipSymbolReferences(modId, targetId, tip, baseRepo.TooltipSymbolsById));
+                }
+            }
+
+            if (baseRepo.TooltipSymbolsById is { Count: > 0 } && !string.IsNullOrWhiteSpace(descZh))
+            {
+                issues.AddRange(ValidateTooltipSymbolReferences(modId, targetId, descZh, baseRepo.TooltipSymbolsById));
             }
 
             // 对带提示文本的模板，逐品阶构造真实 CardInstance 调用 TooltipFormatter.FormatTooltips 真渲染，确保 0 "?"
@@ -1583,6 +1612,104 @@ public static partial class ModValidator
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// P2-03：依据官方 GameData.db 的 136 条 <see cref="TooltipSymbolTemplate"/> 校验 Mod 文案中的
+    /// `&lt;sprite name="..."&gt;` 图标引用与 `&lt;link="..."&gt;` 词条标识，及时告警拼写错误（对普通中文文案零误报）。
+    /// </summary>
+    public static List<ModValidationIssue> ValidateTooltipSymbolReferences(
+        string modId,
+        string targetId,
+        string text,
+        IReadOnlyDictionary<string, TooltipSymbolTemplate> tooltipSymbols)
+    {
+        var found = new List<ModValidationIssue>();
+        if (string.IsNullOrWhiteSpace(text) || tooltipSymbols == null || tooltipSymbols.Count == 0)
+            return found;
+
+        bool hasSprite = text.Contains("<sprite", StringComparison.OrdinalIgnoreCase);
+        bool hasLink = text.Contains("<link", StringComparison.OrdinalIgnoreCase);
+        if (!hasSprite && !hasLink)
+            return found;
+
+        HashSet<string>? validIcons = null;
+        HashSet<string>? validKeys = null;
+
+        if (hasSprite)
+        {
+            validIcons = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var sym in tooltipSymbols.Values)
+            {
+                if (!string.IsNullOrWhiteSpace(sym.Icon)
+                    && !string.Equals(sym.Icon, "Invalid", StringComparison.OrdinalIgnoreCase))
+                {
+                    validIcons.Add(sym.Icon.Trim());
+                }
+            }
+
+            foreach (Match m in TooltipSpriteTagRegex().Matches(text))
+            {
+                string iconName = (m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Success ? m.Groups[2].Value : m.Groups[3].Value).Trim();
+                // 允许纯数字索引（如 <sprite=0>）跳过名称表检查
+                if (string.IsNullOrEmpty(iconName) || int.TryParse(iconName, out _))
+                    continue;
+                if (!validIcons.Contains(iconName))
+                {
+                    string sampleIcons = string.Join("、", validIcons.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).Take(8));
+                    found.Add(new ModValidationIssue(
+                        ModValidationSeverity.Warning,
+                        modId,
+                        "UNKNOWN_TOOLTIP_SPRITE_ICON",
+                        $"条目 '{targetId}' 的文案引用了未知的官方词条图标 '<sprite name=\"{iconName}\">'（不在官方 136 条 tooltips 图标库中）。",
+                        targetId,
+                        GateId: 7,
+                        FixHintZh: $"请检查图标名拼写；常见官方有效图标包括：{sampleIcons} 等。"));
+                }
+            }
+        }
+
+        if (hasLink)
+        {
+            validKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (idKey, sym) in tooltipSymbols)
+            {
+                if (!string.IsNullOrWhiteSpace(idKey)
+                    && !string.Equals(idKey, "Invalid", StringComparison.OrdinalIgnoreCase))
+                {
+                    validKeys.Add(idKey.Trim());
+                }
+                if (!string.IsNullOrWhiteSpace(sym.Id)
+                    && !string.Equals(sym.Id, "Invalid", StringComparison.OrdinalIgnoreCase))
+                {
+                    validKeys.Add(sym.Id.Trim());
+                }
+                if (!string.IsNullOrWhiteSpace(sym.Tag)
+                    && !string.Equals(sym.Tag, "Invalid", StringComparison.OrdinalIgnoreCase))
+                {
+                    validKeys.Add(sym.Tag.Trim());
+                }
+            }
+
+            foreach (Match m in TooltipLinkTagRegex().Matches(text))
+            {
+                string linkKey = (m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Success ? m.Groups[2].Value : m.Groups[3].Value).Trim();
+                if (string.IsNullOrEmpty(linkKey)) continue;
+                if (!validKeys.Contains(linkKey))
+                {
+                    found.Add(new ModValidationIssue(
+                        ModValidationSeverity.Warning,
+                        modId,
+                        "UNKNOWN_TOOLTIP_SYMBOL_LINK",
+                        $"条目 '{targetId}' 的文案引用了未知的官方词条链接 '<link=\"{linkKey}\">'（不在官方 136 条 tooltips 词条表中）。",
+                        targetId,
+                        GateId: 7,
+                        FixHintZh: "请确认 <link=\"...\"> 使用官方标准词条键（如 Burn、Poison、Shield、Haste、Charge、Freeze、Crit Chance 等）。"));
+                }
+            }
+        }
+
+        return found;
     }
 
     private static readonly (string HiddenTag, string LabelZh, string AttrKey, string[] ActionTypes, string MechanicStatus)[] ItemEffectHiddenTagSpecs =

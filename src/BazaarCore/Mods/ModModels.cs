@@ -388,6 +388,26 @@ public sealed class CustomCardDefinition
     [JsonPropertyName("rewardDefeat")]
     public CombatRewardData? RewardDefeat { get; set; }
 
+    /// <summary>P1-04：Mod 自定义遭遇场景切板键（原样透传至 CardTemplate.BoardOverride）。</summary>
+    [JsonPropertyName("boardOverride")]
+    public string? BoardOverride { get; set; }
+
+    /// <summary>P1-04：Mod 自定义遭遇视觉演出键（原样透传至 CardTemplate.Presentation）。</summary>
+    [JsonPropertyName("presentation")]
+    public string? Presentation { get; set; }
+
+    /// <summary>Mod 自定义遭遇相对抽签权重（仅事件/遭遇使用；&lt;=0 转为 GuidOnly）。</summary>
+    [JsonPropertyName("weight")]
+    public double? ModSpawnWeight { get; set; }
+
+    /// <summary>Mod 自定义遭遇最早允许出现天数。</summary>
+    [JsonPropertyName("minDay")]
+    public int? ModMinDay { get; set; }
+
+    /// <summary>Mod 自定义遭遇最晚允许出现天数。</summary>
+    [JsonPropertyName("maxDay")]
+    public int? ModMaxDay { get; set; }
+
     /// <summary>用于 Gate #1 静态检测非引擎废字段（如奇遇步骤中虚构的 effects / costGold）。</summary>
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? ExtensionData { get; set; }
@@ -509,6 +529,13 @@ public sealed class CustomCardDefinition
             RewardCombatXp = RewardCombatXp,
             RewardVictory = RewardVictory,
             RewardDefeat = RewardDefeat,
+            BoardOverride = string.IsNullOrWhiteSpace(BoardOverride) ? null : BoardOverride.Trim(),
+            Presentation = string.IsNullOrWhiteSpace(Presentation) ? null : Presentation.Trim(),
+            ModSpawnWeight = ModSpawnWeight.HasValue && double.IsFinite(ModSpawnWeight.Value)
+                ? Math.Max(0.0, ModSpawnWeight.Value)
+                : null,
+            ModMinDay = ModMinDay is >= 1 ? ModMinDay : null,
+            ModMaxDay = ModMaxDay is >= 1 ? ModMaxDay : null,
             CustomMechanics = CustomMechanics is { Count: > 0 }
                 ? CustomMechanics.Select(m => new CardMechanicAttachment
                 {
@@ -617,6 +644,14 @@ public sealed class CustomEventDefinition
     [JsonPropertyName("combatMonster")]
     public MonsterTemplate? CombatMonster { get; set; }
 
+    /// <summary>P1-04：可选自定义切板键（如远征/主题奇遇棋盘覆写）。</summary>
+    [JsonPropertyName("boardOverride")]
+    public string? BoardOverride { get; set; }
+
+    /// <summary>P1-04：可选自定义遭遇演出键。</summary>
+    [JsonPropertyName("presentation")]
+    public string? Presentation { get; set; }
+
     /// <summary>用于 Gate #1 静态检测事件对象上的非引擎废字段。</summary>
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? ExtensionData { get; set; }
@@ -631,6 +666,12 @@ public sealed class CustomEventDefinition
                 nextOptions.Add(new NextEncounterOption { Id = nid.Trim(), Weight = 1.0 });
         }
 
+        // 工坊约定：weight <= 0 表示“仅允许由上一奇遇跳转进入”，自动转为 GuidOnly 且不进入常规白昼随机池
+        bool isGuidOnly = double.IsFinite(Weight) && Weight <= 0.0;
+        double effectiveWeight = isGuidOnly
+            ? 0.0
+            : (double.IsFinite(Weight) ? Weight : 1.0);
+
         return new CustomCardDefinition
         {
             CustomId = EventId,
@@ -638,11 +679,16 @@ public sealed class CustomEventDefinition
             Type = EventType,
             Size = "Medium",
             StartingTier = "Bronze",
-            SpawningEligibility = "Always",
+            SpawningEligibility = isGuidOnly ? "GuidOnly" : "Always",
             Heroes = Heroes.Count > 0 ? new List<string>(Heroes) : [HeroNames.Common],
             TitleZh = TitleZh,
             DescZh = DescZh,
             CustomArtFile = CustomArtFile,
+            BoardOverride = string.IsNullOrWhiteSpace(BoardOverride) ? null : BoardOverride.Trim(),
+            Presentation = string.IsNullOrWhiteSpace(Presentation) ? null : Presentation.Trim(),
+            ModSpawnWeight = effectiveWeight,
+            ModMinDay = MinDay > 1 ? MinDay : null,
+            ModMaxDay = MaxDay is >= 1 and < 99 ? MaxDay : null,
             NextEncounterOnSelection = nextOptions.Count > 0 ? nextOptions : null,
             CombatantType = CombatMonster != null
                 ? new RuleNode { Type = "TCombatantMonster", MonsterTemplateId = CombatMonster.Id }
@@ -901,6 +947,14 @@ public sealed class CardPatchDefinition
     [JsonPropertyName("accentColor")]
     public string? AccentColor { get; set; }
 
+    /// <summary>P1-04：可选覆写原版遭遇切板键。</summary>
+    [JsonPropertyName("boardOverride")]
+    public string? BoardOverride { get; set; }
+
+    /// <summary>P1-04：可选覆写原版遭遇演出键。</summary>
+    [JsonPropertyName("presentation")]
+    public string? Presentation { get; set; }
+
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? ExtensionData { get; set; }
 
@@ -917,6 +971,10 @@ public sealed class CardPatchDefinition
             cloned.StartingTier = StartingTier.Trim();
         if (!string.IsNullOrWhiteSpace(SpawningEligibility))
             cloned.SpawningEligibility = SpawningEligibility.Trim();
+        if (!string.IsNullOrWhiteSpace(BoardOverride))
+            cloned.BoardOverride = BoardOverride.Trim();
+        if (!string.IsNullOrWhiteSpace(Presentation))
+            cloned.Presentation = Presentation.Trim();
         if (Heroes is { Count: > 0 })
             cloned.Heroes = new List<string>(Heroes);
 

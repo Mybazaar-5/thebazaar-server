@@ -65,13 +65,25 @@ public sealed class V12CombatFrameParityTests
                     new RuleNode
                     {
                         Type = "TActionCardHaste",
-                        Target = new RuleNode { Type = "TTargetCardXMost", TargetSection = "SelfHand", TargetMode = "LeftMostCard" },
+                        Target = new RuleNode
+                        {
+                            Type = "TTargetCardXMost",
+                            TargetSection = "SelfHand",
+                            TargetMode = "LeftMostCard",
+                            RawConditionsElement = JsonSerializer.SerializeToElement(new Dictionary<string, object> { ["$type"] = "TCardConditionalId", ["Id"] = "ammo_zero_gun", ["IsNot"] = false })
+                        },
                         ReferenceValue = Fixed(1000)
                     },
                     new RuleNode
                     {
                         Type = "TActionCardCharge",
-                        Target = new RuleNode { Type = "TTargetCardXMost", TargetSection = "SelfHand", TargetMode = "LeftMostCard" },
+                        Target = new RuleNode
+                        {
+                            Type = "TTargetCardXMost",
+                            TargetSection = "SelfHand",
+                            TargetMode = "LeftMostCard",
+                            RawConditionsElement = JsonSerializer.SerializeToElement(new Dictionary<string, object> { ["$type"] = "TCardConditionalId", ["Id"] = "ammo_zero_gun", ["IsNot"] = false })
+                        },
                         ReferenceValue = Fixed(2000)
                     }
                 ]
@@ -100,7 +112,7 @@ public sealed class V12CombatFrameParityTests
         var gunFires = res.Events.Where(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == gun.InstanceId).ToList();
 
         Assert.Equal(2, gunFires.Count);
-        Assert.Equal(980, gunFires[0].TimeMs);
+        Assert.Equal(950, gunFires[0].TimeMs);
 
         // 1300ms 时（缺弹期）冷却进度必须已被清零，且 Haste 正在正常倒计时（< 1000ms）
         var snap1300 = res.Timeline.First(t => t.TimeMs == 1300).Cards.First(c => c.InstanceId == gun.InstanceId);
@@ -210,7 +222,7 @@ public sealed class V12CombatFrameParityTests
         var fullRes = CombatSimulator.Simulate(repo, p1, p2, seed: 1204);
         var hasteEvents = fullRes.Events.Where(e => e.Type == CombatEventType.HasteApplied && e.TargetCardInstanceId == targetWeapon.InstanceId).ToList();
         Assert.Single(hasteEvents);
-        Assert.Equal(980, hasteEvents[0].TimeMs);
+        Assert.Equal(950, hasteEvents[0].TimeMs);
         Assert.Equal(1000, (int)hasteEvents[0].Value);
 
         // 2. 未满血时治疗恰好补满 HealthMax（reaching HealthMax: 1000 - 100 + 100 = 1000）应触发 OverHeal
@@ -286,10 +298,10 @@ public sealed class V12CombatFrameParityTests
         Assert.Equal(5, (int)ticks[11].Value);
         Assert.Equal(7, (int)ticks[12].Value);
 
-        // 验证间隔递减至 150ms 下限（前两跳间距 ~240ms，第 11 跳以后收敛到 150ms 附近）
-        Assert.InRange(ticks[1].TimeMs - ticks[0].TimeMs, 240, 260);
+        // 验证官方 50ms 累加器间隔（P1-50：首跳同帧预加 50ms 故第 2 跳在 30200ms 间距 200ms，第 11 跳以后收敛到 150ms）
+        Assert.Equal(200, ticks[1].TimeMs - ticks[0].TimeMs);
         int lateGap = ticks[11].TimeMs - ticks[10].TimeMs;
-        Assert.InRange(lateGap, 140, 160);
+        Assert.Equal(150, lateGap);
 
         // Windmill 仅应在沙暴启动时将 1000 MaxHP 翻倍一次到 2000（绝非每跳翻倍指数爆炸）
         var snap30s = natRes.Timeline.First(t => t.TimeMs == 30000);
@@ -339,7 +351,7 @@ public sealed class V12CombatFrameParityTests
 
         var earlyRes = CombatSimulator.Simulate(repo, ep1, ep2, seed: 1208, recordTimeline: true, recordEvents: true);
         var firstEarlyTick = earlyRes.Events.First(e => e.Type == CombatEventType.SandstormTick);
-        Assert.InRange(firstEarlyTick.TimeMs, 4960, 5020);
+        Assert.InRange(firstEarlyTick.TimeMs, 4950, 5020);
         Assert.Equal(1, (int)firstEarlyTick.Value);
 
         var snapEarly = earlyRes.Timeline.First(t => t.TimeMs >= firstEarlyTick.TimeMs);
@@ -389,7 +401,7 @@ public sealed class V12CombatFrameParityTests
         var enrageEnd = res.Events.First(e => e.Type == CombatEventType.PlayerEnrageEnded && e.TargetPlayerId == "p1");
 
         Assert.Equal(0, enrageStart.TimeMs);
-        Assert.Equal(4980, enrageEnd.TimeMs); // 250 ticks * 20ms = 5000ms 完整持续窗口 (0..4980ms)
+        Assert.Equal(4950, enrageEnd.TimeMs); // 100 ticks * 50ms = 5000ms 完整持续窗口 (0..4950ms)
 
         var snap1000 = res.Timeline.First(t => t.TimeMs == 1000);
         var snap5500 = res.Timeline.First(t => t.TimeMs == 5500);
@@ -397,11 +409,11 @@ public sealed class V12CombatFrameParityTests
         Assert.False(snap5500.P1Enraged);
 
         var oppHits = res.Events.Where(e => e.Type == CombatEventType.DamageApplied && e.SourcePlayerId == "p2").ToList();
-        Assert.Equal(50, (int)oppHits[0].Value);  // 1980ms 狂暴期间受 Forest Cloak 50% 减伤
-        Assert.Equal(100, (int)oppHits[2].Value); // 5980ms 狂暴结束后恢复 100 全额伤害
+        Assert.Equal(50, (int)oppHits[0].Value);  // 1950ms 狂暴期间受 Forest Cloak 50% 减伤
+        Assert.Equal(100, (int)oppHits[2].Value); // 5950ms 狂暴结束后恢复 100 全额伤害
 
-        // Frog Hollow 在 TTriggerOnPlayerEnrageEnded (4980ms) 后应对全队施加 Haste
-        Assert.Contains(res.Events, e => e.Type == CombatEventType.HasteApplied && e.TimeMs >= 4980);
+        // Frog Hollow 在 TTriggerOnPlayerEnrageEnded (4950ms) 后应对全队施加 Haste
+        Assert.Contains(res.Events, e => e.Type == CombatEventType.HasteApplied && e.TimeMs >= 4950);
     }
 
     [Fact]
@@ -424,11 +436,11 @@ public sealed class V12CombatFrameParityTests
         }, extraAttrs: new() { ["Multicast"] = 3 }));
 
         var memRes = CombatSimulator.Simulate(repo, p1, p2, seed: 1210, recordTimeline: true, recordEvents: true);
-        // 980ms 第一发致死触发 Memento Mori 复活至 1 HP，980ms..1980ms 内后续多发全部受 100% DR 变为 0 伤害，直到 1980ms+ 无敌到期才被后续击杀
-        var zeroHitsAfterRevive = memRes.Events.Where(e => e.Type == CombatEventType.DamageApplied && e.SourcePlayerId == "p2" && e.TimeMs > 980 && e.TimeMs < 1980).ToList();
+        // 950ms 第一发致死触发 Memento Mori 复活至 1 HP，950ms..1950ms 内后续多发全部受 100% DR 变为 0 伤害，直到 1950ms 无敌到期才被后续击杀
+        var zeroHitsAfterRevive = memRes.Events.Where(e => e.Type == CombatEventType.DamageApplied && e.SourcePlayerId == "p2" && e.TimeMs > 950 && e.TimeMs < 1950).ToList();
         Assert.NotEmpty(zeroHitsAfterRevive);
         Assert.All(zeroHitsAfterRevive, h => Assert.Equal(0, (int)h.Value));
-        Assert.True(memRes.DurationMs >= 1980, $"Memento Mori 1000ms 无敌应保命至少到 1980ms，实际 {memRes.DurationMs}ms");
+        Assert.True(memRes.DurationMs >= 1950, $"Memento Mori 1000ms 无敌应保命至少到 1950ms，实际 {memRes.DurationMs}ms");
 
         // 2. 真实 Fiery Rebirth（Diamond）：首次濒死回满全部 HealthMax 并反杀，整场仅触发一次
         var fp1 = CreatePlayer("fp1", HeroNames.Vanessa, 100);

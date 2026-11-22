@@ -149,6 +149,10 @@ public static class SpawnQueryEngine
         var results = new List<CardInstance>();
         if (spawnContext == null) return results;
 
+        // 统一从上下文回退继承流派解析器与自定义规则，覆盖 AbilityExecutor / EncounterStepEngine / 战利品等全部生成链路
+        archetypeResolver ??= ctx.ArchetypeResolver;
+        rules ??= ctx.CustomRules;
+
         var repo = ctx.Repo;
         var player = ctx.SelfPlayer;
         player.EnsureExclusionSetInitialized(repo?.GameMode);
@@ -744,6 +748,36 @@ public static class SpawnQueryEngine
                 candidates = distinctInBatch;
         }
 
+        bool isSequentialGroup = string.Equals(grp.SelectionMethod, "Sequential", StringComparison.OrdinalIgnoreCase);
+        // P2-21：当 TSpawnGroup 显式声明 SelectionMethod == "Sequential" 时，按 IdList 声明序或候选池确定序依次取出
+        if (isSequentialGroup && idListFilter?.Ids is { Count: > 0 })
+        {
+            var orderMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            for (int idx = 0; idx < idListFilter.Ids.Count; idx++)
+            {
+                if (!orderMap.ContainsKey(idListFilter.Ids[idx]))
+                    orderMap[idListFilter.Ids[idx]] = idx;
+            }
+            candidates.Sort((a, b) =>
+            {
+                int oa = orderMap.TryGetValue(a.Id, out var ia) ? ia : int.MaxValue;
+                int ob = orderMap.TryGetValue(b.Id, out var ib) ? ib : int.MaxValue;
+                int cmp = oa.CompareTo(ob);
+                return cmp != 0 ? cmp : string.CompareOrdinal(a.Id, b.Id);
+            });
+        }
+
+        CardTemplate PickCandidateForGroup(List<CardTemplate> sourcePool)
+        {
+            if (isSequentialGroup)
+            {
+                if (allowDup && alreadyPicked.Count > 0 && sourcePool.All(c => alreadyPicked.Any(a => a.Template.Id == c.Id)))
+                    return sourcePool[alreadyPicked.Count % sourcePool.Count];
+                return sourcePool[0];
+            }
+            return PickCandidateWithArchetypeWeight(sourcePool, ctx.Rng, archetypeResolver, rules, ctx.SelfPlayer.Hero);
+        }
+
         CardTemplate chosen;
         CardTier tier;
         var forcedTiers = (tierConstraint != null && tierConstraint.IsNot != true)
@@ -768,7 +802,7 @@ public static class SpawnQueryEngine
             var excludedTiers = (tierConstraint != null && tierConstraint.IsNot == true)
                 ? ParseConstrainedTiers(tierConstraint)
                 : null;
-            if (!TryPickByDayTierFirst(candidates, ctx.CurrentDay, downShiftTier, ctx.Rng, ctx.Repo?.GameMode, excludedTiers, ownedLookup, archetypeResolver, rules, ctx.SelfPlayer.Hero, out chosen!, out tier))
+            if (!TryPickByDayTierFirst(candidates, ctx.CurrentDay, downShiftTier, ctx.Rng, ctx.Repo?.GameMode, excludedTiers, ownedLookup, archetypeResolver, rules, ctx.SelfPlayer.Hero, out chosen!, out tier, isSequential: isSequentialGroup))
                 return null;
         }
         else if (forcedTiers.Count > 0 && idListFilter == null && targetTemplateIds == null)
@@ -778,7 +812,7 @@ public static class SpawnQueryEngine
                 : candidates.Where(c => c.Type != "Item" || GetValidForcedTiersForCandidate(c, forcedTiers, ownedLookup).Count > 0).ToList();
             if (forcedPool.Count == 0) return null;
 
-            chosen = PickCandidateWithArchetypeWeight(forcedPool, ctx.Rng, archetypeResolver, rules, ctx.SelfPlayer.Hero);
+            chosen = PickCandidateForGroup(forcedPool);
             if (chosen.Type is "Item" or "Skill")
             {
                 var validForced = GetValidForcedTiersForCandidate(chosen, forcedTiers, ownedLookup);
@@ -841,12 +875,12 @@ public static class SpawnQueryEngine
                 if (matchedTierPool == null || matchedTierPool.Count == 0)
                     return null;
 
-                chosen = PickCandidateWithArchetypeWeight(matchedTierPool, ctx.Rng, archetypeResolver, rules, ctx.SelfPlayer.Hero);
+                chosen = PickCandidateForGroup(matchedTierPool);
                 tier = ClampToSupportedTier(chosen, resolvedTier);
             }
             else
             {
-                chosen = PickCandidateWithArchetypeWeight(candidates, ctx.Rng, archetypeResolver, rules, ctx.SelfPlayer.Hero);
+                chosen = PickCandidateForGroup(candidates);
                 tier = ClampToSupportedTier(chosen, chosen.DefaultTier);
             }
         }
@@ -868,7 +902,7 @@ public static class SpawnQueryEngine
                 candidates = eligibleForOwned;
             }
 
-            chosen = PickCandidateWithArchetypeWeight(candidates, ctx.Rng, archetypeResolver, rules, ctx.SelfPlayer.Hero);
+            chosen = PickCandidateForGroup(candidates);
             if (forcedTiers.Count > 0 && chosen.Type is "Item" or "Skill")
             {
                 var validForced = GetValidForcedTiersForCandidate(chosen, forcedTiers, ownedLookup);
@@ -1307,33 +1341,13 @@ public static class SpawnQueryEngine
         CustomRunRuleSet? rules,
         string? playerHero,
         out CardTemplate? chosen,
-        out CardTier chosenTier)
+        out CardTier chosenTier,
+        bool isSequential = false)
     {
         chosen = null;
         chosenTier = CardTier.Bronze;
 
-        var (bronze, silver, gold, diamond) = GetEffectiveDayTierWeights(gameMode, day);
-        // 预设档位高阶概率加成（EnhancedFun: Silver+ +15%；ExtremeRoguelike: Gold+ +20%）
-        if (rules != null && rules.ShopHighTierBonusPct > 1e-6)
-        {
-            double bonus = Math.Clamp(rules.ShopHighTierBonusPct, 0.0, 60.0);
-            if (rules.PresetId == EGameModePreset.ExtremeRoguelike)
-            {
-                double take = Math.Min(bronze + silver, bonus);
-                double fromBronze = Math.Min(bronze, take);
-                bronze -= fromBronze;
-                silver -= (take - fromBronze);
-                gold += take * 0.75;
-                diamond += take * 0.25;
-            }
-            else
-            {
-                double fromBronze = Math.Min(bronze, bonus);
-                bronze -= fromBronze;
-                silver += fromBronze * 0.80;
-                gold += fromBronze * 0.20;
-            }
-        }
+        var (bronze, silver, gold, diamond) = GetEffectiveDayTierWeightsWithRules(gameMode, day, rules);
 
         double[] weights = [bronze, silver, gold, diamond];
         if (excludedTiers != null)
@@ -1385,7 +1399,9 @@ public static class SpawnQueryEngine
                 .ToList();
             if (matching.Count > 0)
             {
-                chosen = PickCandidateWithArchetypeWeight(matching, rng, archetypeResolver, rules, playerHero);
+                chosen = isSequential
+                    ? matching[0]
+                    : PickCandidateWithArchetypeWeight(matching, rng, archetypeResolver, rules, playerHero);
                 chosenTier = chosen.Type is "Item" or "Skill"
                     ? ClampToSupportedTier(chosen, tier)
                     : ClampToSupportedTier(chosen, chosen.DefaultTier);
@@ -1397,12 +1413,68 @@ public static class SpawnQueryEngine
         var nonItemSkill = candidates.Where(c => c.Type is not ("Item" or "Skill")).ToList();
         if (nonItemSkill.Count > 0)
         {
-            chosen = PickCandidateWithArchetypeWeight(nonItemSkill, rng, archetypeResolver, rules, playerHero);
+            chosen = isSequential
+                ? nonItemSkill[0]
+                : PickCandidateWithArchetypeWeight(nonItemSkill, rng, archetypeResolver, rules, playerHero);
             chosenTier = ClampToSupportedTier(chosen, chosen.DefaultTier);
             return true;
         }
 
         return false;
+    }
+
+    /// <summary>返回指定天数的有效物品/技能品阶抽选权重（含 P2-30 Day 12 平滑修正）。</summary>
+    public static (double Bronze, double Silver, double Gold, double Diamond) GetDayTierWeights(
+        GameModeData? gameMode,
+        int day)
+        => GetEffectiveDayTierWeights(gameMode, day);
+
+    /// <summary>
+    /// 返回叠合 <see cref="CustomRunRuleSet.ShopHighTierBonusPct"/> 后的有效物品/技能品阶抽选权重：
+    /// 严格按基础权重总和 <c>rawSum</c> 等比折算百分比（同时兼容 DB 的 0..1 小数表与兜底 0..100 百分表），
+    /// 且在青铜权重已归零的中后期（如 Day 6+）将剩余高阶加成平滑从白银向金/钻转移。
+    /// </summary>
+    public static (double Bronze, double Silver, double Gold, double Diamond) GetEffectiveDayTierWeightsWithRules(
+        GameModeData? gameMode,
+        int day,
+        CustomRunRuleSet? rules)
+    {
+        var (bronze, silver, gold, diamond) = GetEffectiveDayTierWeights(gameMode, day);
+        if (rules == null || !double.IsFinite(rules.ShopHighTierBonusPct) || rules.ShopHighTierBonusPct <= 1e-6)
+            return (bronze, silver, gold, diamond);
+
+        double rawSum = bronze + silver + gold + diamond;
+        if (rawSum <= 1e-9)
+            return (bronze, silver, gold, diamond);
+
+        double bonus = (Math.Clamp(rules.ShopHighTierBonusPct, 0.0, 60.0) / 100.0) * rawSum;
+        if (rules.PresetId == EGameModePreset.ExtremeRoguelike)
+        {
+            double take = Math.Min(bronze + silver, bonus);
+            double fromBronze = Math.Min(bronze, take);
+            bronze -= fromBronze;
+            silver -= (take - fromBronze);
+            gold += take * 0.75;
+            diamond += take * 0.25;
+        }
+        else
+        {
+            double fromBronze = Math.Min(bronze, bonus);
+            bronze -= fromBronze;
+            silver += fromBronze * 0.80;
+            gold += fromBronze * 0.20;
+
+            double remaining = bonus - fromBronze;
+            if (remaining > 1e-9 && silver > 1e-9)
+            {
+                double fromSilver = Math.Min(silver, remaining);
+                silver -= fromSilver;
+                gold += fromSilver * 0.75;
+                diamond += fromSilver * 0.25;
+            }
+        }
+
+        return (bronze, silver, gold, diamond);
     }
 
     private static (double Bronze, double Silver, double Gold, double Diamond) GetEffectiveDayTierWeights(
@@ -1454,8 +1526,15 @@ public static class SpawnQueryEngine
         var table = gameMode?.ItemSkillSpawnTierPercantagesByDay;
         if (table == null || table.Count == 0) return false;
 
+        // Patch 20.2 实测（BazaarDB /shop-odds Day 10–16 合计 38.7 万样本稳态 Silver 20% / Gold 70% / Diamond 10%）：
+        // 官方按 GameMode.NumberOfDays（标准局为 10）钳制查表天数；若自定义 Mode 将 NumberOfDays 设为 >10，
+        // 则自然放行读取对应高天自定义品阶行，同时继续兼容 P2-30 对旧 DB Day 12 总和 0.80 笔误的平滑防呆。
+        int lookupDay = gameMode!.NumberOfDays > 0
+            ? Math.Clamp(day, 1, gameMode.NumberOfDays)
+            : Math.Max(1, day);
+
         Dictionary<string, double>? row = null;
-        if (table.TryGetValue(day.ToString(), out var exact))
+        if (table.TryGetValue(lookupDay.ToString(), out var exact))
         {
             row = exact;
         }
@@ -1473,10 +1552,10 @@ public static class SpawnQueryEngine
                 if (!int.TryParse(key, out int k)) continue;
                 if (k > maxDay) { maxDay = k; maxRow = val; }
                 if (k < minDay) { minDay = k; minRow = val; }
-                if (k <= day && k > bestLeDay) { bestLeDay = k; bestLeRow = val; }
+                if (k <= lookupDay && k > bestLeDay) { bestLeDay = k; bestLeRow = val; }
             }
 
-            row = bestLeRow ?? (day > maxDay ? maxRow : minRow);
+            row = bestLeRow ?? (lookupDay > maxDay ? maxRow : minRow);
         }
 
         if (row == null) return false;
@@ -1484,6 +1563,14 @@ public static class SpawnQueryEngine
         silver = Math.Max(0, row.GetValueOrDefault("Silver", 0));
         gold = Math.Max(0, row.GetValueOrDefault("Gold", 0));
         diamond = Math.Max(0, row.GetValueOrDefault("Diamond", 0));
+        // 防呆保留（P2-30）：若自定义 Mode 设 NumberOfDays>=12 并沿用旧 DB Day 12（0.20/0.55/0.05 总和 0.80），平滑补齐 Diamond=0.25
+        double rawSum = bronze + silver + gold + diamond;
+        if (lookupDay == 12
+            && Math.Abs(rawSum - 0.80) < 1e-6
+            && Math.Abs(diamond - 0.05) < 1e-6)
+        {
+            diamond = 0.25;
+        }
         return (bronze + silver + gold + diamond) > 0;
     }
 

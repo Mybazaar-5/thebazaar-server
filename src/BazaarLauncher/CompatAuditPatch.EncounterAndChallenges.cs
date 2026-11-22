@@ -21,6 +21,7 @@ using BazaarGameShared.Infra.Messages.CombatSimEvents;
 using BazaarGameShared.Infra.Messages.GameSimEvents;
 using HarmonyLib;
 using UnityEngine;
+using BazaarLauncher.Core;
 
 namespace BazaarLauncher;
 
@@ -28,7 +29,7 @@ internal static partial class CompatAuditPatch
 {
     // ── 12. EncounterController 子事件 / EncounterStep 立绘与 Tooltip 补全 (#19) ──
 
-    private static void PatchEncounterController(Harmony harmony)
+    private static void PatchEncounterController(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -66,11 +67,12 @@ internal static partial class CompatAuditPatch
                     : AccessTools.Method(_encounterControllerType, "Setup");
                 if (setupMethod != null)
                 {
-                    harmony.Patch(
+                    patcher.TryPatchMethod(
                         setupMethod,
-                        prefix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(EncounterSetupPrefix))),
-                        postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(EncounterSetupPostfix))));
-                    _patchedCount++;
+                        prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(EncounterSetupPrefix)),
+                        postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(EncounterSetupPostfix)),
+                        optional: true,
+                        label: "Compat.Encounter.EncounterController.Setup");
                 }
 
                 var loadEncMethod = cardType != null
@@ -86,18 +88,22 @@ internal static partial class CompatAuditPatch
                             ?.MakeGenericMethod(_encounterAssetDataSoType);
                         if (genericPostfix != null)
                         {
-                            harmony.Patch(loadEncMethod, postfix: new HarmonyMethod(genericPostfix));
-                            _patchedCount++;
+                            patcher.TryPatchMethod(
+                                loadEncMethod,
+                                postfix: genericPostfix,
+                                optional: true,
+                                label: "Compat.Encounter.EncounterController.LoadEncounterData");
                         }
                     }
                 }
 
                 if (_encSetupEncounterControllerMethod != null)
                 {
-                    harmony.Patch(
+                    patcher.TryPatchMethod(
                         _encSetupEncounterControllerMethod,
-                        prefix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(SetupEncounterControllerPrefix))));
-                    _patchedCount++;
+                        prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(SetupEncounterControllerPrefix)),
+                        optional: true,
+                        label: "Compat.Encounter.EncounterController.SetupEncounterController");
                 }
             }
 
@@ -118,9 +124,11 @@ internal static partial class CompatAuditPatch
                     var rm = AccessTools.Method(dataType, resetName, Type.EmptyTypes);
                     if (rm != null)
                     {
-                        harmony.Patch(rm, postfix: new HarmonyMethod(
-                            AccessTools.Method(typeof(CompatAuditPatch), nameof(DataResetEncounterCachePostfix))));
-                        _patchedCount++;
+                        patcher.TryPatchMethod(
+                            rm,
+                            postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(DataResetEncounterCachePostfix)),
+                            optional: true,
+                            label: $"Compat.Encounter.Data.{resetName}");
                     }
                 }
             }
@@ -131,9 +139,11 @@ internal static partial class CompatAuditPatch
                 var getTitleMethod = AccessTools.Method(tipDataType, "GetTitle", Type.EmptyTypes);
                 if (getTitleMethod != null)
                 {
-                    harmony.Patch(getTitleMethod, postfix: new HarmonyMethod(
-                        AccessTools.Method(typeof(CompatAuditPatch), nameof(CardTooltipGetTitlePostfix))));
-                    _patchedCount++;
+                    patcher.TryPatchMethod(
+                        getTitleMethod,
+                        postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(CardTooltipGetTitlePostfix)),
+                        optional: true,
+                        label: "Compat.Encounter.CardTooltipData.GetTitle");
                 }
             }
 
@@ -143,9 +153,11 @@ internal static partial class CompatAuditPatch
                 var renderPassiveMethod = AccessTools.Method(tipHandlerType, "RenderPassiveEffects");
                 if (renderPassiveMethod != null)
                 {
-                    harmony.Patch(renderPassiveMethod, postfix: new HarmonyMethod(
-                        AccessTools.Method(typeof(CompatAuditPatch), nameof(CardTooltipRenderPassiveEffectsPostfix))));
-                    _patchedCount++;
+                    patcher.TryPatchMethod(
+                        renderPassiveMethod,
+                        postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(CardTooltipRenderPassiveEffectsPostfix)),
+                        optional: true,
+                        label: "Compat.Encounter.CardTooltipTypeHandler.RenderPassiveEffects");
                 }
             }
 
@@ -162,17 +174,48 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    // ── 13. PrizePassChallengesView 空安全保护（消除对局结束回大厅 NRE 与 Uploading Crash Report 卡顿）──
+    // ── 13. PrizePassChallengesView 与 EndOfRunChallengesController 空安全与延迟回调守卫 (P1-48) ──
 
-    private static void PatchPrizePassChallengesGuard(Harmony harmony)
+    private static FieldInfo _ppvCachedDailyField;
+    private static FieldInfo _ppvCachedWeeklyField;
+    private static PropertyInfo _bpcIdProp;
+
+    private static readonly object _eorChallengesLock = new();
+    private static readonly HashSet<int> _activeEorChallengeCtrlIds = new();
+    private static FieldInfo _eorChallengesViewField;
+    private static FieldInfo _eorTierDialField;
+    private static FieldInfo _eorPrizePassFxField;
+    private static FieldInfo _eorSoundHandlerField;
+    private static FieldInfo _eorCachedTierDataField;
+    private static FieldInfo _clientCacheSeasonTrackField;
+    private static FieldInfo _clientCachePrevSeasonTrackField;
+    private static FieldInfo _clientCacheSeasonProgField;
+    private static FieldInfo _clientCachePrevSeasonProgField;
+    private static MethodInfo _doTweenKillMethod;
+
+    internal static void ClearEndOfRunChallengeGuards()
+    {
+        lock (_eorChallengesLock)
+        {
+            _activeEorChallengeCtrlIds.Clear();
+        }
+    }
+
+    private static void PatchPrizePassChallengesGuard(SafeHarmonyPatcher patcher)
     {
         try
         {
             var viewType = GameInspector.FindTypeSafe("TheBazaar.UI.PrizePassChallengesView");
             if (viewType == null) return;
 
-            var prefix = new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(PrizePassChallengesSanitizePrefix)));
-            var fin = new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(SwallowUiFinalizer)));
+            _ppvCachedDailyField = viewType.GetField("_cachedDailyChallengeProgress", BindingFlags.NonPublic | BindingFlags.Instance);
+            _ppvCachedWeeklyField = viewType.GetField("_cachedWeeklyChallengeProgress", BindingFlags.NonPublic | BindingFlags.Instance);
+
+            var bpcType = GameInspector.FindTypeSafe("TheBazaar.UI.BattlePassChallenge");
+            _bpcIdProp = bpcType?.GetProperty("Id", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            var sanitizePrefix = AccessTools.Method(typeof(CompatAuditPatch), nameof(PrizePassChallengesSanitizePrefix));
+            var fin = AccessTools.Method(typeof(CompatAuditPatch), nameof(SwallowUiFinalizer));
 
             foreach (var name in new[] { "Awake", "RefreshChallenges", "ShowChallengesProgress", "OnChallengesUpdated" })
             {
@@ -182,9 +225,46 @@ internal static partial class CompatAuditPatch
                     var ps = m.GetParameters();
                     bool hasRespArg = ps.Length > 0
                         && ps[0].ParameterType == typeof(BazaarGameShared.TempoNet.Responses.PlayerChallengesResponse);
-                    harmony.Patch(m, prefix: hasRespArg ? prefix : null, finalizer: fin);
-                    _patchedCount++;
+                    patcher.TryPatchMethod(
+                        m,
+                        prefix: hasRespArg ? sanitizePrefix : null,
+                        finalizer: fin,
+                        optional: true,
+                        label: $"Compat.Challenges.PrizePassChallengesView.{name}");
                 }
+            }
+
+            // P1-48：ShowChallengeProgress 在空数组或缺失进度项时补齐默认 ChallengeProgress，避免首个空项抛 NRE 提前中止循环
+            var showOne = viewType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                .FirstOrDefault(m =>
+                {
+                    if (m.Name != "ShowChallengeProgress") return false;
+                    var ps = m.GetParameters();
+                    return ps.Length >= 3
+                        && ps[1].ParameterType == typeof(BazaarGameShared.TempoNet.Responses.ChallengeProgress[])
+                        && ps[2].ParameterType == typeof(BazaarGameShared.TempoNet.Responses.ChallengeProgress[]);
+                });
+            if (showOne != null)
+            {
+                patcher.TryPatchMethod(
+                    showOne,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(PrizePassShowChallengeProgressPrefix)),
+                    finalizer: fin,
+                    optional: true,
+                    label: "Compat.Challenges.PrizePassChallengesView.ShowChallengeProgress");
+            }
+
+            var getProg = AccessTools.Method(
+                viewType,
+                "GetProgressFromId",
+                new[] { typeof(BazaarGameShared.TempoNet.Responses.ChallengeProgress[]), typeof(Guid) });
+            if (getProg != null)
+            {
+                patcher.TryPatchMethod(
+                    getProg,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(PrizePassGetProgressFromIdPrefix)),
+                    optional: true,
+                    label: "Compat.Challenges.PrizePassChallengesView.GetProgressFromId");
             }
         }
         catch (Exception ex)
@@ -193,10 +273,22 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    private static bool PrizePassChallengesSanitizePrefix(ref BazaarGameShared.TempoNet.Responses.PlayerChallengesResponse __0)
+    private static bool PrizePassChallengesSanitizePrefix(object __instance, ref BazaarGameShared.TempoNet.Responses.PlayerChallengesResponse __0)
     {
         try
         {
+            if (__instance != null && IsUnityObjectAlive(__instance))
+            {
+                if (_ppvCachedDailyField != null && _ppvCachedDailyField.GetValue(__instance) == null)
+                {
+                    _ppvCachedDailyField.SetValue(__instance, Array.Empty<BazaarGameShared.TempoNet.Responses.ChallengeProgress>());
+                }
+                if (_ppvCachedWeeklyField != null && _ppvCachedWeeklyField.GetValue(__instance) == null)
+                {
+                    _ppvCachedWeeklyField.SetValue(__instance, Array.Empty<BazaarGameShared.TempoNet.Responses.ChallengeProgress>());
+                }
+            }
+
             if (__0.dailyChallenges == null || __0.weeklyChallenges == null)
             {
                 __0 = __0 with
@@ -211,6 +303,399 @@ internal static partial class CompatAuditPatch
         {
             return false;
         }
+    }
+
+    private static bool PrizePassShowChallengeProgressPrefix(
+        object challengeInfo,
+        ref BazaarGameShared.TempoNet.Responses.ChallengeProgress[] cachedChallengeProgress,
+        ref BazaarGameShared.TempoNet.Responses.ChallengeProgress[] currentProgress)
+    {
+        try
+        {
+            if (!IsUnityObjectAlive(challengeInfo)) return false;
+
+            cachedChallengeProgress ??= Array.Empty<BazaarGameShared.TempoNet.Responses.ChallengeProgress>();
+            currentProgress ??= Array.Empty<BazaarGameShared.TempoNet.Responses.ChallengeProgress>();
+
+            var idProp = _bpcIdProp ?? challengeInfo.GetType().GetProperty("Id", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (idProp?.GetValue(challengeInfo) is not Guid challengeId)
+                return false;
+
+            bool found = false;
+            for (int i = 0; i < currentProgress.Length; i++)
+            {
+                var p = currentProgress[i];
+                if (p != null && p.Id == challengeId)
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                // 缺失对应进度项时自动补齐默认 0 进度结构，避免 progressFromId.Progress 抛 NRE 早退
+                var expanded = new BazaarGameShared.TempoNet.Responses.ChallengeProgress[currentProgress.Length + 1];
+                if (currentProgress.Length > 0)
+                {
+                    Array.Copy(currentProgress, expanded, currentProgress.Length);
+                }
+                expanded[currentProgress.Length] = new BazaarGameShared.TempoNet.Responses.ChallengeProgress
+                {
+                    Id = challengeId,
+                    Progress = 0,
+                    Acknowledged = false,
+                };
+                currentProgress = expanded;
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool PrizePassGetProgressFromIdPrefix(
+        BazaarGameShared.TempoNet.Responses.ChallengeProgress[] challengesProgress,
+        ref BazaarGameShared.TempoNet.Responses.ChallengeProgress __result)
+    {
+        if (challengesProgress == null)
+        {
+            __result = null;
+            return false;
+        }
+        return true;
+    }
+
+    private static void PatchEndOfRunChallengesGuard(SafeHarmonyPatcher patcher)
+    {
+        try
+        {
+            var eorType = GameInspector.FindTypeSafe("TheBazaar.EndOfRunChallengesController");
+            if (eorType == null) return;
+
+            const BindingFlags anyInst = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            _eorChallengesViewField = eorType.GetField("PrizePassChallengesView", anyInst);
+            _eorTierDialField = eorType.GetField("PrizePassTierDial", anyInst);
+            _eorPrizePassFxField = eorType.GetField("prizePassFX", anyInst);
+            _eorSoundHandlerField = eorType.GetField("soundEndOfRunHandler", anyInst);
+            _eorCachedTierDataField = eorType.GetField("_cachedTierData", anyInst);
+
+            var cacheType = GameInspector.FindTypeSafe("TheBazaar.ClientCache");
+            if (cacheType != null)
+            {
+                const BindingFlags anyStatic = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+                _clientCacheSeasonTrackField = cacheType.GetField("SeasonTrack", anyStatic);
+                _clientCachePrevSeasonTrackField = cacheType.GetField("PreviousSeasonTrack", anyStatic);
+                _clientCacheSeasonProgField = cacheType.GetField("SeasonTrackProgression", anyStatic);
+                _clientCachePrevSeasonProgField = cacheType.GetField("PreviousSeasonTrackProgression", anyStatic);
+            }
+
+            var doTweenType = GameInspector.FindTypeSafe("DG.Tweening.DOTween");
+            _doTweenKillMethod = doTweenType?.GetMethod("Kill", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(object), typeof(bool) }, null);
+
+            var swallowFin = AccessTools.Method(typeof(CompatAuditPatch), nameof(SwallowUiFinalizer));
+
+            var mOnLoad = AccessTools.Method(eorType, "OnLoadUpdateChallengeData", Type.EmptyTypes);
+            if (mOnLoad != null)
+            {
+                patcher.TryPatchMethod(
+                    mOnLoad,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(EndOfRunChallengesOnLoadPrefix)),
+                    finalizer: swallowFin,
+                    optional: true,
+                    label: "Compat.Challenges.EndOfRunChallengesController.OnLoadUpdateChallengeData");
+            }
+
+            var mOnDisable = AccessTools.Method(eorType, "OnDisable", Type.EmptyTypes);
+            if (mOnDisable != null)
+            {
+                patcher.TryPatchMethod(
+                    mOnDisable,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(EndOfRunChallengesOnDisablePrefix)),
+                    finalizer: swallowFin,
+                    optional: true,
+                    label: "Compat.Challenges.EndOfRunChallengesController.OnDisable");
+            }
+
+            var mGetTier = AccessTools.Method(eorType, "GetTierData", new[] { typeof(int), typeof(int), typeof(bool) });
+            if (mGetTier != null)
+            {
+                patcher.TryPatchMethod(
+                    mGetTier,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(EndOfRunChallengesGetTierDataPrefix)),
+                    finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(EndOfRunChallengesObjectResultFinalizer)),
+                    optional: true,
+                    label: "Compat.Challenges.EndOfRunChallengesController.GetTierData");
+            }
+
+            var mOnXpClaimed = AccessTools.Method(eorType, "OnChallengeXPClaimed", new[] { typeof(int) });
+            if (mOnXpClaimed != null)
+            {
+                patcher.TryPatchMethod(
+                    mOnXpClaimed,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(EndOfRunChallengesOnXpClaimedPrefix)),
+                    finalizer: swallowFin,
+                    optional: true,
+                    label: "Compat.Challenges.EndOfRunChallengesController.OnChallengeXPClaimed");
+            }
+
+            var mExit = AccessTools.Method(eorType, "ExitChallenges", Type.EmptyTypes);
+            if (mExit != null)
+            {
+                patcher.TryPatchMethod(
+                    mExit,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(EndOfRunChallengesExitPrefix)),
+                    finalizer: swallowFin,
+                    optional: true,
+                    label: "Compat.Challenges.EndOfRunChallengesController.ExitChallenges");
+            }
+
+            var mTryClaimAll = AccessTools.Method(eorType, "TryClaimAllChallenges", Type.EmptyTypes);
+            if (mTryClaimAll != null)
+            {
+                patcher.TryPatchMethod(
+                    mTryClaimAll,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(EndOfRunChallengesTryClaimAllPrefix)),
+                    finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(EndOfRunChallengesFloatResultFinalizer)),
+                    optional: true,
+                    label: "Compat.Challenges.EndOfRunChallengesController.TryClaimAllChallenges");
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.PatchEndOfRunChallengesGuard: " + ex.Message);
+        }
+    }
+
+    private static bool IsEndOfRunChallengeControllerActive(object controller)
+    {
+        if (controller is not Behaviour bhv || bhv == null || !bhv.isActiveAndEnabled || !bhv.gameObject.activeInHierarchy)
+            return false;
+        int id = bhv.GetInstanceID();
+        lock (_eorChallengesLock)
+        {
+            return _activeEorChallengeCtrlIds.Contains(id);
+        }
+    }
+
+    private static bool HasObservableNonNullValue(FieldInfo staticCacheField)
+    {
+        var cacheObj = staticCacheField?.GetValue(null);
+        if (cacheObj == null) return false;
+        var valProp = cacheObj.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
+        return valProp != null && valProp.GetValue(cacheObj) != null;
+    }
+
+    private static bool EndOfRunChallengesOnLoadPrefix(object __instance)
+    {
+        try
+        {
+            if (__instance is not Behaviour bhv || bhv == null || !bhv.isActiveAndEnabled)
+                return false;
+
+            var viewObj = _eorChallengesViewField?.GetValue(__instance);
+            var dialObj = _eorTierDialField?.GetValue(__instance);
+            var fxObj = _eorPrizePassFxField?.GetValue(__instance);
+            var soundObj = _eorSoundHandlerField?.GetValue(__instance);
+            if (!IsUnityObjectAlive(viewObj) || !IsUnityObjectAlive(dialObj)
+                || !IsUnityObjectAlive(fxObj) || !IsUnityObjectAlive(soundObj))
+                return false;
+
+            if (!HasObservableNonNullValue(_clientCachePrevSeasonProgField)
+                || !HasObservableNonNullValue(_clientCacheSeasonProgField))
+                return false;
+
+            int id = bhv.GetInstanceID();
+            lock (_eorChallengesLock)
+            {
+                _activeEorChallengeCtrlIds.Add(id);
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void EndOfRunChallengesOnDisablePrefix(object __instance)
+    {
+        try
+        {
+            if (__instance is Component comp && comp != null)
+            {
+                int id = comp.GetInstanceID();
+                lock (_eorChallengesLock)
+                {
+                    _activeEorChallengeCtrlIds.Remove(id);
+                }
+            }
+
+            if (__instance != null && _doTweenKillMethod != null)
+            {
+                _doTweenKillMethod.Invoke(null, new[] { __instance, (object)false });
+                // 同步清理 PrizePassTierDial 及其 transform 上仍在运行的转盘补间，避免离页后收尾回调触碰已销毁 prizePassFX
+                var dialObj = _eorTierDialField?.GetValue(__instance);
+                if (dialObj != null)
+                {
+                    _doTweenKillMethod.Invoke(null, new[] { dialObj, (object)false });
+                    if (dialObj is Component dialComp && dialComp != null && dialComp.transform != null)
+                    {
+                        _doTweenKillMethod.Invoke(null, new[] { (object)dialComp.transform, (object)false });
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private static bool EndOfRunChallengesGetTierDataPrefix(int experience, int challengeXP, bool usePreviousSeasonTrack, ref object __result)
+    {
+        try
+        {
+            var trackCacheField = usePreviousSeasonTrack ? _clientCachePrevSeasonTrackField : _clientCacheSeasonTrackField;
+            var cacheObj = trackCacheField?.GetValue(null);
+            if (cacheObj == null)
+            {
+                __result = null;
+                return false;
+            }
+
+            var hasDataProp = cacheObj.GetType().GetProperty("HasData", BindingFlags.Public | BindingFlags.Instance);
+            if (hasDataProp != null && hasDataProp.GetValue(cacheObj) is bool hasData && !hasData)
+            {
+                __result = null;
+                return false;
+            }
+
+            var valProp = cacheObj.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
+            if (valProp?.GetValue(cacheObj) is not BazaarGameShared.TempoNet.Responses.SeasonTrackResponse track)
+            {
+                __result = null;
+                return false;
+            }
+
+            var tiers = track.tiers;
+            if (tiers == null || tiers.Length == 0)
+            {
+                __result = null;
+                return false;
+            }
+
+            int totalXp = experience + challengeXP;
+            int maxTierXp = tiers[tiers.Length - 1].requiredXp;
+            if (totalXp >= maxTierXp)
+            {
+                // 防止 infiniteTier 为空或 requiredXp <= 0 触发 InvalidOperationException / while 死循环
+                if (!track.infiniteTier.HasValue || track.infiniteTier.Value.requiredXp <= 0)
+                {
+                    __result = null;
+                    return false;
+                }
+            }
+            return true;
+        }
+        catch
+        {
+            __result = null;
+            return false;
+        }
+    }
+
+    private static bool EndOfRunChallengesOnXpClaimedPrefix(object __instance)
+    {
+        try
+        {
+            // 拦截离开结算页 1 秒后才触发的匿名 DOVirtual.DelayedCall 回调，避免在大厅爆销毁对象 NRE
+            if (!IsEndOfRunChallengeControllerActive(__instance))
+                return false;
+
+            var dialObj = _eorTierDialField?.GetValue(__instance);
+            if (!IsUnityObjectAlive(dialObj))
+                return false;
+
+            var cachedTier = _eorCachedTierDataField?.GetValue(__instance);
+            if (cachedTier == null)
+                return false;
+
+            int tierXpReq = GameInspector.GetMember(cachedTier, "tierXPRequired") is int req ? req : 0;
+            var tierResp = GameInspector.GetMember(cachedTier, "tierResponse");
+            if (tierXpReq <= 0 && tierResp == null)
+                return false;
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool EndOfRunChallengesExitPrefix(object __instance)
+    {
+        try
+        {
+            // 拦截离开结算页 3 秒后才触发的匿名 DOVirtual.DelayedCall 回调
+            if (!IsEndOfRunChallengeControllerActive(__instance))
+                return false;
+
+            var soundObj = _eorSoundHandlerField?.GetValue(__instance);
+            return IsUnityObjectAlive(soundObj);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool EndOfRunChallengesTryClaimAllPrefix(object __instance, ref float __result)
+    {
+        try
+        {
+            if (__instance is not Behaviour bhv || bhv == null || !bhv.isActiveAndEnabled)
+            {
+                __result = 0f;
+                return false;
+            }
+            var viewObj = _eorChallengesViewField?.GetValue(__instance);
+            if (!IsUnityObjectAlive(viewObj))
+            {
+                __result = 0f;
+                return false;
+            }
+            lock (_eorChallengesLock)
+            {
+                _activeEorChallengeCtrlIds.Add(bhv.GetInstanceID());
+            }
+            return true;
+        }
+        catch
+        {
+            __result = 0f;
+            return false;
+        }
+    }
+
+    private static Exception EndOfRunChallengesObjectResultFinalizer(Exception __exception, ref object __result)
+    {
+        if (__exception != null)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch[P1-48]: EndOfRunChallengesController.GetTierData guarded: " + __exception.Message);
+            __result = null;
+        }
+        return null;
+    }
+
+    private static Exception EndOfRunChallengesFloatResultFinalizer(Exception __exception, ref float __result)
+    {
+        if (__exception != null)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch[P1-48]: EndOfRunChallengesController.TryClaimAllChallenges guarded: " + __exception.Message);
+            __result = 0f;
+        }
+        return null;
     }
 
     private static PropertyInfo FindPropertyInHierarchy(Type type, string propName)
@@ -528,7 +1013,7 @@ internal static partial class CompatAuditPatch
             var fallback = await ResolveFallbackEncounterAssetAsync(cardData, cardTemplate as ITCard);
             if (fallback is TAsset typedFallback && IsUnityObjectAlive(typedFallback))
             {
-                Interlocked.Increment(ref _encounterPortraitFallbackCount);
+                RecordCompatHackHit("H-6", ref _encounterPortraitFallbackCount, "LoadEncounterDataFallback");
                 return typedFallback;
             }
         }
@@ -581,7 +1066,7 @@ internal static partial class CompatAuditPatch
                     }
                     if (tipData != null)
                     {
-                        Interlocked.Increment(ref _encounterTooltipFallbackCount);
+                        RecordCompatHackHit("H-6", ref _encounterTooltipFallbackCount, "EncounterTooltipFallback");
                     }
                 }
             }
@@ -618,7 +1103,7 @@ internal static partial class CompatAuditPatch
                 {
                     await setupTask;
                 }
-                Interlocked.Increment(ref _encounterPortraitFallbackCount);
+                RecordCompatHackHit("H-6", ref _encounterPortraitFallbackCount, "LoadEncounterDataFallback");
             }
 
             if (!IsUnityObjectAlive(controller))
@@ -875,7 +1360,7 @@ internal static partial class CompatAuditPatch
             }
 
             __result = title;
-            Interlocked.Increment(ref _encounterTooltipFallbackCount);
+            RecordCompatHackHit("H-6", ref _encounterTooltipFallbackCount, "EncounterTooltipFallback");
         }
         catch (Exception ex)
         {
@@ -954,7 +1439,7 @@ internal static partial class CompatAuditPatch
 
             var questData = _tooltipCtrlQuestDataField?.GetValue(controller);
             _tooltipCtrlRenderPassiveMethod.Invoke(controller, new[] { fallbackDesc, questData });
-            Interlocked.Increment(ref _encounterTooltipFallbackCount);
+            RecordCompatHackHit("H-6", ref _encounterTooltipFallbackCount, "EncounterTooltipFallback");
         }
         catch (Exception ex)
         {

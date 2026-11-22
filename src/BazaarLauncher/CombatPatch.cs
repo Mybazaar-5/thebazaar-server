@@ -7,8 +7,10 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using BazaarGameShared.Domain.Core.Types;
+using BazaarGameShared.Domain.Runs;
 using BazaarGameShared.Infra.Messages;
 using BazaarGameShared.Infra.Messages.CombatSimEvents;
+using BazaarLauncher.Core;
 using HarmonyLib;
 using TMPro;
 using UnityEngine;
@@ -19,7 +21,7 @@ namespace BazaarLauncher;
 /// <summary>
 /// 战斗流程增强、首战加速修复、1x/2x/3x 手动倍速稳定控制、高倍速流畅化与战斗触发明细审计补丁：
 ///
-///   1. CombatState.GoToNextState 空值兜底（优先取 LastCombatSequence.DespawnMessage）；
+///   1. CombatState.GoToNextState 安全切态兜底（优先恢复同场战斗 DespawnMessage，严禁对 PvP/战败/终局盲切 Loot）；
 ///   2. 首场战斗加速修复：Day 1 首战（Hour 1~3）只要用户启用首战加速或默认未显式关闭即触发 3x；
 ///   3. 稳定战斗倍速控制：支持 UI 倍速小芯片（1x / 2x / 3x）与 GameDriver.SpeedOverride，
 ///      在模拟阶段不会被每帧 `else SetSpeed(1f)` 覆盖重置，并在常规倍速（&lt; 4x）的最后 40 帧保留终结慢镜流畅演出；
@@ -38,6 +40,9 @@ internal static class CombatPatch
     private static volatile bool _replayReadyToExit;
     private static float _replayEnteredAt;
     private static Type _gameServiceManagerType;
+    private static PropertyInfo _gameServiceManagerInstanceProp;
+    private static FieldInfo _finalBlowCurrentStateField;
+    private static object _finalBlowCompleteEnumVal;
 
     // 模拟生命周期状态（用于精准放行收尾 40 帧与 finally 归位）
     private static volatile bool _inSimulateLoop;
@@ -49,6 +54,25 @@ internal static class CombatPatch
     private static PropertyInfo _speedMultiplierProp;
     private static MethodInfo _enforceMaxTimeScaleMethod;
     private static PropertyInfo _gamePausedProp;
+
+    // P1-29：CombatState.GoToNextState 切态核验反射句柄与最近实况战斗胜负缓存
+    private static Type _appStateType;
+    private static Type _pvpCombatStateType;
+    private static FieldInfo _cachedGameSimField;
+    private static FieldInfo _cachedCombatSimField;
+    private static MethodInfo _appStateSetStateByRunStateMethod;
+    private static Type _networkManagerType;
+    private static MethodInfo _nmGetInstanceMethod;
+    private static PropertyInfo _nmLastCombatSequenceProp;
+    private static FieldInfo _combatSeqDespawnField;
+    private static FieldInfo _combatSeqCombatField;
+    private static ECombatantId? _lastLiveCombatWinner;
+    private static string _lastLiveCombatMessageId;
+    private static bool _lastLiveCombatWasPvp;
+    private static WeakReference<NetMessageCombatSim> _lastLiveCombatSimRef;
+    // P2-15 (H-7)：GoToNextState 兜底命中低频诊断计数
+    private static int _hackH7GoToNextStateFallbackCount;
+    internal static int HackH7GoToNextStateFallbackCount => Volatile.Read(ref _hackH7GoToNextStateFallbackCount);
 
     private static int _combatSeq;
     private static readonly object _auditLock = new();
@@ -268,81 +292,260 @@ internal static class CombatPatch
     internal static void ResetAppliedFlag()
     {
         _applied = false;
+        _inSimulateLoop = false;
+        _currentFramesLeft = -1;
+        _lastLiveCombatWinner = null;
+        _lastLiveCombatMessageId = null;
+        _lastLiveCombatWasPvp = false;
+        _lastLiveCombatSimRef = null;
+        _activeCombatHandlerRef = null;
+        _lastRunObjRef = null;
         UnregisterStaticCombatEndedListeners();
+
+        // P1-45：热卸载时彻底收尾平滑读条缓存、WinMM 1ms 定时器、fixedDeltaTime、FinalBlow 状态机、TimeScale 与常驻 Ticker GameObject
+        ClearSmoothCooldownTracks();
+        UpdateHighResTimer(false);
+        ResetFinalBlowStateToComplete();
+
+        Action mainCleanup = () =>
+        {
+            try
+            {
+                ClearSmoothCooldownTracks();
+                SyncFixedDeltaTimeForSpeed(1f);
+                SafeRestoreNormalTimeScale();
+                if (_smoothTickerGo != null)
+                {
+                    UnityEngine.Object.Destroy(_smoothTickerGo);
+                    _smoothTickerGo = null;
+                }
+            }
+            catch { }
+        };
+
+        if (Thread.CurrentThread.ManagedThreadId == _mainThreadId)
+        {
+            mainCleanup();
+        }
+        else
+        {
+            MainThreadDispatcher.Enqueue(mainCleanup);
+        }
     }
 
-    internal static void Apply(BazaarLauncher.Core.SafeHarmonyPatcher patcher)
+    internal static void Apply(SafeHarmonyPatcher patcher)
     {
-        if (patcher == null) return;
-        Apply(patcher.RawHarmony);
-    }
-
-    internal static void Apply(Harmony harmony)
-    {
-        if (_applied) return;
+        if (patcher == null || _applied) return;
         _applied = true;
         _mainThreadId = Thread.CurrentThread.ManagedThreadId;
         _unitySyncContext ??= SynchronizationContext.Current;
 
-        PatchCombatStateGoNext(harmony);
-        PatchCombatSimSpeed(harmony);
-        PatchOptionsFastForwardSync(harmony);
-        PatchFinalBlowSlowDown(harmony);
-        PatchGameServiceManagerTimeScale(harmony);
+        PatchCombatStateGoNext(patcher);
+        PatchCombatSimSpeed(patcher);
+        PatchOptionsFastForwardSync(patcher);
+        PatchFinalBlowSlowDown(patcher);
+        PatchGameServiceManagerTimeScale(patcher);
         // P1-5 修复：不再对 CombatSimHandler.Simulate 重复打第 2 个补丁，条件审计已合入 SimulateSpeedPrefix
-        PatchReplayAutoExit(harmony);
-        PatchPostCombatVisualCleanup(harmony);
-        PatchDisableTutorials(harmony);
-        PatchSmoothCooldownBars(harmony);
-        PatchPrecisionCooldownTooltip(harmony);
+        PatchReplayAutoExit(patcher);
+        PatchPostCombatVisualCleanup(patcher);
+        PatchDisableTutorials(patcher);
+        PatchSmoothCooldownBars(patcher);
+        PatchPrecisionCooldownTooltip(patcher);
     }
 
-    // ── 1. CombatState.GoToNextState 空值兜底 ───────────────────────────────
-    private static void PatchCombatStateGoNext(Harmony harmony)
+    // ── 1. CombatState.GoToNextState 安全切态兜底（P1-29：移除盲切 Loot）───────
+    private static void PatchCombatStateGoNext(SafeHarmonyPatcher patcher)
     {
         var combatState = AccessTools.TypeByName("TheBazaar.CombatState");
         var go = combatState == null ? null : AccessTools.Method(combatState, "GoToNextState");
         if (go == null) return;
 
-        harmony.Patch(go, prefix: new HarmonyMethod(
-            AccessTools.Method(typeof(CombatPatch), nameof(GoToNextStatePrefix))));
-        BazaarLauncherPlugin.Log.LogInfo("Patched CombatState.GoToNextState (null-safe)");
+        EnsureGoToNextStateReflectionHandles();
+        if (patcher.TryPatchMethod(
+            go,
+            prefix: AccessTools.Method(typeof(CombatPatch), nameof(GoToNextStatePrefix)),
+            optional: true,
+            label: "CombatState.GoToNextState"))
+        {
+            BazaarLauncherPlugin.Log.LogInfo("Patched CombatState.GoToNextState (P1-29 authoritative-safe)");
+        }
     }
 
-    private static bool GoToNextStatePrefix()
+    private static void EnsureGoToNextStateReflectionHandles()
+    {
+        _appStateType ??= AccessTools.TypeByName("TheBazaar.AppState");
+        _pvpCombatStateType ??= AccessTools.TypeByName("TheBazaar.PVPCombatState");
+        if (_appStateType != null)
+        {
+            _cachedGameSimField ??= _appStateType.GetField("_cachedGameSim", BindingFlags.NonPublic | BindingFlags.Static);
+            _cachedCombatSimField ??= _appStateType.GetField("_cachedCombatSim", BindingFlags.NonPublic | BindingFlags.Static);
+            _appStateSetStateByRunStateMethod ??= _appStateType.GetMethod(
+                "SetState",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                null,
+                new[] { typeof(ERunState) },
+                null);
+        }
+
+        _networkManagerType ??= AccessTools.TypeByName("Networking.NetworkManager");
+        if (_networkManagerType != null)
+        {
+            _nmGetInstanceMethod ??= _networkManagerType.GetMethod("GetInstance", BindingFlags.Public | BindingFlags.Static);
+            _nmLastCombatSequenceProp ??= _networkManagerType.GetProperty("LastCombatSequence", BindingFlags.Public | BindingFlags.Instance);
+        }
+    }
+
+    private static bool IsPvpCombatInstance(object combatStateInstance)
+    {
+        if (combatStateInstance != null)
+        {
+            if (_pvpCombatStateType != null && _pvpCombatStateType.IsInstanceOfType(combatStateInstance))
+                return true;
+            if (string.Equals(combatStateInstance.GetType().Name, "PVPCombatState", StringComparison.Ordinal))
+                return true;
+        }
+
+        var curAppState = GameInspector.GetCurrentAppState();
+        if (curAppState != null)
+        {
+            if (_pvpCombatStateType != null && _pvpCombatStateType.IsInstanceOfType(curAppState))
+                return true;
+            if (string.Equals(curAppState.GetType().Name, "PVPCombatState", StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static ERunState? GetAuthoritativeDataRunState()
     {
         try
         {
-            var appStateType = AccessTools.TypeByName("TheBazaar.AppState");
-            var cachedGameSim = appStateType?
-                .GetField("_cachedGameSim", BindingFlags.NonPublic | BindingFlags.Static)?
-                .GetValue(null);
+            var dataState = GameInspector.GetDataCurrentState();
+            if (dataState != null && GameInspector.GetMember(dataState, "StateName") is ERunState runState)
+            {
+                return runState;
+            }
+        }
+        catch { }
+        return null;
+    }
 
+    private static ECombatantId? ResolveCurrentCombatWinner(NetMessageCombatSim cachedCombatSim, bool isPvp)
+    {
+        if (cachedCombatSim?.Data != null)
+        {
+            return cachedCombatSim.Data.Winner;
+        }
+
+        if (_lastLiveCombatWinner.HasValue && _lastLiveCombatWasPvp == isPvp)
+        {
+            return _lastLiveCombatWinner.Value;
+        }
+
+        return null;
+    }
+
+    private static bool IsAuthoritativePostCombatNonLootState(ERunState state)
+    {
+        return state is ERunState.Choice
+            or ERunState.EndRunVictory
+            or ERunState.EndRunDefeat
+            or ERunState.LevelUp
+            or ERunState.TournamentPvpChoice
+            or ERunState.TournamentWaitingRoom;
+    }
+
+    private static bool GoToNextStatePrefix(object __instance)
+    {
+        try
+        {
+            EnsureGoToNextStateReflectionHandles();
+            var cachedGameSim = _cachedGameSimField?.GetValue(null);
             if (cachedGameSim != null) return true;
 
-            var nmType = AccessTools.TypeByName("Networking.NetworkManager");
-            var getInstance = nmType?.GetMethod("GetInstance", BindingFlags.Public | BindingFlags.Static);
-            var nm = getInstance?.Invoke(null, null);
-            var lastSeq = nm?.GetType().GetProperty("LastCombatSequence", BindingFlags.Public | BindingFlags.Instance)?.GetValue(nm);
-            var despawn = lastSeq?.GetType().GetField("DespawnMessage", BindingFlags.Public | BindingFlags.Instance)?.GetValue(lastSeq);
-            if (despawn != null)
+            var cachedCombatSim = _cachedCombatSimField?.GetValue(null) as NetMessageCombatSim;
+            var nm = _nmGetInstanceMethod?.Invoke(null, null);
+            var lastSeq = nm != null ? _nmLastCombatSequenceProp?.GetValue(nm) : null;
+            if (lastSeq != null)
             {
-                appStateType?.GetField("_cachedGameSim", BindingFlags.NonPublic | BindingFlags.Static)?.SetValue(null, despawn);
-                return true;
+                _combatSeqDespawnField ??= lastSeq.GetType().GetField("DespawnMessage", BindingFlags.Public | BindingFlags.Instance);
+                _combatSeqCombatField ??= lastSeq.GetType().GetField("CombatMessage", BindingFlags.Public | BindingFlags.Instance);
+
+                var despawn = _combatSeqDespawnField?.GetValue(lastSeq);
+                var seqCombat = _combatSeqCombatField?.GetValue(lastSeq) as NetMessageCombatSim;
+
+                // 仅当 LastCombatSequence 与当前这场战斗严格匹配（同引用或同非空 MessageId）时才回填 DespawnMessage，
+                // 绝不在 MessageId 为空或缺乏匹配依据时放行，防止本场丢包时误复用上一场战斗残留的 DespawnMessage
+                NetMessageCombatSim expectedCombatSim = cachedCombatSim;
+                if (expectedCombatSim == null && _lastLiveCombatSimRef != null)
+                {
+                    _lastLiveCombatSimRef.TryGetTarget(out expectedCombatSim);
+                }
+
+                string expectedCombatMsgId = !string.IsNullOrEmpty(expectedCombatSim?.MessageId)
+                    ? expectedCombatSim.MessageId
+                    : _lastLiveCombatMessageId;
+
+                bool sequenceMatchesCurrentCombat = false;
+                if (seqCombat != null)
+                {
+                    if (expectedCombatSim != null && ReferenceEquals(seqCombat, expectedCombatSim))
+                    {
+                        sequenceMatchesCurrentCombat = true;
+                    }
+                    else if (!string.IsNullOrEmpty(expectedCombatMsgId)
+                        && !string.IsNullOrEmpty(seqCombat.MessageId)
+                        && string.Equals(seqCombat.MessageId, expectedCombatMsgId, StringComparison.Ordinal))
+                    {
+                        sequenceMatchesCurrentCombat = true;
+                    }
+                }
+
+                if (despawn != null && sequenceMatchesCurrentCombat)
+                {
+                    _cachedGameSimField?.SetValue(null, despawn);
+                    RecordHackH7Hit("RecoveredDespawnFromLastCombatSequence");
+                    return true;
+                }
             }
 
-            BazaarLauncherPlugin.Log.LogWarning("GoToNextState: no cached GameSim or DespawnMessage, forcing Loot");
-            var erunState = AccessTools.TypeByName("BazaarGameShared.Domain.Runs.ERunState");
-            var setState = appStateType?.GetMethod("SetState",
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
-                null, new[] { erunState }, null);
+            bool isPvp = IsPvpCombatInstance(__instance);
+            ECombatantId? winner = ResolveCurrentCombatWinner(cachedCombatSim, isPvp);
+            ERunState? authoritativeState = GetAuthoritativeDataRunState();
 
-            if (setState != null)
+            // P1-29：严禁无条件盲切 ERunState.Loot！
+            // 仅当确认为 PvE（非 PVPCombatState）、玩家胜利、且服务端权威 CurrentState 明确为 Loot 时才允许兜底切入 Loot
+            if (!isPvp && winner == ECombatantId.Player && authoritativeState == ERunState.Loot)
             {
-                var loot = Enum.Parse(erunState, "Loot");
-                _ = setState.Invoke(null, new[] { loot }) as Task;
+                if (_appStateSetStateByRunStateMethod != null)
+                {
+                    RecordHackH7Hit("AuthoritativeFallback:Loot");
+                    BazaarLauncherPlugin.Log.LogWarning(
+                        "GoToNextState[P1-29]: _cachedGameSim 缺失，已核实 PvE 胜利且服务端权威状态为 Loot，执行权威兜底切态 -> Loot");
+                    _ = _appStateSetStateByRunStateMethod.Invoke(null, new object[] { ERunState.Loot }) as Task;
+                    return false;
+                }
             }
-            return false;
+
+            // 若服务端权威 CurrentState 已更新为明确的战后非战斗/非 Loot 状态（如 Choice / EndRunVictory / EndRunDefeat / LevelUp），按权威态切态
+            if (authoritativeState.HasValue && IsAuthoritativePostCombatNonLootState(authoritativeState.Value))
+            {
+                if (_appStateSetStateByRunStateMethod != null)
+                {
+                    RecordHackH7Hit("AuthoritativeFallback:" + authoritativeState.Value);
+                    BazaarLauncherPlugin.Log.LogWarning(
+                        $"GoToNextState[P1-29]: _cachedGameSim 缺失，按服务端权威 CurrentState 切态 -> {authoritativeState.Value} (isPvp={isPvp}, winner={winner})");
+                    _ = _appStateSetStateByRunStateMethod.Invoke(null, new object[] { authoritativeState.Value }) as Task;
+                    return false;
+                }
+            }
+
+            // 其余情况（PvP/终局/战败或延迟包尚未抵达）绝不伪造或盲切 LootState，交由原方法记录日志并安全等待后续服务端消息
+            RecordHackH7Hit($"BlockedBlindLoot(isPvp={isPvp},winner={winner},auth={authoritativeState})");
+            BazaarLauncherPlugin.Log.LogWarning(
+                $"GoToNextState[P1-29]: 缺少 _cachedGameSim 与匹配 DespawnMessage，拒绝盲切 Loot，等待延迟包或状态同步 (isPvp={isPvp}, winner={winner}, authoritativeState={authoritativeState})");
+            return true;
         }
         catch (Exception ex)
         {
@@ -351,8 +554,17 @@ internal static class CombatPatch
         }
     }
 
+    private static void RecordHackH7Hit(string detail)
+    {
+        int cnt = Interlocked.Increment(ref _hackH7GoToNextStateFallbackCount);
+        if (cnt == 1 || cnt == 5 || cnt % 25 == 0)
+        {
+            BazaarLauncherPlugin.Log?.LogInfo($"[CompatDiag][H-7] GoToNextState fallback hit (count={cnt}, detail={detail})");
+        }
+    }
+
     // ── 2. CombatSimHandler 首战加速与倍速稳定控制 ──────────────────────────
-    private static void PatchCombatSimSpeed(Harmony harmony)
+    private static void PatchCombatSimSpeed(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -368,24 +580,33 @@ internal static class CombatPatch
 
             if (_setSpeedMethod != null)
             {
-                harmony.Patch(_setSpeedMethod,
-                    prefix: new HarmonyMethod(AccessTools.Method(typeof(CombatPatch), nameof(SetSpeedPrefix))),
-                    postfix: new HarmonyMethod(AccessTools.Method(typeof(CombatPatch), nameof(SetSpeedPostfix))));
+                patcher.TryPatchMethod(
+                    _setSpeedMethod,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(SetSpeedPrefix)),
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(SetSpeedPostfix)),
+                    optional: true,
+                    label: "CombatSimHandler.SetSpeed");
             }
 
             var shouldFf = AccessTools.Method(handlerType, "ShouldFastForward");
             if (shouldFf != null)
             {
-                harmony.Patch(shouldFf, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(ShouldFastForwardPostfix))));
+                patcher.TryPatchMethod(
+                    shouldFf,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(ShouldFastForwardPostfix)),
+                    optional: true,
+                    label: "CombatSimHandler.ShouldFastForward");
             }
 
             var simMethod = AccessTools.Method(handlerType, "Simulate", new[] { typeof(NetMessageCombatSim), typeof(CancellationTokenSource) });
             if (simMethod != null)
             {
-                harmony.Patch(simMethod,
-                    prefix: new HarmonyMethod(AccessTools.Method(typeof(CombatPatch), nameof(SimulateSpeedPrefix))),
-                    postfix: new HarmonyMethod(AccessTools.Method(typeof(CombatPatch), nameof(SimulateSpeedPostfix))));
+                patcher.TryPatchMethod(
+                    simMethod,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(SimulateSpeedPrefix)),
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(SimulateSpeedPostfix)),
+                    optional: true,
+                    label: "CombatSimHandler.Simulate");
             }
 
             BazaarLauncherPlugin.Log.LogInfo("Patched CombatSimHandler (first-fight 3x, 1x/2x/3x stable control, clean slowmo)");
@@ -418,6 +639,13 @@ internal static class CombatPatch
         {
             bool isReplay = GameInspector.GetAppStateName() == "ReplayState";
             bool isPvp = GameInspector.GetAppStateName() == "PVPCombatState";
+            if (!isReplay)
+            {
+                _lastLiveCombatWasPvp = isPvp;
+                _lastLiveCombatMessageId = message?.MessageId;
+                _lastLiveCombatWinner = message?.Data != null ? message.Data.Winner : null;
+                _lastLiveCombatSimRef = message != null ? new WeakReference<NetMessageCombatSim>(message) : null;
+            }
             BazaarLauncherPlugin.Host?.EventBus.Publish(new BazaarModSdk.CombatLifecycleModEvent(true, isPvp, isReplay));
 
             // P1-5 修复：生产环境默认关闭全帧审计以消除进战前数十毫秒停顿与堆分配；仅诊断/驱动启用时记录
@@ -501,8 +729,13 @@ internal static class CombatPatch
             ClearSmoothCooldownTracks();
             UpdateHighResTimer(false);
 
-            // 若战斗被提前取消或慢镜未完全恢复，保证退出后不会卡在低 TimeScale 或残留高 SpeedMultiplier
-            if (_speedOverride >= 4f || _manualUiSpeed >= 4f || (Time.timeScale > 0.01f && Time.timeScale < 0.99f))
+            // 若战斗被提前取消或慢镜未完全恢复，保证退出后不会卡在低 TimeScale、残留 FinalBlow 状态机或高 SpeedMultiplier
+            if (_speedOverride >= 4f || _manualUiSpeed >= 4f)
+            {
+                ResetFinalBlowStateToComplete();
+                SafeRestoreNormalTimeScale();
+            }
+            else if (Time.timeScale > 0.01f && Time.timeScale < 0.99f)
             {
                 SafeRestoreNormalTimeScale();
             }
@@ -651,7 +884,7 @@ internal static class CombatPatch
     }
 
     // ── 3. OptionsDialogController 首战加速选项同步 ─────────────────────────
-    private static void PatchOptionsFastForwardSync(Harmony harmony)
+    private static void PatchOptionsFastForwardSync(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -661,15 +894,21 @@ internal static class CombatPatch
             var awakeM = AccessTools.Method(optType, "Awake");
             if (awakeM != null)
             {
-                harmony.Patch(awakeM, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(OptionsAwakePostfix))));
+                patcher.TryPatchMethod(
+                    awakeM,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(OptionsAwakePostfix)),
+                    optional: true,
+                    label: "OptionsDialogController.Awake");
             }
 
             var changedM = AccessTools.Method(optType, "OnFastForwardFirstFightChanged", new[] { typeof(bool) });
             if (changedM != null)
             {
-                harmony.Patch(changedM, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(OptionsFastForwardChangedPostfix))));
+                patcher.TryPatchMethod(
+                    changedM,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(OptionsFastForwardChangedPostfix)),
+                    optional: true,
+                    label: "OptionsDialogController.OnFastForwardFirstFightChanged");
             }
         }
         catch (Exception ex)
@@ -717,27 +956,39 @@ internal static class CombatPatch
     }
 
     // ── 4. FinalBlowSlowDown 与 GameServiceManager.EnforceMaxTimeScale 守卫 ─
-    private static void PatchFinalBlowSlowDown(Harmony harmony)
+    private static void PatchFinalBlowSlowDown(SafeHarmonyPatcher patcher)
     {
         try
         {
             var fbType = AccessTools.TypeByName("TheBazaar.FinalBlowSlowDownController");
             if (fbType == null) return;
 
+            _finalBlowCurrentStateField = fbType.GetField("_currentState", BindingFlags.NonPublic | BindingFlags.Static);
+            if (_finalBlowCurrentStateField != null && _finalBlowCurrentStateField.FieldType.IsEnum)
+            {
+                try { _finalBlowCompleteEnumVal = Enum.Parse(_finalBlowCurrentStateField.FieldType, "Complete"); } catch { }
+            }
+
             var processM = AccessTools.Method(fbType, "Process", new[] { typeof(int) });
             if (processM != null)
             {
-                harmony.Patch(processM, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(FinalBlowProcessPrefix))));
+                patcher.TryPatchMethod(
+                    processM,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(FinalBlowProcessPrefix)),
+                    optional: true,
+                    label: "FinalBlowSlowDownController.Process");
             }
 
             var returnM = AccessTools.Method(fbType, "ReturnToNormalSpeed");
             if (returnM != null)
             {
-                harmony.Patch(returnM, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(FinalBlowReturnPrefix))));
+                patcher.TryPatchMethod(
+                    returnM,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(FinalBlowReturnPrefix)),
+                    optional: true,
+                    label: "FinalBlowSlowDownController.ReturnToNormalSpeed");
             }
-            BazaarLauncherPlugin.Log.LogInfo("Patched FinalBlowSlowDownController (smooth 1x-3x slowmo preserved, >=4x fast skip)");
+            BazaarLauncherPlugin.Log.LogInfo("Patched FinalBlowSlowDownController (smooth 1x-3x slowmo preserved, >=4x fast skip + state reset)");
         }
         catch (Exception ex)
         {
@@ -745,20 +996,45 @@ internal static class CombatPatch
         }
     }
 
-    private static void PatchGameServiceManagerTimeScale(Harmony harmony)
+    private static void ResetFinalBlowStateToComplete()
     {
         try
         {
-            var gsmType = _gameServiceManagerType ??= GameInspector.FindTypeSafe("GameServiceManager", "TheBazaar.GameServiceManager");
-            if (gsmType == null) return;
+            if (_finalBlowCurrentStateField != null && _finalBlowCompleteEnumVal != null)
+            {
+                _finalBlowCurrentStateField.SetValue(null, _finalBlowCompleteEnumVal);
+            }
+        }
+        catch { }
+    }
 
-            _enforceMaxTimeScaleMethod = AccessTools.Method(gsmType, "EnforceMaxTimeScale", new[] { typeof(float) });
-            _gamePausedProp = AccessTools.Property(gsmType, "GamePaused");
+    private static void EnsureGameServiceManagerHandles()
+    {
+        if (_gameServiceManagerType == null)
+        {
+            _gameServiceManagerType = GameInspector.FindTypeSafe("GameServiceManager", "TheBazaar.GameServiceManager");
+        }
+        if (_gameServiceManagerType == null) return;
 
+        _gameServiceManagerInstanceProp ??= _gameServiceManagerType.GetProperty(
+            "Instance", BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy);
+        _enforceMaxTimeScaleMethod ??= AccessTools.Method(_gameServiceManagerType, "EnforceMaxTimeScale", new[] { typeof(float) });
+        _gamePausedProp ??= _gameServiceManagerType.GetProperty(
+            "GamePaused", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+    }
+
+    private static void PatchGameServiceManagerTimeScale(SafeHarmonyPatcher patcher)
+    {
+        try
+        {
+            EnsureGameServiceManagerHandles();
             if (_enforceMaxTimeScaleMethod != null)
             {
-                harmony.Patch(_enforceMaxTimeScaleMethod, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(EnforceMaxTimeScalePrefix))));
+                patcher.TryPatchMethod(
+                    _enforceMaxTimeScaleMethod,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(EnforceMaxTimeScalePrefix)),
+                    optional: true,
+                    label: "GameServiceManager.EnforceMaxTimeScale");
             }
         }
         catch (Exception ex)
@@ -771,8 +1047,8 @@ internal static class CombatPatch
     {
         try
         {
-            // 自动化极速模式（SpeedOverride >= 4x）禁止 HitStun / 慢镜压低全局 TimeScale
-            if (_speedOverride >= 4f && maximum < 1f)
+            // P1-45：自动化极速模式（SpeedOverride >= 4x）与玩家手动 5x 沙暴快进均禁止 HitStun / 慢镜压低全局 TimeScale
+            if ((_speedOverride >= 4f || _manualUiSpeed >= 4f) && maximum < 1f)
             {
                 maximum = 1f;
             }
@@ -805,6 +1081,8 @@ internal static class CombatPatch
                 return true;
             }
 
+            // P1-45：跳过 ReturnToNormalSpeed 时同步复位 FinalBlowSlowDownController._currentState = Complete，防止下局切回 1x-3x 错乱
+            ResetFinalBlowStateToComplete();
             SafeRestoreNormalTimeScale();
             __result = Task.CompletedTask;
             return false;
@@ -819,8 +1097,8 @@ internal static class CombatPatch
     {
         try
         {
-            var gsmType = _gameServiceManagerType ??= GameInspector.FindTypeSafe("GameServiceManager", "TheBazaar.GameServiceManager");
-            var inst = gsmType?.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy)?.GetValue(null);
+            EnsureGameServiceManagerHandles();
+            var inst = _gameServiceManagerInstanceProp?.GetValue(null);
             if (inst == null || (inst is UnityEngine.Object uo && uo == null))
             {
                 if (Time.timeScale > 0f && Time.timeScale < 1f)
@@ -834,15 +1112,14 @@ internal static class CombatPatch
             if (!isPaused)
             {
                 Time.timeScale = 1f;
-                (_enforceMaxTimeScaleMethod ?? gsmType.GetMethod("EnforceMaxTimeScale", BindingFlags.Public | BindingFlags.Instance))
-                    ?.Invoke(inst, new object[] { 1f });
+                _enforceMaxTimeScaleMethod?.Invoke(inst, new object[] { 1f });
             }
         }
         catch { }
     }
 
     // ── 5. ReplayState 自动退出回放机制 ──────────────────────────────────────
-    private static void PatchReplayAutoExit(Harmony harmony)
+    private static void PatchReplayAutoExit(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -852,15 +1129,21 @@ internal static class CombatPatch
             var onEnter = AccessTools.Method(replayType, "OnEnter");
             if (onEnter != null)
             {
-                harmony.Patch(onEnter, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(ReplayOnEnterPrefix))));
+                patcher.TryPatchMethod(
+                    onEnter,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(ReplayOnEnterPrefix)),
+                    optional: true,
+                    label: "ReplayState.OnEnter");
             }
 
             var updVic = AccessTools.Method(replayType, "UpdateVictoriesAndPrestige");
             if (updVic != null)
             {
-                harmony.Patch(updVic, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(ReplayPostCombatUpdatedPostfix))));
+                patcher.TryPatchMethod(
+                    updVic,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(ReplayPostCombatUpdatedPostfix)),
+                    optional: true,
+                    label: "ReplayState.UpdateVictoriesAndPrestige");
             }
             BazaarLauncherPlugin.Log.LogInfo("Patched ReplayState (safe autoExitReplay hook)");
         }
@@ -940,39 +1223,7 @@ internal static class CombatPatch
     }
 
     // ── 6. 战斗触发明细捕获（直接读取 NetMessageCombatSim 全量帧事件）─────────
-    private static void PatchCombatSimulateAudit(Harmony harmony)
-    {
-        try
-        {
-            var handlerType = AccessTools.TypeByName("TheBazaar.CombatSimHandler");
-            var simMethod = handlerType == null
-                ? null
-                : AccessTools.Method(handlerType, "Simulate", new[] { typeof(NetMessageCombatSim), typeof(CancellationTokenSource) });
-            if (simMethod == null) return;
-
-            harmony.Patch(simMethod, prefix: new HarmonyMethod(
-                AccessTools.Method(typeof(CombatPatch), nameof(SimulateAuditPrefix))));
-            BazaarLauncherPlugin.Log.LogInfo("Patched CombatSimHandler.Simulate (combat trigger audit)");
-        }
-        catch (Exception ex)
-        {
-            BazaarLauncherPlugin.Log.LogWarning("PatchCombatSimulateAudit: " + ex.Message);
-        }
-    }
-
-    private static void SimulateAuditPrefix(NetMessageCombatSim message)
-    {
-        try
-        {
-            if (message?.Data == null) return;
-            if (GameInspector.GetAppStateName() == "ReplayState") return;
-            RecordCombatAudit(message);
-        }
-        catch (Exception ex)
-        {
-            BazaarLauncherPlugin.Log.LogWarning("SimulateAuditPrefix: " + ex.Message);
-        }
-    }
+    // （由 SimulateSpeedPrefix 按需调用 RecordCombatAudit，避免对 CombatSimHandler.Simulate 重复打补丁）
 
     private static void RecordCombatAudit(NetMessageCombatSim message)
     {
@@ -1182,7 +1433,7 @@ internal static class CombatPatch
     }
 
     // ── 7. 屏蔽首次战败/连胜副教程弹窗，防止 CombatSim 收尾被 GamePaused 阻塞 ─
-    private static void PatchDisableTutorials(Harmony harmony)
+    private static void PatchDisableTutorials(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -1201,13 +1452,17 @@ internal static class CombatPatch
                     BindingFlags.NonPublic | BindingFlags.Static)?.SetValue(null, true);
             }
 
-            var prefix = new HarmonyMethod(AccessTools.Method(typeof(CombatPatch), nameof(SkipCompletedTaskPrefix)));
+            var prefix = AccessTools.Method(typeof(CombatPatch), nameof(SkipCompletedTaskPrefix));
             foreach (var name in new[] { "PreloadSecondaryTutorial", "PreloadHeroTutorial" })
             {
                 var m = AccessTools.Method(tutType, name);
                 if (m != null && typeof(Task).IsAssignableFrom(m.ReturnType))
                 {
-                    harmony.Patch(m, prefix: prefix);
+                    patcher.TryPatchMethod(
+                        m,
+                        prefix: prefix,
+                        optional: true,
+                        label: "TutorialSequenceSpawnerComponent." + name);
                 }
             }
             BazaarLauncherPlugin.Log.LogInfo("Patched TutorialSequenceSpawnerComponent (secondary & hero tutorials skipped)");
@@ -1244,7 +1499,7 @@ internal static class CombatPatch
     private static MethodInfo _animSetBoolIntMethod;
     private static PropertyInfo _itemVfxProp;
 
-    // 按运行时真实 VFX 控制器类型隔离缓存反射成员，杜绝异构/派生 VFX 控制器跨类型强转风险（P2 加固）
+    // 按运行时真实 VFX 控制器类型隔离缓存反射成员，杜绝异构/派生 VFX 控制器跨类型强转风险（P2 加固 + P2-40 补全 Heated/Chilled/Disabled/Tempo）
     private sealed class VfxControllerMemberBag
     {
         public FieldInfo IsFreeze;
@@ -1260,12 +1515,29 @@ internal static class CombatPatch
         public MethodInfo UpdateSlow;
         public FieldInfo IsHaste;
         public MethodInfo UpdateHaste;
+        // P2-40：补全 Heated / Chilled / Disabled / Tempo 四种战斗视觉特效反射成员（全部对应 ItemVFXController.cs 精确字段/方法名）
+        public FieldInfo IsHeated;
+        public FieldInfo HeatedFxGo;
+        public MethodInfo UpdateHeated;
+        public FieldInfo IsChilled;
+        public FieldInfo ChilledFxGo;
+        public MethodInfo UpdateChilled;
+        public FieldInfo IsDisabled;
+        public FieldInfo DestroyEffect;
+        public FieldInfo DisableDisabledCo;
+        public MethodInfo UpdateDisable;
+        public FieldInfo ActiveTempoSpend;
+        public FieldInfo ActiveTempoGain;
+        public FieldInfo DeactivateTempoSpendCo;
+        public FieldInfo DeactivateTempoGainCo;
+        public MethodInfo StopTempoCoroutines;
+        public MethodInfo TempoEffectSetActive;
     }
 
     private static readonly ConcurrentDictionary<Type, VfxControllerMemberBag> _vfxMembersByType = new();
     private static bool _combatEndedListenersAdded;
 
-    private static void PatchPostCombatVisualCleanup(Harmony harmony)
+    private static void PatchPostCombatVisualCleanup(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -1275,15 +1547,21 @@ internal static class CombatPatch
                 var onCombatEnded = AccessTools.Method(bmType, "OnCombatEnded");
                 if (onCombatEnded != null)
                 {
-                    harmony.Patch(onCombatEnded, postfix: new HarmonyMethod(
-                        AccessTools.Method(typeof(CombatPatch), nameof(PostCombatVisualCleanupPostfix))));
+                    patcher.TryPatchMethod(
+                        onCombatEnded,
+                        postfix: AccessTools.Method(typeof(CombatPatch), nameof(PostCombatVisualCleanupPostfix)),
+                        optional: true,
+                        label: "BoardManager.OnCombatEnded");
                 }
 
                 var onStateChanged = AccessTools.Method(bmType, "OnStateChanged");
                 if (onStateChanged != null)
                 {
-                    harmony.Patch(onStateChanged, postfix: new HarmonyMethod(
-                        AccessTools.Method(typeof(CombatPatch), nameof(StateChangedVisualCleanupPostfix))));
+                    patcher.TryPatchMethod(
+                        onStateChanged,
+                        postfix: AccessTools.Method(typeof(CombatPatch), nameof(StateChangedVisualCleanupPostfix)),
+                        optional: true,
+                        label: "BoardManager.OnStateChanged.CombatVisualCleanup");
                 }
             }
 
@@ -1291,8 +1569,11 @@ internal static class CombatPatch
             var replayOnExit = replayType == null ? null : AccessTools.Method(replayType, "OnExit");
             if (replayOnExit != null)
             {
-                harmony.Patch(replayOnExit, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(PostCombatVisualCleanupPostfix))));
+                patcher.TryPatchMethod(
+                    replayOnExit,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(PostCombatVisualCleanupPostfix)),
+                    optional: true,
+                    label: "ReplayState.OnExit");
             }
 
             RegisterStaticCombatEndedListeners();
@@ -1446,6 +1727,9 @@ internal static class CombatPatch
                 int flyingVal = ReadCardAttrInt(attrs, ECardAttributeType.Flying);
                 int slowVal = ReadCardAttrInt(attrs, ECardAttributeType.Slow);
                 int hasteVal = ReadCardAttrInt(attrs, ECardAttributeType.Haste);
+                int heatedVal = ReadCardAttrInt(attrs, ECardAttributeType.Heated);
+                int chilledVal = ReadCardAttrInt(attrs, ECardAttributeType.Chilled);
+                bool isCardStateDisabled = GameInspector.GetMember(cardData, "State") is ECardState st && st == ECardState.Disabled;
 
                 if (freezeVal <= 0)
                 {
@@ -1455,6 +1739,21 @@ internal static class CombatPatch
                 {
                     ClearItemFlyVisual(ctrl);
                 }
+                // P2-40：战后同步清扫 Heated / Chilled / Disabled / Tempo 四种残留战斗特效（仅当卡牌自身已非该状态）
+                if (heatedVal <= 0)
+                {
+                    ClearItemHeatedVfx(ctrl);
+                }
+                if (chilledVal <= 0)
+                {
+                    ClearItemChilledVfx(ctrl);
+                }
+                if (!isCardStateDisabled)
+                {
+                    ClearItemDisabledVfx(ctrl);
+                }
+                ClearItemTempoVfx(ctrl);
+
                 if (onlyWhenOutOfCombat)
                 {
                     if (slowVal <= 0) ClearItemSlowVfx(ctrl);
@@ -1482,21 +1781,43 @@ internal static class CombatPatch
 
     private static VfxControllerMemberBag GetVfxMembers(Type runtimeType)
     {
-        return _vfxMembersByType.GetOrAdd(runtimeType, static vt => new VfxControllerMemberBag
+        return _vfxMembersByType.GetOrAdd(runtimeType, static vt =>
         {
-            IsFreeze = vt.GetField("isFreeze", BindingFlags.NonPublic | BindingFlags.Instance),
-            FreezeFxGo = vt.GetField("freezeFXGO", BindingFlags.NonPublic | BindingFlags.Instance),
-            FreezeStartGo = vt.GetField("freezeFXStateStartGO", BindingFlags.NonPublic | BindingFlags.Instance),
-            FreezeIdleGo = vt.GetField("freezeFXStateIdleGO", BindingFlags.NonPublic | BindingFlags.Instance),
-            FreezeEndGo = vt.GetField("freezeFXStateEndGO", BindingFlags.NonPublic | BindingFlags.Instance),
-            FreezeRemoveGo = vt.GetField("freezeFXStateRemoveGO", BindingFlags.NonPublic | BindingFlags.Instance),
-            FreezeTimer = vt.GetField("freezeTimer", BindingFlags.NonPublic | BindingFlags.Instance),
-            DisableFreezeCo = vt.GetField("disableFreezeFX", BindingFlags.NonPublic | BindingFlags.Instance),
-            UpdateFreeze = vt.GetMethod("UpdateFreezeVFX", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance),
-            IsSlow = vt.GetField("isSlow", BindingFlags.NonPublic | BindingFlags.Instance),
-            UpdateSlow = vt.GetMethod("UpdateSlow", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance),
-            IsHaste = vt.GetField("isHaste", BindingFlags.NonPublic | BindingFlags.Instance),
-            UpdateHaste = vt.GetMethod("UpdateHaste", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance),
+            var tempoSpendField = vt.GetField("_activeTempoSpend", BindingFlags.NonPublic | BindingFlags.Instance);
+            var tempoGainField = vt.GetField("_activeTempoGain", BindingFlags.NonPublic | BindingFlags.Instance);
+            var tempoType = tempoSpendField?.FieldType ?? tempoGainField?.FieldType;
+            return new VfxControllerMemberBag
+            {
+                IsFreeze = vt.GetField("isFreeze", BindingFlags.NonPublic | BindingFlags.Instance),
+                FreezeFxGo = vt.GetField("freezeFXGO", BindingFlags.NonPublic | BindingFlags.Instance),
+                FreezeStartGo = vt.GetField("freezeFXStateStartGO", BindingFlags.NonPublic | BindingFlags.Instance),
+                FreezeIdleGo = vt.GetField("freezeFXStateIdleGO", BindingFlags.NonPublic | BindingFlags.Instance),
+                FreezeEndGo = vt.GetField("freezeFXStateEndGO", BindingFlags.NonPublic | BindingFlags.Instance),
+                FreezeRemoveGo = vt.GetField("freezeFXStateRemoveGO", BindingFlags.NonPublic | BindingFlags.Instance),
+                FreezeTimer = vt.GetField("freezeTimer", BindingFlags.NonPublic | BindingFlags.Instance),
+                DisableFreezeCo = vt.GetField("disableFreezeFX", BindingFlags.NonPublic | BindingFlags.Instance),
+                UpdateFreeze = vt.GetMethod("UpdateFreezeVFX", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance),
+                IsSlow = vt.GetField("isSlow", BindingFlags.NonPublic | BindingFlags.Instance),
+                UpdateSlow = vt.GetMethod("UpdateSlow", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance),
+                IsHaste = vt.GetField("isHaste", BindingFlags.NonPublic | BindingFlags.Instance),
+                UpdateHaste = vt.GetMethod("UpdateHaste", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance),
+                IsHeated = vt.GetField("isHeated", BindingFlags.NonPublic | BindingFlags.Instance),
+                HeatedFxGo = vt.GetField("heatedFXGO", BindingFlags.NonPublic | BindingFlags.Instance),
+                UpdateHeated = vt.GetMethod("UpdateHeatedVFX", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(float) }, null),
+                IsChilled = vt.GetField("isChilled", BindingFlags.NonPublic | BindingFlags.Instance),
+                ChilledFxGo = vt.GetField("chilledFXGO", BindingFlags.NonPublic | BindingFlags.Instance),
+                UpdateChilled = vt.GetMethod("UpdateChilledVFX", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(float) }, null),
+                IsDisabled = vt.GetField("isDisabled", BindingFlags.NonPublic | BindingFlags.Instance),
+                DestroyEffect = vt.GetField("destroyEffect", BindingFlags.NonPublic | BindingFlags.Instance),
+                DisableDisabledCo = vt.GetField("disableDisabledFX", BindingFlags.NonPublic | BindingFlags.Instance),
+                UpdateDisable = vt.GetMethod("UpdateDisableVFX", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(bool) }, null),
+                ActiveTempoSpend = tempoSpendField,
+                ActiveTempoGain = tempoGainField,
+                DeactivateTempoSpendCo = vt.GetField("_deactivateTempoSpendCoroutine", BindingFlags.NonPublic | BindingFlags.Instance),
+                DeactivateTempoGainCo = vt.GetField("_deactivateTempoGainCoroutine", BindingFlags.NonPublic | BindingFlags.Instance),
+                StopTempoCoroutines = vt.GetMethod("StopTempoItemEffectCoroutines", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, Type.EmptyTypes, null),
+                TempoEffectSetActive = tempoType?.GetMethod("SetActive", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(bool) }, null),
+            };
         });
     }
 
@@ -1576,6 +1897,92 @@ internal static class CombatPatch
         }
     }
 
+    private static void ClearItemHeatedVfx(object itemCtrl)
+    {
+        _itemVfxProp ??= _itemControllerType.GetProperty("CardVFXController", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var vfx = _itemVfxProp?.GetValue(itemCtrl) ?? GameInspector.GetMember(itemCtrl, "cardVFXController");
+        if (vfx == null || (vfx is UnityEngine.Object vuo && vuo == null)) return;
+
+        var bag = GetVfxMembers(vfx.GetType());
+        bool isHeated = bag.IsHeated?.GetValue(vfx) is bool h && h;
+        var heatedGo = bag.HeatedFxGo?.GetValue(vfx) as GameObject;
+        if (!isHeated && (heatedGo == null || !heatedGo.activeSelf)) return;
+
+        bag.UpdateHeated?.Invoke(vfx, new object[] { 0f });
+        if (heatedGo != null && heatedGo.activeSelf) heatedGo.SetActive(false);
+        bag.IsHeated?.SetValue(vfx, false);
+    }
+
+    private static void ClearItemChilledVfx(object itemCtrl)
+    {
+        _itemVfxProp ??= _itemControllerType.GetProperty("CardVFXController", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var vfx = _itemVfxProp?.GetValue(itemCtrl) ?? GameInspector.GetMember(itemCtrl, "cardVFXController");
+        if (vfx == null || (vfx is UnityEngine.Object vuo && vuo == null)) return;
+
+        var bag = GetVfxMembers(vfx.GetType());
+        bool isChilled = bag.IsChilled?.GetValue(vfx) is bool c && c;
+        var chilledGo = bag.ChilledFxGo?.GetValue(vfx) as GameObject;
+        if (!isChilled && (chilledGo == null || !chilledGo.activeSelf)) return;
+
+        bag.UpdateChilled?.Invoke(vfx, new object[] { 0f });
+        if (chilledGo != null && chilledGo.activeSelf) chilledGo.SetActive(false);
+        bag.IsChilled?.SetValue(vfx, false);
+    }
+
+    private static void ClearItemDisabledVfx(object itemCtrl)
+    {
+        _itemVfxProp ??= _itemControllerType.GetProperty("CardVFXController", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var vfx = _itemVfxProp?.GetValue(itemCtrl) ?? GameInspector.GetMember(itemCtrl, "cardVFXController");
+        if (vfx == null || (vfx is UnityEngine.Object vuo && vuo == null)) return;
+
+        var bag = GetVfxMembers(vfx.GetType());
+        bool isDisabled = bag.IsDisabled?.GetValue(vfx) is bool d && d;
+        var destroyFx = bag.DestroyEffect?.GetValue(vfx) as Component;
+        bool destroyActive = destroyFx != null && destroyFx.gameObject != null && destroyFx.gameObject.activeSelf;
+        if (!isDisabled && !destroyActive) return;
+
+        if (bag.DisableDisabledCo?.GetValue(vfx) is Coroutine co && co != null && vfx is MonoBehaviour mb && mb != null)
+        {
+            mb.StopCoroutine(co);
+            bag.DisableDisabledCo.SetValue(vfx, null);
+        }
+        if (destroyFx != null)
+        {
+            bag.UpdateDisable?.Invoke(vfx, new object[] { false });
+            if (destroyFx.gameObject != null && destroyFx.gameObject.activeSelf)
+            {
+                destroyFx.gameObject.SetActive(false);
+            }
+        }
+        bag.IsDisabled?.SetValue(vfx, false);
+    }
+
+    private static void ClearItemTempoVfx(object itemCtrl)
+    {
+        _itemVfxProp ??= _itemControllerType.GetProperty("CardVFXController", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var vfx = _itemVfxProp?.GetValue(itemCtrl) ?? GameInspector.GetMember(itemCtrl, "cardVFXController");
+        if (vfx == null || (vfx is UnityEngine.Object vuo && vuo == null)) return;
+
+        var bag = GetVfxMembers(vfx.GetType());
+        var spendCo = bag.DeactivateTempoSpendCo?.GetValue(vfx) as Coroutine;
+        var gainCo = bag.DeactivateTempoGainCo?.GetValue(vfx) as Coroutine;
+        var spendFx = bag.ActiveTempoSpend?.GetValue(vfx);
+        var gainFx = bag.ActiveTempoGain?.GetValue(vfx);
+
+        if (spendCo != null || gainCo != null)
+        {
+            bag.StopTempoCoroutines?.Invoke(vfx, null);
+        }
+        if (spendFx != null && bag.TempoEffectSetActive != null)
+        {
+            bag.TempoEffectSetActive.Invoke(spendFx, new object[] { false });
+        }
+        if (gainFx != null && bag.TempoEffectSetActive != null)
+        {
+            bag.TempoEffectSetActive.Invoke(gainFx, new object[] { false });
+        }
+    }
+
     private static void ClearItemFlyVisual(object itemCtrl)
     {
         _itemIsFlyingField ??= _itemControllerType.GetField("_isFlying", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -1635,7 +2042,7 @@ internal static class CombatPatch
         _cdDeadKeys.Clear();
     }
 
-    private static void PatchSmoothCooldownBars(Harmony harmony)
+    private static void PatchSmoothCooldownBars(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -1650,23 +2057,35 @@ internal static class CombatPatch
 
             if (updM != null && _cdAnimatedTransformField != null)
             {
-                harmony.Patch(updM, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectUpdatePositionPostfix))));
+                patcher.TryPatchMethod(
+                    updM,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectUpdatePositionPostfix)),
+                    optional: true,
+                    label: "CooldownEffect.UpdatePosition");
             }
             if (resetM != null && _cdAnimatedTransformField != null)
             {
-                harmony.Patch(resetM, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectDropTrackPostfix))));
+                patcher.TryPatchMethod(
+                    resetM,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectDropTrackPostfix)),
+                    optional: true,
+                    label: "CooldownEffect.ResetPosition");
             }
             if (showM != null && _cdAnimatedTransformField != null)
             {
-                harmony.Patch(showM, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectShowPostfix))));
+                patcher.TryPatchMethod(
+                    showM,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectShowPostfix)),
+                    optional: true,
+                    label: "CooldownEffect.Show");
             }
             if (cleanM != null && _cdAnimatedTransformField != null)
             {
-                harmony.Patch(cleanM, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectDropTrackPostfix))));
+                patcher.TryPatchMethod(
+                    cleanM,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(CooldownEffectDropTrackPostfix)),
+                    optional: true,
+                    label: "CooldownEffect.Cleanup");
             }
             BazaarLauncherPlugin.Log?.LogInfo("Patched ItemVFXController.CooldownEffect (60/120+ FPS smooth cooldown bar interpolation)");
         }
@@ -1793,15 +2212,15 @@ internal static class CombatPatch
     {
         try
         {
-            if (_gamePausedProp == null)
+            // P1-45：GameServiceManager 位于全局命名空间且继承 Singleton<GameServiceManager>，GamePaused 为实例属性，
+            // 必须经 Singleton.Instance 读取，避免每帧 GetValue(null) 抛出 TargetException
+            EnsureGameServiceManagerHandles();
+            var inst = _gameServiceManagerInstanceProp?.GetValue(null);
+            if (inst != null && !(inst is UnityEngine.Object uo && uo == null) && _gamePausedProp != null)
             {
-                var gsmType = _gameServiceManagerType ?? AccessTools.TypeByName("TheBazaar.GameServiceManager");
-                _gameServiceManagerType = gsmType;
-                _gamePausedProp = gsmType?.GetProperty("IsGamePaused", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
-                    ?? gsmType?.GetProperty("GamePaused", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (_gamePausedProp.GetValue(inst) is bool paused)
+                    return paused;
             }
-            if (_gamePausedProp != null && _gamePausedProp.GetValue(null) is bool paused)
-                return paused;
         }
         catch { }
         return Time.timeScale <= 0.001f;
@@ -1851,7 +2270,7 @@ internal static class CombatPatch
 
     // ── 9. 冷却时间 Tooltip 精准显示（亚十分位如 1980ms 显示 1.98，整 0.1s 保持原版 2.0）──
 
-    private static void PatchPrecisionCooldownTooltip(Harmony harmony)
+    private static void PatchPrecisionCooldownTooltip(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -1868,9 +2287,14 @@ internal static class CombatPatch
 
             if (renderM != null && _cdRendererSetCooldownMethod != null && _tooltipGetCurAttrMethod != null)
             {
-                harmony.Patch(renderM, postfix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CombatPatch), nameof(CooldownRendererRenderPostfix))));
-                BazaarLauncherPlugin.Log?.LogInfo("Patched CooldownRenderer.RenderFromTooltip (sub-0.1s precision display, e.g. 1.98s)");
+                if (patcher.TryPatchMethod(
+                    renderM,
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(CooldownRendererRenderPostfix)),
+                    optional: true,
+                    label: "CooldownRenderer.RenderFromTooltip"))
+                {
+                    BazaarLauncherPlugin.Log?.LogInfo("Patched CooldownRenderer.RenderFromTooltip (sub-0.1s precision display, e.g. 1.98s)");
+                }
             }
         }
         catch (Exception ex)

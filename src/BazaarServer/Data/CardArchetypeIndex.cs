@@ -13,9 +13,12 @@ public sealed class CardArchetypeIndex
 {
     public const string NufuEncounterId = "210003fa-a20d-4ad1-9ada-d5fad5bf9f89";
     public const string TatianaEncounterId = "22bb0004-5131-4588-a567-03ee3c96003b";
-    public const string ZurphinsSafariEncounterId = "b81a1c81-52df-458c-94f9-702c78c8f5cd";
+    public const string ZurphinsSafariEncounterId = "b81a1c81-0a16-462a-8247-04653354b79d";
     public const string ShroudedFigureEncounterId = "818fcd1d-4cfd-4629-b83f-8d5e753dd8f4";
     public const string TheCultEncounterId = "bf1594cc-7f65-4236-b95f-ed2f521739de";
+    public const string MysteriousPortalEncounterId = "b7acf32d-79f8-4040-810f-4fb44e16682b";
+    public const string StatiaEncounterId = "7f2c3a0d-7675-44dd-8667-77b08455eec8";
+    public const string AdvancedTrainingEncounterId = "6a5e82cf-969c-432a-863a-1df6e7f56513";
     public const string TheArtistPedestalId = "49717d0f-71de-4291-8af6-d9c41ad3f438";
     public const string TheArtistLevelUpPedestalId = "9b18ad79-901b-46ac-bec1-f447d41ad5ad";
     public const string FuturaEncounterId = "aef5e7d8-ea0b-4e7e-8f3d-6e7ba492fa10";
@@ -372,6 +375,7 @@ public sealed class CardArchetypeIndex
         // 2. Cult & Mystery
         if (id.Equals(ShroudedFigureEncounterId, StringComparison.OrdinalIgnoreCase) ||
             id.Equals(TheCultEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            id.Equals(MysteriousPortalEncounterId, StringComparison.OrdinalIgnoreCase) ||
             id.Equals(FuturaEncounterId, StringComparison.OrdinalIgnoreCase) ||
             ContainsAny(name, "Shrouded Figure", "Cult", "Mystery", "Mysterious", "Futura",
                 "Crossroads", "Tiny Furry Creature", "Strange Mushroom", "Tomb of the Ancients",
@@ -421,7 +425,9 @@ public sealed class CardArchetypeIndex
         BazaarCore.Models.CardTemplate? coreTpl)
     {
         if (id.Equals(NufuEncounterId, StringComparison.OrdinalIgnoreCase) ||
-            id.Equals(ZurphinsSafariEncounterId, StringComparison.OrdinalIgnoreCase))
+            id.Equals(ZurphinsSafariEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            id.Equals(StatiaEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            id.Equals(AdvancedTrainingEncounterId, StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -457,13 +463,16 @@ public sealed class CardArchetypeIndex
         if (id.Equals(NufuEncounterId, StringComparison.OrdinalIgnoreCase) ||
             id.Equals(TatianaEncounterId, StringComparison.OrdinalIgnoreCase) ||
             id.Equals(ZurphinsSafariEncounterId, StringComparison.OrdinalIgnoreCase) ||
-            ContainsAny(name, "Nufu", "Tatiana", "Zurphin", "Hero Merchant", "Skill"))
+            id.Equals(StatiaEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            id.Equals(AdvancedTrainingEncounterId, StringComparison.OrdinalIgnoreCase) ||
+            ContainsAny(name, "Nufu", "Tatiana", "Zurphin", "Statia", "Advanced Training", "Hero Merchant", "Skill"))
         {
             return true;
         }
 
         string tier = poolTpl?.StartingTier ?? coreTpl?.StartingTier ?? "Bronze";
-        if (string.Equals(tier, "Diamond", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(tier, "Diamond", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(tier, "Legendary", StringComparison.OrdinalIgnoreCase))
             return true;
 
         var spawn = coreTpl?.SelectionContext?.SpawnContext ?? poolTpl?.SelectionContext?.SpawnContext;

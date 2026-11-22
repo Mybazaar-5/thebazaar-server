@@ -47,8 +47,23 @@ public sealed class GameDatabaseLoader
         var levelUps = new Dictionary<int, LevelUpTemplate>();
         var gameModes = new List<GameModeData>();
         var tooltips = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var tooltipSymbols = new Dictionary<string, TooltipSymbolTemplate>(StringComparer.OrdinalIgnoreCase);
+        var challenges = new Dictionary<string, ChallengeTemplate>(StringComparer.OrdinalIgnoreCase);
+        var collectibles = new Dictionary<string, CollectibleTemplate>(StringComparer.OrdinalIgnoreCase);
+        var seasons = new Dictionary<int, SeasonTemplate>();
         var unknownTypes = new HashSet<string>(StringComparer.Ordinal);
         var observedTypes = new HashSet<string>(StringComparer.Ordinal);
+
+        var existingTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var tblCmd = conn.CreateCommand())
+        {
+            tblCmd.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table'";
+            using var tblReader = tblCmd.ExecuteReader();
+            while (tblReader.Read())
+            {
+                existingTables.Add(tblReader.GetString(0));
+            }
+        }
 
         void AuditJsonTypes(string rawJson)
         {
@@ -128,9 +143,10 @@ public sealed class GameDatabaseLoader
             }
         }
 
-        // 5. tooltips
-        using (var cmd = conn.CreateCommand())
+        // 5. tooltips（完整解析全部 136 条 TTooltipSymbol，并同步投影 62 条非空 Keyword 到 TooltipGlossary 兼容视图）
+        if (existingTables.Contains("tooltips"))
         {
+            using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT Data FROM tooltips LIMIT 1";
             using var reader = cmd.ExecuteReader();
             if (reader.Read())
@@ -139,20 +155,83 @@ public sealed class GameDatabaseLoader
                 using var doc = JsonDocument.Parse(raw);
                 foreach (var prop in doc.RootElement.EnumerateObject())
                 {
-                    if (prop.Value.ValueKind == JsonValueKind.Object)
-                    {
-                        var text = prop.Value.TryGetProperty("Keyword", out var kwEl) ? kwEl.GetString()
-                            : prop.Value.TryGetProperty("Description", out var descEl) ? descEl.GetString()
-                            : prop.Value.TryGetProperty("Text", out var txtEl) ? txtEl.GetString()
-                            : null;
-                        if (!string.IsNullOrEmpty(text))
-                            tooltips[prop.Name] = text;
-                    }
+                    if (prop.Value.ValueKind != JsonValueKind.Object) continue;
+                    var symbol = prop.Value.Deserialize<TooltipSymbolTemplate>(JsonOptions);
+                    if (symbol == null) continue;
+                    if (string.IsNullOrEmpty(symbol.Id))
+                        symbol.Id = prop.Name;
+                    if (string.IsNullOrEmpty(symbol.Tag))
+                        symbol.Tag = prop.Name;
+
+                    tooltipSymbols[prop.Name] = symbol;
+                    if (!string.IsNullOrEmpty(symbol.Keyword))
+                        tooltips[prop.Name] = symbol.Keyword;
                 }
             }
         }
 
-        // 6. 单一权威信源：严格以 GameData.db 为准，不再回读过期 21.5 MB cards.json（消除 60MB 临时堆与旧卡污染）
+        // 6. challenges（整表 80 条每日/每周挑战，完整解析并一次性预编译 Trigger 规则树）
+        if (existingTables.Contains("challenges"))
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT Id, Data FROM challenges";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var id = reader.GetString(0);
+                var raw = reader.GetFieldValue<byte[]>(1);
+                var json = System.Text.Encoding.UTF8.GetString(raw);
+                AuditJsonTypes(json);
+                var challenge = JsonSerializer.Deserialize<ChallengeTemplate>(json, JsonOptions)
+                    ?? throw new InvalidDataException($"反序列化挑战失败: {id}");
+                if (string.IsNullOrEmpty(challenge.Id)) challenge.Id = id;
+                PrecompileRuleNode(challenge.Trigger);
+                challenges[challenge.Id] = challenge;
+            }
+        }
+
+        // 7. collectibles（整表 8 类数组共 1,644 条藏品，保留 Rarity / IsFoundInChests / InStore / SeasonId 等全部元数据）
+        if (existingTables.Contains("collectibles"))
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT Id, Data FROM collectibles";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var categoryKey = reader.GetString(0);
+                var raw = reader.GetFieldValue<byte[]>(1);
+                var json = System.Text.Encoding.UTF8.GetString(raw);
+                var items = JsonSerializer.Deserialize<List<CollectibleTemplate>>(json, JsonOptions);
+                if (items == null) continue;
+                for (int i = 0; i < items.Count; i++)
+                {
+                    var item = items[i];
+                    if (item == null || string.IsNullOrWhiteSpace(item.Id)) continue;
+                    item.CategoryKey = categoryKey;
+                    collectibles[item.Id] = item;
+                }
+            }
+        }
+
+        // 8. seasons（整表 21 个赛季；TSeason 为元进度静态表实体而非规则节点，不计入 UnknownRuleTypes）
+        if (existingTables.Contains("seasons"))
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT Id, Data FROM seasons ORDER BY Id";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var id = reader.GetInt32(0);
+                var raw = reader.GetFieldValue<byte[]>(1);
+                var json = System.Text.Encoding.UTF8.GetString(raw);
+                var season = JsonSerializer.Deserialize<SeasonTemplate>(json, JsonOptions)
+                    ?? throw new InvalidDataException($"反序列化赛季失败: {id}");
+                if (season.Id <= 0) season.Id = id;
+                seasons[season.Id] = season;
+            }
+        }
+
+        // 9. 单一权威信源：严格以 GameData.db 为准，不再回读过期 21.5 MB cards.json（消除 60MB 临时堆与旧卡污染）
         var localization = LocalizationLoader.Load(customTranslationPath);
         var primaryMode = gameModes.FirstOrDefault() ?? new GameModeData();
         return new GameDataRepository(
@@ -165,7 +244,11 @@ public sealed class GameDatabaseLoader
             observedTypes,
             unknownTypes,
             localization,
-            sourcePath);
+            sourcePath,
+            challenges,
+            collectibles,
+            seasons,
+            tooltipSymbols);
     }
 
     /// <summary>

@@ -481,6 +481,32 @@ public sealed partial class Persistence : IDisposable
                     CREATE INDEX IF NOT EXISTS idx_chat_created    ON chat_messages(created_at);
                     """);
             });
+
+            ApplyMigration(conn, 4, "wave4a_account_challenges_and_season_progress", c =>
+            {
+                ExecuteNonQuery(c, """
+                    CREATE TABLE IF NOT EXISTS account_challenges (
+                        account_id       TEXT PRIMARY KEY,
+                        challenges_json  TEXT NOT NULL DEFAULT '',
+                        updated_at       TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS account_season_progress (
+                        account_id                   TEXT NOT NULL,
+                        season_id                    INTEGER NOT NULL,
+                        experience                   INTEGER NOT NULL DEFAULT 0,
+                        is_paid                      INTEGER NOT NULL DEFAULT 1,
+                        claimed_free_tiers_json      TEXT NOT NULL DEFAULT '[]',
+                        claimed_paid_tiers_json      TEXT NOT NULL DEFAULT '[]',
+                        claimed_free_infinite_count  INTEGER NOT NULL DEFAULT 0,
+                        claimed_paid_infinite_count  INTEGER NOT NULL DEFAULT 0,
+                        updated_at                   TEXT NOT NULL,
+                        PRIMARY KEY (account_id, season_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_season_progress_account
+                        ON account_season_progress(account_id, season_id);
+                    """);
+            });
         }
     }
 
@@ -744,6 +770,194 @@ public sealed partial class Persistence : IDisposable
     /// <summary>线程安全读取账号自定义规则 JSON（未配置时返回空字符串）。</summary>
     public string LoadAccountCustomRules(Guid accountId)
         => LoadAccountCustomRules(accountId.ToString("D"));
+
+    // ── 每日/每周挑战与赛季通行证进度持久化（Wave 4A：P1-02 / P1-06）────────
+
+    public sealed record SeasonTrackProgressRow(
+        Guid AccountId,
+        int SeasonId,
+        int Experience,
+        bool IsPaid,
+        int[] ClaimedFreeRewardTiers,
+        int[] ClaimedPaidRewardTiers,
+        int ClaimedFreeInfiniteTierCount,
+        int ClaimedPaidInfiniteTierCount,
+        DateTime UpdatedAt);
+
+    /// <summary>读取指定账号的挑战槽位状态 JSON（未初始化时返回空字符串）。</summary>
+    public string LoadAccountChallengesJson(Guid accountId)
+    {
+        if (accountId == Guid.Empty) return "";
+        string key = accountId.ToString("D");
+        return ExecuteRead(conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT challenges_json FROM account_challenges WHERE account_id = $id LIMIT 1;";
+            cmd.Parameters.AddWithValue("$id", key);
+            object? obj = cmd.ExecuteScalar();
+            return obj is string s ? s : "";
+        });
+    }
+
+    /// <summary>保存指定账号的挑战槽位状态 JSON（原子 UPSERT）。</summary>
+    public void SaveAccountChallengesJson(Guid accountId, string json)
+    {
+        if (accountId == Guid.Empty) return;
+        string key = accountId.ToString("D");
+        string payload = json ?? "";
+        ExecuteWrite((conn, tx) =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                INSERT INTO account_challenges (account_id, challenges_json, updated_at)
+                VALUES ($id, $json, $ua)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    challenges_json = excluded.challenges_json,
+                    updated_at = excluded.updated_at;
+                """;
+            cmd.Parameters.AddWithValue("$id", key);
+            cmd.Parameters.AddWithValue("$json", payload);
+            cmd.Parameters.AddWithValue("$ua", DateTime.UtcNow.ToString("O"));
+            cmd.ExecuteNonQuery();
+        });
+    }
+
+    /// <summary>读取指定账号在指定赛季的通行证进度（无记录时返回初始 0 XP 视图）。</summary>
+    public SeasonTrackProgressRow LoadSeasonTrackProgress(Guid accountId, int seasonId)
+    {
+        int normalizedSeason = seasonId > 0 ? seasonId : 2;
+        if (accountId == Guid.Empty)
+        {
+            return new SeasonTrackProgressRow(
+                accountId, normalizedSeason, 0, true,
+                Array.Empty<int>(), Array.Empty<int>(), 0, 0, DateTime.UtcNow);
+        }
+
+        string key = accountId.ToString("D");
+        return ExecuteRead(conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT experience, is_paid, claimed_free_tiers_json, claimed_paid_tiers_json,
+                       claimed_free_infinite_count, claimed_paid_infinite_count, updated_at
+                FROM account_season_progress
+                WHERE account_id = $id AND season_id = $sid
+                LIMIT 1;
+                """;
+            cmd.Parameters.AddWithValue("$id", key);
+            cmd.Parameters.AddWithValue("$sid", normalizedSeason);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read())
+            {
+                return new SeasonTrackProgressRow(
+                    accountId, normalizedSeason, 0, true,
+                    Array.Empty<int>(), Array.Empty<int>(), 0, 0, DateTime.UtcNow);
+            }
+
+            return new SeasonTrackProgressRow(
+                accountId,
+                normalizedSeason,
+                Math.Max(0, r.GetInt32(0)),
+                r.GetInt32(1) != 0,
+                ParseIntArrayJson(r.IsDBNull(2) ? null : r.GetString(2)),
+                ParseIntArrayJson(r.IsDBNull(3) ? null : r.GetString(3)),
+                Math.Max(0, r.GetInt32(4)),
+                Math.Max(0, r.GetInt32(5)),
+                ParseUtc(r.IsDBNull(6) ? null : r.GetString(6)));
+        });
+    }
+
+    /// <summary>保存账号的赛季通行证完整进度行。</summary>
+    public void SaveSeasonTrackProgress(SeasonTrackProgressRow row)
+    {
+        if (row == null || row.AccountId == Guid.Empty) return;
+        int normalizedSeason = row.SeasonId > 0 ? row.SeasonId : 2;
+        ExecuteWrite((conn, tx) =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                INSERT INTO account_season_progress (
+                    account_id, season_id, experience, is_paid,
+                    claimed_free_tiers_json, claimed_paid_tiers_json,
+                    claimed_free_infinite_count, claimed_paid_infinite_count, updated_at)
+                VALUES ($id, $sid, $exp, $paid, $freeJson, $paidJson, $freeInf, $paidInf, $ua)
+                ON CONFLICT(account_id, season_id) DO UPDATE SET
+                    experience = excluded.experience,
+                    is_paid = excluded.is_paid,
+                    claimed_free_tiers_json = excluded.claimed_free_tiers_json,
+                    claimed_paid_tiers_json = excluded.claimed_paid_tiers_json,
+                    claimed_free_infinite_count = excluded.claimed_free_infinite_count,
+                    claimed_paid_infinite_count = excluded.claimed_paid_infinite_count,
+                    updated_at = excluded.updated_at;
+                """;
+            cmd.Parameters.AddWithValue("$id", row.AccountId.ToString("D"));
+            cmd.Parameters.AddWithValue("$sid", normalizedSeason);
+            cmd.Parameters.AddWithValue("$exp", Math.Max(0, row.Experience));
+            cmd.Parameters.AddWithValue("$paid", row.IsPaid ? 1 : 0);
+            cmd.Parameters.AddWithValue("$freeJson", JsonSerializer.Serialize(row.ClaimedFreeRewardTiers ?? Array.Empty<int>()));
+            cmd.Parameters.AddWithValue("$paidJson", JsonSerializer.Serialize(row.ClaimedPaidRewardTiers ?? Array.Empty<int>()));
+            cmd.Parameters.AddWithValue("$freeInf", Math.Max(0, row.ClaimedFreeInfiniteTierCount));
+            cmd.Parameters.AddWithValue("$paidInf", Math.Max(0, row.ClaimedPaidInfiniteTierCount));
+            cmd.Parameters.AddWithValue("$ua", DateTime.UtcNow.ToString("O"));
+            cmd.ExecuteNonQuery();
+        });
+    }
+
+    /// <summary>原子累加账号在指定赛季的通行证经验，并返回累加后的最新总经验值。</summary>
+    public int AddSeasonTrackExperience(Guid accountId, int seasonId, int xpDelta)
+    {
+        int normalizedSeason = seasonId > 0 ? seasonId : 2;
+        if (accountId == Guid.Empty) return 0;
+        int safeDelta = Math.Max(0, xpDelta);
+        string key = accountId.ToString("D");
+
+        return ExecuteWrite((conn, tx) =>
+        {
+            if (safeDelta > 0)
+            {
+                using var upsert = conn.CreateCommand();
+                upsert.Transaction = tx;
+                upsert.CommandText = """
+                    INSERT INTO account_season_progress (
+                        account_id, season_id, experience, is_paid,
+                        claimed_free_tiers_json, claimed_paid_tiers_json,
+                        claimed_free_infinite_count, claimed_paid_infinite_count, updated_at)
+                    VALUES ($id, $sid, $delta, 1, '[]', '[]', 0, 0, $ua)
+                    ON CONFLICT(account_id, season_id) DO UPDATE SET
+                        experience = account_season_progress.experience + excluded.experience,
+                        updated_at = excluded.updated_at;
+                    """;
+                upsert.Parameters.AddWithValue("$id", key);
+                upsert.Parameters.AddWithValue("$sid", normalizedSeason);
+                upsert.Parameters.AddWithValue("$delta", safeDelta);
+                upsert.Parameters.AddWithValue("$ua", DateTime.UtcNow.ToString("O"));
+                upsert.ExecuteNonQuery();
+            }
+
+            using var sel = conn.CreateCommand();
+            sel.Transaction = tx;
+            sel.CommandText = "SELECT experience FROM account_season_progress WHERE account_id = $id AND season_id = $sid LIMIT 1;";
+            sel.Parameters.AddWithValue("$id", key);
+            sel.Parameters.AddWithValue("$sid", normalizedSeason);
+            object? obj = sel.ExecuteScalar();
+            return obj != null && obj != DBNull.Value ? Convert.ToInt32(obj) : 0;
+        });
+    }
+
+    private static int[] ParseIntArrayJson(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return Array.Empty<int>();
+        try
+        {
+            return JsonSerializer.Deserialize<int[]>(json) ?? Array.Empty<int>();
+        }
+        catch
+        {
+            return Array.Empty<int>();
+        }
+    }
 
     /// <summary>线程安全读取账号自定义规则 JSON（未配置时返回空字符串）。</summary>
     public string LoadAccountCustomRules(string accountId)
@@ -1106,7 +1320,7 @@ public sealed partial class Persistence : IDisposable
                 ? accountIdOrSnapshot
                 : RunSnapshotSerializer.Serialize(
                     run,
-                    startSelectionDone: RunSnapshotSerializer.InferStartSelectionDone(run),
+                    startSelectionDone: run.StartSelectionDone,
                     pendingLevelUp: run.PendingLevelUp));
 
         // 修复 MP-P1-08：严禁在 3 参快照重载时把 account_id 误写为 Guid.Empty，回退取 run.AccountId

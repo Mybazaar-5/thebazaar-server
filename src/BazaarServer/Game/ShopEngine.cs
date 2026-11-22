@@ -104,6 +104,82 @@ public sealed class ShopEngine
         _chances = pool.CreateTierChances();
         _rng = run.RngSeed != 0 ? new Random(run.RngSeed) : new Random();
         RestoreMonsterLootPagesFromRun();
+        RestoreActiveShelfDiscountsFromRun();
+    }
+
+    /// <summary>P1-33：从 RunState.ActiveShelfDiscounts 恢复持久化折扣缓存（断点续玩与挂起栈弹栈恢复共用）。</summary>
+    internal void RestoreActiveShelfDiscountsFromRun()
+    {
+        _activeShelfDiscounts.Clear();
+        if (_run.ActiveShelfDiscounts.Count == 0)
+            return;
+
+        foreach (var (instanceId, discountedPrice) in _run.ActiveShelfDiscounts)
+        {
+            if (!_run.Cards.TryGetValue(instanceId, out var entry) || entry.Owner != null)
+                continue;
+            int origPrice = entry.CoreCard != null
+                ? Math.Max(discountedPrice + 1, RunState.ComputeCardBuyPrice(entry, entry.CoreCard, _repo.GameMode.StandardPrices))
+                : Math.Max(discountedPrice + 1, entry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, discountedPrice));
+            if (entry.Attributes.TryGetValue(ECardAttributeType.BuyPrice, out int curPrice) && curPrice > discountedPrice)
+                origPrice = curPrice;
+            int pct = origPrice > 0
+                ? Math.Clamp((int)Math.Round((1.0 - (double)discountedPrice / origPrice) * 100.0), 1, 99)
+                : MerchantItemDiscountPercent;
+            double mult = origPrice > 0 ? Math.Clamp((double)discountedPrice / origPrice, 0.01, 1.0) : (1.0 - pct / 100.0);
+            entry.Attributes[ECardAttributeType.BuyPrice] = discountedPrice;
+            _activeShelfDiscounts[instanceId] = new MerchantDiscountInfo(
+                instanceId,
+                entry.TemplateId.ToString(),
+                origPrice,
+                discountedPrice,
+                pct,
+                mult);
+        }
+    }
+
+    /// <summary>P1-18：计算玩家当前生效的刷新费用修正值 RerollCostModifier（基础 + 光环 + 限时层，杜绝重复叠算）。</summary>
+    public int GetEffectiveRerollCostModifier()
+    {
+        if (_run.PlayerAttributes.TryGetValue(EPlayerAttributeType.RerollCostModifier, out int effectiveAttr) &&
+            effectiveAttr != 0)
+        {
+            return effectiveAttr;
+        }
+        double layered = _run.PlayerAuraAdd.GetValueOrDefault("RerollCostModifier", 0.0)
+                       + _run.PlayerHourAdd.GetValueOrDefault("RerollCostModifier", 0.0)
+                       + _run.PlayerDayAdd.GetValueOrDefault("RerollCostModifier", 0.0);
+        return (int)Math.Round(layered);
+    }
+
+    /// <summary>P1-18：对刷新原始基价叠加玩家 RerollCostModifier（如 Arbitrage / Cloche Hat）并下限钳制为 0。</summary>
+    public uint ComputeEffectiveRerollCost(uint baseCost)
+    {
+        var effectiveCustomRules = ActiveRules ?? _run.CustomRules;
+        if (effectiveCustomRules != null)
+        {
+            if ((effectiveCustomRules.IsSandboxRun && effectiveCustomRules.SandboxFreeInfiniteReroll) ||
+                effectiveCustomRules.HasMutator(MutatorCatalog.BloodMarket) ||
+                (effectiveCustomRules.SpecialModeId == ESpecialModeId.BossRush && _run.Hour == 1))
+            {
+                return 0;
+            }
+        }
+        int adjusted = (int)baseCost + GetEffectiveRerollCostModifier();
+        return (uint)Math.Max(0, adjusted);
+    }
+
+    /// <summary>P1-18 / P2-14：在局外光环重算或刷新前按当前 BaseRerollCost + RerollCostModifier 重新同步 _run.RerollCost，费用变更时自动发射 RerollCostChanged。</summary>
+    public bool RefreshEffectiveRerollCost(List<IGameSimEvent>? events = null)
+    {
+        if (_run.RerollsRemaining == 0)
+            return false;
+        if (_run.SelectionRules?.RerollRules == null && !_run.BaseRerollCost.HasValue)
+            return false;
+        if (!_run.BaseRerollCost.HasValue)
+            _run.BaseRerollCost = _run.RerollCost;
+        uint nextCost = ComputeEffectiveRerollCost(_run.BaseRerollCost.Value);
+        return _run.SetRerollCost(nextCost, events);
     }
 
     /// <summary>
@@ -175,10 +251,13 @@ public sealed class ShopEngine
         }
 
         // 2. 商店买价修正：沙盒 0 元商店 / shop_half_off 五折 / 预设物价倍率（如 ExtremeRoguelike 1.10x）
+        //    直接写入 CoreCard.PermanentMult["BuyPrice"]，防止 SyncShelfEntriesDiff 重算时把五折/倍率/0 元覆盖蒸发
         if (!isFree && isMerchant && entry.Type is ECardType.Item or ECardType.Skill)
         {
             if (rules.IsSandboxRun && rules.SandboxZeroShopPrice)
             {
+                if (entry.CoreCard != null)
+                    entry.CoreCard.PermanentMult["BuyPrice"] = 0.0;
                 entry.Attributes[ECardAttributeType.BuyPrice] = 0;
                 return;
             }
@@ -191,8 +270,18 @@ public sealed class ShopEngine
                     mult *= 0.50;
                 if (Math.Abs(mult - 1.0) > 1e-6)
                 {
-                    int adjusted = Math.Max(1, (int)Math.Round(baseBuy * mult));
-                    entry.Attributes[ECardAttributeType.BuyPrice] = adjusted;
+                    if (entry.CoreCard != null)
+                    {
+                        double existingMult = entry.CoreCard.PermanentMult.GetValueOrDefault("BuyPrice", 1.0);
+                        entry.CoreCard.PermanentMult["BuyPrice"] = existingMult * mult;
+                        entry.Attributes[ECardAttributeType.BuyPrice] =
+                            RunState.ComputeCardBuyPrice(entry, entry.CoreCard, _repo.GameMode.StandardPrices);
+                    }
+                    else
+                    {
+                        int adjusted = Math.Max(1, (int)Math.Round(baseBuy * mult));
+                        entry.Attributes[ECardAttributeType.BuyPrice] = adjusted;
+                    }
                 }
             }
         }
@@ -225,8 +314,12 @@ public sealed class ShopEngine
     /// <summary>当前货架上已命中的商人 25% 折扣卡明细（实例 ID -> 折扣记录）。</summary>
     public IReadOnlyDictionary<string, MerchantDiscountInfo> ActiveShelfDiscounts => _activeShelfDiscounts;
 
-    /// <summary>当前遭遇显式配置的 MaxSelections 上限（null 表示未显式限制）。</summary>
-    public int? CurrentMaxSelections { get; private set; }
+    /// <summary>当前遭遇显式配置的 MaxSelections 上限（持久化于 RunState，null 表示未显式限制）。</summary>
+    public int? CurrentMaxSelections
+    {
+        get => _run.CurrentMaxSelections;
+        private set => _run.CurrentMaxSelections = value;
+    }
 
     /// <summary>当前选择上下文的有效可选次数上限（非多选默认 1，多选未设 MaxSelections 时为 null）。</summary>
     public int? EffectiveMaxSelections => CurrentMaxSelections ?? (_run.SelectionRules.CanSelectMultiple ? null : 1);
@@ -262,8 +355,12 @@ public sealed class ShopEngine
         }
         _run.SelectionSet.Clear();
         _activeShelfDiscounts.Clear();
+        _run.ActiveShelfDiscounts.Clear();
         if (clearMonsterLootPages)
         {
+            // P1-33：清空货架时默认重置 CurrentMaxSelections 与 BaseRerollCost，防止上游多选上限泄漏至 LevelUp 或下一遭遇
+            CurrentMaxSelections = null;
+            _run.BaseRerollCost = null;
             _monsterLootPages.Clear();
             CurrentMonsterLootPageIndex = 0;
             _run.MonsterLootPages.Clear();
@@ -488,17 +585,19 @@ public sealed class ShopEngine
         => DealHourEncounters(playerState: null, visitedTodayIds: null);
 
     public List<IGameSimEvent> DealHourEncounters(PlayerState? playerState, ISet<string>? visitedTodayIds = null)
-        => DealHourEncounters(playerState, visitedTodayIds, ActiveRules, ArchetypeIndex);
+        => DealHourEncounters(playerState, visitedTodayIds, ActiveRules, ArchetypeIndex, spawnCountOverride: null);
 
     public List<IGameSimEvent> DealHourEncounters(
         PlayerState? playerState,
         ISet<string>? visitedTodayIds,
         CustomRunRuleSet? rules,
-        CardArchetypeIndex? archetypeIndex = null)
+        CardArchetypeIndex? archetypeIndex = null,
+        int? spawnCountOverride = null)
     {
         var events = new List<IGameSimEvent>();
         events.AddRange(ClearShelf());
         CurrentMaxSelections = null;
+        int targetChoiceCount = spawnCountOverride is > 0 ? Math.Min(spawnCountOverride.Value, 10) : 3;
 
         string hero = _run.Hero.ToString();
         int day = (int)_run.Day;
@@ -546,11 +645,19 @@ public sealed class ShopEngine
 
         double GetEncounterMultiplier(CardPool.CardTemplate tpl)
         {
-            if (!hasMultipliers) return 1.0;
-            var cat = effectiveIndex != null && effectiveIndex.TryGetEncounterCategory(tpl.Id, out var c)
-                ? c
-                : CardArchetypeIndex.ClassifyEncounter(tpl, _repo.GetCard(tpl.Id));
-            return GetCategoryMultiplier(cat);
+            double mult = 1.0;
+            if (hasMultipliers)
+            {
+                var cat = effectiveIndex != null && effectiveIndex.TryGetEncounterCategory(tpl.Id, out var c)
+                    ? c
+                    : CardArchetypeIndex.ClassifyEncounter(tpl, _repo.GetCard(tpl.Id));
+                mult = GetCategoryMultiplier(cat);
+            }
+            if (tpl.ModSpawnWeight.HasValue && double.IsFinite(tpl.ModSpawnWeight.Value))
+            {
+                mult *= Math.Max(0.0, tpl.ModSpawnWeight.Value);
+            }
+            return mult;
         }
 
         _run.State = ERunState.Choice;
@@ -566,14 +673,26 @@ public sealed class ShopEngine
 
         var streamRng = ResolveStreamRng(hour == 3 ? DailyChallengeSeedGenerator.StreamMonster : DailyChallengeSeedGenerator.StreamEncounter);
 
-        // V13.2 修复问题 #9：处于 Day 6 坠毁点 / Day 9 神庙遗迹 / Day 10 微观世界探险替换集（ReplacementSet）中时，
-        // Hour 2–5 严格沿用该探险的官方专属房间/陷阱怪/宝库/Boss/圣物室/充能室序列，不再提前退回普通事件。
+        // P1-01：处于活跃替换遭遇集（ActiveReplacementSetId / 兼容 ActiveExpeditionId）中时，
+        // Hour 2–5 严格由数据驱动替换集注册表发牌；Hour 6 / Hour 1 或自然结束时清空替换集并复位切板。
         if (hour is >= 2 and <= 5 &&
-            !string.IsNullOrWhiteSpace(_run.ActiveExpeditionId) &&
+            (!string.IsNullOrWhiteSpace(_run.ActiveReplacementSetId) || !string.IsNullOrWhiteSpace(_run.ActiveExpeditionId)) &&
             TryDealActiveExpeditionHourChoices((int)hour, events))
         {
             events.Add(new GameSimEventStateTransitioned(ERunState.Choice, null));
             return events;
+        }
+        else if (hour is 1 or 6 &&
+                 (!string.IsNullOrWhiteSpace(_run.ActiveReplacementSetId) ||
+                  !string.IsNullOrWhiteSpace(_run.ActiveExpeditionId) ||
+                  !string.IsNullOrWhiteSpace(_run.CurrentBoardId)))
+        {
+            _run.ClearActiveReplacementSet();
+            if (!string.IsNullOrWhiteSpace(_run.CurrentBoardId))
+            {
+                _run.CurrentBoardId = null;
+                events.Add(new GameSimEventBoardOverridden(null, null));
+            }
         }
 
         if (hour == 3)
@@ -622,9 +741,14 @@ public sealed class ShopEngine
         else
         {
             var pickedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var queryPlayer = playerState ?? BuildDummyQueryPlayer(hero, effectiveDay);
+            int actualDay = Math.Max(1, day);
+            PlayerState? lazyQueryPlayer = playerState;
+            PlayerState GetQueryPlayer() => lazyQueryPlayer ??= BuildDummyQueryPlayer(hero, actualDay);
             EnsureRunExclusionSetInitialized();
-            ETier maxDayTier = GetMaxEncounterTierForDay(effectiveDay);
+            ETier maxDayTier = GetMaxEncounterTierForDay(actualDay);
+
+            double travelAgentMult = GetCategoryMultiplier(EEncounterWeightCategory.EventExpeditionAgent);
+            bool allowAmplifiedTravelAgent = travelAgentMult > 1.0;
 
             bool IsExcludedInRun(string encId)
             {
@@ -637,9 +761,7 @@ public sealed class ShopEngine
             bool IsEligibleEncounter(CardPool.CardTemplate enc)
             {
                 if (IsExcludedInRun(enc.Id) || IsBanned(enc.Id)) return false;
-                if (effectiveDay <= 1 && string.Equals(enc.Id, CardPool.TravelAgentEncounterId, StringComparison.OrdinalIgnoreCase))
-                    return false;
-                if (!IsWithinOfficialDayWindow(enc, effectiveDay, (int)hour))
+                if (!IsWithinOfficialDayWindow(enc, actualDay, (int)hour, hero, allowAmplifiedTravelAgent))
                     return false;
                 if (IsEffectiveSingleSpawnEncounter(enc) && _run.VisitedSingleSpawnEncounterIds.Contains(enc.Id))
                     return false;
@@ -647,9 +769,13 @@ public sealed class ShopEngine
                     string.Equals(enc.Type, "CombatEncounter", StringComparison.OrdinalIgnoreCase))
                     return false;
                 var core = _repo.GetCard(enc.Id);
-                var checkCtx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, queryPlayer, _rng)
+                // 热路径优化：90%+ 白昼遭遇无 SelectionRequirements 且无 TPrerequisiteRun，无需分配 CardInstance 与 RuleExecutionContext
+                if (!HasEncounterRuntimePrerequisites(enc, core))
+                    return true;
+                var qp = GetQueryPlayer();
+                var checkCtx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, qp, qp, _rng)
                 {
-                    CurrentDay = effectiveDay,
+                    CurrentDay = actualDay,
                     CurrentHour = (int)hour,
                     CurrentEncounterId = enc.Id,
                     PlayMode = _run.PlayMode.ToString(),
@@ -681,23 +807,78 @@ public sealed class ShopEngine
                 allHourlyEvents = rawHourlyEvents
                     .Where(e => !IsExcludedInRun(e.Id) &&
                                 !IsBanned(e.Id) &&
-                                !(effectiveDay <= 1 && string.Equals(e.Id, CardPool.TravelAgentEncounterId, StringComparison.OrdinalIgnoreCase)) &&
+                                IsWithinOfficialDayWindow(e, actualDay, (int)hour, hero, allowAmplifiedTravelAgent) &&
                                 !CardPool.IsExcludedDevOrStoryTemplate(e) &&
                                 !string.Equals(e.Type, "CombatEncounter", StringComparison.OrdinalIgnoreCase))
                     .ToList();
 
-            // 官方 The Travel Agent 从 Day 2 起至 Day 9 可在非商人事件中出现卖门票（Day 1 禁止，Day 2..9 豁免 maxDayTier）
-            double travelAgentMult = GetCategoryMultiplier(EEncounterWeightCategory.EventExpeditionAgent);
-            if (effectiveDay is >= 2 and <= 9 && travelAgentMult > 0.0)
+            var includedEventIds = new HashSet<string>(allHourlyEvents.Count + 64, StringComparer.OrdinalIgnoreCase);
+            foreach (var ev in allHourlyEvents)
+                includedEventIds.Add(ev.Id);
+
+            // P0-16：接入数据驱动的 GuidOnly 白昼遭遇目录（37 套右槽四阶免费物品 + 分天事件 + 独立有效特殊事件 + Deadly Duel/Epic Battle）
+            var guidOnlyBonusChallenges = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (guidCard, guidRole, guidTierExempt) in _pool.GetGuidOnlyHourlyCatalog().ResolveForHeroAndDay(hero, actualDay))
+            {
+                if (includedEventIds.Contains(guidCard.Id))
+                    continue;
+                if (!IsEligibleEncounter(guidCard))
+                    continue;
+                includedEventIds.Add(guidCard.Id);
+                allHourlyEvents.Add(guidCard);
+                if (guidTierExempt)
+                    tierExemptIds.Add(guidCard.Id);
+                if (guidRole == GuidOnlyEncounterRole.BonusCombatChallenge)
+                    guidOnlyBonusChallenges.Add(guidCard.Id);
+            }
+
+            // Patch 20.2：按天接入右槽 3 套高频分天经济卡（Candy Stash / Look for Spare Change / Cache of Riches）
+            foreach (string econId in OfficialEncounterSchedule.GetRightSlotEconomyIdsForDay(actualDay))
+            {
+                if (TryIncludeGuidOnlyEvent(allHourlyEvents, includedEventIds, econId, IsEligibleEncounter))
+                    tierExemptIds.Add(econId);
+            }
+
+            // Patch 20.2：Grand Opening（Days 3–9）接入中槽奇遇池
+            if (actualDay is >= 3 and <= 9)
+            {
+                if (TryIncludeGuidOnlyEvent(allHourlyEvents, includedEventIds, CardPool.GrandOpeningEncounterId, IsEligibleEncounter))
+                    tierExemptIds.Add(CardPool.GrandOpeningEncounterId);
+            }
+
+            // Patch 20.2：Mysterious Portal（实测 Day 6+）与 The Cult（实测 Day 6+）接入中槽奇遇池
+            double cultMysteryMult = GetCategoryMultiplier(EEncounterWeightCategory.EventCultAndMystery);
+            if (actualDay >= 6 && cultMysteryMult > 0.0)
             {
                 TryIncludeGuidOnlyEvent(
                     allHourlyEvents,
-                    CardPool.TravelAgentEncounterId,
+                    includedEventIds,
+                    CardArchetypeIndex.MysteriousPortalEncounterId,
                     IsEligibleEncounter);
-                if (allHourlyEvents.Any(e => e.Id.Equals(CardPool.TravelAgentEncounterId, StringComparison.OrdinalIgnoreCase)))
-                    tierExemptIds.Add(CardPool.TravelAgentEncounterId);
+                if (TryIncludeGuidOnlyEvent(
+                    allHourlyEvents,
+                    includedEventIds,
+                    CardArchetypeIndex.TheCultEncounterId,
+                    IsEligibleEncounter))
+                {
+                    tierExemptIds.Add(CardArchetypeIndex.TheCultEncounterId);
+                }
             }
-            else if (effectiveDay >= 10)
+
+            // Patch 20.2：The Travel Agent（标准模式严格 Days 2–5 并入中槽按实测权重 4.9%/2.6%/2.6%/1.7% 抽取；
+            // 自定义规则显式拉高 EventExpeditionAgent > 1.0 时兼容放宽至 Day 2–9，仍遵守单局唯一与未过期门票过滤）
+            if (travelAgentMult > 0.0 && ((actualDay is >= 2 and <= 5) || (allowAmplifiedTravelAgent && actualDay is >= 2 and <= 9)))
+            {
+                if (TryIncludeGuidOnlyEvent(
+                    allHourlyEvents,
+                    includedEventIds,
+                    CardPool.TravelAgentEncounterId,
+                    IsEligibleEncounter))
+                {
+                    tierExemptIds.Add(CardPool.TravelAgentEncounterId);
+                }
+            }
+            else if (actualDay >= 10)
             {
                 TryIncludeAmplifiedGuidOnlyEvent(
                     allHourlyEvents,
@@ -707,43 +888,90 @@ public sealed class ShopEngine
                     IsEligibleEncounter);
             }
 
-            TryIncludeAmplifiedGuidOnlyEvent(
-                allHourlyEvents,
-                CardArchetypeIndex.TheCultEncounterId,
-                GetCategoryMultiplier(EEncounterWeightCategory.EventCultAndMystery),
-                maxDayTier,
-                IsEligibleEncounter);
+            // 凡已在 OfficialEncounterSchedule 核验且满足官方天数窗的遭遇，自动豁免粗粒度 maxDayTier 拦截
+            // （如 Day 1 的 Wishing Fountain / Finn's Big Bite / Piano、Day 2 的 Farai / Photo Booth、Day 3 的 Apothecary / Library、Day 4 的 Salvage Yard、Day 6 的跨英雄钻商等）
+            foreach (var evItem in allHourlyEvents)
+            {
+                if (OfficialEncounterSchedule.TryGetRule(evItem, out var schedRule) &&
+                    schedRule != null &&
+                    schedRule.ExemptFromMaxDayTier)
+                {
+                    tierExemptIds.Add(evItem.Id);
+                }
+            }
 
-            Func<CardPool.CardTemplate, double>? weightFn = hasMultipliers ? GetEncounterMultiplier : null;
-            var nonZeroEvents = hasMultipliers
+            // P0-15：IsTakeover 单次专属奇遇调度器（Star Chart Treasure + 全 8 英雄专属传奇单次奇遇）
+            CardPool.CardTemplate? preRolledTakeover =
+                TryRollTakeoverEncounter(hero, actualDay, playerState, streamRng, IsEligibleEncounter, GetEncounterMultiplier, dailyVisited);
+
+            bool hasCustomWeights = hasMultipliers || allHourlyEvents.Any(e => e.ModSpawnWeight.HasValue);
+            Func<CardPool.CardTemplate, double>? weightFn = hasCustomWeights ? GetEncounterMultiplier : null;
+            var nonZeroEvents = hasCustomWeights
                 ? allHourlyEvents.Where(e => GetEncounterMultiplier(e) > 0.0).ToList()
                 : allHourlyEvents;
 
-            var merchants = nonZeroEvents.Where(e => IsMerchantEncounter(e)).ToList();
-            var nonMerchants = nonZeroEvents
-                .Where(e => !IsMerchantEncounter(e) && HasPlayableEncounterPayload(e))
-                .ToList();
+            // Patch 20.2 官方三槽分池（21.3 万局实测总账验证：左槽 ~400% 商人 / 中槽 ~400% 奇遇+地图基座 / 右槽 ~400% 四阶免费物品+保底恢复经济）
+            var leftMerchants = new List<CardPool.CardTemplate>(48);
+            var middleEvents = new List<CardPool.CardTemplate>(64);
+            var rightEvents = new List<CardPool.CardTemplate>(64);
+            var nonMerchants = new List<CardPool.CardTemplate>(128);
+
+            foreach (var e in nonZeroEvents)
+            {
+                bool isMerch = IsMerchantEncounter(e);
+                var slot = OfficialEncounterSchedule.ClassifySlot(e, isMerch);
+                if (slot == EOfficialEncounterSlot.LeftMerchant)
+                {
+                    leftMerchants.Add(e);
+                }
+                else if (!HasPlayableEncounterPayload(e))
+                {
+                    continue;
+                }
+                else
+                {
+                    if (!isMerch)
+                        nonMerchants.Add(e);
+
+                    if (slot is EOfficialEncounterSlot.RightFreeItem or EOfficialEncounterSlot.RightUtility)
+                    {
+                        // 额外野怪挑战（Deadly Duel / Epic Battle）归中槽，绝不落入右槽免费池
+                        if (guidOnlyBonusChallenges.Contains(e.Id))
+                            middleEvents.Add(e);
+                        else
+                            rightEvents.Add(e);
+                    }
+                    else
+                    {
+                        middleEvents.Add(e);
+                    }
+                }
+            }
+
             var activeEventPool = nonZeroEvents.Count > 0 ? nonZeroEvents : allHourlyEvents;
             var activeWeightFn = nonZeroEvents.Count > 0 ? weightFn : null;
 
-            // 槽位 0（左槽）：固定 1 家商人（对齐官方左槽商人 + 独立商人天数阶梯门控 + 同日/同名去重）
-            ETier maxMerchantDayTier = GetMaxMerchantTierForDay(effectiveDay);
+            // ── 槽位 0（左槽 / Left Slot）：固定 1 名商人（Patch 20.2 天数窗 + 同日不重复 + BazaarDB 实测 Hazard 加权）──
+            ETier maxMerchantDayTier = GetMaxMerchantTierForDay(actualDay);
             CardPool.CardTemplate? m1 = null;
-            if (merchants.Count > 0)
+            if (leftMerchants.Count > 0)
             {
-                m1 = RollDayTieredEncounterWithDailyDedup(merchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, effectiveDay, isMerchantPool: true)
-                  ?? RollDayTieredEncounterWithDailyDedup(merchants, maxMerchantDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, effectiveDay, isMerchantPool: true);
+                m1 = RollEmpiricalSlotEncounterWithDailyDedup(leftMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
+                  ?? RollEmpiricalSlotEncounterWithDailyDedup(leftMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
+                  ?? RollEmpiricalSlotEncounterWithDailyDedup(leftMerchants, maxMerchantDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng);
             }
             else if (!hasMultipliers)
             {
                 var allMerchants = allHourlyEvents.Where(e => IsMerchantEncounter(e)).ToList();
-                m1 = RollDayTieredEncounterWithDailyDedup(allMerchants, maxMerchantDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, effectiveDay, isMerchantPool: true);
+                m1 = RollEmpiricalSlotEncounterWithDailyDedup(allMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
+                  ?? RollEmpiricalSlotEncounterWithDailyDedup(allMerchants, maxMerchantDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng);
             }
 
             if (m1 == null)
             {
-                m1 = RollDayTieredEncounterWithDailyDedup(nonMerchants, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, effectiveDay)
-                  ?? RollDayTieredEncounterWithDailyDedup(activeEventPool, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, activeWeightFn, bannedIds, tierExemptIds, effectiveDay);
+                m1 = RollEmpiricalSlotEncounterWithDailyDedup(middleEvents, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                  ?? RollEmpiricalSlotEncounterWithDailyDedup(activeEventPool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, activeWeightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                  ?? RollEmpiricalSlotEncounterWithDailyDedup(activeEventPool, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, activeWeightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng);
             }
             if (m1 != null)
             {
@@ -753,176 +981,164 @@ public sealed class ShopEngine
                 events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), ECardType.EventEncounter));
             }
 
-            // 槽位 1（中槽）：对齐官方规律——支持双商人布局（Day 1 Hour 1 约 40%、其余常规小时约 30% 刷第 2 家不同商人），
-            // 或投放交互奇遇事件（动态解锁的 ExclusionSet 事件优先；EventCarnival/放大事件倍率时让位给奇遇）
-            var nonMerchantAll = allHourlyEvents.Where(e => !IsMerchantEncounter(e) && HasPlayableEncounterPayload(e)).ToList();
-            var nonMerchantFallbackPool = nonMerchantAll.Count > 0 ? nonMerchantAll : allHourlyEvents.Where(e => !IsMerchantEncounter(e)).ToList();
-            var effectiveNonMerchantPool = nonMerchants.Count > 0 ? nonMerchants : nonMerchantFallbackPool;
+            // ── 槽位 1（中槽 / Middle Slot）：动态解锁链 -> Takeover 奇遇 -> 官方常规地图基座（占用中槽配额）-> 中槽奇遇池（实测 Hazard 加权）──
+            List<CardPool.CardTemplate>? lazyNonMerchantFallback = null;
+            List<CardPool.CardTemplate> GetNonMerchantFallbackPool()
+            {
+                if (lazyNonMerchantFallback != null)
+                    return lazyNonMerchantFallback;
+                if (!hasCustomWeights && nonMerchants.Count > 0)
+                    return lazyNonMerchantFallback = nonMerchants;
+                var nonMerchantAll = allHourlyEvents.Where(e => !IsMerchantEncounter(e) && HasPlayableEncounterPayload(e)).ToList();
+                return lazyNonMerchantFallback = nonMerchantAll.Count > 0
+                    ? nonMerchantAll
+                    : allHourlyEvents.Where(e => !IsMerchantEncounter(e)).ToList();
+            }
+
+            List<CardPool.CardTemplate> effectiveMiddlePool = middleEvents.Count > 0
+                ? middleEvents
+                : (nonMerchants.Count > 0 ? nonMerchants : GetNonMerchantFallbackPool());
+
             var prioritizedUnlocked = nonMerchants
                 .Where(e => unlockedExclusionIds.Contains(e.Id) &&
                             !_run.VisitedSingleSpawnEncounterIds.Contains(e.Id) &&
                             (dailyVisited == null || !dailyVisited.Contains(e.Id)))
                 .ToList();
 
-            CardPool.CardTemplate? ev2 = prioritizedUnlocked.Count > 0
-                ? RollDayTieredEncounterWithDailyDedup(prioritizedUnlocked, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, effectiveDay)
+            CardPool.CardTemplate? midPick = prioritizedUnlocked.Count > 0
+                ? RollEmpiricalSlotEncounterWithDailyDedup(prioritizedUnlocked, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
                 : null;
+            ECardType midPickType = ECardType.EventEncounter;
 
-            if (ev2 == null && m1 != null && IsMerchantEncounter(m1) && merchants.Count > 1)
+            if (midPick == null && preRolledTakeover != null && !pickedIds.Contains(preRolledTakeover.Id))
             {
-                double doubleMerchantChance = (effectiveDay == 1 && hour == 1) ? 0.40 : 0.30;
-                if (effectiveRules?.HasMutator(MutatorCatalog.EventCarnival) == true)
-                    doubleMerchantChance *= 0.45;
-                if (streamRng.NextDouble() < doubleMerchantChance)
-                {
-                    // 第 2 家商人严格遵循同日去重与商人当日上限（不突破 maxMerchantDayTier 且不与左槽重复）
-                    ev2 = RollDayTieredEncounterWithDailyDedup(
-                        merchants,
-                        maxMerchantDayTier,
-                        pickedIds,
-                        _run.VisitedSingleSpawnEncounterIds,
-                        dailyVisited,
-                        allowExceedDayCap: false,
-                        allowDailyFallback: false,
-                        weightFn,
-                        bannedIds,
-                        tierExemptIds,
-                        effectiveDay,
-                        isMerchantPool: true);
-                }
+                pickedIds.Add(preRolledTakeover.Id);
+                midPick = preRolledTakeover;
             }
 
-            ev2 ??= RollDayTieredEncounterWithDailyDedup(effectiveNonMerchantPool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, effectiveDay)
-                 ?? RollDayTieredEncounterWithDailyDedup(effectiveNonMerchantPool, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, effectiveDay)
-                 ?? RollDayTieredEncounterWithDailyDedup(nonMerchantFallbackPool, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, effectiveDay);
-            if (ev2 == null && nonMerchantFallbackPool.Count == 0)
-            {
-                ev2 = RollDayTieredEncounterWithDailyDedup(activeEventPool, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, effectiveDay);
-            }
-            if (ev2 != null)
-            {
-                var entry = CreateEncounterCandidate(ev2, ECardType.EventEncounter, "enc");
-                _run.Cards[entry.InstanceId] = entry;
-                _run.SelectionSet.Add(entry.InstanceId);
-                events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), ECardType.EventEncounter));
-            }
-
-            // 槽位 2（右槽）：合规天数窗地图基座（Day 3 起低概率 ≤18%：B1&B2 D3-5 / Sterling D3+ / Forja D4-10 / The Artist D6+，
-            // 彻底踢除 12 座 Lv10/Fates 定向附魔祭坛与 8 座 Partner Portal - Forja）或纯免费资源 / 经济补给类事件。
+            // 常规地图基座（B1&B2 Day 3/5、Sterling Day 6–8、Forja Day 9+、The Artist Day 8+）归属中槽配额（21.3 万局实测铁证）
             bool guaranteedPedestalHour =
                 hour == 2 &&
                 (effectiveRules?.SpecialModeId == ESpecialModeId.BossRush ||
                  (effectiveRules?.SpecialModeId == ESpecialModeId.EndlessTower &&
                   EndlessTowerScaler.Compute((int)day).IsMilestoneDay));
-            double pedestalChance = guaranteedPedestalHour
-                ? 1.0
-                : effectiveDay switch
-                {
-                    <= 2 => 0.0,
-                    <= 5 => 0.14,
-                    _ => 0.18,
-                };
-            var rawPedestals = pedestalChance > 0 ? _pool.HourlyEncounters(hero, "PedestalEncounter") : new List<CardPool.CardTemplate>();
-            var allPedestals = rawPedestals.Where(IsEligibleEncounter).ToList();
-            if (pedestalChance > 0)
+            bool skipRegularPedestalForAmplifiedAgent = !guaranteedPedestalHour && allowAmplifiedTravelAgent && travelAgentMult >= 4.0;
+
+            if (midPick == null && (guaranteedPedestalHour || (actualDay >= 3 && !skipRegularPedestalForAmplifiedAgent)) && _run.SelectionSet.Count < targetChoiceCount)
             {
-                // Forja 官方在 Day 4-10、The Artist 在 Day 6+ 即可合法刷新（虽然 DB StartingTier=Diamond），豁免 maxDayTier 限制
-                if (effectiveDay is >= 4 and <= 10)
-                    tierExemptIds.Add(CardPool.PedestalForjaId);
-                if (effectiveDay >= 6)
-                    tierExemptIds.Add(CardPool.PedestalTheArtistId);
+                var rawPedestals = _pool.HourlyEncounters(hero, "PedestalEncounter");
+                var eligiblePedestals = guaranteedPedestalHour
+                    ? rawPedestals.Where(p => !IsExcludedInRun(p.Id) && !IsBanned(p.Id) && !CardPool.IsExcludedDevOrStoryTemplate(p)).ToList()
+                    : rawPedestals.Where(IsEligibleEncounter).ToList();
+
+                // 官方地图基座（Forja Day 9+ / The Artist Day 8+ / B1&B2 / Sterling）豁免 maxDayTier
+                foreach (var p in eligiblePedestals)
+                {
+                    if (OfficialEncounterSchedule.TryGetRule(p, out var pr) && pr != null && pr.ExemptFromMaxDayTier)
+                        tierExemptIds.Add(p.Id);
+                }
 
                 TryIncludeDynamicallyUnlockedExclusionEvents(
-                    allPedestals,
+                    eligiblePedestals,
                     "PedestalEncounter",
                     hero,
                     IsExcludedInRun,
                     IsEligibleEncounter,
                     tierExemptIds);
-            }
-            var nonZeroPedestals = hasMultipliers
-                ? allPedestals.Where(p => GetEncounterMultiplier(p) > 0.0).ToList()
-                : allPedestals;
 
-            if (pedestalChance > 0 && nonZeroPedestals.Count > 0)
-            {
-                double effectivePedChance = pedestalChance;
-                if (hasMultipliers && !guaranteedPedestalHour)
-                {
-                    double avgPedMult = nonZeroPedestals.Average(GetEncounterMultiplier);
-                    effectivePedChance = Math.Clamp(pedestalChance * avgPedMult, 0.0, 0.80);
-                }
+                var nonZeroPedestals = hasMultipliers
+                    ? eligiblePedestals.Where(p => GetEncounterMultiplier(p) > 0.0).ToList()
+                    : eligiblePedestals;
 
-                if (guaranteedPedestalHour || streamRng.NextDouble() < effectivePedChance)
+                // 仅基于当日尚未访问的剩余合法基座动态计算本小时触发率（杜绝 Day 8 抽走 Sterling 后剩余小时高概率强刷 The Artist）
+                var unvisitedPedestals = guaranteedPedestalHour
+                    ? nonZeroPedestals
+                    : nonZeroPedestals.Where(p => !pickedIds.Contains(p.Id) && (dailyVisited == null || !dailyVisited.Contains(p.Id))).ToList();
+
+                if (unvisitedPedestals.Count > 0)
                 {
-                    var ped = RollDayTieredEncounterWithDailyDedup(
-                        nonZeroPedestals,
-                        maxDayTier,
-                        pickedIds,
-                        _run.VisitedSingleSpawnEncounterIds,
-                        dailyVisited,
-                        allowExceedDayCap: guaranteedPedestalHour,
-                        allowDailyFallback: guaranteedPedestalHour,
-                        weightFn,
-                        bannedIds,
-                        tierExemptIds,
-                        effectiveDay);
-                    if (ped != null)
+                    double basePedestalChance = guaranteedPedestalHour
+                        ? 1.0
+                        : OfficialEncounterSchedule.ComputeDynamicMiddlePedestalHourChance(unvisitedPedestals, actualDay);
+                    double effectivePedChance = basePedestalChance;
+                    if (hasMultipliers && !guaranteedPedestalHour)
                     {
-                        var entry = CreateEncounterCandidate(ped, ECardType.PedestalEncounter, "ped");
-                        _run.Cards[entry.InstanceId] = entry;
-                        _run.SelectionSet.Add(entry.InstanceId);
-                        events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), ECardType.PedestalEncounter));
+                        double avgPedMult = unvisitedPedestals.Average(GetEncounterMultiplier);
+                        effectivePedChance = Math.Clamp(basePedestalChance * avgPedMult, 0.0, 0.80);
                     }
-                }
-            }
 
-            // 右槽未刷出基座时：优先投放免费资源 / 经济成长 / 物品改造事件（对齐官方右槽 Free Option / Utility 定位）
-            if (_run.SelectionSet.Count < 3)
-            {
-                var rightUtilityPool = BuildRightSlotUtilityPool(effectiveNonMerchantPool, effectiveIndex);
-                if (rightUtilityPool.Count > 0 && streamRng.NextDouble() < 0.65)
-                {
-                    var utilEv = RollDayTieredEncounterWithDailyDedup(rightUtilityPool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, effectiveDay);
-                    if (utilEv != null)
+                    if (effectivePedChance > 0.0 && (guaranteedPedestalHour || streamRng.NextDouble() < effectivePedChance))
                     {
-                        var entry = CreateEncounterCandidate(utilEv, ECardType.EventEncounter, "enc");
-                        _run.Cards[entry.InstanceId] = entry;
-                        _run.SelectionSet.Add(entry.InstanceId);
-                        events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), ECardType.EventEncounter));
-                    }
-                }
-            }
-
-            if (_run.SelectionSet.Count < 3)
-            {
-                // 弹性 Flex 优先池：英雄专属非商人事件 + 中后期罕见高阶非商人事件
-                var flexPool = BuildFlexNonMerchantPool(effectiveNonMerchantPool, hero, effectiveDay, (int)hour, maxDayTier);
-                if (flexPool.Count > 0)
-                {
-                    double flexChance = effectiveDay >= 4 ? 0.45 : (effectiveDay >= 2 ? 0.30 : 0.25);
-                    if (streamRng.NextDouble() < flexChance)
-                    {
-                        var flexEv = RollDayTieredEncounterWithDailyDedup(flexPool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, effectiveDay);
-                        if (flexEv != null)
+                        var ped = RollEmpiricalSlotEncounterWithDailyDedup(
+                            unvisitedPedestals,
+                            maxDayTier,
+                            pickedIds,
+                            _run.VisitedSingleSpawnEncounterIds,
+                            dailyVisited,
+                            allowExceedDayCap: true,
+                            allowDailyFallback: guaranteedPedestalHour,
+                            weightFn,
+                            bannedIds,
+                            tierExemptIds,
+                            actualDay,
+                            isMerchantPool: false,
+                            streamRng);
+                        if (ped != null)
                         {
-                            var entry = CreateEncounterCandidate(flexEv, ECardType.EventEncounter, "enc");
-                            _run.Cards[entry.InstanceId] = entry;
-                            _run.SelectionSet.Add(entry.InstanceId);
-                            events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), ECardType.EventEncounter));
+                            midPick = ped;
+                            midPickType = ECardType.PedestalEncounter;
                         }
                     }
                 }
             }
 
-            while (_run.SelectionSet.Count < 3)
+            if (midPick == null)
             {
-                var ev = RollDayTieredEncounterWithDailyDedup(effectiveNonMerchantPool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, effectiveDay)
-                      ?? RollDayTieredEncounterWithDailyDedup(effectiveNonMerchantPool, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, effectiveDay)
-                      ?? RollDayTieredEncounterWithDailyDedup(nonMerchantFallbackPool, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, effectiveDay);
-                if (ev == null && nonMerchantFallbackPool.Count == 0)
+                // P2-28：回退链优先放宽 allowDailyFallback 与 allowExceedDayCap，严格保留 visitedSingleSpawn，仅整池为空时再放宽
+                midPick = RollEmpiricalSlotEncounterWithDailyDedup(effectiveMiddlePool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                       ?? RollEmpiricalSlotEncounterWithDailyDedup(effectiveMiddlePool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                       ?? RollEmpiricalSlotEncounterWithDailyDedup(GetNonMerchantFallbackPool(), maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                       ?? RollEmpiricalSlotEncounterWithDailyDedup(GetNonMerchantFallbackPool(), maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng);
+            }
+            if (midPick == null && GetNonMerchantFallbackPool().Count == 0)
+            {
+                midPick = RollEmpiricalSlotEncounterWithDailyDedup(activeEventPool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                       ?? RollEmpiricalSlotEncounterWithDailyDedup(activeEventPool, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng);
+            }
+            if (midPick != null && _run.SelectionSet.Count < targetChoiceCount)
+            {
+                string prefix = midPickType == ECardType.PedestalEncounter ? "ped" : "enc";
+                var entry = CreateEncounterCandidate(midPick, midPickType, prefix);
+                _run.Cards[entry.InstanceId] = entry;
+                _run.SelectionSet.Add(entry.InstanceId);
+                events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), midPickType));
+            }
+
+            // ── 槽位 2（右槽 / Right Slot）：37 组四阶免费物品遭遇（Right Side Options）+ 10 组保底恢复/经济成长选项 ──
+            if (_run.SelectionSet.Count < targetChoiceCount && rightEvents.Count > 0)
+            {
+                var rightEv = RollEmpiricalSlotEncounterWithDailyDedup(rightEvents, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                           ?? RollEmpiricalSlotEncounterWithDailyDedup(rightEvents, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng);
+                if (rightEv != null)
                 {
-                    ev = RollDayTieredEncounterWithDailyDedup(allHourlyEvents, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, effectiveDay);
+                    var entry = CreateEncounterCandidate(rightEv, ECardType.EventEncounter, "enc");
+                    _run.Cards[entry.InstanceId] = entry;
+                    _run.SelectionSet.Add(entry.InstanceId);
+                    events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), ECardType.EventEncounter));
+                }
+            }
+
+            // 兜底补齐至 targetChoiceCount（例如玩家自定义规则把右槽所有类别倍率设为 0，或启用了 >3 槽特殊规则）
+            while (_run.SelectionSet.Count < targetChoiceCount)
+            {
+                var ev = RollEmpiricalSlotEncounterWithDailyDedup(effectiveMiddlePool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                      ?? RollEmpiricalSlotEncounterWithDailyDedup(effectiveMiddlePool, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                      ?? RollEmpiricalSlotEncounterWithDailyDedup(GetNonMerchantFallbackPool(), maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                      ?? RollEmpiricalSlotEncounterWithDailyDedup(GetNonMerchantFallbackPool(), maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng);
+                if (ev == null && GetNonMerchantFallbackPool().Count == 0)
+                {
+                    ev = RollEmpiricalSlotEncounterWithDailyDedup(allHourlyEvents, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                      ?? RollEmpiricalSlotEncounterWithDailyDedup(allHourlyEvents, maxDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng);
                 }
                 if (ev == null) break;
                 var entry = CreateEncounterCandidate(ev, ECardType.EventEncounter, "enc");
@@ -959,120 +1175,180 @@ public sealed class ShopEngine
         return events;
     }
 
+    /// <summary>P1-01：数据驱动替换遭遇集（Replacement Set）单小时条目定义。</summary>
+    public sealed record ReplacementSetEntry(string TemplateId, ECardType ExpectedType);
+
+    /// <summary>P1-01：数据驱动替换遭遇集（Replacement Set）定义（统一收敛官方 NewSetIdOnExit 5 个 GUID 与 Mod 扩展）。</summary>
+    public sealed record ReplacementSetDefinition(
+        string SetId,
+        string? ExpeditionRoomId,
+        string? Variant,
+        IReadOnlyDictionary<int, IReadOnlyList<ReplacementSetEntry>> Hours);
+
+    private static readonly Dictionary<string, ReplacementSetDefinition> ReplacementSetRegistry =
+        CreateDefaultReplacementSetRegistry();
+
+    private static Dictionary<string, ReplacementSetDefinition> CreateDefaultReplacementSetRegistry()
+    {
+        static IReadOnlyList<ReplacementSetEntry> List(params (string Id, ECardType Type)[] items)
+            => items.Select(x => new ReplacementSetEntry(x.Id, x.Type)).ToArray();
+
+        var reg = new Dictionary<string, ReplacementSetDefinition>(StringComparer.OrdinalIgnoreCase);
+
+        // 1. Day 6 Crash Site Expedition (NewSetIdOnExit = bc2ca2fe)
+        //    P1-24：严格官方线性顺序：H2 Crystal Growth Chamber -> H3 3 Boss -> H4 Command Nexus -> H5 Cargo Hold
+        reg[CardPool.ReplacementSetCrashSiteId] = new ReplacementSetDefinition(
+            CardPool.ReplacementSetCrashSiteId,
+            CardPool.CrashSiteExpeditionRoomId,
+            Variant: null,
+            Hours: new Dictionary<int, IReadOnlyList<ReplacementSetEntry>>
+            {
+                [2] = List(("2950afee-ce0e-40c1-becb-735570e560c5", ECardType.EventEncounter)), // Crystal Growth Chamber
+                [3] = List(
+                    ("10504dc3-99cf-46be-b8ac-ea0be24c7b0b", ECardType.CombatEncounter), // Augmented Hellbilly
+                    ("7718437a-cc2e-44d0-b3f1-4a370ea84fdc", ECardType.CombatEncounter), // Conspiracy Theorist
+                    ("4ef60802-3b84-482a-8ba5-640534a94c64", ECardType.CombatEncounter)), // The Vessel
+                [4] = List(("54a0e045-36fe-4de4-92fb-9254fa73c48f", ECardType.EventEncounter)), // Command Nexus
+                [5] = List(("07139793-c844-4fbb-ad90-9f279843cdc8", ECardType.EventEncounter)), // Cargo Hold
+            });
+
+        // 2. Day 9 Jungle Temple Expedition — Fiery Door (NewSetIdOnExit = ffc6b072)
+        var templeBosses = List(
+            ("d1dc075f-f5d4-4bb7-9655-55591e123941", ECardType.CombatEncounter), // Greenheart Guardian
+            ("4ce6d441-4aed-455b-b83f-0b057b462515", ECardType.CombatEncounter), // Mythkeeper
+            ("a5103989-fb08-4ac6-a5e8-6a610e0b1d46", ECardType.CombatEncounter)); // Qomatz
+        var templeReliquary = List(("5852a0ba-c097-419b-98b7-dadd8bd7ae6e", ECardType.EventEncounter));
+
+        reg[CardPool.ReplacementSetJungleFieryId] = new ReplacementSetDefinition(
+            CardPool.ReplacementSetJungleFieryId,
+            CardPool.JungleExpeditionRoomId,
+            Variant: "Fiery",
+            Hours: new Dictionary<int, IReadOnlyList<ReplacementSetEntry>>
+            {
+                [2] = List(
+                    ("14854ca0-bd1f-4f63-951b-97c1afb3af3b", ECardType.CombatEncounter), // Blowguns Monster (Fiery)
+                    ("16a97acb-0b8c-4d04-b30a-c861a52a82e2", ECardType.CombatEncounter), // Caltrops Monster (Fiery)
+                    ("3b0b8b93-75bd-4a2d-8001-1cb8171e71bb", ECardType.CombatEncounter)), // Boulder Monster (Fiery)
+                [3] = List(("a1d43a69-6798-41a2-b356-211a726eee9d", ECardType.EventEncounter)), // Temple Vault (Fiery)
+                [4] = templeBosses,
+                [5] = templeReliquary,
+            });
+
+        // 3. Day 9 Jungle Temple Expedition — Toxic Door (NewSetIdOnExit = fc9adb79)
+        reg[CardPool.ReplacementSetJungleToxicId] = new ReplacementSetDefinition(
+            CardPool.ReplacementSetJungleToxicId,
+            CardPool.JungleExpeditionRoomId,
+            Variant: "Toxic",
+            Hours: new Dictionary<int, IReadOnlyList<ReplacementSetEntry>>
+            {
+                [2] = List(
+                    ("7570c77c-7d47-4ab2-ab33-a140bcdf4b70", ECardType.CombatEncounter), // Blowguns Monster (Toxic)
+                    ("e915e6f0-93c1-46cc-a546-3867f192bb17", ECardType.CombatEncounter), // Caltrops Monster (Toxic)
+                    ("374416cd-89ed-451d-a131-e3839400432e", ECardType.CombatEncounter)), // Boulder Monster (Toxic)
+                [3] = List(("810acb8e-e60a-4a84-b773-431d4d10a071", ECardType.EventEncounter)), // Temple Vault (Toxic)
+                [4] = templeBosses,
+                [5] = templeReliquary,
+            });
+
+        // 4. Day 9 Jungle Temple Expedition — Obsidian Door (NewSetIdOnExit = 3e44be75)
+        reg[CardPool.ReplacementSetJungleObsidianId] = new ReplacementSetDefinition(
+            CardPool.ReplacementSetJungleObsidianId,
+            CardPool.JungleExpeditionRoomId,
+            Variant: "Obsidian",
+            Hours: new Dictionary<int, IReadOnlyList<ReplacementSetEntry>>
+            {
+                [2] = List(
+                    ("9283b658-2d0b-4c0a-8e62-b185a8ac6ad0", ECardType.CombatEncounter), // Blowguns Monster (Obsidian)
+                    ("967508d9-5c1b-4084-a445-23e53a3839bc", ECardType.CombatEncounter), // Caltrops Monster (Obsidian)
+                    ("b654d08b-cd50-44af-b92c-ebf189d81547", ECardType.CombatEncounter)), // Boulder Monster (Obsidian)
+                [3] = List(("7a6ce8eb-3098-403f-96d4-faa47048272b", ECardType.EventEncounter)), // Temple Vault (Obsidian)
+                [4] = templeBosses,
+                [5] = templeReliquary,
+            });
+
+        // 5. Day 10 Tiny World Expedition (NewSetIdOnExit = e40c7e1f)
+        //    P1-23：H2 Where am I?（内含 Barnacle Bigwig 与条件绕过）-> H3 聚焦投放 Bananniboss（不再重复并列 Barnacle Bigwig）-> H4 Ethergy Nexus
+        reg[CardPool.ReplacementSetTinyWorldId] = new ReplacementSetDefinition(
+            CardPool.ReplacementSetTinyWorldId,
+            CardPool.TinyWorldExpeditionRoomId,
+            Variant: null,
+            Hours: new Dictionary<int, IReadOnlyList<ReplacementSetEntry>>
+            {
+                [2] = List(("875caea4-93c5-440b-a9fd-2886eeaa0fc5", ECardType.EventEncounter)), // Where am I?
+                [3] = List(("1a3f7d6a-3f24-42dc-ba27-9d4bf199d0b8", ECardType.CombatEncounter)), // Bananniboss
+                [4] = List(("f418a73c-d442-4ee1-aa7f-ec43f0418d9f", ECardType.EventEncounter)), // Ethergy Nexus
+            });
+
+        return reg;
+    }
+
+    public static bool TryGetReplacementSet(string? setId, out ReplacementSetDefinition? definition)
+    {
+        if (!string.IsNullOrWhiteSpace(setId) && ReplacementSetRegistry.TryGetValue(setId, out var def))
+        {
+            definition = def;
+            return true;
+        }
+        definition = null;
+        return false;
+    }
+
+    /// <summary>供 Mod/扩展注册自定义 NewSetIdOnExit 替换遭遇集。</summary>
+    public static void RegisterReplacementSet(ReplacementSetDefinition definition)
+    {
+        if (definition != null && !string.IsNullOrWhiteSpace(definition.SetId))
+            ReplacementSetRegistry[definition.SetId] = definition;
+    }
+
+    /// <summary>向后兼容：由旧存档 ActiveExpeditionId + ActiveExpeditionVariant 推导对应的官方 ReplacementSetId。</summary>
+    public static string? TryResolveReplacementSetIdForExpedition(string? expeditionRoomId, string? variant)
+    {
+        if (string.IsNullOrWhiteSpace(expeditionRoomId)) return null;
+        if (expeditionRoomId.Equals(CardPool.CrashSiteExpeditionRoomId, StringComparison.OrdinalIgnoreCase))
+            return CardPool.ReplacementSetCrashSiteId;
+        if (expeditionRoomId.Equals(CardPool.TinyWorldExpeditionRoomId, StringComparison.OrdinalIgnoreCase))
+            return CardPool.ReplacementSetTinyWorldId;
+        if (expeditionRoomId.Equals(CardPool.JungleExpeditionRoomId, StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.Equals(variant, "Toxic", StringComparison.OrdinalIgnoreCase))
+                return CardPool.ReplacementSetJungleToxicId;
+            if (string.Equals(variant, "Obsidian", StringComparison.OrdinalIgnoreCase))
+                return CardPool.ReplacementSetJungleObsidianId;
+            return CardPool.ReplacementSetJungleFieryId;
+        }
+        return null;
+    }
+
     /// <summary>
-    /// V13.2 三套官方探险多小时 ReplacementSet 发牌状态机（全部 GUID 与结构经 GameData.db + Mobalytics / BazaarDB 核验）：
-    ///   · Day 9  Temple Expedition (`91287d25`)：H1 选门(Fiery/Toxic/Obsidian) -> H2 对应元素 3 陷阱怪 -> H3 对应元素 Temple Vault -> H4 绿心 3 Boss -> H5 Temple Reliquary；
-    ///   · Day 6  Crash Site Expedition (`ead0a1ed`)：H1 5 选 3 舱室 -> H2 特殊舱室(Cargo Hold/Crystal Growth/Command Nexus) -> H3 3 坠毁点 Boss -> H4-5 剩余未访特殊舱室；
-    ///   · Day 10 Tiny World Expedition (`42db3205`)：H1 缩小拿 Depleted Device -> H2 Where am I? -> H3 Bananniboss / Barnacle Bigwig -> H4 Ethergy Nexus 充能 -> H5 自然退出回归常态。
-    /// 若某小时无剩余可用探险房或资源校验失败，自动清空 ActiveExpeditionId 并返回 false 无缝回落常规发牌，绝不空桌。
+    /// P1-01 / P1-23 / P1-24：统一基于数据驱动 ReplacementSetRegistry（优先 ActiveReplacementSetId，兼顾旧快照 ActiveExpeditionId）
+    /// 调度多小时探险/替换遭遇集；自然结束或无可用房时清空替换集并按需发射 GameSimEventBoardOverridden(null, null) 复位切板。
     /// </summary>
     private bool TryDealActiveExpeditionHourChoices(int hour, List<IGameSimEvent> events)
     {
-        string? expId = _run.ActiveExpeditionId;
-        if (string.IsNullOrWhiteSpace(expId)) return false;
+        string? setId = _run.ActiveReplacementSetId;
+        if (string.IsNullOrWhiteSpace(setId))
+            setId = TryResolveReplacementSetIdForExpedition(_run.ActiveExpeditionId, _run.ActiveExpeditionVariant);
+        if (string.IsNullOrWhiteSpace(setId)) return false;
 
-        List<(string Id, ECardType ExpectedType)> candidates = new();
+        if (!TryGetReplacementSet(setId, out var repSet) || repSet == null)
+        {
+            ExitReplacementSetAndResetBoardIfNeeded(events);
+            return false;
+        }
 
-        if (expId.Equals(CardPool.JungleExpeditionRoomId, StringComparison.OrdinalIgnoreCase))
+        if (!repSet.Hours.TryGetValue(hour, out var entries) || entries == null || entries.Count == 0)
         {
-            string variant = _run.ActiveExpeditionVariant ?? "Fiery";
-            switch (hour)
-            {
-                case 2:
-                    // Hour 2: 对应元素门的 3 个陷阱房怪物（Blowguns / Caltrops / Boulder）
-                    if (variant.Equals("Toxic", StringComparison.OrdinalIgnoreCase))
-                    {
-                        candidates.Add(("7570c77c-7d47-4ab2-ab33-a140bcdf4b70", ECardType.CombatEncounter)); // Blowguns Monster (Toxic)
-                        candidates.Add(("e915e6f0-93c1-46cc-a546-3867f192bb17", ECardType.CombatEncounter)); // Caltrops Monster (Toxic)
-                        candidates.Add(("374416cd-89ed-451d-a131-e3839400432e", ECardType.CombatEncounter)); // Boulder Monster (Toxic)
-                    }
-                    else if (variant.Equals("Obsidian", StringComparison.OrdinalIgnoreCase))
-                    {
-                        candidates.Add(("9283b658-2d0b-4c0a-8e62-b185a8ac6ad0", ECardType.CombatEncounter)); // Blowguns Monster (Obsidian)
-                        candidates.Add(("967508d9-5c1b-4084-a445-23e53a3839bc", ECardType.CombatEncounter)); // Caltrops Monster (Obsidian)
-                        candidates.Add(("b654d08b-cd50-44af-b92c-ebf189d81547", ECardType.CombatEncounter)); // Boulder Monster (Obsidian)
-                    }
-                    else
-                    {
-                        candidates.Add(("14854ca0-bd1f-4f63-951b-97c1afb3af3b", ECardType.CombatEncounter)); // Blowguns Monster (Fiery)
-                        candidates.Add(("16a97acb-0b8c-4d04-b30a-c861a52a82e2", ECardType.CombatEncounter)); // Caltrops Monster (Fiery)
-                        candidates.Add(("3b0b8b93-75bd-4a2d-8001-1cb8171e71bb", ECardType.CombatEncounter)); // Boulder Monster (Fiery)
-                    }
-                    break;
-                case 3:
-                    // Hour 3: 对应元素神庙宝库（Temple Vault）
-                    string vaultId = variant.Equals("Toxic", StringComparison.OrdinalIgnoreCase)
-                        ? "810acb8e-e60a-4a84-b773-431d4d10a071"
-                        : variant.Equals("Obsidian", StringComparison.OrdinalIgnoreCase)
-                            ? "7a6ce8eb-3098-403f-96d4-faa47048272b"
-                            : "a1d43a69-6798-41a2-b356-211a726eee9d";
-                    candidates.Add((vaultId, ECardType.EventEncounter));
-                    break;
-                case 4:
-                    // Hour 4: 绿心神庙 3 位 Boss（Greenheart Guardian / Mythkeeper / Qomatz）
-                    candidates.Add(("d1dc075f-f5d4-4bb7-9655-55591e123941", ECardType.CombatEncounter));
-                    candidates.Add(("4ce6d441-4aed-455b-b83f-0b057b462515", ECardType.CombatEncounter));
-                    candidates.Add(("a5103989-fb08-4ac6-a5e8-6a610e0b1d46", ECardType.CombatEncounter));
-                    break;
-                case 5:
-                    // Hour 5: 神庙圣物室（Temple Reliquary — 传奇圣物抉择）
-                    candidates.Add(("5852a0ba-c097-419b-98b7-dadd8bd7ae6e", ECardType.EventEncounter));
-                    break;
-            }
-        }
-        else if (expId.Equals(CardPool.CrashSiteExpeditionRoomId, StringComparison.OrdinalIgnoreCase))
-        {
-            string[] rooms =
-            [
-                "07139793-c844-4fbb-ad90-9f279843cdc8", // Cargo Hold
-                "2950afee-ce0e-40c1-becb-735570e560c5", // Crystal Growth Chamber
-                "54a0e045-36fe-4de4-92fb-9254fa73c48f", // Command Nexus
-            ];
-            if (hour == 3)
-            {
-                candidates.Add(("10504dc3-99cf-46be-b8ac-ea0be24c7b0b", ECardType.CombatEncounter)); // Augmented Hellbilly
-                candidates.Add(("7718437a-cc2e-44d0-b3f1-4a370ea84fdc", ECardType.CombatEncounter)); // Conspiracy Theorist
-                candidates.Add(("4ef60802-3b84-482a-8ba5-640534a94c64", ECardType.CombatEncounter)); // The Vessel
-            }
-            else
-            {
-                foreach (string rid in rooms)
-                {
-                    if (!_run.ExpeditionVisitedRoomIds.Contains(rid))
-                        candidates.Add((rid, ECardType.EventEncounter));
-                }
-            }
-        }
-        else if (expId.Equals(CardPool.TinyWorldExpeditionRoomId, StringComparison.OrdinalIgnoreCase))
-        {
-            switch (hour)
-            {
-                case 2:
-                    candidates.Add(("875caea4-93c5-440b-a9fd-2886eeaa0fc5", ECardType.EventEncounter)); // Where am I?
-                    break;
-                case 3:
-                    candidates.Add(("1a3f7d6a-3f24-42dc-ba27-9d4bf199d0b8", ECardType.CombatEncounter)); // Bananniboss
-                    candidates.Add(("9f8fa7f6-c322-4ff6-b81f-c379305b97f4", ECardType.CombatEncounter)); // Barnacle Bigwig
-                    break;
-                case 4:
-                    candidates.Add(("f418a73c-d442-4ee1-aa7f-ec43f0418d9f", ECardType.EventEncounter)); // Ethergy Nexus
-                    break;
-                default:
-                    // Hour 5 自然结束微观世界返回常规事件
-                    _run.ActiveExpeditionId = null;
-                    _run.ActiveExpeditionVariant = null;
-                    _run.ExpeditionVisitedRoomIds.Clear();
-                    return false;
-            }
+            ExitReplacementSetAndResetBoardIfNeeded(events);
+            return false;
         }
 
         int dealtCount = 0;
-        foreach (var (cid, expectedType) in candidates)
+        foreach (var item in entries)
         {
-            var tpl = _pool.GetIfAssetValid(cid);
+            var tpl = _pool.GetIfAssetValid(item.TemplateId);
             if (tpl == null) continue;
             ECardType actualType = ParseCardType(tpl.Type);
-            if (actualType == ECardType.Item) actualType = expectedType;
+            if (actualType == ECardType.Item) actualType = item.ExpectedType;
             string prefix = actualType == ECardType.CombatEncounter ? "cbt" : "exp";
             var entry = CreateEncounterCandidate(tpl, actualType, prefix);
             entry.Attributes[ECardAttributeType.BuyPrice] = 0;
@@ -1084,12 +1360,20 @@ public sealed class ShopEngine
 
         if (dealtCount == 0)
         {
-            _run.ActiveExpeditionId = null;
-            _run.ActiveExpeditionVariant = null;
-            _run.ExpeditionVisitedRoomIds.Clear();
+            ExitReplacementSetAndResetBoardIfNeeded(events);
             return false;
         }
         return true;
+    }
+
+    private void ExitReplacementSetAndResetBoardIfNeeded(List<IGameSimEvent> events)
+    {
+        _run.ClearActiveReplacementSet();
+        if (!string.IsNullOrWhiteSpace(_run.CurrentBoardId))
+        {
+            _run.CurrentBoardId = null;
+            events.Add(new GameSimEventBoardOverridden(null, null));
+        }
     }
 
     private void EnsureRunExclusionSetInitialized()
@@ -1145,82 +1429,57 @@ public sealed class ShopEngine
             h.Equals("Common", StringComparison.OrdinalIgnoreCase));
     }
 
-    // V13.2 官方 GameData.db + BazaarDB / HowBazaar 核验的精准遭遇 GUID 门控表
-    private const string MerchantCurioId = "c6cffe25-8e94-4a7b-a821-3e3c7093333b";
-    private const string EventMountainPassId = "956e9c74-7d98-4a2b-b500-def577914945";
-    private const string EventFaraiId = "412fb3ec-88de-40b4-a475-10e583189d8a";
-    private const string MerchantFlexId = "7bd967dd-4631-4252-bdff-ee0bd5e3ddb7";
-    private const string MerchantUitarCenterId = "c5a68a92-9932-40bd-a45f-e1c902807814";
-
     /// <summary>
-    /// 真正适合右槽（Free Option / Resource / Utility）的免费或低门槛补给事件名称白名单，
-    /// 避免把高消费/纯技能导师/非补给事件塞入右槽造成中/右两槽池重叠。
+    /// Patch 20.2 官方 Day 1 合法放行的 10 位银阶商人 GUID（向后兼容旧属性名，直接引用 <see cref="OfficialEncounterSchedule.Day1AllowedSilverMerchantIds"/>）。
+    /// 包含 Valpak / Herma / Shelter Shelby / The Tester / Tinker / Eli / Colt / Nautica / Aero / Laurel；
+    /// Curio / Midsworth / Quixel 为 Day 2+，Barkun / Silvia 为 Day 3+，Orion 为 Day 4+。
     /// </summary>
-    private static readonly string[] RightSlotFreeUtilityNames =
-    [
-        "The Docks", "The Lost Crate", "Lost Crate", "Jungle Ruins", "A Strange Mushroom",
-        "Jules' Cafe", "Gumball Machine", "Likit", "Mandala", "Finn's Big Bite",
-        "Apothecary", "Eating Contest", "Bex", "Dabora", "Wishing Fountain",
-        "Artisan Dunes", "Salvage Yard", "Pearl's Dig Site", "Street Festival",
-        "Gunpowder Cache", "Moonlit Meadow", "Economic Seminar", "Ledger",
-    ];
+    public static IReadOnlySet<string> Day1AllowedNeutralSilverMerchantIds => OfficialEncounterSchedule.Day1AllowedSilverMerchantIds;
+
+    /// <summary>Patch 20.2 官方 Day 1 合法放行的 10 位银阶商人 GUID（语义清晰别名）。</summary>
+    public static IReadOnlySet<string> Day1AllowedSilverMerchantIds => OfficialEncounterSchedule.Day1AllowedSilverMerchantIds;
 
     /// <summary>
-    /// 判断遭遇（常规基座、商人或特殊奇遇）是否处于官方权威允许出现的天数与小时窗口内（V13.2 严谨核验版）：
-    ///   · [BazaarDB / Reddit] B1&amp;B2（青铜升阶基座）：Days 3–5（不再在 Day 1 Hour 2 过早出现）；
-    ///   · [BazaarDB / 社区实测] Sterling（白银升阶基座）：Day 3+；
-    ///   · [BazaarDB / 社区实测] Forja（黄金/钻石升阶基座）：Days 4–10；
-    ///   · [BazaarDB / 社区实测] The Artist（随机附魔基座）：Day 6+；
-    ///   · [Reddit / 社区实测] Tiny Furry Monster（小怪兽）：Days 1–3，且避开 Day 1 Hour 1–2；
-    ///   · [GameData.db 原生 CurrentDay] Mountain Pass（全部子组 CurrentDay==4..6）：Day 4+；
-    ///   · [GameData.db 原生 CurrentDay] Farai（核心子组 CurrentDay>=5）：Day 5+；
-    ///   · [GameData.db 原生 CurrentDay] Flex / Uitar Center（子组 CurrentDay>=6）：Day 6+；
-    ///   · [GameData.db + BazaarDB / Steam 指南] Day 1 银阶商人仅放行官方确认的 Curio（其余 11 名 DB 含 CurrentDay>=2 的银商从 Day 2 起解锁）。
+    /// P2-28：是否启用人工扩展的单局唯一基座约束（B1&amp;B2 / Sterling 在官方 DB 与 2025-07-09 Hotfix 中均非单局唯一，默认关闭；
+    /// 可按需开启以启用人工单局唯一限制）。
+    /// </summary>
+    public static bool EnforceArtificialSingleSpawnPedestals { get; set; } = false;
+
+    /// <summary>P2-28：可配置的人工单局唯一基座 ID 集合（仅在 <see cref="EnforceArtificialSingleSpawnPedestals"/> 为 true 时生效）。</summary>
+    public static HashSet<string> ArtificialSingleSpawnPedestalIds { get; } = new(StringComparer.OrdinalIgnoreCase)
+    {
+        CardPool.PedestalB1B2Id,
+        CardPool.PedestalSterlingId,
+    };
+
+    /// <summary>
+    /// 判断遭遇（常规基座、商人、中槽奇遇或右槽免费/保底事件）是否处于 Patch 20.2 官方允许的天数与小时窗口内。
+    /// 全部 170 条官方遭遇规则统一托管于 <see cref="OfficialEncounterSchedule"/>。
     /// </summary>
     public static bool IsWithinOfficialDayWindow(CardPool.CardTemplate? enc, int day, int hour)
+        => IsWithinOfficialDayWindow(enc, day, hour, hero: null, allowAmplifiedTravelAgent: false);
+
+    /// <summary>带英雄上下文与自定义旅行社放大开关的官方天数/小时窗口校验（支持 Pol Pyg Day 4+ / 非 Pyg Day 6+ 及 Mod 自定义天数窗）。</summary>
+    public static bool IsWithinOfficialDayWindow(
+        CardPool.CardTemplate? enc,
+        int day,
+        int hour,
+        string? hero,
+        bool allowAmplifiedTravelAgent = false)
     {
-        if (enc == null || string.IsNullOrWhiteSpace(enc.Id)) return true;
-
-        // 1. 4 座地图基座天数窗（BazaarDB / Reddit）
-        if (enc.Id.Equals(CardPool.PedestalB1B2Id, StringComparison.OrdinalIgnoreCase))
-            return day is >= 3 and <= 5;
-        if (enc.Id.Equals(CardPool.PedestalSterlingId, StringComparison.OrdinalIgnoreCase))
-            return day >= 3;
-        if (enc.Id.Equals(CardPool.PedestalForjaId, StringComparison.OrdinalIgnoreCase))
-            return day is >= 4 and <= 10;
-        if (enc.Id.Equals(CardPool.PedestalTheArtistId, StringComparison.OrdinalIgnoreCase))
-            return day >= 6;
-
-        // 2. 特殊奇遇天数与小时窗
-        if (enc.Id.Equals(TinyFurryCreatureEncounterId, StringComparison.OrdinalIgnoreCase))
-            return day is >= 1 and <= 3 && !(day == 1 && hour <= 2);
-
-        // 3. GameData.db 原生 CurrentDay 门控（防止子组尚未激活导致空货架或越级出现）
-        if (enc.Id.Equals(EventMountainPassId, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(enc.InternalName, "Mountain Pass", StringComparison.OrdinalIgnoreCase))
-            return day >= 4;
-        if (enc.Id.Equals(EventFaraiId, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(enc.InternalName, "Farai", StringComparison.OrdinalIgnoreCase))
-            return day >= 5;
-        if (enc.Id.Equals(MerchantFlexId, StringComparison.OrdinalIgnoreCase)
-            || enc.Id.Equals(MerchantUitarCenterId, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(enc.InternalName, "Uitar Center", StringComparison.OrdinalIgnoreCase))
-            return day >= 6;
-
-        // 4. Day 1 银阶商人限制：按 BazaarDB / Steam 指南与 GameData.db（11 名专业银商子组含 CurrentDay>=2），
-        //    Day 1 仅放行青铜商人 + 官方确认 Day 1 可出的中立银商 Curio，其余专业银商（Nautica/Colt/Kev's Armory 等）自 Day 2 起解锁。
-        bool isMerchant = enc.Tags != null && enc.Tags.Any(t => string.Equals(t, "Merchant", StringComparison.OrdinalIgnoreCase));
-        if (day <= 1 && isMerchant && ParseTier(enc.StartingTier) >= ETier.Silver)
+        if (enc != null && (enc.ModMinDay.HasValue || enc.ModMaxDay.HasValue))
         {
-            return enc.Id.Equals(MerchantCurioId, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(enc.InternalName, "Curio", StringComparison.OrdinalIgnoreCase);
+            // Mod 显式声明了天数窗时优先尊重 Mod 规则（既可收窄也可放宽，不与官方静态天数锁冲突）
+            if (enc.ModMinDay.HasValue && day < enc.ModMinDay.Value) return false;
+            if (enc.ModMaxDay.HasValue && day > enc.ModMaxDay.Value) return false;
+            return true;
         }
-
-        return true;
+        return OfficialEncounterSchedule.IsWithinWindow(enc, day, hour, hero, allowAmplifiedTravelAgent);
     }
 
     /// <summary>
-    /// 判断遭遇是否应按单局唯一（SingleSpawn）追踪：涵盖 DB 原生 IsSingleSpawn 以及官方单局唯一的 B1&amp;B2 / Sterling / The Artist 基座。
+    /// 判断遭遇是否应按单局唯一（SingleSpawn）追踪：优先遵循 DB 原生 IsSingleSpawn（含 The Artist / The Cult / Takeover 奇遇）；
+    /// P2-28：将无 DB 依据的人工唯一基座（B1&amp;B2 / Sterling）收敛至可配置开关 <see cref="EnforceArtificialSingleSpawnPedestals"/>。
     /// </summary>
     public static bool IsEffectiveSingleSpawnEncounter(CardPool.CardTemplate? tpl, BazaarCore.Models.CardTemplate? coreTpl = null)
     {
@@ -1228,63 +1487,27 @@ public sealed class ShopEngine
             return true;
         string? id = tpl?.Id ?? coreTpl?.Id;
         if (string.IsNullOrWhiteSpace(id)) return false;
-        return id.Equals(CardPool.PedestalB1B2Id, StringComparison.OrdinalIgnoreCase)
-            || id.Equals(CardPool.PedestalSterlingId, StringComparison.OrdinalIgnoreCase)
-            || id.Equals(CardPool.PedestalTheArtistId, StringComparison.OrdinalIgnoreCase);
+        if (id.Equals(CardPool.PedestalTheArtistId, StringComparison.OrdinalIgnoreCase))
+            return true;
+        return EnforceArtificialSingleSpawnPedestals && ArtificialSingleSpawnPedestalIds.Contains(id);
     }
 
-    private List<CardPool.CardTemplate> BuildRightSlotUtilityPool(
-        IReadOnlyList<CardPool.CardTemplate> nonMerchants,
-        CardArchetypeIndex? archetypeIndex)
+    private bool TryIncludeGuidOnlyEvent(
+        List<CardPool.CardTemplate> targetPool,
+        HashSet<string> includedIds,
+        string templateId,
+        Func<CardPool.CardTemplate, bool> isEligible)
     {
-        var utility = new List<CardPool.CardTemplate>();
-        foreach (var e in nonMerchants)
-        {
-            string name = e.InternalName ?? string.Empty;
-            bool isFreeUtility = false;
-            for (int i = 0; i < RightSlotFreeUtilityNames.Length; i++)
-            {
-                if (name.Contains(RightSlotFreeUtilityNames[i], StringComparison.OrdinalIgnoreCase))
-                {
-                    isFreeUtility = true;
-                    break;
-                }
-            }
-            // 若玩家通过自定义规则显式拉高某非商遭遇类别倍率（如 EventExpeditionAgent = 8.0），允许进入右槽参与加权抽取
-            var effectiveRules = ActiveRules ?? _run.CustomRules;
-            if (!isFreeUtility && effectiveRules?.EncounterCategoryMultipliers is { Count: > 0 } && archetypeIndex != null &&
-                archetypeIndex.TryGetEncounterCategory(e.Id, out var cat) &&
-                effectiveRules.EncounterCategoryMultipliers.TryGetValue(cat.ToString(), out double mult) &&
-                mult > 1.0)
-            {
-                isFreeUtility = true;
-            }
-            if (isFreeUtility)
-                utility.Add(e);
-        }
-        return utility;
-    }
+        if (includedIds.Contains(templateId)) return true;
 
-    private static List<CardPool.CardTemplate> BuildFlexNonMerchantPool(
-        IReadOnlyList<CardPool.CardTemplate> nonMerchants,
-        string hero,
-        int effectiveDay,
-        int hour,
-        ETier maxDayTier)
-    {
-        var flex = new List<CardPool.CardTemplate>();
-        foreach (var e in nonMerchants)
-        {
-            bool isHeroExclusive = e.Heroes is { Length: > 0 } &&
-                                   e.Heroes.Any(h => h.Equals(hero, StringComparison.OrdinalIgnoreCase)) &&
-                                   !e.Heroes.Any(h => h.Equals("Common", StringComparison.OrdinalIgnoreCase));
-            var tier = ParseTier(e.StartingTier);
-            bool isRareUpgraded = (effectiveDay >= 4 && tier >= ETier.Gold && tier <= maxDayTier) ||
-                                  (effectiveDay == 3 && hour >= 4 && tier >= ETier.Silver && tier <= maxDayTier);
-            if (isHeroExclusive || isRareUpgraded)
-                flex.Add(e);
-        }
-        return flex;
+        var tpl = _pool.GetIfAssetValid(templateId);
+        if (tpl == null || !_pool.IsPlayerSpawnable(tpl, allowGuidOnly: true)) return false;
+        if (tpl.IsSingleSpawn && _run.VisitedSingleSpawnEncounterIds.Contains(tpl.Id)) return false;
+        if (!isEligible(tpl)) return false;
+
+        includedIds.Add(tpl.Id);
+        targetPool.Add(tpl);
+        return true;
     }
 
     private void TryIncludeGuidOnlyEvent(
@@ -1316,6 +1539,271 @@ public sealed class ShopEngine
         // 绝不在有效天数解锁门槛前放行高阶 GuidOnly 奇遇（如 Diamond 阶需 Day >= 7）
         if (ParseTier(tpl.StartingTier) > maxDayTier) return;
         TryIncludeGuidOnlyEvent(targetPool, templateId, isEligible);
+    }
+
+    /// <summary>
+    /// P0-15：消费 IsTakeover 字段的单次专属奇遇调度器：
+    /// 1) 持有物品 Star Chart (5abf3441) 时，按 SpawningChance=0.1 独立掷骰触发 Star Chart Treasure (34c27d0d，遵守 ShouldProgressHour=false 与 IsSingleSpawn)；
+    /// 2) 接入全部 8 英雄专属传奇 GuidOnly IsTakeover 单次奇遇（Karnok Hidden Lake 自 Day 3+、其余 7 英雄 Diamond 阶自 Day 6+，遵守 IsSingleSpawn）。
+    /// </summary>
+    private CardPool.CardTemplate? TryRollTakeoverEncounter(
+        string hero,
+        int effectiveDay,
+        PlayerState? queryPlayer,
+        Random streamRng,
+        Func<CardPool.CardTemplate, bool> isEligible,
+        Func<CardPool.CardTemplate, double> getEncounterMultiplier,
+        ISet<string>? dailyVisited)
+    {
+        // 1. Star Chart Treasure (34c27d0d)：持 Star Chart 时按 SpawningChance=0.1 (+ SpawningChanceIncrement 递增) 独立掷骰
+        var starChartTpl = _pool.GetStarChartTreasureEncounter();
+        if (starChartTpl != null &&
+            !_run.VisitedSingleSpawnEncounterIds.Contains(starChartTpl.Id) &&
+            !(dailyVisited?.Contains(starChartTpl.Id) ?? false) &&
+            HasOwnedItemTemplate(CardPool.StarChartItemId, queryPlayer) &&
+            isEligible(starChartTpl))
+        {
+            double scMult = getEncounterMultiplier(starChartTpl);
+            if (scMult > 0.0 && RollTakeoverChanceWithIncrement(starChartTpl, defaultBaseChance: 0.10, scMult, streamRng))
+                return starChartTpl;
+        }
+
+        // 2. 8 英雄专属传奇 GuidOnly IsTakeover 单次奇遇（含 SpawningChance / SpawningChanceIncrement 局内递增表）
+        var heroTakeovers = _pool.GetHeroTakeoverEncounters(hero);
+        if (heroTakeovers.Count == 0) return null;
+
+        var eligibleTakeovers = new List<CardPool.CardTemplate>();
+        foreach (var tk in heroTakeovers)
+        {
+            if (_run.VisitedSingleSpawnEncounterIds.Contains(tk.Id)) continue;
+            if (dailyVisited?.Contains(tk.Id) == true) continue;
+            ETier tkTier = ParseTier(tk.StartingTier);
+            int minUnlockDay = tkTier <= ETier.Silver ? 3 : 6;
+            if (effectiveDay < minUnlockDay) continue;
+            if (getEncounterMultiplier(tk) <= 0.0) continue;
+            if (!isEligible(tk)) continue;
+            eligibleTakeovers.Add(tk);
+        }
+
+        if (eligibleTakeovers.Count == 0) return null;
+
+        var chosen = eligibleTakeovers.Count == 1
+            ? eligibleTakeovers[0]
+            : eligibleTakeovers[streamRng.Next(eligibleTakeovers.Count)];
+        double tkMult = getEncounterMultiplier(chosen);
+        return RollTakeoverChanceWithIncrement(chosen, defaultBaseChance: 0.12, tkMult, streamRng, maxChance: 0.95)
+            ? chosen
+            : null;
+    }
+
+    /// <summary>
+    /// P2-26：专用于 IsTakeover 遭遇的独立掷骰与局内 SpawningChanceIncrement 累积概率表：
+    /// 命中后重置该遭遇的累积增量，未命中且配置了 SpawningChanceIncrement &gt; 0 时将增量写入 <see cref="RunState.TakeoverChanceBonuses"/>。
+    /// </summary>
+    public bool RollTakeoverChanceWithIncrement(
+        CardPool.CardTemplate tpl,
+        double defaultBaseChance,
+        double mult,
+        Random streamRng,
+        double maxChance = 1.0)
+    {
+        double baseChance = tpl.SpawningChance > 0 ? tpl.SpawningChance : defaultBaseChance;
+        double bonus = _run.TakeoverChanceBonuses.GetValueOrDefault(tpl.Id, 0.0);
+        double effectiveChance = Math.Clamp((baseChance + bonus) * mult, 0.0, maxChance);
+        if (streamRng.NextDouble() < effectiveChance)
+        {
+            _run.TakeoverChanceBonuses.Remove(tpl.Id);
+            return true;
+        }
+        if (tpl.SpawningChanceIncrement > 0)
+        {
+            _run.TakeoverChanceBonuses[tpl.Id] = Math.Min(1.0, bonus + tpl.SpawningChanceIncrement);
+        }
+        return false;
+    }
+
+    private bool HasOwnedItemTemplate(string templateId, PlayerState? queryPlayer)
+    {
+        if (string.IsNullOrWhiteSpace(templateId)) return false;
+        foreach (var entry in _run.Cards.Values)
+        {
+            if (entry.Owner == ECombatantId.Player &&
+                entry.Type == ECardType.Item &&
+                entry.TemplateId.ToString().Equals(templateId, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        if (queryPlayer != null)
+        {
+            if (queryPlayer.Hand.Cards.Any(c => c.Template.Id.Equals(templateId, StringComparison.OrdinalIgnoreCase)) ||
+                queryPlayer.Stash.Cards.Any(c => c.Template.Id.Equals(templateId, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Patch 20.2 官方实测 Hazard 加权抽签（带同小时 + 同日规范名去重、单局唯一保护与阶梯回退链）：
+    /// 结合 <see cref="OfficialEncounterSchedule.GetEmpiricalDrawWeight"/>（21.3 万局英雄归一化实测权重）、
+    /// <c>game_modes.EncounterSpawnTierPercentages</c> 动态缩放系数与自定义倍率 <paramref name="weightMultiplier"/>，
+    /// 使单日 4 轮无放回抽签的日级出现率精准收敛到官服实测分布。
+    /// </summary>
+    private CardPool.CardTemplate? RollEmpiricalSlotEncounterWithDailyDedup(
+        IReadOnlyList<CardPool.CardTemplate> pool,
+        ETier maxDayTier,
+        HashSet<string> pickedIds,
+        HashSet<string>? visitedSingleSpawn,
+        HashSet<string>? dailyVisited,
+        bool allowExceedDayCap,
+        bool allowDailyFallback,
+        Func<CardPool.CardTemplate, double>? weightMultiplier,
+        ISet<string>? bannedIds,
+        ISet<string>? tierExemptIds,
+        int effectiveDay,
+        bool isMerchantPool,
+        Random rng)
+    {
+        if (pool.Count == 0) return null;
+
+        var pickedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string pid in pickedIds)
+        {
+            var pt = _pool.Get(pid);
+            string k = OfficialEncounterSchedule.NormalizeKey(pt?.InternalName);
+            if (!string.IsNullOrEmpty(k))
+                pickedKeys.Add(k);
+        }
+
+        if (dailyVisited is { Count: > 0 })
+        {
+            var visitedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string vid in dailyVisited)
+            {
+                var vt = _pool.Get(vid);
+                string k = OfficialEncounterSchedule.NormalizeKey(vt?.InternalName);
+                if (!string.IsNullOrEmpty(k))
+                    visitedKeys.Add(k);
+            }
+
+            var unvisited = pool.Where(c =>
+            {
+                if (dailyVisited.Contains(c.Id)) return false;
+                string ck = OfficialEncounterSchedule.NormalizeKey(c.InternalName);
+                return string.IsNullOrEmpty(ck) || !visitedKeys.Contains(ck);
+            }).ToList();
+
+            if (unvisited.Count > 0)
+            {
+                var pick = RollEmpiricalSlotEncounter(
+                    unvisited, maxDayTier, pickedIds, visitedSingleSpawn, allowExceedDayCap: false,
+                    weightMultiplier, bannedIds, tierExemptIds, effectiveDay, isMerchantPool, pickedKeys, rng);
+                if (pick != null) return pick;
+            }
+            if (!allowDailyFallback) return null;
+        }
+
+        return RollEmpiricalSlotEncounter(
+            pool, maxDayTier, pickedIds, visitedSingleSpawn, allowExceedDayCap,
+            weightMultiplier, bannedIds, tierExemptIds, effectiveDay, isMerchantPool, pickedKeys, rng);
+    }
+
+    private CardPool.CardTemplate? RollEmpiricalSlotEncounter(
+        IReadOnlyList<CardPool.CardTemplate> pool,
+        ETier maxDayTier,
+        HashSet<string> pickedIds,
+        HashSet<string>? visitedSingleSpawn,
+        bool allowExceedDayCap,
+        Func<CardPool.CardTemplate, double>? weightMultiplier,
+        ISet<string>? bannedIds,
+        ISet<string>? tierExemptIds,
+        int effectiveDay,
+        bool isMerchantPool,
+        ISet<string>? pickedKeys,
+        Random rng)
+    {
+        if (pool.Count == 0) return null;
+
+        var unpicked = pool
+            .Where(c => !pickedIds.Contains(c.Id) &&
+                        (pickedKeys == null || string.IsNullOrWhiteSpace(c.InternalName) || !pickedKeys.Contains(OfficialEncounterSchedule.NormalizeKey(c.InternalName))) &&
+                        (bannedIds == null || !bannedIds.Contains(c.Id)) &&
+                        (visitedSingleSpawn == null || !visitedSingleSpawn.Contains(c.Id)) &&
+                        (weightMultiplier == null || weightMultiplier(c) > 0.0))
+            .ToList();
+        if (unpicked.Count == 0) return null;
+
+        var available = unpicked
+            .Where(e => ParseTier(e.StartingTier) <= maxDayTier ||
+                        (tierExemptIds != null && tierExemptIds.Contains(e.Id)))
+            .ToList();
+        if (available.Count == 0)
+        {
+            if (!allowExceedDayCap) return null;
+            ETier minRemainingTier = unpicked.Min(e => ParseTier(e.StartingTier));
+            available = unpicked.Where(e => ParseTier(e.StartingTier) == minRemainingTier).ToList();
+        }
+
+        // 构建个体最终权重 = OfficialEncounterSchedule 实测 Hazard 权重 × DB 品阶配置缩放 × 自定义倍率
+        double DbTierScale(ETier tier)
+        {
+            var pct = _repo.GameMode.EncounterSpawnTierPercentages;
+            double canonicalDb = tier switch
+            {
+                ETier.Bronze => 0.4,
+                ETier.Silver => 0.3,
+                ETier.Gold => 0.2,
+                ETier.Diamond => 0.1,
+                _ => 0.05,
+            };
+            if (pct != null && pct.TryGetValue(tier.ToString(), out double rawDb) && rawDb >= 0 && canonicalDb > 0)
+                return rawDb / canonicalDb;
+            return 1.0;
+        }
+
+        var weighted = new List<(CardPool.CardTemplate Card, double Weight)>(available.Count);
+        double total = 0.0;
+        foreach (var c in available)
+        {
+            ETier tier = ParseTier(c.StartingTier);
+            // 自定义 Mod 遭遇与合成测试遭遇给予中性基准权重（0.35），保障玩家自制 Mod 遭遇正常出场且不稀释原版官方分布；
+            // 原版少量未收录事件链/兜底卡仍保持温和回退（0.12×品阶基线），并尊重模板自带的 SpawningChance 权重
+            double fallbackW = (c.IsCustomModCard || c.IsSyntheticTestTemplate)
+                ? 0.35
+                : GetEncounterTierBaseWeight(effectiveDay, tier, isMerchantPool) * 0.12;
+            if (c.SpawningChance > 0.0 && double.IsFinite(c.SpawningChance))
+                fallbackW *= c.SpawningChance;
+            double empW = OfficialEncounterSchedule.GetEmpiricalDrawWeight(c, effectiveDay, fallbackWeight: fallbackW);
+            double dbScale = DbTierScale(tier);
+            double customMult = weightMultiplier != null ? Math.Max(0.0, weightMultiplier(c)) : 1.0;
+            double finalW = empW * dbScale * customMult;
+            if (double.IsFinite(finalW) && finalW > 0.0)
+            {
+                weighted.Add((c, finalW));
+                total += finalW;
+            }
+        }
+
+        if (weighted.Count == 0 || total <= 0.0)
+            return null;
+
+        double r = rng.NextDouble() * total;
+        double acc = 0.0;
+        foreach (var (card, w) in weighted)
+        {
+            acc += w;
+            if (r <= acc)
+            {
+                pickedIds.Add(card.Id);
+                return card;
+            }
+        }
+
+        var last = weighted[^1].Card;
+        pickedIds.Add(last.Id);
+        return last;
     }
 
     private CardPool.CardTemplate? RollDayTieredEncounterWithDailyDedup(
@@ -1418,66 +1906,78 @@ public sealed class ShopEngine
     };
 
     /// <summary>
-    /// V13.2 商人阶级独立天数开放曲线（对照 GameData.db 11 名专业银商 CurrentDay>=2 + BazaarDB / Steam 商人指南）：
-    ///   · Day 1：Bronze 商人 + 官方确认的 Day 1 中立银商 Curio（由 IsWithinOfficialDayWindow 精准放行）；
-    ///   · Day 2–4：Bronze + 全部 Silver 商人（绝不在 Day 2–4 过早刷出 6 金重随的金商如 Goldie/Aimbot/Tatiana）；
-    ///   · Day 5–6：开放至 Gold 商人；
-    ///   · Day 7+：开放至 Diamond 商人（含跨英雄 8 金重随钻商，权重随 Day 7→9+ 渐进抬升）。
+    /// Patch 20.2 商人阶级天数上限：
+    ///   · Day 1–5：Bronze + Silver 商人（单商精确起始/截止天由 OfficialEncounterSchedule 细粒度控制，如 Day 1 仅放行 10 名官方银商、Curio D2–5、Silvia D3–5、Pol Pyg D4+）；
+    ///   · Day 6+：全面开放至 Gold / Diamond 商人（Aimbot/Goldie/Gaseo/Chronos/8 跨英雄钻商等集体 Day 6 解锁，Luxe/Serafina 由单卡规则锁定 Day 8+）。
     /// </summary>
     private static ETier GetMaxMerchantTierForDay(int day) => day switch
     {
-        <= 4 => ETier.Silver,
-        <= 6 => ETier.Gold,
+        <= 5 => ETier.Silver,
         _ => ETier.Legendary,
     };
 
-    private double GetEncounterTierBaseWeight(int effectiveDay, ETier tier, bool isMerchantPool = false)
+    public double GetEncounterTierBaseWeight(int effectiveDay, ETier tier, bool isMerchantPool = false)
     {
+        // P2-26：读取 game_modes.EncounterSpawnTierPercentages（官方基线 Bronze:0.4 / Silver:0.3 / Gold:0.2 / Diamond:0.1），
+        // 令前中期分段权重支持按配置表相对官方基线按比例缩放（标准 DB 下 scale=1.0 保持零回归，改表/Mod 即时生效）。
+        var pct = _repo.GameMode.EncounterSpawnTierPercentages;
+        double canonicalDb = tier switch
+        {
+            ETier.Bronze => 0.4,
+            ETier.Silver => 0.3,
+            ETier.Gold => 0.2,
+            ETier.Diamond => 0.1,
+            _ => 0.05,
+        };
+        double rawDb = 0;
+        bool hasDbEntry = pct != null && pct.TryGetValue(tier.ToString(), out rawDb) && rawDb >= 0;
+        double configuredDb = hasDbEntry ? rawDb : canonicalDb;
+        double dbScale = canonicalDb > 0 ? configuredDb / canonicalDb : 1.0;
+
         if (isMerchantPool)
         {
             if (effectiveDay <= 1)
-                return tier == ETier.Bronze ? 0.80 : (tier == ETier.Silver ? 0.20 : 0.02);
+                return (tier == ETier.Bronze ? 0.80 : (tier == ETier.Silver ? 0.20 : 0.02)) * dbScale;
             if (effectiveDay <= 2)
-                return tier == ETier.Bronze ? 0.55 : (tier == ETier.Silver ? 0.45 : 0.02);
+                return (tier == ETier.Bronze ? 0.55 : (tier == ETier.Silver ? 0.45 : 0.02)) * dbScale;
             if (effectiveDay <= 4)
-                return tier == ETier.Bronze ? 0.35 : (tier == ETier.Silver ? 0.65 : 0.02);
+                return (tier == ETier.Bronze ? 0.35 : (tier == ETier.Silver ? 0.65 : 0.02)) * dbScale;
             if (effectiveDay <= 6)
-                return tier switch
+                return (tier switch
                 {
                     ETier.Bronze => 0.15,
                     ETier.Silver => 0.55,
                     ETier.Gold => 0.30,
                     _ => 0.02,
-                };
+                }) * dbScale;
             if (effectiveDay <= 8)
-                return tier switch
+                return (tier switch
                 {
                     ETier.Bronze => 0.08,
                     ETier.Silver => 0.35,
                     ETier.Gold => 0.37,
                     ETier.Diamond => 0.20,
                     _ => 0.05,
-                };
+                }) * dbScale;
         }
         else
         {
             if (effectiveDay <= 1)
-                return tier == ETier.Bronze ? 0.55 : (tier == ETier.Silver ? 0.45 : 0.02);
+                return (tier == ETier.Bronze ? 0.55 : (tier == ETier.Silver ? 0.45 : 0.02)) * dbScale;
             if (effectiveDay <= 3)
-                return tier == ETier.Bronze ? 0.40 : (tier == ETier.Silver ? 0.60 : 0.02);
+                return (tier == ETier.Bronze ? 0.40 : (tier == ETier.Silver ? 0.60 : 0.02)) * dbScale;
             if (effectiveDay <= 6)
-                return tier switch
+                return (tier switch
                 {
                     ETier.Bronze => 0.22,
                     ETier.Silver => 0.46,
                     ETier.Gold => 0.32,
                     _ => 0.05,
-                };
+                }) * dbScale;
         }
 
         // Day 7+ 事件 / Day 9+ 商人回归官方 game_modes.EncounterSpawnTierPercentages (0.4 / 0.3 / 0.2 / 0.1)
-        var pct = _repo.GameMode.EncounterSpawnTierPercentages;
-        return (pct.TryGetValue(tier.ToString(), out double raw) && raw > 0) ? raw : 0.05;
+        return (hasDbEntry && configuredDb > 0) ? configuredDb : 0.05;
     }
 
     private CardPool.CardTemplate? RollDayTieredEncounter(
@@ -1537,7 +2037,8 @@ public sealed class ShopEngine
                 double sumWeighted = 0.0;
                 foreach (var c in tierCards)
                 {
-                    double baseW = c.SpawningChance > 0 ? c.SpawningChance : 1.0;
+                    // P2-26：不再将 SpawningChance 误作普通池相对权重
+                    const double baseW = 1.0;
                     double mult = Math.Max(0.0, weightMultiplier(c));
                     sumBase += baseW;
                     sumWeighted += baseW * mult;
@@ -1596,7 +2097,8 @@ public sealed class ShopEngine
         IReadOnlyDictionary<string, CardTier>? ownedMaxTiers,
         CustomRunRuleSet? customRules,
         CardArchetypeIndex? archetypeIndex = null,
-        bool applySyntheticDiscounts = true)
+        bool applySyntheticDiscounts = true,
+        int? spawnCountOverride = null)
     {
         var events = new List<IGameSimEvent>();
         events.AddRange(ClearShelf());
@@ -1639,24 +2141,29 @@ public sealed class ShopEngine
         {
             if (effectiveCustomRules.IsSandboxRun && effectiveCustomRules.SandboxFreeInfiniteReroll)
             {
+                _run.BaseRerollCost = 0;
                 _run.RerollCost = 0;
                 _run.RerollsRemaining = UnlimitedRerollsCount;
             }
             else if (effectiveCustomRules.HasMutator(MutatorCatalog.BloodMarket))
             {
+                _run.BaseRerollCost = 0;
                 _run.RerollCost = 0;
                 if (_run.RerollsRemaining == 0)
                     _run.RerollsRemaining = UnlimitedRerollsCount;
             }
             else if (effectiveCustomRules.SpecialModeId == ESpecialModeId.BossRush && _run.Hour == 1)
             {
+                _run.BaseRerollCost = 0;
                 _run.RerollCost = 0;
                 if (_run.RerollsRemaining == 0)
                     _run.RerollsRemaining = 3;
             }
             else if (effectiveCustomRules.HasMutator(MutatorCatalog.ShopHalfOff) && _run.RerollCost > 0)
             {
-                _run.RerollCost = (uint)Math.Max(1, (int)Math.Round(_run.RerollCost * 0.5));
+                uint halfBase = (uint)Math.Max(1, (int)Math.Round((_run.BaseRerollCost ?? _run.RerollCost) * 0.5));
+                _run.BaseRerollCost = halfBase;
+                _run.RerollCost = ComputeEffectiveRerollCost(halfBase);
             }
         }
 
@@ -1708,7 +2215,9 @@ public sealed class ShopEngine
         {
             if (string.Equals(spawnContext.Type, "TSpawnContextMirror", StringComparison.OrdinalIgnoreCase))
             {
-                int limit = (int)Math.Round(ValueAndConditionEvaluator.EvaluateValue(spawnContext.Limit, ctx, 3));
+                int limit = spawnCountOverride is > 0
+                    ? spawnCountOverride.Value
+                    : (int)Math.Round(ValueAndConditionEvaluator.EvaluateValue(spawnContext.Limit, ctx, 3));
                 if (limit <= 0) limit = 3;
                 var ownedItems = _run.Cards.Values
                     .Where(c => c.Owner == ECombatantId.Player &&
@@ -1737,10 +2246,26 @@ public sealed class ShopEngine
                 // 并仅对 Item 货架应用 MaxShelfSlotWidth=10 截断，对 EncounterStep/EventEncounter/PedestalEncounter 严格尊重模板 Limit。
                 var prioritizedSpawnCtx = PrioritizeSequentialConditionalGroups(spawnContext, ctx);
                 var normalizedCtx = NormalizeSequentialSingleGroupQuery(prioritizedSpawnCtx);
-                var spawned = SpawnQueryEngine.SpawnCards(
+                normalizedCtx = EncounterStepEngine.FilterExpiredExpeditionTicketsInSpawnContext(
                     normalizedCtx,
+                    day,
+                    (int)_run.Hour);
+                var spawnCtxForRoll = spawnCountOverride is > 0
+                    ? new RuleNode
+                    {
+                        Type = normalizedCtx.Type,
+                        SelectionMethod = normalizedCtx.SelectionMethod,
+                        Limit = new RuleNode { Type = "TFixedValue", RawValueNode = JsonSerializer.SerializeToElement((double)spawnCountOverride.Value) },
+                        Behaviors = normalizedCtx.Behaviors,
+                        Groups = normalizedCtx.Groups,
+                        Filters = normalizedCtx.Filters,
+                        Prerequisites = normalizedCtx.Prerequisites,
+                    }
+                    : normalizedCtx;
+                var spawned = SpawnQueryEngine.SpawnCards(
+                    spawnCtxForRoll,
                     ctx,
-                    defaultCountOverride: null,
+                    defaultCountOverride: spawnCountOverride,
                     ownedMaxTiers: effectiveOwnedMaxTiers,
                     validAssetIds: validAssetIds,
                     archetypeResolver,
@@ -1752,6 +2277,20 @@ public sealed class ShopEngine
                         !IsFaraiExplicitPackageOption(encounterTemplateId, inst.Template))
                     {
                         continue;
+                    }
+                    // P1-25：过滤已过期探险门票
+                    if (CardPool.IsExpeditionTicketExpired(inst.Template.Id, day, (int)_run.Hour))
+                        continue;
+                    // P0-13：对动态抽出的 EventEncounter（如 Mysterious Portal）二次拦截 DEFUNCT/教程/未解锁 ExclusionSet 卡
+                    if (string.Equals(inst.Template.Type, "EventEncounter", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (_run.ExclusionSet.Contains(inst.Template.Id)) continue;
+                        if (itemPoolTpl != null && CardPool.IsExcludedDevOrStoryTemplate(itemPoolTpl)) continue;
+                        if (inst.Template.InternalName is string evName &&
+                            (evName.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase) ||
+                             evName.Contains("Tutorial", StringComparison.OrdinalIgnoreCase) ||
+                             evName.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase)))
+                            continue;
                     }
                     // 对子遭遇/步骤选项（如 EncounterStep）在发牌阶段即校验天数/局外 Run 前置条件
                     if (inst.Template.Type is "EncounterStep" or "EventEncounter" or "PedestalEncounter" or "CombatEncounter" &&
@@ -1925,7 +2464,10 @@ public sealed class ShopEngine
     internal void ClearShelfDiscount(string instanceId)
     {
         if (!string.IsNullOrEmpty(instanceId))
+        {
             _activeShelfDiscounts.Remove(instanceId);
+            _run.ActiveShelfDiscounts.Remove(instanceId);
+        }
     }
 
     internal void RegisterExternalShelfDiscount(RunState.CardEntry entry, int originalBuyPrice, int discountedBuyPrice)
@@ -1942,6 +2484,7 @@ public sealed class ShopEngine
             discountedBuyPrice,
             discountPct,
             mult);
+        _run.ActiveShelfDiscounts[entry.InstanceId] = discountedBuyPrice;
     }
 
     internal Dictionary<string, ETier> BuildOwnedSkillMaxTiers(PlayerState? playerState = null)
@@ -2029,14 +2572,17 @@ public sealed class ShopEngine
         if (basePrice <= 0) return null;
 
         double multiplier = Math.Clamp(1.0 - discountPercent / 100.0, 0.0, 1.0);
-        int discountedPrice = ComputeDiscountedBuyPrice(basePrice, discountPercent);
-
-        entry.Attributes[ECardAttributeType.BuyPrice] = discountedPrice;
         if (entry.CoreCard != null)
         {
             // 仅写入 HourMult 折扣乘区，避免向未显式配置正基价的卡重复写入 HourAdd["BuyPrice"] 导致同步重算时价格翻倍
             entry.CoreCard.HourMult["BuyPrice"] = multiplier;
         }
+
+        int discountedPrice = entry.CoreCard != null
+            ? RunState.ComputeCardBuyPrice(entry, entry.CoreCard, _repo.GameMode.StandardPrices)
+            : ComputeDiscountedBuyPrice(basePrice, discountPercent);
+
+        entry.Attributes[ECardAttributeType.BuyPrice] = discountedPrice;
 
         var info = new MerchantDiscountInfo(
             entry.InstanceId,
@@ -2046,6 +2592,7 @@ public sealed class ShopEngine
             discountPercent,
             multiplier);
         _activeShelfDiscounts[entry.InstanceId] = info;
+        _run.ActiveShelfDiscounts[entry.InstanceId] = discountedPrice;
         return info;
     }
 
@@ -2128,22 +2675,26 @@ public sealed class ShopEngine
             {
                 if (rulesData.RerollRules != null)
                 {
-                    _run.RerollCost = resolvedStartingCost;
+                    _run.BaseRerollCost = resolvedStartingCost;
+                    _run.RerollCost = ComputeEffectiveRerollCost(resolvedStartingCost);
                     _run.RerollsRemaining = resolvedRerollsRemaining;
                 }
                 else
                 {
+                    _run.BaseRerollCost = null;
                     _run.RerollCost = 0;
                     _run.RerollsRemaining = 0;
                 }
             }
             else if (isMerchantFallback)
             {
-                _run.RerollCost = 2;
+                _run.BaseRerollCost = 2;
+                _run.RerollCost = ComputeEffectiveRerollCost(2);
                 _run.RerollsRemaining = 3;
             }
             else
             {
+                _run.BaseRerollCost = null;
                 _run.RerollCost = 0;
                 _run.RerollsRemaining = 0;
             }
@@ -2181,16 +2732,22 @@ public sealed class ShopEngine
         PlayerState? p1Core,
         bool chooseOne)
     {
-        if (chooseOne)
+        var coreCombatTpl = combatEncounterTpl != null ? _repo.GetCard(combatEncounterTpl.Id) : null;
+        var rewardVictory = coreCombatTpl?.RewardVictory ?? combatEncounterTpl?.RewardVictory;
+        bool hasExplicitVictorySpawn = rewardVictory?.SpawnContext != null;
+
+        // P0-02：无论 MonsterLootChooseOne 是否开启，只要配置了显式 RewardVictory.SpawnContext
+        // （如 9 只丛林陷阱怪 Exit Trap Room、Sparring Partner 固定 Scrap、教程怪），均优先执行 RewardVictory.SpawnContext
+        if (chooseOne && !hasExplicitVictorySpawn)
             return PreparePaginatedMonsterLoot(monster, combatEncounterTpl, p1Core);
 
         var events = new List<IGameSimEvent>();
         events.AddRange(ClearShelf());
 
         _run.State = ERunState.Loot;
+        if (combatEncounterTpl != null && string.IsNullOrEmpty(_run.CurrentEncounterId))
+            _run.CurrentEncounterId = combatEncounterTpl.Id;
 
-        var coreCombatTpl = combatEncounterTpl != null ? _repo.GetCard(combatEncounterTpl.Id) : null;
-        var rewardVictory = coreCombatTpl?.RewardVictory ?? combatEncounterTpl?.RewardVictory;
         var rules = rewardVictory?.SelectionContextRules;
 
         ApplySelectionContextRules(
@@ -2215,18 +2772,23 @@ public sealed class ShopEngine
         {
             var queryPlayer = p1Core ?? BuildDummyQueryPlayer(_run.Hero.ToString(), (int)_run.Day);
             var monsterState = BuildMonsterLootPlayerState(monster);
+            var effectiveLootRules = ActiveRules ?? _run.CustomRules;
             var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, monsterState, _rng)
             {
                 CurrentDay = (int)_run.Day,
                 CurrentHour = (int)_run.Hour,
                 CurrentEncounterId = combatEncounterTpl?.Id ?? _run.CurrentEncounterId,
                 SelfCard = coreCombatTpl != null ? new CardInstance(coreCombatTpl) : null,
+                ArchetypeResolver = ResolveArchetypeResolver(effectiveLootRules, ArchetypeIndex),
+                CustomRules = effectiveLootRules,
             };
 
             var spawned = SpawnQueryEngine.SpawnCards(NormalizeSequentialSingleGroupQuery(rewardVictory.SpawnContext), ctx, defaultCountOverride: null);
             foreach (var inst in spawned)
             {
-                if (!_pool.IsPlayerSpawnableId(inst.Template.Id, allowGuidOnly: true)) continue;
+                bool spawnable = _pool.IsPlayerSpawnableId(inst.Template.Id, allowGuidOnly: true)
+                    || (string.Equals(inst.Template.Type, "EncounterStep", StringComparison.OrdinalIgnoreCase) && _pool.IsAssetValid(inst.Template.Id));
+                if (!spawnable) continue;
                 if (string.Equals(inst.Template.Type, "Skill", StringComparison.OrdinalIgnoreCase) &&
                     !CanOfferOwnedSkill(inst.Template.Id, ParseTier(inst.Tier.ToString()), ownedSkills))
                     continue;
@@ -2236,6 +2798,13 @@ public sealed class ShopEngine
                 dealtList.Add(CreateEntryFromCoreInstance(inst, _run.SelectionRules.SelectionIsFree));
                 usedWidth += slotWidth;
             }
+        }
+
+        // 若开启分页自选且显式 RewardVictory.SpawnContext 意外未产出任何卡，则平滑回落到分页战利品
+        if (dealtList.Count == 0 && chooseOne && hasExplicitVictorySpawn)
+        {
+            events.AddRange(PreparePaginatedMonsterLoot(monster, combatEncounterTpl, p1Core));
+            return events;
         }
 
         // 2. 从野怪完整战利品池（专属装备 + 专属圆形 Skill + 背包消耗品）抽取
@@ -2279,6 +2848,14 @@ public sealed class ShopEngine
             }
         }
 
+        // 仅空货架兜底才强制允许退出；否则严格尊重 RewardVictory.SelectionContextRules.CanExit
+        if (dealtList.Count == 0 && !_run.SelectionRules.CanExit)
+        {
+            var unlockedRules = RunState.CloneRules(_run.SelectionRules);
+            unlockedRules.CanExit = true;
+            _run.SelectionRules = unlockedRules;
+        }
+
         foreach (var entry in dealtList)
         {
             _run.Cards[entry.InstanceId] = entry;
@@ -2296,6 +2873,96 @@ public sealed class ShopEngine
 
         events.Add(new GameSimEventStateTransitioned(ERunState.Loot, _run.CurrentEncounterId));
         return events;
+    }
+
+    /// <summary>
+    /// P0-02：PvE 战败后消费官方 <c>RewardDefeat.SpawnContext</c> 与 <c>SelectionContextRules</c>
+    /// （覆盖三大远征 17 只 Boss/陷阱怪战败退场步骤如 You Awaken Later 及 5 只教程怪固定奖励）。
+    /// 当未配置或未产出有效选项时返回 false，保持 RunState 不受破坏。
+    /// </summary>
+    public bool TryDealMonsterDefeatLoot(
+        CardPool.CardTemplate? combatEncounterTpl,
+        BazaarServer.Data.MonsterTemplate? monster,
+        PlayerState? p1Core,
+        out List<IGameSimEvent> events)
+    {
+        events = new List<IGameSimEvent>();
+        var coreCombatTpl = combatEncounterTpl != null ? _repo.GetCard(combatEncounterTpl.Id) : null;
+        var rewardDefeat = coreCombatTpl?.RewardDefeat ?? combatEncounterTpl?.RewardDefeat;
+        if (rewardDefeat?.SpawnContext == null)
+            return false;
+
+        var rulesData = rewardDefeat.SelectionContextRules ?? new SelectionRulesData
+        {
+            CanSelectMultiple = false,
+            SelectionIsFree = true,
+            CanExit = true,
+        };
+
+        var queryPlayer = p1Core ?? BuildDummyQueryPlayer(_run.Hero.ToString(), (int)_run.Day);
+        var monsterState = BuildMonsterLootPlayerState(monster);
+        var effectiveDefeatRules = ActiveRules ?? _run.CustomRules;
+        var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, monsterState, _rng)
+        {
+            CurrentDay = (int)_run.Day,
+            CurrentHour = (int)_run.Hour,
+            CurrentEncounterId = combatEncounterTpl?.Id ?? _run.CurrentEncounterId,
+            SelfCard = coreCombatTpl != null ? new CardInstance(coreCombatTpl) : null,
+            ArchetypeResolver = ResolveArchetypeResolver(effectiveDefeatRules, ArchetypeIndex),
+            CustomRules = effectiveDefeatRules,
+        };
+
+        var spawned = SpawnQueryEngine.SpawnCards(NormalizeSequentialSingleGroupQuery(rewardDefeat.SpawnContext), ctx, defaultCountOverride: null);
+        var dealtList = new List<RunState.CardEntry>();
+        var usedTemplateIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var ownedSkills = BuildOwnedSkillMaxTiers(p1Core);
+        bool allowDuplicates = (rulesData.SelectionIsFree && rulesData.CanSelectMultiple)
+                            || HasAllowDuplicatesBehavior(rewardDefeat.SpawnContext);
+        int usedWidth = 0;
+
+        foreach (var inst in spawned)
+        {
+            bool spawnable = _pool.IsPlayerSpawnableId(inst.Template.Id, allowGuidOnly: true)
+                || (string.Equals(inst.Template.Type, "EncounterStep", StringComparison.OrdinalIgnoreCase) && _pool.IsAssetValid(inst.Template.Id));
+            if (!spawnable) continue;
+            if (string.Equals(inst.Template.Type, "Skill", StringComparison.OrdinalIgnoreCase) &&
+                !CanOfferOwnedSkill(inst.Template.Id, ParseTier(inst.Tier.ToString()), ownedSkills))
+                continue;
+            if (!allowDuplicates && !usedTemplateIds.Add(inst.Template.Id)) continue;
+            int slotWidth = GetShelfSlotWidth(inst);
+            if (usedWidth + slotWidth > MaxShelfSlotWidth) continue;
+            dealtList.Add(CreateEntryFromCoreInstance(inst, rulesData.SelectionIsFree));
+            usedWidth += slotWidth;
+        }
+
+        if (dealtList.Count == 0)
+            return false;
+
+        events.AddRange(ClearShelf());
+        _run.State = ERunState.Loot;
+        if (combatEncounterTpl != null)
+            _run.CurrentEncounterId = combatEncounterTpl.Id;
+        _run.SelectionsMadeInCurrentContext = 0;
+
+        ApplySelectionContextRules(rulesData, isMerchantFallback: false, isReroll: false);
+
+        foreach (var entry in dealtList)
+        {
+            _run.Cards[entry.InstanceId] = entry;
+            _run.SelectionSet.Add(entry.InstanceId);
+            events.Add(new GameSimEventCardDealt(entry.InstanceId, entry.TemplateId.ToString(), entry.Type));
+        }
+
+        if (_run.SelectionRules.CanSelectMultiple &&
+            _run.SelectionRules.SelectionIsFree &&
+            CurrentMaxSelections == null &&
+            dealtList.Count > 0)
+        {
+            CurrentMaxSelections = dealtList.Count;
+        }
+
+        events.Add(new GameSimEventStateTransitioned(ERunState.Loot, _run.CurrentEncounterId));
+        return true;
     }
 
     /// <summary>
@@ -2330,15 +2997,7 @@ public sealed class ShopEngine
         }
 
         var effectiveRules = ActiveRules ?? _run.CustomRules;
-        int lootMaxSelections = 1;
-        if (effectiveRules?.SpecialModeId == ESpecialModeId.BossRush)
-        {
-            lootMaxSelections = Math.Max(1, BossRushCatalog.GetWave(Math.Max(1, (int)_run.Day)).VictoryLootChoices);
-        }
-        else if (effectiveRules != null && effectiveRules.MonsterLootBonusChoices > 0)
-        {
-            lootMaxSelections = 1 + effectiveRules.MonsterLootBonusChoices;
-        }
+        int lootMaxSelections = ResolveConfiguredMonsterLootMaxSelections();
 
         // 若启用掉落品阶加成（如 ExtremeRoguelike +1 阶）或万物附魔，自动强化战利品候选
         int tierBonus = effectiveRules?.MonsterLootTierBonus ?? 0;
@@ -2444,13 +3103,139 @@ public sealed class ShopEngine
         return result;
     }
 
+    private int ResolveConfiguredMonsterLootMaxSelections()
+    {
+        var effectiveRules = ActiveRules ?? _run.CustomRules;
+        if (effectiveRules?.SpecialModeId == ESpecialModeId.BossRush)
+        {
+            return Math.Max(1, BossRushCatalog.GetWave(Math.Max(1, (int)_run.Day)).VictoryLootChoices);
+        }
+        if (effectiveRules != null && effectiveRules.MonsterLootBonusChoices > 0)
+        {
+            return 1 + effectiveRules.MonsterLootBonusChoices;
+        }
+        return 1;
+    }
+
+    /// <summary>当前分页怪物战利品池中是否仍有未领完的剩余候选卡。</summary>
+    public bool HasRemainingMonsterLootCandidates()
+    {
+        if (_monsterLootPages.Count == 0 && _run.MonsterLootPages.Count > 0)
+            RestoreMonsterLootPagesFromRun();
+        return _monsterLootPages.Any(p => p.Count > 0);
+    }
+
+    /// <summary>
+    /// P0-20：在分页怪物战利品模式下选中某件战利品后，立即从对应分页缓存中移除该卡并同步至 RunState，
+    /// 防止玩家翻页切回后重复领取同一件奖励；若当前页被拿空则自动清理空页并重算翻页可用性。
+    /// </summary>
+    public bool ConsumeMonsterLootSelection(RunState.CardEntry selectedCard)
+    {
+        if (_run.State != ERunState.Loot) return false;
+        if (_monsterLootPages.Count == 0 && _run.MonsterLootPages.Count > 0)
+            RestoreMonsterLootPagesFromRun();
+        if (_monsterLootPages.Count == 0) return false;
+
+        string targetTplId = RunState.ResolveCoreTemplateId(selectedCard);
+        string? targetEnch = selectedCard.Enchantment?.ToString();
+
+        bool TryRemoveFromPage(int pageIdx)
+        {
+            if (pageIdx < 0 || pageIdx >= _monsterLootPages.Count) return false;
+            var page = _monsterLootPages[pageIdx];
+            int idx = page.FindIndex(c =>
+                string.Equals(c.Template.Id, targetTplId, StringComparison.OrdinalIgnoreCase) &&
+                c.Tier == selectedCard.Tier &&
+                string.Equals(c.Enchantment ?? "", targetEnch ?? "", StringComparison.OrdinalIgnoreCase));
+            if (idx < 0)
+            {
+                idx = page.FindIndex(c =>
+                    string.Equals(c.Template.Id, targetTplId, StringComparison.OrdinalIgnoreCase));
+            }
+            if (idx < 0) return false;
+            page.RemoveAt(idx);
+            if (page.Count == 0)
+                _monsterLootPages.RemoveAt(pageIdx);
+            return true;
+        }
+
+        bool removed = TryRemoveFromPage(CurrentMonsterLootPageIndex);
+        if (!removed)
+        {
+            for (int p = 0; p < _monsterLootPages.Count; p++)
+            {
+                if (p == CurrentMonsterLootPageIndex) continue;
+                if (TryRemoveFromPage(p))
+                {
+                    removed = true;
+                    break;
+                }
+            }
+        }
+
+        if (!removed) return false;
+
+        if (_monsterLootPages.Count == 0)
+        {
+            CurrentMonsterLootPageIndex = 0;
+        }
+        else if (CurrentMonsterLootPageIndex >= _monsterLootPages.Count)
+        {
+            CurrentMonsterLootPageIndex = 0;
+        }
+
+        SyncMonsterLootPagesToRun();
+
+        bool hasMultiplePages = _monsterLootPages.Count > 1;
+        _run.RerollCost = 0;
+        _run.RerollsRemaining = hasMultiplePages ? UnlimitedRerollsCount : 0;
+        if (!hasMultiplePages && _run.SelectionRules.RerollRules != null)
+        {
+            var cur = _run.SelectionRules;
+            _run.SelectionRules = new TSelectionContextRules
+            {
+                CanSelectMultiple = cur.CanSelectMultiple,
+                SelectionIsFree = cur.SelectionIsFree,
+                CanExit = cur.CanExit,
+                WillAutoSellOnExit = cur.WillAutoSellOnExit,
+                NextEncounterOnExit = cur.NextEncounterOnExit,
+                RerollRules = null,
+            };
+        }
+
+        return true;
+    }
+
+    /// <summary>当多选战利品当前页已拿空但其它分页仍有候选卡时，自动翻至下一个非空分页继续领取。</summary>
+    public bool TryDealCurrentMonsterLootPage(out List<IGameSimEvent> events)
+    {
+        if (_monsterLootPages.Count == 0 && _run.MonsterLootPages.Count > 0)
+            RestoreMonsterLootPagesFromRun();
+
+        _monsterLootPages.RemoveAll(p => p.Count == 0);
+        if (_run.State != ERunState.Loot || _monsterLootPages.Count == 0)
+        {
+            events = new List<IGameSimEvent>();
+            return false;
+        }
+
+        CurrentMonsterLootPageIndex = Math.Clamp(CurrentMonsterLootPageIndex, 0, _monsterLootPages.Count - 1);
+        SyncMonsterLootPagesToRun();
+        events = ClearShelfInternal(clearMonsterLootPages: false);
+        DealMonsterLootPage(CurrentMonsterLootPageIndex, events);
+        return true;
+    }
+
     /// <summary>
     /// 在多页怪物战利品自选状态下免费循环切换至下一页（<c>(page + 1) % pages.Count</c>）。
+    /// 保留 RunState.CurrentMaxSelections（仅当为空时按当前模式/规则重算），杜绝多选模式翻页吞奖软锁。
     /// </summary>
     public bool TryCycleMonsterLootPage(out List<IGameSimEvent> events)
     {
         if (_monsterLootPages.Count == 0 && _run.MonsterLootPages.Count > 0)
             RestoreMonsterLootPagesFromRun();
+
+        _monsterLootPages.RemoveAll(p => p.Count == 0);
 
         if (_run.State != ERunState.Loot || _monsterLootPages.Count <= 1)
         {
@@ -2461,8 +3246,11 @@ public sealed class ShopEngine
         events = ClearShelfInternal(clearMonsterLootPages: false);
         CurrentMonsterLootPageIndex = (CurrentMonsterLootPageIndex + 1) % _monsterLootPages.Count;
         _run.MonsterLootPageIndex = CurrentMonsterLootPageIndex;
-        if (CurrentMaxSelections <= 0)
-            CurrentMaxSelections = 1;
+        if (CurrentMaxSelections == null || CurrentMaxSelections <= 0)
+        {
+            int totalAvailable = _run.SelectionsMadeInCurrentContext + _monsterLootPages.Sum(p => p.Count);
+            CurrentMaxSelections = Math.Min(ResolveConfiguredMonsterLootMaxSelections(), Math.Max(1, totalAvailable));
+        }
         _run.RerollCost = 0;
         _run.RerollsRemaining = UnlimitedRerollsCount;
         DealMonsterLootPage(CurrentMonsterLootPageIndex, events);
@@ -2571,7 +3359,7 @@ public sealed class ShopEngine
         PlayerState? p1Core,
         bool chooseOne)
     {
-        var engine = new ShopEngine(run, pool, repo);
+        var engine = new ShopEngine(run, pool, repo, run.CustomRules);
         return engine.DealMonsterVictoryLoot(combatEncounterTpl, monster, p1Core, chooseOne);
     }
 
@@ -2634,6 +3422,7 @@ public sealed class ShopEngine
         _run.CurrentEncounterId = null;
         _run.RerollCost = 0;
         _run.RerollsRemaining = 0;
+        CurrentMaxSelections = 1;
         _run.SelectionRules = new TSelectionContextRules
         {
             CanSelectMultiple = false,
@@ -2643,12 +3432,15 @@ public sealed class ShopEngine
 
         var levelRng = ResolveStreamRng(DailyChallengeSeedGenerator.StreamLevelUp, level);
         var queryPlayer = playerState ?? BuildDummyQueryPlayer(_run.Hero.ToString(), (int)_run.Day);
+        var effectiveLevelRules = ActiveRules ?? _run.CustomRules;
         var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, queryPlayer, levelRng)
         {
             CurrentDay = (int)_run.Day,
             CurrentHour = (int)_run.Hour,
             CurrentEncounterId = null,
             PlayMode = _run.PlayMode.ToString(),
+            ArchetypeResolver = ResolveArchetypeResolver(effectiveLevelRules, ArchetypeIndex),
+            CustomRules = effectiveLevelRules,
         };
 
         // 修复 P1-12：消费 LevelUpTable.RollRewardsWithTier 保留真实掷出品阶（不再丢失品阶强制退回 StartingTier）
@@ -2786,6 +3578,7 @@ public sealed class ShopEngine
             Owner = null,
             Socket = null,
             Section = null,
+            IsFreeCandidate = isFree,
             CoreCard = coreCard,
         };
         RunState.PopulateMetaFromTemplate(entry, tpl, coreTpl);
@@ -2805,7 +3598,10 @@ public sealed class ShopEngine
         {
             var prices = _repo.GameMode.StandardPrices;
             entry.Attributes[ECardAttributeType.BuyPrice] = isFree ? 0 : prices.GetSkillBuyPrice(coreTier);
-            entry.Attributes[ECardAttributeType.SellPrice] = prices.GetSkillSellPrice(coreTier);
+            int stdSell = prices.GetSkillSellPrice(coreTier);
+            if ((ActiveRules ?? _run.CustomRules)?.HasMutator(MutatorCatalog.DoubleEconomy) == true)
+                stdSell *= 2;
+            entry.Attributes[ECardAttributeType.SellPrice] = stdSell;
         }
         return entry;
     }
@@ -2829,6 +3625,7 @@ public sealed class ShopEngine
             Owner = null,
             Socket = null,
             Section = null,
+            IsFreeCandidate = isFree,
             CoreCard = coreCard,
         };
         RunState.PopulateMetaFromTemplate(entry, tpl, coreTpl);
@@ -2849,7 +3646,7 @@ public sealed class ShopEngine
         }
         else
         {
-            var (buy, sell) = PriceFor(size, effectiveTier);
+            var (buy, sell) = PriceFor(size, effectiveTier, _repo.GameMode.StandardPrices);
             if (isFree)
                 entry.Attributes[ECardAttributeType.BuyPrice] = 0;
             else if (!entry.Attributes.TryGetValue(ECardAttributeType.BuyPrice, out int existingBuy) || existingBuy <= 0)
@@ -2857,7 +3654,10 @@ public sealed class ShopEngine
             else
                 entry.Attributes[ECardAttributeType.BuyPrice] = Math.Max(1, existingBuy);
             if (!entry.Attributes.TryGetValue(ECardAttributeType.SellPrice, out int existingSell) || existingSell <= 0)
-                entry.Attributes[ECardAttributeType.SellPrice] = sell;
+                existingSell = sell;
+            if ((ActiveRules ?? _run.CustomRules)?.HasMutator(MutatorCatalog.DoubleEconomy) == true && existingSell > 0)
+                existingSell *= 2;
+            entry.Attributes[ECardAttributeType.SellPrice] = existingSell;
         }
         return entry;
     }
@@ -2924,6 +3724,7 @@ public sealed class ShopEngine
             Owner = null,
             Socket = null,
             Section = null,
+            IsFreeCandidate = isFree,
             CoreCard = inst,
         };
         RunState.PopulateMetaFromTemplate(entry, tpl, inst.Template);
@@ -2997,23 +3798,19 @@ public sealed class ShopEngine
             entry.Attributes[ECardAttributeType.Flying] = 1;
 
         var prices = _repo.GameMode.StandardPrices;
+        var effectiveRules = ActiveRules ?? _run.CustomRules;
         if (entry.Type == ECardType.Item)
         {
             int buy = isFree ? 0 : RunState.ComputeCardBuyPrice(entry, inst, prices);
             entry.Attributes[ECardAttributeType.BuyPrice] = buy;
-
-            bool hasValueBonus = inst.BaseAttributes.ContainsKey("Value")
-                              || inst.PermanentAdd.ContainsKey("Value")
-                              || inst.PermanentMult.ContainsKey("Value")
-                              || inst.AuraAdd.ContainsKey("Value")
-                              || inst.AuraMult.ContainsKey("Value");
-            int valueBonus = hasValueBonus ? (int)Math.Round(inst.GetAttribute("Value")) : 0;
-            entry.Attributes[ECardAttributeType.SellPrice] = Math.Max(0, inst.GetSellPrice(prices) + valueBonus);
+            entry.Attributes[ECardAttributeType.SellPrice] =
+                RunState.ResolveAuthoritativeSellPrice(entry, inst, prices, effectiveRules);
         }
         else if (entry.Type == ECardType.Skill)
         {
             entry.Attributes[ECardAttributeType.BuyPrice] = isFree ? 0 : RunState.ComputeCardBuyPrice(entry, inst, prices);
-            entry.Attributes[ECardAttributeType.SellPrice] = Math.Max(0, inst.GetSellPrice(prices));
+            entry.Attributes[ECardAttributeType.SellPrice] =
+                RunState.ResolveAuthoritativeSellPrice(entry, inst, prices, effectiveRules);
         }
         else
         {
@@ -3143,11 +3940,81 @@ public sealed class ShopEngine
         };
     }
 
+    private static readonly JsonSerializerOptions RequirementJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
+    /// <summary>P2-06：统一展平单对象与数组（CombinedSelectionRequirements）两种形式的 SelectionRequirements 条目列表。</summary>
+    internal static IEnumerable<RuleNode> EnumerateSelectionRequirementNodes(
+        CardPool.CardTemplate? poolTpl,
+        BazaarCore.Models.CardTemplate? coreTpl)
+    {
+        bool yieldedFromCore = false;
+        if (coreTpl?.SelectionRequirements != null)
+        {
+            if (coreTpl.SelectionRequirements.CombinedSelectionRequirements is { Count: > 0 } combined)
+            {
+                foreach (var item in combined)
+                {
+                    if (item != null)
+                    {
+                        yieldedFromCore = true;
+                        yield return item;
+                    }
+                }
+            }
+            else
+            {
+                yieldedFromCore = true;
+                yield return coreTpl.SelectionRequirements;
+            }
+        }
+
+        if (!yieldedFromCore && poolTpl?.SelectionRequirements is { Count: > 0 })
+        {
+            foreach (var req in poolTpl.SelectionRequirements)
+            {
+                if (req != null)
+                    yield return req;
+            }
+        }
+    }
+
+    /// <summary>P2-06：从 TSelectionRequirement.ExtensionData["Consumes"] 解析官方 TTargetCardBase 消耗目标。</summary>
+    internal static RuleNode? TryExtractConsumesTarget(RuleNode? req)
+    {
+        if (req?.ExtensionData == null) return null;
+        if (!req.ExtensionData.TryGetValue("Consumes", out var el) || el.ValueKind != JsonValueKind.Object)
+            return null;
+        try
+        {
+            return el.Deserialize<RuleNode>(RequirementJsonOptions);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     internal static bool EvaluateRequirementNode(RuleNode? req, RuleExecutionContext ctx)
     {
         if (req == null) return true;
+        if (req.CombinedSelectionRequirements is { Count: > 0 } combined)
+            return combined.All(item => EvaluateRequirementNode(item, ctx));
         if (string.Equals(req.Type, "TSelectionRequirement", StringComparison.Ordinal))
-            return req.Prerequisites == null || req.Prerequisites.All(p => EvaluateRequirementNode(p, ctx));
+        {
+            bool prereqsOk = req.Prerequisites == null || req.Prerequisites.All(p => EvaluateRequirementNode(p, ctx));
+            if (!prereqsOk) return false;
+            var consumesTarget = TryExtractConsumesTarget(req);
+            if (consumesTarget != null)
+            {
+                var matched = TargetResolver.ResolveCards(consumesTarget, ctx);
+                if (matched.Count == 0)
+                    return false;
+            }
+            return true;
+        }
         if (req.Type.StartsWith("TPrerequisite", StringComparison.Ordinal))
             return ValueAndConditionEvaluator.EvaluatePrerequisite(req, ctx);
         return ValueAndConditionEvaluator.EvaluateRunOrPlayerCondition(req, ctx);
@@ -3161,6 +4028,8 @@ public sealed class ShopEngine
         static bool PassesRunOnly(RuleNode? node, RuleExecutionContext runCtx)
         {
             if (node == null) return true;
+            if (node.CombinedSelectionRequirements is { Count: > 0 } combined)
+                return combined.All(item => PassesRunOnly(item, runCtx));
             if (string.Equals(node.Type, "TSelectionRequirement", StringComparison.Ordinal))
                 return node.Prerequisites == null || node.Prerequisites.All(p => PassesRunOnly(p, runCtx));
             if (string.Equals(node.Type, "TPrerequisiteRun", StringComparison.Ordinal))
@@ -3168,15 +4037,10 @@ public sealed class ShopEngine
             return true;
         }
 
-        if (coreTpl?.SelectionRequirements != null && !PassesRunOnly(coreTpl.SelectionRequirements, ctx))
-            return false;
-        if (poolTpl?.SelectionRequirements is { Count: > 0 })
+        foreach (var req in EnumerateSelectionRequirementNodes(poolTpl, coreTpl))
         {
-            foreach (var req in poolTpl.SelectionRequirements)
-            {
-                if (!PassesRunOnly(req, ctx))
-                    return false;
-            }
+            if (!PassesRunOnly(req, ctx))
+                return false;
         }
         return true;
     }
@@ -3204,20 +4068,40 @@ public sealed class ShopEngine
         return !sawAnyRunPrereq;
     }
 
+    private static bool HasEncounterRuntimePrerequisites(
+        CardPool.CardTemplate? poolTpl,
+        BazaarCore.Models.CardTemplate? coreTpl)
+    {
+        if (coreTpl?.SelectionRequirements != null) return true;
+        if (poolTpl?.SelectionRequirements is { Count: > 0 }) return true;
+        var spawnContext = coreTpl?.SelectionContext?.SpawnContext ?? poolTpl?.SelectionContext?.SpawnContext;
+        if (spawnContext?.Groups is { Count: > 0 } groups)
+        {
+            for (int i = 0; i < groups.Count; i++)
+            {
+                var prereqs = groups[i].Prerequisites;
+                if (prereqs is { Count: > 0 })
+                {
+                    for (int j = 0; j < prereqs.Count; j++)
+                    {
+                        if (string.Equals(prereqs[j].Type, "TPrerequisiteRun", StringComparison.Ordinal))
+                            return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     private bool CheckEncounterRequirements(
         CardPool.CardTemplate? poolTpl,
         BazaarCore.Models.CardTemplate? coreTpl,
         RuleExecutionContext ctx)
     {
-        if (coreTpl?.SelectionRequirements != null && !EvaluateRequirementNode(coreTpl.SelectionRequirements, ctx))
-            return false;
-        if (poolTpl?.SelectionRequirements is { Count: > 0 })
+        foreach (var req in EnumerateSelectionRequirementNodes(poolTpl, coreTpl))
         {
-            foreach (var req in poolTpl.SelectionRequirements)
-            {
-                if (!EvaluateRequirementNode(req, ctx))
-                    return false;
-            }
+            if (!EvaluateRequirementNode(req, ctx))
+                return false;
         }
 
         var spawnContext = coreTpl?.SelectionContext?.SpawnContext ?? poolTpl?.SelectionContext?.SpawnContext;
@@ -3227,12 +4111,23 @@ public sealed class ShopEngine
         return true;
     }
 
-    private bool HasPlayableEncounterPayload(CardPool.CardTemplate tpl)
+    /// <summary>
+    /// P0-16：校验事件遭遇是否具备可执行载荷（除 SpawnContext / NextEncounterOnSelection 外，
+    /// 同步放行含 TTriggerOnCardSelected 直效动作或 ExperienceAwardUponSelection &gt; 0 的 10 张直效/纯 XP 卡）。
+    /// </summary>
+    public bool HasPlayableEncounterPayload(CardPool.CardTemplate tpl)
     {
         if (tpl.SelectionContext?.SpawnContext != null) return true;
+        if (tpl.NextEncounterOnSelection is { Count: > 0 }) return true;
+        if (tpl.ExperienceAwardUponSelection > 0) return true;
         var core = _repo.GetCard(tpl.Id);
-        return core?.SelectionContext?.SpawnContext != null
-            || (core?.NextEncounterOnSelection is { Count: > 0 });
+        if (core == null) return false;
+        if (core.SelectionContext?.SpawnContext != null) return true;
+        if (core.NextEncounterOnSelection is { Count: > 0 }) return true;
+        if ((core.ExperienceAwardUponSelection ?? 0) > 0) return true;
+        return core.Abilities.Values.Any(a =>
+            a.Trigger != null &&
+            string.Equals(a.Trigger.Type, "TTriggerOnCardSelected", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>计算单张候选卡在货架上占用的格子宽度（Small/Tiny=1, Medium=2, Large=3）。</summary>
@@ -3462,24 +4357,23 @@ public sealed class ShopEngine
         _ => ECardType.Item,
     };
 
-    public static (int Buy, int Sell) PriceFor(ECardSize size, ETier tier)
-    {
-        int s = Math.Clamp((int)size - 1, 0, 2);
-        int t = Math.Clamp((int)tier, 0, 4);
+    private static readonly StandardPricesSettings DefaultStandardPrices = new();
 
-        int[,] buy =
-        {
-            { 2, 4, 8, 16, 24 },
-            { 4, 8, 16, 32, 48 },
-            { 6, 12, 24, 48, 64 },
-        };
-        int[,] sell =
-        {
-            { 1, 2, 4, 8, 12 },
-            { 2, 4, 8, 16, 24 },
-            { 3, 6, 12, 24, 32 },
-        };
-        return (buy[s, t], sell[s, t]);
+    public static CardSize ToCoreSize(ECardSize s) => s switch
+    {
+        ECardSize.Small => CardSize.Small,
+        ECardSize.Large => CardSize.Large,
+        _ => CardSize.Medium,
+    };
+
+    /// <summary>P2-38：统一收口至 GameMode.StandardPrices 单一信源（缺省回退 StandardPricesSettings 官方默认表，消除双轨硬编码）。</summary>
+    public static (int Buy, int Sell) PriceFor(ECardSize size, ETier tier, StandardPricesSettings? prices = null)
+    {
+        var effectivePrices = prices ?? DefaultStandardPrices;
+        var coreSize = ToCoreSize(size);
+        var coreTier = ToCoreTier(tier);
+        return (effectivePrices.GetItemBuyPrice(coreSize, coreTier),
+                effectivePrices.GetItemSellPrice(coreSize, coreTier));
     }
 
     public static ECardSize ParseSize(string s) => s switch

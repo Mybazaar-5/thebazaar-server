@@ -803,10 +803,26 @@ public sealed class V4RunOrchestratorIntegrationTests
         Assert.Equal(shopId, restoredRun.CurrentEncounterId);
         Assert.Equal(expectedRerollCost, restoredRun.RerollCost);
         Assert.Equal(expectedRerollsRemaining, restoredRun.RerollsRemaining);
-        Assert.Equal(
-            expectedRemainingShelfIds,
-            restoredRun.SelectionSet.OrderBy(x => x, StringComparer.Ordinal).ToList());
-        Assert.All(expectedRemainingShelfIds, id => Assert.True(restoredRun.Cards.ContainsKey(id)));
+        // P1-32（#80 批准校准）：弹栈恢复非 Hour 6 商店货架时重签全新 InstanceId（避免客户端 DisposedCards 拒收已销毁旧 ID），
+        // 校验还原卡数量、TemplateId、Tier、BuyPrice 与挂起前精确一致，且新 ID 全部存在、无碰撞
+        Assert.Equal(savedShelfCards.Count, restoredRun.SelectionSet.Count);
+        Assert.Equal(savedShelfCards.Count, restoredRun.SelectionSet.Distinct(StringComparer.Ordinal).Count());
+        Assert.All(restoredRun.SelectionSet, id =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(id));
+            Assert.True(restoredRun.Cards.ContainsKey(id));
+            Assert.DoesNotContain(id, expectedRemainingShelfIds);
+        });
+        var expectedShelfSig = savedShelfCards
+            .Select(c => (c.TemplateId, c.Tier, c.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0)))
+            .OrderBy(x => x.TemplateId).ThenBy(x => x.Tier).ThenBy(x => x.Item3)
+            .ToList();
+        var actualShelfSig = restoredRun.SelectionSet
+            .Select(id => restoredRun.Cards[id])
+            .Select(c => (c.TemplateId, c.Tier, c.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0)))
+            .OrderBy(x => x.TemplateId).ThenBy(x => x.Tier).ThenBy(x => x.Item3)
+            .ToList();
+        Assert.Equal(expectedShelfSig, actualShelfSig);
         Assert.Contains(afterLvlOut.Events, e => e is GameSimEventInterruptStateExited ixe && ixe.ExitedState == ERunState.LevelUp && ixe.IsInterrupt);
     }
 

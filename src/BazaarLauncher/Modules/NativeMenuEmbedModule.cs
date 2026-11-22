@@ -57,8 +57,9 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
     private readonly List<NativeWorkshopTabDescriptor> _workshopTabs = new();
     private int _nextDynamicSentinelId = 9100;
 
-    // 主大厅原生嵌入模式选择器运行时引用
+    // 主大厅原生嵌入模式选择器与克隆按钮运行时引用（P2-41：热卸载时全量回收）
     private GameObject _embeddedLobbyModeBarGo;
+    private readonly List<GameObject> _clonedButtons = new();
     private readonly Dictionary<string, (Image Bg, Image Border, TextMeshProUGUI Label)> _lobbyModeChips = new(StringComparer.OrdinalIgnoreCase);
     private TextMeshProUGUI _lobbyModeHintText;
     private string _selectedQuickModeId = "classic";
@@ -102,7 +103,48 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 _embeddedLobbyModeBarGo = null;
                 _lobbyModeChips.Clear();
             }
+
+            // P2-41：热卸载时销毁全部注入到 FightMenuDialog / OptionsDialogController 的克隆按钮，杜绝菜单留僵尸按钮
+            for (int i = 0; i < _clonedButtons.Count; i++)
+            {
+                var btnGo = _clonedButtons[i];
+                if (btnGo != null)
+                {
+                    UnityEngine.Object.Destroy(btnGo);
+                }
+            }
+            _clonedButtons.Clear();
         });
+    }
+
+    private void TrackClonedButton(GameObject clonedGo)
+    {
+        if (clonedGo == null) return;
+        for (int i = _clonedButtons.Count - 1; i >= 0; i--)
+        {
+            if (_clonedButtons[i] == null)
+            {
+                _clonedButtons.RemoveAt(i);
+            }
+        }
+        _clonedButtons.Add(clonedGo);
+    }
+
+    private static void StripNativeButtonCustomComponents(GameObject clonedGo)
+    {
+        if (clonedGo == null) return;
+        var customBtnType = GameInspector.FindTypeSafe("ButtonCustom", "TheBazaar.ButtonCustom");
+        if (customBtnType == null) return;
+
+        var comps = clonedGo.GetComponentsInChildren(customBtnType, includeInactive: true);
+        if (comps == null || comps.Length == 0) return;
+        for (int i = 0; i < comps.Length; i++)
+        {
+            if (comps[i] != null)
+            {
+                UnityEngine.Object.Destroy(comps[i]);
+            }
+        }
     }
 
     public void OnUnload()
@@ -826,14 +868,10 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 GameObject cloned = UnityEngine.Object.Instantiate(templateBtn.gameObject, container, worldPositionStays: false);
                 cloned.name = goName;
                 cloned.SetActive(true);
+                Instance.TrackClonedButton(cloned);
 
                 // 移除克隆体上的 ButtonCustom，避免其 Start() 额外绑定导致重复或误触原生逻辑
-                var customBtnType = GameInspector.FindTypeSafe("ButtonCustom");
-                if (customBtnType != null)
-                {
-                    var customComp = cloned.GetComponent(customBtnType);
-                    if (customComp != null) UnityEngine.Object.Destroy(customComp);
-                }
+                StripNativeButtonCustomComponents(cloned);
 
                 // 剥离原版持久化监听并绑定新回调；关闭弹窗必须调用原生 HideDialogs()，绝不能停用 __instance.gameObject（否则会注销 ESC 监听！）
                 Button btn = cloned.GetComponent<Button>();
@@ -900,6 +938,10 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 GameObject cloned = UnityEngine.Object.Instantiate(gameplayBtn.gameObject, container, worldPositionStays: false);
                 cloned.name = goName;
                 cloned.SetActive(true);
+                Instance.TrackClonedButton(cloned);
+
+                // P2-41：剥离克隆自 _gameplayButton 的 ButtonCustom 组件，防止点击自定义分栏误触原生按钮样式/回调
+                StripNativeButtonCustomComponents(cloned);
 
                 Button btn = cloned.GetComponent<Button>();
                 if (btn != null)

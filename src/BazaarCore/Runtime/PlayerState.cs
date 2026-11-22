@@ -58,19 +58,37 @@ public sealed class PlayerState
 
     /// <summary>本小时临时玩家属性（UntilEndOfHour）。</summary>
     public Dictionary<string, double> HourAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> HourAdditiveMult { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> HourMult { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>当日临时玩家属性（UntilEndOfDay）。</summary>
     public Dictionary<string, double> DayAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> DayAdditiveMult { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> DayMult { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>单场战斗临时玩家属性（UntilEndOfCombat / TCombatDuration）。</summary>
     public Dictionary<string, double> CombatAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> CombatAdditiveMult { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> CombatMult { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>单场战斗零乘数（Multiply 0.0）引用计数，避免覆写破坏 CombatMult 非零连乘值，到期减 1 无损恢复。</summary>
+    public Dictionary<string, int> CombatZeroMultCount { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>光环动态加成属性。</summary>
     public Dictionary<string, double> AuraAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> AuraAdditiveMult { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> AuraMult { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    // 各层纯乘法因子与最近一次同步到公开 *Mult 字典的组合值镜像：
+    // 既保证 AdditiveMultiply（加权初值 0.0）与 Multiply（连乘初值 1.0）彻底解耦、遍历顺序无关，
+    // 又使 RunEngine/EncounterStepEngine 读取公开 HourMult/DayMult/AuraMult 时获得完整等效乘区且支持外部直写。
+    private readonly Dictionary<string, double> _hourPureMult = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _hourSyncedMult = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _dayPureMult = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _daySyncedMult = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _combatPureMult = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _combatSyncedMult = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _auraPureMult = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _auraSyncedMult = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>由 CloneForCombat() 记录的克隆体与原玩家卡牌同 InstanceId 源引用映射。</summary>
     public Dictionary<string, CardInstance>? CombatSourceCardMap { get; private set; }
@@ -121,7 +139,7 @@ public sealed class PlayerState
         CurrentHealth = initialHealthMax;
     }
 
-    public int HealthMax => Math.Max(1, (int)Math.Round(GetAttribute("HealthMax")));
+    public int HealthMax => (int)Math.Clamp(Math.Round(GetAttribute("HealthMax")), 1, int.MaxValue);
     public int Gold
     {
         get => (int)Math.Round(GetAttribute("Gold"));
@@ -147,31 +165,127 @@ public sealed class PlayerState
     public bool IsEnraged => EnragedRemainingMs > 0;
     public bool IsAlive => CurrentHealth > 0;
 
-    public double GetAttributeUnscaled(string attr)
-        => Attributes.GetValueOrDefault(attr, 0);
+    public double GetAttributeUnscaled(string attr) => attr switch
+    {
+        "Enraged" => EnragedRemainingMs > 0
+            ? 1.0
+            : (CombatAdd.TryGetValue("Enraged", out var cEnr) ? cEnr : Attributes.GetValueOrDefault("Enraged", 0)),
+        "EnragedDuration" => EnragedRemainingMs > 0
+            ? EnragedRemainingMs
+            : (CombatAdd.TryGetValue("EnragedDuration", out var cDur) ? cDur : Attributes.GetValueOrDefault("EnragedDuration", 0)),
+        _ => Attributes.GetValueOrDefault(attr, 0)
+    };
+
+    private static (double Additive, double Pure) GetLayerMultipliers(
+        string attr,
+        Dictionary<string, double> additiveDict,
+        Dictionary<string, double> pureDict,
+        Dictionary<string, double> syncedDict,
+        Dictionary<string, double> exposedMultDict)
+    {
+        double additive = additiveDict.GetValueOrDefault(attr, 0.0);
+        if (exposedMultDict.TryGetValue(attr, out double exposed))
+        {
+            if (syncedDict.TryGetValue(attr, out double lastSynced) && Math.Abs(exposed - lastSynced) <= 1e-9)
+                return (additive, pureDict.GetValueOrDefault(attr, 1.0));
+            return (additive, exposed);
+        }
+        return (additive, pureDict.GetValueOrDefault(attr, 1.0));
+    }
+
+    private static void SeedPureMultIfExternallySet(
+        string attr,
+        Dictionary<string, double> additiveDict,
+        Dictionary<string, double> pureDict,
+        Dictionary<string, double> syncedDict,
+        Dictionary<string, double> exposedMultDict)
+    {
+        if (exposedMultDict.TryGetValue(attr, out double exposed)
+            && !pureDict.ContainsKey(attr)
+            && !additiveDict.ContainsKey(attr)
+            && !syncedDict.ContainsKey(attr))
+        {
+            pureDict[attr] = exposed;
+        }
+    }
+
+    private static void SyncLayerExposedMult(
+        string attr,
+        Dictionary<string, double> additiveDict,
+        Dictionary<string, double> pureDict,
+        Dictionary<string, double> syncedDict,
+        Dictionary<string, double> exposedMultDict,
+        int zeroMultCount = 0)
+    {
+        bool hasAdd = additiveDict.TryGetValue(attr, out double additive) && Math.Abs(additive) > 1e-9;
+        bool hasPure = pureDict.TryGetValue(attr, out double pure) && Math.Abs(pure - 1.0) > 1e-9;
+        if (!hasAdd) additive = 0.0;
+        if (!hasPure) pure = 1.0;
+
+        if (!hasAdd && !hasPure && zeroMultCount <= 0)
+        {
+            exposedMultDict.Remove(attr);
+            syncedDict.Remove(attr);
+            return;
+        }
+
+        double combined = zeroMultCount > 0 ? 0.0 : (1.0 + additive) * pure;
+        exposedMultDict[attr] = combined;
+        syncedDict[attr] = combined;
+    }
 
     public double GetAttribute(string attr)
     {
+        double basePoolVal;
         switch (attr)
         {
-            case "Health": return CurrentHealth;
-            case "Shield": return Shield;
-            case "Burn": return Burn;
-            case "Poison": return Poison;
-            case "Rage": return Rage;
-            case "Tempo": return Tempo;
+            case "Health":
+                return CurrentHealth;
+            case "Shield":
+                basePoolVal = Shield;
+                break;
+            case "Burn":
+                basePoolVal = Burn;
+                break;
+            case "Poison":
+                basePoolVal = Poison;
+                break;
+            case "Rage":
+                basePoolVal = Rage;
+                break;
+            case "Tempo":
+                basePoolVal = Tempo;
+                break;
+            case "Enraged":
+                return EnragedRemainingMs > 0
+                    ? 1.0
+                    : (CombatAdd.TryGetValue("Enraged", out var cEnr) ? cEnr : Attributes.GetValueOrDefault("Enraged", 0));
+            case "EnragedDuration":
+                return EnragedRemainingMs > 0
+                    ? EnragedRemainingMs
+                    : (CombatAdd.TryGetValue("EnragedDuration", out var cDur) ? cDur : Attributes.GetValueOrDefault("EnragedDuration", 0));
+            default:
+                basePoolVal = Attributes.GetValueOrDefault(attr, 0);
+                break;
         }
-        var baseVal = Attributes.GetValueOrDefault(attr, 0)
+
+        // 修复 P2-24：保留 Health 直读语义；Shield/Burn/Poison/Rage/Tempo 在保留实时池基值的基础上叠加 AuraAdd/CombatAdd 及乘区
+        var baseVal = basePoolVal
                     + HourAdd.GetValueOrDefault(attr, 0)
                     + DayAdd.GetValueOrDefault(attr, 0)
                     + CombatAdd.GetValueOrDefault(attr, 0)
                     + AuraAdd.GetValueOrDefault(attr, 0);
-        double mult = 1.0;
-        if (HourMult.TryGetValue(attr, out var hm)) mult *= hm;
-        if (DayMult.TryGetValue(attr, out var dm)) mult *= dm;
-        if (CombatMult.TryGetValue(attr, out var cm)) mult *= cm;
-        if (AuraMult.TryGetValue(attr, out var am)) mult *= am;
-        return baseVal * mult;
+
+        var (hAdd, hPure) = GetLayerMultipliers(attr, HourAdditiveMult, _hourPureMult, _hourSyncedMult, HourMult);
+        var (dAdd, dPure) = GetLayerMultipliers(attr, DayAdditiveMult, _dayPureMult, _daySyncedMult, DayMult);
+        var (cAdd, cPure) = GetLayerMultipliers(attr, CombatAdditiveMult, _combatPureMult, _combatSyncedMult, CombatMult);
+        var (aAdd, aPure) = GetLayerMultipliers(attr, AuraAdditiveMult, _auraPureMult, _auraSyncedMult, AuraMult);
+
+        double totalAdditiveMult = hAdd + dAdd + cAdd + aAdd;
+        double totalMult = (CombatZeroMultCount.Count > 0 && CombatZeroMultCount.GetValueOrDefault(attr, 0) > 0)
+            ? 0.0
+            : (hPure * dPure * cPure * aPure);
+        return baseVal * (1.0 + totalAdditiveMult) * totalMult;
     }
 
     public void ModifyAttribute(string attr, string operation, double value)
@@ -179,15 +293,26 @@ public sealed class PlayerState
 
     public void ModifyAttribute(string attr, string operation, double value, DurationTarget target)
     {
-        // 战斗实时池（Health/Shield/Burn/Poison/Rage/Tempo）直接作用于实时属性
-        if (attr is "Health" or "Shield" or "Burn" or "Poison" or "Rage" or "Tempo")
+        // 战斗实时池（Health/Shield/Burn/Poison/Rage/Tempo/Enraged/EnragedDuration）直接作用于实时属性，绝不污染永久 Attributes；
+        // 对实时池增减取裸实时字段而非含光环层的 GetAttribute，防止将光环加成重复烘入实时池（P2-24）。
+        if (attr is "Health" or "Shield" or "Burn" or "Poison" or "Rage" or "Tempo" or "Enraged" or "EnragedDuration")
         {
-            double curRt = GetAttribute(attr);
+            double curRt = attr switch
+            {
+                "Health" => CurrentHealth,
+                "Shield" => Shield,
+                "Burn" => Burn,
+                "Poison" => Poison,
+                "Rage" => Rage,
+                "Tempo" => Tempo,
+                _ => GetAttribute(attr)
+            };
             double nextRt = operation switch
             {
                 "Subtract" => curRt - value,
                 "Multiply" => curRt * value,
                 "AdditiveMultiply" => curRt * (1.0 + value),
+                "Set" => value,
                 _ => curRt + value
             };
 
@@ -211,6 +336,34 @@ public sealed class PlayerState
                 case "Tempo":
                     Tempo = Math.Max(0, (int)Math.Round(nextRt));
                     break;
+                case "Enraged":
+                    if (nextRt <= 0)
+                    {
+                        EnragedRemainingMs = 0;
+                        CombatAdd.Remove("Enraged");
+                        CombatAdd.Remove("EnragedDuration");
+                    }
+                    else
+                    {
+                        if (EnragedRemainingMs <= 0)
+                            EnragedRemainingMs = Math.Max(1000, (int)Math.Round(GetAttribute("EnragedDurationMax")));
+                        CombatAdd["Enraged"] = 1.0;
+                        CombatAdd["EnragedDuration"] = EnragedRemainingMs;
+                    }
+                    break;
+                case "EnragedDuration":
+                    EnragedRemainingMs = Math.Max(0, (int)Math.Round(nextRt));
+                    if (EnragedRemainingMs > 0)
+                    {
+                        CombatAdd["Enraged"] = 1.0;
+                        CombatAdd["EnragedDuration"] = EnragedRemainingMs;
+                    }
+                    else
+                    {
+                        CombatAdd.Remove("Enraged");
+                        CombatAdd.Remove("EnragedDuration");
+                    }
+                    break;
             }
             return;
         }
@@ -223,6 +376,7 @@ public sealed class PlayerState
                 "Subtract" => cur - value,
                 "Multiply" => cur * value,
                 "AdditiveMultiply" => cur * (1.0 + value),
+                "Set" => value,
                 _ => cur + value
             };
             Attributes[attr] = next;
@@ -235,11 +389,11 @@ public sealed class PlayerState
             return;
         }
 
-        var (addDict, multDict) = target switch
+        var (addDict, addMultDict, pureDict, syncedDict, exposedMultDict) = target switch
         {
-            DurationTarget.Hour => (HourAdd, HourMult),
-            DurationTarget.Day => (DayAdd, DayMult),
-            _ => (CombatAdd, CombatMult)
+            DurationTarget.Hour => (HourAdd, HourAdditiveMult, _hourPureMult, _hourSyncedMult, HourMult),
+            DurationTarget.Day => (DayAdd, DayAdditiveMult, _dayPureMult, _daySyncedMult, DayMult),
+            _ => (CombatAdd, CombatAdditiveMult, _combatPureMult, _combatSyncedMult, CombatMult)
         };
 
         double prevEff = GetAttribute(attr);
@@ -249,11 +403,30 @@ public sealed class PlayerState
                 addDict[attr] = addDict.GetValueOrDefault(attr, 0) - value;
                 break;
             case "Multiply":
-                multDict[attr] = multDict.GetValueOrDefault(attr, 1.0) * value;
+                SeedPureMultIfExternallySet(attr, addMultDict, pureDict, syncedDict, exposedMultDict);
+                if (target == DurationTarget.Combat && Math.Abs(value) < 1e-9)
+                {
+                    CombatZeroMultCount[attr] = CombatZeroMultCount.GetValueOrDefault(attr, 0) + 1;
+                }
+                else
+                {
+                    double nextPure = pureDict.GetValueOrDefault(attr, 1.0) * value;
+                    if (Math.Abs(nextPure - 1.0) < 1e-9) pureDict.Remove(attr);
+                    else pureDict[attr] = nextPure;
+                }
+                SyncLayerExposedMult(attr, addMultDict, pureDict, syncedDict, exposedMultDict,
+                    target == DurationTarget.Combat ? CombatZeroMultCount.GetValueOrDefault(attr, 0) : 0);
                 break;
             case "AdditiveMultiply":
-                multDict[attr] = multDict.GetValueOrDefault(attr, 1.0) + value;
+            {
+                SeedPureMultIfExternallySet(attr, addMultDict, pureDict, syncedDict, exposedMultDict);
+                double nextAddMult = addMultDict.GetValueOrDefault(attr, 0.0) + value;
+                if (Math.Abs(nextAddMult) < 1e-9) addMultDict.Remove(attr);
+                else addMultDict[attr] = nextAddMult;
+                SyncLayerExposedMult(attr, addMultDict, pureDict, syncedDict, exposedMultDict,
+                    target == DurationTarget.Combat ? CombatZeroMultCount.GetValueOrDefault(attr, 0) : 0);
                 break;
+            }
             default:
                 addDict[attr] = addDict.GetValueOrDefault(attr, 0) + value;
                 break;
@@ -267,6 +440,58 @@ public sealed class PlayerState
         }
     }
 
+    public void RevertCombatAttributeModifier(string attr, string operation, double value)
+    {
+        switch (operation)
+        {
+            case "Subtract":
+            {
+                double next = CombatAdd.GetValueOrDefault(attr, 0) + value;
+                if (Math.Abs(next) < 1e-9) CombatAdd.Remove(attr);
+                else CombatAdd[attr] = next;
+                break;
+            }
+            case "Multiply":
+            {
+                if (Math.Abs(value) < 1e-9)
+                {
+                    if (CombatZeroMultCount.TryGetValue(attr, out int cnt))
+                    {
+                        if (cnt <= 1) CombatZeroMultCount.Remove(attr);
+                        else CombatZeroMultCount[attr] = cnt - 1;
+                    }
+                }
+                else
+                {
+                    SeedPureMultIfExternallySet(attr, CombatAdditiveMult, _combatPureMult, _combatSyncedMult, CombatMult);
+                    double next = _combatPureMult.GetValueOrDefault(attr, 1.0) / value;
+                    if (Math.Abs(next - 1.0) < 1e-9) _combatPureMult.Remove(attr);
+                    else _combatPureMult[attr] = next;
+                }
+                SyncLayerExposedMult(attr, CombatAdditiveMult, _combatPureMult, _combatSyncedMult, CombatMult,
+                    CombatZeroMultCount.GetValueOrDefault(attr, 0));
+                break;
+            }
+            case "AdditiveMultiply":
+            {
+                SeedPureMultIfExternallySet(attr, CombatAdditiveMult, _combatPureMult, _combatSyncedMult, CombatMult);
+                double next = CombatAdditiveMult.GetValueOrDefault(attr, 0.0) - value;
+                if (Math.Abs(next) < 1e-9) CombatAdditiveMult.Remove(attr);
+                else CombatAdditiveMult[attr] = next;
+                SyncLayerExposedMult(attr, CombatAdditiveMult, _combatPureMult, _combatSyncedMult, CombatMult,
+                    CombatZeroMultCount.GetValueOrDefault(attr, 0));
+                break;
+            }
+            default: // Add
+            {
+                double next = CombatAdd.GetValueOrDefault(attr, 0) - value;
+                if (Math.Abs(next) < 1e-9) CombatAdd.Remove(attr);
+                else CombatAdd[attr] = next;
+                break;
+            }
+        }
+    }
+
     public void ApplyAuraAttribute(string attr, string operation, double value)
     {
         switch (operation)
@@ -275,11 +500,23 @@ public sealed class PlayerState
                 AuraAdd[attr] = AuraAdd.GetValueOrDefault(attr, 0) - value;
                 break;
             case "Multiply":
-                AuraMult[attr] = AuraMult.GetValueOrDefault(attr, 1.0) * value;
+            {
+                SeedPureMultIfExternallySet(attr, AuraAdditiveMult, _auraPureMult, _auraSyncedMult, AuraMult);
+                double nextPure = _auraPureMult.GetValueOrDefault(attr, 1.0) * value;
+                if (Math.Abs(nextPure - 1.0) < 1e-9) _auraPureMult.Remove(attr);
+                else _auraPureMult[attr] = nextPure;
+                SyncLayerExposedMult(attr, AuraAdditiveMult, _auraPureMult, _auraSyncedMult, AuraMult);
                 break;
+            }
             case "AdditiveMultiply":
-                AuraMult[attr] = AuraMult.GetValueOrDefault(attr, 1.0) + value;
+            {
+                SeedPureMultIfExternallySet(attr, AuraAdditiveMult, _auraPureMult, _auraSyncedMult, AuraMult);
+                double nextAddMult = AuraAdditiveMult.GetValueOrDefault(attr, 0.0) + value;
+                if (Math.Abs(nextAddMult) < 1e-9) AuraAdditiveMult.Remove(attr);
+                else AuraAdditiveMult[attr] = nextAddMult;
+                SyncLayerExposedMult(attr, AuraAdditiveMult, _auraPureMult, _auraSyncedMult, AuraMult);
                 break;
+            }
             default:
                 AuraAdd[attr] = AuraAdd.GetValueOrDefault(attr, 0) + value;
                 break;
@@ -289,13 +526,19 @@ public sealed class PlayerState
     public void ClearAuraModifiers()
     {
         AuraAdd.Clear();
+        AuraAdditiveMult.Clear();
         AuraMult.Clear();
+        _auraPureMult.Clear();
+        _auraSyncedMult.Clear();
     }
 
     public void ClearEndOfHourModifiers()
     {
         HourAdd.Clear();
+        HourAdditiveMult.Clear();
         HourMult.Clear();
+        _hourPureMult.Clear();
+        _hourSyncedMult.Clear();
         foreach (var c in EnumerateAllOwnedCards())
             c.ClearEndOfHourModifiers();
         CurrentHealth = Math.Min(CurrentHealth, HealthMax);
@@ -304,7 +547,10 @@ public sealed class PlayerState
     public void ClearEndOfDayModifiers()
     {
         DayAdd.Clear();
+        DayAdditiveMult.Clear();
         DayMult.Clear();
+        _dayPureMult.Clear();
+        _daySyncedMult.Clear();
         foreach (var c in EnumerateAllOwnedCards())
             c.ClearEndOfDayModifiers();
         CurrentHealth = Math.Min(CurrentHealth, HealthMax);
@@ -313,7 +559,11 @@ public sealed class PlayerState
     public void PrepareForCombat()
     {
         CombatAdd.Clear();
+        CombatAdditiveMult.Clear();
         CombatMult.Clear();
+        CombatZeroMultCount.Clear();
+        _combatPureMult.Clear();
+        _combatSyncedMult.Clear();
         CurrentHealth = HealthMax;
         Shield = 0;
         Burn = 0;
@@ -321,6 +571,7 @@ public sealed class PlayerState
         Rage = 0;
         EnragedRemainingMs = 0;
         Tempo = 0;
+        PortraitIndex = 0;
         foreach (var c in Hand.Cards) c.ResetForCombat(null);
         foreach (var c in Stash.Cards) c.ResetForCombat(null);
         foreach (var s in Skills) s.ResetForCombat(null);
@@ -347,9 +598,15 @@ public sealed class PlayerState
         clone.ExclusionSetInitialized = ExclusionSetInitialized;
         foreach (var (k, v) in Attributes) clone.Attributes[k] = v;
         foreach (var (k, v) in HourAdd) clone.HourAdd[k] = v;
+        foreach (var (k, v) in HourAdditiveMult) clone.HourAdditiveMult[k] = v;
         foreach (var (k, v) in HourMult) clone.HourMult[k] = v;
+        foreach (var (k, v) in _hourPureMult) clone._hourPureMult[k] = v;
+        foreach (var (k, v) in _hourSyncedMult) clone._hourSyncedMult[k] = v;
         foreach (var (k, v) in DayAdd) clone.DayAdd[k] = v;
+        foreach (var (k, v) in DayAdditiveMult) clone.DayAdditiveMult[k] = v;
         foreach (var (k, v) in DayMult) clone.DayMult[k] = v;
+        foreach (var (k, v) in _dayPureMult) clone._dayPureMult[k] = v;
+        foreach (var (k, v) in _daySyncedMult) clone._daySyncedMult[k] = v;
 
         var sourceMap = new Dictionary<string, CardInstance>(StringComparer.Ordinal);
         foreach (var c in Hand.Cards)

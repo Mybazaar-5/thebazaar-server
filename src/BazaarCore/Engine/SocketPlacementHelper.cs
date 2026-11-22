@@ -8,7 +8,7 @@ namespace BazaarCore.Engine;
 /// 棋盘 SocketEffect（灶台/冰格/音符）拓扑放置与音符合法性判定辅助器，
 /// 复刻官方 SocketedContainer 槽位占位、孤立防相邻及音符模 7 音阶匹配规则。
 /// </summary>
-internal static class SocketPlacementHelper
+public static class SocketPlacementHelper
 {
     public const int SocketCount = BoardGrid.Capacity;
     public const int MusicNoteCount = 7;
@@ -147,12 +147,18 @@ internal static class SocketPlacementHelper
         return false;
     }
 
+    /// <summary>
+    /// 在棋盘插座层放置 SocketEffect；当 <paramref name="avoidAdjacent"/> 为 true 且 <paramref name="strictIsolated"/> 为 true 时，
+    /// 若无可用孤立槽位则严格返回 false（P2-37：对齐官方 SocketedContainer.GetIsolatedSocket 无解返回 null 语义）；
+    /// 默认 <paramref name="strictIsolated"/> 为 false 保持兼容回退。
+    /// </summary>
     public static bool TryPlaceSocketEffect(
         PlayerState receiver,
         CardInstance card,
         bool avoidAdjacent,
         Random rng,
-        out CardInstance? overwrittenSocketEffect)
+        out CardInstance? overwrittenSocketEffect,
+        bool strictIsolated = false)
     {
         overwrittenSocketEffect = null;
 
@@ -205,6 +211,8 @@ internal static class SocketPlacementHelper
             }
             if (isolated.Count > 0)
                 pickFrom = isolated;
+            else if (strictIsolated)
+                return false;
         }
 
         card.StartSlot = pickFrom[rng.Next(pickFrom.Count)];

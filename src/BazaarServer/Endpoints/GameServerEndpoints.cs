@@ -14,13 +14,16 @@ using BazaarServer.Game;
 using BazaarServer.Mods;
 using BazaarServer.Protocol;
 using BazaarServer.Storage;
+using BazaarServer.TempoNet;
 
 namespace BazaarServer.Endpoints;
 
 public static class GameServerEndpoints
 {
-    private const int MaxRidCacheEntriesPerSession = 64;
-    private const int MaxRidCacheSessions = 1024;
+    /// <summary>P0-21：按 runId 维度跨 sid 保留最近 8 条幂等命令指纹 (reqRid, commandSha256, responsePayload)。</summary>
+    public const int MaxRidCacheEntriesPerRun = 8;
+    private const int MaxRidCacheRuns = 1024;
+    private const long OrphanRunRidCacheExpireMs = 60L * 60 * 1000;
 
     private sealed class CachedCommandResponse
     {
@@ -29,81 +32,307 @@ public static class GameServerEndpoints
         public required long ResponseRid { get; init; }
     }
 
-    private sealed class SessionRidCache
+    private sealed class RunRidCache
     {
+        private readonly object _sync = new();
         private readonly Dictionary<long, CachedCommandResponse> _entries = new();
         private readonly Queue<long> _order = new();
         public long LastAccessTick { get; private set; } = Environment.TickCount64;
 
         public bool TryGetMatch(long reqRid, ReadOnlySpan<byte> commandSha256, out CachedCommandResponse? cached)
         {
-            LastAccessTick = Environment.TickCount64;
-            if (_entries.TryGetValue(reqRid, out var entry) &&
-                CryptographicOperations.FixedTimeEquals(entry.CommandSha256, commandSha256))
+            lock (_sync)
             {
-                cached = entry;
-                return true;
+                LastAccessTick = Environment.TickCount64;
+                if (_entries.TryGetValue(reqRid, out var entry) &&
+                    CryptographicOperations.FixedTimeEquals(entry.CommandSha256, commandSha256))
+                {
+                    cached = entry;
+                    return true;
+                }
+                cached = null;
+                return false;
             }
-            cached = null;
-            return false;
         }
 
         public void Store(long reqRid, byte[] commandSha256, byte[] payload, long responseRid)
         {
-            LastAccessTick = Environment.TickCount64;
-            if (!_entries.ContainsKey(reqRid))
+            lock (_sync)
             {
-                while (_order.Count >= MaxRidCacheEntriesPerSession)
+                LastAccessTick = Environment.TickCount64;
+                if (!_entries.ContainsKey(reqRid))
                 {
-                    long oldest = _order.Dequeue();
-                    _entries.Remove(oldest);
+                    while (_order.Count >= MaxRidCacheEntriesPerRun)
+                    {
+                        long oldest = _order.Dequeue();
+                        _entries.Remove(oldest);
+                    }
+                    _order.Enqueue(reqRid);
                 }
-                _order.Enqueue(reqRid);
+                _entries[reqRid] = new CachedCommandResponse
+                {
+                    CommandSha256 = commandSha256,
+                    Payload = payload,
+                    ResponseRid = responseRid,
+                };
             }
-            _entries[reqRid] = new CachedCommandResponse
-            {
-                CommandSha256 = commandSha256,
-                Payload = payload,
-                ResponseRid = responseRid,
-            };
         }
     }
 
-    private static readonly ConcurrentDictionary<string, SessionRidCache> RidCaches = new(StringComparer.Ordinal);
+    // P0-21：幂等指纹缓存按 runId 维度存储以跨 sid 存活；另维护 sid -> runId 索引与 ReestablishSession 后首包强同步标记
+    private static readonly ConcurrentDictionary<string, RunRidCache> RunRidCaches = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, string> SidToRunId = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, byte> PendingPostResumeSyncSids = new(StringComparer.Ordinal);
+    // P1-37：按账号维度串行化 /sessions 创建恢复与 /runs/active/concede 投降，彻底消除同账号并发竞态与游离 Session
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> AccountSessionLocks = new(StringComparer.OrdinalIgnoreCase);
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
     private static readonly PropertyInfo? StartSelectionDoneProp =
         typeof(RunEngine).GetProperty(nameof(RunEngine.StartSelectionDone), BindingFlags.Public | BindingFlags.Instance);
 
-    /// <summary>移除指定会话的幂等响应缓存，防止长跑内存泄漏。</summary>
+    /// <summary>P1-37：获取指定账号的会话生命周期互斥锁（加锁顺序恒为 AccountLock → Session.Gate）。</summary>
+    public static SemaphoreSlim GetAccountSessionLock(string accountIdKey)
+        => AccountSessionLocks.GetOrAdd(string.IsNullOrWhiteSpace(accountIdKey) ? "_anonymous" : accountIdKey, _ => new SemaphoreSlim(1, 1));
+
+    /// <summary>
+    /// 移除指定会话 sid 的绑定与首包标记，但保留 runId 维度的幂等缓存以支撑 410 / ReestablishSession 跨 sid 重放。
+    /// </summary>
     public static void DetachRidCache(string sid)
     {
-        if (!string.IsNullOrEmpty(sid))
-            RidCaches.TryRemove(sid, out _);
+        if (string.IsNullOrEmpty(sid)) return;
+        SidToRunId.TryRemove(sid, out _);
+        PendingPostResumeSyncSids.TryRemove(sid, out _);
     }
 
-    /// <summary>按活跃会话存在性批量清理孤儿 RidCache 条目。</summary>
+    /// <summary>显式释放指定对局 runId 的幂等缓存（用于投降/终局销毁或测试清理）。</summary>
+    public static void DetachRunRidCache(string? runId)
+    {
+        if (!string.IsNullOrEmpty(runId))
+            RunRidCaches.TryRemove(runId, out _);
+    }
+
+    /// <summary>标记某会话刚刚完成 /sessions 恢复（ReestablishSession），其首次命令拒单需强制附带 GameStateSync。</summary>
+    public static void MarkSessionReestablished(string sid, string runId)
+    {
+        if (!string.IsNullOrEmpty(sid))
+        {
+            if (!string.IsNullOrEmpty(runId))
+                SidToRunId[sid] = runId;
+            PendingPostResumeSyncSids[sid] = 1;
+        }
+    }
+
+    /// <summary>消费并清除某会话的 ReestablishSession 后首次命令标记。</summary>
+    public static bool ConsumeSessionReestablished(string sid)
+        => !string.IsNullOrEmpty(sid) && PendingPostResumeSyncSids.TryRemove(sid, out _);
+
+    /// <summary>按 runId 查询 (reqRid, commandSha256) 幂等命中记录（跨 sid 生效）。</summary>
+    public static bool TryReplayIdempotentCommand(
+        string runId,
+        long reqRid,
+        ReadOnlySpan<byte> commandSha256,
+        out byte[]? payload,
+        out long responseRid)
+    {
+        if (!string.IsNullOrEmpty(runId) &&
+            RunRidCaches.TryGetValue(runId, out var cache) &&
+            cache.TryGetMatch(reqRid, commandSha256, out var cached) &&
+            cached != null)
+        {
+            payload = cached.Payload;
+            responseRid = cached.ResponseRid;
+            return true;
+        }
+        payload = null;
+        responseRid = 0;
+        return false;
+    }
+
+    /// <summary>按 runId 记录最近 8 条命令响应的幂等指纹。</summary>
+    public static void RecordIdempotentResponse(
+        string runId,
+        long reqRid,
+        byte[] commandSha256,
+        byte[] payload,
+        long responseRid)
+    {
+        if (string.IsNullOrEmpty(runId)) return;
+        var cache = RunRidCaches.GetOrAdd(runId, _ => new RunRidCache());
+        cache.Store(reqRid, commandSha256, payload, responseRid);
+        EnforceRidCacheCapacity();
+    }
+
+    /// <summary>按活跃会话存在性批量清理孤儿 sid 映射及长期失活的 runId 幂等缓存。</summary>
     public static int PurgeOrphanRidCaches(Func<string, bool> exists)
     {
         int removed = 0;
-        foreach (string sid in RidCaches.Keys)
+        var activeRunIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var kv in SidToRunId)
         {
-            if (!exists(sid) && RidCaches.TryRemove(sid, out _))
+            if (!exists(kv.Key))
+            {
+                if (SidToRunId.TryRemove(kv.Key, out _))
+                    removed++;
+                PendingPostResumeSyncSids.TryRemove(kv.Key, out _);
+            }
+            else if (!string.IsNullOrEmpty(kv.Value))
+            {
+                activeRunIds.Add(kv.Value);
+            }
+        }
+        foreach (string sid in PendingPostResumeSyncSids.Keys)
+        {
+            if (!exists(sid))
+                PendingPostResumeSyncSids.TryRemove(sid, out _);
+        }
+
+        long now = Environment.TickCount64;
+        foreach (var kv in RunRidCaches)
+        {
+            if (!activeRunIds.Contains(kv.Key) &&
+                now - kv.Value.LastAccessTick >= OrphanRunRidCacheExpireMs &&
+                RunRidCaches.TryRemove(kv.Key, out _))
+            {
                 removed++;
+            }
         }
         return removed;
     }
 
     private static void EnforceRidCacheCapacity()
     {
-        if (RidCaches.Count <= MaxRidCacheSessions) return;
-        int over = RidCaches.Count - (MaxRidCacheSessions * 3 / 4);
-        var victims = RidCaches
+        if (RunRidCaches.Count <= MaxRidCacheRuns) return;
+        int over = RunRidCaches.Count - (MaxRidCacheRuns * 3 / 4);
+        var victims = RunRidCaches
             .OrderBy(kv => kv.Value.LastAccessTick)
             .Take(Math.Max(1, over))
             .Select(kv => kv.Key)
             .ToList();
-        foreach (string sid in victims)
-            RidCaches.TryRemove(sid, out _);
+        foreach (string runId in victims)
+            RunRidCaches.TryRemove(runId, out _);
+    }
+
+    /// <summary>
+    /// P0-17 &amp; P0-21：判断命令拒单是否需要在响应末尾附加 NetMessageGameStateSync 强制对齐客户端乐观盘面。
+    /// 战斗态（Combat/PVPCombat）与终局态（EndRun*/Shutdown）绝不附加 GameStateSync。
+    /// </summary>
+    public static bool ShouldAttachStateSyncOnCommandError(
+        INetCommand cmd,
+        ERunState currentState,
+        bool isFirstAfterReestablish = false)
+    {
+        if (currentState is ERunState.Combat or ERunState.PVPCombat
+            or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown)
+        {
+            return false;
+        }
+
+        if (isFirstAfterReestablish)
+            return true;
+
+        return cmd is SelectItemCommand
+            or MoveItemCommand
+            or SellCardCommand
+            or SelectSkillCommand
+            or CommitToPedestalCommand
+            or SelectEncounterCommand
+            or ExitCurrentStateCommand
+            or RerollCommand;
+    }
+
+    /// <summary>
+    /// 统一构造 /commands 下行消息：
+    /// - 拒单时对可触发乐观变更的命令或 ReestablishSession 首包过期拒单包装 [Error, GameStateSync]（GameStateSync 居尾且后无 GameSim）；
+    /// - 正常响应透传 ExtraSimCards（P0-19 技能融合源卡）；
+    /// - 降级落位（AppendStateSyncAtTail）返回 [GameSim, GameStateSync]（GameStateSync 居尾不吞 GameSim）。
+    /// </summary>
+    public static INetMessage BuildCommandReply(
+        INetCommand cmd,
+        RunState run,
+        RunEngine.Outcome outcome,
+        ERunState stateBefore,
+        bool isOwnedSelectMove,
+        bool isFirstAfterReestablish,
+        out bool isPureBoardMove,
+        out bool isCombatSequence)
+    {
+        isCombatSequence = false;
+
+        if (outcome.Error != null)
+        {
+            isPureBoardMove = false;
+            if (ShouldAttachStateSyncOnCommandError(cmd, run.State, isFirstAfterReestablish))
+            {
+                return new NetMessageAggregate(new List<INetMessage>
+                {
+                    outcome.Error,
+                    new NetMessageGameStateSync(run.BuildSnapshot()),
+                });
+            }
+            return outcome.Error;
+        }
+
+        if (outcome.CombatSpawnSim != null && outcome.Combat != null && outcome.CombatDespawnSim != null)
+        {
+            isPureBoardMove = false;
+            isCombatSequence = true;
+            return new NetMessageAggregate(new List<INetMessage>
+            {
+                new NetMessageGameSim(outcome.CombatSpawnSim),
+                new NetMessageCombatSim(outcome.Combat),
+                new NetMessageGameSim(outcome.CombatDespawnSim),
+            });
+        }
+
+        isPureBoardMove = (cmd is MoveItemCommand || isOwnedSelectMove) &&
+            run.State == stateBefore &&
+            !Persistence.IsTerminalState(run.State) &&
+            outcome.CombatSpawnSim == null &&
+            outcome.Combat == null &&
+            !outcome.ForceStateSync &&
+            !outcome.AppendStateSyncAtTail;
+
+        if (isPureBoardMove)
+        {
+            // V13.1 拖拽加速（Top 7）：MoveItem 返回增量 GameSim（仅打包被移动/挤位/光环变更卡），削减 80%+ 包体与客户端刷新开销
+            return new NetMessageAggregate(new List<INetMessage>
+            {
+                new NetMessageGameSim(run.BuildDeltaGameSim(outcome.Events, outcome.DirtyCardIds)),
+            });
+        }
+
+        if (outcome.PreSplitGameSim != null && outcome.SecondaryGameSimEvents is { Count: > 0 })
+        {
+            isPureBoardMove = false;
+            // P2-32：存在 Pedestal NextEncounterOnExit 跳往 Encounter / Pedestal 时，拆分为两条独立 NetMessageGameSim，
+            // 避免客户端 PedestalState 在同一条 GameSim 中吞并 StateTransitioned 并强清 CurrentEncounterId。
+            var splitList = new List<INetMessage>
+            {
+                new NetMessageGameSim(outcome.PreSplitGameSim),
+                new NetMessageGameSim(run.BuildFullGameSim(outcome.SecondaryGameSimEvents)),
+            };
+            if (outcome.Combat != null) splitList.Add(new NetMessageCombatSim(outcome.Combat));
+            if ((outcome.ForceStateSync || outcome.AppendStateSyncAtTail) &&
+                run.State is not (ERunState.Combat or ERunState.PVPCombat or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown))
+            {
+                splitList.Add(new NetMessageGameStateSync(run.BuildSnapshot()));
+            }
+            return new NetMessageAggregate(splitList);
+        }
+
+        var extraCards = outcome.ExtraSimCards.Count > 0 ? outcome.ExtraSimCards : null;
+        var list = new List<INetMessage>
+        {
+            new NetMessageGameSim(run.BuildFullGameSim(outcome.Events, extraCards)),
+        };
+        if (outcome.Combat != null) list.Add(new NetMessageCombatSim(outcome.Combat));
+        if ((outcome.ForceStateSync || outcome.AppendStateSyncAtTail) &&
+            run.State is not (ERunState.Combat or ERunState.PVPCombat or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown))
+        {
+            // P1-26：与官方客户端 NetMessageAggregate 串行顺序一致，GameStateSync 必须位于 GameSim 之后，
+            // 避免先全量覆盖再播增量事件导致二次触发，同时对 ForceStateSync / AppendStateSyncAtTail 自动去重
+            list.Add(new NetMessageGameStateSync(run.BuildSnapshot()));
+        }
+        return new NetMessageAggregate(list);
     }
 
     public static void Map(WebApplication app)
@@ -177,156 +406,175 @@ public static class GameServerEndpoints
             var account = ResolveAccount(ctx, accounts);
             string accountIdKey = account.AccountId.ToString("N");
             var desiredRules = ResolveDesiredRulesForAccount(accountIdKey, init, playerRules, lobbies);
+            var challengeService = app.Services.GetService<ChallengeService>() ?? TempoNetEndpoints.SharedChallengeService;
 
-            // 1. 优先检查内存中或 SQLite 是否存在该账号的未完结活跃对局（Resume Run / 410 重连恢复，严格防串局）
-            RunState? resumedRun = null;
-            bool? resumedStarterDone = null;
-
-            var existingSession = sessions.GetByAccount(accountIdKey);
-            if (existingSession != null)
+            // P1-37：账号级互斥锁串行化 /sessions 与 /runs/active/concede（加锁顺序恒为 AccountLock → Session.Gate）
+            var accountLock = GetAccountSessionLock(accountIdKey);
+            await accountLock.WaitAsync(ctx.RequestAborted);
+            try
             {
-                await existingSession.Gate.WaitAsync(ctx.RequestAborted);
-                try
+                // 1. 优先检查内存中或 SQLite 是否存在该账号的未完结活跃对局（Resume Run / 410 重连恢复，严格防串局）
+                RunState? resumedRun = null;
+                bool? resumedStarterDone = null;
+
+                var existingSession = sessions.GetByAccount(accountIdKey);
+                if (existingSession != null)
                 {
-                    var existingHandle = SessionRegistry.Get(existingSession.Sid);
-                    if (existingHandle != null)
+                    await existingSession.Gate.WaitAsync(ctx.RequestAborted);
+                    try
                     {
-                        // 新会话创建/恢复前先冲刷该局挂起防抖写入任务，保证内存与 SQLite 完全同步
-                        try { db.FlushRunImmediate(existingHandle.Run.RunId); } catch { }
-                        if (!Persistence.IsTerminalState(existingHandle.Run.State) &&
-                            CanResumeRunForInit(existingHandle.Run, init, desiredRules))
+                        var existingHandle = SessionRegistry.Get(existingSession.Sid);
+                        if (existingHandle != null)
                         {
-                            resumedRun = existingHandle.Run;
-                            resumedStarterDone = existingHandle.Engine.StartSelectionDone;
+                            // 新会话创建/恢复前先冲刷该局挂起防抖写入任务，保证内存与 SQLite 完全同步
+                            try { db.FlushRunImmediate(existingHandle.Run.RunId); } catch { }
+                            if (!Persistence.IsTerminalState(existingHandle.Run.State) &&
+                                CanResumeRunForInit(existingHandle.Run, init, desiredRules))
+                            {
+                                resumedRun = existingHandle.Run;
+                                resumedStarterDone = existingHandle.Engine.StartSelectionDone;
+                            }
+                            else if (Persistence.IsTerminalState(existingHandle.Run.State))
+                            {
+                                DetachRunRidCache(existingHandle.Run.RunId);
+                            }
                         }
+                        SessionRegistry.Detach(existingSession.Sid);
+                        DetachRidCache(existingSession.Sid);
                     }
-                    SessionRegistry.Detach(existingSession.Sid);
-                    DetachRidCache(existingSession.Sid);
+                    finally
+                    {
+                        existingSession.Gate.Release();
+                    }
                 }
-                finally
+
+                if (resumedRun == null)
                 {
-                    existingSession.Gate.Release();
+                    var savedRow = db.LoadLatestActiveRun(account.AccountId);
+                    if (savedRow != null &&
+                        RunSnapshotSerializer.TryDeserialize(savedRow.Snapshot, activeRepo, out var restored, out var snapDto) &&
+                        restored != null &&
+                        !Persistence.IsTerminalState(restored.State) &&
+                        CanResumeRunForInit(restored, init, desiredRules))
+                    {
+                        resumedRun = restored;
+                        resumedStarterDone = snapDto?.StartSelectionDone;
+                    }
                 }
-            }
 
-            if (resumedRun == null)
-            {
-                var savedRow = db.LoadLatestActiveRun(account.AccountId);
-                if (savedRow != null &&
-                    RunSnapshotSerializer.TryDeserialize(savedRow.Snapshot, activeRepo, out var restored, out var snapDto) &&
-                    restored != null &&
-                    !Persistence.IsTerminalState(restored.State) &&
-                    CanResumeRunForInit(restored, init, desiredRules))
+                var session = sessions.Create(accountIdKey, account.Username, init);
+
+                if (resumedRun != null)
                 {
-                    resumedRun = restored;
-                    resumedStarterDone = snapDto?.StartSelectionDone;
+                    if (string.IsNullOrWhiteSpace(resumedRun.AccountId))
+                        resumedRun.AccountId = accountIdKey;
+                    if (string.IsNullOrWhiteSpace(resumedRun.Username))
+                        resumedRun.Username = account.Username;
+                    if (!resumedRun.TournamentSessionId.HasValue && init.TournamentSessionId.HasValue)
+                        resumedRun.TournamentSessionId = init.TournamentSessionId;
+
+                    bool starterDone = resumedStarterDone ?? resumedRun.StartSelectionDone;
+                    resumedRun.StartSelectionDone = starterDone;
+
+                    var resumedEngine = new RunEngine(
+                        resumedRun, pool, monsters, levelUps, mode, activeRepo, ghosts,
+                        archetypeIndex, playerRules, lobbies, diSessions ?? sessions,
+                        pvpCoordinator, socialSink, accounts, challengeService, db);
+                    if (starterDone)
+                    {
+                        StartSelectionDoneProp?.SetValue(resumedEngine, true);
+                    }
+
+                    SessionRegistry.Attach(session.Sid, resumedRun, resumedEngine);
+                    MarkSessionReestablished(session.Sid, resumedRun.RunId);
+                    try { SaveSnapshotImmediate(db, resumedRun, session, resumedEngine); } catch { }
+                    try
+                    {
+                        var tLobby = lobbies?.FindLobbyForRun(resumedRun.TournamentSessionId, accountIdKey);
+                        if (tLobby != null)
+                            lobbies!.RecordRunProgress(tLobby, accountIdKey, resumedRun);
+                    }
+                    catch { }
+
+                    var resumeEvents = RunSnapshotSerializer.BuildResumeEvents(resumedRun);
+                    var resumeMsgs = new List<INetMessage>
+                    {
+                        resumedRun.BuildRunInitialized(),
+                        new NetMessageGameStateSync(resumedRun.BuildSnapshot()),
+                        new NetMessageGameSim(resumedRun.BuildFullGameSim(resumeEvents)),
+                    };
+
+                    log.LogInformation(
+                        "/sessions [RESUME]: sid={sid} runId={runId} account={acc} hero={hero} mode={spMode} day={day} hour={hour} state={state} cards={cards}",
+                        session.Sid, resumedRun.RunId, account.Username, resumedRun.Hero,
+                        resumedRun.CustomRules.SpecialModeId, resumedRun.Day, resumedRun.Hour, resumedRun.State, resumedRun.Cards.Count);
+
+                    byte[] resumePayload = await WriteMessageAndReturnPayload(
+                        ctx, new NetMessageAggregate(resumeMsgs), session, resumedRun, modHost);
+                    try
+                    {
+                        spectateRecorder?.RecordBootstrapSnapshot(
+                            accountIdKey, resumedRun.RunId, resumedRun.TournamentSessionId, session.RequestId, resumePayload);
+                    }
+                    catch { }
+                    return;
                 }
-            }
 
-            var session = sessions.Create(accountIdKey, account.Username, init);
+                // 2. 无可复用的活跃对局 → 开启全新对局
+                log.LogInformation("/sessions [NEW]: sid={sid} account={acc} hero={hero} mode={mode} special={spMode} tournament={tid}",
+                    session.Sid, account.Username, init.SelectedHero, init.PlayMode, desiredRules.SpecialModeId, init.TournamentSessionId);
 
-            if (resumedRun != null)
-            {
-                if (string.IsNullOrWhiteSpace(resumedRun.AccountId))
-                    resumedRun.AccountId = accountIdKey;
-                if (string.IsNullOrWhiteSpace(resumedRun.Username))
-                    resumedRun.Username = account.Username;
-                if (!resumedRun.TournamentSessionId.HasValue && init.TournamentSessionId.HasValue)
-                    resumedRun.TournamentSessionId = init.TournamentSessionId;
-
-                var resumedEngine = new RunEngine(
-                    resumedRun, pool, monsters, levelUps, mode, activeRepo, ghosts,
+                var run = new RunState
+                {
+                    RunId = session.RunId,
+                    GameModeId = init.GameModeId ?? pool.DefaultGameModeId,
+                    Hero = init.SelectedHero,
+                    PlayMode = init.PlayMode,
+                    AccountId = accountIdKey,
+                    Username = account.Username,
+                    TournamentSessionId = init.TournamentSessionId,
+                    CustomRules = desiredRules.CloneNormalized(),
+                };
+                var engine = new RunEngine(
+                    run, pool, monsters, levelUps, mode, activeRepo, ghosts,
                     archetypeIndex, playerRules, lobbies, diSessions ?? sessions,
-                    pvpCoordinator, socialSink);
-                bool starterDone = resumedStarterDone ?? RunSnapshotSerializer.InferStartSelectionDone(resumedRun);
-                if (starterDone)
-                {
-                    StartSelectionDoneProp?.SetValue(resumedEngine, true);
-                }
+                    pvpCoordinator, socialSink, accounts, challengeService, db);
 
-                SessionRegistry.Attach(session.Sid, resumedRun, resumedEngine);
-                try { SaveSnapshotImmediate(db, resumedRun, session, resumedEngine); } catch { }
+                // 开局：发起始技能三选一 / Day 1 Hour 1 遭遇
+                var startOutcome = engine.StartRun();
+
+                // 首次响应：RunInitialized + 全量快照 + 首个 GameSim（含开局事件）
+                var msgs = new List<INetMessage>
+                {
+                    run.BuildRunInitialized(),
+                    new NetMessageGameStateSync(run.BuildSnapshot()),
+                    new NetMessageGameSim(run.BuildFullGameSim(startOutcome.Events)),
+                };
+
+                SessionRegistry.Attach(session.Sid, run, engine);
+                SidToRunId[session.Sid] = run.RunId;
+                try { SaveSnapshotImmediate(db, run, session, engine); } catch { }
                 try
                 {
-                    var tLobby = lobbies?.FindLobbyForRun(resumedRun.TournamentSessionId, accountIdKey);
+                    var tLobby = lobbies?.FindLobbyForRun(run.TournamentSessionId, accountIdKey);
                     if (tLobby != null)
-                        lobbies!.RecordRunProgress(tLobby, accountIdKey, resumedRun);
+                        lobbies!.RecordRunProgress(tLobby, accountIdKey, run);
                 }
                 catch { }
 
-                var resumeEvents = RunSnapshotSerializer.BuildResumeEvents(resumedRun);
-                var resumeMsgs = new List<INetMessage>
-                {
-                    resumedRun.BuildRunInitialized(),
-                    new NetMessageGameStateSync(resumedRun.BuildSnapshot()),
-                    new NetMessageGameSim(resumedRun.BuildFullGameSim(resumeEvents)),
-                };
-
-                log.LogInformation(
-                    "/sessions [RESUME]: sid={sid} runId={runId} account={acc} hero={hero} mode={spMode} day={day} hour={hour} state={state} cards={cards}",
-                    session.Sid, resumedRun.RunId, account.Username, resumedRun.Hero,
-                    resumedRun.CustomRules.SpecialModeId, resumedRun.Day, resumedRun.Hour, resumedRun.State, resumedRun.Cards.Count);
-
-                byte[] resumePayload = await WriteMessageAndReturnPayload(
-                    ctx, new NetMessageAggregate(resumeMsgs), session, resumedRun, modHost);
+                byte[] startPayload = await WriteMessageAndReturnPayload(
+                    ctx, new NetMessageAggregate(msgs), session, run, modHost);
                 try
                 {
                     spectateRecorder?.RecordBootstrapSnapshot(
-                        accountIdKey, resumedRun.RunId, resumedRun.TournamentSessionId, session.RequestId, resumePayload);
+                        accountIdKey, run.RunId, run.TournamentSessionId, session.RequestId, startPayload);
                 }
                 catch { }
-                return;
             }
-
-            // 2. 无可复用的活跃对局 → 开启全新对局
-            log.LogInformation("/sessions [NEW]: sid={sid} account={acc} hero={hero} mode={mode} special={spMode} tournament={tid}",
-                session.Sid, account.Username, init.SelectedHero, init.PlayMode, desiredRules.SpecialModeId, init.TournamentSessionId);
-
-            var run = new RunState
+            finally
             {
-                RunId = session.RunId,
-                GameModeId = init.GameModeId ?? pool.DefaultGameModeId,
-                Hero = init.SelectedHero,
-                PlayMode = init.PlayMode,
-                AccountId = accountIdKey,
-                Username = account.Username,
-                TournamentSessionId = init.TournamentSessionId,
-                CustomRules = desiredRules.CloneNormalized(),
-            };
-            var engine = new RunEngine(
-                run, pool, monsters, levelUps, mode, activeRepo, ghosts,
-                archetypeIndex, playerRules, lobbies, diSessions ?? sessions,
-                pvpCoordinator, socialSink);
-
-            // 开局：发起始技能三选一 / Day 1 Hour 1 遭遇
-            var startOutcome = engine.StartRun();
-
-            // 首次响应：RunInitialized + 全量快照 + 首个 GameSim（含开局事件）
-            var msgs = new List<INetMessage>
-            {
-                run.BuildRunInitialized(),
-                new NetMessageGameStateSync(run.BuildSnapshot()),
-                new NetMessageGameSim(run.BuildFullGameSim(startOutcome.Events)),
-            };
-
-            SessionRegistry.Attach(session.Sid, run, engine);
-            try { SaveSnapshotImmediate(db, run, session, engine); } catch { }
-            try
-            {
-                var tLobby = lobbies?.FindLobbyForRun(run.TournamentSessionId, accountIdKey);
-                if (tLobby != null)
-                    lobbies!.RecordRunProgress(tLobby, accountIdKey, run);
+                accountLock.Release();
             }
-            catch { }
-
-            byte[] startPayload = await WriteMessageAndReturnPayload(
-                ctx, new NetMessageAggregate(msgs), session, run, modHost);
-            try
-            {
-                spectateRecorder?.RecordBootstrapSnapshot(
-                    accountIdKey, run.RunId, run.TournamentSessionId, session.RequestId, startPayload);
-            }
-            catch { }
         });
 
         // ── /commands ────────────────────────────────────────────────────────
@@ -370,20 +618,27 @@ public static class GameServerEndpoints
                     return;
                 }
 
+                string runId = handle.Run.RunId;
+                SidToRunId[sid] = runId;
+                bool isFirstAfterReestablish = ConsumeSessionReestablished(sid);
+
                 if (hasReqRid &&
-                    RidCaches.TryGetValue(sid, out var ridCache) &&
-                    ridCache.TryGetMatch(reqRid, commandSha256, out var cachedResp) &&
-                    cachedResp != null)
+                    TryReplayIdempotentCommand(runId, reqRid, commandSha256, out var cachedPayload, out long cachedRespRid) &&
+                    cachedPayload != null)
                 {
                     session.LastCommandAt = DateTime.UtcNow;
-                    log.LogInformation("/commands [RID-REPLAY]: sid={sid} reqRid={reqRid} respRid={respRid} cmd={cmd}",
-                        sid, reqRid, cachedResp.ResponseRid, cmd.GetType().Name);
-                    await WriteSerializedPayload(ctx, cachedResp.Payload, session.Sid, cachedResp.ResponseRid, handle.Run, modHost);
+                    session.RequestId = Math.Max(session.RequestId, cachedRespRid);
+                    log.LogInformation("/commands [RID-REPLAY]: sid={sid} runId={runId} reqRid={reqRid} respRid={respRid} cmd={cmd}",
+                        sid, runId, reqRid, cachedRespRid, cmd.GetType().Name);
+                    await WriteSerializedPayload(ctx, cachedPayload, session.Sid, cachedRespRid, handle.Run, modHost);
                     return;
                 }
 
                 long prevRid = session.RequestId;
-                long rid = hasReqRid ? reqRid + 1 : session.RequestId + 1;
+                // P2-35：强制单调递增 session.RequestId，防止乱序旧 reqRid 导致 rid 回退
+                long rid = hasReqRid
+                    ? Math.Max(session.RequestId + 1, reqRid + 1)
+                    : session.RequestId + 1;
                 session.RequestId = rid;
                 session.LastCommandAt = DateTime.UtcNow;
 
@@ -401,7 +656,7 @@ public static class GameServerEndpoints
                     outcome = new RunEngine.Outcome
                     {
                         Error = new NetMessageError(
-                            null,
+                            $"cmd_{rid}_cheat_blocked",
                             EResponseErrorType.NotAllowed,
                             "当前模式（锦标赛/每日挑战或服务器配置）已禁用调试指令"),
                     };
@@ -411,7 +666,7 @@ public static class GameServerEndpoints
                     outcome = new RunEngine.Outcome
                     {
                         Error = new NetMessageError(
-                            null,
+                            $"cmd_{rid}_abandon_terminal",
                             EResponseErrorType.NotAllowed,
                             $"对局已处于终局状态（{handle.Run.State}），无法重复放弃"),
                     };
@@ -476,46 +731,15 @@ public static class GameServerEndpoints
                     }
                 }
 
-                bool isPureBoardMove = (cmd is MoveItemCommand || isOwnedSelectMove) &&
-                    outcome.Error == null &&
-                    handle.Run.State == stateBefore &&
-                    !Persistence.IsTerminalState(handle.Run.State) &&
-                    outcome.CombatSpawnSim == null &&
-                    outcome.Combat == null &&
-                    !outcome.ForceStateSync;
-
-                INetMessage reply;
-                bool isCombatSequence = false;
-                if (outcome.Error != null)
-                {
-                    reply = outcome.Error;
-                }
-                else if (outcome.CombatSpawnSim != null && outcome.Combat != null && outcome.CombatDespawnSim != null)
-                {
-                    isCombatSequence = true;
-                    reply = new NetMessageAggregate(new List<INetMessage>
-                    {
-                        new NetMessageGameSim(outcome.CombatSpawnSim),
-                        new NetMessageCombatSim(outcome.Combat),
-                        new NetMessageGameSim(outcome.CombatDespawnSim),
-                    });
-                }
-                else if (isPureBoardMove)
-                {
-                    // V13.1 拖拽加速（Top 7）：MoveItem 返回增量 GameSim（仅打包被移动/挤位/光环变更卡），削减 80%+ 包体与客户端刷新开销
-                    reply = new NetMessageAggregate(new List<INetMessage>
-                    {
-                        new NetMessageGameSim(handle.Run.BuildDeltaGameSim(outcome.Events, outcome.DirtyCardIds)),
-                    });
-                }
-                else
-                {
-                    var list = new List<INetMessage>();
-                    if (outcome.ForceStateSync) list.Add(new NetMessageGameStateSync(handle.Run.BuildSnapshot()));
-                    list.Add(new NetMessageGameSim(handle.Run.BuildFullGameSim(outcome.Events)));
-                    if (outcome.Combat != null) list.Add(new NetMessageCombatSim(outcome.Combat));
-                    reply = new NetMessageAggregate(list);
-                }
+                INetMessage reply = BuildCommandReply(
+                    cmd,
+                    handle.Run,
+                    outcome,
+                    stateBefore,
+                    isOwnedSelectMove,
+                    isFirstAfterReestablish,
+                    out bool isPureBoardMove,
+                    out bool isCombatSequence);
 
                 log.LogInformation("/commands: sid={sid} rid={rid} cmd={cmd} ok={ok} state={state} hour={hour} day={day}",
                     sid, rid, cmd.GetType().Name, outcome.Error == null,
@@ -561,7 +785,7 @@ public static class GameServerEndpoints
                     catch { }
                 }
 
-                byte[] replyPayload = SerializeAndRecordResponse(session, reqRid, hasReqRid, commandSha256, reply);
+                byte[] replyPayload = SerializeAndRecordResponse(session, runId, reqRid, hasReqRid, commandSha256, reply);
 
                 // 先将响应刷给客户端，再做（有观战者时的）异步观战录制，消除回包前观战序列化阻塞！
                 await WriteSerializedPayload(ctx, replyPayload, session.Sid, session.RequestId, handle.Run, modHost);
@@ -675,7 +899,7 @@ public static class GameServerEndpoints
                 }
             }
 
-            // 2. 查 SQLite 未完结对局
+            // 2. 查 SQLite 未完结对局（P2-35：补齐 SpecialModeId 摘要字段与内存分支一致）
             var row = db.LoadLatestActiveRun(acc.AccountId);
             if (row != null)
             {
@@ -684,6 +908,7 @@ public static class GameServerEndpoints
                     HasActiveRun = true,
                     RunId = (Guid?)ToGuidOrDeterministic(row.RunId),
                     PlayMode = row.PlayMode.ToString(),
+                    SpecialModeId = ResolveRunRowSpecialModeId(row),
                     Hero = row.Hero.ToString(),
                     Day = row.Day,
                     Hour = row.Hour,
@@ -700,6 +925,7 @@ public static class GameServerEndpoints
                 HasActiveRun = false,
                 RunId = (Guid?)null,
                 PlayMode = (string?)null,
+                SpecialModeId = (string?)null,
                 Hero = (string?)null,
                 Day = 0u,
                 Hour = 0u,
@@ -723,82 +949,93 @@ public static class GameServerEndpoints
             string accountIdKey = acc.AccountId.ToString("N");
             string concededRunId = "";
 
-            // 投降前加会话锁并冲刷挂起的异步写盘任务，避免与 /commands 或后台定时器竞争
-            var memSession = sessions.GetByAccount(accountIdKey);
-            if (memSession != null)
+            // P1-37：与 /sessions 共享同账号互斥锁（AccountLock → Session.Gate），杜绝并发建局/投降竞态
+            var accountLock = GetAccountSessionLock(accountIdKey);
+            await accountLock.WaitAsync(ctx.RequestAborted);
+            try
             {
-                await memSession.Gate.WaitAsync(ctx.RequestAborted);
-                try
+                // 投降前加会话锁并冲刷挂起的异步写盘任务，避免与 /commands 或后台定时器竞争
+                var memSession = sessions.GetByAccount(accountIdKey);
+                if (memSession != null)
                 {
-                    var handle = SessionRegistry.Get(memSession.Sid);
-                    if (handle != null)
-                    {
-                        concededRunId = handle.Run.RunId;
-                        try { db.FlushRunImmediate(concededRunId); } catch { }
-                        if (!Persistence.IsTerminalState(handle.Run.State))
-                        {
-                            handle.Run.State = ERunState.EndRunDefeat;
-                            try
-                            {
-                                SaveSnapshotImmediate(db, handle.Run, memSession, handle.Engine);
-                                db.MarkRunEnded(handle.Run.RunId, ERunState.EndRunDefeat, "conceded");
-                                if (!handle.Run.IsSandboxRun && !handle.Run.CustomRules.ShouldSkipCareerAndLeaderboard)
-                                {
-                                    int elapsed = ComputeElapsedSeconds(db, handle.Run.RunId, memSession.CreatedAt);
-                                    accounts.RecordRunCompleted(acc, handle.Run, isConceded: true, elapsedSeconds: elapsed);
-                                }
-                            }
-                            catch { }
-                        }
-                        var tLobby = lobbies?.FindLobbyForRun(handle.Run.TournamentSessionId, accountIdKey);
-                        if (tLobby != null)
-                            lobbies!.RecordRunProgress(tLobby, accountIdKey, handle.Run);
-                    }
-                    memSession.CommandLog.Clear();
-                    sessions.Remove(memSession.Sid);
-                    SessionRegistry.Detach(memSession.Sid);
-                    DetachRidCache(memSession.Sid);
-                    try { spectateRecorder?.ClearForAccount(accountIdKey); } catch { }
-                }
-                finally
-                {
-                    memSession.Gate.Release();
-                }
-            }
-            else if (db.PendingDebounceCount > 0)
-            {
-                try { db.FlushAllPending(); } catch { }
-            }
-
-            var dbConceded = db.ConcedeActiveRuns(acc.AccountId);
-            if (dbConceded != null)
-            {
-                if (string.IsNullOrEmpty(concededRunId)) concededRunId = dbConceded.RunId;
-                bool skipDbCareer = IsSnapshotSandboxRun(dbConceded.Snapshot);
-                if (!skipDbCareer)
-                {
+                    await memSession.Gate.WaitAsync(ctx.RequestAborted);
                     try
                     {
-                        int elapsed = ComputeElapsedSeconds(db, dbConceded.RunId, dbConceded.SavedAt);
-                        accounts.RecordRunCompleted(
-                            acc,
-                            dbConceded.RunId,
-                            dbConceded.Hero,
-                            dbConceded.PlayMode,
-                            dbConceded.Day,
-                            dbConceded.Victories,
-                            dbConceded.Defeats,
-                            dbConceded.Prestige,
-                            ERunState.EndRunDefeat,
-                            isConceded: true,
-                            elapsedSeconds: elapsed);
+                        var handle = SessionRegistry.Get(memSession.Sid);
+                        if (handle != null)
+                        {
+                            concededRunId = handle.Run.RunId;
+                            try { db.FlushRunImmediate(concededRunId); } catch { }
+                            if (!Persistence.IsTerminalState(handle.Run.State))
+                            {
+                                handle.Run.State = ERunState.EndRunDefeat;
+                                try
+                                {
+                                    SaveSnapshotImmediate(db, handle.Run, memSession, handle.Engine);
+                                    db.MarkRunEnded(handle.Run.RunId, ERunState.EndRunDefeat, "conceded");
+                                    if (!handle.Run.IsSandboxRun && !handle.Run.CustomRules.ShouldSkipCareerAndLeaderboard)
+                                    {
+                                        int elapsed = ComputeElapsedSeconds(db, handle.Run.RunId, memSession.CreatedAt);
+                                        accounts.RecordRunCompleted(acc, handle.Run, isConceded: true, elapsedSeconds: elapsed);
+                                    }
+                                }
+                                catch { }
+                            }
+                            var tLobby = lobbies?.FindLobbyForRun(handle.Run.TournamentSessionId, accountIdKey);
+                            if (tLobby != null)
+                                lobbies!.RecordRunProgress(tLobby, accountIdKey, handle.Run);
+                        }
+                        memSession.CommandLog.Clear();
+                        sessions.Remove(memSession.Sid);
+                        SessionRegistry.Detach(memSession.Sid);
+                        DetachRidCache(memSession.Sid);
+                        DetachRunRidCache(concededRunId);
+                        try { spectateRecorder?.ClearForAccount(accountIdKey); } catch { }
                     }
-                    catch { }
+                    finally
+                    {
+                        memSession.Gate.Release();
+                    }
                 }
-            }
+                else if (db.PendingDebounceCount > 0)
+                {
+                    try { db.FlushAllPending(); } catch { }
+                }
 
-            log.LogInformation("/runs/active/concede: account={acc} runId={rid}", acc.Username, concededRunId);
-            return Results.Json(new { AccountId = acc.AccountId.ToString("D"), RunId = concededRunId }, JsonOpts);
+                var dbConceded = db.ConcedeActiveRuns(acc.AccountId);
+                if (dbConceded != null)
+                {
+                    if (string.IsNullOrEmpty(concededRunId)) concededRunId = dbConceded.RunId;
+                    bool skipDbCareer = IsSnapshotSandboxRun(dbConceded.Snapshot);
+                    if (!skipDbCareer)
+                    {
+                        try
+                        {
+                            int elapsed = ComputeElapsedSeconds(db, dbConceded.RunId, dbConceded.SavedAt);
+                            accounts.RecordRunCompleted(
+                                acc,
+                                dbConceded.RunId,
+                                dbConceded.Hero,
+                                dbConceded.PlayMode,
+                                dbConceded.Day,
+                                dbConceded.Victories,
+                                dbConceded.Defeats,
+                                dbConceded.Prestige,
+                                ERunState.EndRunDefeat,
+                                isConceded: true,
+                                elapsedSeconds: elapsed);
+                        }
+                        catch { }
+                    }
+                }
+
+                log.LogInformation("/runs/active/concede: account={acc} runId={rid}", acc.Username, concededRunId);
+                return Results.Json(new { AccountId = acc.AccountId.ToString("D"), RunId = concededRunId }, JsonOpts);
+            }
+            finally
+            {
+                accountLock.Release();
+            }
         });
 
         // ── 开发用：自动驾驶（官方也有这个端点）─────────────────────────────
@@ -887,7 +1124,7 @@ public static class GameServerEndpoints
 
     private static void SaveSnapshotImmediate(Persistence db, RunState run, Session session, RunEngine? engine = null)
     {
-        bool startDone = engine?.StartSelectionDone ?? RunSnapshotSerializer.InferStartSelectionDone(run);
+        bool startDone = engine?.StartSelectionDone ?? run.StartSelectionDone;
         string snapshotJson = RunSnapshotSerializer.Serialize(
             run,
             startSelectionDone: startDone,
@@ -1004,6 +1241,7 @@ public static class GameServerEndpoints
 
     private static byte[] SerializeAndRecordResponse(
         Session session,
+        string runId,
         long reqRid,
         bool hasReqRid,
         byte[] commandSha256,
@@ -1016,9 +1254,7 @@ public static class GameServerEndpoints
         }
         if (hasReqRid)
         {
-            var cache = RidCaches.GetOrAdd(session.Sid, _ => new SessionRidCache());
-            cache.Store(reqRid, commandSha256, payload, session.RequestId);
-            EnforceRidCacheCapacity();
+            RecordIdempotentResponse(runId, reqRid, commandSha256, payload, session.RequestId);
         }
         return payload;
     }
@@ -1059,6 +1295,46 @@ public static class GameServerEndpoints
 
         await WriteSerializedPayload(ctx, payload, session.Sid, session.RequestId, run, modHost);
         return payload;
+    }
+
+    /// <summary>P2-11：限流错误统一填充官方客户端 NetErrorHandler 识别的 MessageId="RateLimited"。</summary>
+    public static NetMessageError CreateRateLimitedError(string message = "Too many requests.")
+        => new("RateLimited", EResponseErrorType.NotAllowed, message);
+
+    /// <summary>P2-35：从 SQLite RunRow（优先 RulesJson，次之 ModeId）解析活跃局摘要所需的 SpecialModeId 名称。</summary>
+    public static string ResolveRunRowSpecialModeId(Persistence.RunRow row)
+    {
+        if (!string.IsNullOrWhiteSpace(row.RulesJson))
+        {
+            try
+            {
+                var rules = JsonSerializer.Deserialize<CustomRunRuleSet>(row.RulesJson, JsonOpts);
+                if (rules != null)
+                    return rules.SpecialModeId.ToString();
+            }
+            catch
+            {
+                // 忽略旧格式 JSON 解析失败，回退至 ModeId 映射
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(row.ModeId))
+        {
+            if (Enum.TryParse<ESpecialModeId>(row.ModeId, ignoreCase: true, out var parsed))
+                return parsed.ToString();
+
+            return row.ModeId.Trim().ToLowerInvariant() switch
+            {
+                "boss_rush" or "bossrush" => nameof(ESpecialModeId.BossRush),
+                "sandbox" or "sandbox_lab" or "sandboxlab" => nameof(ESpecialModeId.SandboxLab),
+                "endless" or "endless_tower" or "endlesstower" => nameof(ESpecialModeId.EndlessTower),
+                "daily" or "daily_challenge" or "dailychallenge" => nameof(ESpecialModeId.DailyChallenge),
+                "cross_hero" or "cross_hero_mayhem" or "crossheromayhem" => nameof(ESpecialModeId.CrossHeroMayhem),
+                _ => nameof(ESpecialModeId.Standard),
+            };
+        }
+
+        return nameof(ESpecialModeId.Standard);
     }
 }
 

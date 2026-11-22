@@ -132,7 +132,7 @@ public sealed class GameDataLoadTests
         }
         Assert.True(verifiedZhTooltips >= 10, $"应至少验证 10 件物品的中文 Tooltip 渲染，实际: {verifiedZhTooltips}");
 
-        // 校验 Day 12 非 1.0 权重和 (0.2 + 0.55 + 0.05 = 0.8) 归一化及超上限天数回退
+        // 校验 Patch 20.2 Day 10+ 商店品阶稳态（按 Base GameMode.NumberOfDays=10 钳制为 0 / 0.20 / 0.70 / 0.10，与 BazaarDB /shop-odds 实测对齐）
         var bronzeTpl = repo.AlwaysSpawnableItems.First(c => c.DefaultTier == CardTier.Bronze && c.Tiers != null && c.Tiers.ContainsKey("Diamond"));
         var rng = new Random(12345);
         int silver = 0, gold = 0, diamond = 0;
@@ -147,9 +147,9 @@ public sealed class GameDataLoadTests
             }
         }
         Assert.Equal(2000, silver + gold + diamond);
-        Assert.InRange(silver / 2000.0, 0.18, 0.33);   // 理论 0.25
-        Assert.InRange(gold / 2000.0, 0.60, 0.77);     // 理论 0.6875
-        Assert.InRange(diamond / 2000.0, 0.02, 0.12);  // 理论 0.0625
+        Assert.InRange(silver / 2000.0, 0.15, 0.26);   // 理论 0.20 (BazaarDB Day 12 实测 20%)
+        Assert.InRange(gold / 2000.0, 0.64, 0.76);     // 理论 0.70 (BazaarDB Day 12 实测 70%)
+        Assert.InRange(diamond / 2000.0, 0.06, 0.15);  // 理论 0.10 (BazaarDB Day 12 实测 10%)
 
         // 超出表最大天数键（例如 Day 30 > 20）应取最大键配置而非退化为全 Bronze
         var lateTier = SpawnQueryEngine.RollTierForDay(bronzeTpl, day: 30, ignoreTierTable: false, inheritSource: null, downShift: false, rng, repo.GameMode);

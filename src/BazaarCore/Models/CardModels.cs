@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace BazaarCore.Models;
@@ -36,10 +37,16 @@ public sealed class CardTemplate
 
     // 遭遇卡/事件卡/野怪战/基座专有字段
     public SelectionContextData? SelectionContext { get; set; }
+    /// <summary>
+    /// 遭遇/步骤选择前置条件（P2-06：通过自定义 JsonConverter 同时兼容官方 JSON 数组 List&lt;TSelectionRequirement&gt; 与历史单对象格式，保持既有单对象访问无缝兼容）。
+    /// </summary>
+    [JsonConverter(typeof(SelectionRequirementsRuleNodeConverter))]
     public RuleNode? SelectionRequirements { get; set; }
     public RuleNode? SelectionCriteria { get; set; }
     public List<NextEncounterOption>? NextEncounterOnSelection { get; set; }
     public string? NewSetIdOnExit { get; set; }
+    public string? BoardOverride { get; set; }
+    public string? Presentation { get; set; }
     public bool? IsSingleSpawn { get; set; }
     public bool? IsTakeover { get; set; }
     public bool? ShouldProgressHour { get; set; }
@@ -64,6 +71,13 @@ public sealed class CardTemplate
 
     /// <summary>V14 开放自定义沙盒机制挂载列表（由 Mod 卡牌或补丁声明，纯原版卡恒为 null）。</summary>
     public List<BazaarCore.Mods.CardMechanicAttachment>? CustomMechanics { get; set; }
+
+    /// <summary>Mod 自定义遭遇相对抽签权重（纯原版卡恒为 null；&gt;0 时按倍率作用于白昼遭遇抽签，&lt;=0 转为 GuidOnly）。</summary>
+    public double? ModSpawnWeight { get; set; }
+    /// <summary>Mod 自定义遭遇最早允许出现天数（纯原版卡恒为 null）。</summary>
+    public int? ModMinDay { get; set; }
+    /// <summary>Mod 自定义遭遇最晚允许出现天数（纯原版卡恒为 null）。</summary>
+    public int? ModMaxDay { get; set; }
 
     public string DisplayTitle => Localization?.Title?.Text ?? InternalName;
 
@@ -154,6 +168,8 @@ public sealed class AuraDefinition
     public string? InternalName { get; set; }
     public string? InternalDescription { get; set; }
     public string? TranslationKey { get; set; }
+    /// <summary>光环自定义特效配置（P2-01：对齐官方 TCardAura.VFXConfig，透传 VFXOverrideKey）。</summary>
+    public VfxConfigData? VFXConfig { get; set; }
 }
 
 public sealed class QuestDefinition
@@ -176,6 +192,10 @@ public sealed class QuestEntry
     public double Target { get; set; }
     public QuestUpdate? Update { get; set; }
     public QuestReward? Reward { get; set; }
+    /// <summary>任务条目本地化描述（P2-02：对齐官方 TQuestEntry.Localization，供 TooltipFormatter 优先渲染任务目标文案）。</summary>
+    public LocalizationBlock? Localization { get; set; }
+    /// <summary>任务条目自定义图标覆盖键（P2-02：对齐官方 TQuestEntry.IconKeyOverride）。</summary>
+    public string? IconKeyOverride { get; set; }
     /// <summary>任务首次达标时一次性执行的效果能力映射（如 Recycling Truck、Jabalian Totem）。</summary>
     public Dictionary<string, AbilityDefinition>? CompletionEffects { get; set; }
 }
@@ -242,10 +262,13 @@ public sealed class RerollRulesData
 {
     public int? CostIncrease { get; set; }
     public int? CostMax { get; set; }
+    /// <summary>非官方 DB 兼容字段（P2-06：官方 RerollRules 无此字段，仅保留供历史配置/Mod 反序列化兼容）。</summary>
     public bool ResetCostOnExit { get; set; }
     public int? StartingCost { get; set; } = 2;
+    /// <summary>非官方 DB 兼容回退字段（P2-06：官方 DB 使用 TotalAllowedRerolls，此处仅作历史/Mod 回退别名）。</summary>
     public int? MaxRerolls { get; set; }
     public int? TotalAllowedRerolls { get; set; }
+    /// <summary>非官方 DB 兼容字段（P2-06：官方 RerollRules 无此字段，仅保留供历史配置/Mod 反序列化兼容）。</summary>
     public bool? RerollOnPurchase { get; set; }
 
     /// <summary>解析允许的最大刷新次数；null 表示无限刷新（如 Pearl's Dig Site）。</summary>
@@ -271,4 +294,68 @@ public sealed class CombatRewardData
     public RuleNode? SpawnContext { get; set; }
     public int? GoldReward { get; set; }
     public int? ExperienceReward { get; set; }
+}
+
+/// <summary>
+/// P2-06：兼容反序列化官方数组形式 <c>List&lt;TSelectionRequirement&gt;</c> 与单对象形式 <c>TSelectionRequirement</c>；
+/// 遇到多元素 JSON 数组时自动聚合全部前置条件至统一 <c>TSelectionRequirement</c> 节点，并保留原始子项于 <c>CombinedSelectionRequirements</c>。
+/// </summary>
+public sealed class SelectionRequirementsRuleNodeConverter : JsonConverter<RuleNode?>
+{
+    public override RuleNode? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.Null)
+            return null;
+
+        if (reader.TokenType == JsonTokenType.StartArray)
+        {
+            var list = JsonSerializer.Deserialize<List<RuleNode>>(ref reader, options);
+            if (list == null || list.Count == 0)
+                return null;
+            if (list.Count == 1)
+            {
+                list[0].CombinedSelectionRequirements = list;
+                return list[0];
+            }
+
+            var mergedPrereqs = new List<RuleNode>();
+            foreach (var item in list)
+            {
+                if (item == null) continue;
+                if (string.Equals(item.Type, "TSelectionRequirement", StringComparison.Ordinal))
+                {
+                    if (item.Prerequisites != null)
+                        mergedPrereqs.AddRange(item.Prerequisites);
+                }
+                else
+                {
+                    mergedPrereqs.Add(item);
+                }
+            }
+
+            return new RuleNode
+            {
+                Type = "TSelectionRequirement",
+                Prerequisites = mergedPrereqs,
+                CombinedSelectionRequirements = list
+            };
+        }
+
+        return JsonSerializer.Deserialize<RuleNode>(ref reader, options);
+    }
+
+    public override void Write(Utf8JsonWriter writer, RuleNode? value, JsonSerializerOptions options)
+    {
+        if (value == null)
+        {
+            writer.WriteNullValue();
+            return;
+        }
+        if (value.CombinedSelectionRequirements is { Count: > 1 })
+        {
+            JsonSerializer.Serialize(writer, value.CombinedSelectionRequirements, options);
+            return;
+        }
+        JsonSerializer.Serialize(writer, value, options);
+    }
 }

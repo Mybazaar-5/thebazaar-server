@@ -171,19 +171,19 @@ public sealed class V12WikiCombatMechanicsTests
 
         var res = CombatSimulator.Simulate(Repo.Value, p1, p2, seed: 42, recordTimeline: true, recordEvents: true);
 
-        // t=1000ms 时 3 把快武器同帧触发 -> statScaler 应在 t=1000ms 即时叠加到 Damage=40 (10 + 3*10)
-        var frame980 = res.Timeline.First(t => t.TimeMs == 980);
-        var scalerFrame = frame980.Cards.First(c => c.InstanceId == statScaler.InstanceId);
+        // t=950ms (50ms 步长满 1000ms) 时 3 把快武器同帧触发 -> statScaler 应在 t=950ms 即时叠加到 Damage=40 (10 + 3*10)
+        var frame950 = res.Timeline.First(t => t.TimeMs == 950);
+        var scalerFrame = frame950.Cards.First(c => c.InstanceId == statScaler.InstanceId);
         Assert.Equal(40, scalerFrame.DamageAmount);
 
-        // 输出型被动 outputWatcher 的 3 次 20 伤害应在 980ms, ~1240ms, ~1480ms 分步排队结算，而非单帧全打出
+        // 输出型被动 outputWatcher 的 3 次 20 伤害应在 950ms, 1200ms, 1450ms 分步排队结算，而非单帧全打出
         var watcherDmgEvents = res.Events
             .Where(e => e.Type == CombatEventType.DamageApplied && e.SourceCardInstanceId == outputWatcher.InstanceId && e.TimeMs < 1800)
             .ToList();
         Assert.Equal(3, watcherDmgEvents.Count);
-        Assert.Equal(980, watcherDmgEvents[0].TimeMs);
-        Assert.True(watcherDmgEvents[1].TimeMs >= 1220, $"第二次输出应受 250ms ICD 队列顺延，实际 TimeMs={watcherDmgEvents[1].TimeMs}");
-        Assert.True(watcherDmgEvents[2].TimeMs >= 1480, $"第三次输出应受 250ms ICD 队列顺延，实际 TimeMs={watcherDmgEvents[2].TimeMs}");
+        Assert.Equal(950, watcherDmgEvents[0].TimeMs);
+        Assert.Equal(1200, watcherDmgEvents[1].TimeMs);
+        Assert.Equal(1450, watcherDmgEvents[2].TimeMs);
     }
 
     [Fact]
@@ -229,9 +229,9 @@ public sealed class V12WikiCombatMechanicsTests
             .ToList();
 
         Assert.Equal(2, clockFires.Count);
-        Assert.Equal(baseFires[0], clockFires[0]); // 满 Haste 下 1.0s CD 物品不加速到 0.5s(480ms)，与无 Haste 一致维持首击 980ms
-        Assert.Equal(980, clockFires[0]);
-        Assert.Equal(1980, clockFires[1]);
+        Assert.Equal(baseFires[0], clockFires[0]); // 满 Haste 下 1.0s CD 物品不加速到 0.5s(450ms)，与无 Haste 一致维持首击 950ms
+        Assert.Equal(950, clockFires[0]);
+        Assert.Equal(1950, clockFires[1]);
     }
 
     [Fact]
@@ -295,9 +295,9 @@ public sealed class V12WikiCombatMechanicsTests
             .Where(e => e.Type == CombatEventType.ShieldApplied && e.SourceCardInstanceId == useCounter.InstanceId)
             .ToList();
 
-        // Bottled Lightning 仅 1 发弹药于第 250 帧(4980ms)激活 1 次（同时造成伤害与灼烧），仅产生 1 次 Use；开场被动与技能均不计 Use
+        // Bottled Lightning 仅 1 发弹药于第 100 帧(4950ms)激活 1 次（同时造成伤害与灼烧），仅产生 1 次 Use；开场被动与技能均不计 Use
         Assert.Single(counterTriggers);
-        Assert.Equal(4980, counterTriggers[0].TimeMs);
+        Assert.Equal(4950, counterTriggers[0].TimeMs);
     }
 
     [Fact]
@@ -356,12 +356,12 @@ public sealed class V12WikiCombatMechanicsTests
             .Select(e => e.TimeMs)
             .ToList();
 
-        // AmmoMax=2 -> 共激活 2 轮，每轮 3 发 Multicast = 共 6 次发射；第 3 轮因 0 弹药被阻断
+        // AmmoMax=2 -> 共激活 2 轮，每轮 3 发 Multicast = 共 6 次发射；第 3 轮因 0 弹药被阻断（50ms 步长下 250ms 零漂移）
         Assert.Equal(6, fires.Count);
-        Assert.Equal(1980, fires[0]);
-        Assert.InRange(fires[1], 2220, 2260); // scheduled 1980+250=2230 -> 20ms tick = 2240
-        Assert.Equal(2500, fires[2]);         // scheduled 2240+250=2490 -> 20ms tick = 2500
-        Assert.Equal(3980, fires[3]);
+        Assert.Equal(1950, fires[0]);
+        Assert.Equal(2200, fires[1]);
+        Assert.Equal(2450, fires[2]);
+        Assert.Equal(3950, fires[3]);
 
         // 首轮中：第 1 发执行前敌人 Burn==0，故 Damage 未触发；第 1 发挂上 Burn>=5 后，第 2 发(t~2260)、第 3 发(t=2500) 重估条件成立 -> 均打出暴击伤害!
         var firstRoundDmg = res.Events
@@ -476,24 +476,24 @@ public sealed class V12WikiCombatMechanicsTests
 
         var res = CombatSimulator.Simulate(Repo.Value, p1, p2, seed: 42, recordTimeline: false, recordEvents: true);
 
-        // Charge 验证：t=1000 充能 2000 后不会在 Frozen 期间立即触发，而在 t=3000 解冻后凭 Haste(2x) 跑完剩下 2000ms，即 t=4000 首次开火
+        // Charge 验证：t=1000 充能 2000 后不会在 Frozen 期间立即触发，而在 t=3000 解冻后凭 Haste(2x) 跑完剩下 2000ms，即 t=3950 首次开火
         var chargeTargetFires = res.Events.Where(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == chargeTarget.InstanceId).Select(e => e.TimeMs).ToList();
         Assert.True(chargeTargetFires.Count >= 1);
-        Assert.Equal(3980, chargeTargetFires[0]);
+        Assert.Equal(3950, chargeTargetFires[0]);
 
-        // ForceUse 于 t=1480ms 触发：
+        // ForceUse 于 t=1450ms 触发：
         // - noCdCard: 0 次
         // - frozenCard: 0 次
-        // - zeroAmmoCard: 仅 t=980 自然触发 1 次（耗光弹药），t=1480 ForceUse 被 0 弹药阻断！
-        // - legalMulti: ForceUse 时打出完整 2 发 Multicast（t=1480 与 ~1740）且消耗完唯一 1 发弹药（9000ms 后不再开火）
+        // - zeroAmmoCard: 仅 t=950 自然触发 1 次（耗光弹药），t=1450 ForceUse 被 0 弹药阻断！
+        // - legalMulti: ForceUse 时打出完整 2 发 Multicast（t=1450 与 1700）且消耗完唯一 1 发弹药（9000ms 后不再开火）
         Assert.Empty(res.Events.Where(e => e.SourceCardInstanceId == noCdCard.InstanceId && e.Type == CombatEventType.CardFired));
         Assert.Empty(res.Events.Where(e => e.SourceCardInstanceId == frozenCard.InstanceId && e.Type == CombatEventType.CardFired && e.TimeMs < 5000));
         var zeroAmmoFires = res.Events.Where(e => e.SourceCardInstanceId == zeroAmmoCard.InstanceId && e.Type == CombatEventType.CardFired).Select(e => e.TimeMs).ToList();
-        Assert.Equal(new[] { 980 }, zeroAmmoFires);
+        Assert.Equal(new[] { 950 }, zeroAmmoFires);
         var legalFires = res.Events.Where(e => e.SourceCardInstanceId == legalMulti.InstanceId && e.Type == CombatEventType.CardFired).Select(e => e.TimeMs).ToList();
         Assert.Equal(2, legalFires.Count);
-        Assert.Equal(1480, legalFires[0]);
-        Assert.InRange(legalFires[1], 1720, 1760);
+        Assert.Equal(1450, legalFires[0]);
+        Assert.Equal(1700, legalFires[1]);
     }
 
     [Fact]
@@ -754,29 +754,29 @@ public sealed class V12WikiCombatMechanicsTests
 
         var res = CombatSimulator.Simulate(Repo.Value, p1, p2, seed: 42, recordTimeline: true, recordEvents: true);
 
-        // #21 共存抵消：cancelCard 精确在 3980ms 发射
-        Assert.Equal(3980, res.Events.First(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == cancelCard.InstanceId).TimeMs);
+        // #21 共存抵消：cancelCard 精确在 3950ms 发射
+        Assert.Equal(3950, res.Events.First(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == cancelCard.InstanceId).TimeMs);
 
-        // #22 Freeze 期间 Slow 同步流逝：t=1000 时 frozenSlowCard 解冻且 SlowMs == 0，故能在 4980ms（1000冻结 + 4000推进）准时开火
+        // #22 Freeze 期间 Slow 同步流逝：t=1000 时 frozenSlowCard 解冻且 SlowMs == 0，故能在 4950ms（1000冻结 + 4000推进）准时开火
         var f1000 = res.Timeline.First(t => t.TimeMs == 1000);
         Assert.Equal(0, f1000.Cards.First(c => c.InstanceId == frozenSlowCard.InstanceId).FreezeMs);
         Assert.Equal(0, f1000.Cards.First(c => c.InstanceId == frozenSlowCard.InstanceId).SlowMs);
-        Assert.Equal(4980, res.Events.First(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == frozenSlowCard.InstanceId).TimeMs);
+        Assert.Equal(4950, res.Events.First(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == frozenSlowCard.InstanceId).TimeMs);
 
         // #23 混池优先级（Conditionals.Priorities）：随机 Slow/Haste 优先命中 p2WithCd 与 flyingCard，跳过无 CD 卡 p2NoCd 与 noCdCard；
-        // flyingCard 共收到自身 2000 + 随机 2000 = 4000ms Haste（t=0 首跳扣 20ms 后为 3980ms）
-        var f20 = res.Timeline.First(t => t.TimeMs == 20);
-        Assert.Equal(0, f20.Cards.First(c => c.InstanceId == p2NoCd.InstanceId).SlowMs);
-        Assert.True(f20.Cards.First(c => c.InstanceId == p2WithCd.InstanceId).SlowMs > 0);
-        Assert.Equal(0, f20.Cards.First(c => c.InstanceId == noCdCard.InstanceId).HasteMs);
+        // flyingCard 共收到自身 2000 + 随机 2000 = 4000ms Haste（t=0 首跳扣 50ms 后为 3950ms）
+        var f50 = res.Timeline.First(t => t.TimeMs == 50);
+        Assert.Equal(0, f50.Cards.First(c => c.InstanceId == p2NoCd.InstanceId).SlowMs);
+        Assert.True(f50.Cards.First(c => c.InstanceId == p2WithCd.InstanceId).SlowMs > 0);
+        Assert.Equal(0, f50.Cards.First(c => c.InstanceId == noCdCard.InstanceId).HasteMs);
 
-        // #24 Flying 减半受控且不减半 Haste（t=0 快照已扣首跳 20ms：1000->980, 4000->3980）
+        // #24 Flying 减半受控且不减半 Haste（t=0 快照已扣首跳 50ms：1000->950, 4000->3950）
         var f0 = res.Timeline.First(t => t.TimeMs == 0);
         var flyFrame0 = f0.Cards.First(c => c.InstanceId == flyingCard.InstanceId);
         Assert.True(flyFrame0.IsFlying);
-        Assert.Equal(980, flyFrame0.SlowMs);   // 2000 * 0.5 - 20
-        Assert.Equal(980, flyFrame0.FreezeMs); // 2000 * 0.5 - 20
-        Assert.Equal(3980, flyFrame0.HasteMs); // 自身 2000 + 随机优先命中 2000，不减半 (4000 - 20)
+        Assert.Equal(950, flyFrame0.SlowMs);   // 2000 * 0.5 - 50
+        Assert.Equal(950, flyFrame0.FreezeMs); // 2000 * 0.5 - 50
+        Assert.Equal(3950, flyFrame0.HasteMs); // 自身 2000 + 随机优先命中 2000，不减半 (4000 - 50)
 
         // #23 补充验证官方 BazaarGameShared 回落桶：当随机 Haste/Slow 仅剩无 CD 合法目标且模板未限定 CooldownMax>0 时，按 Priorities 第二优先级允许回落命中
         var fbP1 = new PlayerState("fb_p1", "FB1", "Stelle", initialHealthMax: 5000, unlockedHandSlots: 10);
@@ -798,9 +798,9 @@ public sealed class V12WikiCombatMechanicsTests
         Assert.True(fbP2.Hand.TryPlaceOrShift(fbNoCdOpp, 0));
         var fbRes = CombatSimulator.Simulate(Repo.Value, fbP1, fbP2, seed: 42, recordTimeline: true, recordEvents: true);
         var fbF0 = fbRes.Timeline.First(t => t.TimeMs == 0);
-        // 无 CD 卡本身不参与 AdvanceSideCards 冷却推进，因此 t=0 时 HasteMs/SlowMs 保持全额 1000ms
-        Assert.Equal(1000, fbF0.Cards.First(c => c.InstanceId == fbNoCdSelf.InstanceId).HasteMs);
-        Assert.Equal(1000, fbF0.Cards.First(c => c.InstanceId == fbNoCdOpp.InstanceId).SlowMs);
+        // P1-53 新契约（对齐官方 BazaarCardDealer.cs:4110-4152）：无 CD 卡同样在 AdvanceSideCards 正常递减 Haste/Slow/Freeze（t=0 首跳扣 50ms -> 950ms）
+        Assert.Equal(950, fbF0.Cards.First(c => c.InstanceId == fbNoCdSelf.InstanceId).HasteMs);
+        Assert.Equal(950, fbF0.Cards.First(c => c.InstanceId == fbNoCdOpp.InstanceId).SlowMs);
     }
 
     [Fact]
@@ -845,9 +845,9 @@ public sealed class V12WikiCombatMechanicsTests
         Assert.Equal(2, bottledBurn.Value);  // 1 * 2x
 
         Assert.Equal(20, res.Events.First(e => e.Type == CombatEventType.ShieldApplied && e.SourceCardInstanceId == standardCrit.InstanceId).Value);
-        Assert.Equal(20, res.Events.First(e => e.Type == CombatEventType.HealApplied && e.SourceCardInstanceId == standardCrit.InstanceId && e.Detail != "RegenGain").Value);
+        Assert.Equal(20, res.Events.First(e => e.Type == CombatEventType.HealApplied && e.SourceCardInstanceId == standardCrit.InstanceId).Value);
         Assert.Equal(6, res.Events.First(e => e.Type == CombatEventType.PoisonApplied && e.SourceCardInstanceId == standardCrit.InstanceId).Value);
-        Assert.Equal(8, res.Events.First(e => e.Type == CombatEventType.HealApplied && e.SourceCardInstanceId == standardCrit.InstanceId && e.Detail == "RegenGain").Value);
+        Assert.Equal(8, res.Events.First(e => e.Type == CombatEventType.RegenApplied && e.SourceCardInstanceId == standardCrit.InstanceId).Value);
     }
 
     [Fact]
@@ -883,10 +883,10 @@ public sealed class V12WikiCombatMechanicsTests
 
         var res = CombatSimulator.Simulate(Repo.Value, p1, p2, seed: 42, recordTimeline: true, recordEvents: true);
 
-        Assert.Contains(res.Events, e => e.Type == CombatEventType.PlayerEnraged && e.TargetPlayerId == p1.PlayerId && e.TimeMs == 980);
-        var f980 = res.Timeline.First(t => t.TimeMs == 980);
-        Assert.True(f980.P1Enraged);
-        var wFrame = f980.Cards.First(c => c.InstanceId == weapon.InstanceId);
+        Assert.Contains(res.Events, e => e.Type == CombatEventType.PlayerEnraged && e.TargetPlayerId == p1.PlayerId && e.TimeMs == 950);
+        var f950 = res.Timeline.First(t => t.TimeMs == 950);
+        Assert.True(f950.P1Enraged);
+        var wFrame = f950.Cards.First(c => c.InstanceId == weapon.InstanceId);
         // Enraged 清零己方全场 Slow/Freeze 且全场武器 CD -10% (4000 -> 3600)
         Assert.Equal(0, wFrame.SlowMs);
         Assert.Equal(0, wFrame.FreezeMs);
@@ -916,25 +916,26 @@ public sealed class V12WikiCombatMechanicsTests
 
         var res = CombatSimulator.Simulate(Repo.Value, p1, p2, seed: 42, recordTimeline: true, recordEvents: true);
 
-        // 开暴前 t=9980 的 100 伤被 Gold Leather Jacket 30% 减伤至 70
-        var hit10s = res.Events.First(e => e.Type == CombatEventType.DamageApplied && e.TimeMs == 9980);
+        // 开暴前 t=9950 的 100 伤被 Gold Leather Jacket 30% 减伤至 70
+        var hit10s = res.Events.First(e => e.Type == CombatEventType.DamageApplied && e.TimeMs == 9950);
         Assert.Equal(70, hit10s.Value);
 
-        // Sandstorm 官方真值（P1-11，对齐 BazaarCardDealer.cs:4243-4274）：
-        // 20000ms 预警，30000ms 启动首跳 1 伤；先按 -10ms/跳 将间隔从 250ms 降至 150ms 下限（期间伤害保持 1），
+        // Sandstorm 官方真值（P1-50，对齐 BazaarCardDealer.cs:4235-4274 50ms 累加器 + 顺序双 if）：
+        // 20000ms 预警，30000ms 启动首跳 1 伤并同帧累加 50ms -> 第 2 跳 30200ms(+200ms)，第 3 跳 30450ms(+250ms)，
         // 触底 150ms 后才按 +2/跳 递增伤害（ticks[0..9]=1, ticks[10]=3, ticks[11]=5, ticks[12]=7...）
         var warn = res.Events.First(e => e.Type == CombatEventType.SandstormWarning);
-        Assert.InRange(warn.TimeMs, 19980, 20000);
+        Assert.Equal(20000, warn.TimeMs);
         var ticks = res.Events.Where(e => e.Type == CombatEventType.SandstormTick).ToList();
         Assert.True(ticks.Count >= 13, $"沙暴应至少产生 13 跳以验证 150ms 触底后增伤，实际={ticks.Count}");
-        Assert.InRange(ticks[0].TimeMs, 29980, 30000);
+        Assert.Equal(30000, ticks[0].TimeMs);
         for (int i = 0; i <= 9; i++)
             Assert.Equal(1, ticks[i].Value);
         Assert.Equal(3, ticks[10].Value);
         Assert.Equal(5, ticks[11].Value);
         Assert.Equal(7, ticks[12].Value);
-        Assert.True(ticks[1].TimeMs - ticks[0].TimeMs <= 260 && ticks[2].TimeMs - ticks[1].TimeMs <= ticks[1].TimeMs - ticks[0].TimeMs);
-        Assert.InRange(ticks[11].TimeMs - ticks[10].TimeMs, 140, 160);
+        Assert.Equal(200, ticks[1].TimeMs - ticks[0].TimeMs);
+        Assert.Equal(250, ticks[2].TimeMs - ticks[1].TimeMs);
+        Assert.Equal(150, ticks[11].TimeMs - ticks[10].TimeMs);
 
         // Leather Jacket 收到沙暴自毁并给友军施加 Haste + +100% CritChance
         Assert.Contains(res.Events, e => e.Type == CombatEventType.CardDestroyed && e.TargetCardInstanceId == jacket.InstanceId && e.TimeMs >= 29980 && e.TimeMs <= 30000);
@@ -1050,15 +1051,15 @@ public sealed class V12WikiCombatMechanicsTests
 
         var resC = CombatSimulator.Simulate(Repo.Value, p1c, p2c, seed: 42, recordTimeline: true, recordEvents: true);
 
-        // 验证 3D Printer 在 t=4980 变形为 3 张 Claws，且占据原地槽位 [1, 2, 3]
-        var p1Trans = resC.Events.Where(e => e.Type == CombatEventType.CardTransformed && e.SourcePlayerId == p1c.PlayerId && e.TimeMs == 4980).ToList();
+        // 验证 3D Printer 在 t=4950 变形为 3 张 Claws，且占据原地槽位 [1, 2, 3]
+        var p1Trans = resC.Events.Where(e => e.Type == CombatEventType.CardTransformed && e.SourcePlayerId == p1c.PlayerId && e.TimeMs == 4950).ToList();
         Assert.Equal(3, p1Trans.Count);
         var f5000 = resC.Timeline.First(t => t.TimeMs == 5000);
         // 原始 printer 已不在战中序列，而多了 3 张临时小卡（与 leftSmall 合计 P1 场上 5 张：1 Claws + 3 临时 Claws + 1 Hacksaw = 5）
         Assert.DoesNotContain(f5000.Cards, c => c.InstanceId == printer.InstanceId);
 
-        // 验证 Hacksaw 于 t=7980 将 enemyMed (2格) 变成 2 张 Small 卡（enemyLeg 为 Legendary 豁免，被变形卡属 p2c 故查 TargetPlayerId）
-        var p2Trans = resC.Events.Where(e => e.Type == CombatEventType.CardTransformed && e.TargetPlayerId == p2c.PlayerId && e.TimeMs == 7980).ToList();
+        // 验证 Hacksaw 于 t=7950 将 enemyMed (2格) 变成 2 张 Small 卡（enemyLeg 为 Legendary 豁免，被变形卡属 p2c 故查 TargetPlayerId）
+        var p2Trans = resC.Events.Where(e => e.Type == CombatEventType.CardTransformed && e.TargetPlayerId == p2c.PlayerId && e.TimeMs == 7950).ToList();
         Assert.Equal(2, p2Trans.Count);
 
         // 战后双方原始手牌完整无损还原！
@@ -1140,21 +1141,21 @@ public sealed class V12WikiCombatMechanicsTests
 
         var res = CombatSimulator.Simulate(Repo.Value, p1, p2, seed: 42, recordTimeline: true, recordEvents: true);
 
-        // DB Base Tempo 周期 = 2000ms (每满 100 帧即 t=1980ms / t=3980ms 各 +1 Tempo，非旧资料误传 1.0s/1.05s)
-        var t1960 = res.Timeline.First(t => t.TimeMs == 1960).P1Tempo;
-        var t1980 = res.Timeline.First(t => t.TimeMs == 1980).P1Tempo;
-        var t3960 = res.Timeline.First(t => t.TimeMs == 3960).P1Tempo;
-        var t3980 = res.Timeline.First(t => t.TimeMs == 3980).P1Tempo;
-        Assert.Equal(4, t1960);
-        Assert.Equal(5, t1980);
-        Assert.Equal(5, t3960);
-        Assert.Equal(6, t3980);
+        // DB Base Tempo 周期 = 2000ms (每满 40 帧即 t=1950ms / t=3950ms 各 +1 Tempo，非旧资料误传 1.0s/1.05s)
+        var t1900 = res.Timeline.First(t => t.TimeMs == 1900).P1Tempo;
+        var t1950 = res.Timeline.First(t => t.TimeMs == 1950).P1Tempo;
+        var t3900 = res.Timeline.First(t => t.TimeMs == 3900).P1Tempo;
+        var t3950 = res.Timeline.First(t => t.TimeMs == 3950).P1Tempo;
+        Assert.Equal(4, t1900);
+        Assert.Equal(5, t1950);
+        Assert.Equal(5, t3900);
+        Assert.Equal(6, t3950);
 
-        // 双 [G Note] 光环累加 -20% CDR：10000ms -> 8000ms (第 400 帧 7980ms) 发射，且单次使用从占据的 2 个插座同时各触发 +3 Tempo（共 +6）
+        // 双 [G Note] 光环累加 -20% CDR：10000ms -> 8000ms (第 160 帧 7950ms) 发射，且单次使用从占据的 2 个插座同时各触发 +3 Tempo（共 +6）
         var itemFires = res.Events.Where(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == multiSlotTempoCard.InstanceId).Select(e => e.TimeMs).ToList();
-        Assert.Contains(7980, itemFires);
-        var beforeFire = res.Timeline.First(t => t.TimeMs == 7960).P1Tempo;
-        var atFire = res.Timeline.First(t => t.TimeMs == 7980).P1Tempo;
+        Assert.Contains(7950, itemFires);
+        var beforeFire = res.Timeline.First(t => t.TimeMs == 7900).P1Tempo;
+        var atFire = res.Timeline.First(t => t.TimeMs == 7950).P1Tempo;
         Assert.True(atFire - beforeFire >= 6, $"多格卡跨两个 G Note 插座应叠加触发 2 次 G Minor (+6 Tempo)，实际增量={atFire - beforeFire}");
 
         // 卖出 Obsidian G Note 应生成 G Note 插座与 Obsidian 小物品

@@ -297,11 +297,11 @@ public sealed class V9ScheduleXpPvpTests
         Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
         Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
-        // 2b. P0-1 单份经验校验：Study (xp=2) 不再叠 +1 小时经验 = 2；Aldric (xp=1) + Exploit (xp=1 同小时去重) = 1
+        // 2b. P0-1 / P0-16 单份经验与直效即退校验：Study (xp=2, 无 SpawnContext) 选中后直效即退回 Choice 且 Hour==2、XP==2；Aldric (xp=1) + Exploit (xp=1 同小时去重) = 1
         var (studyRun, studyEngine) = CreateStartedEngine(fx.Pool, fx.Monsters, fx.LevelUps, fx.Mode, fx.Repo, fx.Ghosts);
         var studyOpt = InjectChoiceEncounter(studyRun, fx.Pool, StudyDefaultEventId);
         Assert.Null(studyEngine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(studyOpt.InstanceId) }).Error);
-        Assert.Null(studyEngine.Handle(new ExitCurrentStateCommand()).Error);
+        Assert.Equal(ERunState.Choice, studyRun.State);
         Assert.Equal(2u, studyRun.Hour);
         Assert.Equal(2, studyRun.PlayerAttributes[EPlayerAttributeType.Experience]);
 

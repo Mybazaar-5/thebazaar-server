@@ -51,59 +51,6 @@ public sealed class MonsterTemplate
         foreach (var sk in Skills) yield return sk;
         foreach (var st in StashItems) yield return st;
     }
-
-    /// <summary>
-    /// 估算该野怪在指定等级的实战强度。
-    ///
-    /// ⚠ `monsters.Player.Attributes.HealthMax` 是**该野怪的终局数值**（例如 5500），
-    /// 而 `CombatantType.Level` 才决定它在当前天数的实际缩放。
-    /// 直接拿 HealthMax 会导致 Day1 的玩家（战力 20-50）面对 5500 血的怪，必输。
-    ///
-    /// 所以这里按 Level 缩放：Level 1 取 8%，每升 1 级 +6%，上限 100%。
-    /// </summary>
-    public int ScaledHealth(int encounterLevel)
-    {
-        int lvl = encounterLevel <= 0 ? 1 : encounterLevel;
-        double factor = Math.Min(1.0, 0.08 + 0.06 * (lvl - 1));
-        return Math.Max(30, (int)(HealthMax * factor));
-    }
-
-    /// <summary>按等级缩放的战力。</summary>
-    public int ScaledPower(CardPool pool, int encounterLevel)
-    {
-        int lvl = encounterLevel <= 0 ? 1 : encounterLevel;
-        double factor = Math.Min(1.0, 0.15 + 0.08 * (lvl - 1));
-        return Math.Max(1, (int)(EstimatePower(pool) * factor));
-    }
-
-    /// <summary>
-    /// 估算该野怪的总输出：把每件装备的 DamageAmount 加起来，乘以品质系数。
-    /// 这是简化模型（不做 ICD/冷却），用于自建服的胜负判定。
-    /// </summary>
-    public int EstimatePower(CardPool pool)
-    {
-        int total = 0;
-        foreach (var it in Items)
-        {
-            var tpl = pool.Get(it.TemplateId);
-            if (tpl == null) continue;
-
-            string tier = it.Tier ?? tpl.StartingTier ?? "Bronze";
-            int dmg = 0;
-            if (tpl.TierAttributes.TryGetValue(tier, out var attrs) &&
-                attrs.TryGetValue("DamageAmount", out int d))
-            {
-                dmg = d;
-            }
-            else if (tpl.TierAttributes.TryGetValue(tpl.StartingTier ?? "Bronze", out var baseAttrs) &&
-                     baseAttrs.TryGetValue("DamageAmount", out int bd))
-            {
-                dmg = bd;
-            }
-            total += dmg;
-        }
-        return total;
-    }
 }
 
 public static class MonsterPool
@@ -462,7 +409,7 @@ public static class MonsterPool
                 Items = MapEntries(core.Player?.Hand?.Items),
                 Skills = MapEntries(core.Player?.Skills),
                 StashItems = MapEntries(core.Player?.Stash?.Items),
-                SocketEffects = MapEntries(core.Player?.SocketEffects),
+                SocketEffects = MapEntries(core.Player?.GetEffectiveSocketEffects()),
             });
         }
         Console.WriteLine($"[MonsterPool] (shared repo) mapped {list.Count} monsters (withSkills={list.Count(m => m.Skills.Count > 0)})");
@@ -532,10 +479,26 @@ public static class MonsterPool
                 ? ParseCardList(skillsEl)
                 : new List<MonsterTemplate.MonsterItem>();
 
-            var socketEffects = player.ValueKind == JsonValueKind.Object &&
-                                player.TryGetProperty("SocketEffects", out var seEl)
-                ? ParseCardList(seEl)
-                : new List<MonsterTemplate.MonsterItem>();
+            var socketEffects = new List<MonsterTemplate.MonsterItem>();
+            if (player.ValueKind == JsonValueKind.Object &&
+                player.TryGetProperty("Socket", out var socketEl) &&
+                socketEl.ValueKind == JsonValueKind.Object &&
+                socketEl.TryGetProperty("Effects", out var nestedSeEl))
+            {
+                socketEffects.AddRange(ParseCardList(nestedSeEl));
+            }
+            if (player.ValueKind == JsonValueKind.Object &&
+                player.TryGetProperty("SocketEffects", out var legacySeEl))
+            {
+                foreach (var legacyItem in ParseCardList(legacySeEl))
+                {
+                    bool dup = socketEffects.Any(x =>
+                        string.Equals(x.SocketId, legacyItem.SocketId, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(x.TemplateId, legacyItem.TemplateId, StringComparison.OrdinalIgnoreCase));
+                    if (!dup)
+                        socketEffects.Add(legacyItem);
+                }
+            }
 
             return new MonsterTemplate
             {

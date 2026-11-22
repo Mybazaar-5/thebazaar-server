@@ -22,6 +22,7 @@ using BazaarGameShared.Infra.Messages.CombatSimEvents;
 using BazaarGameShared.Infra.Messages.GameSimEvents;
 using HarmonyLib;
 using UnityEngine;
+using BazaarLauncher.Core;
 
 namespace BazaarLauncher;
 
@@ -29,7 +30,7 @@ internal static partial class CompatAuditPatch
 {
     // ── 1. CombatSimHandler：CardTransformed 防缺 Key & ExtractFrameEffects 兜底 ──
 
-    private static void PatchCombatSimHandler(Harmony harmony)
+    private static void PatchCombatSimHandler(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -40,27 +41,30 @@ internal static partial class CompatAuditPatch
                 new[] { typeof(CombatSimEventCardTransformed), typeof(CombatSimFrame) });
             if (tryCache != null)
             {
-                harmony.Patch(tryCache, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(TryCacheTransformedCardPrefix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(tryCache,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(TryCacheTransformedCardPrefix)),
+                    optional: true,
+                    label: "Compat.GameSim.CombatSimHandler.TryCacheTransformedCard");
             }
 
             var processEvents = AccessTools.Method(t, "ProcessEvents",
                 new[] { typeof(ICombatSimEvent), typeof(CombatSimFrame), typeof(List<string>) });
             if (processEvents != null)
             {
-                harmony.Patch(processEvents, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(CombatProcessEventsPrefix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(processEvents,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(CombatProcessEventsPrefix)),
+                    optional: true,
+                    label: "Compat.GameSim.CombatSimHandler.ProcessEvents");
             }
 
             var extractEffects = AccessTools.Method(t, "ExtractFrameEffects",
                 new[] { typeof(List<CombatSimFrame>), typeof(List<string>) });
             if (extractEffects != null)
             {
-                harmony.Patch(extractEffects, finalizer: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(ExtractFrameEffectsFinalizer))));
-                _patchedCount++;
+                patcher.TryPatchMethod(extractEffects,
+                    finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(ExtractFrameEffectsFinalizer)),
+                    optional: true,
+                    label: "Compat.GameSim.CombatSimHandler.ExtractFrameEffects");
             }
         }
         catch (Exception ex)
@@ -114,6 +118,7 @@ internal static partial class CompatAuditPatch
             if (!frame.CardUpdates.ContainsKey(origId))
             {
                 frame.CardUpdates[origId] = new CombatSimCardUpdate { CardInstanceId = origId };
+                RecordCompatHackHit("H-4", ref _hackH4TransformShellCount, "CombatFrame.OriginalCardShell:" + evt.OriginalInstanceId);
             }
         }
 
@@ -125,6 +130,7 @@ internal static partial class CompatAuditPatch
             if (!frame.CardUpdates.ContainsKey(newId))
             {
                 frame.CardUpdates[newId] = new CombatSimCardUpdate { CardInstanceId = newId };
+                RecordCompatHackHit("H-4", ref _hackH4TransformShellCount, "CombatFrame.TransformedCardShell:" + tc.InstanceId);
             }
         }
     }
@@ -141,7 +147,7 @@ internal static partial class CompatAuditPatch
 
     // ── 2. VFXManager.GenerateCombatVFX：属性映射动作 TargetCard 为空防 NRE ──
 
-    private static void PatchVfxManager(Harmony harmony)
+    private static void PatchVfxManager(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -152,9 +158,10 @@ internal static partial class CompatAuditPatch
             var genMethod = AccessTools.Method(vfxMgrType, "GenerateCombatVFX", new[] { evtType });
             if (genMethod != null)
             {
-                harmony.Patch(genMethod, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(GenerateCombatVfxPrefix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(genMethod,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(GenerateCombatVfxPrefix)),
+                    optional: true,
+                    label: "Compat.GameSim.VFXManager.GenerateCombatVFX");
             }
         }
         catch (Exception ex)
@@ -163,14 +170,22 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    // P1-3 & P2 加固：按运行时真实类型分桶缓存战斗 VFX 反射成员，彻底消除跨类型强转风险与每次触发无缓存反射
+    // P1-3 & P2-15 (O-5) 加固：按 CombatActionData.cs 精确字段/属性布局分桶缓存（VFXShouldPlay/ActionType/TargetInstanceId/IsCrit/HealthBefore/HealthAfter/VFXOverrideKey 为 FieldInfo，TargetCard/SourceCard 为 PropertyInfo）
     private sealed class VfxEventDataMemberBag
     {
-        public PropertyInfo ShouldPlay;
-        public PropertyInfo ActionType;
+        public FieldInfo ShouldPlayField;
+        public PropertyInfo ShouldPlayProp;
+        public FieldInfo ActionTypeField;
+        public PropertyInfo ActionTypeProp;
+        public FieldInfo TargetInstanceIdField;
+        public PropertyInfo TargetInstanceIdProp;
+        public FieldInfo IsCritField;
+        public PropertyInfo IsCritProp;
+        public FieldInfo HealthBeforeField;
+        public FieldInfo HealthAfterField;
+        public FieldInfo VfxOverrideKeyField;
         public PropertyInfo TargetCard;
         public PropertyInfo SourceCard;
-        public PropertyInfo TargetInstanceId;
     }
 
     private static readonly ConcurrentDictionary<Type, PropertyInfo> _vfxEventDataPropByType = new();
@@ -179,17 +194,54 @@ internal static partial class CompatAuditPatch
     private static readonly ConcurrentDictionary<Type, MethodInfo> _vfxIsActionMappedByType = new();
     private static readonly ConcurrentDictionary<Type, PropertyInfo> _vfxCardInstanceIdPropByType = new();
 
+    private static BazaarLauncher.Modules.PerfOptimizerModule.CombatVfxPriority ClassifyCombatVfxPriority(
+        VfxEventDataMemberBag bag, object data, object actionTypeObj)
+    {
+        // 1. 暴击 / 致死 / 显式自定义覆盖 VFX：Critical（永不节流）
+        bool isCrit = (bag.IsCritField?.GetValue(data) ?? bag.IsCritProp?.GetValue(data)) is bool c && c;
+        if (isCrit)
+            return BazaarLauncher.Modules.PerfOptimizerModule.CombatVfxPriority.Critical;
+
+        if (bag.HealthBeforeField != null && bag.HealthAfterField != null
+            && bag.HealthBeforeField.GetValue(data) is float hpBefore
+            && bag.HealthAfterField.GetValue(data) is float hpAfter
+            && hpBefore > 0f && hpAfter <= 0f)
+        {
+            return BazaarLauncher.Modules.PerfOptimizerModule.CombatVfxPriority.Critical;
+        }
+
+        if (bag.VfxOverrideKeyField?.GetValue(data) is string ovKey && !string.IsNullOrEmpty(ovKey))
+            return BazaarLauncher.Modules.PerfOptimizerModule.CombatVfxPriority.Critical;
+
+        if (actionTypeObj == null)
+            return BazaarLauncher.Modules.PerfOptimizerModule.CombatVfxPriority.Minor;
+
+        // 2. 按 TheBazaar.ActionType 官方枚举值分类（见 ActionType.cs）
+        int code;
+        try { code = Convert.ToInt32(actionTypeObj); }
+        catch { return BazaarLauncher.Modules.PerfOptimizerModule.CombatVfxPriority.Minor; }
+
+        return code switch
+        {
+            // Critical：摧毁/变形/升级/禁用/任务完成/开战/头像切换（低频重大演出）
+            200 or 250 or 900 or 1000 or 1010 or 1400 or 11200
+                => BazaarLauncher.Modules.PerfOptimizerModule.CombatVfxPriority.Critical,
+
+            // Core：主激活战斗效果（伤害/护盾/治疗/灼烧/剧毒/再生/快乐/节奏/冻结/强制触发/最大生命变化/偷金/飞行）
+            300 or 400 or 1600 or 1800 or 1900 or 2000 or 2100 or 2300 or 2400
+                or 2600 or 3000 or 5000 or 6100 or 6200 or 11300 or 11301 or 11302
+                => BazaarLauncher.Modules.PerfOptimizerModule.CombatVfxPriority.Core,
+
+            // Minor：高频小粒子（光环/属性修改、充能/加速/减速/装填、移除类特效等）优先节流
+            _ => BazaarLauncher.Modules.PerfOptimizerModule.CombatVfxPriority.Minor,
+        };
+    }
+
     private static bool GenerateCombatVfxPrefix(object __instance, object eventData)
     {
         try
         {
             if (__instance == null || eventData == null) return false;
-
-            // 与 PerfOptimizerModule 联动：高并发 VFX 安全限流
-            if (BazaarLauncher.Modules.PerfOptimizerModule.ShouldThrottleCombatVfx())
-            {
-                return false;
-            }
 
             var evDataProp = _vfxEventDataPropByType.GetOrAdd(
                 eventData.GetType(),
@@ -197,17 +249,43 @@ internal static partial class CompatAuditPatch
             var data = evDataProp?.GetValue(eventData);
             if (data == null) return false;
 
-            var dataBag = _vfxDataBagByType.GetOrAdd(data.GetType(), static dt => new VfxEventDataMemberBag
+            var dataBag = _vfxDataBagByType.GetOrAdd(data.GetType(), static dt =>
             {
-                ShouldPlay = dt.GetProperty("VFXShouldPlay", BindingFlags.Public | BindingFlags.Instance),
-                ActionType = dt.GetProperty("ActionType", BindingFlags.Public | BindingFlags.Instance),
-                TargetCard = dt.GetProperty("TargetCard", BindingFlags.Public | BindingFlags.Instance),
-                SourceCard = dt.GetProperty("SourceCard", BindingFlags.Public | BindingFlags.Instance),
-                TargetInstanceId = dt.GetProperty("TargetInstanceId", BindingFlags.Public | BindingFlags.Instance),
+                const BindingFlags anyPub = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                return new VfxEventDataMemberBag
+                {
+                    ShouldPlayField = dt.GetField("VFXShouldPlay", anyPub),
+                    ShouldPlayProp = dt.GetProperty("VFXShouldPlay", anyPub),
+                    ActionTypeField = dt.GetField("ActionType", anyPub),
+                    ActionTypeProp = dt.GetProperty("ActionType", anyPub),
+                    TargetInstanceIdField = dt.GetField("TargetInstanceId", anyPub),
+                    TargetInstanceIdProp = dt.GetProperty("TargetInstanceId", anyPub),
+                    IsCritField = dt.GetField("IsCrit", anyPub),
+                    IsCritProp = dt.GetProperty("IsCrit", anyPub),
+                    HealthBeforeField = dt.GetField("HealthBefore", anyPub),
+                    HealthAfterField = dt.GetField("HealthAfter", anyPub),
+                    VfxOverrideKeyField = dt.GetField("VFXOverrideKey", anyPub),
+                    TargetCard = dt.GetProperty("TargetCard", anyPub),
+                    SourceCard = dt.GetProperty("SourceCard", anyPub),
+                };
             });
 
-            if (dataBag.ShouldPlay != null && dataBag.ShouldPlay.GetValue(data) is bool play && !play)
+            object shouldPlayObj = dataBag.ShouldPlayField != null
+                ? dataBag.ShouldPlayField.GetValue(data)
+                : dataBag.ShouldPlayProp?.GetValue(data);
+            if (shouldPlayObj is bool play && !play)
                 return true;
+
+            var actionType = dataBag.ActionTypeField != null
+                ? dataBag.ActionTypeField.GetValue(data)
+                : dataBag.ActionTypeProp?.GetValue(data);
+
+            // P2-15 (O-5)：分级保留 VFX 限流（Critical 永不丢弃、Core 高预算优先保留、Minor 高频小粒子率先节流）
+            var priority = ClassifyCombatVfxPriority(dataBag, data, actionType);
+            if (BazaarLauncher.Modules.PerfOptimizerModule.ShouldThrottleCombatVfx(priority))
+            {
+                return false;
+            }
 
             var mgrSoField = _vfxManagerSoFieldByType.GetOrAdd(
                 __instance.GetType(),
@@ -215,7 +293,6 @@ internal static partial class CompatAuditPatch
             var vfxSo = mgrSoField?.GetValue(__instance);
             if (vfxSo == null) return false;
 
-            var actionType = dataBag.ActionType?.GetValue(data);
             var targetCard = dataBag.TargetCard?.GetValue(data);
 
             var isMappedMethod = _vfxIsActionMappedByType.GetOrAdd(
@@ -232,13 +309,31 @@ internal static partial class CompatAuditPatch
                         var srcIdProp = _vfxCardInstanceIdPropByType.GetOrAdd(
                             srcCard.GetType(),
                             static ct => ct.GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance));
-                        if (srcIdProp != null && dataBag.TargetInstanceId != null && dataBag.TargetInstanceId.CanWrite)
+                        if (srcIdProp != null)
                         {
-                            dataBag.TargetInstanceId.SetValue(data, srcIdProp.GetValue(srcCard));
-                            if (dataBag.TargetCard?.GetValue(data) != null) return true;
+                            object srcIdVal = srcIdProp.GetValue(srcCard);
+                            if (dataBag.TargetInstanceIdField != null)
+                            {
+                                dataBag.TargetInstanceIdField.SetValue(data, srcIdVal);
+                                if (dataBag.TargetCard?.GetValue(data) != null)
+                                {
+                                    RecordCompatHackHit("H-3", ref _hackH3VfxTargetFallbackCount, "FallbackTargetToSource:" + actionType);
+                                    return true;
+                                }
+                            }
+                            else if (dataBag.TargetInstanceIdProp != null && dataBag.TargetInstanceIdProp.CanWrite)
+                            {
+                                dataBag.TargetInstanceIdProp.SetValue(data, srcIdVal);
+                                if (dataBag.TargetCard?.GetValue(data) != null)
+                                {
+                                    RecordCompatHackHit("H-3", ref _hackH3VfxTargetFallbackCount, "FallbackTargetToSource:" + actionType);
+                                    return true;
+                                }
+                            }
                         }
                     }
 
+                    RecordCompatHackHit("H-3", ref _hackH3VfxTargetFallbackCount, "DroppedMissingTarget:" + actionType);
                     return false;
                 }
             }
@@ -252,7 +347,7 @@ internal static partial class CompatAuditPatch
 
     // ── 3. GameSimHandler：Transform 缺 Key 防护 & SkillEquipped 实体判空 ──
 
-    private static void PatchGameSimHandler(Harmony harmony)
+    private static void PatchGameSimHandler(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -262,31 +357,112 @@ internal static partial class CompatAuditPatch
             var mTrans = AccessTools.Method(t, "ProcessCardTransformedEvents");
             if (mTrans != null)
             {
-                harmony.Patch(mTrans, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(ProcessCardTransformedEventsPrefix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(mTrans,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(ProcessCardTransformedEventsPrefix)),
+                    optional: true,
+                    label: "Compat.GameSim.GameSimHandler.ProcessCardTransformedEvents");
             }
 
             var mRev = AccessTools.Method(t, "ProcessTransformRevertedEvents");
             if (mRev != null)
             {
-                harmony.Patch(mRev, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(ProcessTransformRevertedEventsPrefix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(mRev,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(ProcessTransformRevertedEventsPrefix)),
+                    optional: true,
+                    label: "Compat.GameSim.GameSimHandler.ProcessTransformRevertedEvents");
             }
 
             var mProc = AccessTools.Method(t, "ProcessEvents", new[] { typeof(IList<IGameSimEvent>) });
             if (mProc != null)
             {
-                harmony.Patch(mProc, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(GameSimProcessEventsPrefix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(mProc,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(GameSimProcessEventsPrefix)),
+                    optional: true,
+                    label: "Compat.GameSim.GameSimHandler.ProcessEvents");
+            }
+
+            // P1-43：同场景重开/重置对局数据时自主触发跨局静态字段清理，不依赖 PerfOptimizerModule
+            var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
+            var resetRunData = dataType == null ? null : AccessTools.Method(dataType, "ResetRunData", Type.EmptyTypes);
+            if (resetRunData != null)
+            {
+                patcher.TryPatchMethod(resetRunData,
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(DataResetRunDataPostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.Data.ResetRunData");
+            }
+
+            // P2-39：原生 GameStateHandler.InitializeSocketEffects 错写 Player.SocketEffects 而非 Player.Socket，
+            // 挂载 Postfix 同步清理并写入 Player.Socket，杜绝局中 StateSync 同步后残留脏引用拒放
+            var gshType = GameInspector.FindTypeSafe("TheBazaar.GameStateHandler");
+            var initSocketEffects = gshType == null ? null : AccessTools.Method(gshType, "InitializeSocketEffects", Type.EmptyTypes);
+            if (initSocketEffects != null)
+            {
+                _socketEffectCardRuntimeType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.SocketEffect");
+                patcher.TryPatchMethod(initSocketEffects,
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(GameStateHandlerInitializeSocketEffectsPostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.GameStateHandler.InitializeSocketEffects");
             }
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.GameSimHandler: " + ex.Message);
         }
+    }
+
+    private static Type _socketEffectCardRuntimeType;
+
+    private static void GameStateHandlerInitializeSocketEffectsPostfix()
+    {
+        try
+        {
+            var run = GameInspector.GetDataRun() as IRun;
+            var player = run?.GetPlayer();
+            var entities = GameInspector.GetDataEntities();
+            if (player?.Socket?.Container == null || entities == null)
+                return;
+
+            var container = player.Socket.Container;
+            var sockets = container.Sockets;
+            if (sockets != null)
+            {
+                for (int i = 0; i < sockets.Length; i++)
+                {
+                    var existing = sockets[i];
+                    if (existing != null)
+                    {
+                        container.Remove(existing);
+                    }
+                }
+            }
+
+            foreach (DictionaryEntry kv in entities)
+            {
+                var val = kv.Value;
+                if (val == null) continue;
+                bool isSocketEffect = _socketEffectCardRuntimeType != null
+                    ? _socketEffectCardRuntimeType.IsInstanceOfType(val)
+                    : (val is ICard c && c.Type == ECardType.SocketEffect);
+                if (!isSocketEffect) continue;
+
+                if (val is ICard card && val is ISocketable socketable
+                    && ReferenceEquals(card.Owner, player)
+                    && card.LeftSocketId.HasValue)
+                {
+                    container.PlaceOnSocket(socketable, card.LeftSocketId.Value);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.GameStateHandlerInitializeSocketEffectsPostfix: " + ex.Message);
+        }
+    }
+
+    private static void DataResetRunDataPostfix()
+    {
+        ClearRunScopedCaches("Data.ResetRunData");
     }
 
     private static void ProcessCardTransformedEventsPrefix(
@@ -306,6 +482,7 @@ internal static partial class CompatAuditPatch
                     if (!simUpdates.ContainsKey(tc.InstanceId))
                     {
                         simUpdates[tc.InstanceId] = new SimUpdateCard { InstanceId = tc.InstanceId };
+                        RecordCompatHackHit("H-4", ref _hackH4TransformShellCount, "GameSim.CardTransformedShell:" + tc.InstanceId);
                     }
                 }
             }
@@ -330,6 +507,7 @@ internal static partial class CompatAuditPatch
                 if (!simUpdates.ContainsKey(ev.OriginalCard.InstanceId))
                 {
                     simUpdates[ev.OriginalCard.InstanceId] = new SimUpdateCard { InstanceId = ev.OriginalCard.InstanceId };
+                    RecordCompatHackHit("H-4", ref _hackH4TransformShellCount, "GameSim.TransformRevertedShell:" + ev.OriginalCard.InstanceId);
                 }
             }
         }
@@ -388,9 +566,7 @@ internal static partial class CompatAuditPatch
                         ClearParentEncounterCache("GameSimTransition:" + stEv.ToState);
                         if (stEv.ToState is ERunState.EndRunVictory or ERunState.EndRunDefeat)
                         {
-                            _enchDynamicSyncedTags.Clear();
-                            _cardTagSyncStamps.Clear();
-                            _lastTriggeredPvpSnapshot = default;
+                            ClearRunScopedCaches("GameSimTransition:" + stEv.ToState);
                         }
                     }
                     BazaarLauncherPlugin.Host?.EventBus.Publish(new BazaarModSdk.RunStateChangedModEvent(string.Empty, stEv.ToState.ToString()));
@@ -431,6 +607,7 @@ internal static partial class CompatAuditPatch
                     bool inEntities = entities.Contains(new InstanceId(id));
                     if (!inEntities && !spawnedInBatch.Contains(id))
                     {
+                        RecordCompatHackHit("H-5", ref _hackH5OrphanSkillDroppedCount, "OrphanPlayerSkillEquipped:" + id);
                         BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch: dropped orphan PlayerSkillEquipped ({id}) to prevent GameSimHandler NRE");
                         events.RemoveAt(i);
                     }
@@ -443,9 +620,389 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    // ── 4. CardQuestGroupData：任务条目越界与实例空安全 ──
+    // ── 3.5 SkillPresentationManager：重复 TemplateId 防锁盘 + 索引复位 + 贴图备份保护 (P1-44) ──
 
-    private static void PatchCardQuestGroupData(Harmony harmony)
+    private static FieldInfo _spmSkillProxyLookupField;
+    private static FieldInfo _spmCurrentSkillEntryIndexField;
+    private static PropertyInfo _spmIsUpdatingSkillBoardProp;
+    private static MethodInfo _spmIsUpdatingSkillBoardSetter;
+    private static FieldInfo _spmIsUpdatingSkillBoardBackingField;
+    private static FieldInfo _spmTempBoardTextureField;
+    [ThreadStatic] private static Stack<bool> _spmSkipOrAlreadyUpdatingStack;
+
+    private static void PatchSkillPresentationManager(SafeHarmonyPatcher patcher)
+    {
+        try
+        {
+            var spmType = GameInspector.FindTypeSafe("TheBazaar.SkillPresentationManager", "SkillPresentationManager");
+            if (spmType == null) return;
+
+            _spmSkillProxyLookupField = spmType.GetField("_skillProxyLookup", BindingFlags.NonPublic | BindingFlags.Instance);
+            _spmCurrentSkillEntryIndexField = spmType.GetField("_currentSkillEntryIndex", BindingFlags.NonPublic | BindingFlags.Instance);
+            _spmIsUpdatingSkillBoardProp = spmType.GetProperty("IsUpdatingSkillBoard", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            _spmIsUpdatingSkillBoardSetter = _spmIsUpdatingSkillBoardProp?.GetSetMethod(nonPublic: true);
+            _spmIsUpdatingSkillBoardBackingField = spmType.GetField("<IsUpdatingSkillBoard>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance);
+            _spmTempBoardTextureField = spmType.GetField("_tempBoardTexture", BindingFlags.NonPublic | BindingFlags.Instance);
+
+            var cardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.Card");
+            var addMethod = cardType != null
+                ? AccessTools.Method(spmType, "Add", new[] { cardType, typeof(bool) })
+                : AccessTools.Method(spmType, "Add");
+            if (addMethod != null && typeof(Task).IsAssignableFrom(addMethod.ReturnType))
+            {
+                patcher.TryPatchMethod(
+                    addMethod,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(SkillPresentationAddPrefix)),
+                    finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(SkillPresentationAddFinalizer)),
+                    optional: true,
+                    label: "Compat.GameSim.SkillPresentationManager.Add");
+            }
+
+            if (cardType != null)
+            {
+                var initMethod = AccessTools.Method(spmType, "Initialize", new[] { typeof(List<>).MakeGenericType(cardType) });
+                if (initMethod != null)
+                {
+                    patcher.TryPatchMethod(
+                        initMethod,
+                        prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(SkillPresentationInitializePrefix)),
+                        optional: true,
+                        label: "Compat.GameSim.SkillPresentationManager.Initialize");
+                }
+            }
+
+            var removeSkills = AccessTools.Method(spmType, "RemoveSkills", Type.EmptyTypes);
+            if (removeSkills != null)
+            {
+                patcher.TryPatchMethod(
+                    removeSkills,
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(SkillPresentationRemoveSkillsPostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.SkillPresentationManager.RemoveSkills");
+            }
+
+            var setTempTex = AccessTools.Method(spmType, "SetTempBoardTexture", new[] { typeof(Texture2D) });
+            if (setTempTex != null)
+            {
+                patcher.TryPatchMethod(
+                    setTempTex,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(SkillPresentationSetTempTexturePrefix)),
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(SkillPresentationSetTempTexturePostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.SkillPresentationManager.SetTempBoardTexture");
+            }
+
+            var resetTex = AccessTools.Method(spmType, "ResetBoardTextures", Type.EmptyTypes);
+            if (resetTex != null)
+            {
+                patcher.TryPatchMethod(
+                    resetTex,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(SkillPresentationResetBoardTexturesPrefix)),
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(SkillPresentationResetBoardTexturesPostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.SkillPresentationManager.ResetBoardTextures");
+            }
+
+            var setEntryTex = AccessTools.Method(spmType, "SetSkillEntryTexture", new[] { typeof(Texture2D) });
+            if (setEntryTex != null)
+            {
+                patcher.TryPatchMethod(
+                    setEntryTex,
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(SkillPresentationSetSkillEntryTexturePostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.SkillPresentationManager.SetSkillEntryTexture");
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.PatchSkillPresentationManager: " + ex.Message);
+        }
+    }
+
+    private static bool IsSkillBoardUpdating(object spm)
+    {
+        if (spm == null || _spmIsUpdatingSkillBoardProp == null) return false;
+        try
+        {
+            return _spmIsUpdatingSkillBoardProp.GetValue(spm) is bool b && b;
+        }
+        catch { return false; }
+    }
+
+    private static void ResetSkillBoardUpdatingFlag(object spm)
+    {
+        if (spm == null || (spm is UnityEngine.Object uo && uo == null)) return;
+        try
+        {
+            if (!IsSkillBoardUpdating(spm)) return;
+            if (_spmIsUpdatingSkillBoardSetter != null)
+            {
+                _spmIsUpdatingSkillBoardSetter.Invoke(spm, new object[] { false });
+            }
+            else if (_spmIsUpdatingSkillBoardBackingField != null)
+            {
+                _spmIsUpdatingSkillBoardBackingField.SetValue(spm, false);
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.ResetSkillBoardUpdatingFlag: " + ex.Message);
+        }
+    }
+
+    private static bool SkillPresentationAddPrefix(object __instance, object card, ref Task __result)
+    {
+        bool skipOrAlreadyUpdating = false;
+        try
+        {
+            if (__instance == null || (__instance is UnityEngine.Object uo && uo == null) || card == null)
+            {
+                skipOrAlreadyUpdating = true;
+                __result = Task.CompletedTask;
+                (_spmSkipOrAlreadyUpdatingStack ??= new Stack<bool>(2)).Push(skipOrAlreadyUpdating);
+                return false;
+            }
+
+            if (GameInspector.GetMember(card, "TemplateId") is Guid tplId
+                && tplId != Guid.Empty
+                && _spmSkillProxyLookupField?.GetValue(__instance) is IDictionary lookup
+                && lookup.Contains(tplId))
+            {
+                BazaarLauncherPlugin.Log?.LogWarning(
+                    $"CompatAuditPatch[P1-44]: 拦截重复 TemplateId ({tplId}) 进入 SkillPresentationManager.Add，避免 ArgumentException 锁死 IsUpdatingSkillBoard");
+                skipOrAlreadyUpdating = true;
+                __result = Task.CompletedTask;
+                (_spmSkipOrAlreadyUpdatingStack ??= new Stack<bool>(2)).Push(skipOrAlreadyUpdating);
+                return false;
+            }
+
+            skipOrAlreadyUpdating = IsSkillBoardUpdating(__instance);
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.SkillPresentationAddPrefix: " + ex.Message);
+        }
+
+        (_spmSkipOrAlreadyUpdatingStack ??= new Stack<bool>(2)).Push(skipOrAlreadyUpdating);
+        return true;
+    }
+
+    private static Exception SkillPresentationAddFinalizer(object __instance, Exception __exception, ref Task __result)
+    {
+        bool skipOrAlreadyUpdating = false;
+        if (_spmSkipOrAlreadyUpdatingStack != null && _spmSkipOrAlreadyUpdatingStack.Count > 0)
+        {
+            skipOrAlreadyUpdating = _spmSkipOrAlreadyUpdatingStack.Pop();
+        }
+
+        if (skipOrAlreadyUpdating)
+            return __exception;
+
+        if (__exception != null)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-44]: SkillPresentationManager.Add 同步异常已兜底归零 IsUpdatingSkillBoard: {__exception.Message}");
+            ResetSkillBoardUpdatingFlag(__instance);
+            __result = Task.CompletedTask;
+            return null;
+        }
+
+        if (__result == null)
+        {
+            ResetSkillBoardUpdatingFlag(__instance);
+            __result = Task.CompletedTask;
+            return null;
+        }
+
+        if (__result.IsCompleted)
+        {
+            if (__result.IsFaulted)
+            {
+                var innerEx = __result.Exception?.GetBaseException();
+                BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-44]: SkillPresentationManager.Add 同步 Fault 已兜底归零 IsUpdatingSkillBoard: {innerEx?.Message}");
+                __result = Task.CompletedTask;
+            }
+            ResetSkillBoardUpdatingFlag(__instance);
+            return null;
+        }
+
+        __result = WrapSkillPresentationAddTask(__result, __instance);
+        return null;
+    }
+
+    private static async Task WrapSkillPresentationAddTask(Task inner, object spm)
+    {
+        try
+        {
+            await inner;
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-44]: SkillPresentationManager.Add 异步异常已拦截并归零 IsUpdatingSkillBoard: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            PostToMainThread(() => ResetSkillBoardUpdatingFlag(spm));
+        }
+    }
+
+    private static void SkillPresentationInitializePrefix(IList skills)
+    {
+        try
+        {
+            if (skills == null || skills.Count <= 1) return;
+            var seen = new HashSet<Guid>();
+            for (int i = 0; i < skills.Count;)
+            {
+                var sk = skills[i];
+                if (sk == null)
+                {
+                    skills.RemoveAt(i);
+                    continue;
+                }
+                if (GameInspector.GetMember(sk, "TemplateId") is Guid tplId && tplId != Guid.Empty)
+                {
+                    if (!seen.Add(tplId))
+                    {
+                        BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-44]: SkillPresentationManager.Initialize 剔除重复 TemplateId ({tplId})");
+                        skills.RemoveAt(i);
+                        continue;
+                    }
+                }
+                i++;
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.SkillPresentationInitializePrefix: " + ex.Message);
+        }
+    }
+
+    private static void SkillPresentationRemoveSkillsPostfix(object __instance)
+    {
+        try
+        {
+            if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+            _spmCurrentSkillEntryIndexField?.SetValue(__instance, 0);
+        }
+        catch { }
+    }
+
+    private static void SkillPresentationSetTempTexturePrefix(object __instance, out Texture2D __state)
+    {
+        __state = null;
+        try
+        {
+            if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+            __state = _spmTempBoardTextureField?.GetValue(__instance) as Texture2D;
+        }
+        catch { }
+    }
+
+    private static void SkillPresentationSetTempTexturePostfix(object __instance, Texture2D __state)
+    {
+        try
+        {
+            // 若调用前已存在原始贴图备份，则恢复原备份，避免连续 SetTempBoardTexture 覆写丢失原板贴图
+            if (__state != null && __instance != null && !(__instance is UnityEngine.Object uo && uo == null))
+            {
+                _spmTempBoardTextureField?.SetValue(__instance, __state);
+            }
+        }
+        catch { }
+    }
+
+    private static bool SkillPresentationResetBoardTexturesPrefix(object __instance)
+    {
+        try
+        {
+            if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return false;
+            var backup = _spmTempBoardTextureField?.GetValue(__instance) as Texture2D;
+            return backup != null;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private static void SkillPresentationResetBoardTexturesPostfix(object __instance)
+    {
+        try
+        {
+            if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+            _spmTempBoardTextureField?.SetValue(__instance, null);
+        }
+        catch { }
+    }
+
+    private static void SkillPresentationSetSkillEntryTexturePostfix(object __instance)
+    {
+        try
+        {
+            if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+            _spmTempBoardTextureField?.SetValue(__instance, null);
+        }
+        catch { }
+    }
+
+    // ── 4. CardQuestGroupData：任务条目越界、实例空安全与跨局 _subscribedGroups 泄漏清理 (P2-42) ──
+
+    private static FieldInfo _questSubscribedGroupsField;
+    private static MethodInfo _questSubscribedGroupsClearMethod;
+    private static FieldInfo[] _cardQuestsDataStaticEventFields;
+
+    internal static void ClearCardQuestSubscribedGroups(string reason)
+    {
+        try
+        {
+            if (_questSubscribedGroupsField == null)
+            {
+                var qType = GameInspector.FindTypeSafe("TheBazaar.CardQuestGroupData", "CardQuestGroupData");
+                _questSubscribedGroupsField = qType?.GetField("_subscribedGroups", BindingFlags.NonPublic | BindingFlags.Static);
+            }
+
+            var setObj = _questSubscribedGroupsField?.GetValue(null);
+            if (setObj != null)
+            {
+                _questSubscribedGroupsClearMethod ??= setObj.GetType().GetMethod("Clear", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+                _questSubscribedGroupsClearMethod?.Invoke(setObj, null);
+            }
+
+            // 同步清空 CardQuestsData 的 4 个静态事件（全库仅由 CardQuestGroupData 订阅），彻底释放残留 Card 与委托链
+            if (_cardQuestsDataStaticEventFields == null)
+            {
+                var qdType = GameInspector.FindTypeSafe("TheBazaar.CardQuestsData", "CardQuestsData");
+                if (qdType != null)
+                {
+                    const BindingFlags anyStatic = BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static;
+                    var list = new List<FieldInfo>(4);
+                    foreach (var evName in new[] { "CombatQuestUpdated", "CombatQuestCompleted", "GameSimQuestUpdated", "GameSimQuestCompleted" })
+                    {
+                        var f = qdType.GetField(evName, anyStatic);
+                        if (f != null && typeof(Delegate).IsAssignableFrom(f.FieldType))
+                        {
+                            list.Add(f);
+                        }
+                    }
+                    _cardQuestsDataStaticEventFields = list.ToArray();
+                }
+            }
+
+            if (_cardQuestsDataStaticEventFields != null)
+            {
+                for (int i = 0; i < _cardQuestsDataStaticEventFields.Length; i++)
+                {
+                    _cardQuestsDataStaticEventFields[i].SetValue(null, null);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch.ClearCardQuestSubscribedGroups({reason}): {ex.Message}");
+        }
+    }
+
+    private static void PatchCardQuestGroupData(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -455,9 +1012,10 @@ internal static partial class CompatAuditPatch
             var onComplete = AccessTools.Method(t, "OnQuestCompleted", new[] { typeof(int) });
             if (onComplete != null)
             {
-                harmony.Patch(onComplete, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(OnQuestCompletedPrefix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(onComplete,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(OnQuestCompletedPrefix)),
+                    optional: true,
+                    label: "Compat.GameSim.CardQuestGroupData.OnQuestCompleted");
             }
 
             foreach (var name in new[]
@@ -471,9 +1029,10 @@ internal static partial class CompatAuditPatch
                 var m = AccessTools.Method(t, name);
                 if (m != null)
                 {
-                    harmony.Patch(m, prefix: new HarmonyMethod(
-                        AccessTools.Method(typeof(CompatAuditPatch), nameof(QuestMessagePrefix))));
-                    _patchedCount++;
+                    patcher.TryPatchMethod(m,
+                        prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(QuestMessagePrefix)),
+                        optional: true,
+                        label: $"Compat.GameSim.CardQuestGroupData.{name}");
                 }
             }
         }
@@ -519,7 +1078,7 @@ internal static partial class CompatAuditPatch
 
     // ── 5. HealthBarRewardController：野怪掉币/经验阈值查表空安全 ──
 
-    private static void PatchHealthBarRewardController(Harmony harmony)
+    private static void PatchHealthBarRewardController(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -529,9 +1088,10 @@ internal static partial class CompatAuditPatch
             var calc = AccessTools.Method(t, "CalculateRewardReceived", new[] { typeof(float) });
             if (calc != null)
             {
-                harmony.Patch(calc, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(CalculateRewardReceivedPrefix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(calc,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(CalculateRewardReceivedPrefix)),
+                    optional: true,
+                    label: "Compat.GameSim.HealthBarRewardController.CalculateRewardReceived");
             }
         }
         catch (Exception ex)
@@ -564,7 +1124,7 @@ internal static partial class CompatAuditPatch
 
     // ── 6. ResumeVisualController / MainMenuBaseState / EndOfRunRatingController：空 TrackRewards 与 UI 重叠安全兜底 ──
 
-    private static void PatchResumeAndEndOfRunControllers(Harmony harmony)
+    private static void PatchResumeAndEndOfRunControllers(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -572,32 +1132,31 @@ internal static partial class CompatAuditPatch
             var initMethod = resumeType == null ? null : AccessTools.Method(resumeType, "Init");
             if (initMethod != null)
             {
-                harmony.Patch(initMethod,
-                    prefix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(ResumeVisualInitPrefix))),
-                    finalizer: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(ResumeVisualInitFinalizer))));
-                _patchedCount++;
+                patcher.TryPatchMethod(initMethod,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(ResumeVisualInitPrefix)),
+                    finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(ResumeVisualInitFinalizer)),
+                    optional: true,
+                    label: "Compat.GameSim.ResumeVisualController.Init");
             }
 
             var menuBaseType = AccessTools.TypeByName("TheBazaar.UI.MainMenu.MainMenuBaseState");
             var onEnterMethod = menuBaseType == null ? null : AccessTools.Method(menuBaseType, "OnEnter");
             if (onEnterMethod != null)
             {
-                harmony.Patch(onEnterMethod,
-                    postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(MainMenuBaseStateOnEnterPostfix))),
-                    finalizer: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(MainMenuBaseStateOnEnterFinalizer))));
-                _patchedCount++;
+                patcher.TryPatchMethod(onEnterMethod,
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(MainMenuBaseStateOnEnterPostfix)),
+                    finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(MainMenuBaseStateOnEnterFinalizer)),
+                    optional: true,
+                    label: "Compat.GameSim.MainMenuBaseState.OnEnter");
             }
 
             var refreshMethod = menuBaseType == null ? null : AccessTools.Method(menuBaseType, "Refresh");
             if (refreshMethod != null && !refreshMethod.IsAbstract)
             {
-                try
-                {
-                    harmony.Patch(refreshMethod,
-                        postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(MainMenuBaseStateOnEnterPostfix))));
-                    _patchedCount++;
-                }
-                catch (Exception ex) { BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.MainMenuBaseState.Refresh: " + ex.Message); }
+                patcher.TryPatchMethod(refreshMethod,
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(MainMenuBaseStateOnEnterPostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.MainMenuBaseState.Refresh");
             }
 
             foreach (var subStateName in new[]
@@ -611,13 +1170,10 @@ internal static partial class CompatAuditPatch
                 var hm = subT == null ? null : AccessTools.Method(subT, "HandleResumeStateVisuals");
                 if (hm != null && !hm.IsAbstract)
                 {
-                    try
-                    {
-                        harmony.Patch(hm,
-                            postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(MainMenuBaseStateOnEnterPostfix))));
-                        _patchedCount++;
-                    }
-                    catch (Exception ex) { BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch.{subStateName}: " + ex.Message); }
+                    patcher.TryPatchMethod(hm,
+                        postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(MainMenuBaseStateOnEnterPostfix)),
+                        optional: true,
+                        label: $"Compat.GameSim.{subStateName}.HandleResumeStateVisuals");
                 }
             }
 
@@ -629,13 +1185,10 @@ internal static partial class CompatAuditPatch
                     var rcM = AccessTools.Method(runCfgCacheType, rcMethodName);
                     if (rcM != null && !rcM.IsAbstract)
                     {
-                        try
-                        {
-                            harmony.Patch(rcM,
-                                postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(OnRunConfigCacheUpdatedPostfix))));
-                            _patchedCount++;
-                        }
-                        catch (Exception ex) { BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch.RunConfigurationCache.{rcMethodName}: " + ex.Message); }
+                        patcher.TryPatchMethod(rcM,
+                            postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(OnRunConfigCacheUpdatedPostfix)),
+                            optional: true,
+                            label: $"Compat.GameSim.RunConfigurationCache.{rcMethodName}");
                     }
                 }
             }
@@ -644,18 +1197,20 @@ internal static partial class CompatAuditPatch
             var refreshScore = winCounterType == null ? null : AccessTools.Method(winCounterType, "RefreshScore");
             if (refreshScore != null)
             {
-                harmony.Patch(refreshScore,
-                    finalizer: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(SwallowUiFinalizer))));
-                _patchedCount++;
+                patcher.TryPatchMethod(refreshScore,
+                    finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(SwallowUiFinalizer)),
+                    optional: true,
+                    label: "Compat.GameSim.TournamentWinCounterController.RefreshScore");
             }
 
             var eorType = AccessTools.TypeByName("TheBazaar.UI.EndOfRun.EndOfRunRatingController");
             var cfgRewards = eorType == null ? null : AccessTools.Method(eorType, "ConfigureRewards");
             if (cfgRewards != null)
             {
-                harmony.Patch(cfgRewards, prefix: new HarmonyMethod(
-                    AccessTools.Method(typeof(CompatAuditPatch), nameof(ConfigureRewardsPrefix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(cfgRewards,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(ConfigureRewardsPrefix)),
+                    optional: true,
+                    label: "Compat.GameSim.EndOfRunRatingController.ConfigureRewards");
             }
         }
         catch (Exception ex)
@@ -942,7 +1497,7 @@ internal static partial class CompatAuditPatch
 
     private static FieldInfo _soundManagerField;
 
-    private static void PatchSoundEventListener(Harmony harmony)
+    private static void PatchSoundEventListener(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -959,10 +1514,11 @@ internal static partial class CompatAuditPatch
 
             if (onMoved != null)
             {
-                harmony.Patch(onMoved,
-                    prefix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(OnCardMovedPrefix))),
-                    finalizer: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(OnCardMovedFinalizer))));
-                _patchedCount++;
+                patcher.TryPatchMethod(onMoved,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(OnCardMovedPrefix)),
+                    finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(OnCardMovedFinalizer)),
+                    optional: true,
+                    label: "Compat.GameSim.SoundEventListener.OnCardMoved");
             }
         }
         catch (Exception ex)
@@ -977,7 +1533,7 @@ internal static partial class CompatAuditPatch
         {
             if (__instance == null || itemCard == null)
             {
-                Interlocked.Increment(ref _suppressedSoundMoveCount);
+                RecordCompatHackHit("H-2", ref _suppressedSoundMoveCount, "OnCardMoved:NullArg");
                 return false;
             }
 
@@ -991,7 +1547,7 @@ internal static partial class CompatAuditPatch
                 : GameInspector.GetMember(__instance, "_soundManager");
             if (soundMgr == null || GameInspector.GetMember(soundMgr, "SFXPlayer") == null)
             {
-                Interlocked.Increment(ref _suppressedSoundMoveCount);
+                RecordCompatHackHit("H-2", ref _suppressedSoundMoveCount, "OnCardMoved:MissingSoundMgr");
                 return false;
             }
 
@@ -1000,14 +1556,14 @@ internal static partial class CompatAuditPatch
             var lookup = GameInspector.GetDataLookup();
             if (iid == null || entities == null || lookup == null || !entities.Contains(iid))
             {
-                Interlocked.Increment(ref _suppressedSoundMoveCount);
+                RecordCompatHackHit("H-2", ref _suppressedSoundMoveCount, "OnCardMoved:EntityMissing");
                 return false;
             }
 
             var entity = entities[iid];
             if (entity == null)
             {
-                Interlocked.Increment(ref _suppressedSoundMoveCount);
+                RecordCompatHackHit("H-2", ref _suppressedSoundMoveCount, "OnCardMoved:NullEntity");
                 return false;
             }
 
@@ -1017,23 +1573,13 @@ internal static partial class CompatAuditPatch
             if (ctrl == null || (ctrl is UnityEngine.Object uo && uo == null) ||
                 (ctrl is Component comp && comp.gameObject == null))
             {
-                int cnt = Interlocked.Increment(ref _suppressedSoundMoveCount);
-                if (cnt <= 3 || cnt % 25 == 0)
-                {
-                    BazaarLauncherPlugin.Log?.LogInfo(
-                        $"CompatAuditPatch: skipped SoundEventListener.OnCardMoved due to missing CardController (count={cnt})");
-                }
+                RecordCompatHackHit("H-2", ref _suppressedSoundMoveCount, "OnCardMoved:MissingCardController");
                 return false;
             }
         }
         catch (Exception ex)
         {
-            int cnt = Interlocked.Increment(ref _suppressedSoundMoveCount);
-            if (cnt <= 3 || cnt % 25 == 0)
-            {
-                BazaarLauncherPlugin.Log?.LogWarning(
-                    $"CompatAuditPatch: OnCardMovedPrefix fallback skip (count={cnt}): {ex.Message}");
-            }
+            RecordCompatHackHit("H-2", ref _suppressedSoundMoveCount, "OnCardMoved:PrefixEx:" + ex.GetType().Name);
             return false;
         }
         return true;
@@ -1043,19 +1589,14 @@ internal static partial class CompatAuditPatch
     {
         if (__exception != null)
         {
-            int cnt = Interlocked.Increment(ref _suppressedSoundMoveCount);
-            if (cnt <= 3 || cnt % 25 == 0)
-            {
-                BazaarLauncherPlugin.Log?.LogWarning(
-                    $"CompatAuditPatch: suppressed SoundEventListener.OnCardMoved {__exception.GetType().Name} (count={cnt}): {__exception.Message}");
-            }
+            RecordCompatHackHit("H-2", ref _suppressedSoundMoveCount, "OnCardMoved:Finalizer:" + __exception.GetType().Name);
         }
         return null;
     }
 
     // ── 8. BaseCardRevealAnimationDriver.GetCardContainerBounds：空集合防越界 ──
 
-    private static void PatchCardRevealAnimationDriver(Harmony harmony)
+    private static void PatchCardRevealAnimationDriver(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -1066,10 +1607,11 @@ internal static partial class CompatAuditPatch
                     ?? AccessTools.Method(t, "GetCardContainerBounds");
             if (m != null)
             {
-                harmony.Patch(m,
-                    prefix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(GetCardContainerBoundsPrefix))),
-                    finalizer: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(GetCardContainerBoundsFinalizer))));
-                _patchedCount++;
+                patcher.TryPatchMethod(m,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(GetCardContainerBoundsPrefix)),
+                    finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(GetCardContainerBoundsFinalizer)),
+                    optional: true,
+                    label: "Compat.GameSim.BaseCardRevealAnimationDriver.GetCardContainerBounds");
             }
         }
         catch (Exception ex)
@@ -1118,7 +1660,7 @@ internal static partial class CompatAuditPatch
 
     // ── 9. Data.ApplySimPvpOpponent：首次设置对手或切换英雄时补发 PvpOpponentChanged ──
 
-    private static void PatchDataApplySimPvpOpponent(Harmony harmony)
+    private static void PatchDataApplySimPvpOpponent(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -1129,10 +1671,11 @@ internal static partial class CompatAuditPatch
             var applyM = AccessTools.Method(dataType, "ApplySimPvpOpponent");
             if (applyM != null)
             {
-                harmony.Patch(applyM,
-                    prefix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(ApplySimPvpOpponentPrefix))),
-                    postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(ApplySimPvpOpponentPostfix))));
-                _patchedCount++;
+                patcher.TryPatchMethod(applyM,
+                    prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(ApplySimPvpOpponentPrefix)),
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(ApplySimPvpOpponentPostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.Data.ApplySimPvpOpponent");
             }
 
             var eventsType = GameInspector.FindTypeSafe("TheBazaar.Events");
@@ -1269,9 +1812,8 @@ internal static partial class CompatAuditPatch
                 var ps = _pvpOpponentChangedTriggerMethod.GetParameters();
                 _pvpOpponentChangedTriggerMethod.Invoke(_pvpOpponentChangedEventObj, ps.Length == 0 ? null : new object[] { null });
                 _lastTriggeredPvpSnapshot = nowSnap;
-                int cnt = Interlocked.Increment(ref _pvpOpponentChangedFixedCount);
-                BazaarLauncherPlugin.Log?.LogInfo(
-                    $"CompatAuditPatch: triggered missing Events.PvpOpponentChanged (count={cnt}, day={nowSnap.Day}, hour={nowSnap.Hour}, hero={nowSnap.Hero}, accountId={nowSnap.AccountId}, hp={nowSnap.MaxHealth})");
+                RecordCompatHackHit("H-1", ref _pvpOpponentChangedFixedCount,
+                    $"day={nowSnap.Day},hour={nowSnap.Hour},hero={nowSnap.Hero},accountId={nowSnap.AccountId}");
             }
         }
         catch (Exception ex)
@@ -1295,7 +1837,7 @@ internal static partial class CompatAuditPatch
     private static MethodInfo _bmHasCardsToRevealMethod;
     private static int _hour6WatchdogSeq;
 
-    private static void PatchTransitionInHour6Guard(Harmony harmony)
+    private static void PatchTransitionInHour6Guard(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -1322,19 +1864,21 @@ internal static partial class CompatAuditPatch
             var shouldWaitMethod = AccessTools.Method(tiType, "ShouldWaitForNewDayTransition", Type.EmptyTypes);
             if (shouldWaitMethod != null)
             {
-                harmony.Patch(
+                patcher.TryPatchMethod(
                     shouldWaitMethod,
-                    postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(TransitionInShouldWaitForNewDayPostfix))));
-                _patchedCount++;
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(TransitionInShouldWaitForNewDayPostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.TransitionInComponent.ShouldWaitForNewDayTransition");
             }
 
             var tryUpdateClockMethod = AccessTools.Method(tiType, "TryUpdateClock", Type.EmptyTypes);
             if (tryUpdateClockMethod != null)
             {
-                harmony.Patch(
+                patcher.TryPatchMethod(
                     tryUpdateClockMethod,
-                    postfix: new HarmonyMethod(AccessTools.Method(typeof(CompatAuditPatch), nameof(TransitionInTryUpdateClockPostfix))));
-                _patchedCount++;
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(TransitionInTryUpdateClockPostfix)),
+                    optional: true,
+                    label: "Compat.GameSim.TransitionInComponent.TryUpdateClock");
             }
         }
         catch (Exception ex)
@@ -1411,12 +1955,7 @@ internal static partial class CompatAuditPatch
             }
             __result = false;
 
-            int cnt = Interlocked.Increment(ref _hour6TransitionUnblockedCount);
-            if (cnt <= 5 || cnt % 20 == 0)
-            {
-                BazaarLauncherPlugin.Log?.LogInfo(
-                    $"CompatAuditPatch: unblocked Hour {curHour} Choice TransitionIn deadlock (count={cnt})");
-            }
+            RecordCompatHackHit("H-5", ref _hour6TransitionUnblockedCount, $"Hour{curHour}TransitionInDeadlockUnblocked");
         }
         catch (Exception ex)
         {
@@ -1529,9 +2068,7 @@ internal static partial class CompatAuditPatch
             if (_tiTryRevealCardsMethod != null && _tiTryRevealCardsMethod.DeclaringType.IsInstanceOfType(ti))
             {
                 _ = _tiTryRevealCardsMethod.Invoke(ti, null);
-                int cnt = Interlocked.Increment(ref _hour6WatchdogRevealCount);
-                BazaarLauncherPlugin.Log?.LogInfo(
-                    $"CompatAuditPatch: Hour 6 watchdog triggered fallback TryRevealCards() for PvpEncounter (count={cnt})");
+                RecordCompatHackHit("H-5", ref _hour6WatchdogRevealCount, "Hour6WatchdogFallbackTryRevealCards");
             }
         }
         catch (Exception ex)

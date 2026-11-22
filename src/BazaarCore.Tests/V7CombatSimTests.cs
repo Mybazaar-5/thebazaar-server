@@ -270,10 +270,10 @@ public sealed class V7CombatSimTests
         var res = CombatSimulator.Simulate(repo, p1, p2, seed: 401);
         var casts = res.Events.Where(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == multiWeapon.InstanceId).ToList();
         Assert.Equal(6, casts.Count); // 2 发弹药 * 3 连击 = 6 次施放（每次 CD 激活消耗 1 弹药）
-        Assert.Equal(980, casts[0].TimeMs);
+        Assert.Equal(950, casts[0].TimeMs);
         Assert.True(casts[1].TimeMs - casts[0].TimeMs >= 250, $"第2发应间隔 >=250ms，实际 {casts[1].TimeMs - casts[0].TimeMs}ms");
         Assert.True(casts[2].TimeMs - casts[1].TimeMs >= 250, $"第3发应间隔 >=250ms，实际 {casts[2].TimeMs - casts[1].TimeMs}ms");
-        Assert.Equal(1980, casts[3].TimeMs);
+        Assert.Equal(1950, casts[3].TimeMs);
         Assert.True(casts[4].TimeMs - casts[3].TimeMs >= 250);
         Assert.True(casts[5].TimeMs - casts[4].TimeMs >= 250);
 
@@ -314,8 +314,8 @@ public sealed class V7CombatSimTests
         var frozenRes = CombatSimulator.Simulate(repo, fp1, fp2, seed: 403);
         var frozenCasts = frozenRes.Events.Where(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == fGun.InstanceId).ToList();
         Assert.True(frozenCasts.Count >= 3);
-        Assert.Equal(980, frozenCasts[0].TimeMs);
-        // 980ms 后在 1000ms 被冻结 1000ms -> 第 2 发必须推迟到 2000ms+
+        Assert.Equal(950, frozenCasts[0].TimeMs);
+        // 950ms 触发第 1 发并在同帧被冻结 1000ms -> 第 2 发必须推迟到解冻后 (>= 2000ms)
         Assert.True(frozenCasts[1].TimeMs >= 2000, $"冻结期间应推迟后续连发，实际第2发时间 {frozenCasts[1].TimeMs}ms");
         Assert.True(frozenCasts[2].TimeMs - frozenCasts[1].TimeMs >= 250);
 
@@ -387,12 +387,13 @@ public sealed class V7CombatSimTests
         var firstCharge = res.Events.First(e => e.Type == CombatEventType.ChargeApplied && e.TargetCardInstanceId == receiver.InstanceId);
         var receiverFires = res.Events.Where(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == receiver.InstanceId).ToList();
 
-        Assert.Equal(980, firstCharge.TimeMs);
-        Assert.Equal(980, receiverFires[0].TimeMs); // 同 tick 立即开火
-        // 保留 500ms 溢出后：980 + 1500 = 2480ms 无需等到 2980ms；甚至在 1980ms charger 再次充能前自然推进也在 2480ms 之前或 1980ms 就已开火
-        Assert.True(receiverFires[1].TimeMs == 1980, $"保留 500ms 溢出后第 2 次充能应在 1980ms 立即触发，实际 {receiverFires[1].TimeMs}ms");
+        Assert.Equal(950, firstCharge.TimeMs);
+        Assert.Equal(950, receiverFires[0].TimeMs); // 同 tick 立即开火
+        // P1-54 新契约：950ms 超额充能钳制至 2000ms 并触发后归零，不结转 500ms 溢出；
+        // 到 1950ms 自然走满 1000ms 后 charger 再充 1500ms -> 钳制至 2000ms 并在 1950ms 当帧再次开火
+        Assert.True(receiverFires[1].TimeMs == 1950, $"第 2 次充能应在 1950ms 立即触发，实际 {receiverFires[1].TimeMs}ms");
 
-        // 冻结时 Charge 保留进度但不立即触发；解冻后携带溢出完成并立即触发
+        // 冻结时 Charge 保留进度但不立即触发；解冻后完成并立即触发
         // P1 槽 0 先施加 1000ms 冻结到 P2，再由 P2 槽 1 触发 Charge 2500ms 给 P2 槽 0 的 fcTarget（保证先冻后充）
         var fcp1 = CreatePlayer("fcp1", HeroNames.Vanessa, 5000);
         var fcp2 = CreatePlayer("fcp2", HeroNames.Dooley, 5000);
@@ -419,8 +420,8 @@ public sealed class V7CombatSimTests
 
         var fcRes = CombatSimulator.Simulate(repo, fcp1, fcp2, seed: 503);
         var fcFirstFire = fcRes.Events.First(e => e.Type == CombatEventType.CardFired && e.SourceCardInstanceId == fcTarget.InstanceId);
-        // 0ms 时被冻结 1000ms，虽然 Charged 2500ms >= 2000ms，但冻结期间不得开火；1000ms 解冻后首跳推进立刻保留 500ms 溢出并开火
-        Assert.True(fcFirstFire.TimeMs >= 1000 && fcFirstFire.TimeMs <= 1040, $"解冻后应保留 Charge 并立刻开火，实际 {fcFirstFire.TimeMs}ms");
+        // 0ms 时被冻结 1000ms，虽然 Charged 2500ms 钳制至 2000ms，但冻结期间不得开火；1000ms 解冻后首跳立刻开火
+        Assert.True(fcFirstFire.TimeMs >= 1000 && fcFirstFire.TimeMs <= 1050, $"解冻后应保留 Charge 并立刻开火，实际 {fcFirstFire.TimeMs}ms");
 
         // 缺弹时 Charge 不得提前触发开火
         var acp1 = CreatePlayer("acp1", HeroNames.Dooley, 5000);
@@ -526,9 +527,9 @@ public sealed class V7CombatSimTests
         var sharedRes = CombatSimulator.Simulate(repo, p1, p2, seed: 601);
         var firstBurn = sharedRes.Events.First(e => e.Type == CombatEventType.BurnApplied && e.SourceCardInstanceId == dualCard.InstanceId);
         var firstPoison = sharedRes.Events.First(e => e.Type == CombatEventType.PoisonApplied && e.SourceCardInstanceId == dualCard.InstanceId);
-        Assert.Equal(980, firstBurn.TimeMs);
-        Assert.True(firstPoison.TimeMs - firstBurn.TimeMs >= 250,
-            $"同卡双被动应共享 250ms ICD，实际 Burn={firstBurn.TimeMs}ms, Poison={firstPoison.TimeMs}ms");
+        // P1-21 新契约：对齐官方单能力粒度 ICD，同卡双被动能力 "a"/"b" 拥有独立 ICD 槽位，首触发均于 950ms 同帧结算不互相挤占
+        Assert.Equal(950, firstBurn.TimeMs);
+        Assert.Equal(950, firstPoison.TimeMs);
 
         // 2. 确定性排序：Player < Opponent, StartSlot 升序, InstanceId 字典序
         var op1 = CreatePlayer("p1", HeroNames.Vanessa, 2000);
@@ -731,9 +732,9 @@ public sealed class V7CombatSimTests
         var snap1000 = res.Timeline.First(t => t.TimeMs == 1000).Cards.First(c => c.InstanceId == targetItem.InstanceId);
         var snap1500 = res.Timeline.First(t => t.TimeMs == 1500).Cards.First(c => c.InstanceId == targetItem.InstanceId);
 
-        // 对齐官服 BazaarCardDealer.cs:4110-4151：冻结期间冷却进度完全暂停，但 Haste / Slow / Freeze 计时器均独立照常逐帧流逝
+        // 对齐官服 BazaarCardDealer.cs:4110-4151：冻结期间冷却进度完全暂停，但 Haste / Slow / Freeze 计时器均独立照常逐帧流逝（50ms*11=550ms -> 450ms）
         Assert.Equal(0f, snap500.Progress01);
-        Assert.Equal(480, snap500.HasteMs);
+        Assert.Equal(450, snap500.HasteMs);
         Assert.True(snap500.FreezeMs > 0);
         Assert.Equal(0, snap1000.HasteMs);
         Assert.Equal(0, snap1000.FreezeMs);

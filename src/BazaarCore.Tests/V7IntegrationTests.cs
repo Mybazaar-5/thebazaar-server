@@ -458,7 +458,10 @@ public sealed class V7IntegrationTests
             m.ToSocket == EContainerSocketId.Socket_3);
 
         var simAfterMove = run.BuildFullGameSim(moveOut.Events);
-        Assert.Equal(EContainerSocketId.Socket_3, simAfterMove.Cards[cutlass.InstanceId].Placement!.Socket);
+        // P0-18：本帧已有 GameSimEventCardMoved 的现存卡省略 Placement（交由客户端 ProcessCardMovedEvents 驱动观战移位动画），无事件全量快照保留最终 Placement
+        Assert.Null(simAfterMove.Cards[cutlass.InstanceId].Placement);
+        var snapAfterMove = run.BuildFullGameSim();
+        Assert.Equal(EContainerSocketId.Socket_3, snapAfterMove.Cards[cutlass.InstanceId].Placement!.Socket);
 
         // 2b. 购买新卡直接落入已占用槽位 (Socket_1)：挤开 Swash Buckle 与 Cutlass，所有网格内卡牌 Socket 必须与 CoreCard.StartSlot 1:1 匹配
         var shopOpt = InjectChoiceEncounter(run, ov.Pool, shopId);

@@ -152,7 +152,7 @@ public sealed class CombatEngineTests
         baseP1.Hand.TryAddAuto(baseWeapon);
         var baseRes = CombatSimulator.Simulate(repo, baseP1, baseP2, seed: 10);
         int baseFirstFire = baseRes.Events.First(e => e.Type == CombatEventType.CardFired && e.SourcePlayerId == "p1").TimeMs;
-        Assert.Equal(3980, baseFirstFire); // 20ms * 200 ticks (0..3980ms)
+        Assert.Equal(3950, baseFirstFire); // 50ms * 80 ticks (0..3950ms)
 
         // Haste 4000ms：加速 2x，首触发应在 ~2000ms 左右
         var hasteP1 = CreatePlayer("p1", HeroNames.Vanessa, 2000);
@@ -608,8 +608,8 @@ public sealed class CombatEngineTests
             .ToList();
 
         Assert.Single(p2ShieldEvents);
-        // 第1击 980ms (1000->700 >=500 未触发)；第2击 1980ms (700->400 <500 触发 200 护盾)
-        Assert.True(p2ShieldEvents[0].TimeMs >= 1980);
+        // 第1击 950ms (1000->700 >=500 未触发)；第2击 1950ms (700->400 <500 触发 200 护盾)
+        Assert.True(p2ShieldEvents[0].TimeMs >= 1950);
         Assert.Equal(200, (int)p2ShieldEvents[0].Value);
         Assert.Equal(200, (int)hardShellRes.Player2TotalShieldGained);
 
@@ -629,7 +629,7 @@ public sealed class CombatEngineTests
             .Where(e => e.Type == CombatEventType.HealApplied && e.TargetPlayerId == "hp2")
             .ToList();
         Assert.NotEmpty(p2HealEvents);
-        Assert.True(p2HealEvents[0].TimeMs >= 1980);
+        Assert.True(p2HealEvents[0].TimeMs >= 1950);
         Assert.True(p2HealEvents[0].Value > 0);
     }
 

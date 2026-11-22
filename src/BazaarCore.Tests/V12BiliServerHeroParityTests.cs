@@ -789,7 +789,7 @@ public sealed class V12BiliServerHeroParityTests
 
         var combatRes = CombatSimulator.Simulate(fx.Repo, p1, p2, seed: 45, recordTimeline: true, recordEvents: true);
         Assert.Contains(combatRes.Events, e => e.Type == CombatEventType.BurnApplied);
-        Assert.Contains(combatRes.Events, e => e.Type == CombatEventType.HealApplied && e.Detail == "RegenGain");
+        Assert.Contains(combatRes.Events, e => e.Type == CombatEventType.RegenApplied);
     }
 
     /// <summary>Q47：长袍怪商 30g 神秘宝箱在 Encounter 态可选并触发 Legendary 遭遇任务，同时核验 Waystones 当前 DB 6 条官方任务链。</summary>

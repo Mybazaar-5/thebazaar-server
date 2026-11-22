@@ -22,6 +22,8 @@ using BazaarGameShared.Infra.Messages.CombatSimEvents;
 using BazaarGameShared.Infra.Messages.GameSimEvents;
 using HarmonyLib;
 using UnityEngine;
+using UnityEngine.SceneManagement;
+using BazaarLauncher.Core;
 
 namespace BazaarLauncher;
 
@@ -33,7 +35,10 @@ namespace BazaarLauncher;
 internal static partial class CompatAuditPatch
 {
     private static bool _applied;
-    private static int _patchedCount;
+    private static int _gameSimPatchedCount;
+    private static int _pedestalHintsPatchedCount;
+    private static int _encounterPatchedCount;
+    private static bool _sceneCleanupSubscribed;
     private static int _suppressedSoundMoveCount;
     private static int _suppressedRevealBoundsCount;
     private static int _pedestalFastCompletedCount;
@@ -123,6 +128,10 @@ internal static partial class CompatAuditPatch
     private static FieldInfo _tooltipCtrlQuestDataField;
     private static int _hour6TransitionUnblockedCount;
     private static int _hour6WatchdogRevealCount;
+    // P2-15 (H-1~H-6)：客户端防御性兜底命中低频诊断计数（便于验证服务端修复后是否已归零）
+    private static int _hackH3VfxTargetFallbackCount;
+    private static int _hackH4TransformShellCount;
+    private static int _hackH5OrphanSkillDroppedCount;
     private static long _gameSimVersion;
 
     private struct PvpOpponentSnapshot
@@ -139,7 +148,10 @@ internal static partial class CompatAuditPatch
     // 记录上次已成功触发 PvpOpponentChanged 时的跨天快照键，避免跨天同 accountId+hero 被误跳
     private static PvpOpponentSnapshot _lastTriggeredPvpSnapshot;
 
-    internal static int PatchedCount => _patchedCount;
+    internal static int PatchedCount
+        => Volatile.Read(ref _gameSimPatchedCount)
+           + Volatile.Read(ref _pedestalHintsPatchedCount)
+           + Volatile.Read(ref _encounterPatchedCount);
 
     internal static void NotifyPedestalCommitted() => _pedestalCommitRequested = true;
 
@@ -156,14 +168,65 @@ internal static partial class CompatAuditPatch
         ["encounterTooltipFallback"] = Volatile.Read(ref _encounterTooltipFallbackCount),
         ["hour6TransitionUnblocked"] = Volatile.Read(ref _hour6TransitionUnblockedCount),
         ["hour6WatchdogReveal"] = Volatile.Read(ref _hour6WatchdogRevealCount),
+        ["hackH1PvpOpponentChanged"] = Volatile.Read(ref _pvpOpponentChangedFixedCount),
+        ["hackH2SoundOnCardMoved"] = Volatile.Read(ref _suppressedSoundMoveCount),
+        ["hackH3VfxMissingTarget"] = Volatile.Read(ref _hackH3VfxTargetFallbackCount),
+        ["hackH4TransformShellUpdate"] = Volatile.Read(ref _hackH4TransformShellCount),
+        ["hackH5OrphanSkillOrHour6"] = Volatile.Read(ref _hackH5OrphanSkillDroppedCount)
+            + Volatile.Read(ref _hour6TransitionUnblockedCount)
+            + Volatile.Read(ref _hour6WatchdogRevealCount),
+        ["hackH6EncounterFallback"] = Volatile.Read(ref _encounterPortraitFallbackCount)
+            + Volatile.Read(ref _encounterTooltipFallbackCount),
+        ["hackH7GoToNextStateFallback"] = CombatPatch.HackH7GoToNextStateFallbackCount,
     };
+
+    /// <summary>P2-15 (H-1~H-6)：低频记录客户端防御兜底命中诊断日志（第 1、5 次及每 25 次输出），便于验证服务端修完后零触发。</summary>
+    private static void RecordCompatHackHit(string hackId, ref int counter, string detail)
+    {
+        int cnt = Interlocked.Increment(ref counter);
+        if (cnt == 1 || cnt == 5 || cnt % 25 == 0)
+        {
+            BazaarLauncherPlugin.Log?.LogInfo($"[CompatDiag][{hackId}] defensive fallback hit (count={cnt}, detail={detail})");
+        }
+    }
+
+    // P1-46：拆分为三组独立热启停复位方法，杜绝单模块禁用误清其余两个在运模块的标记
+    internal static void ResetGameSimAppliedFlag()
+    {
+        _gameSimApplied = false;
+        _applied = false;
+        Interlocked.Exchange(ref _gameSimPatchedCount, 0);
+        _lastTriggeredPvpSnapshot = default;
+        Interlocked.Increment(ref _gameSimVersion);
+        TryUnsubscribeSceneCleanupIfIdle();
+    }
+
+    internal static void ResetHintEnchantAppliedFlag()
+    {
+        _pedestalHintsApplied = false;
+        _applied = false;
+        Interlocked.Exchange(ref _pedestalHintsPatchedCount, 0);
+        _enchDynamicSyncedTags.Clear();
+        _cardTagSyncStamps.Clear();
+        ResetPedestalAndDragRunScopedCaches();
+        TryUnsubscribeSceneCleanupIfIdle();
+    }
+
+    internal static void ResetEncounterAssetAppliedFlag()
+    {
+        _encounterApplied = false;
+        _applied = false;
+        Interlocked.Exchange(ref _encounterPatchedCount, 0);
+        ClearParentEncounterCache("ResetEncounterAssetAppliedFlag");
+        ClearEndOfRunChallengeGuards();
+        TryUnsubscribeSceneCleanupIfIdle();
+    }
 
     internal static void ResetAppliedFlag()
     {
-        _applied = false;
-        _gameSimApplied = false;
-        _pedestalHintsApplied = false;
-        _encounterApplied = false;
+        ResetGameSimAppliedFlag();
+        ResetHintEnchantAppliedFlag();
+        ResetEncounterAssetAppliedFlag();
         ClearRunScopedCaches("ResetAppliedFlag");
     }
 
@@ -171,75 +234,107 @@ internal static partial class CompatAuditPatch
     private static bool _pedestalHintsApplied;
     private static bool _encounterApplied;
 
-    /// <summary>切场景或对局结束时清理跨局动态标签缓存与遭遇资产引用，杜绝内存/显存泄漏（修复 P1-3 / P1-4）。</summary>
+    private static void EnsureSceneCleanupLifecycleHooked()
+    {
+        if (_sceneCleanupSubscribed) return;
+        _sceneCleanupSubscribed = true;
+        SceneManager.activeSceneChanged += OnCompatActiveSceneChanged;
+    }
+
+    private static void TryUnsubscribeSceneCleanupIfIdle()
+    {
+        if (!_sceneCleanupSubscribed) return;
+        if (_gameSimApplied || _pedestalHintsApplied || _encounterApplied) return;
+        _sceneCleanupSubscribed = false;
+        SceneManager.activeSceneChanged -= OnCompatActiveSceneChanged;
+    }
+
+    private static void OnCompatActiveSceneChanged(Scene prev, Scene next)
+    {
+        ClearRunScopedCaches("ActiveSceneChanged:" + next.name);
+    }
+
+    /// <summary>切场景或对局结束/重启时清理跨局动态标签、祭坛/拖拽静态字段与遭遇资产引用，杜绝跨局脏态与内存泄漏（P1-43）。</summary>
     internal static void ClearRunScopedCaches(string reason)
     {
         try
         {
             _enchDynamicSyncedTags.Clear();
             _cardTagSyncStamps.Clear();
-            ResetShowCardHintDedupeCache();
             _lastTriggeredPvpSnapshot = default;
             Interlocked.Increment(ref _gameSimVersion);
+            ResetPedestalAndDragRunScopedCaches();
             ClearParentEncounterCache(reason);
+            ClearEndOfRunChallengeGuards();
+            ClearCardQuestSubscribedGroups(reason);
         }
         catch { }
     }
 
-    internal static void ApplyGameSimGroup(Harmony harmony)
+    internal static void ApplyGameSimGroup(SafeHarmonyPatcher patcher)
     {
-        if (_gameSimApplied || harmony == null) return;
+        if (_gameSimApplied || patcher == null) return;
         _gameSimApplied = true;
         _mainThreadId = Thread.CurrentThread.ManagedThreadId;
         _unitySyncContext ??= SynchronizationContext.Current;
+        EnsureSceneCleanupLifecycleHooked();
 
-        PatchCombatSimHandler(harmony);
-        PatchVfxManager(harmony);
-        PatchGameSimHandler(harmony);
-        PatchCardQuestGroupData(harmony);
-        PatchHealthBarRewardController(harmony);
-        PatchResumeAndEndOfRunControllers(harmony);
-        PatchSoundEventListener(harmony);
-        PatchCardRevealAnimationDriver(harmony);
-        PatchDataApplySimPvpOpponent(harmony);
-        PatchTransitionInHour6Guard(harmony);
+        int before = patcher.SucceededCount;
+        PatchCombatSimHandler(patcher);
+        PatchVfxManager(patcher);
+        PatchGameSimHandler(patcher);
+        PatchSkillPresentationManager(patcher);
+        PatchCardQuestGroupData(patcher);
+        PatchHealthBarRewardController(patcher);
+        PatchResumeAndEndOfRunControllers(patcher);
+        PatchSoundEventListener(patcher);
+        PatchCardRevealAnimationDriver(patcher);
+        PatchDataApplySimPvpOpponent(patcher);
+        PatchTransitionInHour6Guard(patcher);
+        Interlocked.Exchange(ref _gameSimPatchedCount, Math.Max(0, patcher.SucceededCount - before));
     }
 
-    internal static void ApplyPedestalAndHintGroup(Harmony harmony)
+    internal static void ApplyPedestalAndHintGroup(SafeHarmonyPatcher patcher)
     {
-        if (_pedestalHintsApplied || harmony == null) return;
+        if (_pedestalHintsApplied || patcher == null) return;
         _pedestalHintsApplied = true;
         _mainThreadId = Thread.CurrentThread.ManagedThreadId;
         _unitySyncContext ??= SynchronizationContext.Current;
+        EnsureSceneCleanupLifecycleHooked();
 
-        PatchPedestalState(harmony);
-        PatchRewardController(harmony);
-        PatchTargetingAndHints(harmony);
+        int before = patcher.SucceededCount;
+        PatchPedestalState(patcher);
+        PatchRewardController(patcher);
+        PatchTargetingAndHints(patcher);
+        Interlocked.Exchange(ref _pedestalHintsPatchedCount, Math.Max(0, patcher.SucceededCount - before));
     }
 
-    internal static void ApplyEncounterAndChallengeGroup(Harmony harmony)
+    internal static void ApplyEncounterAndChallengeGroup(SafeHarmonyPatcher patcher)
     {
-        if (_encounterApplied || harmony == null) return;
+        if (_encounterApplied || patcher == null) return;
         _encounterApplied = true;
         _mainThreadId = Thread.CurrentThread.ManagedThreadId;
         _unitySyncContext ??= SynchronizationContext.Current;
+        EnsureSceneCleanupLifecycleHooked();
 
-        PatchEncounterController(harmony);
-        PatchPrizePassChallengesGuard(harmony);
-        PatchLootPaginatedReroll(harmony);
+        int before = patcher.SucceededCount;
+        PatchEncounterController(patcher);
+        PatchPrizePassChallengesGuard(patcher);
+        PatchEndOfRunChallengesGuard(patcher);
+        PatchLootPaginatedReroll(patcher);
+        Interlocked.Exchange(ref _encounterPatchedCount, Math.Max(0, patcher.SucceededCount - before));
     }
 
-    internal static void Apply(Harmony harmony)
+    internal static void Apply(SafeHarmonyPatcher patcher)
     {
-        if (_applied) return;
+        if (_applied || patcher == null) return;
         _applied = true;
-        _patchedCount = 0;
 
-        ApplyGameSimGroup(harmony);
-        ApplyPedestalAndHintGroup(harmony);
-        ApplyEncounterAndChallengeGroup(harmony);
+        ApplyGameSimGroup(patcher);
+        ApplyPedestalAndHintGroup(patcher);
+        ApplyEncounterAndChallengeGroup(patcher);
 
-        BazaarLauncherPlugin.Log?.LogInfo($"CompatAuditPatch 已安全安装 {_patchedCount} 项兼容防护");
+        BazaarLauncherPlugin.Log?.LogInfo($"CompatAuditPatch 已安全安装 {PatchedCount} 项兼容防护");
     }
 
 }

@@ -18,7 +18,20 @@ public sealed class GameDataRepository
     public IReadOnlyDictionary<int, LevelUpTemplate> LevelUps { get; }
     /// <summary>按等级索引的升级表只读视图（Wave 2/3 契约别名）。</summary>
     public IReadOnlyDictionary<int, LevelUpTemplate> LevelUpsByLevel => LevelUps;
+    /// <summary>旧版关键词只读兼容视图（仅含 Keyword 非空的 62 条词条）。</summary>
     public IReadOnlyDictionary<string, string> TooltipGlossary { get; }
+    /// <summary>tooltips 整表 136 条 TTooltipSymbol 完整只读索引。</summary>
+    public IReadOnlyDictionary<string, TooltipSymbolTemplate> TooltipSymbolsById { get; }
+    /// <summary>challenges 整表 80 条每日/每周挑战完整只读索引（Trigger 已预编译）。</summary>
+    public IReadOnlyDictionary<string, ChallengeTemplate> ChallengesById { get; }
+    /// <summary>全部 IsActive=true 的每日挑战列表（33 条）。</summary>
+    public IReadOnlyList<ChallengeTemplate> ActiveDailyChallenges { get; }
+    /// <summary>全部 IsActive=true 的每周挑战列表（17 条）。</summary>
+    public IReadOnlyList<ChallengeTemplate> ActiveWeeklyChallenges { get; }
+    /// <summary>collectibles 整表 1,644 条藏品完整只读索引（含 Rarity/IsFoundInChests/InStore/SeasonId）。</summary>
+    public IReadOnlyDictionary<string, CollectibleTemplate> CollectiblesById { get; }
+    /// <summary>seasons 整表 21 个赛季完整只读索引（Id 1..21）。</summary>
+    public IReadOnlyDictionary<int, SeasonTemplate> SeasonsById { get; }
     public IReadOnlySet<string> ObservedRuleTypes { get; }
     public IReadOnlySet<string> UnknownRuleTypes { get; }
 
@@ -56,7 +69,11 @@ public sealed class GameDataRepository
         HashSet<string> observedRuleTypes,
         HashSet<string> unknownRuleTypes,
         ILocalizationStore? localization = null,
-        string? sourceDataPath = null)
+        string? sourceDataPath = null,
+        Dictionary<string, ChallengeTemplate>? challenges = null,
+        Dictionary<string, CollectibleTemplate>? collectibles = null,
+        Dictionary<int, SeasonTemplate>? seasons = null,
+        Dictionary<string, TooltipSymbolTemplate>? tooltipSymbols = null)
     {
         SourceZipPath = sourceZipPath;
         SourceDataPath = string.IsNullOrEmpty(sourceDataPath) ? sourceZipPath : sourceDataPath;
@@ -65,7 +82,40 @@ public sealed class GameDataRepository
         CardsById = cards;
         MonstersById = monsters;
         LevelUps = levelUps;
-        TooltipGlossary = tooltips;
+
+        var symbolMap = tooltipSymbols ?? new Dictionary<string, TooltipSymbolTemplate>(StringComparer.OrdinalIgnoreCase);
+        TooltipSymbolsById = symbolMap;
+        if (tooltips.Count == 0 && symbolMap.Count > 0)
+        {
+            var projected = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in symbolMap)
+            {
+                if (!string.IsNullOrEmpty(kv.Value.Keyword))
+                    projected[kv.Key] = kv.Value.Keyword;
+            }
+            TooltipGlossary = projected;
+        }
+        else
+        {
+            TooltipGlossary = tooltips;
+        }
+
+        var challengeMap = challenges ?? new Dictionary<string, ChallengeTemplate>(StringComparer.OrdinalIgnoreCase);
+        ChallengesById = challengeMap;
+        var activeDaily = new List<ChallengeTemplate>();
+        var activeWeekly = new List<ChallengeTemplate>();
+        foreach (var ch in challengeMap.Values)
+        {
+            if (ch == null || !ch.IsActive) continue;
+            if (ch.IsDaily) activeDaily.Add(ch);
+            else if (ch.IsWeekly) activeWeekly.Add(ch);
+        }
+        ActiveDailyChallenges = activeDaily;
+        ActiveWeeklyChallenges = activeWeekly;
+
+        CollectiblesById = collectibles ?? new Dictionary<string, CollectibleTemplate>(StringComparer.OrdinalIgnoreCase);
+        SeasonsById = seasons ?? new Dictionary<int, SeasonTemplate>();
+
         ObservedRuleTypes = observedRuleTypes;
         UnknownRuleTypes = unknownRuleTypes;
 
@@ -238,7 +288,11 @@ public sealed class GameDataRepository
             new HashSet<string>(ObservedRuleTypes, StringComparer.Ordinal),
             new HashSet<string>(UnknownRuleTypes, StringComparer.Ordinal),
             localizationOverride ?? Localization,
-            SourceDataPath);
+            SourceDataPath,
+            new Dictionary<string, ChallengeTemplate>(ChallengesById, StringComparer.OrdinalIgnoreCase),
+            new Dictionary<string, CollectibleTemplate>(CollectiblesById, StringComparer.OrdinalIgnoreCase),
+            new Dictionary<int, SeasonTemplate>(SeasonsById),
+            new Dictionary<string, TooltipSymbolTemplate>(TooltipSymbolsById, StringComparer.OrdinalIgnoreCase));
     }
 
     /// <summary>当前仓库是否已加载有效的官方中文翻译词库。</summary>
@@ -275,6 +329,18 @@ public sealed class GameDataRepository
 
     public MonsterTemplate? GetMonster(string? id)
         => string.IsNullOrEmpty(id) ? null : (MonstersById.TryGetValue(id, out var m) ? m : null);
+
+    public ChallengeTemplate? GetChallenge(string? id)
+        => string.IsNullOrEmpty(id) ? null : (ChallengesById.TryGetValue(id, out var c) ? c : null);
+
+    public CollectibleTemplate? GetCollectible(string? id)
+        => string.IsNullOrEmpty(id) ? null : (CollectiblesById.TryGetValue(id, out var c) ? c : null);
+
+    public SeasonTemplate? GetSeason(int id)
+        => SeasonsById.TryGetValue(id, out var s) ? s : null;
+
+    public TooltipSymbolTemplate? GetTooltipSymbol(string? id)
+        => string.IsNullOrEmpty(id) ? null : (TooltipSymbolsById.TryGetValue(id, out var t) ? t : null);
 
     public CardTemplate? GetStartRunEncounter(string hero)
         => _startRunByHero.TryGetValue(hero, out var card) ? card : null;

@@ -862,8 +862,9 @@ public sealed class V12EncounterIronWallTests
                 }
             }
 
-            // Day 2..9（代表性校验 Day 2、Day 5、Day 9）标准规则下均可合法入池刷出
-            foreach (uint checkDay in new uint[] { 2, 5, 9 })
+            // P1-25 校准：标准规则下 Day 2..5（代表性校验 Day 2、Day 5）可合法刷出 The Travel Agent；
+            // Day 9 起标准规则不再刷出（避免卖出过期门票，自定义放大规则 EventExpeditionAgent=8.0 仍由其他用例覆盖）
+            foreach (uint checkDay in new uint[] { 2, 5 })
             {
                 bool appeared = false;
                 var dayRun = new RunState
@@ -889,6 +890,29 @@ public sealed class V12EncounterIronWallTests
                     }
                 }
                 Assert.True(appeared, $"Day {checkDay} 常规小时刷牌（1500 次内）应能合法刷出 The Travel Agent (002d8f6d)");
+            }
+
+            {
+                var day9Run = new RunState
+                {
+                    RunId = "ta_d9_std_forbid",
+                    GameModeId = fx.Pool.DefaultGameModeId,
+                    Hero = EHero.Vanessa,
+                    Day = 9,
+                    Hour = 2,
+                    RngSeed = 8009,
+                    CustomRules = new CustomRunRuleSet(),
+                };
+                var shop9 = new ShopEngine(day9Run, fx.Pool, fx.Repo, day9Run.CustomRules);
+                for (int attempt = 0; attempt < 300; attempt++)
+                {
+                    day9Run.VisitedDayEncounterIds.Clear();
+                    day9Run.VisitedSingleSpawnEncounterIds.Clear();
+                    shop9.DealHourEncounters();
+                    Assert.DoesNotContain(
+                        day9Run.SelectionSet,
+                        id => day9Run.Cards[id].TemplateId == Guid.Parse(TravelAgentEventId));
+                }
             }
         }
     }

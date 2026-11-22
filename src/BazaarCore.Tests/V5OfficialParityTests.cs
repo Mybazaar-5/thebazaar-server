@@ -1243,7 +1243,7 @@ public sealed class V5OfficialParityTests
         Assert.Equal(0, result.Player1RemainingHp);
         Assert.Equal(0, result.Player2RemainingHp);
         Assert.Equal(2000, result.DurationMs);
-        Assert.Equal(2, result.Events.Count(e => e.TimeMs == 1980 && e.Type == CombatEventType.DamageApplied));
+        Assert.Equal(2, result.Events.Count(e => e.TimeMs == 1950 && e.Type == CombatEventType.DamageApplied));
     }
 
     // ── V5.1 专项测试 2：同毫秒 readyBatch 敌方致死触发器排在玩家前仍双死判玩家胜 ──
@@ -1332,12 +1332,12 @@ public sealed class V5OfficialParityTests
         p2.Skills.Add(new CardInstance(MakeOnShieldDamageSkill("p2_lethal", 60), CardTier.Bronze, null, "p2_lethal"));
 
         var result = CombatSimulator.Simulate(fx.Repo, p1, p2, seed: 7, combatType: "PVP", recordEvents: true);
-        var tick1980Dmgs = result.Events
-            .Where(e => e.TimeMs == 1980 && e.Type == CombatEventType.DamageApplied)
+        var tick1950Dmgs = result.Events
+            .Where(e => e.TimeMs == 1950 && e.Type == CombatEventType.DamageApplied)
             .ToList();
-        Assert.Equal(2, tick1980Dmgs.Count);
-        Assert.Equal("player", tick1980Dmgs[0].SourcePlayerId);
-        Assert.Equal("opp", tick1980Dmgs[1].SourcePlayerId);
+        Assert.Equal(2, tick1950Dmgs.Count);
+        Assert.Equal("player", tick1950Dmgs[0].SourcePlayerId);
+        Assert.Equal("opp", tick1950Dmgs[1].SourcePlayerId);
         Assert.Equal("player", result.WinnerPlayerId);
         Assert.False(result.IsDraw);
         Assert.Equal(0, result.Player1RemainingHp);
@@ -1404,7 +1404,7 @@ public sealed class V5OfficialParityTests
         Assert.False(dotTieRes.IsDraw);
         Assert.Equal(0, dotTieRes.Player1RemainingHp);
         Assert.Equal(0, dotTieRes.Player2RemainingHp);
-        Assert.True(dotTieRes.DurationMs <= 1020);
+        Assert.True(dotTieRes.DurationMs <= 1050);
 
         var dotSurvP1 = new PlayerState("player", "P1", HeroNames.Vanessa, 8, 20, 1, 1);
         var dotSurvP2 = new PlayerState("opp", "P2", HeroNames.Vanessa, 7, 20, 1, 1);

@@ -11,10 +11,16 @@ public enum CombatEventType
     DamageApplied,
     ShieldApplied,
     BurnApplied,
+    /// <summary>灼烧层数被移除/净化（P2-20）。</summary>
+    BurnRemoved,
     BurnTick,
     PoisonApplied,
+    /// <summary>剧毒层数被移除/净化（P2-20）。</summary>
+    PoisonRemoved,
     PoisonTick,
     HealApplied,
+    /// <summary>施加再生层数（P0-09 与 HealApplied 彻底解耦）。</summary>
+    RegenApplied,
     RegenTick,
     HasteApplied,
     SlowApplied,
@@ -22,20 +28,29 @@ public enum CombatEventType
     ChargeApplied,
     FlyingChanged,
     CardAttributeModified,
+    /// <summary>战内卡牌某非基模动态属性键或被移除附魔的独有属性键彻底消失（P1-11）。</summary>
+    CardAttributeDeleted,
     CardDestroyed,
     PlayerEnraged,
     PlayerEnrageEnded,
+    PlayerRageApplied,
+    PlayerJoyApplied,
     SandstormWarning,
     SandstormTick,
     FightEnded,
     QuestUpdated,
     QuestCompleted,
     CardTransformed,
+    /// <summary>战内限时变形到期还原（P1-10）。</summary>
+    CardTransformReverted,
     CardEnchanted,
     CardUpgraded,
     CardReloaded,
     PlayerTempoApplied,
-    ActionCostSpent
+    PlayerTempoRemoved,
+    ActionCostSpent,
+    /// <summary>战内光环目标集增量生效/撤销（P1-09）。</summary>
+    AuraExecuted
 }
 
 /// <summary>
@@ -48,15 +63,36 @@ public sealed class CombatEvent
     public string? SourcePlayerId { get; init; }
     public string? TargetPlayerId { get; init; }
     public string? SourceCardInstanceId { get; init; }
+    /// <summary>引起本次反应/动作执行的真实触发源卡牌实例 ID（P1-08，主动施放时等于自身，被动反应时指向触发它的源卡）。</summary>
+    public string? TriggerSourceCardInstanceId { get; init; }
     public string? TargetCardInstanceId { get; init; }
     public double Value { get; init; }
+    /// <summary>本次伤害事件中被护盾吸收的精确数值（P0-10 BurnTick / 伤害拆盾权威依据）。</summary>
+    public int ShieldAbsorbed { get; init; }
+    /// <summary>本次伤害事件中穿透或溢出护盾后作用于生命值的精确伤害（含致命溢出，满足 ShieldAbsorbed + HpDamage == 实际结算伤害）。</summary>
+    public int HpDamage { get; init; }
+    /// <summary>本次治疗/吸血/再生跳血实际净恢复的生命值（P1-15，满血零回血为 0；为 null 表示旧合成事件，由转换器按实时血量钳制）。</summary>
+    public int? EffectiveHpRestored { get; init; }
     public bool IsCrit { get; init; }
     public string? Detail { get; init; }
     public string? AbilityId { get; init; }
     public string? ActionType { get; init; }
     public bool IsSkillSource { get; init; }
+    /// <summary>同一触发/施放链共享的执行上下文 ID（P2-10，用于协议层按因果链共享 ExecutionContextId）。</summary>
+    public string? ExecutionContextId { get; set; }
+    /// <summary>标识本次附魔变更是否为撤回/过期还原（P2-10，透传至 CombatSimEventCardEnchanted.IsReverted）。</summary>
+    public bool IsReverted { get; init; }
     /// <summary>可选白名单官方 VFXOverrideKey 覆盖（供自定义机制复用官方弹道/爆炸等视觉演出）。</summary>
     public string? VfxKeyOverride { get; init; }
+
+    // P1-09 光环生效/撤销目标集合（仅 AuraExecuted 事件填充，其他事件保持 null 零分配）
+    public IReadOnlyList<string>? AuraAppliedCardIds { get; init; }
+    public IReadOnlyList<string>? AuraRemovedCardIds { get; init; }
+    public IReadOnlyList<string>? AuraAppliedPlayerIds { get; init; }
+    public IReadOnlyList<string>? AuraRemovedPlayerIds { get; init; }
+
+    // P1-10 战内限时变形还原时被移除的临时产物实例 ID 列表（仅 CardTransformReverted 填充）
+    public IReadOnlyList<string>? RevertedTransformedInstanceIds { get; init; }
 
     // 供 UI 同步显示的快照（可选）
     public int Player1Health { get; init; }
@@ -97,6 +133,12 @@ public sealed class CardCooldownFrame
     public int Lifesteal { get; init; }
     public int SellPrice { get; init; }
     public int Counter { get; init; }
+    /// <summary>卡牌实时标签集合（P1-12，按 AttributeVersion 复用不可变快照，仅变化时由转换器下发）。</summary>
+    public IReadOnlyList<string>? Tags { get; init; }
+    /// <summary>卡牌实时隐藏标签集合（P1-12）。</summary>
+    public IReadOnlyList<string>? HiddenTags { get; init; }
+    /// <summary>卡牌实时所属英雄集合（P1-12）。</summary>
+    public IReadOnlyList<string>? Heroes { get; init; }
     /// <summary>Custom_0..Custom_9 动态属性值快照（按需稀疏分配，原版无自定义属性卡牌保持 null 零开销）。</summary>
     public int[]? CustomAttrs { get; init; }
 }
@@ -111,8 +153,14 @@ public sealed class CombatTickState
     public int P1Poison { get; init; }
     public int P1Regen { get; init; }
     public int P1Rage { get; init; }
+    public int P1RageMax { get; init; }
     public bool P1Enraged { get; init; }
+    public int P1EnragedDuration { get; init; }
+    public int P1EnragedDurationMax { get; init; }
     public int P1Tempo { get; init; }
+    public int P1TempoGainCooldownMax { get; init; }
+    public int P1Joy { get; init; }
+    public int P1PortraitIndex { get; init; }
 
     public int P2Hp { get; init; }
     public int P2MaxHp { get; init; }
@@ -121,12 +169,32 @@ public sealed class CombatTickState
     public int P2Poison { get; init; }
     public int P2Regen { get; init; }
     public int P2Rage { get; init; }
+    public int P2RageMax { get; init; }
     public bool P2Enraged { get; init; }
+    public int P2EnragedDuration { get; init; }
+    public int P2EnragedDurationMax { get; init; }
     public int P2Tempo { get; init; }
+    public int P2TempoGainCooldownMax { get; init; }
+    public int P2Joy { get; init; }
+    public int P2PortraitIndex { get; init; }
 
     public bool SandstormActive { get; init; }
     public int SandstormNextDamage { get; init; }
     public List<CardCooldownFrame> Cards { get; init; } = new();
+}
+
+/// <summary>
+/// 战斗期间发生的 UntilEndOfCombat 临时变形记录（P1-10），供战后 RunEngine 发射 GameSimEventCardTransformReverted 还原客户端视图。
+/// </summary>
+public sealed class CombatTemporaryTransformRecord
+{
+    public string OwnerPlayerId { get; init; } = string.Empty;
+    public string OriginalCardInstanceId { get; init; } = string.Empty;
+    public string OriginalTemplateId { get; init; } = string.Empty;
+    public string OriginalCardType { get; init; } = "Item";
+    public string OriginalSection { get; init; } = "Hand";
+    public int OriginalSlot { get; init; }
+    public List<string> TransformedInstanceIds { get; init; } = new();
 }
 
 /// <summary>单张卡牌战后永久同步变更明细。</summary>
@@ -166,7 +234,13 @@ public sealed class CombatResult
 {
     public string WinnerPlayerId { get; init; } = string.Empty;
     public string LoserPlayerId { get; init; } = string.Empty;
+    public string Player1Hero { get; init; } = string.Empty;
+    public string Player2Hero { get; init; } = string.Empty;
     public bool IsDraw { get; init; }
+    /// <summary>双方同帧倒地（同归于尽）标记（P1-55，供同步真人 PvP / 锦标赛公平平局裁决；异步 Ghost PvP 保持官方判玩家胜）。</summary>
+    public bool IsSimultaneousDeath { get; init; }
+    /// <summary>战斗达到 MaxDurationMs 上限仍双双存活的超时标记（P1-55）。</summary>
+    public bool IsTimeout { get; init; }
     public int DurationMs { get; init; }
     public int Player1RemainingHp { get; init; }
     public int Player2RemainingHp { get; init; }
@@ -177,6 +251,8 @@ public sealed class CombatResult
     public List<CombatEvent> Events { get; init; } = new();
     public List<CombatTickState> Timeline { get; init; } = new();
     public PostCombatPermanentSyncResult? PostCombatPermanentSync { get; set; }
+    /// <summary>本场战斗中发生的 UntilEndOfCombat 临时变形清单（P1-10，供战后 RunEngine 还原客户端变形视图）。</summary>
+    public List<CombatTemporaryTransformRecord> TemporaryTransforms { get; init; } = new();
     /// <summary>V14 自定义机制经由受控门面登记的战后结转操作（由 RunEngine 统一校验并同步给客户端）。</summary>
     public List<BazaarCore.Mods.PostCombatMutationOp> PostCombatOps { get; init; } = new();
     /// <summary>V14 自定义机制运行时安全诊断与熔断日志。</summary>

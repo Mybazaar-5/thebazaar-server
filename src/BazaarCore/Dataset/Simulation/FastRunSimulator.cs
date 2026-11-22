@@ -440,9 +440,10 @@ public sealed class SimulationRepoIndex
             _poolsByHero[hero] = pool;
         }
 
-        // 3. 预构建并归一化每日品质概率表（兼容 Day 12 总和为 0.8 的官方原始配置）
+        // 3. 预构建并归一化每日品质概率表（对齐 Patch 20.2：按 GameMode.NumberOfDays 钳制至 Day 10+ 稳态 0/20/70/10）
         var rawTable = repo.GameMode.ItemSkillSpawnTierPercantagesByDay;
-        int maxDay = 20;
+        int clampDays = repo.GameMode.NumberOfDays > 0 ? repo.GameMode.NumberOfDays : 10;
+        int maxDay = Math.Max(20, clampDays);
         if (rawTable.Count > 0)
         {
             foreach (var k in rawTable.Keys)
@@ -456,20 +457,26 @@ public sealed class SimulationRepoIndex
 
         for (int d = 1; d <= maxDay; d++)
         {
-            if (rawTable.TryGetValue(d.ToString(), out var row) && row.Count > 0)
+            int lookupDay = Math.Min(d, clampDays);
+            if (rawTable.TryGetValue(lookupDay.ToString(), out var row) && row.Count > 0)
             {
                 double b = Math.Max(0, row.GetValueOrDefault("Bronze", 0));
                 double s = Math.Max(0, row.GetValueOrDefault("Silver", 0));
                 double g = Math.Max(0, row.GetValueOrDefault("Gold", 0));
                 double di = Math.Max(0, row.GetValueOrDefault("Diamond", 0));
                 double sum = b + s + g + di;
+                if (lookupDay == 12 && Math.Abs(sum - 0.80) < 1e-6 && Math.Abs(di - 0.05) < 1e-6)
+                {
+                    di = 0.25;
+                    sum = 1.0;
+                }
                 if (sum > 1e-6)
                 {
                     _normalizedTierWeightsByDay[d] = (b / sum, s / sum, g / sum, di / sum);
                     continue;
                 }
             }
-            _normalizedTierWeightsByDay[d] = GetFallbackTierWeights(d);
+            _normalizedTierWeightsByDay[d] = GetFallbackTierWeights(lookupDay);
         }
 
         // 4. 预构建合法 PvE 野怪与战斗原型状态
@@ -642,10 +649,7 @@ public sealed class SimulationRepoIndex
         if (day == 7) return (0.0, 0.80, 0.20, 0.0);
         if (day == 8) return (0.0, 0.60, 0.40, 0.0);
         if (day == 9) return (0.0, 0.35, 0.60, 0.05);
-        if (day == 10) return (0.0, 0.20, 0.70, 0.10);
-        if (day == 11) return (0.0, 0.25, 0.55, 0.20);
-        if (day == 12) return (0.0, 0.25, 0.6875, 0.0625);
-        return (0.0, 0.15, 0.60, 0.25);
+        return (0.0, 0.20, 0.70, 0.10);
     }
 }
 

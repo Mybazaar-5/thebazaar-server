@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Reflection;
 using BazaarGameShared.Domain.Runs;
+using BazaarLauncher.Core;
 using HarmonyLib;
 using UnityEngine;
 
@@ -39,7 +40,7 @@ internal static partial class CompatAuditPatch
     ///      在多页 Loot 状态下切换显示自带免费刷新轮盘的 defaultMerchantBoardButtons，并隐藏 defaultCombatBoardButtons；
     ///   3. RerollButton.UpdateView：在多页 Loot 状态下确保 0 金币刷新费用文本预制体就绪且按钮保持可点击。
     /// </summary>
-    private static void PatchLootPaginatedReroll(Harmony harmony)
+    private static void PatchLootPaginatedReroll(SafeHarmonyPatcher patcher)
     {
         try
         {
@@ -87,19 +88,21 @@ internal static partial class CompatAuditPatch
                 var canHandle = AccessTools.Method(appStateType, "CanHandleOperation", new[] { _lrStateOpsEnumType });
                 if (canHandle != null)
                 {
-                    harmony.Patch(
+                    patcher.TryPatchMethod(
                         canHandle,
-                        postfix: new HarmonyMethod(typeof(CompatAuditPatch), nameof(AppStateCanHandleOperationPostfix)));
-                    _patchedCount++;
+                        postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(AppStateCanHandleOperationPostfix)),
+                        optional: true,
+                        label: "Compat.LootReroll.AppState.CanHandleOperation");
                 }
 
                 var execIfAllowed = AccessTools.Method(appStateType, "ExecuteIfAllowed", new[] { _lrStateOpsEnumType, typeof(Func<bool>) });
                 if (execIfAllowed != null)
                 {
-                    harmony.Patch(
+                    patcher.TryPatchMethod(
                         execIfAllowed,
-                        prefix: new HarmonyMethod(typeof(CompatAuditPatch), nameof(AppStateExecuteIfAllowedPrefix)));
-                    _patchedCount++;
+                        prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(AppStateExecuteIfAllowedPrefix)),
+                        optional: true,
+                        label: "Compat.LootReroll.AppState.ExecuteIfAllowed");
                 }
             }
 
@@ -114,38 +117,42 @@ internal static partial class CompatAuditPatch
                 var loadButtons = AccessTools.Method(bmType, "LoadBoardButtonsByState");
                 if (loadButtons != null)
                 {
-                    harmony.Patch(
+                    patcher.TryPatchMethod(
                         loadButtons,
-                        postfix: new HarmonyMethod(typeof(CompatAuditPatch), nameof(BoardManagerLoadButtonsPostfix)));
-                    _patchedCount++;
+                        postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(BoardManagerLoadButtonsPostfix)),
+                        optional: true,
+                        label: "Compat.LootReroll.BoardManager.LoadBoardButtonsByState");
                 }
 
                 var revealButtons = AccessTools.Method(bmType, "RevealBoardButtons");
                 if (revealButtons != null)
                 {
-                    harmony.Patch(
+                    patcher.TryPatchMethod(
                         revealButtons,
-                        postfix: new HarmonyMethod(typeof(CompatAuditPatch), nameof(BoardManagerRevealButtonsPostfix)));
-                    _patchedCount++;
+                        postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(BoardManagerRevealButtonsPostfix)),
+                        optional: true,
+                        label: "Compat.LootReroll.BoardManager.RevealBoardButtons");
                 }
 
                 var showReplayRecap = AccessTools.Method(bmType, "ShowReplayAndRecapButtons");
                 if (showReplayRecap != null)
                 {
-                    harmony.Patch(
+                    patcher.TryPatchMethod(
                         showReplayRecap,
-                        postfix: new HarmonyMethod(typeof(CompatAuditPatch), nameof(BoardManagerShowReplayRecapPostfix)));
-                    _patchedCount++;
+                        postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(BoardManagerShowReplayRecapPostfix)),
+                        optional: true,
+                        label: "Compat.LootReroll.BoardManager.ShowReplayAndRecapButtons");
                 }
             }
 
             // 3. RerollButton.UpdateView：多页 Loot 时确保费用标签就绪并点亮免费刷新按钮
             if (_lrRerollUpdateViewMethod != null)
             {
-                harmony.Patch(
+                patcher.TryPatchMethod(
                     _lrRerollUpdateViewMethod,
-                    postfix: new HarmonyMethod(typeof(CompatAuditPatch), nameof(RerollButtonUpdateViewPostfix)));
-                _patchedCount++;
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(RerollButtonUpdateViewPostfix)),
+                    optional: true,
+                    label: "Compat.LootReroll.RerollButton.UpdateView");
             }
         }
         catch (Exception ex)

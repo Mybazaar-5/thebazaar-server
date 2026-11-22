@@ -1047,6 +1047,30 @@ public sealed class AccountStore : IDisposable
         lock (_lock) return acc.Gems;
     }
 
+    /// <summary>原子增加账号宝石余额并立即持久化（用于挑战货币奖励与活动发放）。</summary>
+    public int AddGems(Account acc, int delta)
+    {
+        if (acc == null || delta <= 0) return acc != null ? GetGems(acc) : 0;
+        int total;
+        lock (_lock)
+        {
+            acc.Gems = Math.Max(0, acc.Gems + delta);
+            total = acc.Gems;
+        }
+        SaveAccount(acc);
+        return total;
+    }
+
+    /// <summary>读取账号在指定赛季的通行证进度（由 SQLite account_season_progress 持久化驱动）。</summary>
+    public Persistence.SeasonTrackProgressRow GetSeasonTrackProgress(Account acc, int seasonId)
+        => acc == null
+            ? new Persistence.SeasonTrackProgressRow(Guid.Empty, seasonId, 0, true, Array.Empty<int>(), Array.Empty<int>(), 0, 0, DateTime.UtcNow)
+            : _db.LoadSeasonTrackProgress(acc.AccountId, seasonId);
+
+    /// <summary>累加账号在指定赛季的通行证 XP 并持久化落盘。</summary>
+    public int AddSeasonTrackExperience(Account acc, int seasonId, int xpDelta)
+        => acc == null ? 0 : _db.AddSeasonTrackExperience(acc.AccountId, seasonId, xpDelta);
+
     public List<string> GetOpenedCardSkinIds(Account acc)
     {
         lock (_lock) return acc.OpenedCardSkinIds.ToList();
@@ -1087,7 +1111,7 @@ public sealed class AccountStore : IDisposable
                 {
                     acc.Gems += Math.Max(0, draw.GemsAwarded);
                 }
-                else if (draw.IsCardSkin && !string.IsNullOrEmpty(draw.NormalizedId))
+                else if (!string.IsNullOrEmpty(draw.NormalizedId))
                 {
                     acc.OpenedCardSkinIds.Add(draw.NormalizedId);
                 }

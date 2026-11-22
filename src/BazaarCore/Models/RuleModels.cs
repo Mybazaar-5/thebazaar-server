@@ -22,8 +22,35 @@ public sealed class RuleNode
     [JsonPropertyName("ComparisonValue")]
     public JsonElement? RawComparisonValueElement { get; set; }
     public double? ComparisonAmount { get; set; }
-    public double? CurrentValue { get; set; }
-    public double? PreviousValue { get; set; }
+    /// <summary>P2-19：兼容官方 RuleNode 表达式与历史标量数值格式。</summary>
+    [JsonPropertyName("CurrentValue")]
+    public JsonElement? RawCurrentValueElement { get; set; }
+    /// <summary>P2-19：兼容官方 RuleNode 表达式与历史标量数值格式。</summary>
+    [JsonPropertyName("PreviousValue")]
+    public JsonElement? RawPreviousValueElement { get; set; }
+    [JsonIgnore]
+    public double? CurrentValue
+    {
+        get => GetFixedCurrentValue();
+        set
+        {
+            RawCurrentValueElement = value.HasValue ? JsonSerializer.SerializeToElement(value.Value) : null;
+            Volatile.Write(ref _cachedCurrentValueNode, null);
+        }
+    }
+    [JsonIgnore]
+    public double? PreviousValue
+    {
+        get => GetFixedPreviousValue();
+        set
+        {
+            RawPreviousValueElement = value.HasValue ? JsonSerializer.SerializeToElement(value.Value) : null;
+            Volatile.Write(ref _cachedPreviousValueNode, null);
+        }
+    }
+    /// <summary>P2-06：当 SelectionRequirements 以 JSON 数组提供多条选择前置条件时，保留原始条目列表。</summary>
+    [JsonIgnore]
+    public List<RuleNode>? CombinedSelectionRequirements { get; set; }
     public double? UpgradeChance { get; set; }
     public int? RandomWeight { get; set; }
     public int? CurrentDay { get; set; }
@@ -140,7 +167,61 @@ public sealed class RuleNode
     private object? _cachedSingleConstraint;
     private object? _cachedConstraintList;
     private object? _cachedComparisonValueNode;
+    private object? _cachedCurrentValueNode;
+    private object? _cachedPreviousValueNode;
     private List<(string Enchantment, double Weight)>? _cachedEnchantments;
+
+    /// <summary>P2-19：若 CurrentValue 直接为数字或 TFixedValue 节点则返回数值，否则返回 null。</summary>
+    public double? GetFixedCurrentValue()
+        => TryExtractFixedNumeric(RawCurrentValueElement);
+
+    /// <summary>P2-19：若 PreviousValue 直接为数字或 TFixedValue 节点则返回数值，否则返回 null。</summary>
+    public double? GetFixedPreviousValue()
+        => TryExtractFixedNumeric(RawPreviousValueElement);
+
+    private static double? TryExtractFixedNumeric(JsonElement? element)
+    {
+        if (!element.HasValue) return null;
+        var el = element.Value;
+        if (el.ValueKind == JsonValueKind.Number && el.TryGetDouble(out var d))
+            return d;
+        if (el.ValueKind == JsonValueKind.Object
+            && (!el.TryGetProperty("$type", out var tEl)
+                || string.Equals(tEl.GetString(), "TFixedValue", StringComparison.OrdinalIgnoreCase))
+            && el.TryGetProperty("Value", out var vEl)
+            && vEl.ValueKind == JsonValueKind.Number
+            && vEl.TryGetDouble(out var fd))
+        {
+            return fd;
+        }
+        return null;
+    }
+
+    /// <summary>P2-19：当 CurrentValue 为嵌套 RuleNode 对象时反序列化并线程安全缓存返回。</summary>
+    public RuleNode? GetCurrentValueNode(JsonSerializerOptions options)
+    {
+        if (!RawCurrentValueElement.HasValue || RawCurrentValueElement.Value.ValueKind != JsonValueKind.Object)
+            return null;
+        var cached = Volatile.Read(ref _cachedCurrentValueNode);
+        if (cached != null) return ReferenceEquals(cached, NullCacheSentinel) ? null : (RuleNode)cached;
+        var parsed = RawCurrentValueElement.Value.Deserialize<RuleNode>(options);
+        Interlocked.CompareExchange(ref _cachedCurrentValueNode, (object?)parsed ?? NullCacheSentinel, null);
+        var finalObj = Volatile.Read(ref _cachedCurrentValueNode);
+        return ReferenceEquals(finalObj, NullCacheSentinel) ? null : (RuleNode?)finalObj;
+    }
+
+    /// <summary>P2-19：当 PreviousValue 为嵌套 RuleNode 对象时反序列化并线程安全缓存返回。</summary>
+    public RuleNode? GetPreviousValueNode(JsonSerializerOptions options)
+    {
+        if (!RawPreviousValueElement.HasValue || RawPreviousValueElement.Value.ValueKind != JsonValueKind.Object)
+            return null;
+        var cached = Volatile.Read(ref _cachedPreviousValueNode);
+        if (cached != null) return ReferenceEquals(cached, NullCacheSentinel) ? null : (RuleNode)cached;
+        var parsed = RawPreviousValueElement.Value.Deserialize<RuleNode>(options);
+        Interlocked.CompareExchange(ref _cachedPreviousValueNode, (object?)parsed ?? NullCacheSentinel, null);
+        var finalObj = Volatile.Read(ref _cachedPreviousValueNode);
+        return ReferenceEquals(finalObj, NullCacheSentinel) ? null : (RuleNode?)finalObj;
+    }
 
     /// <summary>
     /// 若该节点的 Value 属性是数字（TFixedValue.Value）则直接返回数值；若为嵌套 RuleNode 则解析为 RuleNode。

@@ -820,6 +820,7 @@ public sealed class V9BoardAndProtocolTests
 
         // 至少有原邻卡发生滑移腾位且事件与 NetMessageGameSim.Cards 完整同步
         var sim = run.BuildFullGameSim(buyOut.Events);
+        var snap = run.BuildFullGameSim();
         var movedNeighbors = buyOut.Events.OfType<GameSimEventCardMoved>()
             .Where(m => m.InstanceId != cutlassShelf.InstanceId)
             .ToList();
@@ -827,8 +828,9 @@ public sealed class V9BoardAndProtocolTests
         foreach (var mv in movedNeighbors)
         {
             Assert.Equal(run.Cards[mv.InstanceId].Socket, mv.ToSocket);
-            Assert.Equal(run.Cards[mv.InstanceId].Socket, sim.Cards[mv.InstanceId].Placement!.Socket);
-            Assert.Equal(EInventorySection.Hand, sim.Cards[mv.InstanceId].Placement!.Section);
+            Assert.Null(sim.Cards[mv.InstanceId].Placement);
+            Assert.Equal(run.Cards[mv.InstanceId].Socket, snap.Cards[mv.InstanceId].Placement!.Socket);
+            Assert.Equal(EInventorySection.Hand, snap.Cards[mv.InstanceId].Placement!.Section);
         }
         Assert.Contains(engine.BoardAuditLogs, l => l.Contains("[BoardAudit] op=Buy", StringComparison.Ordinal));
     }
@@ -870,7 +872,7 @@ public sealed class V9BoardAndProtocolTests
         {
             InstanceId = new InstanceId(m3.InstanceId),
             Section = EInventorySection.Hand,
-            TargetSockets = new List<EContainerSocketId> { EContainerSocketId.Socket_3 },
+            TargetSockets = new List<EContainerSocketId> { EContainerSocketId.Socket_3, EContainerSocketId.Socket_4 },
         });
         Assert.Null(swapOut.Error);
         Assert.Equal(EInventorySection.Hand, m3.Section);
@@ -882,8 +884,11 @@ public sealed class V9BoardAndProtocolTests
         Assert.Contains(swapOut.Events, e => e is GameSimEventCardMoved m && m.InstanceId == m3.InstanceId && m.ToInventory == EInventorySection.Hand);
         Assert.Contains(swapOut.Events, e => e is GameSimEventCardMoved m && m.InstanceId == m1.InstanceId && m.ToInventory == EInventorySection.Stash);
         var simSwap = run.BuildFullGameSim(swapOut.Events);
-        Assert.Equal(EInventorySection.Hand, simSwap.Cards[m3.InstanceId].Placement!.Section);
-        Assert.Equal(EInventorySection.Stash, simSwap.Cards[m1.InstanceId].Placement!.Section);
+        Assert.Null(simSwap.Cards[m3.InstanceId].Placement);
+        Assert.Null(simSwap.Cards[m1.InstanceId].Placement);
+        var snapSwap = run.BuildFullGameSim();
+        Assert.Equal(EInventorySection.Hand, snapSwap.Cards[m3.InstanceId].Placement!.Section);
+        Assert.Equal(EInventorySection.Stash, snapSwap.Cards[m1.InstanceId].Placement!.Section);
         Assert.Contains(engine.BoardAuditLogs, l => l.Contains("[BoardAudit] op=Move", StringComparison.Ordinal));
     }
 
@@ -936,9 +941,14 @@ public sealed class V9BoardAndProtocolTests
         Assert.Equal(jetbike.Section, trInfo.Section);
         Assert.Equal(jetbike.Socket, trInfo.Socket);
         var simTr = run.BuildFullGameSim(trOut.Events);
+        var snapTr = run.BuildFullGameSim();
         Assert.Equal(jetbike.Socket, simTr.Cards[jetbike.InstanceId].Placement!.Socket);
-        Assert.Equal(cutlass.Socket, simTr.Cards[cutlass.InstanceId].Placement!.Socket);
-        Assert.Equal(tape.Socket, simTr.Cards[tape.InstanceId].Placement!.Socket);
+        Assert.Contains(trOut.Events, e => e is GameSimEventCardMoved m && m.InstanceId == cutlass.InstanceId && m.ToSocket == cutlass.Socket);
+        Assert.Contains(trOut.Events, e => e is GameSimEventCardMoved m && m.InstanceId == tape.InstanceId && m.ToSocket == tape.Socket);
+        Assert.Null(simTr.Cards[cutlass.InstanceId].Placement);
+        Assert.Null(simTr.Cards[tape.InstanceId].Placement);
+        Assert.Equal(cutlass.Socket, snapTr.Cards[cutlass.InstanceId].Placement!.Socket);
+        Assert.Equal(tape.Socket, snapTr.Cards[tape.InstanceId].Placement!.Socket);
         Assert.Contains(engine.BoardAuditLogs, l => l.Contains("[BoardAudit] op=Transform", StringComparison.Ordinal));
 
         // 4b. 进入后续野怪战斗：Jetbike 必须正常进入 Combat 且不丢失、战后依然保留在 HandGrid

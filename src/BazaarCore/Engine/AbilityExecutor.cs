@@ -225,78 +225,10 @@ public static class AbilityExecutor
     }
 
     /// <summary>
-    /// 按官方 BazaarGameShared.dll TAction*.TargetingPriorities 对 TTargetCardRandom 执行分级优先随机抽取：
-    /// 保持 TargetResolver.ResolveCards 本身纯规则不变，仅在动作目标解析层优先抽取可装弹/可充能等高优桶。
+    /// 按官方 BazaarGameShared.dll TAction*.TargetingPriorities 执行目标解析（P1-19 已统一下沉至 TargetResolver.ResolveCards，覆盖 TTargetCardRandom 与 TTargetCardXMost 全部 7 类动作）。
     /// </summary>
     private static List<CardInstance> ResolveWithTargetingPriorities(RuleNode target, RuleExecutionContext ctx, int? maxCount)
-    {
-        if (!string.Equals(target.Type, "TTargetCardRandom", StringComparison.Ordinal))
-            return TargetResolver.ResolveCards(target, ctx, maxCount);
-
-        string? actionType = ctx.ActiveExecution.ActionType;
-        if (actionType is not ("TActionCardReload" or "TActionCardCharge" or "TActionCardHaste" or "TActionCardSlow" or "TActionCardFreeze"))
-            return TargetResolver.ResolveCards(target, ctx, maxCount);
-
-        string nonNullActionType = actionType;
-        var pool = TargetResolver.ResolveCards(target, ctx, int.MaxValue);
-        if (pool.Count == 0) return pool;
-
-        int effectiveTake = maxCount.HasValue
-            ? maxCount.Value
-            : 1;
-        if (effectiveTake <= 0) return [];
-
-        static int GetPriorityTier(CardInstance c, string act) => act switch
-        {
-            // 对齐 Conditionals.CanBeReloaded：Ammo < AmmoMax
-            "TActionCardReload" => (c.EffectiveAmmoMax > 0 && c.CurrentAmmo < c.EffectiveAmmoMax) ? 0 : 1,
-            // 对齐 Conditionals.ChargePriorities：[(HasCooldown && (NotAnAmmoItem || UsesAndHasAmmo)), HasCooldown]
-            "TActionCardCharge" => c.HasActiveCooldown
-                ? ((c.EffectiveAmmoMax <= 0 || c.CurrentAmmo > 0) ? 0 : 1)
-                : 2,
-            // 对齐 Conditionals.Priorities：[HasCooldown, HasNoCooldown]
-            _ => c.HasActiveCooldown ? 0 : 1
-        };
-
-        var tier0 = new List<CardInstance>(pool.Count);
-        var tier1 = new List<CardInstance>(pool.Count);
-        var tier2 = new List<CardInstance>();
-        for (int i = 0; i < pool.Count; i++)
-        {
-            var c = pool[i];
-            int t = GetPriorityTier(c, nonNullActionType);
-            if (t == 0) tier0.Add(c);
-            else if (t == 1) tier1.Add(c);
-            else tier2.Add(c);
-        }
-
-        // 若单次目标数不超过最高优桶且最高优桶非空，直接在该桶内等概率随机抽取
-        var picked = new List<CardInstance>(Math.Min(effectiveTake, pool.Count));
-        void DrawFromTier(List<CardInstance> bucket)
-        {
-            if (bucket.Count == 0 || picked.Count >= effectiveTake) return;
-            int need = effectiveTake - picked.Count;
-            if (need >= bucket.Count)
-            {
-                picked.AddRange(bucket);
-                bucket.Clear();
-                return;
-            }
-            for (int i = 0; i < need; i++)
-            {
-                int idx = ctx.Rng.Next(bucket.Count);
-                picked.Add(bucket[idx]);
-                bucket.RemoveAt(idx);
-            }
-        }
-
-        DrawFromTier(tier0);
-        // Charge 目标不回落到无冷却物品（tier2）；Reload/Haste/Slow/Freeze 按官方分级回落
-        DrawFromTier(tier1);
-        if (actionType != "TActionCardCharge")
-            DrawFromTier(tier2);
-        return picked;
-    }
+        => TargetResolver.ResolveCards(target, ctx, maxCount);
 
     public static bool MatchesTrigger(
         RuleNode? trigger,
@@ -451,9 +383,37 @@ public static class AbilityExecutor
                     return false;
                 if (trigger.ChangeType == "Gain" && curVal <= prevVal) return false;
                 if (trigger.ChangeType == "Loss" && curVal >= prevVal) return false;
-                return trigger.Subject == null
+                var ownerCtx = ctx.WithCards(ownerCard);
+                var prevNode = trigger.GetPreviousValueNode(GameDatabaseLoader.JsonOptions);
+                double? expectedPrev = prevNode != null
+                    ? ValueAndConditionEvaluator.EvaluateValue(prevNode, ownerCtx, 0)
+                    : trigger.PreviousValue;
+                if (expectedPrev.HasValue && Math.Abs(prevVal - expectedPrev.Value) > 1e-6)
+                    return false;
+                var curNode = trigger.GetCurrentValueNode(GameDatabaseLoader.JsonOptions);
+                double? expectedCur = curNode != null
+                    ? ValueAndConditionEvaluator.EvaluateValue(curNode, ownerCtx, 0)
+                    : trigger.CurrentValue;
+                if (expectedCur.HasValue)
+                {
+                    if (!string.IsNullOrEmpty(trigger.ComparisonOperator))
+                    {
+                        if (!ValueAndConditionEvaluator.Compare(curVal, trigger.ComparisonOperator, expectedCur.Value))
+                            return false;
+                    }
+                    else if (Math.Abs(curVal - expectedCur.Value) > 1e-6)
+                    {
+                        return false;
+                    }
+                }
+                bool subjectOk = trigger.Subject == null
                     ? (eventTargetCard ?? eventSourceCard) == ownerCard
                     : (eventTargetCard ?? eventSourceCard) != null && MatchesCardSubject(trigger.Subject, ownerCard, ownerPlayer, (eventTargetCard ?? eventSourceCard)!, ctx);
+                if (!subjectOk) return false;
+                // P2-19：补齐 TTriggerOnCardAttributeChanged.Source 校验（修复 Basket 等监听他源卡修改属性的条件）
+                bool sourceOk = trigger.Source == null
+                    || (eventSourceCard != null && MatchesCardSubject(trigger.Source, ownerCard, ownerPlayer, eventSourceCard, ctx));
+                return sourceOk;
             }
 
             case "TTriggerOnPlayerAttributeChanged":
@@ -515,15 +475,8 @@ public static class AbilityExecutor
             {
                 bool pOk = trigger.Subject == null || (eventSubjectPlayer != null && TargetResolver.ResolvePlayers(trigger.Subject, ctx.WithCards(ownerCard)).Contains(eventSubjectPlayer));
                 if (!pOk) return false;
-                int? targetLevel = trigger.Level;
-                if (!targetLevel.HasValue
-                    && trigger.ExtensionData != null
-                    && trigger.ExtensionData.TryGetValue("NewLevel", out var nlEl)
-                    && nlEl.ValueKind == System.Text.Json.JsonValueKind.Number
-                    && nlEl.TryGetInt32(out int nl))
-                {
-                    targetLevel = nl;
-                }
+                // P2-22：直接读取强类型 NewLevel，避免被强类型属性遮蔽而落空
+                int? targetLevel = trigger.Level ?? trigger.NewLevel;
                 if (targetLevel.HasValue && targetLevel.Value > 0)
                 {
                     double levelVal = curVal > 0 ? curVal : (eventSubjectPlayer?.Level ?? ownerPlayer.Level);
@@ -537,14 +490,10 @@ public static class AbilityExecutor
             case "TTriggerOnRunCompleted":
             {
                 if (ctx.Scope == RuleScope.InCombat) return false;
-                string? reqOutcome = trigger.CombatOutcome;
-                if (string.IsNullOrEmpty(reqOutcome)
-                    && trigger.ExtensionData != null
-                    && trigger.ExtensionData.TryGetValue("Outcome", out var outEl)
-                    && outEl.ValueKind == System.Text.Json.JsonValueKind.String)
-                {
-                    reqOutcome = outEl.GetString();
-                }
+                // P2-22：直接读取强类型 Outcome，避免被强类型属性遮蔽而落空
+                string? reqOutcome = !string.IsNullOrEmpty(trigger.CombatOutcome)
+                    ? trigger.CombatOutcome
+                    : trigger.Outcome;
                 if (string.IsNullOrEmpty(reqOutcome)) return true;
                 if (string.IsNullOrEmpty(combatOutcome)) return false;
                 return string.Equals(NormalizeRunOutcome(reqOutcome), NormalizeRunOutcome(combatOutcome), StringComparison.Ordinal);
@@ -578,7 +527,8 @@ public static class AbilityExecutor
             case "TTriggerOnHourStarted":
             case "TTriggerOnRunStarted":
             case "TTriggerOnSandstorm":
-                return true;
+                return trigger.Subject == null
+                    || (eventSubjectPlayer != null && TargetResolver.ResolvePlayers(trigger.Subject, ctx.WithCards(ownerCard)).Contains(eventSubjectPlayer));
 
             default:
                 RuleExecutionContext.NotifyUnknownRuleType(ctx, "TTrigger", eventType);
@@ -678,7 +628,7 @@ public static class AbilityExecutor
             string? targetsAttr = GetTargetsAttributeForAction(action.Type);
             if (targetsAttr != null)
             {
-                double attrTargets = sourceCard.GetAttribute(targetsAttr);
+                double attrTargets = sourceCard.GetAttributeForAbility(targetsAttr, ctx.ActiveExecution.AbilityId);
                 if (attrTargets > 0)
                     targetCount = Math.Max(1, (int)Math.Round(attrTargets));
             }
@@ -743,7 +693,8 @@ public static class AbilityExecutor
                                 DispatchDetailed(ctx, "TTriggerOnPlayerAttributeChanged", target, sourceCard, null, target, "Shield", prevShield, target.Shield);
                             if (hpDmg > 0)
                             {
-                                DispatchDetailed(ctx, "TTriggerOnPlayerDamaged", target, sourceCard, sourceCard, target, "Health", prevHp, target.CurrentHealth);
+                                // P2-17：curVal 传实际伤害量（对齐 CombatSimulator 及 ComparisonAmount 语义），避免致命一击 CurrentHealth==0 误判失败
+                                DispatchDetailed(ctx, "TTriggerOnPlayerDamaged", target, sourceCard, sourceCard, target, "Health", prevHp, hpDmg);
                                 DispatchDetailed(ctx, "TTriggerOnPlayerAttributeChanged", target, sourceCard, null, target, "Health", prevHp, target.CurrentHealth);
                             }
                             if (target.CurrentHealth <= 0 && prevHp > 0)
@@ -751,7 +702,7 @@ public static class AbilityExecutor
                         }
                     }
                     if (isCrit && finalDmg > 0 && targets.Count > 0)
-                        DispatchDetailed(ctx, "TTriggerOnCardCritted", ctx.SelfPlayer, sourceCard, sourceCard, ctx.SelfPlayer);
+                        RecordOrDispatchCrit(ctx, sourceCard);
                     return true;
                 }
 
@@ -761,7 +712,11 @@ public static class AbilityExecutor
                     var targets = TargetResolver.ResolvePlayers(action.Target, ctx);
                     foreach (var target in targets)
                     {
-                        if (ctx.OnShieldApplied != null)
+                        if (ctx.OnShieldAppliedWithCrit != null)
+                        {
+                            ctx.OnShieldAppliedWithCrit.Invoke(target, amount, isCrit, sourceCard);
+                        }
+                        else if (ctx.OnShieldApplied != null)
                         {
                             ctx.OnShieldApplied.Invoke(target, amount, sourceCard);
                         }
@@ -775,7 +730,7 @@ public static class AbilityExecutor
                         }
                     }
                     if (isCrit && amount > 0 && targets.Count > 0)
-                        DispatchDetailed(ctx, "TTriggerOnCardCritted", ctx.SelfPlayer, sourceCard, sourceCard, ctx.SelfPlayer);
+                        RecordOrDispatchCrit(ctx, sourceCard);
                     return true;
                 }
 
@@ -798,7 +753,7 @@ public static class AbilityExecutor
                         }
                     }
                     if (isCrit && amount > 0 && targets.Count > 0)
-                        DispatchDetailed(ctx, "TTriggerOnCardCritted", ctx.SelfPlayer, sourceCard, sourceCard, ctx.SelfPlayer);
+                        RecordOrDispatchCrit(ctx, sourceCard);
                     return true;
                 }
 
@@ -821,7 +776,7 @@ public static class AbilityExecutor
                         }
                     }
                     if (isCrit && amount > 0 && targets.Count > 0)
-                        DispatchDetailed(ctx, "TTriggerOnCardCritted", ctx.SelfPlayer, sourceCard, sourceCard, ctx.SelfPlayer);
+                        RecordOrDispatchCrit(ctx, sourceCard);
                     return true;
                 }
 
@@ -831,7 +786,11 @@ public static class AbilityExecutor
                     var targets = TargetResolver.ResolvePlayers(action.Target, ctx);
                     foreach (var target in targets)
                     {
-                        if (ctx.OnHealApplied != null)
+                        if (ctx.OnHealAppliedWithCrit != null)
+                        {
+                            ctx.OnHealAppliedWithCrit.Invoke(target, amount, isCrit, sourceCard);
+                        }
+                        else if (ctx.OnHealApplied != null)
                         {
                             ctx.OnHealApplied.Invoke(target, amount, sourceCard);
                         }
@@ -849,24 +808,24 @@ public static class AbilityExecutor
                         }
                     }
                     if (isCrit && amount > 0 && targets.Count > 0)
-                        DispatchDetailed(ctx, "TTriggerOnCardCritted", ctx.SelfPlayer, sourceCard, sourceCard, ctx.SelfPlayer);
+                        RecordOrDispatchCrit(ctx, sourceCard);
                     return true;
                 }
 
                 case "TActionPlayerRegenApply":
                 {
                     int amount = ScaleWithCrit(EvalActionAmount(action, sourceCard, ctx, "RegenApplyAmount"), sourceCard, ctx, out bool isCrit, "RegenCrit");
+                    var regenDur = ResolveDurationTarget(action.Duration, ctx.Scope);
                     var targets = TargetResolver.ResolvePlayers(action.Target, ctx);
                     foreach (var target in targets)
                     {
                         if (ctx.OnRegenApplied != null)
                         {
-                            ctx.OnRegenApplied.Invoke(target, amount, sourceCard);
+                            ctx.OnRegenApplied.Invoke(target, amount, sourceCard, regenDur);
                         }
                         else if (amount > 0)
                         {
                             double prevRegen = target.GetAttribute("HealthRegen");
-                            var regenDur = ctx.Scope == RuleScope.InCombat ? DurationTarget.Combat : DurationTarget.Permanent;
                             target.ModifyAttribute("HealthRegen", "Add", amount, regenDur);
                             double curRegen = target.GetAttribute("HealthRegen");
                             DispatchDetailed(ctx, "TTriggerOnCardPerformedRegen", ctx.SelfPlayer, sourceCard, sourceCard, target);
@@ -875,7 +834,7 @@ public static class AbilityExecutor
                         }
                     }
                     if (isCrit && amount > 0 && targets.Count > 0)
-                        DispatchDetailed(ctx, "TTriggerOnCardCritted", ctx.SelfPlayer, sourceCard, sourceCard, ctx.SelfPlayer);
+                        RecordOrDispatchCrit(ctx, sourceCard);
                     return true;
                 }
 
@@ -887,6 +846,21 @@ public static class AbilityExecutor
                         double prevRage = target.GetAttribute("Rage");
                         target.ModifyAttribute("Rage", "Add", amount);
                         double curRage = target.GetAttribute("Rage");
+                        if (amount > 0)
+                        {
+                            ctx.EmitCombatEvent?.Invoke(new CombatEvent
+                            {
+                                TimeMs = ctx.TimeMs,
+                                Type = CombatEventType.PlayerRageApplied,
+                                SourcePlayerId = ctx.SelfPlayer.PlayerId,
+                                TargetPlayerId = target.PlayerId,
+                                SourceCardInstanceId = sourceCard.InstanceId,
+                                Value = amount,
+                                AbilityId = ctx.ActiveExecution.AbilityId,
+                                ActionType = action.Type,
+                                IsSkillSource = sourceCard.Template.Type == "Skill"
+                            });
+                        }
                         if (Math.Abs(curRage - prevRage) > 1e-6)
                             DispatchDetailed(ctx, "TTriggerOnPlayerAttributeChanged", ctx.SelfPlayer, sourceCard, null, target, "Rage", prevRage, curRage);
 
@@ -895,8 +869,8 @@ public static class AbilityExecutor
                         {
                             target.Rage = 0;
                             target.EnragedRemainingMs = Math.Max(1000, (int)Math.Round(target.GetAttribute("EnragedDurationMax")));
-                            target.Attributes["Enraged"] = 1.0;
-                            target.Attributes["EnragedDuration"] = target.EnragedRemainingMs;
+                            target.CombatAdd["Enraged"] = 1.0;
+                            target.CombatAdd["EnragedDuration"] = target.EnragedRemainingMs;
                             ctx.EmitCombatEvent?.Invoke(new CombatEvent
                             {
                                 TimeMs = ctx.TimeMs,
@@ -910,6 +884,56 @@ public static class AbilityExecutor
                             });
                             DispatchDetailed(ctx, "TTriggerOnPlayerEnraged", ctx.SelfPlayer, sourceCard, null, target);
                         }
+                    }
+                    return true;
+                }
+
+                case "TActionPlayerJoyApply":
+                {
+                    int amount = ScaleWithCrit(EvalActionAmount(action, sourceCard, ctx, "JoyApplyAmount"), sourceCard, ctx, out bool isCrit, "JoyCrit");
+                    var joyDur = ResolveDurationTarget(action.Duration, ctx.Scope);
+                    var targets = TargetResolver.ResolvePlayers(action.Target, ctx);
+                    foreach (var target in targets)
+                    {
+                        if (amount <= 0) continue;
+                        double prevJoy = target.GetAttribute("Joy");
+                        target.ModifyAttribute("Joy", "Add", amount, joyDur);
+                        double curJoy = target.GetAttribute("Joy");
+                        ctx.EmitCombatEvent?.Invoke(new CombatEvent
+                        {
+                            TimeMs = ctx.TimeMs,
+                            Type = CombatEventType.PlayerJoyApplied,
+                            SourcePlayerId = ctx.SelfPlayer.PlayerId,
+                            TargetPlayerId = target.PlayerId,
+                            SourceCardInstanceId = sourceCard.InstanceId,
+                            Value = amount,
+                            IsCrit = isCrit,
+                            AbilityId = ctx.ActiveExecution.AbilityId,
+                            ActionType = action.Type,
+                            IsSkillSource = sourceCard.Template.Type == "Skill"
+                        });
+                        if (Math.Abs(curJoy - prevJoy) > 1e-6)
+                            DispatchDetailed(ctx, "TTriggerOnPlayerAttributeChanged", ctx.SelfPlayer, sourceCard, null, target, "Joy", prevJoy, curJoy);
+                    }
+                    if (isCrit && amount > 0 && targets.Count > 0)
+                        RecordOrDispatchCrit(ctx, sourceCard);
+                    return true;
+                }
+
+                case "TActionPlayerJoyRemove":
+                {
+                    int amount = Math.Max(0, (int)Math.Round(EvalActionAmount(action, sourceCard, ctx, "JoyRemoveAmount")));
+                    var joyDur = ResolveDurationTarget(action.Duration, ctx.Scope);
+                    foreach (var target in TargetResolver.ResolvePlayers(action.Target, ctx))
+                    {
+                        if (amount <= 0) continue;
+                        double prevJoy = target.GetAttribute("Joy");
+                        double actualRemove = Math.Min(Math.Max(0, prevJoy), amount);
+                        if (actualRemove > 0)
+                            target.ModifyAttribute("Joy", "Subtract", actualRemove, joyDur);
+                        double curJoy = target.GetAttribute("Joy");
+                        if (Math.Abs(curJoy - prevJoy) > 1e-6)
+                            DispatchDetailed(ctx, "TTriggerOnPlayerAttributeChanged", ctx.SelfPlayer, sourceCard, null, target, "Joy", prevJoy, curJoy);
                     }
                     return true;
                 }
@@ -952,6 +976,22 @@ public static class AbilityExecutor
                         double prevTempo = target.GetAttribute("Tempo");
                         target.ModifyAttribute("Tempo", "Subtract", amount);
                         double curTempo = target.GetAttribute("Tempo");
+                        int removed = Math.Max(0, (int)Math.Round(prevTempo - curTempo));
+                        if (removed > 0)
+                        {
+                            ctx.EmitCombatEvent?.Invoke(new CombatEvent
+                            {
+                                TimeMs = ctx.TimeMs,
+                                Type = CombatEventType.PlayerTempoRemoved,
+                                SourcePlayerId = ctx.SelfPlayer.PlayerId,
+                                TargetPlayerId = target.PlayerId,
+                                SourceCardInstanceId = sourceCard.InstanceId,
+                                Value = removed,
+                                AbilityId = ctx.ActiveExecution.AbilityId,
+                                ActionType = action.Type,
+                                IsSkillSource = sourceCard.Template.Type == "Skill"
+                            });
+                        }
                         if (Math.Abs(curTempo - prevTempo) > 1e-6)
                             DispatchDetailed(ctx, "TTriggerOnPlayerAttributeChanged", ctx.SelfPlayer, sourceCard, null, target, "Tempo", prevTempo, curTempo);
                     }
@@ -962,7 +1002,30 @@ public static class AbilityExecutor
                 {
                     int amount = Math.Max(0, (int)Math.Round(EvalActionAmount(action, sourceCard, ctx, "BurnRemoveAmount")));
                     foreach (var target in TargetResolver.ResolvePlayers(action.Target, ctx))
+                    {
+                        int prevBurn = target.Burn;
                         target.Burn = Math.Max(0, target.Burn - amount);
+                        int removed = prevBurn - target.Burn;
+                        if (removed > 0)
+                        {
+                            // P2-20：补发 BurnRemoved 战报事件并触发属性变更
+                            ctx.EmitCombatEvent?.Invoke(new CombatEvent
+                            {
+                                TimeMs = ctx.TimeMs,
+                                Type = CombatEventType.BurnRemoved,
+                                SourcePlayerId = ctx.SelfPlayer.PlayerId,
+                                TargetPlayerId = target.PlayerId,
+                                SourceCardInstanceId = sourceCard.InstanceId,
+                                TriggerSourceCardInstanceId = ctx.ActiveExecution.TriggerSourceCardInstanceId ?? sourceCard.InstanceId,
+                                Value = removed,
+                                AbilityId = ctx.ActiveExecution.AbilityId,
+                                ActionType = action.Type,
+                                ExecutionContextId = ctx.ActiveExecution.ExecutionContextId,
+                                IsSkillSource = sourceCard.Template.Type == "Skill"
+                            });
+                            DispatchDetailed(ctx, "TTriggerOnPlayerAttributeChanged", ctx.SelfPlayer, sourceCard, null, target, "Burn", prevBurn, target.Burn);
+                        }
+                    }
                     return true;
                 }
 
@@ -970,7 +1033,30 @@ public static class AbilityExecutor
                 {
                     int amount = Math.Max(0, (int)Math.Round(EvalActionAmount(action, sourceCard, ctx, "PoisonRemoveAmount")));
                     foreach (var target in TargetResolver.ResolvePlayers(action.Target, ctx))
+                    {
+                        int prevPoison = target.Poison;
                         target.Poison = Math.Max(0, target.Poison - amount);
+                        int removed = prevPoison - target.Poison;
+                        if (removed > 0)
+                        {
+                            // P2-20：补发 PoisonRemoved 战报事件并触发属性变更
+                            ctx.EmitCombatEvent?.Invoke(new CombatEvent
+                            {
+                                TimeMs = ctx.TimeMs,
+                                Type = CombatEventType.PoisonRemoved,
+                                SourcePlayerId = ctx.SelfPlayer.PlayerId,
+                                TargetPlayerId = target.PlayerId,
+                                SourceCardInstanceId = sourceCard.InstanceId,
+                                TriggerSourceCardInstanceId = ctx.ActiveExecution.TriggerSourceCardInstanceId ?? sourceCard.InstanceId,
+                                Value = removed,
+                                AbilityId = ctx.ActiveExecution.AbilityId,
+                                ActionType = action.Type,
+                                ExecutionContextId = ctx.ActiveExecution.ExecutionContextId,
+                                IsSkillSource = sourceCard.Template.Type == "Skill"
+                            });
+                            DispatchDetailed(ctx, "TTriggerOnPlayerAttributeChanged", ctx.SelfPlayer, sourceCard, null, target, "Poison", prevPoison, target.Poison);
+                        }
+                    }
                     return true;
                 }
 
@@ -983,6 +1069,7 @@ public static class AbilityExecutor
                         int nextHp = Math.Clamp(amount, 1, target.HealthMax);
                         target.CurrentHealth = nextHp;
                         int delta = nextHp - prevHp;
+                        int restored = Math.Max(0, delta);
                         ctx.EmitCombatEvent?.Invoke(new CombatEvent
                         {
                             TimeMs = ctx.TimeMs,
@@ -990,7 +1077,8 @@ public static class AbilityExecutor
                             SourcePlayerId = ctx.SelfPlayer.PlayerId,
                             TargetPlayerId = target.PlayerId,
                             SourceCardInstanceId = sourceCard.InstanceId,
-                            Value = Math.Max(0, delta),
+                            Value = restored,
+                            EffectiveHpRestored = restored,
                             AbilityId = ctx.ActiveExecution.AbilityId,
                             ActionType = action.Type,
                             IsSkillSource = sourceCard.Template.Type == "Skill"
@@ -1029,8 +1117,11 @@ public static class AbilityExecutor
                 case "TActionCardModifyAttribute":
                 {
                     var valNode = action.GetValueNode(GameDatabaseLoader.JsonOptions);
-                    double val = valNode != null ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx) : (action.GetFixedNumericValue() ?? 0);
-                    if (double.IsNaN(val) || double.IsInfinity(val)) val = 0;
+                    bool perTargetEval = valNode != null && ValueAndConditionEvaluator.ContainsNullTargetCardRef(valNode);
+                    double sharedVal = (!perTargetEval && valNode != null)
+                        ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx)
+                        : (!perTargetEval ? (action.GetFixedNumericValue() ?? 0) : 0);
+                    if (double.IsNaN(sharedVal) || double.IsInfinity(sharedVal)) sharedVal = 0;
                     var attr = action.AttributeType ?? "DamageAmount";
                     var op = action.Operation ?? "Add";
                     var durationTarget = ResolveDurationTarget(action.Duration, ctx.Scope);
@@ -1040,25 +1131,65 @@ public static class AbilityExecutor
                     int timedDurationMs = isTimedCombat ? Math.Max(1, action.Duration!.DurationInMs ?? 1000) : 0;
                     foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
                     {
+                        double val;
+                        if (perTargetEval)
+                        {
+                            var prevCurrentTarget = ctx.CurrentTargetCard;
+                            ctx.CurrentTargetCard = card;
+                            try
+                            {
+                                val = ValueAndConditionEvaluator.EvaluateValue(valNode!, ctx);
+                            }
+                            finally
+                            {
+                                ctx.CurrentTargetCard = prevCurrentTarget;
+                            }
+                            if (double.IsNaN(val) || double.IsInfinity(val)) val = 0;
+                        }
+                        else
+                        {
+                            val = sharedVal;
+                        }
+
+                        // P2-43：兼容两张 SpawningEligibility=Never 历史遗留卡的异常百分比 Multiply（防沙盒 25 倍爆伤或减冷却静默丢弃）
+                        string effectiveOp = op;
+                        if (string.Equals(effectiveOp, "Multiply", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (string.Equals(sourceCard.Template.Id, "5b393f5e-2c86-40c6-b210-1a215c1ccd51", StringComparison.OrdinalIgnoreCase)
+                                && attr.Equals("DamageAmount", StringComparison.OrdinalIgnoreCase)
+                                && val > 1.0)
+                            {
+                                // High Impact：DamageAmount Multiply 25.0 → +25% (AdditiveMultiply 0.25)
+                                effectiveOp = "AdditiveMultiply";
+                                val = val / 100.0;
+                            }
+                            else if (string.Equals(sourceCard.Template.Id, "f87817fd-7a77-4bd6-8248-37e90a72c81d", StringComparison.OrdinalIgnoreCase)
+                                && attr.Equals("PercentCooldownReduction", StringComparison.OrdinalIgnoreCase))
+                            {
+                                // Escalation Protocol：PercentCooldownReduction Multiply 5.0 → Add 5.0
+                                effectiveOp = "Add";
+                            }
+                        }
+
                         double prev = card.GetAttribute(attr);
                         if (attr.Equals("Ammo", StringComparison.OrdinalIgnoreCase))
                         {
                             int curAmmo = card.CurrentAmmo;
                             int ammoMax = card.EffectiveAmmoMax;
                             int nextAmmo;
-                            if (string.Equals(op, "Multiply", StringComparison.OrdinalIgnoreCase))
+                            if (string.Equals(effectiveOp, "Multiply", StringComparison.OrdinalIgnoreCase))
                                 nextAmmo = (int)Math.Round(curAmmo * val);
-                            else if (string.Equals(op, "AdditiveMultiply", StringComparison.OrdinalIgnoreCase))
+                            else if (string.Equals(effectiveOp, "AdditiveMultiply", StringComparison.OrdinalIgnoreCase))
                                 nextAmmo = (int)Math.Round(curAmmo * (1.0 + val));
-                            else if (string.Equals(op, "Subtract", StringComparison.OrdinalIgnoreCase))
+                            else if (string.Equals(effectiveOp, "Subtract", StringComparison.OrdinalIgnoreCase))
                                 nextAmmo = curAmmo - (int)Math.Round(val);
-                            else if (string.Equals(op, "Set", StringComparison.OrdinalIgnoreCase))
+                            else if (string.Equals(effectiveOp, "Set", StringComparison.OrdinalIgnoreCase))
                                 nextAmmo = (int)Math.Round(val);
                             else
                                 nextAmmo = curAmmo + (int)Math.Round(val);
                             card.CurrentAmmo = Math.Clamp(nextAmmo, 0, ammoMax);
                         }
-                        else if (string.Equals(op, "Multiply", StringComparison.OrdinalIgnoreCase)
+                        else if (string.Equals(effectiveOp, "Multiply", StringComparison.OrdinalIgnoreCase)
                             && Math.Abs(val) < 1e-9
                             && !isTimedCombat
                             && !attr.Equals("Freeze", StringComparison.OrdinalIgnoreCase)
@@ -1089,6 +1220,8 @@ public static class AbilityExecutor
                                 };
                                 targetMult.Remove(attr);
                                 targetAdd.Remove(attr);
+                                if (durationTarget == DurationTarget.Combat)
+                                    card.CombatZeroMultCount.Remove(attr);
                                 double remaining = card.BaseAttributes.GetValueOrDefault(attr, 0)
                                                  + card.PermanentAdd.GetValueOrDefault(attr, 0)
                                                  + (durationTarget == DurationTarget.Combat
@@ -1103,13 +1236,13 @@ public static class AbilityExecutor
                         }
                         else
                         {
-                            card.ModifyAttribute(attr, op, val, durationTarget);
+                            card.ModifyAttribute(attr, effectiveOp, val, durationTarget);
                             if (!isTimedCombat
                                 && (attr.Equals("Heated", StringComparison.OrdinalIgnoreCase)
                                     || attr.Equals("Chilled", StringComparison.OrdinalIgnoreCase))
                                 && card.GetAttribute(attr) <= 0
-                                && (string.Equals(op, "Subtract", StringComparison.OrdinalIgnoreCase)
-                                    || string.Equals(op, "Set", StringComparison.OrdinalIgnoreCase)))
+                                && (string.Equals(effectiveOp, "Subtract", StringComparison.OrdinalIgnoreCase)
+                                    || string.Equals(effectiveOp, "Set", StringComparison.OrdinalIgnoreCase)))
                             {
                                 if (attr.Equals("Heated", StringComparison.OrdinalIgnoreCase)) card.Heated = false;
                                 else card.Chilled = false;
@@ -1604,13 +1737,61 @@ public static class AbilityExecutor
                 {
                     var durationTarget = ResolveDurationTarget(action.Duration, ctx.Scope);
                     foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
+                    {
+                        var beforeKeys = ctx.EmitCombatEvent != null ? card.GetActiveAttributeKeys() : null;
+                        string? prevEnch = card.Enchantment;
                         card.RemoveEnchantment(durationTarget);
+                        if (ctx.EmitCombatEvent != null && beforeKeys != null)
+                        {
+                            var cardOwner = TargetResolver.FindOwner(card, ctx);
+                            if (!string.IsNullOrEmpty(prevEnch) && !string.Equals(card.Enchantment, prevEnch, StringComparison.Ordinal))
+                            {
+                                ctx.EmitCombatEvent.Invoke(new CombatEvent
+                                {
+                                    TimeMs = ctx.TimeMs,
+                                    Type = CombatEventType.CardEnchanted,
+                                    SourcePlayerId = ctx.SelfPlayer.PlayerId,
+                                    TargetPlayerId = cardOwner.PlayerId,
+                                    SourceCardInstanceId = sourceCard.InstanceId,
+                                    TargetCardInstanceId = card.InstanceId,
+                                    Detail = $"Reverted:{prevEnch}",
+                                    IsReverted = true,
+                                    AbilityId = ctx.ActiveExecution.AbilityId,
+                                    ActionType = action.Type,
+                                    ExecutionContextId = ctx.ActiveExecution.ExecutionContextId,
+                                    IsSkillSource = sourceCard.Template.Type == "Skill"
+                                });
+                            }
+                            foreach (var attrKey in beforeKeys)
+                            {
+                                if (!card.HasAnyAttributeKey(attrKey))
+                                {
+                                    ctx.EmitCombatEvent.Invoke(new CombatEvent
+                                    {
+                                        TimeMs = ctx.TimeMs,
+                                        Type = CombatEventType.CardAttributeDeleted,
+                                        SourcePlayerId = ctx.SelfPlayer.PlayerId,
+                                        TargetPlayerId = cardOwner.PlayerId,
+                                        SourceCardInstanceId = sourceCard.InstanceId,
+                                        TargetCardInstanceId = card.InstanceId,
+                                        Detail = attrKey,
+                                        AbilityId = ctx.ActiveExecution.AbilityId,
+                                        ActionType = action.Type,
+                                        IsSkillSource = sourceCard.Template.Type == "Skill"
+                                    });
+                                }
+                            }
+                        }
+                    }
                     return true;
                 }
 
                 case "TActionCardUpgrade":
                 {
-                    bool isTemporary = ResolveDurationTarget(action.Duration, ctx.Scope) != DurationTarget.Permanent;
+                    var upgradeDuration = ResolveDurationTarget(action.Duration, ctx.Scope);
+                    bool isTemporary = upgradeDuration != DurationTarget.Permanent;
+                    // P2-23：按 TActionCardUpgrade.InheritEnchantment（默认 true）分流处理源卡附魔向未附魔目标的继承
+                    bool inheritEnchantment = action.InheritEnchantment ?? true;
                     foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
                     {
                         var prevTier = card.Tier;
@@ -1638,10 +1819,39 @@ public static class AbilityExecutor
                                 Detail = card.Tier.ToString(),
                                 AbilityId = ctx.ActiveExecution.AbilityId,
                                 ActionType = action.Type,
+                                ExecutionContextId = ctx.ActiveExecution.ExecutionContextId,
                                 IsSkillSource = sourceCard.Template.Type == "Skill"
                             });
                             ctx.OnCardUpgraded?.Invoke(cardOwner, card);
                             DispatchDetailed(ctx, "TTriggerOnCardUpgraded", cardOwner, sourceCard, card, cardOwner);
+
+                            if (inheritEnchantment
+                                && !string.IsNullOrEmpty(sourceCard.Enchantment)
+                                && string.IsNullOrEmpty(card.Enchantment)
+                                && card.Template.Enchantments != null
+                                && card.Template.Enchantments.ContainsKey(sourceCard.Enchantment))
+                            {
+                                card.ApplyEnchantment(sourceCard.Enchantment, isTemporary);
+                                if (!string.IsNullOrEmpty(card.Enchantment))
+                                {
+                                    ctx.EmitCombatEvent?.Invoke(new CombatEvent
+                                    {
+                                        TimeMs = ctx.TimeMs,
+                                        Type = CombatEventType.CardEnchanted,
+                                        SourcePlayerId = ctx.SelfPlayer.PlayerId,
+                                        TargetPlayerId = cardOwner.PlayerId,
+                                        SourceCardInstanceId = sourceCard.InstanceId,
+                                        TargetCardInstanceId = card.InstanceId,
+                                        Detail = card.Enchantment,
+                                        AbilityId = ctx.ActiveExecution.AbilityId,
+                                        ActionType = action.Type,
+                                        ExecutionContextId = ctx.ActiveExecution.ExecutionContextId,
+                                        IsSkillSource = sourceCard.Template.Type == "Skill"
+                                    });
+                                    ctx.OnCardEnchanted?.Invoke(cardOwner, card);
+                                    DispatchDetailed(ctx, "TTriggerOnCardEnchanted", cardOwner, sourceCard, card, cardOwner);
+                                }
+                            }
                         }
                     }
                     return true;
@@ -1654,8 +1864,10 @@ public static class AbilityExecutor
                         foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
                         {
                             var bag = isTemporary ? card.CombatTags : card.ExtraTags;
+                            bool changed = false;
                             foreach (var t in action.Tags)
-                                bag.Add(t);
+                                if (bag.Add(t)) changed = true;
+                            if (changed) card.MarkAttributeDirty();
                         }
                     }
                     return true;
@@ -1689,12 +1901,14 @@ public static class AbilityExecutor
                                     }
                                 }
                             }
+                            bool changed = false;
                             for (int i = 0; i < cnt && candidates.Count > 0; i++)
                             {
                                 int idx = ctx.Rng.Next(candidates.Count);
-                                bag.Add(candidates[idx]);
+                                if (bag.Add(candidates[idx])) changed = true;
                                 candidates.RemoveAt(idx);
                             }
+                            if (changed) card.MarkAttributeDirty();
                         }
                     }
                     return true;
@@ -1707,8 +1921,43 @@ public static class AbilityExecutor
                     foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
                     {
                         var bag = isTemporary ? card.CombatTags : card.ExtraTags;
+                        bool changed = false;
                         foreach (var t in tags)
-                            bag.Add(t);
+                            if (bag.Add(t)) changed = true;
+                        if (changed) card.MarkAttributeDirty();
+                    }
+                    return true;
+                }
+
+                case "TActionCardRemoveTagsList":
+                    if (action.Tags != null && action.Tags.Count > 0)
+                    {
+                        foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
+                        {
+                            bool changed = false;
+                            foreach (var t in action.Tags)
+                            {
+                                if (card.CombatTags.Remove(t)) changed = true;
+                                if (card.ExtraTags.Remove(t)) changed = true;
+                            }
+                            if (changed) card.MarkAttributeDirty();
+                        }
+                    }
+                    return true;
+
+                case "TActionCardRemoveTagsBySource":
+                {
+                    var sources = action.Source != null ? ResolveActionTargets(action.Source, ctx) : [sourceCard];
+                    var tags = sources.SelectMany(s => s.GetAllTags()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
+                    {
+                        bool changed = false;
+                        foreach (var t in tags)
+                        {
+                            if (card.CombatTags.Remove(t)) changed = true;
+                            if (card.ExtraTags.Remove(t)) changed = true;
+                        }
+                        if (changed) card.MarkAttributeDirty();
                     }
                     return true;
                 }
@@ -1739,6 +1988,10 @@ public static class AbilityExecutor
                     if (ctx.Repo == null || action.SpawnContext == null) return false;
                     var durationTarget = ResolveDurationTarget(action.Duration, ctx.Scope);
                     bool isTemporary = durationTarget != DurationTarget.Permanent;
+                    bool isTimedCombatTransform = ctx.Scope == RuleScope.InCombat
+                                                  && action.Duration?.Type == "TCombatDuration"
+                                                  && action.Duration.DurationInMs is > 0;
+                    int? timedTransformDurationMs = isTimedCombatTransform ? action.Duration!.DurationInMs!.Value : null;
                     bool isRandomTransform = IsRandomTransformTarget(action.Target);
                     bool allowDisabledTargets = string.Equals(action.Type, "TActionCardTransformDestroyed", StringComparison.Ordinal);
                     var transformTargets = ResolveTransformTargets(
@@ -1787,6 +2040,7 @@ public static class AbilityExecutor
                             if (isTemporary)
                             {
                                 replacement.IsCombatTemporary = true;
+                                replacement.TransformedFromInstanceId = card.TransformedFromInstanceId ?? card.InstanceId;
                             }
                             else
                             {
@@ -1803,11 +2057,13 @@ public static class AbilityExecutor
                         int slot = card.StartSlot;
                         int origWidth = card.SlotWidth;
                         bool replacedInHand = false;
+                        string origSection = "Hand";
                         replacement.IsDisabled = false;
                         replacement.IsDestroyed = false;
 
                         if (owner.Hand.Cards.Contains(card))
                         {
+                            origSection = "Hand";
                             owner.Hand.Remove(card);
                             card.IsDestroyed = true;
                             replacedInHand = true;
@@ -1819,6 +2075,7 @@ public static class AbilityExecutor
                         }
                         else if (owner.Stash.Cards.Contains(card))
                         {
+                            origSection = "Stash";
                             owner.Stash.Remove(card);
                             card.IsDestroyed = true;
                             if (slot < 0 || !owner.Stash.TryPlaceWithDisplaceOrSwap(replacement, slot))
@@ -1826,12 +2083,14 @@ public static class AbilityExecutor
                         }
                         else if (owner.Skills.Contains(card))
                         {
+                            origSection = "Skill";
                             int sIdx = owner.Skills.IndexOf(card);
                             card.IsDestroyed = true;
                             if (sIdx >= 0) owner.Skills[sIdx] = replacement;
                         }
                         else if (owner.SocketEffects.Contains(card))
                         {
+                            origSection = "SocketEffect";
                             int seIdx = owner.SocketEffects.IndexOf(card);
                             card.IsDestroyed = true;
                             replacement.StartSlot = slot;
@@ -1850,8 +2109,7 @@ public static class AbilityExecutor
                             if (ctx.Scope == RuleScope.InCombat)
                             {
                                 extra.IsCombatTemporary = isTemporary;
-                                if (!isTemporary)
-                                    extra.TransformedFromInstanceId = card.TransformedFromInstanceId ?? card.InstanceId;
+                                extra.TransformedFromInstanceId = card.TransformedFromInstanceId ?? card.InstanceId;
                             }
                             if (extra.Template.Type == "Skill")
                             {
@@ -1934,6 +2192,7 @@ public static class AbilityExecutor
                             IsSkillSource = sourceCard.Template.Type == "Skill"
                         });
                         ctx.OnCardTransformed?.Invoke(owner, card, replacement);
+                        ctx.OnCardTransformBatch?.Invoke(owner, card, replacements, isTemporary, timedTransformDurationMs, origSection, slot);
                         DispatchDetailed(ctx, "TTriggerOnCardAfterTransform", owner, sourceCard, replacement, owner);
                     }
                     return true;
@@ -2117,8 +2376,15 @@ public static class AbilityExecutor
                 }
 
                 case "TActionGameReroll":
-                    ctx.OnRerollEncounter?.Invoke(action.RerollType ?? "All");
+                {
+                    // P1-17：透传可选 SpawnCount 覆盖至局外调度层，兼容旧 1 参回调
+                    string rerollType = action.RerollType ?? "All";
+                    if (ctx.OnRerollEncounterWithCount != null)
+                        ctx.OnRerollEncounterWithCount.Invoke(rerollType, action.SpawnCount);
+                    else
+                        ctx.OnRerollEncounter?.Invoke(rerollType);
                     return true;
+                }
 
                 case "TActionExitReplacementSet":
                     ctx.OnExitSelection?.Invoke();
@@ -2217,12 +2483,28 @@ public static class AbilityExecutor
 
                     if (next >= entry.Target)
                     {
-                        card.CompletedQuests.Add(entry.AttributeType);
                         changed = true;
                         newlyCompleted ??= new List<(QuestEntry, double)>();
                         newlyCompleted.Add((entry, next));
-                        if (q.Repeatable == null)
+                        if (q.Repeatable != null)
+                        {
+                            // P2-19：可重复任务校验 Repeatable.Prerequisites，满足时重置进度而不锁入 CompletedQuests
+                            bool canRepeat = ValueAndConditionEvaluator.EvaluatePrerequisites(q.Repeatable.Prerequisites, localCtx);
+                            if (canRepeat)
+                            {
+                                card.CompletedQuests.Remove(entry.AttributeType);
+                                card.QuestProgress[entry.AttributeType] = 0;
+                            }
+                            else
+                            {
+                                card.CompletedQuests.Add(entry.AttributeType);
+                            }
+                        }
+                        else
+                        {
+                            card.CompletedQuests.Add(entry.AttributeType);
                             break;
+                        }
                     }
                 }
             }
@@ -2260,6 +2542,7 @@ public static class AbilityExecutor
         card.QuestProgress[questAttr] = nextProg;
 
         List<(QuestEntry Entry, double Progress)>? newlyCompleted = null;
+        var localCtx = ctx.WithCards(card, sourceCard, card);
         foreach (var q in card.Template.Quests)
         {
             if (IsQuestGroupCompleted(card, q)) continue;
@@ -2269,11 +2552,26 @@ public static class AbilityExecutor
                 if (card.CompletedQuests.Contains(entry.AttributeType)) continue;
                 if (nextProg >= entry.Target)
                 {
-                    card.CompletedQuests.Add(entry.AttributeType);
                     newlyCompleted ??= new List<(QuestEntry, double)>();
                     newlyCompleted.Add((entry, nextProg));
-                    if (q.Repeatable == null)
+                    if (q.Repeatable != null)
+                    {
+                        bool canRepeat = ValueAndConditionEvaluator.EvaluatePrerequisites(q.Repeatable.Prerequisites, localCtx);
+                        if (canRepeat)
+                        {
+                            card.CompletedQuests.Remove(entry.AttributeType);
+                            card.QuestProgress[entry.AttributeType] = 0;
+                        }
+                        else
+                        {
+                            card.CompletedQuests.Add(entry.AttributeType);
+                        }
+                    }
+                    else
+                    {
+                        card.CompletedQuests.Add(entry.AttributeType);
                         break;
+                    }
                 }
             }
         }
@@ -2374,7 +2672,7 @@ public static class AbilityExecutor
                 if (fixedVal.HasValue) result = fixedVal.Value;
                 else
                 {
-                    var cardAttr = sourceCard.GetAttribute(fallbackAttr);
+                    var cardAttr = sourceCard.GetAttributeForAbility(fallbackAttr, ctx.ActiveExecution.AbilityId);
                     result = Math.Abs(cardAttr) > 1e-6 ? cardAttr : defaultVal;
                 }
             }
@@ -2421,9 +2719,38 @@ public static class AbilityExecutor
         return Math.Clamp((int)Math.Round(raw), 0, 120_000);
     }
 
+    private static void RecordOrDispatchCrit(RuleExecutionContext ctx, CardInstance sourceCard)
+    {
+        // 修复 P0-05：同次 TTriggerOnCardFired 施放内延迟到施放循环末尾统一仅派发 1 次 TTriggerOnCardCritted；
+        // 非 CardFired 的被动响应动作维持单次触发即时派发。
+        if (ctx.ActiveExecution.InCardFiredExecution
+            && ReferenceEquals(ctx.ActiveExecution.CurrentCastCard, sourceCard))
+        {
+            ctx.ActiveExecution.CurrentCastDidCrit = true;
+            return;
+        }
+        DispatchDetailed(ctx, "TTriggerOnCardCritted", ctx.SelfPlayer, sourceCard, sourceCard, ctx.SelfPlayer);
+    }
+
     private static bool RollCrit(CardInstance sourceCard, RuleExecutionContext ctx)
     {
-        double critChance = sourceCard.GetAttribute("CritChance") + ctx.CombatBonusCritChance;
+        if (ctx.ActiveExecution.InCardFiredExecution
+            && ReferenceEquals(ctx.ActiveExecution.CurrentCastCard, sourceCard))
+        {
+            if (ctx.ActiveExecution.CurrentCastCritRoll.HasValue)
+                return ctx.ActiveExecution.CurrentCastCritRoll.Value;
+            bool rolled = RollCritCore(sourceCard, ctx);
+            ctx.ActiveExecution.CurrentCastCritRoll = rolled;
+            return rolled;
+        }
+        return RollCritCore(sourceCard, ctx);
+    }
+
+    private static bool RollCritCore(CardInstance sourceCard, RuleExecutionContext ctx)
+    {
+        double critChance = sourceCard.GetAttribute("CritChance")
+                          + (ctx.SelfPlayer?.GetAttribute("CritChance") ?? 0)
+                          + ctx.CombatBonusCritChance;
         if (critChance <= 0) return false;
         if (critChance >= 100) return true;
         return ctx.Rng.NextDouble() * 100.0 < critChance;

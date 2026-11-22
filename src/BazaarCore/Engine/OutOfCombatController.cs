@@ -71,6 +71,8 @@ public sealed class OutOfCombatBatchResult
     public List<string> TriggeredAbilityLogs { get; } = new();
     public List<(List<CardInstance> Cards, string SpawnMode)> DealtSelectionRequests { get; } = new();
     public List<string> RerollRequests { get; } = new();
+    /// <summary>带可选 SpawnCount 覆盖的完整重掷请求明细（P1-17；与 RerollRequests 同步追加以保持向后兼容）。</summary>
+    public List<(string RerollType, int? SpawnCount)> RerollEntries { get; } = new();
     public bool ExitSelectionRequested { get; set; }
 }
 
@@ -81,7 +83,30 @@ public static class OutOfCombatController
 {
     private const int MaxDispatchDepth = 8;
 
+    private sealed record OutOfCombatSpawnPreferences(
+        Func<string, ulong>? ArchetypeResolver,
+        CustomRunRuleSet? CustomRules);
+
     private static readonly ConditionalWeakTable<PlayerState, List<CardInstance>> AttachedPlayerEffects = new();
+    private static readonly ConditionalWeakTable<PlayerState, OutOfCombatSpawnPreferences> AttachedSpawnPreferences = new();
+
+    /// <summary>
+    /// 为指定玩家实例挂载局外生成偏好（流派位掩码解析器与自定义规则集），
+    /// 令该玩家触发的所有局外发牌/衍生/变形能力（如铲子、钓竿、曼陀罗）自动继承流派倾向与高阶掉率加成。
+    /// </summary>
+    public static void AttachSpawnPreferences(
+        PlayerState player,
+        Func<string, ulong>? archetypeResolver,
+        CustomRunRuleSet? customRules)
+    {
+        if (player == null) return;
+        if (archetypeResolver == null && customRules == null)
+        {
+            AttachedSpawnPreferences.Remove(player);
+            return;
+        }
+        AttachedSpawnPreferences.AddOrUpdate(player, new OutOfCombatSpawnPreferences(archetypeResolver, customRules));
+    }
 
     private static readonly string[] CorePlayerAttributes =
     [
@@ -860,17 +885,17 @@ public static class OutOfCombatController
                 var candidates = CollectTriggerCandidates(player, extraCardsForTrigger, activeEncounterCard);
                 double delta = Math.Abs(cVal - pVal);
 
+                // 修复 P1-21：先跨全盘收集全部候选 (card, ab)，再按官方 Ability.Priority 全局稳定排序执行
+                var pendingAbilities = new List<(CardInstance Card, AbilityDefinition Ability, bool AllowMismatch, int CardOrder, int AbilityOrder)>(candidates.Count * 2);
                 for (int i = 0; i < candidates.Count; i++)
                 {
                     var (card, activeInMismatchAllowed) = candidates[i];
                     if (card.IsDisabled) continue;
-                    // 若卡牌在当前事件前已被永久移除或销毁（除 BeforeCardDestroyed 外），跳过
                     if (card.IsDestroyed && evName != "TTriggerOnBeforeCardDestroyed") continue;
 
-                    var abilities = OrderAbilitiesByPriority(card.ActiveAbilities);
-                    for (int a = 0; a < abilities.Count; a++)
+                    for (int a = 0; a < card.ActiveAbilities.Count; a++)
                     {
-                        var ab = abilities[a];
+                        var ab = card.ActiveAbilities[a];
                         if (ab.Trigger == null) continue;
                         if (string.Equals(ab.WorksIn, "CombatOnly", StringComparison.OrdinalIgnoreCase)) continue;
                         bool allowDirectCardMismatch = activeInMismatchAllowed && evName == eventType && card == srcCard;
@@ -880,29 +905,50 @@ public static class OutOfCombatController
                         if (!allowDirectCardMismatch && !IsAbilityActiveInOutOfCombat(ab.ActiveIn, inHand, inStash))
                             continue;
 
-                        var abCtx = baseCtx.WithCards(card, srcCard, tgtCard);
-                        abCtx.LastAttributeChangeDelta = delta;
-                        if (!ValueAndConditionEvaluator.EvaluatePrerequisites(ab.Prerequisites, abCtx))
-                            continue;
+                        pendingAbilities.Add((card, ab, allowDirectCardMismatch, i, a));
+                    }
+                }
 
-                        if (!AbilityExecutor.MatchesTrigger(
-                                ab.Trigger, evName, card, player,
-                                srcCard, tgtCard, subjPlayer,
-                                attr, pVal, cVal,
-                                combatType, combatOutcome, abCtx))
-                            continue;
+                if (pendingAbilities.Count > 1)
+                {
+                    pendingAbilities.Sort(static (x, y) =>
+                    {
+                        int prioCmp = GetAbilityPriorityRank(x.Ability.Priority).CompareTo(GetAbilityPriorityRank(y.Ability.Priority));
+                        if (prioCmp != 0) return prioCmp;
+                        int cardCmp = x.CardOrder.CompareTo(y.CardOrder);
+                        if (cardCmp != 0) return cardCmp;
+                        return x.AbilityOrder.CompareTo(y.AbilityOrder);
+                    });
+                }
 
-                        var prevAbId = abCtx.ActiveExecution.AbilityId;
-                        abCtx.ActiveExecution.AbilityId = ab.Id;
-                        try
-                        {
-                            if (AbilityExecutor.ExecuteAction(ab.Action, card, abCtx))
-                                result.TriggeredAbilityLogs.Add($"{card.Template.InternalName}:{ab.Id}:{evName}");
-                        }
-                        finally
-                        {
-                            abCtx.ActiveExecution.AbilityId = prevAbId;
-                        }
+                for (int pIdx = 0; pIdx < pendingAbilities.Count; pIdx++)
+                {
+                    var (card, ab, _, _, _) = pendingAbilities[pIdx];
+                    if (card.IsDisabled) continue;
+                    if (card.IsDestroyed && evName != "TTriggerOnBeforeCardDestroyed") continue;
+
+                    var abCtx = baseCtx.WithCards(card, srcCard, tgtCard);
+                    abCtx.LastAttributeChangeDelta = delta;
+                    if (!ValueAndConditionEvaluator.EvaluatePrerequisites(ab.Prerequisites, abCtx))
+                        continue;
+
+                    if (!AbilityExecutor.MatchesTrigger(
+                            ab.Trigger, evName, card, player,
+                            srcCard, tgtCard, subjPlayer,
+                            attr, pVal, cVal,
+                            combatType, combatOutcome, abCtx))
+                        continue;
+
+                    var prevAbId = abCtx.ActiveExecution.AbilityId;
+                    abCtx.ActiveExecution.AbilityId = ab.Id;
+                    try
+                    {
+                        if (AbilityExecutor.ExecuteAction(ab.Action, card, abCtx))
+                            result.TriggeredAbilityLogs.Add($"{card.Template.InternalName}:{ab.Id}:{evName}");
+                    }
+                    finally
+                    {
+                        abCtx.ActiveExecution.AbilityId = prevAbId;
                     }
                 }
 
@@ -921,6 +967,7 @@ public static class OutOfCombatController
             }
         }
 
+        AttachedSpawnPreferences.TryGetValue(player, out var spawnPrefs);
         baseCtx = new RuleExecutionContext(repo, RuleScope.OutOfCombat, player, opponent, effectiveRng)
         {
             LocalPlayerId = player.PlayerId,
@@ -930,8 +977,19 @@ public static class OutOfCombatController
             CurrentEncounterId = currentEncounterId ?? activeEncounterCard?.Template.Id,
             IsFusionUpgrade = isFusionUpgrade,
             SelectionCards = selectionCards,
+            ArchetypeResolver = spawnPrefs?.ArchetypeResolver,
+            CustomRules = spawnPrefs?.CustomRules,
             OnDealCardsToSelection = (cards, mode) => result.DealtSelectionRequests.Add((cards, mode)),
-            OnRerollEncounter = rerollType => result.RerollRequests.Add(rerollType),
+            OnRerollEncounter = rerollType =>
+            {
+                result.RerollRequests.Add(rerollType);
+                result.RerollEntries.Add((rerollType, null));
+            },
+            OnRerollEncounterWithCount = (rerollType, spawnCount) =>
+            {
+                result.RerollRequests.Add(rerollType);
+                result.RerollEntries.Add((rerollType, spawnCount));
+            },
             OnExitSelection = () => result.ExitSelectionRequested = true,
             OnCardSpawned = (owner, spawned) =>
             {
@@ -1072,21 +1130,29 @@ public static class OutOfCombatController
         CardInstance? activeEncounterCard,
         IReadOnlyList<CardInstance>? selectionCards)
     {
-        void ApplyExternalAuras()
+        // 修复 P2-25：删除重复简化副本 ApplyEncounterAuraAction，直接将外部效果与活跃遭遇卡纳入 AuraEngine 统一管线
+        List<CardInstance>? externalAuras = null;
+        if (AttachedPlayerEffects.TryGetValue(player, out var attachedEffects) && attachedEffects.Count > 0)
         {
-            if (AttachedPlayerEffects.TryGetValue(player, out var attachedEffects) && attachedEffects.Count > 0)
-            {
-                for (int e = 0; e < attachedEffects.Count; e++)
-                    EvaluateExternalCardAuras(player, repo, attachedEffects[e], activeEncounterCard?.Template.Id, selectionCards);
-            }
-            if (activeEncounterCard != null)
-                EvaluateExternalCardAuras(player, repo, activeEncounterCard, activeEncounterCard.Template.Id, selectionCards, clearBefore: true);
+            externalAuras = new List<CardInstance>(attachedEffects.Count + (activeEncounterCard != null ? 1 : 0));
+            for (int e = 0; e < attachedEffects.Count; e++)
+                externalAuras.Add(attachedEffects[e]);
+        }
+        if (activeEncounterCard != null)
+        {
+            externalAuras ??= new List<CardInstance>(1);
+            externalAuras.Add(activeEncounterCard);
         }
 
-        var transitions = AuraEngine.RecalculateAurasInternal(player, null, RuleScope.OutOfCombat, player.Day, player.Hour, repo, selectionCards);
-        ApplyExternalAuras();
+        string? encId = activeEncounterCard?.Template.Id;
+        var transitions = AuraEngine.RecalculateAurasInternal(
+            player, null, RuleScope.OutOfCombat, player.Day, player.Hour, repo,
+            selectionCards: selectionCards,
+            snapshotSink: null,
+            externalAuraCards: externalAuras,
+            currentEncounterId: encId);
 
-        // 非战斗光环重算后，将拥有弹药上限的卡牌当前弹药同步补满；若触发光环增弹引发 CurrentAmmo 变化，再刷新一次关联光环并重新补施外部光环（修复 P1-4）
+        // 非战斗光环重算后，将拥有弹药上限的卡牌当前弹药同步补满；若触发光环增弹引发 CurrentAmmo 变化，再刷新一次关联光环（修复 P1-4）
         bool anyAmmoChanged = false;
         foreach (var c in player.EnumerateAllOwnedCards())
         {
@@ -1096,8 +1162,12 @@ public static class OutOfCombatController
         }
         if (anyAmmoChanged)
         {
-            var secondTransitions = AuraEngine.RecalculateAurasInternal(player, null, RuleScope.OutOfCombat, player.Day, player.Hour, repo, selectionCards);
-            ApplyExternalAuras();
+            var secondTransitions = AuraEngine.RecalculateAurasInternal(
+                player, null, RuleScope.OutOfCombat, player.Day, player.Hour, repo,
+                selectionCards: selectionCards,
+                snapshotSink: null,
+                externalAuraCards: externalAuras,
+                currentEncounterId: encId);
             if (secondTransitions.Count > 0)
             {
                 if (transitions.Count == 0)
@@ -1108,92 +1178,6 @@ public static class OutOfCombatController
         }
 
         return transitions;
-    }
-
-    private static void EvaluateExternalCardAuras(
-        PlayerState player,
-        GameDataRepository repo,
-        CardInstance externalCard,
-        string? currentEncounterId,
-        IReadOnlyList<CardInstance>? selectionCards,
-        bool clearBefore = false)
-    {
-        if (clearBefore)
-            externalCard.ClearAuraModifiers();
-        if (externalCard.IsDestroyed || externalCard.IsDisabled || externalCard.ActiveAuras.Count == 0)
-            return;
-
-        var baseCtx = new RuleExecutionContext(repo, RuleScope.OutOfCombat, player, null, new Random(0))
-        {
-            LocalPlayerId = player.PlayerId,
-            CurrentDay = player.Day,
-            CurrentHour = player.Hour,
-            CurrentEncounterId = currentEncounterId,
-            SelectionCards = selectionCards,
-        };
-
-        for (int i = 0; i < externalCard.ActiveAuras.Count; i++)
-        {
-            var aura = externalCard.ActiveAuras[i];
-            if (string.Equals(aura.WorksIn, "CombatOnly", StringComparison.OrdinalIgnoreCase)) continue;
-            if (string.Equals(aura.ActiveIn, "StashOnly", StringComparison.OrdinalIgnoreCase)) continue;
-
-            var ctx = baseCtx.WithCards(externalCard, externalCard);
-            if (!ValueAndConditionEvaluator.EvaluatePrerequisites(aura.Prerequisites, ctx))
-                continue;
-
-            if (aura.Action != null)
-                ApplyEncounterAuraAction(aura.Action, externalCard, ctx);
-        }
-    }
-
-    private static void ApplyEncounterAuraAction(RuleNode action, CardInstance sourceCard, RuleExecutionContext ctx)
-    {
-        switch (action.Type)
-        {
-            case "TAuraActionCardModifyAttribute":
-            {
-                var valNode = action.GetValueNode(GameDatabaseLoader.JsonOptions);
-                double val = valNode != null ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx) : (action.GetFixedNumericValue() ?? 0);
-                if (double.IsNaN(val) || double.IsInfinity(val)) val = 0;
-                var attr = action.AttributeType ?? "Custom_0";
-                var op = action.Operation ?? "Add";
-                foreach (var target in TargetResolver.ResolveCards(action.Target, ctx))
-                    target.ApplyAuraAttribute(attr, op, val);
-                break;
-            }
-            case "TAuraActionPlayerModifyAttribute":
-            {
-                var valNode = action.GetValueNode(GameDatabaseLoader.JsonOptions);
-                double val = valNode != null ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx) : (action.GetFixedNumericValue() ?? 0);
-                if (double.IsNaN(val) || double.IsInfinity(val)) val = 0;
-                var attr = action.AttributeType ?? "HealthMax";
-                var op = action.Operation ?? "Add";
-                foreach (var targetPlayer in TargetResolver.ResolvePlayers(action.Target, ctx))
-                    targetPlayer.ApplyAuraAttribute(attr, op, val);
-                break;
-            }
-            case "TAuraActionCardAddTagsList":
-            {
-                if (action.Tags == null) break;
-                foreach (var target in TargetResolver.ResolveCards(action.Target, ctx))
-                    foreach (var tag in action.Tags)
-                        target.AuraTags.Add(tag);
-                break;
-            }
-            case "TAuraActionCardAddTagsBySource":
-            {
-                var sources = action.Source != null ? TargetResolver.ResolveCards(action.Source, ctx) : [sourceCard];
-                var tags = sources.SelectMany(s => s.GetAllTags()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                foreach (var target in TargetResolver.ResolveCards(action.Target, ctx))
-                    foreach (var tag in tags)
-                        target.AuraTags.Add(tag);
-                break;
-            }
-            default:
-                RuleExecutionContext.NotifyUnknownRuleType(ctx, "TAuraAction", action.Type);
-                break;
-        }
     }
 
     private static List<(CardInstance Card, bool AllowAnyActiveIn)> CollectTriggerCandidates(

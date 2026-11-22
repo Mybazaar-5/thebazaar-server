@@ -143,9 +143,38 @@ public static class ValueAndConditionEvaluator
         return Math.Round(raw, MidpointRounding.AwayFromZero);
     }
 
+    /// <summary>
+    /// 递归检查数值表达式节点及其 Modifier 子树是否包含 Target == null 的卡牌引用节点（修复 P0-06：
+    /// 覆盖 Eagle Sigil、Sunderer、Streaming Setup、Clean Storefront 与 [Shrouded Figure] Absorb Memories）。
+    /// </summary>
+    internal static bool ContainsNullTargetCardRef(RuleNode? node, int depth = 0)
+    {
+        if (node == null || depth > 8) return false;
+        if (node.Target == null
+            && node.Type is "TReferenceValueCardAttribute"
+                or "TReferenceValueCardAttributeUnscaled"
+                or "TReferenceValueCardAttributeAggregate"
+                or "TReferenceValueCardTagCount"
+                or "TReferenceValueCardHeroCount"
+                or "TReferenceValueCardCount"
+                or "TReferenceValueUniqueCardCount")
+        {
+            return true;
+        }
+        if (node.Modifier?.Value != null && ContainsNullTargetCardRef(node.Modifier.Value, depth + 1))
+            return true;
+        if (node.ReferenceValue != null && ContainsNullTargetCardRef(node.ReferenceValue, depth + 1))
+            return true;
+        var innerVal = node.GetValueNode(GameDatabaseLoader.JsonOptions);
+        if (innerVal != null && ContainsNullTargetCardRef(innerVal, depth + 1))
+            return true;
+        return false;
+    }
+
     private static List<CardInstance> ResolveValueTargets(RuleNode? target, RuleExecutionContext ctx)
     {
-        if (target == null) return [];
+        if (target == null)
+            return ctx.CurrentTargetCard != null ? [ctx.CurrentTargetCard] : [];
         return AbilityExecutor.ResolveActionTargets(target, ctx, int.MaxValue);
     }
 

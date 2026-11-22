@@ -68,6 +68,7 @@ internal sealed partial class CustomGameplayUI
     private string _activeLeaderboardKey = "endless";
     private string _activeChatChannel = "lobby";
     private CancellationTokenSource _socialSseCts;
+    private string _subscribedSseLobbyId = string.Empty;
     private readonly List<(long Id, string Channel, string Sender, string Content)> _socialMessages = new();
 
     // ── 性能监控与诊断控件引用 ──────────────────────────────────────────────────
@@ -136,6 +137,11 @@ internal sealed partial class CustomGameplayUI
         rt.pivot = new Vector2(0.5f, 1f);
         rt.anchoredPosition = new Vector2(0f, -66f);
         rt.sizeDelta = new Vector2(600f, 34f);
+
+        // P1-49：附加独立排序子 Canvas（sortingOrder=560 > _modalCanvas=500，无 GraphicRaycaster），确保弹窗打开时 Toast 仍清晰可见且不阻挡点击
+        var toastCanvas = _toastGo.AddComponent<Canvas>();
+        toastCanvas.overrideSorting = true;
+        toastCanvas.sortingOrder = 560;
 
         _toastBg = _toastGo.GetComponent<Image>();
         _toastText = _ui.CreateText("ToastText", _toastGo.transform, string.Empty, 14f, NativeUguiFactory.ColGold, FontStyles.Bold, TextAlignmentOptions.Center, wrap: false);
@@ -886,21 +892,64 @@ internal sealed partial class CustomGameplayUI
         }
     }
 
+    private void StopSocialSse()
+    {
+        try
+        {
+            _socialSseCts?.Cancel();
+            _socialSseCts?.Dispose();
+        }
+        catch { }
+        _socialSseCts = null;
+        _subscribedSseLobbyId = string.Empty;
+    }
+
+    private void SyncSocialSseForLobbyOrPanelState()
+    {
+        bool shouldKeepAlive = (_isOpen && _activeTab == UiTab.Social)
+            || IsActiveRunTournamentMode()
+            || IsTournamentUiContext();
+        if (!shouldKeepAlive)
+        {
+            StopSocialSse();
+            return;
+        }
+
+        if (_socialSseCts != null && !_socialSseCts.IsCancellationRequested)
+        {
+            string desiredLobbyId = _currentLobby?.LobbyId ?? string.Empty;
+            if (!string.Equals(_subscribedSseLobbyId, desiredLobbyId, StringComparison.Ordinal))
+            {
+                EnsureSocialSseSubscribed();
+            }
+        }
+    }
+
     private void EnsureSocialSseSubscribed()
     {
-        if (_socialSseCts != null && !_socialSseCts.IsCancellationRequested) return;
+        string desiredLobbyId = _currentLobby?.LobbyId ?? string.Empty;
+        if (_socialSseCts != null && !_socialSseCts.IsCancellationRequested)
+        {
+            // P2-41：若已订阅同一 lobbyId 则复用，切换锦标赛房间时断开旧连接并按新 lobbyId 重建
+            if (string.Equals(_subscribedSseLobbyId, desiredLobbyId, StringComparison.Ordinal))
+                return;
+            StopSocialSse();
+        }
+
         string baseUrl = NameAuth.GetServerBaseUrl();
         if (string.IsNullOrWhiteSpace(baseUrl)) return;
 
-        _socialSseCts = HttpClientHub.CreateLinkedCts();
-        var token = _socialSseCts.Token;
+        _subscribedSseLobbyId = desiredLobbyId;
+        var cts = HttpClientHub.CreateLinkedCts();
+        _socialSseCts = cts;
+        var token = cts.Token;
 
         _ = Task.Run(async () =>
         {
             try
             {
-                string lobbyQ = !string.IsNullOrEmpty(_currentLobby?.LobbyId)
-                    ? $"&lobbyId={Uri.EscapeDataString(_currentLobby.LobbyId)}"
+                string lobbyQ = !string.IsNullOrEmpty(desiredLobbyId)
+                    ? $"&lobbyId={Uri.EscapeDataString(desiredLobbyId)}"
                     : string.Empty;
                 using var req = new System.Net.Http.HttpRequestMessage(
                     System.Net.Http.HttpMethod.Get,
