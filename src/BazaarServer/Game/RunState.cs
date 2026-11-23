@@ -247,7 +247,7 @@ public sealed class RunState
 
     /// <summary>玩家权威属性字典（必含 Health/HealthMax/Shield/Joy 等客户端 UI 强依赖键）。</summary>
     public Dictionary<EPlayerAttributeType, int> PlayerAttributes { get; } =
-        CreateDefaultCombatantAttributes(hp: 250, hpMax: 250, prestige: 20, level: 1, gold: 15, income: 5);
+        CreateDefaultCombatantAttributes(hp: 300, hpMax: 300, prestige: 20, level: 1, gold: 15, income: 5);
 
     /// <summary>玩家局外限时属性层（UntilEndOfHour / UntilEndOfDay），挂于 RunState 便于无损序列化持久化。</summary>
     public Dictionary<string, double> PlayerHourAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -264,6 +264,26 @@ public sealed class RunState
 
     /// <summary>当天已访问过的遭遇模板 ID（用于跨小时同天去重，跨天时清空）。</summary>
     public HashSet<string> VisitedDayEncounterIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 当天常规小时（Hour 1/2/4/5）已在桌面展示过的遭遇模板 ID（含跳过未点击的商人/奇遇/右槽事件），
+    /// 与 <see cref="VisitedDayEncounterIds"/> 共同构成官方「同日刷出即锁定（Once-Per-Day）」无放回抽签集合。
+    /// </summary>
+    public HashSet<string> OfferedDayEncounterIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>记录 <see cref="OfferedDayEncounterIds"/> 对应的游戏天数（跨天或重置时自动清零）。</summary>
+    public uint OfferedDayEncounterDay { get; set; }
+
+    /// <summary>记录 <see cref="OfferedDayEncounterIds"/> 最近一次写入时的小时（同小时重发或回退时自动清零）。</summary>
+    public uint OfferedDayEncounterLastHour { get; set; }
+
+    /// <summary>清空当日已展示遭遇追踪（跨天/重开时调用）。</summary>
+    public void ClearOfferedDayEncounters()
+    {
+        OfferedDayEncounterIds.Clear();
+        OfferedDayEncounterDay = 0;
+        OfferedDayEncounterLastHour = 0;
+    }
 
     /// <summary>
     /// P1-01：一等公民替换遭遇集（Replacement Set）GUID（对应 GameData.db cards.NewSetIdOnExit 的 5 个官方 GUID 与 Mod 自定义替换集）；

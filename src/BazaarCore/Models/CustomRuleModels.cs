@@ -541,13 +541,13 @@ public sealed class CustomRunRuleSet
     public int StartingIncome { get; set; } = 5;
 
     [JsonPropertyName("startingExperience")]
-    public int StartingExperience { get; set; } = 0;
+    public int StartingExperience { get; set; } = 3;
 
     [JsonPropertyName("startingPrestige")]
     public int StartingPrestige { get; set; } = 20;
 
     [JsonPropertyName("startingHealth")]
-    public int StartingHealth { get; set; } = 250;
+    public int StartingHealth { get; set; } = 300;
 
     [JsonPropertyName("startingItems")]
     public List<PresetCardSpec> StartingItems { get; set; } = new();
@@ -691,9 +691,9 @@ public sealed class CustomRunRuleSet
         bool isStandardStats =
             StartingGold == 15 &&
             StartingIncome == 5 &&
-            StartingExperience == 0 &&
+            StartingExperience == 3 &&
             StartingPrestige == 20 &&
-            StartingHealth == 250 &&
+            StartingHealth == 300 &&
             Math.Abs(ShopHighTierBonusPct) < 1e-6 &&
             Math.Abs(ShopPriceMultiplier - 1.0) < 1e-6 &&
             MonsterLootBonusChoices == 0 &&

@@ -173,10 +173,10 @@ public sealed class V13_1_WikiParityAndHour6Tests
         var fx = Fx.Value;
         var (run, engine) = CreateStartedRun(EHero.Vanessa, seed: 13101);
 
-        // 开局初始经验为 0（而非旧哨兵 3）
-        Assert.Equal(0, new CustomRunRuleSet().StartingExperience);
+        // 开局初始经验为 3（官方 Patch 20.x 基准，确保 Day 1 击败野怪后在 Hour 6 PvP 前稳定升至 Lv2 / 400 HP）
+        Assert.Equal(3, new CustomRunRuleSet().StartingExperience);
         Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
         // 给玩家塞一件强力高阶武器保证 Hour 3 必胜青铜怪拿到完整 3 XP（不给额外 XP 的普通武器 Cutlass）
         var cutlassTpl = fx.Repo.GetCard("1b955b8d-0ea6-4437-935c-d588be5898c1");
@@ -197,17 +197,17 @@ public sealed class V13_1_WikiParityAndHour6Tests
         };
         run.Cards[ceWeapon.InstanceId] = ceWeapon;
 
-        // Hour 1 -> 2 (+1 XP)
+        // Hour 1 -> 2 (+1 XP, 累计 4 XP)
         PassOneNonCombatHourViaMerchant(run, engine);
         Assert.Equal(2u, run.Hour);
-        Assert.Equal(1, TotalAccumulatedXp(run, fx.Mode));
+        Assert.Equal(4, TotalAccumulatedXp(run, fx.Mode));
 
-        // Hour 2 -> 3 (+1 XP, 累计 2 XP)
+        // Hour 2 -> 3 (+1 XP, 累计 5 XP)
         PassOneNonCombatHourViaMerchant(run, engine);
         Assert.Equal(3u, run.Hour);
-        Assert.Equal(2, TotalAccumulatedXp(run, fx.Mode));
+        Assert.Equal(5, TotalAccumulatedXp(run, fx.Mode));
 
-        // Hour 3：选左槽青铜野怪开打（胜得 +3 XP，不叠加小时 +1 XP -> 累计 5 XP）
+        // Hour 3：选左槽青铜野怪开打（胜得 +3 XP，不叠加小时 +1 XP -> 累计 8 XP 升至 Lv2！）
         Assert.Equal(ERunState.Choice, run.State);
         Assert.Equal(3, run.SelectionSet.Count);
         string monsterId = run.SelectionSet[0];
@@ -221,43 +221,59 @@ public sealed class V13_1_WikiParityAndHour6Tests
             var exitLoot = engine.Handle(new ExitCurrentStateCommand());
             Assert.Null(exitLoot.Error);
         }
+        while (run.State is ERunState.LevelUp or ERunState.Encounter)
+        {
+            if (run.State == ERunState.Encounter && run.SelectionRules.CanExit)
+                Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
+            else if (run.SelectionSet.Count > 0)
+            {
+                var pick = run.Cards[run.SelectionSet[0]];
+                bool isEnc = pick.Type is ECardType.EncounterStep or ECardType.EventEncounter
+                    or ECardType.PedestalEncounter or ECardType.CombatEncounter or ECardType.PvpEncounter;
+                INetCommand cmd = isEnc
+                    ? new SelectEncounterCommand { InstanceId = new(pick.InstanceId) }
+                    : new SelectItemCommand { InstanceId = new(pick.InstanceId) };
+                Assert.Null(engine.Handle(cmd).Error);
+            }
+            else break;
+        }
         Assert.Equal(4u, run.Hour);
-        Assert.Equal(5, TotalAccumulatedXp(run, fx.Mode));
+        Assert.Equal(8, TotalAccumulatedXp(run, fx.Mode));
+        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
 
-        // Hour 4 -> 5 (+1 XP, 累计 6 XP)
+        // Hour 4 -> 5 (+1 XP, 累计 9 XP)
         PassOneNonCombatHourViaMerchant(run, engine);
         Assert.Equal(5u, run.Hour);
-        Assert.Equal(6, TotalAccumulatedXp(run, fx.Mode));
+        Assert.Equal(9, TotalAccumulatedXp(run, fx.Mode));
 
-        // Hour 5 -> 6 (+1 XP, 进入 Hour 6 PvP 前精确 7/8 XP，尚未升 2 级！)
+        // Hour 5 -> 6 (+1 XP, 进入 Hour 6 PvP 前已稳居 Lv2, 2/8 XP, 累计 10 XP！)
         PassOneNonCombatHourViaMerchant(run, engine);
         Assert.Equal(1u, run.Day);
         Assert.Equal(6u, run.Hour);
-        Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(7, run.PlayerAttributes[EPlayerAttributeType.Experience]);
-        Assert.Equal(7, TotalAccumulatedXp(run, fx.Mode));
+        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
+        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(10, TotalAccumulatedXp(run, fx.Mode));
 
-        // Hour 6 PvP：战斗本身 0 XP，跨日推进至 Day 2 Hour 1 给 +1 小时 XP -> 全天精确 8 XP（升 Lv2 余 0 XP，绝非 10 XP！）
+        // Hour 6 PvP：战斗本身 0 XP，跨日推进至 Day 2 Hour 1 给 +1 小时 XP -> 累计 11 XP（Lv2 3/8 XP）
         string pvpCardId = run.SelectionSet.Single();
         var pvpOutcome = engine.Handle(new SelectEncounterCommand { InstanceId = new(pvpCardId) });
         Assert.Null(pvpOutcome.Error);
         Assert.NotNull(pvpOutcome.CombatSpawnSim);
         Assert.NotNull(pvpOutcome.CombatDespawnSim);
 
-        // PvP 跨日正好 7 + 1 = 8 XP -> 升 Lv2 触发挂起 LevelUp，总累计经验严格 == 8 XP
         Assert.Equal(2u, run.Day);
         Assert.Equal(1u, run.Hour);
         Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
-        Assert.Equal(8, TotalAccumulatedXp(run, fx.Mode));
+        Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(11, TotalAccumulatedXp(run, fx.Mode));
     }
 
     [Fact]
     public void Issue1_CustomStartingExperience3_ShouldActuallyTakeEffect()
     {
-        var customRules = new CustomRunRuleSet { StartingExperience = 3 };
+        var customRules = new CustomRunRuleSet { StartingExperience = 5 };
         var (run, _) = CreateStartedRun(EHero.Vanessa, rules: customRules, seed: 13102);
-        Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(5, run.PlayerAttributes[EPlayerAttributeType.Experience]);
         Assert.True(customRules.IsCustomPowerModified());
     }
 

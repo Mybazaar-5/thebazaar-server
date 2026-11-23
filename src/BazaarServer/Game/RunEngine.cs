@@ -294,6 +294,7 @@ public sealed class RunEngine
         _run.ParentEncounterTemplateId = null;
         _run.VisitedSingleSpawnEncounterIds.Clear();
         _run.VisitedDayEncounterIds.Clear();
+        _run.ClearOfferedDayEncounters();
         _run.ExclusionSet.Clear();
         _run.ExclusionSetInitialized = false;
         EnsureRunExclusionSetInitialized();
@@ -449,11 +450,11 @@ public sealed class RunEngine
 
     private void ApplyStartingStats(CustomRunRuleSet rules, List<IGameSimEvent> events)
     {
-        int startHp = Math.Max(1, rules.StartingHealth != 250 ? rules.StartingHealth : _mode.StartingHealth);
+        int startHp = Math.Max(1, rules.StartingHealth != 300 ? rules.StartingHealth : _mode.StartingHealth);
         int startGold = Math.Max(0, rules.StartingGold != 15 ? rules.StartingGold : _mode.StartingGold);
         int startIncome = Math.Max(0, rules.StartingIncome != 5 ? rules.StartingIncome : _mode.StartingIncome);
         int startPrestige = Math.Max(1, rules.StartingPrestige != 20 ? rules.StartingPrestige : _mode.PrestigeInitial);
-        int startExp = Math.Max(0, rules.StartingExperience != 0 ? rules.StartingExperience : _mode.StartingExperience);
+        int startExp = Math.Max(0, rules.StartingExperience != 3 ? rules.StartingExperience : _mode.StartingExperience);
 
         if (rules.HasMutator(MutatorCatalog.DoubleEconomy))
         {
@@ -3933,6 +3934,7 @@ public sealed class RunEngine
             // 1) 清理 UntilEndOfDay 临时层（并同步回写属性/附魔还原事件）与当日已访问遭遇集合
             ClearDayModifiersOnRun(events);
             _run.VisitedDayEncounterIds.Clear();
+            _run.ClearOfferedDayEncounters();
             _run.ClearActiveReplacementSet();
             ResetBoardOverrideIfNeeded(events);
             _run.PendingPvpGhost = null;
@@ -4835,6 +4837,7 @@ public sealed class RunEngine
                     return NotAllowed("day 参数无效，范围应为 1~99");
                 _run.Day = d;
                 _run.VisitedDayEncounterIds.Clear();
+                _run.ClearOfferedDayEncounters();
                 _run.PendingPvpGhost = null;
                 _run.CurrentPvpOpponent = null;
                 o.Events.Add(new GameSimEventRunDayChanged(d));

@@ -1177,6 +1177,88 @@ public sealed class AuditWave2EncountersTests
         }
     }
 
+    [Fact]
+    public void SameDayOfferedEncounters_NeverRepeatEvenWhenSkipped_And_PvpGhostPoolPrioritizesRealBuilds()
+    {
+        // 1. 同日刷出即锁定（含跳过未点进去的左槽商人，如收容所谢尔比）：连续 20 局 × Day 1..5 跨 Hour 1,2,4,5 绝不重复
+        for (int trial = 0; trial < 20; trial++)
+        {
+            var run = new RunState
+            {
+                RunId = $"dedup_offered_{trial}",
+                GameModeId = Pool.Value.DefaultGameModeId,
+                Hero = (EHero)((trial % 8) + 1),
+                Day = (uint)(1 + (trial % 5)),
+                Hour = 1,
+                RngSeed = 77001 + trial * 19,
+                CustomRules = new CustomRunRuleSet(),
+            };
+            var shop = new ShopEngine(run, Pool.Value, Repo.Value, run.CustomRules);
+            var seenMerchantsToday = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seenNormalizedKeysToday = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 模拟玩家全程不把左槽商人写进 VisitedDayEncounterIds（只跳过不点！）
+            foreach (uint hr in new uint[] { 1, 2, 4, 5 })
+            {
+                run.Hour = hr;
+                shop.DealHourEncounters(playerState: null, visitedTodayIds: run.VisitedDayEncounterIds);
+                Assert.True(run.SelectionSet.Count >= 3);
+
+                foreach (string instId in run.SelectionSet)
+                {
+                    var card = run.Cards[instId];
+                    string tid = card.TemplateId.ToString();
+                    var tpl = Pool.Value.Get(tid);
+                    string normKey = OfficialEncounterSchedule.NormalizeKey(tpl?.InternalName);
+
+                    if (tpl != null && CardArchetypeIndex.IsMerchantEncounterTemplate(tpl.Id, tpl.InternalName, tpl, Repo.Value.GetCard(tid)))
+                    {
+                        Assert.True(
+                            seenMerchantsToday.Add(tid),
+                            $"Day {run.Day} Hero={run.Hero} Hour {hr} 出现同日重复商人 {tpl.InternalName} ({tid})！");
+                    }
+                    if (!string.IsNullOrEmpty(normKey))
+                    {
+                        Assert.True(
+                            seenNormalizedKeysToday.Add(normKey),
+                            $"Day {run.Day} Hero={run.Hero} Hour {hr} 出现同日重复遭遇套系 {tpl?.InternalName} (key={normKey})！");
+                    }
+                }
+            }
+
+            // 快照序列化往返必须完整保留 OfferedDayEncounterIds 与游标
+            string snap = RunSnapshotSerializer.Serialize(run);
+            Assert.True(RunSnapshotSerializer.TryDeserialize(snap, Repo.Value, out var restored, out _));
+            Assert.Equal(run.OfferedDayEncounterIds.Count, restored!.OfferedDayEncounterIds.Count);
+            Assert.Equal(run.OfferedDayEncounterDay, restored.OfferedDayEncounterDay);
+            Assert.Equal(run.OfferedDayEncounterLastHour, restored.OfferedDayEncounterLastHour);
+        }
+
+        // 2. PvpGhostPool 加载期硬剔演菜 AI 人格，且 Day 1..14 全天期压倒性优先抽中真实玩家盘面
+        string dataDir = Path.GetDirectoryName(ResolveDataPath("GameData.db"))!;
+        var realGhosts = PvpGhostPool.Load(dataDir);
+        Assert.True(realGhosts.Count >= 10000, $"升级后的镜像池应 >= 10,000 条，实际 {realGhosts.Count}");
+        var rng = new Random(20261123);
+        int realCommHits = 0;
+        int totalSamples = 0;
+        for (int day = 1; day <= 14; day++)
+        {
+            for (int k = 0; k < 20; k++)
+            {
+                var opp = realGhosts.PickOpponent(day, playerWins: day / 2, playerLosses: 1, rng, Repo.Value);
+                totalSamples++;
+                Assert.NotEqual("CluelessNewbie", opp.Persona);
+                Assert.NotEqual("GreedyBust", opp.Persona);
+                Assert.NotEqual("MessyHybrid", opp.Persona);
+                Assert.NotEqual("Casual", opp.Persona);
+                if (opp.IsRealCommunityGhost) realCommHits++;
+            }
+        }
+        Assert.True(
+            realCommHits >= totalSamples * 0.95,
+            $"Day 1..14 全天期真实玩家盘面命中率应 >= 95%，实际 {realCommHits}/{totalSamples}");
+    }
+
     private static RunState.CardEntry InjectStepIntoEncounter(RunState run, string encounterId, string stepTemplateId)
     {
         var poolTpl = Pool.Value.Get(stepTemplateId);

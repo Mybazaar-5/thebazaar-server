@@ -1875,7 +1875,7 @@ public sealed class V11CompassAndServerParityTests
             TargetSockets = new List<EContainerSocketId> { EContainerSocketId.Socket_6 },
         });
         int hpWithAura = run.PlayerAttributes[EPlayerAttributeType.HealthMax];
-        Assert.Equal(250 + 1000, hpWithAura);
+        Assert.Equal(300 + 1000, hpWithAura);
 
         // 加上升级衍生第 6 张手牌的技能，设定当前等级=13，升至 14 级 (+800 MaxHP) 同时手牌增至 6 张导致 -1000 光环关闭 => 净变化正好 -200
         var spTpl = ov.Repo.GetCard(synthLvlSpawnId)!;

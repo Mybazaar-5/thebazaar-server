@@ -87,11 +87,23 @@ public sealed class PvpGhostPool
         public int UnlockedSlotsMask { get; init; } = 120;
         public string PowerBucket { get; init; } = "Normal";
         public double EstimatedWinRate { get; init; } = 0.5;
+        public string Source { get; init; } = "";
+        public string Persona { get; init; } = "";
+        public string Archetype { get; init; } = "";
         public bool IsPlayerGhost { get; init; }
         public bool IsCustomRule { get; init; }
         public string PoolPartition { get; init; } = StandardPartition;
         public List<GhostItem> Items { get; init; } = new();
         public List<GhostSkill> Skills { get; init; } = new();
+
+        /// <summary>是否来自真实玩家社区/天梯数据源（巴扎罗盘 / 巴扎++ 十胜库 / BazaarHub 实盘）。</summary>
+        [JsonIgnore]
+        public bool IsRealCommunityGhost =>
+            !IsPlayerGhost &&
+            (Source.StartsWith("real_", StringComparison.OrdinalIgnoreCase)
+             || Source.StartsWith("bazaarplusplus", StringComparison.OrdinalIgnoreCase)
+             || Source.StartsWith("compass", StringComparison.OrdinalIgnoreCase)
+             || Source.StartsWith("bazaarhub", StringComparison.OrdinalIgnoreCase));
     }
 
     private sealed class StoredGhostBoardPayload
@@ -111,6 +123,7 @@ public sealed class PvpGhostPool
     {
         public required GhostBoard[] All { get; init; }
         public required GhostBoard[] StaticPreferred { get; init; }
+        public required GhostBoard[] RealCommunityPreferred { get; init; }
         public required GhostBoard[] PlayerGhosts { get; init; }
         public required GhostBoard[] HighPowerBoards { get; init; }
     }
@@ -236,14 +249,30 @@ public sealed class PvpGhostPool
     }
 
     /// <summary>
-    /// 静态池加载期强力卫生过滤：剔除 Day 1 超血(&gt;550)/Lv3+、不支持英雄、异常同卡>=3件以及 Day 4/5+ 残缺未满编盘面，
-    /// 彻底杜绝异常高阶脏样本与残缺样本常驻内存。
+    /// 静态池加载期强力卫生过滤：剔除 Day 1 超血(&gt;550)/Lv3+、不支持英雄、异常同卡>=3件、
+    /// 故意演菜/乱搭的 AI 人格（CluelessNewbie / GreedyBust / MessyHybrid）、Day 4+ 低级垃圾拼盘与残缺盘面。
     /// </summary>
     private static bool IsCleanStaticGhostForLoad(GhostBoard ghost)
     {
         if (!IsSaneGhostForDay(ghost, ghost.Day)) return false;
         if (!IsSupportedClientHero(ghost.Hero)) return false;
         if (HasAbnormalDuplicateOrInvalidItems(ghost, repo: null)) return false;
+
+        // 硬过滤故意演菜/胡乱混搭的合成 AI 人格，避免污染实战对手体验
+        if (!string.IsNullOrEmpty(ghost.Persona) && IsJunkSyntheticPersona(ghost.Persona, ghost.Day))
+            return false;
+
+        bool isSyntheticAi = string.Equals(ghost.Source, "synthetic_selfplay", StringComparison.OrdinalIgnoreCase);
+        if (isSyntheticAi)
+        {
+            if (ghost.Day >= 3 && ghost.Level < ghost.Day)
+                return false;
+            if (ghost.Day >= 4 && ghost.Skills.Count == 0)
+                return false;
+            // 剔除 Day 5+ 无核塞满 8+ 件全 1 格小垃圾的 AI 杂烩盘面
+            if (ghost.Day >= 5 && ghost.Items.Count >= 8 && ghost.Items.All(it => Math.Clamp(it.Width, 1, 3) == 1))
+                return false;
+        }
 
         int totalWidth = GetTotalSlotWidth(ghost, repo: null);
         if (ghost.Day <= 1)
@@ -255,6 +284,17 @@ public sealed class PvpGhostPool
         if (ghost.Day == 4)
             return totalWidth >= 6;
         return totalWidth >= 8;
+    }
+
+    private static bool IsJunkSyntheticPersona(string persona, int day)
+    {
+        if (string.Equals(persona, "CluelessNewbie", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(persona, "GreedyBust", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(persona, "MessyHybrid", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        return day >= 4 && string.Equals(persona, "Casual", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>从 SQLite pvp_ghosts 表加载已沉淀的真人玩家镜像并热加入对应分区-天数分桶。</summary>
@@ -558,7 +598,17 @@ public sealed class PvpGhostPool
         Random rng,
         GameDataRepository? repo)
     {
-        var staticSource = bucket.StaticPreferred.Length > 0 ? bucket.StaticPreferred : bucket.All;
+        // 真实社区/天梯盘面（巴扎++ 十胜库 / 巴扎罗盘实测盘）享有 90% 压倒性优先权，彻底告别胡扯 AI
+        GhostBoard[] staticSource;
+        if (bucket.RealCommunityPreferred.Length > 0
+            && (bucket.RealCommunityPreferred.Length >= 30 || rng.NextDouble() < 0.90))
+        {
+            staticSource = bucket.RealCommunityPreferred;
+        }
+        else
+        {
+            staticSource = bucket.StaticPreferred.Length > 0 ? bucket.StaticPreferred : bucket.All;
+        }
         if (staticSource.Length == 0) return null;
 
         string[] preferredBuckets = playerLosses >= playerWins + 2
@@ -718,29 +768,30 @@ public sealed class PvpGhostPool
         var midStatic = staticPool.Where(IsMidBand).ToList();
         var midPlayers = playerGhosts.Where(IsMidBand).ToList();
 
+        const double liveHumanPreference = 0.65;
         double roll = rng.NextDouble();
         if (roll < 0.03 && ultraTail.Count > 0)
             return ultraTail[rng.Next(ultraTail.Count)];
 
         if (roll < 0.05 && (midStatic.Count > 0 || midPlayers.Count > 0))
         {
-            if (midPlayers.Count > 0 && (midStatic.Count == 0 || rng.NextDouble() < 0.35))
+            if (midPlayers.Count > 0 && (midStatic.Count == 0 || rng.NextDouble() < liveHumanPreference))
                 return midPlayers[rng.Next(midPlayers.Count)];
             if (midStatic.Count > 0)
                 return midStatic[rng.Next(midStatic.Count)];
         }
 
-        if (normalPlayers.Count > 0 && (normalStatic.Count == 0 || rng.NextDouble() < 0.35))
+        if (normalPlayers.Count > 0 && (normalStatic.Count == 0 || rng.NextDouble() < liveHumanPreference))
             return normalPlayers[rng.Next(normalPlayers.Count)];
         if (normalStatic.Count > 0)
             return normalStatic[rng.Next(normalStatic.Count)];
 
-        if (midPlayers.Count > 0 && (midStatic.Count == 0 || rng.NextDouble() < 0.35))
+        if (midPlayers.Count > 0 && (midStatic.Count == 0 || rng.NextDouble() < liveHumanPreference))
             return midPlayers[rng.Next(midPlayers.Count)];
         if (midStatic.Count > 0)
             return midStatic[rng.Next(midStatic.Count)];
 
-        if (playerGhosts.Count > 0 && (staticPool.Count == 0 || rng.NextDouble() < 0.35))
+        if (playerGhosts.Count > 0 && (staticPool.Count == 0 || rng.NextDouble() < liveHumanPreference))
             return playerGhosts[rng.Next(playerGhosts.Count)];
         return staticPool[rng.Next(staticPool.Count)];
     }
@@ -793,14 +844,22 @@ public sealed class PvpGhostPool
             var allArr = list.ToArray();
             var playerList = new List<GhostBoard>();
             var full10List = new List<GhostBoard>();
+            var realCommAll = new List<GhostBoard>();
+            var realCommFull10 = new List<GhostBoard>();
             var highPower = new List<GhostBoard>();
 
             for (int i = 0; i < allArr.Length; i++)
             {
                 var b = allArr[i];
                 if (b.IsPlayerGhost) playerList.Add(b);
-                if (key.Day >= 4 && GetTotalSlotWidth(b, null) >= 10)
+                bool isFull10 = key.Day >= 4 && GetTotalSlotWidth(b, null) >= 10;
+                if (isFull10)
                     full10List.Add(b);
+                if (b.IsRealCommunityGhost)
+                {
+                    realCommAll.Add(b);
+                    if (isFull10) realCommFull10.Add(b);
+                }
                 if (string.Equals(b.PowerBucket, "Strong", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(b.PowerBucket, "MetaBoss", StringComparison.OrdinalIgnoreCase))
                 {
@@ -812,6 +871,9 @@ public sealed class PvpGhostPool
             {
                 All = allArr,
                 StaticPreferred = full10List.Count > 0 ? full10List.ToArray() : allArr,
+                RealCommunityPreferred = realCommFull10.Count >= 16
+                    ? realCommFull10.ToArray()
+                    : realCommAll.ToArray(),
                 PlayerGhosts = playerList.ToArray(),
                 HighPowerBoards = highPower.ToArray(),
             };
@@ -987,6 +1049,9 @@ public sealed class PvpGhostPool
                 UnlockedSlotsMask = GetInt(r, "unlockedSlotsMask", DefaultUnlockedMaskForDay(day)),
                 PowerBucket = GetStr(r, "powerBucket") ?? "Normal",
                 EstimatedWinRate = r.TryGetProperty("estimatedWinRate", out var ew) && ew.TryGetDouble(out double d) ? d : 0.5,
+                Source = GetStr(r, "source") ?? "",
+                Persona = GetStr(r, "persona") ?? "",
+                Archetype = GetStr(r, "archetype") ?? "",
                 IsPlayerGhost = false,
                 IsCustomRule = false,
                 PoolPartition = StandardPartition,

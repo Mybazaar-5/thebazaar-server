@@ -35,11 +35,11 @@ public sealed class GameModeConfig
     /// <summary>PvE 野怪战败声望扣减量（无损透传自 GameModeData.Prestige.PrestigeLossFromMonsters）。</summary>
     public int PrestigeLossFromMonsters { get; init; }
 
-    /// <summary>开局初始资源默认值（可由配置或测试覆写；官方默认起始经验为 0）。</summary>
+    /// <summary>开局初始资源默认值（可由配置或测试覆写；官方默认起始经验 3、起始生命 300）。</summary>
     public int StartingGold { get; init; } = 15;
     public int StartingIncome { get; init; } = 5;
-    public int StartingExperience { get; init; } = 0;
-    public int StartingHealth { get; init; } = 250;
+    public int StartingExperience { get; init; } = 3;
+    public int StartingHealth { get; init; } = 300;
 
     public string FatesTemplateId { get; init; } = "aef5e7d8-ea0b-4e7e-8f3d-6e7ba492fa10";
     public int FatesSpawnAtOrBelowPrestige { get; init; }
@@ -103,7 +103,7 @@ public sealed class GameModeConfig
             StartingGold = 15,
             StartingIncome = 5,
             StartingExperience = Math.Max(0, source.StartingExperience),
-            StartingHealth = 250,
+            StartingHealth = 300,
 
             FatesTemplateId = !string.IsNullOrWhiteSpace(source.Fates?.TemplateId)
                 ? source.Fates.TemplateId!

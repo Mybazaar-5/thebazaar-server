@@ -90,6 +90,9 @@ public static class RunSnapshotSerializer
         public Dictionary<string, double> PlayerAuraMult { get; set; } = new();
         public List<string> VisitedSingleSpawnEncounterIds { get; set; } = new();
         public List<string> VisitedDayEncounterIds { get; set; } = new();
+        public List<string> OfferedDayEncounterIds { get; set; } = new();
+        public uint OfferedDayEncounterDay { get; set; }
+        public uint OfferedDayEncounterLastHour { get; set; }
         public string? ActiveReplacementSetId { get; set; }
         public string? ActiveExpeditionId { get; set; }
         public string? ActiveExpeditionVariant { get; set; }
@@ -334,6 +337,11 @@ public static class RunSnapshotSerializer
 
         foreach (string visitedDay in run.VisitedDayEncounterIds)
             dto.VisitedDayEncounterIds.Add(visitedDay);
+
+        foreach (string offeredDay in run.OfferedDayEncounterIds)
+            dto.OfferedDayEncounterIds.Add(offeredDay);
+        dto.OfferedDayEncounterDay = run.OfferedDayEncounterDay;
+        dto.OfferedDayEncounterLastHour = run.OfferedDayEncounterLastHour;
 
         dto.ExclusionSetInitialized = run.ExclusionSetInitialized;
         foreach (string excludedId in run.ExclusionSet)
@@ -635,6 +643,17 @@ public static class RunSnapshotSerializer
                     run.VisitedDayEncounterIds.Add(visitedDay);
             }
         }
+
+        if (dto.OfferedDayEncounterIds != null)
+        {
+            foreach (string offeredDay in dto.OfferedDayEncounterIds)
+            {
+                if (!string.IsNullOrWhiteSpace(offeredDay))
+                    run.OfferedDayEncounterIds.Add(offeredDay);
+            }
+        }
+        run.OfferedDayEncounterDay = dto.OfferedDayEncounterDay;
+        run.OfferedDayEncounterLastHour = dto.OfferedDayEncounterLastHour;
 
         if (dto.ExclusionSet != null)
         {

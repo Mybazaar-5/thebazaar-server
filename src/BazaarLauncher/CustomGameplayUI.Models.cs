@@ -97,9 +97,9 @@ internal sealed partial class CustomGameplayUI
         [JsonProperty("promptTendencyBeforeRun")] public bool PromptTendencyBeforeRun { get; set; } = true;
         [JsonProperty("startingGold")] public int StartingGold { get; set; } = 15;
         [JsonProperty("startingIncome")] public int StartingIncome { get; set; } = 5;
-        [JsonProperty("startingExperience")] public int StartingExperience { get; set; } = 0;
+        [JsonProperty("startingExperience")] public int StartingExperience { get; set; } = 3;
         [JsonProperty("startingPrestige")] public int StartingPrestige { get; set; } = 20;
-        [JsonProperty("startingHealth")] public int StartingHealth { get; set; } = 250;
+        [JsonProperty("startingHealth")] public int StartingHealth { get; set; } = 300;
         [JsonProperty("startingItems")] public List<StartingItemRule> StartingItems { get; set; } = new();
         [JsonProperty("startingSkills")] public List<StartingSkillRule> StartingSkills { get; set; } = new();
         [JsonProperty("monsterLootChooseOne")] public bool MonsterLootChooseOne { get; set; } = true;
@@ -160,9 +160,9 @@ internal sealed partial class CustomGameplayUI
             PromptTendencyBeforeRun = promptBefore;
             StartingGold = 15;
             StartingIncome = 5;
-            StartingExperience = 0;
+            StartingExperience = 3;
             StartingPrestige = 20;
-            StartingHealth = 250;
+            StartingHealth = 300;
             StartingItems = new List<StartingItemRule>();
             StartingSkills = new List<StartingSkillRule>();
             MonsterLootChooseOne = true;
@@ -203,8 +203,8 @@ internal sealed partial class CustomGameplayUI
             {
                 return true;
             }
-            if (StartingGold != 15 || StartingIncome != 5 || StartingExperience != 0
-                || StartingPrestige != 20 || StartingHealth != 250
+            if (StartingGold != 15 || StartingIncome != 5 || StartingExperience != 3
+                || StartingPrestige != 20 || StartingHealth != 300
                 || Math.Abs(ShopHighTierBonusPct) > 1e-6
                 || Math.Abs(ShopPriceMultiplier - 1.0) > 1e-6
                 || MonsterLootBonusChoices != 0
@@ -344,7 +344,7 @@ internal sealed partial class CustomGameplayUI
         public string IncomeText = "5";
         public string ExperienceText = "3";
         public string PrestigeText = "20";
-        public string HealthText = "250";
+        public string HealthText = "300";
 
         public string ItemSearch = string.Empty;
         public bool ItemHeroFilterOnly = true;
@@ -433,8 +433,8 @@ internal sealed partial class CustomGameplayUI
             tags.Add($"流派倾向×{archCount}");
         }
 
-        if (rules.StartingGold != 15 || rules.StartingIncome != 5 || rules.StartingExperience != 0
-            || rules.StartingPrestige != 20 || rules.StartingHealth != 250)
+        if (rules.StartingGold != 15 || rules.StartingIncome != 5 || rules.StartingExperience != 3
+            || rules.StartingPrestige != 20 || rules.StartingHealth != 300)
         {
             tags.Add("开局预设");
         }

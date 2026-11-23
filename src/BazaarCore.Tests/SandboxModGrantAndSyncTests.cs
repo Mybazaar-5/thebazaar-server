@@ -499,6 +499,6 @@ public sealed class SandboxModGrantAndSyncTests
         using var r2Doc = JsonDocument.Parse(await r2.Content.ReadAsStringAsync());
         Assert.Equal("PureOfficial", r2Doc.RootElement.GetProperty("presetId").GetString());
         Assert.Equal("EndlessTower", r2Doc.RootElement.GetProperty("specialModeId").GetString());
-        Assert.Equal(0, r2Doc.RootElement.GetProperty("rules").GetProperty("startingExperience").GetInt32());
+        Assert.Equal(3, r2Doc.RootElement.GetProperty("rules").GetProperty("startingExperience").GetInt32());
     }
 }

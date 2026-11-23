@@ -448,9 +448,9 @@ public sealed class V4RunOrchestratorIntegrationTests
             .ToList();
         Assert.Equal(2, remainingShelfIds.Count);
 
-        // V9-B2：默认官方起始经验为 0（StartingExperience=0）
+        // 默认官方起始经验为 3（StartingExperience=3）
         Assert.Equal(ov.Mode.StartingExperience, run.PlayerAttributes[EPlayerAttributeType.Experience]);
-        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
         // 买入经验道具，留在同一商店中
         var buyOut = engine.Handle(new SelectItemCommand
@@ -525,10 +525,10 @@ public sealed class V4RunOrchestratorIntegrationTests
         engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(shopOpt.InstanceId) });
         Assert.Equal(1u, run.Hour);
 
-        // V9-B2：默认开局起始经验为 0（StartingExperience=0），扣减当前经验后再补足至差 1 小时升级
+        // 默认开局起始经验为 3（StartingExperience=3），扣减当前经验后再补足至差 1 小时升级
         int currentXp = run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0);
         Assert.Equal(ov.Mode.StartingExperience, currentXp);
-        Assert.Equal(0, currentXp);
+        Assert.Equal(3, currentXp);
         int almostLvlUp = Math.Max(0, ov.Mode.ExperiencePerLevel - currentXp - Math.Max(1, ov.Mode.ExperiencePerHour));
         engine.Handle(new CheatCommand { Args = new List<string> { "exp", almostLvlUp.ToString() } });
 

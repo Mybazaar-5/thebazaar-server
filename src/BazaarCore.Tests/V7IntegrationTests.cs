@@ -368,7 +368,7 @@ public sealed class V7IntegrationTests
         return entry;
     }
 
-    // ── 1. 默认开局属性 (15 Gold / 5 Income / 0 XP / 20 Prestige / 250 HP) ──
+    // ── 1. 默认开局属性 (15 Gold / 5 Income / 3 XP / 20 Prestige / 300 HP) ──
 
     [Fact]
     public void V7_01_StartRunAndCheatRestart_ApplyOfficialDefaultStats_WithoutFalseLevelUp()
@@ -376,18 +376,18 @@ public sealed class V7IntegrationTests
         var fx = RealFixture.Value;
         Assert.Equal(15, fx.Mode.StartingGold);
         Assert.Equal(5, fx.Mode.StartingIncome);
-        Assert.Equal(0, fx.Mode.StartingExperience);
+        Assert.Equal(3, fx.Mode.StartingExperience);
         Assert.Equal(20, fx.Mode.PrestigeInitial);
-        Assert.Equal(250, fx.Mode.StartingHealth);
+        Assert.Equal(300, fx.Mode.StartingHealth);
 
         var (run, engine) = CreateStartedEngine(fx.Pool, fx.Monsters, fx.LevelUps, fx.Mode, fx.Repo, fx.Ghosts);
 
         Assert.Equal(15, run.PlayerAttributes[EPlayerAttributeType.Gold]);
         Assert.Equal(5, run.PlayerAttributes[EPlayerAttributeType.Income]);
-        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Experience]);
         Assert.Equal(20, run.PlayerAttributes[EPlayerAttributeType.Prestige]);
-        Assert.Equal(250, run.PlayerAttributes[EPlayerAttributeType.HealthMax]);
-        Assert.Equal(250, run.PlayerAttributes[EPlayerAttributeType.Health]);
+        Assert.Equal(300, run.PlayerAttributes[EPlayerAttributeType.HealthMax]);
+        Assert.Equal(300, run.PlayerAttributes[EPlayerAttributeType.Health]);
         Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
         Assert.Equal(0, run.PendingLevelUps);
         Assert.False(run.PendingLevelUp);
@@ -406,9 +406,9 @@ public sealed class V7IntegrationTests
 
         Assert.Equal(15, run.PlayerAttributes[EPlayerAttributeType.Gold]);
         Assert.Equal(5, run.PlayerAttributes[EPlayerAttributeType.Income]);
-        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Experience]);
         Assert.Equal(20, run.PlayerAttributes[EPlayerAttributeType.Prestige]);
-        Assert.Equal(250, run.PlayerAttributes[EPlayerAttributeType.HealthMax]);
+        Assert.Equal(300, run.PlayerAttributes[EPlayerAttributeType.HealthMax]);
         Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
         Assert.Equal(0, run.PendingLevelUps);
         Assert.Empty(run.VisitedDayEncounterIds);
@@ -530,11 +530,11 @@ public sealed class V7IntegrationTests
         var sellOut = engine.Handle(new SellCardCommand { InstanceId = new InstanceId(xpShelf.InstanceId) });
         Assert.Null(sellOut.Error);
 
-        // 遭遇内禁止打断：必须留在 Encounter，累计 PendingLevelUps=2，货架保留
+        // 遭遇内禁止打断：必须留在 Encounter，累计 PendingLevelUps=2，货架保留（初始 3 XP + 16 XP = 19 -> 连升 Lv2/Lv3 余 3 XP）
         Assert.Equal(ERunState.Encounter, run.State);
         Assert.Equal(shopId, run.CurrentEncounterId);
         Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Experience]);
         Assert.Equal(2, run.PendingLevelUps);
         Assert.Single(run.SelectionSet);
 

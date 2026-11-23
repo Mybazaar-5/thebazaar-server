@@ -862,7 +862,7 @@ internal sealed partial class CustomGameplayUI
         var btnStd = _ui.CreateButton(
             "BtnStd",
             row.transform,
-            "恢复标准 15/5/0/20/250",
+            "恢复标准 15/5/3/20/300",
             13.5f,
             NativeUguiFactory.ColBtnNormal,
             NativeUguiFactory.ColBtnHover,
@@ -1281,7 +1281,7 @@ internal sealed partial class CustomGameplayUI
         var sTitle = _ui.CreateText("Title", sHeader.transform, "开局数值预设", 15.5f, NativeUguiFactory.ColGold, FontStyles.Bold);
         NativeUguiFactory.SetLayout(sTitle.gameObject, flexW: 1f, minH: 26f);
 
-        var btnResetStats = _ui.CreateButton("BtnResetStats", sHeader.transform, "恢复标准 15/5/0/20/250", 13f,
+        var btnResetStats = _ui.CreateButton("BtnResetStats", sHeader.transform, "恢复标准 15/5/3/20/300", 13f,
             NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
             {
                 var r = getRules();
@@ -1290,9 +1290,9 @@ internal sealed partial class CustomGameplayUI
                 {
                     r.StartingGold = 15;
                     r.StartingIncome = 5;
-                    r.StartingExperience = 0;
+                    r.StartingExperience = 3;
                     r.StartingPrestige = 20;
-                    r.StartingHealth = 250;
+                    r.StartingHealth = 300;
                     // 同步清零预设遗留的隐藏倍率与额外野怪自选次数，避免从爽玩/肉鸽切回标准数值后仍隐形锁死 2 选
                     r.MonsterLootBonusChoices = 0;
                     r.MonsterLootTierBonus = 0;

@@ -27,8 +27,8 @@ public sealed class GameModeData
     public int HoursInADay { get; set; } = 6;
     public int ExperiencePerLevel { get; set; } = 8;
     public int ExperiencePerHour { get; set; } = 1;
-    /// <summary>自建服兼容扩展字段（官方 DB 无该键，恒默认 0，供测试与自定义规则覆写）。</summary>
-    public int StartingExperience { get; set; } = 0;
+    /// <summary>自建服兼容扩展字段（官方 DB 无该键，默认 3 经验以匹配官方 Patch 20.x Day 1 升级节奏，供测试与自定义规则覆写）。</summary>
+    public int StartingExperience { get; set; } = 3;
     public int MaxLevel { get; set; } = 999;
     public int BurnDecrementByAsPercentage { get; set; } = 3;
     public List<string> ExclusionSet { get; set; } = new();

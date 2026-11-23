@@ -610,9 +610,33 @@ public sealed class ShopEngine
         uint hour = _run.Hour;
         _chances.CurrentDay = day;
 
-        HashSet<string>? dailyVisited = visitedTodayIds is { Count: > 0 }
-            ? new HashSet<string>(visitedTodayIds, StringComparer.OrdinalIgnoreCase)
-            : null;
+        // 当天或小时回退/重置时（例如跨天、restart 或单测反复重抽同一小时），自动清空当日已展示去重集
+        if (hour != 3 && hour != (uint)_repo.GameMode.HoursInADay)
+        {
+            if (_run.OfferedDayEncounterDay != _run.Day || _run.Hour <= _run.OfferedDayEncounterLastHour)
+            {
+                _run.ClearOfferedDayEncounters();
+            }
+        }
+
+        HashSet<string>? dailyVisited = null;
+        if (visitedTodayIds is { Count: > 0 } || _run.OfferedDayEncounterIds.Count > 0)
+        {
+            dailyVisited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (visitedTodayIds != null)
+            {
+                foreach (string id in visitedTodayIds)
+                {
+                    if (!string.IsNullOrWhiteSpace(id))
+                        dailyVisited.Add(id);
+                }
+            }
+            foreach (string id in _run.OfferedDayEncounterIds)
+            {
+                if (!string.IsNullOrWhiteSpace(id))
+                    dailyVisited.Add(id);
+            }
+        }
 
         var effectiveRules = rules ?? ActiveRules;
         HashSet<string>? bannedIds = effectiveRules?.BannedEncounterIds is { Count: > 0 }
@@ -960,14 +984,16 @@ public sealed class ShopEngine
             CardPool.CardTemplate? m1 = null;
             if (leftMerchants.Count > 0)
             {
-                m1 = RollEmpiricalSlotEncounterWithDailyDedup(leftMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
+                m1 = RollEmpiricalSlotEncounterWithDailyDedup(leftMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
+                  ?? RollEmpiricalSlotEncounterWithDailyDedup(leftMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
                   ?? RollEmpiricalSlotEncounterWithDailyDedup(leftMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
                   ?? RollEmpiricalSlotEncounterWithDailyDedup(leftMerchants, maxMerchantDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng);
             }
             else if (!hasMultipliers)
             {
                 var allMerchants = allHourlyEvents.Where(e => IsMerchantEncounter(e)).ToList();
-                m1 = RollEmpiricalSlotEncounterWithDailyDedup(allMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
+                m1 = RollEmpiricalSlotEncounterWithDailyDedup(allMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: false, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
+                  ?? RollEmpiricalSlotEncounterWithDailyDedup(allMerchants, maxMerchantDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng)
                   ?? RollEmpiricalSlotEncounterWithDailyDedup(allMerchants, maxMerchantDayTier, pickedIds, visitedSingleSpawn: null, dailyVisited, allowExceedDayCap: true, allowDailyFallback: true, weightMultiplier: null, bannedIds, tierExemptIds, actualDay, isMerchantPool: true, streamRng);
             }
 
@@ -1171,6 +1197,23 @@ public sealed class ShopEngine
                     _run.Cards[expEntry.InstanceId] = expEntry;
                     _run.SelectionSet.Add(expEntry.InstanceId);
                     events.Add(new GameSimEventCardDealt(expEntry.InstanceId, expEntry.TemplateId.ToString(), ECardType.EventEncounter));
+                }
+            }
+
+            // 官方「同日刷出即锁定（Once-Per-Day）」：常规白昼发出的所有遭遇模板 ID 立即记入 OfferedDayEncounterIds，
+            // 哪怕玩家跳过未点击，当天后续小时也不会自然重复刷出同一商人/奇遇/右槽套系。
+            _run.OfferedDayEncounterDay = _run.Day;
+            _run.OfferedDayEncounterLastHour = _run.Hour;
+            foreach (string selId in _run.SelectionSet)
+            {
+                if (_run.Cards.TryGetValue(selId, out var offeredCard) &&
+                    offeredCard.Type is ECardType.EventEncounter or ECardType.PedestalEncounter)
+                {
+                    string offeredTplId = string.IsNullOrWhiteSpace(offeredCard.CustomCardId)
+                        ? offeredCard.TemplateId.ToString()
+                        : offeredCard.CustomCardId!;
+                    if (!string.IsNullOrWhiteSpace(offeredTplId))
+                        _run.OfferedDayEncounterIds.Add(offeredTplId);
                 }
             }
         }
@@ -1730,6 +1773,15 @@ public sealed class ShopEngine
                     unvisited, maxDayTier, pickedIds, visitedSingleSpawn, allowExceedDayCap: false,
                     weightMultiplier, bannedIds, tierExemptIds, effectiveDay, isMerchantPool, pickedKeys, rng);
                 if (pick != null) return pick;
+
+                // 先在未出现池内放宽品阶上限，绝不抢先回退到当天已刷出过的遭遇
+                if (allowExceedDayCap)
+                {
+                    pick = RollEmpiricalSlotEncounter(
+                        unvisited, maxDayTier, pickedIds, visitedSingleSpawn, allowExceedDayCap: true,
+                        weightMultiplier, bannedIds, tierExemptIds, effectiveDay, isMerchantPool, pickedKeys, rng);
+                    if (pick != null) return pick;
+                }
             }
             if (!allowDailyFallback) return null;
         }

@@ -133,18 +133,20 @@ public sealed class V9ScheduleXpPvpTests
         return entry;
     }
 
-    // ── 1. 开局 StartingExperience=0、残缺 JSON 防御及默认规则保留 ──
+    // ── 1. 开局 StartingExperience=3 / StartingHealth=300、残缺 JSON 防御及默认规则保留 ──
 
     [Fact]
     public void Test01_StartingExperienceZero_CustomOverridePreserved_AndDbAuthorityCheck()
     {
         var fx = RealFixture.Value;
-        Assert.Equal(0, fx.Mode.StartingExperience);
-        Assert.Equal(0, new GameModeConfig().StartingExperience);
-        Assert.Equal(0, new GameModeData().StartingExperience);
+        Assert.Equal(3, fx.Mode.StartingExperience);
+        Assert.Equal(3, new GameModeConfig().StartingExperience);
+        Assert.Equal(3, new GameModeData().StartingExperience);
+        Assert.Equal(300, fx.Mode.StartingHealth);
 
         var (stdRun, _) = CreateStartedEngine(fx.Pool, fx.Monsters, fx.LevelUps, fx.Mode, fx.Repo, fx.Ghosts);
-        Assert.Equal(0, stdRun.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(3, stdRun.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(300, stdRun.PlayerAttributes[EPlayerAttributeType.HealthMax]);
         Assert.Equal(1, stdRun.PlayerAttributes[EPlayerAttributeType.Level]);
         Assert.False(stdRun.GainedHourXpThisHour);
         Assert.False(stdRun.IsCustomRuleRun);
@@ -224,54 +226,70 @@ public sealed class V9ScheduleXpPvpTests
             CoreCard = weaponCore,
         };
 
-        // P0-1 官方单份经验规则（精确对齐第 203 行官方节奏：0 -> H1(+1)=1 -> H2(+1)=2 -> H3野怪(+3)=5 -> H4(+1)=6 -> H5(+1)=7 -> H6 PvP(+3) -> Lv2 2/8 XP）
-        // Hour 1：进入 Pol（ExperienceAwardUponSelection = 1）并直接离开 → 仅 1 XP（绝不双算为 2）
+        // P0-1 官方单份经验规则（Patch 20.6 初始 3 XP / 300 HP：3 -> H1(+1)=4 -> H2(+1)=5 -> H3野怪(+3)=8 升 Lv2 0/8 400HP -> H4(+1)=1 -> H5(+1)=2 -> H6 PvP 跨天(+1) -> Lv2 3/8 XP）
+        // Hour 1：进入 Pol（ExperienceAwardUponSelection = 1）并直接离开 → 仅 +1 XP（3+1=4，绝不双算为 5）
         var pol1 = InjectChoiceEncounter(run, ov.Pool, PolShopId);
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol1.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
         Assert.Equal(2u, run.Hour);
         Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(4, run.PlayerAttributes[EPlayerAttributeType.Experience]);
         Assert.False(run.GainedHourXpThisHour);
         Assert.False(run.GainedAdvanceHourXpThisHour);
 
-        // Hour 2：进入 0 XP 免费事件并直接离开 → 由 AdvanceHourOrDay 兜底发放 1 点小时推进经验 → 累计 2 XP
+        // Hour 2：进入 0 XP 免费事件并直接离开 → 由 AdvanceHourOrDay 兜底发放 1 点小时推进经验 → 累计 5 XP
         var zeroEv = InjectChoiceEncounter(run, ov.Pool, "11111111-9001-4001-8001-111111111101");
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(zeroEv.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
         Assert.Equal(3u, run.Hour);
         Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(5, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
-        // Hour 3：选打真实 Day 1 Lv1 野怪 Fanged Inglet（RewardCombatXp = 3）→ Loot 退出推进至 Hour 4（战斗小时不再额外叠 +1）→ 累计 5 XP
+        // Hour 3：选打真实 Day 1 Lv1 野怪 Fanged Inglet（RewardCombatXp = 3）→ 5+3=8 触发 Lv2 升级（300 -> 400 HP），完成后推进至 Hour 4（战斗小时不再额外叠 +1）
         var mobOpt = InjectChoiceEncounter(run, ov.Pool, FangedIngletCombatId, ECardType.CombatEncounter);
         var pveOut = engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(mobOpt.InstanceId) });
         Assert.Null(pveOut.Error);
         Assert.Equal(ERunState.Loot, run.State);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
+        while (run.State is ERunState.LevelUp or ERunState.Encounter)
+        {
+            if (run.State == ERunState.Encounter && run.SelectionRules.CanExit)
+                Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
+            else if (run.SelectionSet.Count > 0)
+            {
+                var pick = run.Cards[run.SelectionSet[0]];
+                bool isEnc = pick.Type is ECardType.EncounterStep or ECardType.EventEncounter
+                    or ECardType.PedestalEncounter or ECardType.CombatEncounter or ECardType.PvpEncounter;
+                INetCommand cmd = isEnc
+                    ? new SelectEncounterCommand { InstanceId = new InstanceId(pick.InstanceId) }
+                    : new SelectItemCommand { InstanceId = new InstanceId(pick.InstanceId) };
+                Assert.Null(engine.Handle(cmd).Error);
+            }
+            else break;
+        }
         Assert.Equal(4u, run.Hour);
-        Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(5, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
+        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
-        // Hour 4：进入 Pol (+1 XP) 并离开 → 累计 6 XP（仍为 Lv1）
+        // Hour 4：进入 Pol (+1 XP) 并离开 → Lv2 1/8 XP
         var pol4 = InjectChoiceEncounter(run, ov.Pool, PolShopId);
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol4.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
         Assert.Equal(5u, run.Hour);
         Assert.Equal(ERunState.Choice, run.State);
-        Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(6, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
+        Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
-        // Hour 5：进入 Pol (+1 XP) 并离开 → Hour 6 PvP 前稳持 Lv1 7/8 XP
+        // Hour 5：进入 Pol (+1 XP) 并离开 → Hour 6 PvP 前已稳居 Lv2（2/8 XP, 400+ HP，对齐 Patch 20.6 官服实机！）
         var pol5 = InjectChoiceEncounter(run, ov.Pool, PolShopId);
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol5.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
         Assert.Equal(6u, run.Hour);
         Assert.Equal(ERunState.Choice, run.State);
-        Assert.Equal(1, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(7, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
+        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
-        // V13.1 官方经验总账：Hour 6 PvP 战斗本身 0 XP，跨入 Day 2 Hour 1 发放 +1 小时经验 → 全天合计 7 + 1 = 8 XP 升至 Lv2（余 0/8 XP）！
+        // Hour 6 PvP 战斗本身 0 XP，跨入 Day 2 Hour 1 发放 +1 小时经验 → Lv2 3/8 XP
         var pvpCard = run.Cards[Assert.Single(run.SelectionSet)];
         Assert.Equal(ECardType.PvpEncounter, pvpCard.Type);
         var pvpOut = engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pvpCard.InstanceId) });
@@ -295,15 +313,15 @@ public sealed class V9ScheduleXpPvpTests
         Assert.Equal(2u, run.Day);
         Assert.Equal(1u, run.Hour);
         Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(0, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
-        // 2b. P0-1 / P0-16 单份经验与直效即退校验：Study (xp=2, 无 SpawnContext) 选中后直效即退回 Choice 且 Hour==2、XP==2；Aldric (xp=1) + Exploit (xp=1 同小时去重) = 1
+        // 2b. P0-1 / P0-16 单份经验与直效即退校验：Study (xp=2, 无 SpawnContext) 选中后直效即退回 Choice 且 Hour==2、XP==3+2=5；Aldric (xp=1) + Exploit (xp=1 同小时去重) = 3+1=4
         var (studyRun, studyEngine) = CreateStartedEngine(fx.Pool, fx.Monsters, fx.LevelUps, fx.Mode, fx.Repo, fx.Ghosts);
         var studyOpt = InjectChoiceEncounter(studyRun, fx.Pool, StudyDefaultEventId);
         Assert.Null(studyEngine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(studyOpt.InstanceId) }).Error);
         Assert.Equal(ERunState.Choice, studyRun.State);
         Assert.Equal(2u, studyRun.Hour);
-        Assert.Equal(2, studyRun.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(5, studyRun.PlayerAttributes[EPlayerAttributeType.Experience]);
 
         var (aldricRun, aldricEngine) = CreateStartedEngine(fx.Pool, fx.Monsters, fx.LevelUps, fx.Mode, fx.Repo, fx.Ghosts);
         var aldricOpt = InjectChoiceEncounter(aldricRun, fx.Pool, AldricEventId);
@@ -324,7 +342,7 @@ public sealed class V9ScheduleXpPvpTests
                 else
                     break;
             }
-            Assert.Equal(1, aldricRun.PlayerAttributes[EPlayerAttributeType.Experience]);
+            Assert.Equal(4, aldricRun.PlayerAttributes[EPlayerAttributeType.Experience]);
         }
 
         // 2c. 快照序列化往返保留 GainedHourXpThisHour

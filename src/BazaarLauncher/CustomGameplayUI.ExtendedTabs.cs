@@ -268,9 +268,9 @@ internal sealed partial class CustomGameplayUI
 
         rules.StartingGold = 15;
         rules.StartingIncome = 5;
-        rules.StartingExperience = 0;
+        rules.StartingExperience = 3;
         rules.StartingPrestige = 20;
-        rules.StartingHealth = 250;
+        rules.StartingHealth = 300;
         rules.MonsterLootChooseOne = true;
         rules.MonsterLootBonusChoices = 0;
         rules.MonsterLootTierBonus = 0;
