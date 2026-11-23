@@ -5,7 +5,7 @@
     <Nullable>disable</Nullable>
     <AssemblyName>BazaarLauncher</AssemblyName>
     <RootNamespace>BazaarLauncher</RootNamespace>
-    <Version>15.3.0</Version>
+    <Version>15.4.0</Version>
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
     <RestorePackages>false</RestorePackages>
     <NoWarn>$(NoWarn);CS0168;CS0219;MSB3277</NoWarn>

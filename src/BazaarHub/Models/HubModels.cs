@@ -149,7 +149,7 @@ public sealed class ServerProbeResult
 /// </summary>
 public static class LauncherConstants
 {
-    public const string HubVersion = "15.3.0";
+    public const string HubVersion = "15.4.0";
     public const string CloudTencentUrl = "http://127.0.0.1:8080";
     public const string LocalStandaloneUrl = "http://127.0.0.1:8080";
     public const string LauncherCfgRelativePath = @"BepInEx\config\local.thebazaar.bazaarlauncher.cfg";
