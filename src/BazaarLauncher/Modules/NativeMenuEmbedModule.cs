@@ -207,11 +207,11 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
             OnClick = () => OpenWorkspacePanelTab(CustomGameplayUI.UiTab.Performance),
         });
 
-        // 局内 ESC 菜单 3 大原生快捷按钮
+        // 局内 ESC 菜单 3 大紧凑快捷入口（收拢在鎏金框底部的单行三列暗金快捷栏内，绝不撑爆原版外框）
         RegisterEscapeMenuButton(new NativeMenuButtonDescriptor
         {
             Id = "esc.workshop",
-            Label = "自建工坊 & Mod 中心",
+            Label = "工坊 · Mod",
             Order = 10,
             OnClick = () => OpenWorkspacePanelTab(CustomGameplayUI.UiTab.Workshop),
         });
@@ -219,7 +219,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         RegisterEscapeMenuButton(new NativeMenuButtonDescriptor
         {
             Id = "esc.social",
-            Label = "多人社交与观战",
+            Label = "社交 · 观战",
             Order = 20,
             OnClick = () => OpenWorkspacePanelTab(CustomGameplayUI.UiTab.Social),
         });
@@ -227,7 +227,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         RegisterEscapeMenuButton(new NativeMenuButtonDescriptor
         {
             Id = "esc.perf",
-            Label = "性能监控与诊断",
+            Label = "性能 · 诊断",
             Order = 30,
             OnClick = () => OpenWorkspacePanelTab(CustomGameplayUI.UiTab.Performance),
         });
@@ -236,7 +236,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         RegisterOptionsSection(new NativeOptionsSectionDescriptor
         {
             Id = "opt.perf_modkit",
-            Title = "自建服与极致性能",
+            Title = "自建服与性能",
             Order = 10,
             OnOpen = () => OpenWorkspacePanelTab(CustomGameplayUI.UiTab.Performance),
         });
@@ -899,15 +899,25 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         return true;
     }
 
-    // ── 锚点三实现：局内 ESC 菜单（FightMenuDialog）原版按钮克隆注入 ──────────
+    // ── 锚点三实现：局内 ESC 菜单（FightMenuDialog）鎏金框内紧凑快捷栏注入 ──────
+
+    private sealed class FightMenuLayoutMemory : MonoBehaviour
+    {
+        public bool Captured;
+        public float OriginalSpacing;
+        public int OriginalPadTop;
+        public int OriginalPadBottom;
+        public float OriginalDialogHeight;
+        public float OriginalContainerHeight;
+    }
 
     private static void FightMenuDialogStartPostfix(Component __instance)
     {
         if (__instance == null || Instance == null) return;
         try
         {
-            // 仅允许在暂停菜单弹窗内部（fightMenuDialog）且存在 LayoutGroup 的按钮列表中安全追加，
-            // 绝不触碰右上角常驻齿轮（SettingButton），也绝不在无排版容器的固定坐标上原地克隆覆盖原生按钮。
+            // 仅允许在暂停菜单弹窗内部（fightMenuDialog）且存在 LayoutGroup 的按钮列表中安全挂载，
+            // 绝不触碰右上角常驻齿轮（SettingButton），也绝不把大按钮纵向堆叠撑破原版鎏金外框。
             GameObject dialogRoot = _fightMenuDialogRootField?.GetValue(__instance) as GameObject;
             object rawBtn = _fightOptionsBtnField?.GetValue(__instance);
             Button templateBtn = (rawBtn as Button)
@@ -916,35 +926,184 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
             if (!templateBtn.transform.IsChildOf(dialogRoot.transform)) return;
 
             Transform container = templateBtn.transform.parent;
-            if (container.GetComponent<LayoutGroup>() == null)
+            var vlg = container.GetComponent<VerticalLayoutGroup>();
+            if (vlg == null && container.GetComponent<LayoutGroup>() == null)
             {
                 return;
             }
 
-            var buttons = Instance.GetRegisteredEscapeMenuButtons();
-            foreach (var desc in buttons)
+            // 清理历史上旧版本可能残留的独立全高克隆按钮
+            for (int i = container.childCount - 1; i >= 0; i--)
             {
-                if (desc.IsVisible != null && !desc.IsVisible()) continue;
-
-                string goName = "BazaarEscBtn_" + desc.Id;
-                Transform existing = container.Find(goName);
-                if (existing != null) continue;
-
-                GameObject cloned = UnityEngine.Object.Instantiate(templateBtn.gameObject, container, worldPositionStays: false);
-                cloned.name = goName;
-                cloned.SetActive(true);
-                Instance.TrackClonedButton(cloned);
-
-                // 移除克隆体上的 ButtonCustom，避免其 Start() 额外绑定导致重复或误触原生逻辑
-                StripNativeButtonCustomComponents(cloned);
-
-                // 剥离原版持久化监听并绑定新回调；关闭弹窗必须调用原生 HideDialogs()，绝不能停用 __instance.gameObject（否则会注销 ESC 监听！）
-                Button btn = cloned.GetComponent<Button>();
-                if (btn != null)
+                Transform ch = container.GetChild(i);
+                if (ch != null && ch.name.StartsWith("BazaarEscBtn_", StringComparison.Ordinal))
                 {
-                    btn.onClick = new Button.ButtonClickedEvent();
-                    var captured = desc;
+                    UnityEngine.Object.Destroy(ch.gameObject);
+                }
+            }
+
+            var allButtons = Instance.GetRegisteredEscapeMenuButtons();
+            var visibleButtons = new List<NativeMenuButtonDescriptor>(allButtons.Count);
+            for (int i = 0; i < allButtons.Count; i++)
+            {
+                var d = allButtons[i];
+                if (d != null && (d.IsVisible == null || d.IsVisible()))
+                {
+                    visibleButtons.Add(d);
+                }
+            }
+
+            const string dockName = "BazaarEscActionDock";
+            Transform existingDock = container.Find(dockName);
+            if (visibleButtons.Count == 0)
+            {
+                if (existingDock != null) UnityEngine.Object.Destroy(existingDock.gameObject);
+                return;
+            }
+
+            // 记录原版布局基线（防 UpdateButtonsState 反复触发导致间距越压越扁）
+            var mem = container.GetComponent<FightMenuLayoutMemory>() ?? container.gameObject.AddComponent<FightMenuLayoutMemory>();
+            var containerRt = container as RectTransform;
+            var dialogRt = dialogRoot.transform as RectTransform;
+            if (!mem.Captured)
+            {
+                mem.Captured = true;
+                if (vlg != null)
+                {
+                    mem.OriginalSpacing = vlg.spacing;
+                    mem.OriginalPadTop = vlg.padding.top;
+                    mem.OriginalPadBottom = vlg.padding.bottom;
+                }
+                if (containerRt != null) mem.OriginalContainerHeight = containerRt.rect.height;
+                if (dialogRt != null) mem.OriginalDialogHeight = dialogRt.sizeDelta.y;
+            }
+
+            // 若快捷栏已存在且按钮数未变，仅校准一次排布顺序与框内拟合后返回
+            if (existingDock != null && existingDock.GetComponentsInChildren<Button>(true).Length == visibleButtons.Count)
+            {
+                existingDock.SetAsLastSibling();
+                FitFightMenuInsideGoldFrame(vlg, mem, containerRt, dialogRt);
+                return;
+            }
+            if (existingDock != null)
+            {
+                UnityEngine.Object.Destroy(existingDock.gameObject);
+            }
+
+            var templateRt = templateBtn.transform as RectTransform;
+            float dockWidth = (templateRt != null && templateRt.rect.width > 120f) ? templateRt.rect.width : 340f;
+            TMP_Text templateTmp = templateBtn.GetComponentInChildren<TMP_Text>(true);
+            TMP_FontAsset nativeFont = CustomGameplayUI.Instance?.GetActiveUiFont()
+                ?? (templateTmp != null ? templateTmp.font : null)
+                ?? TMP_Settings.defaultFontAsset;
+
+            int perRow = visibleButtons.Count <= 3 ? visibleButtons.Count : 3;
+            int rowCount = (visibleButtons.Count + perRow - 1) / perRow;
+            const float rowHeight = 40f;
+            const float rowSpacing = 6f;
+            const float dividerBlockHeight = 10f;
+            float totalDockHeight = dividerBlockHeight + rowCount * rowHeight + Math.Max(0, rowCount - 1) * rowSpacing;
+
+            var dockGo = new GameObject(dockName, typeof(RectTransform), typeof(VerticalLayoutGroup), typeof(LayoutElement));
+            dockGo.transform.SetParent(container, worldPositionStays: false);
+            dockGo.transform.SetAsLastSibling();
+            dockGo.layer = container.gameObject.layer;
+            Instance.TrackClonedButton(dockGo);
+
+            var dockRt = dockGo.GetComponent<RectTransform>();
+            dockRt.sizeDelta = new Vector2(dockWidth, totalDockHeight);
+
+            var dockLe = dockGo.GetComponent<LayoutElement>();
+            dockLe.minWidth = dockWidth;
+            dockLe.preferredWidth = dockWidth;
+            dockLe.minHeight = totalDockHeight;
+            dockLe.preferredHeight = totalDockHeight;
+            dockLe.flexibleHeight = 0f;
+
+            var dockVlg = dockGo.GetComponent<VerticalLayoutGroup>();
+            dockVlg.padding = new RectOffset(0, 0, 2, 0);
+            dockVlg.spacing = rowSpacing;
+            dockVlg.childAlignment = TextAnchor.MiddleCenter;
+            dockVlg.childControlWidth = true;
+            dockVlg.childControlHeight = true;
+            dockVlg.childForceExpandWidth = true;
+            dockVlg.childForceExpandHeight = false;
+
+            // 精致古铜鎏金细分隔线（与上方原版按钮视觉自然区分）
+            var divWrap = new GameObject("GoldDivider", typeof(RectTransform), typeof(LayoutElement));
+            divWrap.transform.SetParent(dockGo.transform, false);
+            divWrap.layer = dockGo.layer;
+            var divLe = divWrap.GetComponent<LayoutElement>();
+            divLe.preferredHeight = 4f;
+            divLe.minHeight = 4f;
+
+            var divLine = new GameObject("Line", typeof(RectTransform), typeof(Image));
+            divLine.transform.SetParent(divWrap.transform, false);
+            divLine.layer = dockGo.layer;
+            var dlRt = divLine.GetComponent<RectTransform>();
+            dlRt.anchorMin = new Vector2(0.06f, 0.5f);
+            dlRt.anchorMax = new Vector2(0.94f, 0.5f);
+            dlRt.pivot = new Vector2(0.5f, 0.5f);
+            dlRt.sizeDelta = new Vector2(0f, 1.5f);
+            var dlImg = divLine.GetComponent<Image>();
+            dlImg.color = new Color(0.84f, 0.67f, 0.30f, 0.48f);
+            dlImg.raycastTarget = false;
+
+            // 按每行最多 3 枚紧凑暗金浮雕按钮排布，严丝合缝贴合原版宽度
+            for (int r = 0; r < rowCount; r++)
+            {
+                var rowGo = new GameObject("DockRow_" + r, typeof(RectTransform), typeof(HorizontalLayoutGroup), typeof(LayoutElement));
+                rowGo.transform.SetParent(dockGo.transform, false);
+                rowGo.layer = dockGo.layer;
+
+                var rowLe = rowGo.GetComponent<LayoutElement>();
+                rowLe.minHeight = rowHeight;
+                rowLe.preferredHeight = rowHeight;
+                rowLe.flexibleWidth = 1f;
+
+                var hlg = rowGo.GetComponent<HorizontalLayoutGroup>();
+                hlg.spacing = 8f;
+                hlg.childAlignment = TextAnchor.MiddleCenter;
+                hlg.childControlWidth = true;
+                hlg.childControlHeight = true;
+                hlg.childForceExpandWidth = true;
+                hlg.childForceExpandHeight = true;
+
+                int start = r * perRow;
+                int end = Math.Min(visibleButtons.Count, start + perRow);
+                for (int i = start; i < end; i++)
+                {
+                    var captured = visibleButtons[i];
                     var dialogInst = __instance;
+                    bool isPrimary = i == 0;
+
+                    var btnGo = new GameObject("DockBtn_" + captured.Id, typeof(RectTransform), typeof(Image), typeof(Button), typeof(LayoutElement));
+                    btnGo.transform.SetParent(rowGo.transform, false);
+                    btnGo.layer = dockGo.layer;
+
+                    var bLe = btnGo.GetComponent<LayoutElement>();
+                    bLe.minHeight = rowHeight;
+                    bLe.preferredHeight = rowHeight;
+                    bLe.flexibleWidth = 1f;
+
+                    var bImg = btnGo.GetComponent<Image>();
+                    bImg.sprite = CardBadgeArtLibrary.GetPlaqueSprite(ready: false);
+                    bImg.type = Image.Type.Sliced;
+                    bImg.color = isPrimary
+                        ? new Color(1.06f, 0.98f, 0.88f, 0.98f)
+                        : new Color(0.95f, 0.94f, 0.96f, 0.96f);
+
+                    var btn = btnGo.GetComponent<Button>();
+                    btn.targetGraphic = bImg;
+                    var cb = ColorBlock.defaultColorBlock;
+                    cb.normalColor = bImg.color;
+                    cb.highlightedColor = new Color(1.22f, 1.12f, 0.92f, 1f);
+                    cb.pressedColor = new Color(0.84f, 0.74f, 0.56f, 1f);
+                    cb.selectedColor = cb.highlightedColor;
+                    cb.colorMultiplier = 1f;
+                    cb.fadeDuration = 0.08f;
+                    btn.colors = cb;
+
                     btn.onClick.AddListener(() =>
                     {
                         try
@@ -961,20 +1120,109 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                         catch { }
                         captured.OnClick?.Invoke();
                     });
-                }
 
-                // 替换克隆按钮上的文字（自动继承原版 TMP 字体、材质与鎏金描边）
-                var tmp = cloned.GetComponentInChildren<TMP_Text>(true);
-                if (tmp != null)
-                {
-                    tmp.text = desc.Label;
+                    var txtGo = new GameObject("Label", typeof(RectTransform));
+                    txtGo.transform.SetParent(btnGo.transform, false);
+                    txtGo.layer = dockGo.layer;
+                    var tRt = txtGo.GetComponent<RectTransform>();
+                    tRt.anchorMin = Vector2.zero;
+                    tRt.anchorMax = Vector2.one;
+                    tRt.offsetMin = new Vector2(6f, 2f);
+                    tRt.offsetMax = new Vector2(-6f, -2f);
+
+                    var tmp = txtGo.AddComponent<TextMeshProUGUI>();
+                    if (nativeFont != null) tmp.font = nativeFont;
+                    tmp.text = captured.Label;
+                    tmp.fontSize = visibleButtons.Count >= 3 ? 14.5f : 16f;
+                    tmp.fontStyle = FontStyles.Bold;
+                    tmp.color = isPrimary ? new Color(0.99f, 0.88f, 0.58f, 1f) : new Color(0.95f, 0.91f, 0.82f, 1f);
+                    tmp.alignment = TextAlignmentOptions.Center;
+                    tmp.textWrappingMode = TextWrappingModes.NoWrap;
+                    tmp.overflowMode = TextOverflowModes.Ellipsis;
+                    tmp.raycastTarget = false;
+
+                    var shadow = txtGo.AddComponent<Shadow>();
+                    shadow.effectColor = new Color(0.04f, 0.02f, 0.01f, 0.88f);
+                    shadow.effectDistance = new Vector2(1f, -1f);
                 }
             }
+
+            FitFightMenuInsideGoldFrame(vlg, mem, containerRt, dialogRt);
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogDebug("[NativeMenuEmbed] FightMenuDialog 注入异常: " + ex.Message);
         }
+    }
+
+    /// <summary>
+    /// 严控 ESC 暂停菜单总高度严格落在原版鎏金外框与屏幕安全区内：
+    /// 优先微调垂直按钮间距吸收新增 46px 紧凑快捷栏，彻底杜绝按钮冲出金框或被屏幕底边裁切。
+    /// </summary>
+    private static void FitFightMenuInsideGoldFrame(
+        VerticalLayoutGroup vlg,
+        FightMenuLayoutMemory mem,
+        RectTransform containerRt,
+        RectTransform dialogRt)
+    {
+        if (vlg == null || mem == null || containerRt == null) return;
+
+        // 先还原至基线间距再按实际子项高度精准压缩
+        vlg.spacing = mem.OriginalSpacing;
+        vlg.padding.top = mem.OriginalPadTop;
+        vlg.padding.bottom = mem.OriginalPadBottom;
+        LayoutRebuilder.ForceRebuildLayoutImmediate(containerRt);
+
+        float availH = mem.OriginalContainerHeight > 100f ? mem.OriginalContainerHeight : containerRt.rect.height;
+        float prefH = LayoutUtility.GetPreferredHeight(containerRt);
+        if (availH <= 100f || prefH <= availH)
+        {
+            return;
+        }
+
+        int activeCount = 0;
+        for (int i = 0; i < containerRt.childCount; i++)
+        {
+            if (containerRt.GetChild(i).gameObject.activeSelf) activeCount++;
+        }
+        int gaps = Math.Max(1, activeCount - 1);
+        float excess = prefH - availH + 6f;
+
+        // 1. 优先微调按钮垂直间距（保持最低 8px 呼吸感）
+        float targetSpacing = Mathf.Max(8f, mem.OriginalSpacing - (excess / gaps));
+        vlg.spacing = targetSpacing;
+
+        // 2. 若仍有少量超出，温和收紧上下内边距
+        LayoutRebuilder.ForceRebuildLayoutImmediate(containerRt);
+        prefH = LayoutUtility.GetPreferredHeight(containerRt);
+        if (prefH > availH)
+        {
+            float rem = prefH - availH + 4f;
+            int trimEach = Mathf.Clamp(Mathf.CeilToInt(rem * 0.5f), 0, 14);
+            vlg.padding.top = Math.Max(6, mem.OriginalPadTop - trimEach);
+            vlg.padding.bottom = Math.Max(6, mem.OriginalPadBottom - trimEach);
+            LayoutRebuilder.ForceRebuildLayoutImmediate(containerRt);
+            prefH = LayoutUtility.GetPreferredHeight(containerRt);
+        }
+
+        // 3. 极端兜底（例如第三方 Mod 追加了多行按钮）：适度扩展外框高度并限制在画布 86% 以内
+        if (prefH > availH && dialogRt != null)
+        {
+            float addH = Mathf.Min(prefH - availH + 8f, 110f);
+            float maxDialogH = 820f;
+            var rootCanvas = dialogRt.GetComponentInParent<Canvas>();
+            if (rootCanvas != null && rootCanvas.transform is RectTransform cRt && cRt.rect.height > 300f)
+            {
+                maxDialogH = cRt.rect.height * 0.86f;
+            }
+            float desiredDialogH = Mathf.Min(maxDialogH, mem.OriginalDialogHeight + addH);
+            if (desiredDialogH > dialogRt.sizeDelta.y + 1f)
+            {
+                dialogRt.sizeDelta = new Vector2(dialogRt.sizeDelta.x, desiredDialogH);
+            }
+        }
+
+        LayoutRebuilder.ForceRebuildLayoutImmediate(containerRt);
     }
 
     // ── 锚点四实现：原生设置页（OptionsDialogController）分栏入口注入 ─────────
@@ -990,7 +1238,8 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
             if (gameplayBtn == null || gameplayBtn.transform.parent == null) return;
 
             Transform container = gameplayBtn.transform.parent;
-            if (container.GetComponent<LayoutGroup>() == null)
+            var layoutGroup = container.GetComponent<LayoutGroup>();
+            if (layoutGroup == null)
             {
                 return;
             }
@@ -1001,6 +1250,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 sectionsSnapshot = new List<NativeOptionsSectionDescriptor>(Instance._optionsSections);
             }
 
+            var templateRt = gameplayBtn.transform as RectTransform;
             foreach (var sec in sectionsSnapshot)
             {
                 string goName = "BazaarOptSec_" + sec.Id;
@@ -1014,6 +1264,14 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 // P2-41：剥离克隆自 _gameplayButton 的 ButtonCustom 组件，防止点击自定义分栏误触原生按钮样式/回调
                 StripNativeButtonCustomComponents(cloned);
 
+                // 锁定与原版 _gameplayButton 一致的尺寸，防止在紧凑设置页中变形或溢框
+                if (templateRt != null && templateRt.rect.height > 10f)
+                {
+                    var le = cloned.GetComponent<LayoutElement>() ?? cloned.AddComponent<LayoutElement>();
+                    le.preferredHeight = templateRt.rect.height;
+                    if (templateRt.rect.width > 40f) le.preferredWidth = templateRt.rect.width;
+                }
+
                 Button btn = cloned.GetComponent<Button>();
                 if (btn != null)
                 {
@@ -1026,7 +1284,14 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 if (tmp != null)
                 {
                     tmp.text = sec.Title;
+                    tmp.textWrappingMode = TextWrappingModes.NoWrap;
+                    tmp.overflowMode = TextOverflowModes.Ellipsis;
                 }
+            }
+
+            if (container is RectTransform cRt)
+            {
+                LayoutRebuilder.ForceRebuildLayoutImmediate(cRt);
             }
         }
         catch (Exception ex)

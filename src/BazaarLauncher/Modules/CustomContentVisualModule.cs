@@ -48,8 +48,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     // 反射缓存（零热路径反射查找）
     private static FieldInfo _itemMatInstanceField;
     private static FieldInfo _itemArtRendererField;
+    private static FieldInfo _itemFrameAnchorField;
     private static FieldInfo _itemControllerField;
     private static FieldInfo _itemBackVisibleField;
+    private static Type _itemVisualsControllerType;
     private static MethodInfo _skillUpdateIconMethod;
     private static FieldInfo _previewItemMaterialField;
     private static FieldInfo _previewCardDataField;
@@ -62,9 +64,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     private static FieldInfo _encounterInstancedBgMatField;
     private static MethodInfo _cardFrameUpdateBgMethod;
     private static Type _skillIconUpdaterType;
-
-    // 追踪 ItemVisualsController.Setup(Card/ITCard) 进入深度，识别外部直接调用 Setup(Material) 的池化复用场景
-    [ThreadStatic] private static int _itemSetupEntryDepth;
 
     // 按运行时真实类型隔离缓存卡牌反射属性（彻底杜绝 ItemCard.Enchantment 复用到 SkillCard/Card 抛出 InvalidCastException）
     private sealed class CardPropBag
@@ -177,6 +176,13 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 else if (!string.IsNullOrEmpty(query.TemplateId) && !string.IsNullOrEmpty(b.TemplateId)
                     && string.Equals(query.TemplateId, b.TemplateId, StringComparison.OrdinalIgnoreCase))
                 {
+                    // 铁律防串图：若某绑定带独立 CustomCardId 且 CustomCardId != TemplateId，说明是借壳自定义卡，
+                    // 严禁按原版借壳 TemplateId 兜底匹配，否则会把原版物品的贴图错误替换成自定义卡贴图！
+                    if (!string.IsNullOrEmpty(b.CustomCardId)
+                        && !string.Equals(b.CustomCardId, b.TemplateId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
                     score = 10000 + b.Priority;
                 }
 
@@ -201,20 +207,73 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         lock (_sync) return _bindings.Count;
     }
 
-    /// <summary>当 /api/mods/active-bindings 同步返回新实例绑定后，在主线程对已在场的 3D 物品卡立即补刷定制 PNG 贴图。</summary>
+    /// <summary>当 /api/mods/active-bindings 同步返回新实例绑定（或切换/禁用 Mod）后，在主线程对已在场的 3D 物品卡立即补刷或还原贴图。</summary>
     internal void ReapplyActiveVisualsOnMainThread()
     {
         try
         {
+            var visited = new HashSet<int>();
             var agents = UnityEngine.Object.FindObjectsByType<CardVisualOverrideAgent>(FindObjectsSortMode.None);
-            if (agents == null || agents.Length == 0) return;
-            for (int i = 0; i < agents.Length; i++)
+            if (agents != null)
             {
-                var ag = agents[i];
-                if (ag == null || !ag.HasContext || ag.HostController == null) continue;
-                if (ag.LastQuery.Target == CardVisualTarget.ItemArt)
+                for (int i = 0; i < agents.Length; i++)
                 {
-                    TryApplyItemVisual(ag.HostController, ag, ag.Epoch);
+                    var ag = agents[i];
+                    if (ag == null || ag.HostController == null) continue;
+                    visited.Add(ag.HostController.GetInstanceID());
+
+                    // 若因极端路径导致 agent 丢失上下文但所属 ItemController 仍有活体 Card，自动重建上下文
+                    if (!ag.HasContext && _itemVisualsControllerType != null && _itemVisualsControllerType.IsInstanceOfType(ag.HostController))
+                    {
+                        object liveCard = ResolveLiveCardFromVisuals(ag.HostController);
+                        if (liveCard != null)
+                        {
+                            ag.BoundCardObj = liveCard;
+                            ag.SetContext(BuildQueryFromCard(liveCard, CardVisualTarget.ItemArt));
+                        }
+                    }
+
+                    if (!ag.HasContext) continue;
+                    if (ag.LastQuery.Target == CardVisualTarget.ItemArt)
+                    {
+                        TryApplyItemVisual(ag.HostController, ag, ag.Epoch);
+                    }
+                }
+            }
+
+            // 兜底补扫：若场上有在钩子前已生成或尚无 Agent 的 ItemVisualsController 且其实体已命中绑定，立即挂接并补刷
+            if (_itemVisualsControllerType != null)
+            {
+                var visualsArr = UnityEngine.Object.FindObjectsByType(_itemVisualsControllerType, FindObjectsSortMode.None);
+                if (visualsArr != null)
+                {
+                    for (int i = 0; i < visualsArr.Length; i++)
+                    {
+                        if (visualsArr[i] is not Component visComp || visComp == null) continue;
+                        if (!visited.Add(visComp.GetInstanceID())) continue;
+
+                        object liveCard = ResolveLiveCardFromVisuals(visComp);
+                        if (liveCard == null) continue;
+                        var q = BuildQueryFromCard(liveCard, CardVisualTarget.ItemArt);
+                        bool hasVisual = TryResolveVisual(in q, out _);
+                        var l10n = LocalizationOverlayModule.Instance;
+                        bool hasBadge = l10n != null
+                            && l10n.TryResolveCardMetadata(q.InstanceId, q.CustomCardId, q.TemplateId, out var ov)
+                            && ov?.CounterDisplays != null && ov.CounterDisplays.Length > 0;
+                        if (!hasVisual && !hasBadge) continue;
+
+                        var ag = GetOrAddAgent(visComp);
+                        ag.HostController = visComp;
+                        ag.BoundCardObj = liveCard;
+                        if (!ag.HasContext || !ag.MatchesQuery(in q))
+                        {
+                            ag.SetContext(q);
+                        }
+                        if (hasVisual)
+                        {
+                            TryApplyItemVisual(visComp, ag, ag.Epoch);
+                        }
+                    }
                 }
             }
         }
@@ -232,8 +291,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         var itemVisType = GameInspector.FindTypeSafe("TheBazaar.Game.CardFrames.ItemVisualsController");
         if (itemVisType != null)
         {
+            _itemVisualsControllerType = itemVisType;
             _itemMatInstanceField = AccessTools.Field(itemVisType, "materialInstance");
             _itemArtRendererField = AccessTools.Field(itemVisType, "cardIllustrationRenderer");
+            _itemFrameAnchorField = AccessTools.Field(itemVisType, "cardFrameAnchor");
             _itemControllerField = AccessTools.Field(itemVisType, "_itemController");
             _itemBackVisibleField = AccessTools.Field(itemVisType, "_backVisible");
 
@@ -411,7 +472,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     {
         try
         {
-            _itemSetupEntryDepth++;
             if (__instance == null || Instance == null) return;
             var agent = GetOrAddAgent(__instance);
             agent.HostController = __instance;
@@ -422,7 +482,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             }
             agent.BoundCardObj = __0;
             var query = BuildQueryFromCard(__0, CardVisualTarget.ItemArt);
-            agent.SetContext(query);
+            agent.BeginTypedSetup(query);
         }
         catch (Exception ex)
         {
@@ -434,7 +494,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     {
         try
         {
-            if (_itemSetupEntryDepth > 0) _itemSetupEntryDepth--;
             if (__instance == null || __0 == null || Instance == null) return;
             var agent = GetOrAddAgent(__instance);
             agent.HostController = __instance;
@@ -444,6 +503,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             {
                 agent.SetContext(query);
             }
+            agent.FinishTypedSetupEntry(__result);
 
             if (!Instance.TryResolveVisual(in query, out _) && !string.IsNullOrEmpty(query.InstanceId))
             {
@@ -470,7 +530,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     {
         try
         {
-            _itemSetupEntryDepth++;
             if (__instance == null || Instance == null) return;
             var agent = GetOrAddAgent(__instance);
             agent.HostController = __instance;
@@ -481,7 +540,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 agent.ClearContext();
                 return;
             }
-            agent.SetContext(new CardVisualQuery(null, null, tplId, 0, null, CardVisualTarget.ItemArt));
+            agent.BeginTypedSetup(new CardVisualQuery(null, null, tplId, 0, null, CardVisualTarget.ItemArt));
         }
         catch (Exception ex)
         {
@@ -493,7 +552,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     {
         try
         {
-            if (_itemSetupEntryDepth > 0) _itemSetupEntryDepth--;
             if (__instance == null || __0 == null || Instance == null) return;
             string tplId = ReadTemplateId(__0);
             if (string.IsNullOrEmpty(tplId)) return;
@@ -506,6 +564,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             {
                 agent.SetContext(query);
             }
+            agent.FinishTypedSetupEntry(__result);
 
             if (__result != null && !__result.IsCompleted)
             {
@@ -527,10 +586,24 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     {
         try
         {
-            if (_itemSetupEntryDepth > 0 || __instance == null) return;
-            // 未经过 Setup(Card) 或 Setup(ITCard) 直接调用 Setup(Material) 时，必须清空池化视图上可能残留的旧自定义卡上下文
+            if (__instance == null) return;
             var agent = __instance.GetComponent<CardVisualOverrideAgent>();
-            agent?.ClearContext();
+            if (agent == null) return;
+
+            // 核心修复：ItemVisualsController.Setup(Card/ITCard) 是 async Task 方法，会先 await GetCardMaterial/GetEquippedCardBack
+            // 挂起后再异步续体调用本 Setup(Material) 重载。必须以实例级在途 Task 状态识别内部续体，严禁误调 ClearContext 清掉刚建立的自定义卡绑定！
+            if (agent.IsTypedSetupInFlight)
+            {
+                return;
+            }
+
+            // 仅当确实是外部直接调用 Setup(Material)（例如图鉴/卡背展示，或所属 ItemController 活体卡已变更）时才清空上下文
+            object liveCard = ResolveLiveCardFromVisuals(__instance);
+            if (liveCard != null && agent.HasContext && LiveCardMatchesAgent(__instance, agent))
+            {
+                return;
+            }
+            agent.ClearContext();
         }
         catch (Exception ex)
         {
@@ -614,9 +687,18 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         {
             if (visualsComp == null || agent == null || !agent.HasContext || agent.Epoch != capturedEpoch || Instance == null) return;
             if (!LiveCardMatchesAgent(visualsComp, agent)) return;
-            if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null) return;
 
             Material mat = _itemMatInstanceField?.GetValue(visualsComp) as Material;
+            if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null)
+            {
+                // 若当前卡不再命中任何自定义贴图绑定（例如禁用 Mod、切服或复用回原版借壳卡），无损还原该实例材质的原版贴图
+                if (mat != null)
+                {
+                    agent.RestoreOriginalMaterialIfApplied(mat);
+                }
+                return;
+            }
+
             if (mat == null) return;
 
             int matId = mat.GetInstanceID();
@@ -647,6 +729,9 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                         CardTextureCache.Instance.Release(entry);
                         return;
                     }
+
+                    // 首次覆写该实例化材质前抓取原版贴图快照，确保随时可无损还原原版借壳物品贴图
+                    agent.EnsureOriginalMaterialSnapshot(currentMat);
 
                     if (CardTextureCache.Instance.ApplyTextureToUrpMaterial(currentMat, entry.Texture, binding.DisableParallaxPremium))
                     {
@@ -1244,28 +1329,40 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
-    /// <summary>挂在对象池视图上的轻量版本号代理：防止池化复用后晚到的异步 PNG 回调污染新卡（铁律四），回收/销毁时彻底清零上下文与引用计数（铁律六），并承载通用自定义机制实时计数胶囊角标。</summary>
+    /// <summary>挂在对象池视图上的轻量版本号代理：防止池化复用后晚到的异步 PNG 回调污染新卡（铁律四），回收/销毁时彻底清零上下文与引用计数（铁律六），并托管原生 3D World-Space 通用自定义机制徽章。</summary>
     internal sealed class CardVisualOverrideAgent : MonoBehaviour
     {
-        private static readonly ConcurrentDictionary<Type, PropertyInfo> AttrsPropCache = new();
-        private static readonly Vector3[] CornerBuf = new Vector3[8];
-        private static GUIStyle _pillTextStyle;
-        private static Texture2D _solidWhiteTex;
-        private static Font _cnFont;
-
         private uint _epoch;
         private CardTextureCache.CacheEntry _primaryEntry;
         private CardTextureCache.CacheEntry _secondaryEntry;
         private int _lastAppliedMaterialId;
         private string _lastAppliedImagePath;
-        private readonly Dictionary<string, int> _lastCounterValues = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, float> _counterPulseUntil = new(StringComparer.OrdinalIgnoreCase);
+        private CardTextureCache.MaterialTextureSnapshot _originalMatSnapshot;
+        private bool _inTypedSetupSyncEntry;
+        private Task _pendingTypedSetupTask;
+        private readonly CardMechanismBadgeView _badgeView = new();
 
         public uint Epoch => _epoch;
         public bool HasContext { get; private set; }
         public CardVisualQuery LastQuery { get; private set; }
         public Component HostController { get; set; }
         public object BoundCardObj { get; set; }
+
+        public bool IsTypedSetupInFlight =>
+            _inTypedSetupSyncEntry || (_pendingTypedSetupTask != null && !_pendingTypedSetupTask.IsCompleted);
+
+        public void BeginTypedSetup(in CardVisualQuery query)
+        {
+            _inTypedSetupSyncEntry = true;
+            _pendingTypedSetupTask = null;
+            SetContext(query);
+        }
+
+        public void FinishTypedSetupEntry(Task pendingTask)
+        {
+            _inTypedSetupSyncEntry = false;
+            _pendingTypedSetupTask = (pendingTask != null && !pendingTask.IsCompleted) ? pendingTask : null;
+        }
 
         public bool MatchesQuery(in CardVisualQuery q)
         {
@@ -1289,6 +1386,26 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _lastAppliedImagePath = imagePath;
         }
 
+        public void EnsureOriginalMaterialSnapshot(Material currentMat)
+        {
+            if (currentMat == null) return;
+            int id = currentMat.GetInstanceID();
+            if (_originalMatSnapshot != null && _originalMatSnapshot.MaterialInstanceId == id) return;
+            _originalMatSnapshot = CardTextureCache.Instance.CaptureOriginalMaterialState(currentMat);
+        }
+
+        public void RestoreOriginalMaterialIfApplied(Material currentMat)
+        {
+            if (currentMat != null && _originalMatSnapshot != null
+                && _originalMatSnapshot.MaterialInstanceId == currentMat.GetInstanceID())
+            {
+                CardTextureCache.Instance.RestoreOriginalMaterialState(currentMat, _originalMatSnapshot);
+            }
+            _lastAppliedMaterialId = 0;
+            _lastAppliedImagePath = null;
+            ReleaseBoundEntries();
+        }
+
         public void SetContext(in CardVisualQuery query)
         {
             _epoch++;
@@ -1296,22 +1413,24 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             LastQuery = query;
             _lastAppliedMaterialId = 0;
             _lastAppliedImagePath = null;
-            _lastCounterValues.Clear();
-            _counterPulseUntil.Clear();
+            _originalMatSnapshot = null;
+            _badgeView.HideAndClear();
             ReleaseBoundEntries();
         }
 
-        /// <summary>对象池回收（Cleanup）或销毁时彻底清空全部旧卡上下文，严禁跨卡污染。</summary>
+        /// <summary>对象池回收（Cleanup）或销毁时彻底清空全部旧卡上下文与自定义徽章，严禁跨卡污染。</summary>
         public void ClearContext()
         {
             _epoch++;
             HasContext = false;
             LastQuery = default;
             BoundCardObj = null;
+            _inTypedSetupSyncEntry = false;
+            _pendingTypedSetupTask = null;
             _lastAppliedMaterialId = 0;
             _lastAppliedImagePath = null;
-            _lastCounterValues.Clear();
-            _counterPulseUntil.Clear();
+            _originalMatSnapshot = null;
+            _badgeView.HideAndClear();
             ReleaseBoundEntries();
         }
 
@@ -1329,262 +1448,52 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _secondaryEntry = entry;
         }
 
-        private void OnGUI()
+        private void LateUpdate()
         {
             try
             {
-                if (!HasContext || LastQuery.Target != CardVisualTarget.ItemArt || HostController == null) return;
-                if (Event.current == null || Event.current.type != EventType.Repaint) return;
+                if (!HasContext || LastQuery.Target != CardVisualTarget.ItemArt || HostController == null)
+                {
+                    _badgeView.HideAndClear();
+                    return;
+                }
 
                 var l10n = LocalizationOverlayModule.Instance;
-                if (l10n == null) return;
-                if (!l10n.TryResolveCardText(l10n.CurrentLocale, LastQuery.InstanceId, LastQuery.CustomCardId, LastQuery.TemplateId, out var ov)
+                if (l10n == null
+                    || !l10n.TryResolveCardMetadata(LastQuery.InstanceId, LastQuery.CustomCardId, LastQuery.TemplateId, out var ov)
                     || ov?.CounterDisplays == null || ov.CounterDisplays.Length == 0)
                 {
+                    _badgeView.HideAndClear();
                     return;
                 }
 
                 // 优先从所属 ItemController.CardData 读取最新活体 Card，避免切场景/战斗切换导致旧引用失效
                 object liveCard = ResolveLiveCardFromVisuals(HostController) ?? BoundCardObj;
-                if (liveCard == null) return;
-                if (!LiveCardMatchesAgent(HostController, this)) return;
-
-                // 卡牌翻面朝下（卡背可见）时自动隐藏角标
-                if (_itemBackVisibleField?.GetValue(HostController) is bool backVisible && backVisible)
+                if (liveCard == null || !LiveCardMatchesAgent(HostController, this))
                 {
+                    _badgeView.HideAndClear();
                     return;
                 }
 
-                // 严格取 cardIllustrationRenderer 精确卡画网格，绝不用 GetComponentInChildren<Renderer> 误抓卡背/阴影/外框
+                bool backVisible = _itemBackVisibleField?.GetValue(HostController) is bool bv && bv;
                 Renderer artR = _itemArtRendererField?.GetValue(HostController) as Renderer;
-                if (artR == null || !artR.enabled || !artR.gameObject.activeInHierarchy || !artR.isVisible)
-                {
-                    return;
-                }
+                Transform frameAnchor = _itemFrameAnchorField?.GetValue(HostController) as Transform;
+                object itemCtrlObj = _itemControllerField?.GetValue(HostController);
 
-                Camera cam = Camera.main;
-                if (cam == null) return;
-
-                if (!TryProjectCardArtScreenRect(artR, cam, out float minGuiX, out float maxGuiX, out float minGuiY, out float maxGuiY))
-                {
-                    return;
-                }
-
-                float cardW = maxGuiX - minGuiX;
-                float cardH = maxGuiY - minGuiY;
-                if (cardW < 24f || cardH < 30f) return;
-
-                var attrsProp = AttrsPropCache.GetOrAdd(
-                    liveCard.GetType(),
-                    static t => t.GetProperty("Attributes", BindingFlags.Public | BindingFlags.Instance));
-                var attrs = attrsProp?.GetValue(liveCard) as IDictionary;
-
-                EnsurePillResources();
-                _pillTextStyle.fontSize = cardW < 88f ? 11 : 12;
-
-                // 锚定在 3D 卡画真实屏幕空间的底部安全带（距离顶部伤害/护盾/灼烧/剧毒原生角标保持 >50% 卡高间距）
-                float centerX = (minGuiX + maxGuiX) * 0.5f;
-                float bottomInset = Mathf.Clamp(cardH * 0.11f, 7f, 16f);
-                float baseBottomY = maxGuiY - bottomInset;
-                float minSafeTopY = minGuiY + cardH * 0.40f;
-                float offsetY = 0f;
-                float now = Time.unscaledTime;
-
-                for (int i = 0; i < ov.CounterDisplays.Length; i++)
-                {
-                    var cd = ov.CounterDisplays[i];
-                    if (cd == null || string.IsNullOrWhiteSpace(cd.SyncAttribute)) continue;
-
-                    int curVal = ReadLiveIntAttr(attrs, cd.SyncAttribute);
-                    if (_lastCounterValues.TryGetValue(cd.SyncAttribute, out int prevVal))
-                    {
-                        if (prevVal != curVal)
-                        {
-                            _lastCounterValues[cd.SyncAttribute] = curVal;
-                            _counterPulseUntil[cd.SyncAttribute] = now + 0.40f;
-                        }
-                    }
-                    else
-                    {
-                        _lastCounterValues[cd.SyncAttribute] = curVal;
-                    }
-
-                    if (cd.HideWhenZero && curVal <= 0) continue;
-
-                    bool hasMax = cd.MaxValue.HasValue && cd.MaxValue.Value > 0;
-                    bool isReady = hasMax && curVal >= cd.MaxValue.Value;
-                    bool isPulsing = _counterPulseUntil.TryGetValue(cd.SyncAttribute, out float pulseUntil) && now < pulseUntil;
-                    float pulseBoost = isPulsing ? 2f : 0f;
-
-                    string label = string.IsNullOrWhiteSpace(cd.LabelZh) ? "层数" : cd.LabelZh;
-                    string text = hasMax ? $"{label} {curVal}/{cd.MaxValue.Value}" : $"{label} {curVal}";
-
-                    Vector2 sz = _pillTextStyle.CalcSize(new GUIContent(text));
-                    float pillW = Mathf.Clamp(sz.x + 14f + pulseBoost * 2f, 52f, Mathf.Max(82f, cardW * 0.94f));
-                    float pillH = Mathf.Max(20f, sz.y + 5f + pulseBoost);
-                    float pillTopY = Mathf.Max(minSafeTopY, baseBottomY - pillH - offsetY);
-                    Rect rect = new Rect(centerX - pillW * 0.5f, pillTopY, pillW, pillH);
-
-                    Color baseAccent = ParseHexColor(cd.ColorHex, new Color(0.98f, 0.45f, 0.09f, 0.96f));
-                    Color accent = isReady
-                        ? new Color(1f, 0.84f, 0.14f, 1f)
-                        : (isPulsing ? Color.Lerp(baseAccent, Color.white, 0.45f) : baseAccent);
-                    Color bg = isReady
-                        ? new Color(0.26f, 0.14f, 0.02f, 0.94f)
-                        : (isPulsing ? new Color(0.14f, 0.12f, 0.22f, 0.94f) : new Color(0.05f, 0.08f, 0.15f, 0.88f));
-
-                    Color prevColor = GUI.color;
-                    // 柔暗投影底边增强对比度
-                    GUI.color = new Color(0f, 0f, 0f, 0.52f);
-                    GUI.DrawTexture(new Rect(rect.x - 1f, rect.y + 1f, rect.width + 2f, rect.height + 2f), _solidWhiteTex);
-                    // 外框高光边
-                    float border = isPulsing || isReady ? 2f : 1.5f;
-                    GUI.color = accent;
-                    GUI.DrawTexture(new Rect(rect.x - border, rect.y - border, rect.width + border * 2f, rect.height + border * 2f), _solidWhiteTex);
-                    // 内核深底
-                    GUI.color = bg;
-                    GUI.DrawTexture(rect, _solidWhiteTex);
-                    // 亮色文字
-                    GUI.color = isReady ? new Color(1f, 0.96f, 0.68f, 1f) : Color.white;
-                    GUI.Label(rect, text, _pillTextStyle);
-                    GUI.color = prevColor;
-
-                    offsetY += pillH + 3f;
-                }
+                _badgeView.Sync(HostController, itemCtrlObj, artR, frameAnchor, backVisible, liveCard, ov.CounterDisplays);
             }
             catch { }
         }
 
-        /// <summary>将 3D 卡画网格的 8 个顶点投影到 GUI 屏幕空间，准确得到无论平铺/悬停/倾斜时的卡顶(minGuiY)与卡底(maxGuiY)。</summary>
-        private static bool TryProjectCardArtScreenRect(
-            Renderer artRenderer,
-            Camera cam,
-            out float minGuiX,
-            out float maxGuiX,
-            out float minGuiY,
-            out float maxGuiY)
-        {
-            minGuiX = float.MaxValue;
-            maxGuiX = float.MinValue;
-            minGuiY = float.MaxValue;
-            maxGuiY = float.MinValue;
-
-            bool usedLocalMesh = false;
-            var mf = artRenderer.GetComponent<MeshFilter>();
-            if (mf != null && mf.sharedMesh != null)
-            {
-                Bounds lb = mf.sharedMesh.bounds;
-                if (lb.size.sqrMagnitude > 0.00001f)
-                {
-                    Transform tf = artRenderer.transform;
-                    Vector3 lmin = lb.min;
-                    Vector3 lmax = lb.max;
-                    CornerBuf[0] = tf.TransformPoint(new Vector3(lmin.x, lmin.y, lmin.z));
-                    CornerBuf[1] = tf.TransformPoint(new Vector3(lmax.x, lmin.y, lmin.z));
-                    CornerBuf[2] = tf.TransformPoint(new Vector3(lmin.x, lmax.y, lmin.z));
-                    CornerBuf[3] = tf.TransformPoint(new Vector3(lmax.x, lmax.y, lmin.z));
-                    CornerBuf[4] = tf.TransformPoint(new Vector3(lmin.x, lmin.y, lmax.z));
-                    CornerBuf[5] = tf.TransformPoint(new Vector3(lmax.x, lmin.y, lmax.z));
-                    CornerBuf[6] = tf.TransformPoint(new Vector3(lmin.x, lmax.y, lmax.z));
-                    CornerBuf[7] = tf.TransformPoint(new Vector3(lmax.x, lmax.y, lmax.z));
-                    usedLocalMesh = true;
-                }
-            }
-
-            if (!usedLocalMesh)
-            {
-                Bounds wb = artRenderer.bounds;
-                if (wb.size.sqrMagnitude < 0.00001f) return false;
-                Vector3 wmin = wb.min;
-                Vector3 wmax = wb.max;
-                CornerBuf[0] = new Vector3(wmin.x, wmin.y, wmin.z);
-                CornerBuf[1] = new Vector3(wmax.x, wmin.y, wmin.z);
-                CornerBuf[2] = new Vector3(wmin.x, wmax.y, wmin.z);
-                CornerBuf[3] = new Vector3(wmax.x, wmax.y, wmin.z);
-                CornerBuf[4] = new Vector3(wmin.x, wmin.y, wmax.z);
-                CornerBuf[5] = new Vector3(wmax.x, wmin.y, wmax.z);
-                CornerBuf[6] = new Vector3(wmin.x, wmax.y, wmax.z);
-                CornerBuf[7] = new Vector3(wmax.x, wmax.y, wmax.z);
-            }
-
-            int validCorners = 0;
-            float sh = Screen.height;
-            for (int i = 0; i < 8; i++)
-            {
-                Vector3 sp = cam.WorldToScreenPoint(CornerBuf[i]);
-                if (sp.z <= 0.05f) continue;
-                validCorners++;
-                float gx = sp.x;
-                float gy = sh - sp.y;
-                if (gx < minGuiX) minGuiX = gx;
-                if (gx > maxGuiX) maxGuiX = gx;
-                if (gy < minGuiY) minGuiY = gy;
-                if (gy > maxGuiY) maxGuiY = gy;
-            }
-
-            if (validCorners < 4) return false;
-            if (maxGuiX < 0f || minGuiX > Screen.width || maxGuiY < 0f || minGuiY > sh) return false;
-            return true;
-        }
-
-        private static int ReadLiveIntAttr(IDictionary attrs, string attrName)
-        {
-            if (attrs == null || string.IsNullOrEmpty(attrName)) return 0;
-            foreach (DictionaryEntry kv in attrs)
-            {
-                if (string.Equals(kv.Key?.ToString(), attrName, StringComparison.OrdinalIgnoreCase))
-                {
-                    if (kv.Value != null && double.TryParse(kv.Value.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out double d))
-                        return (int)Math.Round(d);
-                    return 0;
-                }
-            }
-            return 0;
-        }
-
-        private static Color ParseHexColor(string hex, Color fallback)
-        {
-            if (string.IsNullOrWhiteSpace(hex)) return fallback;
-            string s = hex.Trim();
-            if (!s.StartsWith("#", StringComparison.Ordinal)) s = "#" + s;
-            return ColorUtility.TryParseHtmlString(s, out Color parsed) ? parsed : fallback;
-        }
-
-        private static void EnsurePillResources()
-        {
-            if (_solidWhiteTex == null)
-            {
-                _solidWhiteTex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
-                _solidWhiteTex.SetPixel(0, 0, Color.white);
-                _solidWhiteTex.Apply();
-                UnityEngine.Object.DontDestroyOnLoad(_solidWhiteTex);
-            }
-            if (_pillTextStyle == null)
-            {
-                try { _cnFont = Font.CreateDynamicFontFromOSFont(new[] { "Microsoft YaHei", "SimHei", "Arial" }, 12); }
-                catch { _cnFont = null; }
-
-                _pillTextStyle = new GUIStyle(GUI.skin.label)
-                {
-                    alignment = TextAnchor.MiddleCenter,
-                    fontSize = 12,
-                    fontStyle = FontStyle.Bold,
-                    wordWrap = false,
-                };
-                if (_cnFont != null) _pillTextStyle.font = _cnFont;
-                _pillTextStyle.normal.textColor = Color.white;
-            }
-        }
-
         private void OnDisable()
         {
-            // 注意：切储物箱或进出战斗时 Unity 会临时禁用/启用卡牌物体，绝不可在 OnDisable 清空 BoundCardObj、HasContext 或释放贴图引用，
-            // 否则整场战斗都无法显示实时计数角标且储物箱内自定义卡纹理可能被提前驱逐；
+            // 注意：切储物箱或进出战斗时 Unity 会临时禁用/启用卡牌物体，绝不可在 OnDisable 清空 BoundCardObj、HasContext 或释放贴图引用；
             // 对象池回收由 ItemVisualsCleanupPrefix -> ClearContext() 精准清理，销毁由 OnDestroy() 清理。
         }
 
         private void OnDestroy()
         {
+            _badgeView.DestroyAll();
             ClearContext();
         }
 

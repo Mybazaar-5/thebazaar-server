@@ -184,7 +184,28 @@ internal sealed partial class ModContentSyncClient
         long prevMs = Interlocked.Read(ref _lastAutoBindingsTickMs);
         if (nowMs - prevMs < 250)
         {
-            Interlocked.Exchange(ref _activeBindingsResyncQueued, 1);
+            if (Volatile.Read(ref _activeBindingsInFlight) != 0)
+            {
+                Interlocked.Exchange(ref _activeBindingsResyncQueued, 1);
+                return;
+            }
+            // 上一次请求已结束但仍在防抖窗口内：延迟 260ms 补拉一次，避免快速连刷商店/战中生卡时漏同步
+            if (Interlocked.CompareExchange(ref _activeBindingsResyncQueued, 1, 0) == 0)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(260, HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                        if (Interlocked.Exchange(ref _activeBindingsResyncQueued, 0) != 0)
+                        {
+                            Interlocked.Exchange(ref _lastAutoBindingsTickMs, DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond);
+                            TriggerActiveBindingsSyncInBackground();
+                        }
+                    }
+                    catch { }
+                });
+            }
             return;
         }
         Interlocked.Exchange(ref _lastAutoBindingsTickMs, nowMs);
@@ -515,6 +536,36 @@ internal sealed partial class ModContentSyncClient
             }
         }
 
+        Dictionary<string, CardPreviewAttrOp[]> enchPreviewOps = null;
+        if (bo["enchantmentPreviewOps"] is JObject epoObj)
+        {
+            enchPreviewOps = new Dictionary<string, CardPreviewAttrOp[]>(StringComparer.OrdinalIgnoreCase);
+            foreach (var ep in epoObj.Properties())
+            {
+                if (ep.Value is not JArray opArr) continue;
+                var opList = new List<CardPreviewAttrOp>(opArr.Count);
+                foreach (var item in opArr)
+                {
+                    if (item is not JObject opObj) continue;
+                    string attrName = ((string)opObj["attribute"])?.Trim();
+                    if (string.IsNullOrEmpty(attrName)) continue;
+                    double opVal = 0;
+                    if (opObj["value"] != null)
+                    {
+                        double.TryParse(opObj["value"].ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out opVal);
+                    }
+                    opList.Add(new CardPreviewAttrOp
+                    {
+                        Attribute = attrName,
+                        Operation = ((string)opObj["operation"])?.Trim() ?? "Set",
+                        Value = opVal,
+                        SourceAttribute = ((string)opObj["sourceAttribute"])?.Trim(),
+                    });
+                }
+                enchPreviewOps[ep.Name] = opList.ToArray();
+            }
+        }
+
         CardCounterDisplayInfo[] counterDisplays = null;
         if (bo["counterDisplays"] is JArray cdArr && cdArr.Count > 0)
         {
@@ -531,6 +582,11 @@ internal sealed partial class ModContentSyncClient
                     MaxValue = (int?)cdo["maxValue"],
                     ColorHex = ((string)cdo["colorHex"])?.Trim(),
                     HideWhenZero = (bool?)cdo["hideWhenZero"] ?? false,
+                    Style = ((string)cdo["style"])?.Trim(),
+                    ValueType = ((string)cdo["valueType"])?.Trim(),
+                    Format = ((string)cdo["format"])?.Trim(),
+                    Unit = ((string)cdo["unit"])?.Trim(),
+                    Position = ((string)cdo["position"])?.Trim(),
                 });
             }
             if (cdList.Count > 0) counterDisplays = cdList.ToArray();
@@ -541,6 +597,7 @@ internal sealed partial class ModContentSyncClient
             || (passiveTips != null && passiveTips.Length > 0)
             || (enchantTips != null && enchantTips.Count > 0)
             || (tierAttrs != null && tierAttrs.Count > 0)
+            || (enchPreviewOps != null && enchPreviewOps.Count > 0)
             || (counterDisplays != null && counterDisplays.Length > 0))
         {
             texts.Add(new CardTextOverride
@@ -557,6 +614,7 @@ internal sealed partial class ModContentSyncClient
                 EnchantmentTooltips = enchantTips,
                 ExtraDisplayTags = extraTags,
                 TierAttributes = tierAttrs,
+                EnchantmentPreviewOps = enchPreviewOps,
                 CounterDisplays = counterDisplays,
                 Priority = string.IsNullOrWhiteSpace(instanceId) ? 100 : 500,
             });

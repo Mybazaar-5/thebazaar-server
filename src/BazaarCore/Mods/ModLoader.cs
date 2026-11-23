@@ -182,7 +182,8 @@ public static class ModLoader
                     : null,
                 Tags = new List<string>(card.Tags),
                 AccentColor = card.AccentColor,
-                TierAttributes = BuildTierAttributesSnapshot(card)
+                TierAttributes = BuildTierAttributesSnapshot(card),
+                EnchantmentPreviewOps = BuildEnchantmentPreviewOpsSnapshot(card.Enchantments)
             };
         }
 
@@ -196,17 +197,29 @@ public static class ModLoader
                 foreach (var (k, v) in card.Attributes)
                     running[k] = v;
             }
-            foreach (var tierName in new[] { "Bronze", "Silver", "Gold", "Diamond" })
+            bool started = false;
+            foreach (var tierName in new[] { "Bronze", "Silver", "Gold", "Diamond", "Legendary" })
             {
-                if (card.Tiers.TryGetValue(tierName, out var td) && td?.Attributes != null)
+                bool hasExplicit = card.Tiers.TryGetValue(tierName, out var td) && td != null;
+                if (hasExplicit)
                 {
-                    foreach (var (k, v) in td.Attributes)
-                        running[k] = v;
+                    started = true;
+                    if (td!.Attributes != null)
+                    {
+                        foreach (var (k, v) in td.Attributes)
+                            running[k] = v;
+                    }
                 }
-                if (running.Count > 0)
+                if (started && running.Count > 0 && (hasExplicit || !tierName.Equals("Legendary", StringComparison.OrdinalIgnoreCase)))
                     res[tierName] = new Dictionary<string, double>(running, StringComparer.OrdinalIgnoreCase);
             }
             return res.Count > 0 ? res : null;
+        }
+
+        static Dictionary<string, List<ResolvedPreviewAttrOp>>? BuildEnchantmentPreviewOpsSnapshot(
+            Dictionary<string, EnchantmentData>? enchantments)
+        {
+            return ModRegistry.ExtractEnchantmentPreviewOps(enchantments);
         }
 
         for (int i = 0; i < pkg.Cards.Count; i++)

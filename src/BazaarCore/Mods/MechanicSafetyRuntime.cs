@@ -48,7 +48,7 @@ public interface ICombatMutationApi
 
     void DealDamage(PlayerState targetPlayer, CardInstance? sourceCard, double amount, bool bypassShield = false, string? vfxKey = null);
     void ApplyStatus(string status, PlayerState actorPlayer, CardInstance? sourceCard, CardInstance? targetCard, PlayerState? targetPlayer, double amount);
-    void ModifyCardAttribute(CardInstance targetCard, string attribute, string operation, double value, bool permanent = false);
+    void ModifyCardAttribute(CardInstance targetCard, string attribute, string operation, double value, bool permanent = false, bool grantIfMissing = false);
     void ModifyPlayerAttribute(PlayerState targetPlayer, string attribute, string operation, double value);
     void ChangeCardState(CardInstance targetCard, CardInstance? sourceCard, string changeKind, string? reason = null, bool suppressNormalDestroyTriggers = false, string? vfxKey = null);
     void ForceUseCard(CardInstance targetCard, CardInstance? sourceCard);
@@ -670,11 +670,73 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
         _host.ApplyStatus(status, actorPlayer, sourceCard, targetCard, targetPlayer, amt);
     }
 
-    public void ModifyCardAttribute(CardInstance targetCard, string attribute, string operation, double value, bool permanent = false)
+    private static bool IsOutputActionAttribute(string attribute)
+    {
+        return attribute.Equals("DamageAmount", StringComparison.OrdinalIgnoreCase)
+            || attribute.Equals("ShieldApplyAmount", StringComparison.OrdinalIgnoreCase)
+            || attribute.Equals("HealAmount", StringComparison.OrdinalIgnoreCase)
+            || attribute.Equals("BurnApplyAmount", StringComparison.OrdinalIgnoreCase)
+            || attribute.Equals("PoisonApplyAmount", StringComparison.OrdinalIgnoreCase)
+            || attribute.Equals("RegenApplyAmount", StringComparison.OrdinalIgnoreCase)
+            || attribute.Equals("JoyApplyAmount", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ActionTreeHasActionType(RuleNode? node, string targetActionType, int depth = 0)
+    {
+        if (node == null || depth > 16) return false;
+        if (string.Equals(node.Type, targetActionType, StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (node.Actions != null)
+        {
+            for (int i = 0; i < node.Actions.Count; i++)
+            {
+                if (ActionTreeHasActionType(node.Actions[i], targetActionType, depth + 1))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool CardSupportsOutputAttribute(CardInstance card, string attribute)
+    {
+        if (card.BaseAttributes.TryGetValue(attribute, out double baseVal) && baseVal > 0)
+            return true;
+        if (card.GetAttribute(attribute) > 0)
+            return true;
+
+        string? requiredAction = attribute.ToLowerInvariant() switch
+        {
+            "damageamount" => "TActionPlayerDamage",
+            "shieldapplyamount" => "TActionPlayerShieldApply",
+            "healamount" => "TActionPlayerHeal",
+            "burnapplyamount" => "TActionPlayerBurnApply",
+            "poisonapplyamount" => "TActionPlayerPoisonApply",
+            "regenapplyamount" => "TActionPlayerRegenApply",
+            "joyapplyamount" => "TActionPlayerJoyApply",
+            _ => null,
+        };
+        if (requiredAction == null) return true;
+
+        for (int i = 0; i < card.ActiveAbilities.Count; i++)
+        {
+            if (ActionTreeHasActionType(card.ActiveAbilities[i].Action, requiredAction))
+                return true;
+        }
+        return false;
+    }
+
+    public void ModifyCardAttribute(CardInstance targetCard, string attribute, string operation, double value, bool permanent = false, bool grantIfMissing = false)
     {
         if (targetCard == null || string.IsNullOrWhiteSpace(attribute)) return;
         double safeVal = SanitizeNumber(value);
         string op = string.IsNullOrWhiteSpace(operation) ? "Add" : operation;
+
+        // 官方一致性铁律：群体/单体增益伤害、护盾、治疗、灼烧、剧毒、再生、喜悦等产出属性时，
+        // 默认严禁给原本不具备该产出能力的物品凭空写入属性（否则客户端会常显一颗无效伤害/护盾宝石），除非 Mod 显式声明 grantIfMissing=true
+        if (!grantIfMissing && IsOutputActionAttribute(attribute) && !CardSupportsOutputAttribute(targetCard, attribute))
+        {
+            return;
+        }
 
         // 冷却属性强钳制：确保有效冷却绝不跌破 1000ms（杜绝 0 秒无限开火）
         if (attribute.Equals("CooldownMax", StringComparison.OrdinalIgnoreCase))

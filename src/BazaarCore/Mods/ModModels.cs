@@ -343,6 +343,10 @@ public sealed class CustomCardDefinition
     [JsonPropertyName("customMechanics")]
     public List<CardMechanicAttachment>? CustomMechanics { get; set; }
 
+    /// <summary>可选：卡牌级直配实时数值徽章列表（不依赖机制钩子即可展示任意 Custom_0..Custom_9 或原生属性）。</summary>
+    [JsonPropertyName("counterDisplays")]
+    public List<MechanicCounterDisplay>? CounterDisplays { get; set; }
+
     [JsonPropertyName("selectionContext")]
     public SelectionContextData? SelectionContext { get; set; }
 
@@ -728,7 +732,7 @@ public sealed class CustomModeDefinition
 }
 
 /// <summary>
-/// 已按具体卡牌参数实例解析后的通用卡面计数角标元数据（由服务端下发给客户端渲染实时叠层/充能/倒计时胶囊）。
+/// 已按具体卡牌参数实例解析后的通用卡面实时数值徽章元数据（由服务端下发给客户端在卡牌 3D 层级渲染晶球/进度条/宝石/徽章）。
 /// </summary>
 public sealed class ResolvedCounterDisplay
 {
@@ -746,6 +750,39 @@ public sealed class ResolvedCounterDisplay
 
     [JsonPropertyName("hideWhenZero")]
     public bool HideWhenZero { get; set; }
+
+    [JsonPropertyName("style")]
+    public string? Style { get; set; }
+
+    [JsonPropertyName("valueType")]
+    public string? ValueType { get; set; }
+
+    [JsonPropertyName("format")]
+    public string? Format { get; set; }
+
+    [JsonPropertyName("unit")]
+    public string? Unit { get; set; }
+
+    [JsonPropertyName("position")]
+    public string? Position { get; set; }
+}
+
+/// <summary>
+/// 通用附魔预览属性运算（从附魔自身的 attributes 与作用于自身的 TAuraActionCardModifyAttribute 自动提取，面向任意 Mod 卡通用）。
+/// </summary>
+public sealed class ResolvedPreviewAttrOp
+{
+    [JsonPropertyName("attribute")]
+    public string Attribute { get; set; } = string.Empty;
+
+    [JsonPropertyName("operation")]
+    public string Operation { get; set; } = "Set";
+
+    [JsonPropertyName("value")]
+    public double Value { get; set; }
+
+    [JsonPropertyName("sourceAttribute")]
+    public string? SourceAttribute { get; set; }
 }
 
 /// <summary>
@@ -798,9 +835,13 @@ public sealed class CustomCardVisualBinding
     [JsonPropertyName("tags")]
     public List<string> Tags { get; set; } = new();
 
-    /// <summary>四阶基础属性映射（Bronze/Silver/Gold/Diamond → 属性表），供客户端局内升级预览精确渲染自定义卡成长数值。</summary>
+    /// <summary>五阶基础属性映射（Bronze/Silver/Gold/Diamond/Legendary → 属性表），供客户端局内升阶对比与详情预览精确渲染。</summary>
     [JsonPropertyName("tierAttributes")]
     public Dictionary<string, Dictionary<string, double>>? TierAttributes { get; set; }
+
+    /// <summary>附魔预览属性运算映射（附魔名 → 属性修改列表），供客户端详情预览切换任意附魔时 100% 准确计算面板数值。</summary>
+    [JsonPropertyName("enchantmentPreviewOps")]
+    public Dictionary<string, List<ResolvedPreviewAttrOp>>? EnchantmentPreviewOps { get; set; }
 
     /// <summary>通用自定义机制实时计数角标列表（任意叠层/充能/倒计时机制均可声明并自动下发给客户端实时渲染）。</summary>
     [JsonPropertyName("counterDisplays")]
@@ -832,13 +873,28 @@ public sealed class CustomCardVisualBinding
             kv => kv.Key,
             kv => new Dictionary<string, double>(kv.Value, StringComparer.OrdinalIgnoreCase),
             StringComparer.OrdinalIgnoreCase),
+        EnchantmentPreviewOps = EnchantmentPreviewOps?.ToDictionary(
+            kv => kv.Key,
+            kv => kv.Value.Select(op => new ResolvedPreviewAttrOp
+            {
+                Attribute = op.Attribute,
+                Operation = op.Operation,
+                Value = op.Value,
+                SourceAttribute = op.SourceAttribute
+            }).ToList(),
+            StringComparer.OrdinalIgnoreCase),
         CounterDisplays = CounterDisplays?.Select(cd => new ResolvedCounterDisplay
         {
             LabelZh = cd.LabelZh,
             SyncAttribute = cd.SyncAttribute,
             MaxValue = cd.MaxValue,
             ColorHex = cd.ColorHex,
-            HideWhenZero = cd.HideWhenZero
+            HideWhenZero = cd.HideWhenZero,
+            Style = cd.Style,
+            ValueType = cd.ValueType,
+            Format = cd.Format,
+            Unit = cd.Unit,
+            Position = cd.Position
         }).ToList()
     };
 }

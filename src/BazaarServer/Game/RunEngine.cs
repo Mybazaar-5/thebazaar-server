@@ -2034,10 +2034,19 @@ public sealed class RunEngine
                     return;
                 }
 
-                // PvP 战斗绝不在顶栏或中央地毯保留 PvP 挑战卡/朱尔斯头像卡，进入 CombatSpawnSim 前全数清理并下发 CardDisposed
+                // 官方协议：先发 CardPurchased(Socket=null) 使客户端 OnCardPurchased 把 PvP 对手卡移入 21 号头像槽、
+                // 触发 BeginPVPTransition 并绑定 Data.CurrentEncounterController，再移除后端 _run.Cards 并发 CardDisposed；
+                // GameSimHandler 固定按 StateTransitioned(PVPCombat) → CardPurchased → CardDisposed 顺序执行，
+                // BoardManager.IsActivePvpEncounterPortrait 会精确放行保护顶栏对手立绘，同时保证地毯零残留！
                 if (selectedCard != null)
                 {
                     _run.SelectionSet.Remove(selectedCard.InstanceId);
+                    o.Events.Add(new GameSimEventCardPurchased(
+                        selectedCard.InstanceId,
+                        0u,
+                        null,
+                        null,
+                        null));
                     if (_run.Cards.Remove(selectedCard.InstanceId))
                         o.Events.Add(new GameSimEventCardDisposed(selectedCard.InstanceId, ECardDisposalReason.Cleared));
                 }

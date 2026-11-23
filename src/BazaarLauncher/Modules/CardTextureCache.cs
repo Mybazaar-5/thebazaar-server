@@ -192,6 +192,93 @@ internal sealed class CardTextureCache
         }
     }
 
+    internal sealed class MaterialTextureSnapshot
+    {
+        public int MaterialInstanceId;
+        public Shader OriginalShader;
+        public int PrimaryPropId = -1;
+        public Texture OriginalPrimaryTex;
+        public (int PropId, Texture OriginalTex)[] SecondaryOriginalTexs = Array.Empty<(int, Texture)>();
+        public bool HadPremiumKeyword;
+    }
+
+    /// <summary>在首次覆写某张卡牌的实例化材质前抓取原版贴图快照，供禁用 Mod/切服/池化回退时无损恢复原版借壳贴图。</summary>
+    internal MaterialTextureSnapshot CaptureOriginalMaterialState(Material instanceMaterial)
+    {
+        if (instanceMaterial == null || instanceMaterial.shader == null) return null;
+        try
+        {
+            Shader shader = instanceMaterial.shader;
+            ShaderSlotProfile profile = GetOrBuildShaderProfile(shader);
+            var snap = new MaterialTextureSnapshot
+            {
+                MaterialInstanceId = instanceMaterial.GetInstanceID(),
+                OriginalShader = shader,
+                PrimaryPropId = profile.PrimaryTexturePropId,
+                OriginalPrimaryTex = profile.PrimaryTexturePropId >= 0 ? instanceMaterial.GetTexture(profile.PrimaryTexturePropId) : null,
+                HadPremiumKeyword = instanceMaterial.IsKeywordEnabled("_ISPREMIUM_ON"),
+            };
+
+            if (profile.SecondaryParallaxPropIds.Length > 0)
+            {
+                var arr = new (int PropId, Texture OriginalTex)[profile.SecondaryParallaxPropIds.Length];
+                for (int i = 0; i < profile.SecondaryParallaxPropIds.Length; i++)
+                {
+                    int pid = profile.SecondaryParallaxPropIds[i];
+                    arr[i] = (pid, instanceMaterial.GetTexture(pid));
+                }
+                snap.SecondaryOriginalTexs = arr;
+            }
+            return snap;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>将之前覆写过自定义 PNG 的实例材质无损还原回原版贴图与关键字，彻底杜绝自定义卡与原版卡串图。</summary>
+    internal bool RestoreOriginalMaterialState(Material instanceMaterial, MaterialTextureSnapshot snapshot)
+    {
+        if (instanceMaterial == null || snapshot == null) return false;
+        if (instanceMaterial.GetInstanceID() != snapshot.MaterialInstanceId) return false;
+        try
+        {
+            if (snapshot.OriginalShader != null && instanceMaterial.shader != snapshot.OriginalShader)
+            {
+                instanceMaterial.shader = snapshot.OriginalShader;
+            }
+            if (snapshot.PrimaryPropId >= 0 && instanceMaterial.HasProperty(snapshot.PrimaryPropId))
+            {
+                instanceMaterial.SetTexture(snapshot.PrimaryPropId, snapshot.OriginalPrimaryTex);
+            }
+            if (snapshot.SecondaryOriginalTexs != null)
+            {
+                for (int i = 0; i < snapshot.SecondaryOriginalTexs.Length; i++)
+                {
+                    var (pid, tex) = snapshot.SecondaryOriginalTexs[i];
+                    if (pid >= 0 && instanceMaterial.HasProperty(pid))
+                    {
+                        instanceMaterial.SetTexture(pid, tex);
+                    }
+                }
+            }
+            if (snapshot.HadPremiumKeyword)
+            {
+                try { instanceMaterial.EnableKeyword("_ISPREMIUM_ON"); } catch { }
+            }
+            else
+            {
+                try { instanceMaterial.DisableKeyword("_ISPREMIUM_ON"); } catch { }
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>
     /// 铁律一：对原版 URP 实例材质执行 Shader 属性自省与安全贴图注入（防粉块 &amp; 防原版视差前景穿透）。
     /// </summary>
@@ -249,6 +336,7 @@ internal sealed class CardTextureCache
 
         int bestPrimaryScore = -1;
         int bestPrimaryId = -1;
+        string bestPrimaryName = null;
 
         for (int i = 0; i < propCount; i++)
         {
@@ -261,12 +349,14 @@ internal sealed class CardTextureCache
             int score = ScorePrimaryArtSlot(propName);
             if (score > bestPrimaryScore)
             {
-                if (bestPrimaryId >= 0 && IsParallaxLayerSlot(propName))
+                // 修正：判断被替换下来的旧 bestPrimaryName 是否为视差层，防止前景槽位排在主贴图之前时漏清零
+                if (bestPrimaryId >= 0 && !string.IsNullOrEmpty(bestPrimaryName) && IsParallaxLayerSlot(bestPrimaryName))
                 {
                     secondaryList.Add(bestPrimaryId);
                 }
                 bestPrimaryScore = score;
                 bestPrimaryId = propId;
+                bestPrimaryName = propName;
             }
             else if (IsParallaxLayerSlot(propName))
             {

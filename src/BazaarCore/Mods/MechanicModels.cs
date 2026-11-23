@@ -305,6 +305,13 @@ public sealed class MechanicStep
     [JsonPropertyName("duration")]
     public string? Duration { get; set; }
 
+    /// <summary>
+    /// 仅用于 ModifyCardAttribute：默认 false，对伤害/护盾/治疗/灼烧/剧毒/再生/喜悦等产出型属性仅增益原本具备该能力的卡牌，
+    /// 严禁给非武器/非对应产出物品凭空挂出伤害红标；若 Mod 明确需要“赋予新产出数值”可显式设为 true。
+    /// </summary>
+    [JsonPropertyName("grantIfMissing")]
+    public bool GrantIfMissing { get; set; }
+
     /// <summary>Disable | Destroy | Repair。</summary>
     [JsonPropertyName("changeKind")]
     public string? ChangeKind { get; set; }
@@ -356,34 +363,54 @@ public sealed class MechanicHookDefinition
 }
 
 /// <summary>
-/// 通用自定义机制卡面实时计数角标声明（不绑定任何特定玩法：过载/剑意/热量/灵魂/蓄力等均可声明）。
-/// 客户端收到后会在对应卡牌左上/右上角渲染轻量实时胶囊，战斗中随 Custom_0..Custom_9 逐帧跳动。
+/// 通用自定义机制/数值卡面实时徽章声明（不绑定任何特定玩法：过载/剑意/热量/灵魂/蓄力/倍率/倒计时等均可声明）。
+/// 客户端收到后会在卡牌自身 3D World-Space 层级以原版鎏金/晶球/进度条/宝石美学渲染，并随 Custom_0..Custom_9 或指定属性逐帧同步。
 /// </summary>
 public sealed class MechanicCounterDisplay
 {
-    /// <summary>角标中文短名（如「过载」「剑意」「热量」「充能」）。</summary>
+    /// <summary>徽章中文短名（如「过载」「剑意」「热量」「充能」；留空时仅展示纯数值/晶球）。</summary>
     [JsonPropertyName("labelZh")]
     public string LabelZh { get; set; } = string.Empty;
 
-    /// <summary>绑定的同步属性槽（Custom_0..Custom_9）。</summary>
+    /// <summary>绑定的同步属性槽（Custom_0..Custom_9 或任意卡牌属性名）。</summary>
     [JsonPropertyName("syncAttribute")]
     public string SyncAttribute { get; set; } = "Custom_3";
 
-    /// <summary>可选：从机制参数读取上限值（如 "threshold"），用于渲染「当前/上限」格式。</summary>
+    /// <summary>可选：从机制参数读取上限值（如 "threshold"），用于渲染晶球/进度条或「当前/上限」格式。</summary>
     [JsonPropertyName("maxParam")]
     public string? MaxParam { get; set; }
 
-    /// <summary>可选：固定上限常量（若未指定 maxParam 且未指定 maxConst，则渲染纯数字如「过载 2」）。</summary>
+    /// <summary>可选：固定上限常量（若未指定 maxParam 且未指定 maxConst，则按纯数值宝石渲染）。</summary>
     [JsonPropertyName("maxConst")]
     public int? MaxConst { get; set; }
 
-    /// <summary>角标主题色（十六进制如 "#F97316"）。</summary>
+    /// <summary>徽章主题色（十六进制如 "#F97316"）。</summary>
     [JsonPropertyName("colorHex")]
     public string? ColorHex { get; set; }
 
-    /// <summary>为 true 时当层数为 0 自动隐藏角标；默认 false 以便局外也能清晰看到「0/3」。</summary>
+    /// <summary>为 true 时当层数为 0 自动隐藏徽章；默认 false 以便局外也能清晰看到当前进度。</summary>
     [JsonPropertyName("hideWhenZero")]
     public bool HideWhenZero { get; set; }
+
+    /// <summary>视觉样式：auto | pips | bar | gem | pill。</summary>
+    [JsonPropertyName("style")]
+    public string? Style { get; set; }
+
+    /// <summary>数值语义类型：count | progress | percent | seconds | multiplier | delta。</summary>
+    [JsonPropertyName("valueType")]
+    public string? ValueType { get; set; }
+
+    /// <summary>可选自定义格式模板（支持 {label} / {value} / {max} / {unit}）。</summary>
+    [JsonPropertyName("format")]
+    public string? Format { get; set; }
+
+    /// <summary>可选短单位后缀（如「层」「秒」「%」）。</summary>
+    [JsonPropertyName("unit")]
+    public string? Unit { get; set; }
+
+    /// <summary>锚点位置：bottom（默认底框）| bottomRight | topLeft | topRight。</summary>
+    [JsonPropertyName("position")]
+    public string? Position { get; set; }
 }
 
 /// <summary>

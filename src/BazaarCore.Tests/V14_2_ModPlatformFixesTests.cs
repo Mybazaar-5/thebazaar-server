@@ -733,4 +733,166 @@ public sealed class V14_2_ModPlatformFixesTests
         var bogusReport = new ModRegistry(fx.BaseRepo, fx.Whitelist).LoadPackages([bogusPkg]);
         Assert.Contains(bogusReport.Issues, i => i.Code == "HIDDEN_TAG_WITHOUT_MATCHING_EFFECT" && i.Severity == ModValidationSeverity.Warning);
     }
+
+    [Fact]
+    public void Fix_OutputAttributeGuard_PreventsAddingDamageToNonDamageItems_AndSupportsExtendedCounterDisplays()
+    {
+        var fx = Shared.Value;
+        var registry = LoadWorkspaceMods(fx);
+
+        // 1. 构造「过载蓄能炉」+ 一件武器（有 DamageAmount）+ 两件非伤害物品（纯毒/纯盾工具），验证满 3 层过载引爆时：
+        //    - 仅给具备伤害能力的武器加 +4 DamageAmount；
+        //    - 严禁给纯护盾/纯剧毒/工具卡凭空写入 DamageAmount（防止客户端常显无效红字伤害宝石）。
+        var overloadTpl = registry.ActiveRepository.GetCard(OverloadCardId)!;
+        var weaponTpl = new CardTemplate
+        {
+            Id = "test:ally_weapon",
+            Type = "Item",
+            Size = "Small",
+            StartingTier = "Bronze",
+            Tags = ["Weapon"],
+            Tiers = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Bronze"] = new TierData
+                {
+                    Attributes = new(StringComparer.OrdinalIgnoreCase) { ["CooldownMax"] = 2000, ["DamageAmount"] = 10 },
+                    AbilityIds = ["0"]
+                }
+            },
+            Abilities = new()
+            {
+                ["0"] = new AbilityDefinition
+                {
+                    Id = "0",
+                    Trigger = new RuleNode { Type = "TTriggerOnCardFired" },
+                    ActiveIn = "HandOnly",
+                    Action = new RuleNode { Type = "TActionPlayerDamage", Target = new RuleNode { Type = "TTargetPlayerRelative", TargetMode = "Opponent" } }
+                }
+            }
+        };
+        var nonDamageShieldTpl = new CardTemplate
+        {
+            Id = "test:ally_shield_only",
+            Type = "Item",
+            Size = "Small",
+            StartingTier = "Bronze",
+            Tags = ["Tool"],
+            Tiers = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Bronze"] = new TierData
+                {
+                    Attributes = new(StringComparer.OrdinalIgnoreCase) { ["CooldownMax"] = 2000, ["ShieldApplyAmount"] = 15 },
+                    AbilityIds = ["0"]
+                }
+            },
+            Abilities = new()
+            {
+                ["0"] = new AbilityDefinition
+                {
+                    Id = "0",
+                    Trigger = new RuleNode { Type = "TTriggerOnCardFired" },
+                    ActiveIn = "HandOnly",
+                    Action = new RuleNode { Type = "TActionPlayerShieldApply", Target = new RuleNode { Type = "TTargetPlayerRelative", TargetMode = "Self" } }
+                }
+            }
+        };
+
+        var p1 = new PlayerState("p1", "P1", "Vanessa", 2000, 20, 10, 10);
+        var p2 = new PlayerState("p2", "P2", "Common", 2000, 20, 10, 10);
+        var shieldCard = new CardInstance(nonDamageShieldTpl, CardTier.Bronze, null, "itm_shield_left");
+        var furnaceCard = new CardInstance(overloadTpl, CardTier.Bronze, null, "itm_furnace_mid");
+        var weaponCard = new CardInstance(weaponTpl, CardTier.Bronze, null, "itm_weapon_right");
+        p1.Hand.TryPlaceWithDisplaceOrSwap(shieldCard, 0);
+        p1.Hand.TryPlaceWithDisplaceOrSwap(furnaceCard, 1);
+        p1.Hand.TryPlaceWithDisplaceOrSwap(weaponCard, 3);
+
+        var sim = CombatSimulator.Simulate(
+            registry.ActiveRepository,
+            p1,
+            p2,
+            seed: 77,
+            combatType: "PVP",
+            recordTimeline: true,
+            recordEvents: true,
+            syncPermanentChanges: false,
+            modifiers: null,
+            mechanicDefinitionsOverride: registry.MechanicsById);
+
+        // 2s 时左右相邻各开火 1 次 (+2 层)，4s 再各开火 (+2 层 -> 满 3 层)，5s 蓄能炉开火触发过载引爆！
+        bool weaponBuffed = sim.Timeline.Any(f =>
+            f.Cards.Any(c => c.InstanceId == "itm_weapon_right" && c.DamageAmount >= 14));
+        bool nonDamageCorrupted = sim.Timeline.Any(f =>
+            f.Cards.Any(c => c.InstanceId == "itm_shield_left" && c.DamageAmount > 0));
+
+        Assert.True(weaponBuffed, "过载引爆应正常给有伤害能力的友方武器增加 +4 DamageAmount");
+        Assert.False(nonDamageCorrupted, "严禁给无伤害能力的纯盾/工具物品凭空写入 DamageAmount");
+
+        // 2. 验证卡牌级直配 counterDisplays 及扩展样式字段（style/valueType/format/unit/position）完整解析下发
+        var cardLevelBadgeCard = new CustomCardDefinition
+        {
+            CustomId = "demo-badge:custom_gauge",
+            BaseVisualTemplateId = ZSwordDonorId,
+            Type = "Item",
+            Size = "Medium",
+            StartingTier = "Bronze",
+            SpawningEligibility = "Always",
+            Heroes = [HeroNames.Vanessa],
+            Tags = ["Tool"],
+            TitleZh = "热量压力表",
+            DescZh = "测试卡牌级扩展徽章声明。",
+            CounterDisplays =
+            [
+                new MechanicCounterDisplay
+                {
+                    LabelZh = "热量",
+                    SyncAttribute = "Custom_2",
+                    MaxConst = 100,
+                    ColorHex = "#EF4444",
+                    Style = "bar",
+                    ValueType = "percent",
+                    Unit = "",
+                    Position = "bottomRight",
+                }
+            ],
+            Tiers = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Bronze"] = new TierData { Attributes = new(StringComparer.OrdinalIgnoreCase) { ["CooldownMax"] = 4000, ["Custom_2"] = 25, ["BuyPrice"] = 4, ["SellPrice"] = 2 } }
+            }
+        };
+        var badgePkg = new ModPackage
+        {
+            RootDirectory = "<in-memory>",
+            Manifest = new ModManifest { Id = "demo-badge", Name = "Badge Demo", Version = "1.0.0" },
+        };
+        badgePkg.Cards.Add(cardLevelBadgeCard);
+        var regBadge = new ModRegistry(fx.BaseRepo, fx.Whitelist);
+        var repBadge = regBadge.LoadPackages([badgePkg]);
+        Assert.True(repBadge.Succeeded);
+        Assert.True(regBadge.VisualBindingsByCustomId.TryGetValue(cardLevelBadgeCard.CustomId, out var bBind));
+        var resolvedCd = Assert.Single(bBind!.CounterDisplays!);
+        Assert.Equal("热量", resolvedCd.LabelZh);
+        Assert.Equal("bar", resolvedCd.Style);
+        Assert.Equal("percent", resolvedCd.ValueType);
+        Assert.Equal("bottomRight", resolvedCd.Position);
+        Assert.Equal(100, resolvedCd.MaxValue);
+
+        // 3. 验证《过载蓄能炉》全四阶预览属性（含钻石 5 发/96 伤/3500ms）与结构化附魔预览运算表（黑曜石×2、黄金×2、致命+50、闪亮+1）完整下发
+        Assert.True(registry.VisualBindingsByCustomId.TryGetValue(OverloadCardId, out var overloadBinding));
+        Assert.NotNull(overloadBinding!.TierAttributes);
+        Assert.Equal(5, overloadBinding.TierAttributes!["Diamond"]["Custom_0"]);
+        Assert.Equal(75, overloadBinding.TierAttributes["Diamond"]["Custom_1"]);
+        Assert.Equal(32, overloadBinding.TierAttributes["Diamond"]["Custom_2"]);
+        Assert.Equal(96, overloadBinding.TierAttributes["Diamond"]["DamageAmount"]);
+        Assert.Equal(3500, overloadBinding.TierAttributes["Diamond"]["CooldownMax"]);
+        Assert.Equal(16, overloadBinding.TierAttributes["Diamond"]["SellPrice"]);
+        Assert.NotNull(overloadBinding.EnchantmentPreviewOps);
+        Assert.True(overloadBinding.EnchantmentPreviewOps!.ContainsKey("Golden"));
+        Assert.Contains(overloadBinding.EnchantmentPreviewOps["Golden"], op => op.Attribute == "SellPrice" && op.Operation == "Multiply" && Math.Abs(op.Value - 2) < 1e-6);
+        Assert.True(overloadBinding.EnchantmentPreviewOps.ContainsKey("Obsidian"));
+        Assert.Contains(overloadBinding.EnchantmentPreviewOps["Obsidian"], op => op.Attribute == "DamageAmount" && op.Operation == "Multiply" && Math.Abs(op.Value - 2) < 1e-6);
+        Assert.True(overloadBinding.EnchantmentPreviewOps.ContainsKey("Deadly"));
+        Assert.Contains(overloadBinding.EnchantmentPreviewOps["Deadly"], op => op.Attribute == "CritChance" && op.Operation == "Add" && Math.Abs(op.Value - 50) < 1e-6);
+        Assert.True(overloadBinding.EnchantmentPreviewOps.ContainsKey("Shiny"));
+        Assert.Contains(overloadBinding.EnchantmentPreviewOps["Shiny"], op => op.Attribute == "Multicast" && op.Operation == "Add" && Math.Abs(op.Value - 1) < 1e-6);
+    }
 }

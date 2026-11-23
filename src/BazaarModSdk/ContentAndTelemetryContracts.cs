@@ -135,20 +135,45 @@ public sealed class LocalizationRegexRule
 }
 
 /// <summary>
-/// 通用自定义机制卡面实时计数角标描述（由服务端解析并下发，任意自定义叠层/充能/倒计时机制共用）。
+/// 通用自定义机制/数值卡面实时徽章描述（由服务端解析并下发，任意叠层、充能、进度、倍率、倒计时或状态机制共用）。
 /// </summary>
 public sealed class CardCounterDisplayInfo
 {
-    /// <summary>角标中文短名（如「过载」「剑意」「热量」）。</summary>
+    /// <summary>徽章中文短名（如「过载」「剑意」「热量」；留空时仅展示纯数值/晶球）。</summary>
     public string LabelZh { get; set; } = string.Empty;
-    /// <summary>绑定的原生同步属性槽（Custom_0..Custom_8）。</summary>
+    /// <summary>绑定的原生同步属性槽（Custom_0..Custom_9 或任意 ECardAttributeType 名称）。</summary>
     public string SyncAttribute { get; set; } = "Custom_3";
-    /// <summary>可选上限值（存在时按「当前/上限」展示）。</summary>
+    /// <summary>可选上限值（存在时按晶球/进度条或「当前/上限」展示）。</summary>
     public int? MaxValue { get; set; }
-    /// <summary>角标高光色（十六进制如 "#F97316"）。</summary>
+    /// <summary>徽章主题高光色（十六进制如 "#F97316"）。</summary>
     public string? ColorHex { get; set; }
     /// <summary>为 true 时计数为 0 自动隐藏。</summary>
     public bool HideWhenZero { get; set; }
+    /// <summary>视觉样式：auto（默认：2..6 上限用晶球 pips，>6 用进度条 bar，无上限用宝石 gem）| pips | bar | gem | pill。</summary>
+    public string? Style { get; set; }
+    /// <summary>数值语义类型：count（默认）| progress | percent | seconds | multiplier | delta。</summary>
+    public string? ValueType { get; set; }
+    /// <summary>可选自定义格式模板（支持 {label} / {value} / {max} / {unit}）。</summary>
+    public string? Format { get; set; }
+    /// <summary>可选短单位后缀（如「层」「秒」「%」）。</summary>
+    public string? Unit { get; set; }
+    /// <summary>锚点位置：bottom（默认底框中右，避开左下角价格菱标）| bottomRight | topLeft | topRight。</summary>
+    public string? Position { get; set; }
+}
+
+/// <summary>
+/// 通用附魔/形态预览属性运算条目（支持任意 Add / Subtract / Multiply / AdditiveMultiply / Set 以及按源属性引用计算）。
+/// </summary>
+public sealed class CardPreviewAttrOp
+{
+    /// <summary>目标属性名（如 DamageAmount / SellPrice / CritChance / Multicast）。</summary>
+    public string Attribute { get; set; } = string.Empty;
+    /// <summary>运算类型：Set | Add | Subtract | Multiply | AdditiveMultiply。</summary>
+    public string Operation { get; set; } = "Set";
+    /// <summary>运算常数值。</summary>
+    public double Value { get; set; }
+    /// <summary>可选：动态引用当前卡牌另一属性（如 Shielded 引用 DamageAmount）。</summary>
+    public string? SourceAttribute { get; set; }
 }
 
 /// <summary>
@@ -189,8 +214,11 @@ public sealed class CardTextOverride
     /// <summary>附加纯展示标签（不改动底层 Card.Tags，确保联机协议与巴扎罗盘兼容）。</summary>
     public string[]? ExtraDisplayTags { get; set; }
 
-    /// <summary>四阶属性表（Bronze/Silver/Gold/Diamond），供局内自定义卡升级预览精准渲染下一阶数值。</summary>
+    /// <summary>五阶属性表（Bronze/Silver/Gold/Diamond/Legendary），供局内自定义卡升阶对比与详情预览精准渲染各阶数值。</summary>
     public Dictionary<string, Dictionary<string, double>>? TierAttributes { get; set; }
+
+    /// <summary>附魔预览属性运算表（EnchantmentName → 运算条目），供详情弹窗切换附魔时 100% 准确推演面板与提示数值。</summary>
+    public Dictionary<string, CardPreviewAttrOp[]>? EnchantmentPreviewOps { get; set; }
 
     /// <summary>通用机制实时计数角标列表（如过载 2/3、剑意 4/5 等）。</summary>
     public CardCounterDisplayInfo[]? CounterDisplays { get; set; }

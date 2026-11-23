@@ -40,7 +40,7 @@
           "defaultValue": "Fireball"
         }
       ],
-      "tooltipTemplateZh": "满 {threshold} 层过载时开火引爆：连射 {attr.Custom_0} 发火球（每发 {attr.Custom_1} 伤），全队其他物品本战 +{attr.Custom_2} 伤害，本卡减 {selfCdrPct}% 冷却（当前过载：{attr.Custom_3}/{threshold}）",
+      "tooltipTemplateZh": "满 {threshold} 层过载时开火引爆：连射 {attr.Custom_0} 发火球（每发 {attr.Custom_1} 伤），其他友方伤害物品本战 +{attr.Custom_2} 伤害，本卡减 {selfCdrPct}% 冷却（当前过载：{attr.Custom_3}/{threshold}）",
       "counterDisplay": {
         "labelZh": "过载",
         "syncAttribute": "Custom_3",

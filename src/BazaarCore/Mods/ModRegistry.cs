@@ -456,12 +456,23 @@ public sealed class ModRegistry : IModContentRegistry
                         AccentColor = binding.AccentColor
                     };
                 }
-                if (mergedCardsById.TryGetValue(cid, out var mergedTpl) && mergedTpl.CustomMechanics is { Count: > 0 })
+                if (mergedCardsById.TryGetValue(cid, out var mergedTpl))
                 {
-                    var displays = ResolveCounterDisplaysForCard(mergedTpl.CustomMechanics, mechanicsMap);
-                    if (displays.Count > 0)
-                        resolved.CounterDisplays = displays;
+                    // 从最终合并后的卡牌模板补全五阶属性与附魔预览运算表，确保自定义卡与原位平衡补丁卡在详情预览 100% 准确
+                    var mergedTiers = BuildTierAttributesFromTemplate(mergedTpl);
+                    if (mergedTiers is { Count: > 0 })
+                        resolved.TierAttributes = mergedTiers;
+                    var mergedEnchOps = ExtractEnchantmentPreviewOps(mergedTpl.Enchantments);
+                    if (mergedEnchOps is { Count: > 0 })
+                        resolved.EnchantmentPreviewOps = mergedEnchOps;
                 }
+                var cardDef = pkg.Cards.FirstOrDefault(c => string.Equals(c.CustomId, cid, StringComparison.OrdinalIgnoreCase));
+                IReadOnlyList<CardMechanicAttachment>? mechs = mergedCardsById.TryGetValue(cid, out var mergedForMech)
+                    ? mergedForMech.CustomMechanics
+                    : null;
+                var displays = ResolveCounterDisplaysForCard(cardDef?.CounterDisplays, mechs, mechanicsMap);
+                if (displays.Count > 0)
+                    resolved.CounterDisplays = displays;
                 visualBindingsMap[cid] = resolved;
             }
 
@@ -806,18 +817,147 @@ public sealed class ModRegistry : IModContentRegistry
         return dto;
     }
 
+    /// <summary>从合并后的卡牌模板构造完整五阶基础属性表（Bronze..Legendary），兼容全新自定义卡与原位平衡补丁卡。</summary>
+    internal static Dictionary<string, Dictionary<string, double>>? BuildTierAttributesFromTemplate(CardTemplate tpl)
+    {
+        if (tpl?.Tiers == null || tpl.Tiers.Count == 0) return null;
+        var res = new Dictionary<string, Dictionary<string, double>>(StringComparer.OrdinalIgnoreCase);
+        var running = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        bool started = false;
+        foreach (var tierName in new[] { "Bronze", "Silver", "Gold", "Diamond", "Legendary" })
+        {
+            bool hasExplicit = tpl.Tiers.TryGetValue(tierName, out var td) && td != null;
+            if (hasExplicit)
+            {
+                started = true;
+                if (td!.Attributes != null)
+                {
+                    foreach (var (k, v) in td.Attributes)
+                        running[k] = v;
+                }
+            }
+            if (started && running.Count > 0 && (hasExplicit || !tierName.Equals("Legendary", StringComparison.OrdinalIgnoreCase)))
+                res[tierName] = new Dictionary<string, double>(running, StringComparer.OrdinalIgnoreCase);
+        }
+        return res.Count > 0 ? res : null;
+    }
+
     /// <summary>
-    /// 通用解析某张卡牌挂载的全部自定义机制的实时计数角标配置：
-    /// 1. 优先消费机制显式声明的 counterDisplay（自动解析 maxParam 参数或 maxConst 常量）；
-    /// 2. 若机制未手写 counterDisplay，但步骤流中使用了 ModifyCounter + syncAttribute，则自动推导默认角标，
-    ///    确保任意玩家/开发者自创的叠层、充能、倒计时机制都能开箱即得实时卡面进度显示。
+    /// 通用提取卡牌全部附魔的预览属性运算表：
+    /// 1. 收集 enchantments[name].attributes 中的直接属性（对 Multicast=1 兼容官方增量约定为 Add 1）；
+    /// 2. 收集 enchantments[name].auras 中作用于自身（TTargetCardSelf）的 TAuraActionCardModifyAttribute（覆盖黑曜石×2/黄金×2/致命+50/闪亮+1/任意自定义附魔）。
+    /// </summary>
+    internal static Dictionary<string, List<ResolvedPreviewAttrOp>>? ExtractEnchantmentPreviewOps(
+        Dictionary<string, EnchantmentData>? enchantments)
+    {
+        if (enchantments == null || enchantments.Count == 0) return null;
+        var result = new Dictionary<string, List<ResolvedPreviewAttrOp>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (enchName, ench) in enchantments)
+        {
+            if (string.IsNullOrWhiteSpace(enchName) || ench == null) continue;
+            var ops = new List<ResolvedPreviewAttrOp>();
+
+            if (ench.Attributes != null)
+            {
+                foreach (var (attrKey, attrVal) in ench.Attributes)
+                {
+                    if (string.IsNullOrWhiteSpace(attrKey)) continue;
+                    // 与 CardInstance.RebuildTierAndEnchantmentData (L709) 严格同源：ench.Attributes 统一按 Add 语义叠加（客户端对 Multicast 自动按隐含基准 1 累加）
+                    ops.Add(new ResolvedPreviewAttrOp
+                    {
+                        Attribute = attrKey,
+                        Operation = "Add",
+                        Value = attrVal
+                    });
+                }
+            }
+
+            if (ench.Auras != null)
+            {
+                foreach (var aura in ench.Auras.Values)
+                {
+                    var act = aura?.Action;
+                    if (act == null || !string.Equals(act.Type, "TAuraActionCardModifyAttribute", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (act.Target != null && !string.Equals(act.Target.Type, "TTargetCardSelf", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (string.IsNullOrWhiteSpace(act.AttributeType))
+                        continue;
+
+                    string opName = string.IsNullOrWhiteSpace(act.Operation) ? "Add" : act.Operation!;
+                    double? fixedNum = act.GetFixedNumericValue();
+                    string? srcAttr = null;
+                    if (!fixedNum.HasValue)
+                    {
+                        var vn = act.GetValueNode(Data.GameDatabaseLoader.JsonOptions);
+                        fixedNum = vn?.GetFixedNumericValue();
+                        if (!fixedNum.HasValue && vn != null && !string.IsNullOrWhiteSpace(vn.AttributeType))
+                        {
+                            srcAttr = vn.AttributeType;
+                        }
+                    }
+
+                    if (fixedNum.HasValue || !string.IsNullOrEmpty(srcAttr))
+                    {
+                        ops.Add(new ResolvedPreviewAttrOp
+                        {
+                            Attribute = act.AttributeType!,
+                            Operation = opName,
+                            Value = fixedNum ?? 0,
+                            SourceAttribute = srcAttr
+                        });
+                    }
+                }
+            }
+
+            result[enchName.Trim()] = ops;
+        }
+
+        return result.Count > 0 ? result : null;
+    }
+
+    /// <summary>
+    /// 通用解析某张卡牌的实时数值徽章配置（支持卡牌级直配 + 机制级显式声明 + ModifyCounter 自动推导）：
+    /// 1. 优先消费卡牌自身声明的 counterDisplays（不依赖机制钩子即可展示任意 Custom_0..Custom_9 或原生属性）；
+    /// 2. 其次消费机制显式声明的 counterDisplay（自动解析 maxParam 参数或 maxConst 常量）；
+    /// 3. 若机制未手写 counterDisplay，但步骤流中使用了 ModifyCounter + syncAttribute，则自动推导默认徽章，
+    ///    确保任意玩家/开发者自创的叠层、充能、进度、倒计时机制都能开箱即得原生 3D 实时卡面显示。
     /// </summary>
     private static List<ResolvedCounterDisplay> ResolveCounterDisplaysForCard(
-        IReadOnlyList<CardMechanicAttachment> attachments,
+        IReadOnlyList<MechanicCounterDisplay>? cardLevelDisplays,
+        IReadOnlyList<CardMechanicAttachment>? attachments,
         IReadOnlyDictionary<string, MechanicDefinition> mechanicsMap)
     {
         var list = new List<ResolvedCounterDisplay>();
         var usedSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (cardLevelDisplays is { Count: > 0 })
+        {
+            foreach (var cd in cardLevelDisplays)
+            {
+                if (cd == null || string.IsNullOrWhiteSpace(cd.SyncAttribute)) continue;
+                string slot = cd.SyncAttribute.Trim();
+                if (!usedSlots.Add(slot)) continue;
+
+                list.Add(new ResolvedCounterDisplay
+                {
+                    LabelZh = cd.LabelZh?.Trim() ?? string.Empty,
+                    SyncAttribute = slot,
+                    MaxValue = cd.MaxConst,
+                    ColorHex = string.IsNullOrWhiteSpace(cd.ColorHex) ? "#F97316" : cd.ColorHex!.Trim(),
+                    HideWhenZero = cd.HideWhenZero,
+                    Style = string.IsNullOrWhiteSpace(cd.Style) ? null : cd.Style!.Trim(),
+                    ValueType = string.IsNullOrWhiteSpace(cd.ValueType) ? null : cd.ValueType!.Trim(),
+                    Format = string.IsNullOrWhiteSpace(cd.Format) ? null : cd.Format!.Trim(),
+                    Unit = string.IsNullOrWhiteSpace(cd.Unit) ? null : cd.Unit!.Trim(),
+                    Position = string.IsNullOrWhiteSpace(cd.Position) ? null : cd.Position!.Trim()
+                });
+            }
+        }
+
+        if (attachments is null || attachments.Count == 0)
+            return list;
 
         foreach (var att in attachments)
         {
@@ -840,7 +980,12 @@ public sealed class ModRegistry : IModContentRegistry
                     SyncAttribute = slot,
                     MaxValue = maxVal,
                     ColorHex = string.IsNullOrWhiteSpace(cd.ColorHex) ? "#F97316" : cd.ColorHex!.Trim(),
-                    HideWhenZero = cd.HideWhenZero
+                    HideWhenZero = cd.HideWhenZero,
+                    Style = string.IsNullOrWhiteSpace(cd.Style) ? null : cd.Style!.Trim(),
+                    ValueType = string.IsNullOrWhiteSpace(cd.ValueType) ? null : cd.ValueType!.Trim(),
+                    Format = string.IsNullOrWhiteSpace(cd.Format) ? null : cd.Format!.Trim(),
+                    Unit = string.IsNullOrWhiteSpace(cd.Unit) ? null : cd.Unit!.Trim(),
+                    Position = string.IsNullOrWhiteSpace(cd.Position) ? null : cd.Position!.Trim()
                 });
                 continue;
             }

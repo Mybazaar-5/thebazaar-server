@@ -137,6 +137,11 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
     private static PropertyInfo _tooltipCardInstanceProp;
     private static PropertyInfo _tooltipCardTemplateProp;
     private static PropertyInfo _tooltipCanFuseProp;
+    private static MethodInfo _lockCreateTierOptionMethod;
+    private static MethodInfo _lockCreateNoneEnchOptionMethod;
+    private static MethodInfo _lockCreateEnchOptionMethod;
+    private static Type _cardTierOptionType;
+    private static Type _cardEnchOptionType;
     private static readonly ConcurrentDictionary<Type, CardMemberCache> _cardMembersByType = new();
     private static readonly HashSet<string> DurationAttrNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -567,6 +572,31 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         return hasCjk;
     }
 
+    /// <summary>按卡实例/自定义ID/模板ID查询结构化元数据（TierAttributes/EnchantmentPreviewOps/CounterDisplays），不受界面中英文语言限制。</summary>
+    internal bool TryResolveCardMetadata(
+        string instanceId,
+        string customCardId,
+        string templateId,
+        out CardTextOverride cardOverride)
+    {
+        cardOverride = null;
+        var snapshots = _snapshots;
+        if (snapshots == null || snapshots.Count == 0) return false;
+
+        string loc = NormalizeLocale(CurrentLocale);
+        if (snapshots.TryGetValue(loc, out var curSnap) && TryMatchCardOverrideFromSnapshot(curSnap, instanceId, customCardId, templateId, out cardOverride))
+        {
+            return true;
+        }
+        if (!string.Equals(loc, "zh-CN", StringComparison.OrdinalIgnoreCase)
+            && snapshots.TryGetValue("zh-CN", out var zhSnap)
+            && TryMatchCardOverrideFromSnapshot(zhSnap, instanceId, customCardId, templateId, out cardOverride))
+        {
+            return true;
+        }
+        return false;
+    }
+
     public bool TryResolveCardText(
         string locale,
         string instanceId,
@@ -583,6 +613,19 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         {
             return false;
         }
+
+        return TryMatchCardOverrideFromSnapshot(snap, instanceId, customCardId, templateId, out cardOverride);
+    }
+
+    private static bool TryMatchCardOverrideFromSnapshot(
+        LocaleSnapshot snap,
+        string instanceId,
+        string customCardId,
+        string templateId,
+        out CardTextOverride cardOverride)
+    {
+        cardOverride = null;
+        if (snap == null || snap.CardOverrides.Length == 0) return false;
 
         int bestScore = -1;
         var arr = snap.CardOverrides;
@@ -968,6 +1011,65 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                     optional: true,
                     label: "L10n.CardTooltipData.GetBaseValueFromCardTemplate");
             }
+
+            // 阶段 8 通用详情/升阶/附魔预览全链路拦截：彻底切断原版借壳模板属性渗入自定义卡预览
+            var cardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.Card");
+            var itemCardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.ItemCard");
+            var itCardType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Cards.ITCard");
+            var tCardItemType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Cards.Item.TCardItem");
+            var cardExtType = GameInspector.FindTypeSafe("TheBazaar.CardExtensions");
+            if (cardExtType != null && cardType != null && itCardType != null)
+            {
+                patcher.TryPatch(
+                    cardExtType,
+                    "BuildAttributeDictionaryForTier",
+                    new[] { cardType, itCardType, typeof(ETier) },
+                    prefix: AccessTools.Method(typeof(LocalizationOverlayModule), nameof(BuildAttributeDictionaryForTierPrefix)),
+                    optional: true,
+                    label: "L10n.CardExtensions.BuildAttributeDictionaryForTier");
+            }
+            if (cardExtType != null && tCardItemType != null && itemCardType != null)
+            {
+                patcher.TryPatch(
+                    cardExtType,
+                    "ApplyPreviewEnchantment",
+                    new[] { tCardItemType, itemCardType, typeof(Dictionary<ECardAttributeType, int>), typeof(EEnchantmentType?) },
+                    prefix: AccessTools.Method(typeof(LocalizationOverlayModule), nameof(ApplyPreviewEnchantmentPrefix)),
+                    optional: true,
+                    label: "L10n.CardExtensions.ApplyPreviewEnchantment");
+            }
+
+            var lockOptType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.LockMode.CardLockVariantOptions");
+            if (lockOptType != null)
+            {
+                _cardTierOptionType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.LockMode.CardTierOption");
+                _cardEnchOptionType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.LockMode.CardEnchantmentOption");
+                _lockCreateTierOptionMethod = AccessTools.Method(lockOptType, "CreateTierOption", new[] { typeof(ETier) });
+                _lockCreateNoneEnchOptionMethod = AccessTools.Method(lockOptType, "CreateNoneEnchantmentOption", Type.EmptyTypes);
+                _lockCreateEnchOptionMethod = AccessTools.Method(lockOptType, "CreateEnchantmentOption", new[] { typeof(EEnchantmentType) });
+
+                var buildTierM = AccessTools.Method(lockOptType, "BuildTierOptions", new[] { tooltipType });
+                if (buildTierM != null)
+                {
+                    patcher.TryPatchMethod(
+                        buildTierM,
+                        postfix: AccessTools.Method(typeof(LocalizationOverlayModule), nameof(BuildLockTierOptionsPostfix)),
+                        optional: true,
+                        label: "L10n.CardLockVariantOptions.BuildTierOptions");
+                }
+                if (cardType != null)
+                {
+                    var buildEnchM = AccessTools.Method(lockOptType, "BuildEnchantmentOptions", new[] { cardType });
+                    if (buildEnchM != null)
+                    {
+                        patcher.TryPatchMethod(
+                            buildEnchM,
+                            postfix: AccessTools.Method(typeof(LocalizationOverlayModule), nameof(BuildLockEnchantmentOptionsPostfix)),
+                            optional: true,
+                            label: "L10n.CardLockVariantOptions.BuildEnchantmentOptions");
+                    }
+                }
+            }
         }
     }
 
@@ -1223,6 +1325,325 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             }
         }
         catch { }
+    }
+
+    // ── 通用自定义卡/补丁卡 详情与品阶/附魔预览全链路拦截 ─────────────────────
+
+    private static readonly string[] OrderedTierNames = { "Bronze", "Silver", "Gold", "Diamond", "Legendary" };
+
+    private static bool TryResolveOverrideForCardObject(object cardObj, object cardTemplateObj, out CardTextOverride ov)
+    {
+        ov = null;
+        var inst = Instance;
+        if (inst == null) return false;
+
+        string iid = null;
+        string tplId = null;
+        if (cardObj != null)
+        {
+            var members = GetCardMemberCache(cardObj.GetType());
+            iid = SafeGetPropertyValue(members.InstanceId, cardObj)?.ToString();
+            tplId = SafeGetPropertyValue(members.TemplateId, cardObj)?.ToString();
+        }
+        if (string.IsNullOrEmpty(tplId) && cardTemplateObj != null)
+        {
+            var tplMembers = GetCardMemberCache(cardTemplateObj.GetType());
+            tplId = SafeGetPropertyValue(tplMembers.Id, cardTemplateObj)?.ToString();
+        }
+        return inst.TryResolveCardMetadata(iid, null, tplId, out ov) && ov != null;
+    }
+
+    private static Dictionary<string, double> SelectBestTierAttrMap(
+        Dictionary<string, Dictionary<string, double>> tierAttrs,
+        ETier requestedTier)
+    {
+        if (tierAttrs == null || tierAttrs.Count == 0) return null;
+        string reqName = requestedTier.ToString();
+        if (tierAttrs.TryGetValue(reqName, out var exact) && exact != null)
+            return exact;
+
+        int reqIdx = Array.FindIndex(OrderedTierNames, t => string.Equals(t, reqName, StringComparison.OrdinalIgnoreCase));
+        if (reqIdx >= 0)
+        {
+            for (int i = reqIdx - 1; i >= 0; i--)
+            {
+                if (tierAttrs.TryGetValue(OrderedTierNames[i], out var lower) && lower != null)
+                    return lower;
+            }
+            for (int i = reqIdx + 1; i < OrderedTierNames.Length; i++)
+            {
+                if (tierAttrs.TryGetValue(OrderedTierNames[i], out var higher) && higher != null)
+                    return higher;
+            }
+        }
+        foreach (var kv in tierAttrs)
+        {
+            if (kv.Value != null) return kv.Value;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 通用拦截 CardExtensions.BuildAttributeDictionaryForTier：
+    /// 命中自定义 Mod 卡或原位平衡补丁卡时，直接按服务端同步的真实五阶 TierAttributes 构造预览属性表，
+    /// 彻底阻断原版借壳模板（如 Z-Sword 钻石 Custom_0=20、CooldownMax=5000）污染 3D 宝石、冷却圈、售价与词条数值。
+    /// </summary>
+    private static bool BuildAttributeDictionaryForTierPrefix(
+        object cardInstance,
+        object cardTemplate,
+        ETier tier,
+        ref Dictionary<ECardAttributeType, int> __result)
+    {
+        try
+        {
+            if (!TryResolveOverrideForCardObject(cardInstance, cardTemplate, out var ov)
+                || ov?.TierAttributes == null || ov.TierAttributes.Count == 0)
+            {
+                return true;
+            }
+
+            var targetTierMap = SelectBestTierAttrMap(ov.TierAttributes, tier);
+            if (targetTierMap == null)
+            {
+                return true;
+            }
+
+            // 收集该卡任意品阶或附魔运算中出现过的受管属性键：切阶/去附魔时绝不残留旧阶或旧附魔脏值
+            var managedKeys = new HashSet<ECardAttributeType>();
+            foreach (var tm in ov.TierAttributes.Values)
+            {
+                if (tm == null) continue;
+                foreach (var k in tm.Keys)
+                {
+                    if (Enum.TryParse<ECardAttributeType>(k, ignoreCase: true, out var e))
+                        managedKeys.Add(e);
+                }
+            }
+            if (ov.EnchantmentPreviewOps != null)
+            {
+                foreach (var ops in ov.EnchantmentPreviewOps.Values)
+                {
+                    if (ops == null) continue;
+                    for (int i = 0; i < ops.Length; i++)
+                    {
+                        if (!string.IsNullOrEmpty(ops[i]?.Attribute)
+                            && Enum.TryParse<ECardAttributeType>(ops[i].Attribute, ignoreCase: true, out var e))
+                        {
+                            managedKeys.Add(e);
+                        }
+                    }
+                }
+            }
+
+            var dict = new Dictionary<ECardAttributeType, int>();
+
+            // 仅保留非受管结构属性（如非品阶/非附魔控制的基础元数据），随后全量写入目标品阶的真实基础数值
+            if (cardInstance != null)
+            {
+                var members = GetCardMemberCache(cardInstance.GetType());
+                if (SafeGetPropertyValue(members.Attributes, cardInstance) is IDictionary curAttrs)
+                {
+                    foreach (DictionaryEntry kv in curAttrs)
+                    {
+                        if (kv.Key is ECardAttributeType attrEnum && !managedKeys.Contains(attrEnum) && kv.Value != null)
+                        {
+                            try { dict[attrEnum] = Convert.ToInt32(kv.Value); } catch { }
+                        }
+                    }
+                }
+            }
+
+            foreach (var kv in targetTierMap)
+            {
+                if (Enum.TryParse<ECardAttributeType>(kv.Key, ignoreCase: true, out var attrEnum))
+                {
+                    dict[attrEnum] = (int)Math.Round(kv.Value);
+                }
+            }
+
+            __result = dict;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LogL10nHookErrorThrottled(nameof(BuildAttributeDictionaryForTierPrefix), ex);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 通用拦截 CardExtensions.ApplyPreviewEnchantment：
+    /// 命中自定义 Mod 卡或原位补丁卡时，按服务端同步的 EnchantmentPreviewOps 应用附魔运算（涵盖 Add/Subtract/Multiply/Set/属性引用），
+    /// 彻底避免回退套用原版借壳模板的附魔数值。
+    /// </summary>
+    private static bool ApplyPreviewEnchantmentPrefix(
+        object itemTemplate,
+        object previewItemCard,
+        Dictionary<ECardAttributeType, int> previewAttributes,
+        EEnchantmentType? selectedEnchantment)
+    {
+        try
+        {
+            if (previewItemCard == null) return true;
+            if (!TryResolveOverrideForCardObject(previewItemCard, itemTemplate, out var ov))
+            {
+                return true;
+            }
+            bool isModdedCard = (ov.TierAttributes != null && ov.TierAttributes.Count > 0)
+                || (ov.EnchantmentPreviewOps != null && ov.EnchantmentPreviewOps.Count > 0)
+                || (ov.EnchantmentTooltips != null && ov.EnchantmentTooltips.Count > 0);
+            if (!isModdedCard)
+            {
+                return true;
+            }
+
+            var members = GetCardMemberCache(previewItemCard.GetType());
+            if (members.Enchantment != null && members.Enchantment.CanWrite)
+            {
+                members.Enchantment.SetValue(previewItemCard, selectedEnchantment);
+            }
+
+            if (selectedEnchantment.HasValue && previewAttributes != null && ov.EnchantmentPreviewOps != null
+                && ov.EnchantmentPreviewOps.TryGetValue(selectedEnchantment.Value.ToString(), out var ops) && ops != null)
+            {
+                for (int i = 0; i < ops.Length; i++)
+                {
+                    var op = ops[i];
+                    if (op == null || string.IsNullOrWhiteSpace(op.Attribute)) continue;
+                    if (!Enum.TryParse<ECardAttributeType>(op.Attribute, ignoreCase: true, out var attrEnum)) continue;
+
+                    double operand = op.Value;
+                    if (!string.IsNullOrWhiteSpace(op.SourceAttribute)
+                        && Enum.TryParse<ECardAttributeType>(op.SourceAttribute, ignoreCase: true, out var srcEnum)
+                        && previewAttributes.TryGetValue(srcEnum, out int srcInt))
+                    {
+                        operand = srcInt;
+                    }
+
+                    double cur = previewAttributes.TryGetValue(attrEnum, out int existing)
+                        ? existing
+                        : (attrEnum == ECardAttributeType.Multicast ? 1 : 0);
+
+                    string opKind = op.Operation?.Trim() ?? "Set";
+                    double next;
+                    if (string.Equals(opKind, "Add", StringComparison.OrdinalIgnoreCase))
+                        next = cur + operand;
+                    else if (string.Equals(opKind, "Subtract", StringComparison.OrdinalIgnoreCase))
+                        next = Math.Max(0, cur - operand);
+                    else if (string.Equals(opKind, "Multiply", StringComparison.OrdinalIgnoreCase))
+                        next = cur * operand;
+                    else if (string.Equals(opKind, "AdditiveMultiply", StringComparison.OrdinalIgnoreCase))
+                        next = cur * (1.0 + operand);
+                    else
+                        next = operand;
+
+                    previewAttributes[attrEnum] = (int)Math.Round(next);
+                }
+            }
+
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LogL10nHookErrorThrottled(nameof(ApplyPreviewEnchantmentPrefix), ex);
+            return true;
+        }
+    }
+
+    /// <summary>同步对齐详情弹窗的「级别」下拉菜单，确保任意自定义卡（含借用高阶/低阶借壳或传奇卡）显示自身真实品阶列表。</summary>
+    private static void BuildLockTierOptionsPostfix(object tooltipData, ref object __result)
+    {
+        try
+        {
+            if (tooltipData == null || _lockCreateTierOptionMethod == null || _cardTierOptionType == null) return;
+            object cardInst = SafeGetPropertyValue(_tooltipCardInstanceProp, tooltipData);
+            object cardTpl = SafeGetPropertyValue(_tooltipCardTemplateProp, tooltipData);
+            if (!TryResolveOverrideForCardObject(cardInst, cardTpl, out var ov)
+                || ov?.TierAttributes == null || ov.TierAttributes.Count == 0)
+            {
+                return;
+            }
+
+            var tiers = new List<ETier>();
+            foreach (string tn in OrderedTierNames)
+            {
+                if (ov.TierAttributes.ContainsKey(tn) && Enum.TryParse<ETier>(tn, ignoreCase: true, out var parsedTier))
+                {
+                    tiers.Add(parsedTier);
+                }
+            }
+            if (cardInst != null)
+            {
+                var members = GetCardMemberCache(cardInst.GetType());
+                if (SafeGetPropertyValue(members.Tier, cardInst) is ETier curTier && !tiers.Contains(curTier))
+                {
+                    tiers.Add(curTier);
+                    tiers.Sort();
+                }
+            }
+            if (tiers.Count == 0) return;
+
+            var listType = typeof(List<>).MakeGenericType(_cardTierOptionType);
+            if (Activator.CreateInstance(listType) is not IList newList) return;
+            for (int i = 0; i < tiers.Count; i++)
+            {
+                object opt = _lockCreateTierOptionMethod.Invoke(null, new object[] { tiers[i] });
+                if (opt != null) newList.Add(opt);
+            }
+            if (newList.Count > 0) __result = newList;
+        }
+        catch (Exception ex)
+        {
+            LogL10nHookErrorThrottled(nameof(BuildLockTierOptionsPostfix), ex);
+        }
+    }
+
+    /// <summary>同步对齐详情弹窗的「附魔」下拉菜单，确保任意自定义卡显示自身真实支持的附魔选项清单。</summary>
+    private static void BuildLockEnchantmentOptionsPostfix(object cardInstance, ref object __result)
+    {
+        try
+        {
+            if (cardInstance == null || _lockCreateNoneEnchOptionMethod == null || _lockCreateEnchOptionMethod == null || _cardEnchOptionType == null) return;
+            if (!TryResolveOverrideForCardObject(cardInstance, null, out var ov)) return;
+            bool hasOps = ov.EnchantmentPreviewOps != null && ov.EnchantmentPreviewOps.Count > 0;
+            bool hasTips = ov.EnchantmentTooltips != null && ov.EnchantmentTooltips.Count > 0;
+            if (!hasOps && !hasTips) return;
+
+            var enchSet = new HashSet<EEnchantmentType>();
+            if (hasOps)
+            {
+                foreach (var k in ov.EnchantmentPreviewOps.Keys)
+                {
+                    if (Enum.TryParse<EEnchantmentType>(k, ignoreCase: true, out var e)) enchSet.Add(e);
+                }
+            }
+            if (hasTips)
+            {
+                foreach (var k in ov.EnchantmentTooltips.Keys)
+                {
+                    if (Enum.TryParse<EEnchantmentType>(k, ignoreCase: true, out var e)) enchSet.Add(e);
+                }
+            }
+            if (enchSet.Count == 0) return;
+
+            var ordered = new List<EEnchantmentType>(enchSet);
+            ordered.Sort();
+
+            var listType = typeof(List<>).MakeGenericType(_cardEnchOptionType);
+            if (Activator.CreateInstance(listType) is not IList newList) return;
+            object noneOpt = _lockCreateNoneEnchOptionMethod.Invoke(null, null);
+            if (noneOpt != null) newList.Add(noneOpt);
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                object opt = _lockCreateEnchOptionMethod.Invoke(null, new object[] { ordered[i] });
+                if (opt != null) newList.Add(opt);
+            }
+            if (newList.Count > 0) __result = newList;
+        }
+        catch (Exception ex)
+        {
+            LogL10nHookErrorThrottled(nameof(BuildLockEnchantmentOptionsPostfix), ex);
+        }
     }
 
     // ── 工具方法 ─────────────────────────────────────────────────────────────

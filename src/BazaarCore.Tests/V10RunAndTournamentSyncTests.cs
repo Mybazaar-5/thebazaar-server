@@ -693,7 +693,9 @@ public sealed class V10RunAndTournamentSyncTests
         Assert.NotEqual(99, spawnSim.Opponent.Attributes[EPlayerAttributeType.Income]);
         Assert.Equal(5, spawnSim.Opponent.Attributes[EPlayerAttributeType.Income]);
 
-        // PvP 挑战卡与多余遭遇卡在 CombatSpawnSim 前已彻底 Dispose，绝不出现在地毯或 oppEntries 中
+        // PvP 挑战卡先发 CardPurchased(Socket=null) 移入 21 号对手头像槽（触发 BeginPVPTransition 与 IsActivePvpEncounterPortrait 保护），
+        // 再发 CardDisposed 且绝不残留在服务端 Cards、SelectionSet 或对手地毯 Socket_5 中
+        Assert.Contains(spawnSim.Events.OfType<GameSimEventCardPurchased>(), p => p.InstanceId == pvpCard.InstanceId && p.LeftSocketId == null);
         Assert.Contains(spawnSim.Events.OfType<GameSimEventCardDisposed>(), d => d.InstanceId == pvpCard.InstanceId);
         Assert.Contains(spawnSim.Events.OfType<GameSimEventCardDisposed>(), d => d.InstanceId == strayChoice.InstanceId);
         Assert.False(spawnSim.Cards.ContainsKey(pvpCard.InstanceId));

@@ -211,7 +211,7 @@ public static class MechanicSandboxInterpreter
                         k => ResolveParamString(k, def, attachment),
                         k => ResolveParamNumber(k, def, attachment));
                     for (int t = 0; t < targets.Count; t++)
-                        runtime.ModifyCardAttribute(targets[t], attr, step.Operation ?? "Add", val, permanent);
+                        runtime.ModifyCardAttribute(targets[t], attr, step.Operation ?? "Add", val, permanent, step.GrantIfMissing);
                     break;
                 }
 
