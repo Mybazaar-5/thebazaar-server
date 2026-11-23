@@ -1293,6 +1293,13 @@ internal sealed partial class CustomGameplayUI
                     r.StartingExperience = 0;
                     r.StartingPrestige = 20;
                     r.StartingHealth = 250;
+                    // 同步清零预设遗留的隐藏倍率与额外野怪自选次数，避免从爽玩/肉鸽切回标准数值后仍隐形锁死 2 选
+                    r.MonsterLootBonusChoices = 0;
+                    r.MonsterLootTierBonus = 0;
+                    r.ShopHighTierBonusPct = 0.0;
+                    r.ShopPriceMultiplier = 1.0;
+                    r.EnemyStatMultiplier = 1.0;
+                    r.DisableFatesRevive = false;
                     b?.SyncFromRules(r);
                 }
                 SyncStatsInputs(w, getRules(), getBuf());

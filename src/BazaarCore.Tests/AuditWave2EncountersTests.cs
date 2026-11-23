@@ -517,54 +517,23 @@ public sealed class AuditWave2EncountersTests
             }
         }
 
-        // 2. Star Chart Treasure (34c27d0d)：未持 Star Chart 时 0 触发；持 Star Chart 时按 ~10% 触发；且遵守 ShouldProgressHour=false
+        // 2. Star Chart Treasure (34c27d0d)：经 Patch 20.2 多源核验确认已淘汰（0 样本，现行 Star Chart 联动位于 The Docks），
+        //    即便持有 Star Chart 也不再在常规小时中自动触发 Takeover。
         var scGuid = Guid.Parse(CardPool.StarChartTreasureEncounterId);
-        var noScRun = new RunState
-        {
-            RunId = "sc_none",
-            GameModeId = Pool.Value.DefaultGameModeId,
-            Hero = EHero.Vanessa,
-            Day = 3,
-            Hour = 2,
-            RngSeed = 15200,
-            CustomRules = new CustomRunRuleSet(),
-        };
-        var noScShop = new ShopEngine(noScRun, Pool.Value, Repo.Value, noScRun.CustomRules);
-        for (int i = 0; i < 250; i++)
-        {
-            noScRun.VisitedDayEncounterIds.Clear();
-            noScShop.DealHourEncounters();
-            Assert.DoesNotContain(noScRun.SelectionSet, id => noScRun.Cards[id].TemplateId == scGuid);
-        }
-
-        var (scRun, scEngine) = CreateStartedRun(hero: EHero.Vanessa, day: 3, hour: 2, seed: 15201);
+        Assert.Null(Pool.Value.GetStarChartTreasureEncounter());
+        var (scRun, _) = CreateStartedRun(hero: EHero.Vanessa, day: 3, hour: 2, seed: 15201);
         AddOwnedItem(scRun, CardPool.StarChartItemId, ETier.Silver, EInventorySection.Hand, EContainerSocketId.Socket_3);
         var scShop = new ShopEngine(scRun, Pool.Value, Repo.Value, scRun.CustomRules);
-        int scHits = 0;
-        const int scTrials = 500;
-        for (int i = 0; i < scTrials; i++)
+        for (int i = 0; i < 250; i++)
         {
             scRun.VisitedDayEncounterIds.Clear();
             scRun.VisitedSingleSpawnEncounterIds.Clear();
             scShop.DealHourEncounters();
-            if (scRun.SelectionSet.Any(id => scRun.Cards[id].TemplateId == scGuid))
-                scHits++;
+            Assert.DoesNotContain(scRun.SelectionSet, id => scRun.Cards[id].TemplateId == scGuid);
         }
-        // SpawningChance = 0.10，500 次抽样 10% 期望 ~50 次（考虑前置旅行社占约 9.5% 后净期望 ~45 次），区间 [20, 95] 极稳健
-        Assert.InRange(scHits, 20, 95);
-
-        // 验证进入并离开 Star Chart Treasure 遵守 ShouldProgressHour=false（小时不推进）
-        scRun.Day = 3;
-        scRun.Hour = 2;
-        var scEnc = InjectChoiceEncounter(scRun, CardPool.StarChartTreasureEncounterId);
-        Assert.Null(scEngine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(scEnc.InstanceId) }).Error);
-        Assert.Equal(ERunState.Encounter, scRun.State);
-        Assert.Null(scEngine.Handle(new ExitCurrentStateCommand()).Error);
-        Assert.Equal(ERunState.Choice, scRun.State);
-        Assert.Equal(2u, scRun.Hour);
     }
 
-    // ── P0-16：数据驱动 GuidOnly 白昼奇遇编目（41 套 / 157 张 + 商人/挑战分流 + 直效/纯 XP 即退执行） ──
+    // ── P0-16：数据驱动 GuidOnly 白昼奇遇编目（剔除 6 张已淘汰/限时/系统卡 + 按英雄接回 Pol + 全 8 英雄严格隔离） ──
 
     [Fact]
     public void P0_16_GuidOnlyHourlyCatalog_SuitesSplit_And_DirectEffectEncounters()
@@ -577,13 +546,13 @@ public sealed class AuditWave2EncountersTests
         Assert.Contains(catalog.DayRangeSuites, s => s.BaseName.Equals("Deadly Duel", StringComparison.OrdinalIgnoreCase) && s.Role == GuidOnlyEncounterRole.BonusCombatChallenge);
         Assert.Contains(catalog.DayRangeSuites, s => s.BaseName.Equals("Epic Battle", StringComparison.OrdinalIgnoreCase) && s.Role == GuidOnlyEncounterRole.BonusCombatChallenge);
 
-        // Statia 与 Advanced Training 必须分流到 RareOrSkillMerchant 并被识别为商人
-        Assert.Contains(catalog.StandaloneEntries, e => e.Card.Id.Equals(CardArchetypeIndex.StatiaEncounterId, StringComparison.OrdinalIgnoreCase) && e.Role == GuidOnlyEncounterRole.RareOrSkillMerchant);
+        // Advanced Training 分流到 RareOrSkillMerchant 并被识别为商人；官方大件商人 Pol / Pol (Pygmalien) 按英雄接回独立目录
         Assert.Contains(catalog.StandaloneEntries, e => e.Card.Id.Equals(CardArchetypeIndex.AdvancedTrainingEncounterId, StringComparison.OrdinalIgnoreCase) && e.Role == GuidOnlyEncounterRole.RareOrSkillMerchant);
-        Assert.True(CardArchetypeIndex.IsMerchantEncounterTemplate(CardArchetypeIndex.StatiaEncounterId, "Statia", Pool.Value.Get(CardArchetypeIndex.StatiaEncounterId), Repo.Value.GetCard(CardArchetypeIndex.StatiaEncounterId)));
         Assert.True(CardArchetypeIndex.IsMerchantEncounterTemplate(CardArchetypeIndex.AdvancedTrainingEncounterId, "Advanced Training", Pool.Value.Get(CardArchetypeIndex.AdvancedTrainingEncounterId), Repo.Value.GetCard(CardArchetypeIndex.AdvancedTrainingEncounterId)));
+        Assert.Contains(catalog.StandaloneEntries, e => e.Card.Id.Equals(CardPool.PolEncounterId, StringComparison.OrdinalIgnoreCase) && e.MinDay == 6);
+        Assert.Contains(catalog.StandaloneEntries, e => e.Card.Id.Equals(CardPool.PolPygmalienEncounterId, StringComparison.OrdinalIgnoreCase) && e.MinDay == 4);
 
-        // 严格剔除 2 张未接完任务残留、Futura、Grand Opening 与被其他卡引用的子事件（如 Candy Stash / Burning Library）
+        // 严格剔除全部 8 张已淘汰/限时活动/非白昼系统/任务残留卡、Futura、Sprout、Grand Opening 与被引用子事件
         var allCatalogIds = catalog.TieredSuites.SelectMany(s => s.VariantsByTier.Values.Select(c => c.Id))
             .Concat(catalog.DayRangeSuites.SelectMany(s => s.Variants.Select(v => v.Card.Id)))
             .Concat(catalog.StandaloneEntries.Select(e => e.Card.Id))
@@ -593,6 +562,13 @@ public sealed class AuditWave2EncountersTests
         {
             "7676de25-e0eb-4aa2-a33c-0570ddf4777a", // 任务残留 1 (The Financial District - Blacksmith Investment)
             "be759478-d828-4bc2-8268-0596f2c731aa", // 任务残留 2 (Furry Return - Large - Pet - Purr)
+            "a64974ac-1250-41fe-aada-508b22c93ac4", // 比约恩的礼物交换 (Bjorn's Gift Exchange - Patch 9.2 冬季限时活动)
+            "972e6031-4036-47ef-8e6e-1b8feb53fe47", // 地下抵抗组织 (Underground Resistance - 早期赛季末限时活动)
+            "8c69a3e3-8c82-4049-aa89-1836ccb6ebc4", // 古奇潜水 (Gulch's Dive - 废案残留)
+            CardPool.CoreInitializationEncounterId,  // 核心初始化 (Dooley Lv3 升级专属)
+            CardArchetypeIndex.StatiaEncounterId,    // 丝塔奇娅 (Statia - 已更名重做为 Futura)
+            CardPool.StarChartTreasureEncounterId,   // 星图宝藏 (Star Chart Treasure - 旧版残留)
+            CardPool.SproutEncounterId,              // Sprout (Tiny World 远征子节点)
             CardArchetypeIndex.FuturaEncounterId,
             CardPool.GrandOpeningEncounterId,
             "e6e09e6a-ebe0-46f8-bfbb-716b74f78bc6", // Candy Stash (Day 1-3) — 子事件
@@ -1073,6 +1049,128 @@ public sealed class AuditWave2EncountersTests
                         Assert.False(
                             CardPool.IsExpeditionTicketExpired(c.TemplateId.ToString(), (int)testDay, 1),
                             $"步骤 {stepId} 在 Day {testDay} Hour 1 违规发出了过期门票 {c.TemplateId}");
+                    }
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void Patch20_2_RetiredEventsExcluded_SecondaryPoolsGuarded_HeroPartitionStrict_And_PolRestored()
+    {
+        var retiredGuids = new HashSet<Guid>
+        {
+            Guid.Parse("a64974ac-1250-41fe-aada-508b22c93ac4"), // Bjorn's Gift Exchange
+            Guid.Parse("972e6031-4036-47ef-8e6e-1b8feb53fe47"), // Underground Resistance
+            Guid.Parse("8c69a3e3-8c82-4049-aa89-1836ccb6ebc4"), // Gulch's Dive
+            Guid.Parse(CardPool.CoreInitializationEncounterId), // Core Initialization
+            Guid.Parse(CardArchetypeIndex.StatiaEncounterId),   // Statia
+            Guid.Parse(CardPool.StarChartTreasureEncounterId),  // Star Chart Treasure
+            Guid.Parse("7676de25-e0eb-4aa2-a33c-0570ddf4777a"), // Blacksmith Investment
+            Guid.Parse("be759478-d828-4bc2-8268-0596f2c731aa"), // Furry Return
+            Guid.Parse("9ddb3457-d4a5-45ec-913e-ae52fce9cb22"), // Trophy Hunt (Day 1-3)
+            Guid.Parse("58e800bd-a2ae-4135-a8c3-2eca839c17d2"), // Trophy Hunt (Day 4-6)
+            Guid.Parse("754ff658-3032-46ab-91f3-a2ce3a1cb1da"), // Trophy Hunt (Day 7-9)
+        };
+
+        var all8Heroes = new[]
+        {
+            EHero.Vanessa, EHero.Dooley, EHero.Pygmalien, EHero.Mak,
+            EHero.Karnok, EHero.Jules, EHero.Stelle, EHero.Hero8,
+        };
+
+        // 1. 全 8 英雄 × Day 1–10 高频抽样：严禁刷出任何已淘汰/限时/系统事件，且每张发出的遭遇严格匹配当前英雄或 Common
+        var polNormalGuid = Guid.Parse(CardPool.PolEncounterId);
+        var polPygGuid = Guid.Parse(CardPool.PolPygmalienEncounterId);
+        bool sawPolPyg = false;
+        bool sawPolNormal = false;
+
+        foreach (var hero in all8Heroes)
+        {
+            string heroName = hero.ToString();
+            var run = new RunState
+            {
+                RunId = $"hero_part_{heroName}",
+                GameModeId = Pool.Value.DefaultGameModeId,
+                Hero = hero,
+                Day = 1,
+                Hour = 2,
+                RngSeed = 20260 + (int)hero,
+                CustomRules = new CustomRunRuleSet(),
+            };
+            var shop = new ShopEngine(run, Pool.Value, Repo.Value, run.CustomRules);
+
+            for (uint d = 1; d <= 10; d++)
+            {
+                run.Day = d;
+                run.Hour = 2;
+                int trials = (hero == EHero.Pygmalien && d == 5) || (hero == EHero.Vanessa && d == 7) ? 120 : 12;
+                for (int t = 0; t < trials; t++)
+                {
+                    run.VisitedDayEncounterIds.Clear();
+                    run.VisitedSingleSpawnEncounterIds.Clear();
+                    shop.DealHourEncounters();
+
+                    foreach (string instId in run.SelectionSet)
+                    {
+                        var card = run.Cards[instId];
+                        Assert.DoesNotContain(card.TemplateId, retiredGuids);
+
+                        var tpl = Pool.Value.Get(card.TemplateId.ToString());
+                        Assert.NotNull(tpl);
+                        Assert.True(
+                            tpl!.Heroes.Contains(heroName, StringComparer.OrdinalIgnoreCase) ||
+                            tpl.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase),
+                            $"跨英雄泄漏！英雄 {heroName} 在 Day {d} 刷到了仅属 [{string.Join(",", tpl.Heroes)}] 的遭遇 {tpl.InternalName} ({tpl.Id})");
+
+                        if (hero == EHero.Pygmalien && card.TemplateId == polPygGuid) sawPolPyg = true;
+                        if (hero == EHero.Vanessa && card.TemplateId == polNormalGuid) sawPolNormal = true;
+                        if (hero == EHero.Hero8)
+                        {
+                            Assert.NotEqual(polNormalGuid, card.TemplateId);
+                            Assert.NotEqual(polPygGuid, card.TemplateId);
+                        }
+                    }
+                }
+            }
+        }
+
+        Assert.True(sawPolPyg, "Pygmalien 在 Day 4+ 应能正常刷到官方大件商人 Pol (Pygmalien)");
+        Assert.True(sawPolNormal, "Vanessa 等 6 英雄在 Day 6+ 应能正常刷到官方大件商人 Pol");
+
+        // 2. 次级动态召唤池（Aerodrome / Mysterious Portal）同样严格拦截所有已淘汰/系统遭遇且严守英雄归属
+        const string aerodromeId = "f1302d1d-24e4-4d17-a434-3550af908ba3";
+        foreach (string portalId in new[] { aerodromeId, CardArchetypeIndex.MysteriousPortalEncounterId })
+        {
+            var pRun = new RunState
+            {
+                RunId = $"sec_pool_{portalId[..8]}",
+                GameModeId = Pool.Value.DefaultGameModeId,
+                Hero = EHero.Dooley,
+                Day = 8,
+                Hour = 2,
+                RngSeed = 20299,
+                CustomRules = new CustomRunRuleSet(),
+            };
+            var pShop = new ShopEngine(pRun, Pool.Value, Repo.Value, pRun.CustomRules);
+            for (int i = 0; i < 60; i++)
+            {
+                pShop.DealEncounterShelf(portalId, isReroll: i > 0);
+                foreach (string instId in pRun.SelectionSet)
+                {
+                    var card = pRun.Cards[instId];
+                    if (card.Type is not (ECardType.EventEncounter or ECardType.PedestalEncounter))
+                        continue;
+                    var tpl = Pool.Value.Get(card.TemplateId.ToString());
+                    Assert.False(
+                        CardPool.IsExcludedFromDynamicEncounterPool(card.TemplateId.ToString(), tpl?.InternalName, tpl),
+                        $"次级池 {portalId} 违规刷出禁用/已淘汰遭遇 {tpl?.InternalName} ({card.TemplateId})");
+                    if (tpl != null)
+                    {
+                        Assert.True(
+                            tpl.Heroes.Contains("Dooley", StringComparer.OrdinalIgnoreCase) ||
+                            tpl.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase),
+                            $"次级池 {portalId} 跨英雄泄漏给 Dooley：{tpl.InternalName} [{string.Join(",", tpl.Heroes)}]");
                     }
                 }
             }

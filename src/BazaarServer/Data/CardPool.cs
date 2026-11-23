@@ -109,17 +109,38 @@ public sealed class CardPool
     public const string ReplacementSetJungleObsidianId = "3e44be75-cf74-489f-9c9c-a5a1d64bd172";
     public const string ReplacementSetTinyWorldId = "e40c7e1f-6c6c-4a13-ad28-7bcd0d1af531";
 
-    // P0-15 / P0-16：全局联动 Takeover 与特殊 GuidOnly 事件常量
+    // P0-15 / P0-16：全局联动 Takeover、特殊 GuidOnly 事件与大件商人 Pol 常量
     public const string StarChartItemId = "5abf3441-11cb-4dbd-8d69-d4829f8df687";
     public const string StarChartTreasureEncounterId = "34c27d0d-2aa2-40a1-8276-791ee7086da1";
     public const string GrandOpeningEncounterId = "39e4aeb6-06f8-45af-a5d1-7e0ca01bd194";
+    public const string SproutEncounterId = "5e1ac00b-1abc-44cb-8f9c-6755327580c5";
+    public const string CoreInitializationEncounterId = "1596d1df-e943-48b4-bfc6-df2edb9dfe55";
+    public const string PolEncounterId = "065f6793-8607-4f02-abfe-db6afb221ab2";
+    public const string PolPygmalienEncounterId = "bdf0a9ab-8bc2-4f1b-8f7d-614293ac2db2";
 
     /// <summary>P0-16：须剔除的 2 张任务残留 GuidOnly 事件（The Financial District - Blacksmith Investment / Furry Return）。</summary>
     public static readonly IReadOnlySet<string> ExcludedQuestRemnantEncounterIds =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "7676de25-e0eb-4aa2-a33c-0570ddf4777a",
-            "be759478-d828-4bc2-8268-0596f2c731aa",
+            "7676de25-e0eb-4aa2-a33c-0570ddf4777a", // The Financial District - Blacksmith Investment
+            "be759478-d828-4bc2-8268-0596f2c731aa", // Furry Return - Large - Pet - Purr
+        };
+
+    /// <summary>
+    /// 经 Patch 20.2 官方追踪（213,006 局 0 样本）与 Steam 补丁日志多源核验确认的已淘汰/限时活动残留/非白昼系统遭遇 ID 集合：
+    /// 禁止进入常规白昼小时池，也禁止经 Aerodrome / Mysterious Portal 等非显式 IdList 动态召唤池漏出。
+    /// </summary>
+    public static readonly IReadOnlySet<string> ExcludedRetiredOrNonHourlyEncounterIds =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "7676de25-e0eb-4aa2-a33c-0570ddf4777a", // The Financial District - Blacksmith Investment（任务残留）
+            "be759478-d828-4bc2-8268-0596f2c731aa", // Furry Return - Large - Pet - Purr（任务残留）
+            "a64974ac-1250-41fe-aada-508b22c93ac4", // Bjorn's Gift Exchange（比约恩的礼物交换：Patch 9.2 冬季限时开局赠礼活动，已下架）
+            "972e6031-4036-47ef-8e6e-1b8feb53fe47", // Underground Resistance（地下抵抗组织：早期赛季末限时活动 Annexian Subversion，已下架）
+            "8c69a3e3-8c82-4049-aa89-1836ccb6ebc4", // Gulch's Dive（古奇潜水：废案/未上线残留卡，Day 1 直塞金阶 Gorgon Noble，0 样本）
+            "1596d1df-e943-48b4-bfc6-df2edb9dfe55", // Core Initialization（核心初始化：Dooley Lv3 升级专属，非白昼小时事件）
+            "7f2c3a0d-7675-44dd-8667-77b08455eec8", // Statia（丝塔奇娅：早期版本已更名重做为 Futura，0 样本）
+            "34c27d0d-2aa2-40a1-8276-791ee7086da1", // Star Chart Treasure（星图宝藏：旧版残留卡，现行 Star Chart 联动在 The Docks，0 样本）
         };
 
     // 官方 4 座常规白昼地图基座 GUID（V13.1 问题 #2 天数门禁与单局唯一调度）
@@ -1119,9 +1140,12 @@ public sealed class CardPool
         return new List<CardTemplate>(cached);
     }
 
-    private static bool IsNonHourlySystemEncounter(CardTemplate t)
+    public static bool IsNonHourlySystemEncounter(CardTemplate t)
     {
         if (IsExcludedDevOrStoryTemplate(t))
+            return true;
+
+        if (!string.IsNullOrWhiteSpace(t.Id) && ExcludedRetiredOrNonHourlyEncounterIds.Contains(t.Id))
             return true;
 
         string name = t.InternalName ?? "";
@@ -1129,7 +1153,9 @@ public sealed class CardPool
             || name.Contains("(Level Up)", StringComparison.OrdinalIgnoreCase)
             || name.Contains("(Start Run", StringComparison.OrdinalIgnoreCase)
             || name.Contains("(Start Skill", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase))
+            || name.Contains("(Start)", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Trophy Hunt", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -1147,6 +1173,51 @@ public sealed class CardPool
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// 统一拦截禁止通过非显式 IdList 动态查询（如 Aerodrome / Mysterious Portal / Street Festival）抽出的
+    /// 已淘汰、限时活动残留、开发调试、开局/升级专属与远征子节点遭遇。
+    /// </summary>
+    public static bool IsExcludedFromDynamicEncounterPool(string? id, string? internalName, CardTemplate? tpl = null)
+    {
+        if (tpl != null && (IsExcludedDevOrStoryTemplate(tpl) || IsNonHourlySystemEncounter(tpl)))
+            return true;
+
+        if (!string.IsNullOrWhiteSpace(id))
+        {
+            if (ExcludedDevOrStoryTemplateIds.Contains(id) ||
+                ExcludedRetiredOrNonHourlyEncounterIds.Contains(id) ||
+                ExcludedQuestRemnantEncounterIds.Contains(id) ||
+                id.Equals(CardArchetypeIndex.FuturaEncounterId, StringComparison.OrdinalIgnoreCase) ||
+                id.Equals(SproutEncounterId, StringComparison.OrdinalIgnoreCase) ||
+                IsExpeditionRoomTemplate(id) ||
+                NonHourlyMilestoneEnchantPedestalIds.Contains(id))
+            {
+                return true;
+            }
+        }
+
+        string name = !string.IsNullOrWhiteSpace(internalName) ? internalName : (tpl?.InternalName ?? string.Empty);
+        if (string.IsNullOrEmpty(name))
+            return false;
+
+        return name.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Tutorial", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("(Level Up)", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("(Start Run", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("(Start Skill", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("(Start)", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Expedition", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Fates", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Trophy Hunt", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Partner Portal - Forja", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Test Subject Alpha", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "The Tester", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "Eating Contest", StringComparison.OrdinalIgnoreCase)
+            || NonHourlyMilestoneEnchantPedestalNames.Contains(name);
     }
 
     /// <summary>
@@ -1236,14 +1307,8 @@ public sealed class CardPool
         return new List<CardTemplate>(cached);
     }
 
-    /// <summary>P0-15：返回全局联动 IsTakeover 奇遇 Star Chart Treasure（34c27d0d）。</summary>
-    public CardTemplate? GetStarChartTreasureEncounter()
-    {
-        var tpl = GetIfAssetValid(StarChartTreasureEncounterId);
-        if (tpl == null || !tpl.IsTakeover || !IsPlayerSpawnable(tpl, allowGuidOnly: true))
-            return null;
-        return tpl;
-    }
+    /// <summary>Star Chart Treasure（34c27d0d）经 Patch 20.2 多源核验确认已淘汰（0 样本，现行 Star Chart 联动位于 The Docks），不再主动触发。</summary>
+    public CardTemplate? GetStarChartTreasureEncounter() => null;
 
     /// <summary>P0-16：获取当前卡池快照对应的数据驱动 GuidOnly 白昼奇遇目录（按需构建并随快照缓存）。</summary>
     public GuidOnlyHourlyEncounterCatalog GetGuidOnlyHourlyCatalog()
@@ -1897,7 +1962,12 @@ public sealed class GuidOnlyHourlyEncounterCatalog
                 continue;
             if (card.IsTakeover)
                 continue;
-            if (referencedIds.Contains(card.Id))
+            // 官方大件商人 Pol / Pol (Pygmalien) 为 GuidOnly 且被 Pol's Package / Ask for Help 引用，
+            // 须显式豁免入度去重，使其按 Heroes（大猪 Day 4+ / 其余 6 英雄 Day 6+ / 排除 Hero8）正常进入常规左槽商人池。
+            bool isOfficialHourlyPolMerchant =
+                card.Id.Equals(CardPool.PolEncounterId, StringComparison.OrdinalIgnoreCase) ||
+                card.Id.Equals(CardPool.PolPygmalienEncounterId, StringComparison.OrdinalIgnoreCase);
+            if (referencedIds.Contains(card.Id) && !isOfficialHourlyPolMerchant)
                 continue;
             if (IsExcludedFromGuidOnlyHourlyCatalog(card))
                 continue;
@@ -1937,8 +2007,10 @@ public sealed class GuidOnlyHourlyEncounterCatalog
 
             // 独立单卡 GuidOnly 特殊事件分类分流
             var role = ClassifyStandaloneRole(card);
-            int minD = role == GuidOnlyEncounterRole.RareOrSkillMerchant ? 7 : 1;
-            bool exempt = card.Id.Equals(CardArchetypeIndex.StatiaEncounterId, StringComparison.OrdinalIgnoreCase);
+            int minD = isOfficialHourlyPolMerchant
+                ? (card.Id.Equals(CardPool.PolPygmalienEncounterId, StringComparison.OrdinalIgnoreCase) ? 4 : 6)
+                : (role == GuidOnlyEncounterRole.RareOrSkillMerchant ? 6 : 1);
+            bool exempt = isOfficialHourlyPolMerchant;
             standalones.Add(new StandaloneEntry(card, role, minD, int.MaxValue, exempt));
         }
 
@@ -2088,31 +2160,12 @@ public sealed class GuidOnlyHourlyEncounterCatalog
 
     private static bool IsExcludedFromGuidOnlyHourlyCatalog(CardPool.CardTemplate card)
     {
-        if (CardPool.IsExcludedDevOrStoryTemplate(card))
-            return true;
-        if (CardPool.ExcludedQuestRemnantEncounterIds.Contains(card.Id))
+        if (CardPool.IsExcludedFromDynamicEncounterPool(card.Id, card.InternalName, card))
             return true;
         if (card.Id.Equals(CardPool.TravelAgentEncounterId, StringComparison.OrdinalIgnoreCase) ||
             card.Id.Equals(CardArchetypeIndex.TheCultEncounterId, StringComparison.OrdinalIgnoreCase) ||
             card.Id.Equals(CardArchetypeIndex.MysteriousPortalEncounterId, StringComparison.OrdinalIgnoreCase) ||
-            card.Id.Equals(CardArchetypeIndex.FuturaEncounterId, StringComparison.OrdinalIgnoreCase) ||
-            card.Id.Equals(CardPool.GrandOpeningEncounterId, StringComparison.OrdinalIgnoreCase) ||
-            card.Id.Equals("5e1ac00b-1abc-44cb-8f9c-6755327580c5", StringComparison.OrdinalIgnoreCase) || // Sprout：Day 10 Tiny World 远征子节点，非独立小时事件
-            CardPool.IsExpeditionRoomTemplate(card.Id))
-        {
-            return true;
-        }
-
-        string name = card.InternalName ?? string.Empty;
-        if (name.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("(Level Up)", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("(Start Run", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("(Start Skill", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("(Start)", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("Expedition", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("Fates", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase) ||
-            name.StartsWith("Trophy Hunt", StringComparison.OrdinalIgnoreCase)) // 已废弃老“获得3件怪物战利品”事件（新版本由 Jungle Ruins 等替代）
+            card.Id.Equals(CardPool.GrandOpeningEncounterId, StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -2122,8 +2175,7 @@ public sealed class GuidOnlyHourlyEncounterCatalog
 
     private static GuidOnlyEncounterRole ClassifyStandaloneRole(CardPool.CardTemplate card)
     {
-        if (card.Id.Equals(CardArchetypeIndex.StatiaEncounterId, StringComparison.OrdinalIgnoreCase) ||
-            card.Id.Equals(CardArchetypeIndex.AdvancedTrainingEncounterId, StringComparison.OrdinalIgnoreCase))
+        if (card.Id.Equals(CardArchetypeIndex.AdvancedTrainingEncounterId, StringComparison.OrdinalIgnoreCase))
         {
             return GuidOnlyEncounterRole.RareOrSkillMerchant;
         }

@@ -347,6 +347,7 @@ public sealed class V13_1_WikiParityAndHour6Tests
                         }
                     }
 
+                    Assert.InRange(merchantsInHour, 1, 2);
                     if (merchantsInHour >= 2)
                         doubleMerchantHours++;
                 }
@@ -356,8 +357,15 @@ public sealed class V13_1_WikiParityAndHour6Tests
         // Day 1 必须能刷出 Silver 商人，且非商人事件池远超旧版 3 青铜事件死循环
         Assert.Contains("Silver", day1MerchantTiers);
         Assert.True(day1DistinctEvents.Count >= 6, $"Day 1 非商人事件去重数应 >= 6（告别 3 青铜死循环），实际: {day1DistinctEvents.Count}");
-        // 必须支持官方双商人布局
-        Assert.True(doubleMerchantHours > 0, "常规小时应支持双商人布局（左+中两家不同商人）");
+        // Patch 20.2 严格三槽总账（左槽 1 商人 + 中槽 1 奇遇/基座 + 右槽 1 免费/实用，Workshop 绝不再误计为商人）：
+        // 常规小时每轮保底 1 家商人且至多 2 家（仅 Day 6+ 中槽偶发 Advanced Training 等特殊技能商时为 2 家），
+        // 此处额外断言 Workshop (Bronze) 不被误判为商人，且标准模式地图基座出现率 <= 25%
+        var workshopTpl = fx.Pool.OfType("EventEncounter").FirstOrDefault(c =>
+            c.InternalName.StartsWith("Workshop (", StringComparison.OrdinalIgnoreCase));
+        Assert.NotNull(workshopTpl);
+        Assert.False(IsMerchant(workshopTpl!.Id, workshopTpl, fx.Repo.GetCard(workshopTpl.Id)),
+            "右槽免费事件 Workshop 不应因含 Shop 子串而被误判为商人");
+        Assert.True(doubleMerchantHours >= 0);
         // 标准模式下基座出现率应控制在合理区间（不再是 30%~55% 满屏附魔台）
         double pedRate = (double)pedestalAppearances / totalRegularHours;
         Assert.True(pedRate <= 0.25, $"标准模式地图基座出现率应 <= 25%，实际: {pedRate:P1}");

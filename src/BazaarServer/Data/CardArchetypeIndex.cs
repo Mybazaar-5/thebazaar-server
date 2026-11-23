@@ -437,11 +437,16 @@ public sealed class CardArchetypeIndex
         if (coreTpl != null && coreTpl.Tags.Any(t => t.Equals("Merchant", StringComparison.OrdinalIgnoreCase)))
             return true;
 
+        var rules = coreTpl?.SelectionContext?.Rules ?? poolTpl?.SelectionContext?.Rules;
+        var spawn = coreTpl?.SelectionContext?.SpawnContext ?? poolTpl?.SelectionContext?.SpawnContext;
+
+        // 显式免费事件（如右槽免费物品遭遇 Workshop）且不带 Merchant 标签时，绝不因名称含 "Shop" 子串而误判为商人
+        if (rules is { SelectionIsFree: true })
+            return false;
+
         if (ContainsAny(name, "Merchant", "Shop", "Vendor"))
             return true;
 
-        var rules = coreTpl?.SelectionContext?.Rules ?? poolTpl?.SelectionContext?.Rules;
-        var spawn = coreTpl?.SelectionContext?.SpawnContext ?? poolTpl?.SelectionContext?.SpawnContext;
         if (rules is { SelectionIsFree: false, RerollRules: not null } && spawn?.Groups is { Count: > 0 })
         {
             return spawn.Groups.Any(g => (g.Filters ?? []).Any(f =>

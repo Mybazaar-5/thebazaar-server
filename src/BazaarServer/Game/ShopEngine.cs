@@ -1425,6 +1425,42 @@ public sealed class ShopEngine
         }
     }
 
+    /// <summary>判断 SpawnContext 中是否存在显式列出目标模板 ID 的 TSpawnFilterIdList（用于区分远征/剧情定点子卡与 Portal/Aerodrome 随机查询）。</summary>
+    internal static bool HasExplicitIdListFor(RuleNode? spawnCtx, string? templateId)
+    {
+        if (spawnCtx == null || string.IsNullOrWhiteSpace(templateId)) return false;
+
+        static bool FiltersContainId(IReadOnlyList<RuleNode>? filters, string id)
+        {
+            if (filters == null) return false;
+            for (int i = 0; i < filters.Count; i++)
+            {
+                var f = filters[i];
+                if (f != null &&
+                    string.Equals(f.Type, "TSpawnFilterIdList", StringComparison.OrdinalIgnoreCase) &&
+                    f.Ids != null &&
+                    f.Ids.Any(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if (FiltersContainId(spawnCtx.Filters, templateId))
+            return true;
+
+        if (spawnCtx.Groups != null)
+        {
+            for (int i = 0; i < spawnCtx.Groups.Count; i++)
+            {
+                if (FiltersContainId(spawnCtx.Groups[i]?.Filters, templateId))
+                    return true;
+            }
+        }
+        return false;
+    }
+
     private static bool MatchesHeroOrCommon(CardPool.CardTemplate tpl, string hero)
     {
         if (tpl.Heroes == null || tpl.Heroes.Length == 0) return true;
@@ -1506,6 +1542,7 @@ public sealed class ShopEngine
 
         var tpl = _pool.GetIfAssetValid(templateId);
         if (tpl == null || !_pool.IsPlayerSpawnable(tpl, allowGuidOnly: true)) return false;
+        if (!MatchesHeroOrCommon(tpl, _run.Hero.ToString())) return false;
         if (tpl.IsSingleSpawn && _run.VisitedSingleSpawnEncounterIds.Contains(tpl.Id)) return false;
         if (!isEligible(tpl)) return false;
 
@@ -1523,6 +1560,7 @@ public sealed class ShopEngine
 
         var tpl = _pool.GetIfAssetValid(templateId);
         if (tpl == null || !_pool.IsPlayerSpawnable(tpl, allowGuidOnly: true)) return;
+        if (!MatchesHeroOrCommon(tpl, _run.Hero.ToString())) return;
         if (tpl.IsSingleSpawn && _run.VisitedSingleSpawnEncounterIds.Contains(tpl.Id)) return;
         if (!isEligible(tpl)) return;
 
@@ -1547,8 +1585,8 @@ public sealed class ShopEngine
 
     /// <summary>
     /// P0-15：消费 IsTakeover 字段的单次专属奇遇调度器：
-    /// 1) 持有物品 Star Chart (5abf3441) 时，按 SpawningChance=0.1 独立掷骰触发 Star Chart Treasure (34c27d0d，遵守 ShouldProgressHour=false 与 IsSingleSpawn)；
-    /// 2) 接入全部 8 英雄专属传奇 GuidOnly IsTakeover 单次奇遇（Karnok Hidden Lake 自 Day 3+、其余 7 英雄 Diamond 阶自 Day 6+，遵守 IsSingleSpawn）。
+    /// 接入全部 8 英雄专属传奇 GuidOnly IsTakeover 单次奇遇（Karnok Hidden Lake 自 Day 7+、Stelle Family Reunion 自 Day 8+、其余 6 英雄 Diamond 阶自 Day 6+，严格按英雄归属与 IsSingleSpawn 调度）。
+    /// （注：Star Chart Treasure 34c27d0d 经 Patch 20.2 多源核验确认已淘汰 0 样本，现行 Star Chart 联动位于 The Docks，不再主动触发。）
     /// </summary>
     private CardPool.CardTemplate? TryRollTakeoverEncounter(
         string hero,
@@ -1559,20 +1597,7 @@ public sealed class ShopEngine
         Func<CardPool.CardTemplate, double> getEncounterMultiplier,
         ISet<string>? dailyVisited)
     {
-        // 1. Star Chart Treasure (34c27d0d)：持 Star Chart 时按 SpawningChance=0.1 (+ SpawningChanceIncrement 递增) 独立掷骰
-        var starChartTpl = _pool.GetStarChartTreasureEncounter();
-        if (starChartTpl != null &&
-            !_run.VisitedSingleSpawnEncounterIds.Contains(starChartTpl.Id) &&
-            !(dailyVisited?.Contains(starChartTpl.Id) ?? false) &&
-            HasOwnedItemTemplate(CardPool.StarChartItemId, queryPlayer) &&
-            isEligible(starChartTpl))
-        {
-            double scMult = getEncounterMultiplier(starChartTpl);
-            if (scMult > 0.0 && RollTakeoverChanceWithIncrement(starChartTpl, defaultBaseChance: 0.10, scMult, streamRng))
-                return starChartTpl;
-        }
-
-        // 2. 8 英雄专属传奇 GuidOnly IsTakeover 单次奇遇（含 SpawningChance / SpawningChanceIncrement 局内递增表）
+        // 8 英雄专属传奇 GuidOnly IsTakeover 单次奇遇（含 SpawningChance / SpawningChanceIncrement 局内递增表）
         var heroTakeovers = _pool.GetHeroTakeoverEncounters(hero);
         if (heroTakeovers.Count == 0) return null;
 
@@ -2289,8 +2314,9 @@ public sealed class ShopEngine
                         // P1-25：过滤已过期探险门票
                         if (CardPool.IsExpeditionTicketExpired(inst.Template.Id, day, (int)_run.Hour))
                             return false;
-                        // P0-13：对动态抽出的 EventEncounter（如 Mysterious Portal）二次拦截 DEFUNCT/教程/未解锁 ExclusionSet 卡
-                        if (string.Equals(inst.Template.Type, "EventEncounter", StringComparison.OrdinalIgnoreCase))
+                        // P0-13 + Patch 20.2：对动态抽出的 EventEncounter / PedestalEncounter（如 Mysterious Portal / Aerodrome / Street Festival）
+                        // 二次拦截 ExclusionSet、已淘汰/限时活动/非白昼系统卡（仅放行显式 TSpawnFilterIdList 指定的剧情或远征子节点）
+                        if (inst.Template.Type is "EventEncounter" or "PedestalEncounter")
                         {
                             if (_run.ExclusionSet.Contains(inst.Template.Id)) return false;
                             if (itemPoolTpl != null && CardPool.IsExcludedDevOrStoryTemplate(itemPoolTpl)) return false;
@@ -2298,6 +2324,9 @@ public sealed class ShopEngine
                                 (evName.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase) ||
                                  evName.Contains("Tutorial", StringComparison.OrdinalIgnoreCase) ||
                                  evName.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase)))
+                                return false;
+                            if (!HasExplicitIdListFor(spawnCtxForRoll, inst.Template.Id) &&
+                                CardPool.IsExcludedFromDynamicEncounterPool(inst.Template.Id, inst.Template.InternalName, itemPoolTpl))
                                 return false;
                         }
                         // 对子遭遇/步骤选项（如 EncounterStep）在发牌阶段即校验天数/局外 Run 前置条件

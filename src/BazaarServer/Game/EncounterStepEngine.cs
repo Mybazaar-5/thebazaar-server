@@ -474,7 +474,7 @@ public sealed class EncounterStepEngine
                         if (CardPool.IsExpeditionTicketExpired(inst.Template.Id, (int)_run.Day, (int)_run.Hour))
                             return false;
                         var pTpl = _pool.Get(inst.Template.Id);
-                        if (string.Equals(inst.Template.Type, "EventEncounter", StringComparison.OrdinalIgnoreCase))
+                        if (inst.Template.Type is "EventEncounter" or "PedestalEncounter")
                         {
                             if (_run.ExclusionSet.Contains(inst.Template.Id)) return false;
                             if (pTpl != null && CardPool.IsExcludedDevOrStoryTemplate(pTpl)) return false;
@@ -482,6 +482,9 @@ public sealed class EncounterStepEngine
                                 (en.Contains("DEFUNCT", StringComparison.OrdinalIgnoreCase) ||
                                  en.Contains("Tutorial", StringComparison.OrdinalIgnoreCase) ||
                                  en.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase)))
+                                return false;
+                            if (!ShopEngine.HasExplicitIdListFor(normalizedDealCtx, inst.Template.Id) &&
+                                CardPool.IsExcludedFromDynamicEncounterPool(inst.Template.Id, inst.Template.InternalName, pTpl))
                                 return false;
                         }
                         if (inst.Template.Type is "EncounterStep" or "EventEncounter" or "PedestalEncounter" or "CombatEncounter" &&

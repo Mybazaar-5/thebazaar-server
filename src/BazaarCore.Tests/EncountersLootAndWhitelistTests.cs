@@ -221,8 +221,16 @@ public sealed class EncountersLootAndWhitelistTests
             {
                 var entry = run.Cards[cid];
                 Assert.Equal(ECardType.EventEncounter, entry.Type);
-                // V13.1 官方 Day 1 遭遇开放 Bronze 与 Silver（告别 3 青铜事件死循环），严禁 Gold/Diamond/Legendary 泄露
-                Assert.True(entry.Tier is ETier.Bronze or ETier.Silver, $"英雄 {hero} Day 1 Hour 1 遭遇 {entry.TemplateId} 品阶={entry.Tier} 违规越阶");
+                var encTpl = pool.Get(entry.TemplateId.ToString());
+                bool isOfficialDay1Exempt = encTpl != null
+                    && OfficialEncounterSchedule.TryGetRule(encTpl, out var day1Rule)
+                    && day1Rule != null
+                    && day1Rule.ExemptFromMaxDayTier
+                    && OfficialEncounterSchedule.IsWithinWindow(encTpl, 1, 1, hero.ToString());
+                // Patch 20.2 官方 Day 1 开放 Bronze/Silver 及实测合法 Day 1 豁免事件（如 Wishing Fountain / Finn's Big Bite / Piano），严禁其他 Gold/Diamond/Legendary 越阶泄露
+                Assert.True(
+                    entry.Tier is ETier.Bronze or ETier.Silver || isOfficialDay1Exempt,
+                    $"英雄 {hero} Day 1 Hour 1 遭遇 {entry.TemplateId} ({encTpl?.InternalName}) 品阶={entry.Tier} 违规越阶");
                 Assert.True(pool.IsAssetValid(entry.TemplateId.ToString()), $"英雄 {hero} 开局遭遇 {entry.TemplateId} 未通过白名单");
             }
 
