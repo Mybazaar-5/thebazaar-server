@@ -2956,6 +2956,23 @@ public sealed class RunEngine
             oppEntries.Add(CreateTransientOpponentEntry(se, ECardType.SocketEffect, EInventorySection.Hand, (EContainerSocketId)seSlot, usedOppEntryIds));
         }
 
+        // 记录本场战斗敌方（PvP 幽灵/锦标赛对手/自定义野怪）所有自定义 Mod 物品与技能的实例映射，
+        // 让客户端 /api/mods/active-bindings 在战斗中与战后复盘均能正确呈现对手的自定义贴图、文案、预览与数值徽章。
+        bool hadPrevOppCustom = _run.ActiveCombatOpponentCustomCardIds.Count > 0;
+        _run.ActiveCombatOpponentCustomCardIds.Clear();
+        for (int i = 0; i < oppEntries.Count; i++)
+        {
+            var oe = oppEntries[i];
+            if (!string.IsNullOrWhiteSpace(oe.InstanceId) && !string.IsNullOrWhiteSpace(oe.CustomCardId))
+            {
+                _run.ActiveCombatOpponentCustomCardIds[oe.InstanceId] = oe.CustomCardId!;
+            }
+        }
+        if (hadPrevOppCustom || _run.ActiveCombatOpponentCustomCardIds.Count > 0)
+        {
+            _run.VisualBindingsRevision++;
+        }
+
         _lastCombatMonster = monster;
 
         // 4. 构造模式/词条/无尽/BossRush 战斗修正器并执行 BazaarCore 完整规则战斗模拟（50ms 采样直降内存与包体积）
@@ -5789,6 +5806,14 @@ public sealed class RunEngine
                      && !string.IsNullOrWhiteSpace(op.Attribute)
                      && coreCard != null)
             {
+                // 与战中 ModifyCardAttribute 共享同一套输出属性守卫：战后永久群体/单体增益同样严禁给非产出物品凭空写伤害/护盾宝石
+                if (!op.GrantIfMissing
+                    && BazaarCore.Mods.CombatMechanicRuntime.IsOutputActionAttribute(op.Attribute)
+                    && !BazaarCore.Mods.CombatMechanicRuntime.CardSupportsOutputAttribute(coreCard, op.Attribute))
+                {
+                    continue;
+                }
+
                 double safeVal = double.IsFinite(op.Value) ? Math.Clamp(op.Value, -100000, 100000) : 0;
                 if (op.Attribute.Equals("CooldownMax", StringComparison.OrdinalIgnoreCase))
                 {

@@ -924,7 +924,7 @@ public sealed class ModRegistry : IModContentRegistry
     /// 3. 若机制未手写 counterDisplay，但步骤流中使用了 ModifyCounter + syncAttribute，则自动推导默认徽章，
     ///    确保任意玩家/开发者自创的叠层、充能、进度、倒计时机制都能开箱即得原生 3D 实时卡面显示。
     /// </summary>
-    private static List<ResolvedCounterDisplay> ResolveCounterDisplaysForCard(
+    internal static List<ResolvedCounterDisplay> ResolveCounterDisplaysForCard(
         IReadOnlyList<MechanicCounterDisplay>? cardLevelDisplays,
         IReadOnlyList<CardMechanicAttachment>? attachments,
         IReadOnlyDictionary<string, MechanicDefinition> mechanicsMap)

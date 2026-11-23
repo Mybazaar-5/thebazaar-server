@@ -79,6 +79,13 @@ public sealed class RunState
     [System.Text.Json.Serialization.JsonIgnore]
     public int VisualBindingsRevision { get; set; }
 
+    /// <summary>
+    /// 当前/最近一场战斗中敌方瞬态卡牌（含 PvP 幽灵/锦标赛对手/自定义野怪的物品与技能）的自定义模板映射（InstanceId -> CustomCardId）。
+    /// 供 /api/mods/active-bindings 实时下发对手的自定义贴图、中文文案、详情预览与计数器，并在战后保留以支持复盘界面。
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public Dictionary<string, string> ActiveCombatOpponentCustomCardIds { get; } = new(StringComparer.Ordinal);
+
     /// <summary>标记运行态快照是否已脏（用于 MoveItem 高频拖拽延迟到 HTTP 回包后后台防抖序列化）。</summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public bool SnapshotDirty { get; set; }

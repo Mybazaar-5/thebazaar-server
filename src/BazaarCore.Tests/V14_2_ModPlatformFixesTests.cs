@@ -14,6 +14,7 @@ using BazaarGameShared.Infra.Messages.CombatSimEvents;
 using BazaarGameShared.Infra.Messages.GameSimEvents;
 using BazaarServer.Data;
 using BazaarServer.Game;
+using BazaarServer.Mods;
 
 namespace BazaarCore.Tests;
 
@@ -894,5 +895,135 @@ public sealed class V14_2_ModPlatformFixesTests
         Assert.Contains(overloadBinding.EnchantmentPreviewOps["Deadly"], op => op.Attribute == "CritChance" && op.Operation == "Add" && Math.Abs(op.Value - 50) < 1e-6);
         Assert.True(overloadBinding.EnchantmentPreviewOps.ContainsKey("Shiny"));
         Assert.Contains(overloadBinding.EnchantmentPreviewOps["Shiny"], op => op.Attribute == "Multicast" && op.Operation == "Add" && Math.Abs(op.Value - 1) < 1e-6);
+    }
+
+    [Fact]
+    public void GeneralityHardening_ZeroBaseScalingWeapon_CommunityCounters_AndOpponentActiveBindings()
+    {
+        var fx = Shared.Value;
+
+        // 1. 验证 0 初始成长型武器（DamageAmount = 0）正常接受伤害增益；非输出物品被拦截；grantIfMissing=true 显式放行
+        var zeroScalingWeaponTpl = new CardTemplate
+        {
+            Id = "test:zero_scaling_weapon",
+            Type = "Item",
+            Size = "Small",
+            StartingTier = "Bronze",
+            Tags = ["Weapon"],
+            Tiers = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Bronze"] = new TierData
+                {
+                    Attributes = new(StringComparer.OrdinalIgnoreCase) { ["CooldownMax"] = 3000, ["DamageAmount"] = 0 },
+                    AbilityIds = []
+                }
+            }
+        };
+        var pureToolTpl = new CardTemplate
+        {
+            Id = "test:pure_tool_no_dmg",
+            Type = "Item",
+            Size = "Small",
+            StartingTier = "Bronze",
+            Tags = ["Tool"],
+            Tiers = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Bronze"] = new TierData
+                {
+                    Attributes = new(StringComparer.OrdinalIgnoreCase) { ["CooldownMax"] = 3000 },
+                    AbilityIds = []
+                }
+            }
+        };
+
+        var p1 = new PlayerState("p1", "P1", "Vanessa", 1000, 20, 10, 10);
+        var p2 = new PlayerState("p2", "P2", "Common", 1000, 20, 10, 10);
+        var scalingWeapon = new CardInstance(zeroScalingWeaponTpl, CardTier.Bronze, null, "itm_zero_weapon");
+        var pureTool = new CardInstance(pureToolTpl, CardTier.Bronze, null, "itm_pure_tool");
+        p1.Hand.TryPlaceWithDisplaceOrSwap(scalingWeapon, 0);
+        p1.Hand.TryPlaceWithDisplaceOrSwap(pureTool, 1);
+
+        Assert.True(CombatMechanicRuntime.CardSupportsOutputAttribute(scalingWeapon, "DamageAmount"), "0 初始成长型武器应判定为支持 DamageAmount");
+        Assert.False(CombatMechanicRuntime.CardSupportsOutputAttribute(pureTool, "DamageAmount"), "无伤害基础键与动作的纯工具物品应判定为不支持 DamageAmount");
+
+        var callbacks = new CombatMechanicHostCallbacks
+        {
+            GetTimeMs = () => 1000,
+            DealDamage = (_, _, _, _, _) => { },
+            ApplyStatus = (_, _, _, _, _, _) => { },
+            ChangeCardState = (_, _, _, _, _, _) => { },
+            ForceUseCard = (_, _) => { },
+            RecalculateAuras = () => { },
+            IsValidVfxKey = _ => true
+        };
+        var runtime = new CombatMechanicRuntime(p1, p2, new Random(1), callbacks, null, Array.Empty<ICombatPipelineInterceptor>());
+
+        runtime.ModifyCardAttribute(scalingWeapon, "DamageAmount", "Add", 10, permanent: false, grantIfMissing: false);
+        runtime.ModifyCardAttribute(pureTool, "DamageAmount", "Add", 10, permanent: false, grantIfMissing: false);
+        Assert.Equal(10, scalingWeapon.GetAttribute("DamageAmount"));
+        Assert.Equal(0, pureTool.GetAttribute("DamageAmount"));
+
+        runtime.ModifyCardAttribute(pureTool, "DamageAmount", "Add", 7, permanent: false, grantIfMissing: true);
+        Assert.Equal(7, pureTool.GetAttribute("DamageAmount"));
+
+        runtime.QueuePostCombatModifyAttr(pureTool, "DamageAmount", "Add", 5, "test_mech", grantIfMissing: false);
+        runtime.QueuePostCombatModifyAttr(pureTool, "DamageAmount", "Add", 9, "test_mech", grantIfMissing: true);
+        Assert.Equal(2, runtime.PostCombatOps.Count);
+        Assert.False(runtime.PostCombatOps[0].GrantIfMissing);
+        Assert.True(runtime.PostCombatOps[1].GrantIfMissing);
+
+        // 2. 验证 ModLoader.LoadSinglePackage 直接为社区/房间隔离 Mod 填充 CounterDisplays + TierAttributes + EnchantmentPreviewOps
+        var loadIssues = new List<ModValidationIssue>();
+        var clockworkPkg = ModLoader.LoadSinglePackage(Path.Combine(fx.ModsRoot, "clockwork-forge"), "clockwork-forge", loadIssues);
+        Assert.NotNull(clockworkPkg);
+        Assert.True(clockworkPkg!.VisualBindingsByCustomId.TryGetValue(OverloadCardId, out var pkgBinding));
+        Assert.NotNull(pkgBinding!.CounterDisplays);
+        Assert.Contains(pkgBinding.CounterDisplays!, d => d.SyncAttribute == "Custom_3" && d.MaxValue == 3);
+        Assert.NotNull(pkgBinding.TierAttributes);
+        Assert.Equal(5, pkgBinding.TierAttributes!["Diamond"]["Custom_0"]);
+        Assert.NotNull(pkgBinding.EnchantmentPreviewOps);
+        Assert.True(pkgBinding.EnchantmentPreviewOps!.ContainsKey("Obsidian"));
+
+        // 3. 验证 ServerModHost.CollectActiveVisualBindings 同时收录玩家卡牌与 PvP/锦标赛对手瞬态自定义卡牌
+        //    同时覆盖“单局/房间隔离 SelectedModIds（全局未启用）”与“全局启用”两条真实路径
+        string tmpStateDir = Path.Combine(Path.GetTempPath(), $"bz_modhost_test_{Guid.NewGuid():N}");
+        try
+        {
+            var host = new ServerModHost(fx.BaseRepo, fx.DataDir, tmpStateDir, fx.Whitelist, modsRootOverride: fx.ModsRoot);
+            host.Reload();
+
+            var run = new RunState { Hero = EHero.Vanessa };
+            run.CustomRules.SelectedModIds.Add("clockwork-forge");
+            run.Cards["p1_custom_item"] = new RunState.CardEntry
+            {
+                InstanceId = "p1_custom_item",
+                TemplateId = Guid.Parse(ZSwordDonorId),
+                CustomCardId = OverloadCardId,
+                Type = ECardType.Item,
+                Owner = ECombatantId.Player
+            };
+            run.ActiveCombatOpponentCustomCardIds["opp_custom_item"] = OverloadCardId;
+
+            // 路径 A：单局/房间社区 Mod 隔离模式（全局未启用）
+            var activeScoped = host.CollectActiveVisualBindings(run);
+            Assert.True(activeScoped.ContainsKey("p1_custom_item"), "房间隔离模式应收录玩家自己的自定义卡实例");
+            Assert.True(activeScoped.ContainsKey("opp_custom_item"), "房间隔离模式应收录对手幽灵/锦标赛的自定义卡实例");
+            Assert.Equal(OverloadCardId, activeScoped["opp_custom_item"].CustomTemplateId);
+            Assert.NotNull(activeScoped["opp_custom_item"].CounterDisplays);
+            Assert.Contains(activeScoped["opp_custom_item"].CounterDisplays!, d => d.SyncAttribute == "Custom_3" && d.MaxValue == 3);
+
+            // 路径 B：服务器全局启用模式（不依赖 SelectedModIds）
+            run.CustomRules.SelectedModIds.Clear();
+            host.SetModEnabledAndReload("clockwork-forge", true);
+            var activeGlobal = host.CollectActiveVisualBindings(run);
+            Assert.True(activeGlobal.ContainsKey("p1_custom_item"), "全局启用模式应收录玩家自己的自定义卡实例");
+            Assert.True(activeGlobal.ContainsKey("opp_custom_item"), "全局启用模式应收录对手幽灵/锦标赛的自定义卡实例");
+            Assert.NotNull(activeGlobal["opp_custom_item"].CounterDisplays);
+        }
+        finally
+        {
+            if (Directory.Exists(tmpStateDir))
+                Directory.Delete(tmpStateDir, recursive: true);
+        }
     }
 }

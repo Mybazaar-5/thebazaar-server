@@ -68,7 +68,7 @@ public interface ICombatMutationApi
     double GetCombatCounter(string key);
 
     void QueuePostCombatRemoveCard(CardInstance card, string? reason, string mechanicId);
-    void QueuePostCombatModifyAttr(CardInstance card, string attribute, string operation, double value, string mechanicId);
+    void QueuePostCombatModifyAttr(CardInstance card, string attribute, string operation, double value, string mechanicId, bool grantIfMissing = false);
 
     IReadOnlyList<CardInstance> ResolveTargets(
         MechanicTargetSpec spec,
@@ -670,7 +670,7 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
         _host.ApplyStatus(status, actorPlayer, sourceCard, targetCard, targetPlayer, amt);
     }
 
-    private static bool IsOutputActionAttribute(string attribute)
+    public static bool IsOutputActionAttribute(string attribute)
     {
         return attribute.Equals("DamageAmount", StringComparison.OrdinalIgnoreCase)
             || attribute.Equals("ShieldApplyAmount", StringComparison.OrdinalIgnoreCase)
@@ -697,9 +697,13 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
         return false;
     }
 
-    private static bool CardSupportsOutputAttribute(CardInstance card, string attribute)
+    public static bool CardSupportsOutputAttribute(CardInstance card, string attribute)
     {
-        if (card.BaseAttributes.TryGetValue(attribute, out double baseVal) && baseVal > 0)
+        if (card == null || string.IsNullOrWhiteSpace(attribute))
+            return false;
+        // 模板当前品阶显式声明该属性（含 0 初始成长型武器/护盾卡）或当前动态值 > 0 即视为具备该输出能力；
+        // 非输出物品（如 Fishing Rod / Catfish / Sea Shell）不包含 DamageAmount 键，严禁凭空写入。
+        if (card.BaseAttributes.ContainsKey(attribute))
             return true;
         if (card.GetAttribute(attribute) > 0)
             return true;
@@ -929,7 +933,7 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
         });
     }
 
-    public void QueuePostCombatModifyAttr(CardInstance card, string attribute, string operation, double value, string mechanicId)
+    public void QueuePostCombatModifyAttr(CardInstance card, string attribute, string operation, double value, string mechanicId, bool grantIfMissing = false)
     {
         if (card == null || string.IsNullOrWhiteSpace(attribute)) return;
         PostCombatOps.Add(new PostCombatMutationOp
@@ -939,6 +943,7 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
             Attribute = attribute.Trim(),
             Operation = string.IsNullOrWhiteSpace(operation) ? "Add" : operation.Trim(),
             Value = SanitizeNumber(value),
+            GrantIfMissing = grantIfMissing,
             SourceMechanicId = mechanicId
         });
     }

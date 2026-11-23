@@ -145,6 +145,13 @@ public static class ModLoader
     {
         pkg.VisualBindingsByCustomId.Clear();
         string modId = pkg.Manifest.Id;
+        var pkgMechMap = new Dictionary<string, MechanicDefinition>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < pkg.Mechanics.Count; i++)
+        {
+            var m = pkg.Mechanics[i];
+            if (m != null && !string.IsNullOrWhiteSpace(m.Id))
+                pkgMechMap[m.Id.Trim()] = m;
+        }
 
         void RegisterBinding(CustomCardDefinition card)
         {
@@ -159,6 +166,11 @@ public static class ModLoader
                 if (pkg.AssetsByLogicalPath.TryGetValue(normalizedArt, out var asset))
                     artSha256 = asset.Sha256;
             }
+
+            var resolvedDisplays = ModRegistry.ResolveCounterDisplaysForCard(
+                card.CounterDisplays,
+                card.CustomMechanics,
+                pkgMechMap);
 
             pkg.VisualBindingsByCustomId[cid] = new CustomCardVisualBinding
             {
@@ -183,7 +195,8 @@ public static class ModLoader
                 Tags = new List<string>(card.Tags),
                 AccentColor = card.AccentColor,
                 TierAttributes = BuildTierAttributesSnapshot(card),
-                EnchantmentPreviewOps = BuildEnchantmentPreviewOpsSnapshot(card.Enchantments)
+                EnchantmentPreviewOps = BuildEnchantmentPreviewOpsSnapshot(card.Enchantments),
+                CounterDisplays = resolvedDisplays.Count > 0 ? resolvedDisplays : null
             };
         }
 

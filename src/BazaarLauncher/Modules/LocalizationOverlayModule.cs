@@ -1277,12 +1277,12 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         {
             var inst = Instance;
             if (inst == null || __instance == null || __0 == null) return;
-            if (!TryExtractCardOverride(__instance, inst.CurrentLocale, out var ov, out var cardInst)) return;
+            if (!TryExtractCardMetadata(__instance, out var ov, out var cardInst)) return;
             if (ov?.TierAttributes == null || ov.TierAttributes.Count == 0 || cardInst == null) return;
 
             var members = GetCardMemberCache(cardInst.GetType());
             string curTier = SafeGetPropertyValue(members.Tier, cardInst)?.ToString();
-            string nextTier = GetNextTierName(curTier);
+            string nextTier = GetNextTierName(curTier, ov.TierAttributes);
             if (nextTier == null)
             {
                 __result = false;
@@ -1302,7 +1302,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         {
             var inst = Instance;
             if (inst == null || __instance == null || __0 == null || __1 == null || __3 == null) return;
-            if (!TryExtractCardOverride(__instance, inst.CurrentLocale, out var ov, out _)) return;
+            if (!TryExtractCardMetadata(__instance, out var ov, out _)) return;
             if (ov?.TierAttributes == null || ov.TierAttributes.Count == 0) return;
 
             string attrName = __0.ToString();
@@ -1648,13 +1648,19 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
 
     // ── 工具方法 ─────────────────────────────────────────────────────────────
 
-    private static string GetNextTierName(string currentTier) => currentTier switch
+    private static string GetNextTierName(string currentTier, Dictionary<string, Dictionary<string, double>> tierAttrs = null)
     {
-        "Bronze" => "Silver",
-        "Silver" => "Gold",
-        "Gold" => "Diamond",
-        _ => null,
-    };
+        if (string.Equals(currentTier, "Bronze", StringComparison.OrdinalIgnoreCase)) return "Silver";
+        if (string.Equals(currentTier, "Silver", StringComparison.OrdinalIgnoreCase)) return "Gold";
+        if (string.Equals(currentTier, "Gold", StringComparison.OrdinalIgnoreCase)) return "Diamond";
+        if (string.Equals(currentTier, "Diamond", StringComparison.OrdinalIgnoreCase)
+            && tierAttrs != null
+            && tierAttrs.ContainsKey("Legendary"))
+        {
+            return "Legendary";
+        }
+        return null;
+    }
 
     private static CardMemberCache GetCardMemberCache(Type runtimeType)
     {
@@ -1681,6 +1687,33 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         {
             return null;
         }
+    }
+
+    private static bool TryExtractCardMetadata(object tooltipData, out CardTextOverride ov, out object cardInst)
+    {
+        ov = null;
+        cardInst = SafeGetPropertyValue(_tooltipCardInstanceProp, tooltipData);
+        string iid = null;
+        string tplId = null;
+
+        if (cardInst != null)
+        {
+            var members = GetCardMemberCache(cardInst.GetType());
+            iid = SafeGetPropertyValue(members.InstanceId, cardInst)?.ToString();
+            tplId = SafeGetPropertyValue(members.TemplateId, cardInst)?.ToString();
+        }
+
+        if (string.IsNullOrEmpty(tplId))
+        {
+            object tpl = SafeGetPropertyValue(_tooltipCardTemplateProp, tooltipData);
+            if (tpl != null)
+            {
+                var tplMembers = GetCardMemberCache(tpl.GetType());
+                tplId = SafeGetPropertyValue(tplMembers.Id, tpl)?.ToString();
+            }
+        }
+
+        return Instance != null && Instance.TryResolveCardMetadata(iid, null, tplId, out ov) && ov != null;
     }
 
     private static bool TryExtractCardOverride(object tooltipData, string locale, out CardTextOverride ov, out object cardInst)
@@ -1733,7 +1766,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         var attrs = SafeGetPropertyValue(members.Attributes, cardInst) as IDictionary;
 
         string curTier = SafeGetPropertyValue(members.Tier, cardInst)?.ToString();
-        string nextTier = isUpgradePreview ? GetNextTierName(curTier) : null;
+        string nextTier = isUpgradePreview ? GetNextTierName(curTier, ov?.TierAttributes) : null;
         Dictionary<string, double> curBaseMap = null;
         Dictionary<string, double> nextBaseMap = null;
         if (ov?.TierAttributes != null && ov.TierAttributes.Count > 0)

@@ -289,7 +289,7 @@ public static class MechanicSandboxInterpreter
                         k => ResolveParamString(k, def, attachment),
                         k => ResolveParamNumber(k, def, attachment));
                     for (int t = 0; t < targets.Count; t++)
-                        runtime.QueuePostCombatModifyAttr(targets[t], attr, step.Operation ?? "Add", val, def.Id);
+                        runtime.QueuePostCombatModifyAttr(targets[t], attr, step.Operation ?? "Add", val, def.Id, step.GrantIfMissing);
                     break;
                 }
             }

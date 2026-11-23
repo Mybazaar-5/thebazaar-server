@@ -430,27 +430,43 @@ public sealed class ServerModHost
         }
     }
 
-    /// <summary>收集指定对局内全部活跃实例对应的 Mod 自定义卡视觉与文本绑定（兼容房间/单局额外选中的社区 Mod）。</summary>
+    /// <summary>收集指定对局内全部活跃实例对应的 Mod 自定义卡视觉与文本绑定（覆盖玩家卡牌、最近战斗的对手幽灵/锦标赛自定义卡牌以及房间额外社区 Mod）。</summary>
     public Dictionary<string, CustomCardVisualBinding> CollectActiveVisualBindings(RunState? run)
     {
         var result = new Dictionary<string, CustomCardVisualBinding>(StringComparer.Ordinal);
         if (run == null) return result;
 
         var extraCatalog = CollectExtraVisualCatalogForRun(run);
-        foreach (var entry in run.Cards.Values)
+        void TryAddInstanceBinding(string? instanceId, string? customId)
         {
-            string? customId = entry.CustomCardId;
-            if (string.IsNullOrWhiteSpace(customId))
-                continue;
-            if (_registry.TryResolveVisualBinding(customId, out var binding, entry.InstanceId) && binding != null)
+            if (string.IsNullOrWhiteSpace(instanceId) || string.IsNullOrWhiteSpace(customId))
+                return;
+            if (_registry.TryResolveVisualBinding(customId, out var binding, instanceId) && binding != null)
             {
-                result[entry.InstanceId] = binding;
+                result[instanceId] = binding;
             }
             else if (extraCatalog != null && extraCatalog.TryGetValue(customId, out var extraBinding))
             {
-                result[entry.InstanceId] = extraBinding;
+                result[instanceId] = extraBinding;
             }
         }
+
+        foreach (var entry in run.Cards.Values)
+        {
+            TryAddInstanceBinding(entry.InstanceId, entry.CustomCardId);
+        }
+
+        if (run.ActiveCombatOpponentCustomCardIds.Count > 0)
+        {
+            foreach (var (oppInstId, oppCustomId) in run.ActiveCombatOpponentCustomCardIds)
+            {
+                if (!result.ContainsKey(oppInstId))
+                {
+                    TryAddInstanceBinding(oppInstId, oppCustomId);
+                }
+            }
+        }
+
         return result;
     }
 

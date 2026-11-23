@@ -580,6 +580,8 @@ public sealed class PostCombatMutationOp
     public string? Attribute { get; init; }
     public string? Operation { get; init; }
     public double Value { get; init; }
+    /// <summary>可选：设为 true 时允许为原本不具备对应产出能力的卡牌凭空赋予该输出属性；默认 false。</summary>
+    public bool GrantIfMissing { get; init; }
     public string? Reason { get; init; }
     public string? SourceMechanicId { get; init; }
 }
