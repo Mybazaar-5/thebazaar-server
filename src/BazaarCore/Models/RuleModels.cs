@@ -90,6 +90,42 @@ public sealed class RuleNode
     public string? GameMode { get; set; }
     public string? Outcome { get; set; }
 
+    // Wave 4A #2：统一收口 RuleNode 属性名与比较运算符别名解析（官方主字段优先 + 兼容 Mod 常见别名 + 过滤空串）
+    private static string? FirstNonEmpty(string? a, string? b, string? c = null, string? d = null)
+    {
+        if (!string.IsNullOrWhiteSpace(a)) return a;
+        if (!string.IsNullOrWhiteSpace(b)) return b;
+        if (!string.IsNullOrWhiteSpace(c)) return c;
+        if (!string.IsNullOrWhiteSpace(d)) return d;
+        return null;
+    }
+
+    public string ResolveCardAttributeName(string fallback, bool preferAttributeField = false)
+        => (preferAttributeField
+            ? FirstNonEmpty(Attribute, AttributeType, CardAttributeType, AttributeChanged)
+            : FirstNonEmpty(AttributeType, CardAttributeType, Attribute, AttributeChanged)) ?? fallback;
+
+    public string ResolvePlayerAttributeName(string fallback, bool preferAttributeField = false)
+        => (preferAttributeField
+            ? FirstNonEmpty(Attribute, AttributeType, PlayerAttributeType, AttributeChanged)
+            : FirstNonEmpty(AttributeType, PlayerAttributeType, Attribute, AttributeChanged)) ?? fallback;
+
+    public string ResolveCostCardAttributeName(string fallback = "Ammo")
+        => FirstNonEmpty(CardAttributeType, AttributeType, Attribute, AttributeChanged) ?? fallback;
+
+    public string ResolveCostPlayerAttributeName(string fallback = "Gold")
+        => FirstNonEmpty(PlayerAttributeType, AttributeType, Attribute, AttributeChanged) ?? fallback;
+
+    public string? ResolveAttributeChangedFilter(bool isPlayer = false)
+        => isPlayer
+            ? FirstNonEmpty(AttributeType, PlayerAttributeType, AttributeChanged, Attribute)
+            : FirstNonEmpty(AttributeChanged, AttributeType, CardAttributeType, Attribute);
+
+    public string? ResolveComparisonOperator(string? fallback = null, bool preferComparisonField = false)
+        => (preferComparisonField
+            ? FirstNonEmpty(Comparison, ComparisonOperator)
+            : FirstNonEmpty(ComparisonOperator, Comparison)) ?? fallback;
+
     public bool? IsNot { get; set; }
     public bool? ExcludeSelf { get; set; }
     public bool? IncludeOrigin { get; set; }

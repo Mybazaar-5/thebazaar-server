@@ -143,7 +143,8 @@
     if (c.$type === 'TCardConditionalOr') return (c.conditions || []).map(describeConditionZh).filter(Boolean).join(' 或 ');
     if (c.$type === 'TCardConditionalSize') return `尺寸:${(c.sizes || []).join('/')}`;
     if (c.$type === 'TCardConditionalTier') return `品质:${(c.tiers || []).join('/')}`;
-    if (c.$type === 'TCardConditionalAttribute') return `${c.attributeType || '属性'}${c.comparisonOperator || ''}`;
+    if (c.$type === 'TCardConditionalAttribute') return `${c.attribute || c.attributeType || '属性'}${c.comparisonOperator || ''}`;
+    if (c.$type === 'TPlayerConditionalAttribute') return `玩家${c.attribute || c.attributeType || '属性'}${c.comparisonOperator || ''}`;
     return labelFromList(catalog().conditions, c.$type);
   }
 
@@ -152,9 +153,26 @@
     if (v.$type === 'TFixedValue') return String(v.value ?? 0);
     if (v.$type === 'TReferenceValueCardAttribute') return `{attr.${v.attributeType || 'Custom_0'}}`;
     if (v.$type === 'TReferenceValuePlayerAttribute') return `玩家${v.attributeType || 'Gold'}`;
-    if (v.$type === 'TReferenceValueCardTagCount') return `场上[${(v.tags || []).join('/')}]数量`;
-    if (v.$type === 'TReferenceValueCardCount') return '符合条件的卡牌数';
+    if (v.$type === 'TReferenceValueCardTagCount') return `场上[${(v.tags || v.target?.conditions?.tags || []).join('/')}]标签种类数`;
+    if (v.$type === 'TReferenceValueCardCount') {
+      const condTags = v.target?.conditions?.tags;
+      return condTags?.length ? `场上[${condTags.join('/')}]数量` : '符合条件的卡牌数';
+    }
     return v.$type;
+  }
+
+  function describeDurationZh(d) {
+    if (!d || !d.$type) return '';
+    if (d.$type === 'TDeterminantDuration') {
+      if (d.durationType === 'UntilEndOfHour') return '（本小时）';
+      if (d.durationType === 'UntilEndOfDay') return '（本日）';
+      return '（本战）';
+    }
+    if (d.$type === 'TCombatDuration') {
+      const ms = Number(d.durationInMs);
+      return Number.isFinite(ms) && ms > 0 ? `（限时 ${Math.round(ms / 100) / 10}s）` : '（本战限时）';
+    }
+    return '';
   }
 
   function describeActionZh(a) {
@@ -167,7 +185,7 @@
     const val = describeValueZh(a.value);
     if (a.$type === 'TActionCardModifyAttribute' || a.$type === 'TActionPlayerModifyAttribute') {
       const opSym = a.operation === 'Subtract' ? '-' : (a.operation === 'Multiply' ? '×' : '+');
-      const dur = a.duration?.$type === 'TCombatDuration' ? '（本战）' : '';
+      const dur = describeDurationZh(a.duration);
       return `使【${tgt}】的 ${a.attributeType || 'DamageAmount'} ${opSym}${val || '{attr.Custom_0}'}${dur}`;
     }
     if (a.$type === 'TActionCardCharge' || a.$type === 'TActionCardHaste' || a.$type === 'TActionCardSlow' || a.$type === 'TActionCardFreeze') {
@@ -292,9 +310,46 @@
     if ($('abAuraVfxKey')) $('abAuraVfxKey').innerHTML = renderVfxOptionsHtml($('abAuraVfxKey').value);
   }
 
+  function buildDurationRuleNode(duration, durationMs) {
+    if (duration === 'Combat') {
+      return { $type: 'TDeterminantDuration', durationType: 'UntilEndOfCombat' };
+    }
+    if (duration === 'UntilEndOfHour') {
+      return { $type: 'TDeterminantDuration', durationType: 'UntilEndOfHour' };
+    }
+    if (duration === 'UntilEndOfDay') {
+      return { $type: 'TDeterminantDuration', durationType: 'UntilEndOfDay' };
+    }
+    if (duration === 'TimedCombat') {
+      const ms = Math.max(500, parseInt(durationMs, 10) || 2000);
+      return { $type: 'TCombatDuration', durationInMs: ms };
+    }
+    return undefined;
+  }
+
+  function parseDurationFromRuleNode(durationNode) {
+    if (!durationNode || !durationNode.$type) {
+      return { duration: 'Permanent', durationMs: 2000 };
+    }
+    if (durationNode.$type === 'TDeterminantDuration') {
+      if (durationNode.durationType === 'UntilEndOfHour') return { duration: 'UntilEndOfHour', durationMs: 2000 };
+      if (durationNode.durationType === 'UntilEndOfDay') return { duration: 'UntilEndOfDay', durationMs: 2000 };
+      return { duration: 'Combat', durationMs: 2000 };
+    }
+    if (durationNode.$type === 'TCombatDuration') {
+      const ms = parseInt(durationNode.durationInMs, 10);
+      if (Number.isFinite(ms) && ms > 0) return { duration: 'TimedCombat', durationMs: ms };
+      return { duration: 'Combat', durationMs: 2000 };
+    }
+    return { duration: 'Permanent', durationMs: 2000 };
+  }
+
+  const PERMANENT_PLAYER_ATTRS = new Set(['Gold', 'Income', 'Experience', 'Prestige']);
+
   function makeDefaultActionRow(actionType = 'TActionPlayerDamage') {
     const isPlayer = PLAYER_ACTIONS.has(actionType);
     const isSelfHelpful = isSelfPlayerAction(actionType);
+    const defaultAttr = actionType === 'TActionPlayerModifyAttribute' ? 'Gold' : 'DamageAmount';
     return {
       actionType,
       targetMode: isPlayer ? (isSelfHelpful ? 'SelfPlayer' : 'OpponentPlayer') : 'Neighbor',
@@ -303,9 +358,10 @@
       randomCount: 1,
       valueMode: 'default', // default | fixed | cardAttr | playerAttr | cardTagCount
       valueInput: '1000',
-      attributeType: 'DamageAmount',
+      attributeType: defaultAttr,
       operation: 'Add',
-      duration: 'Combat',
+      duration: (actionType === 'TActionPlayerModifyAttribute' && PERMANENT_PLAYER_ATTRS.has(defaultAttr)) ? 'Permanent' : 'Combat',
+      durationMs: 2000,
       enchantmentType: 'Fiery',
       vfxKey: '',
     };
@@ -361,18 +417,23 @@
     } else if (actionNode.value?.$type === 'TReferenceValuePlayerAttribute') {
       valueMode = 'playerAttr';
       valueInput = actionNode.value.attributeType || 'Gold';
+    } else if (actionNode.value?.$type === 'TReferenceValueCardCount' && actionNode.value.target?.conditions?.tags?.[0]) {
+      valueMode = 'cardTagCount';
+      valueInput = actionNode.value.target.conditions.tags[0];
     } else if (actionNode.value?.$type === 'TReferenceValueCardTagCount') {
       valueMode = 'cardTagCount';
-      valueInput = (actionNode.value.tags || ['Weapon'])[0];
+      valueInput = (actionNode.value.tags || actionNode.value.target?.conditions?.tags || ['Weapon'])[0];
     }
+    const parsedDur = parseDurationFromRuleNode(actionNode.duration);
     return [{
       actionType: actionNode.$type || 'TActionPlayerDamage',
       ...tgt,
       valueMode,
       valueInput: valueInput || '10',
-      attributeType: actionNode.attributeType || 'DamageAmount',
+      attributeType: actionNode.attributeType || (actionNode.$type === 'TActionPlayerModifyAttribute' ? 'Gold' : 'DamageAmount'),
       operation: actionNode.operation || 'Add',
-      duration: actionNode.duration?.$type === 'TCombatDuration' ? 'Combat' : 'Permanent',
+      duration: parsedDur.duration,
+      durationMs: parsedDur.durationMs,
       enchantmentType: actionNode.enchantmentType || 'Fiery',
       vfxKey: '',
     }];
@@ -409,7 +470,16 @@
     if (mode === 'fixed') return { $type: 'TFixedValue', value: parseFloat(input) || 0 };
     if (mode === 'cardAttr') return { $type: 'TReferenceValueCardAttribute', attributeType: (input || 'Custom_0').trim(), target: { $type: 'TTargetCardSelf' } };
     if (mode === 'playerAttr') return { $type: 'TReferenceValuePlayerAttribute', attributeType: (input || 'Gold').trim(), target: { $type: 'TTargetPlayerRelative', targetMode: 'Self' } };
-    if (mode === 'cardTagCount') return { $type: 'TReferenceValueCardTagCount', tags: [(input || 'Weapon').trim()], targetSection: 'SelfHand' };
+    if (mode === 'cardTagCount') {
+      return {
+        $type: 'TReferenceValueCardCount',
+        target: {
+          $type: 'TTargetCardSection',
+          targetSection: 'SelfHand',
+          conditions: { $type: 'TCardConditionalTag', tags: [(input || 'Weapon').trim()], operator: 'Any' },
+        },
+      };
+    }
     return undefined;
   }
 
@@ -435,11 +505,11 @@
       return [{
         $type: 'TPrerequisitePlayer',
         subject: {
-          $type: 'TTargetPlayerAbsolute',
-          targetMode: 'Player',
+          $type: 'TTargetPlayerRelative',
+          targetMode: 'Self',
           conditions: {
             $type: 'TPlayerConditionalAttribute',
-            attributeType: pAttr,
+            attribute: pAttr,
             comparisonOperator: pOp,
             comparisonValue: { $type: 'TFixedValue', value: pVal },
           },
@@ -553,10 +623,11 @@
       if (valNode) a.value = valNode;
 
       if (row.actionType === 'TActionCardModifyAttribute' || row.actionType === 'TActionPlayerModifyAttribute') {
-        a.attributeType = row.attributeType || 'DamageAmount';
+        a.attributeType = row.attributeType || (row.actionType === 'TActionPlayerModifyAttribute' ? 'Gold' : 'DamageAmount');
         a.operation = row.operation || 'Add';
         if (!a.value) a.value = { $type: 'TReferenceValueCardAttribute', attributeType: 'Custom_0', target: { $type: 'TTargetCardSelf' } };
-        if (row.duration === 'Combat') a.duration = { $type: 'TCombatDuration' };
+        const durNode = buildDurationRuleNode(row.duration, row.durationMs);
+        if (durNode) a.duration = durNode;
       } else if (row.actionType === 'TActionCardEnchant') {
         a.enchantmentType = row.enchantmentType || 'Fiery';
       }
@@ -684,7 +755,17 @@
               <span>要修改的属性与增减</span>
               <div class="inline-pair">
                 <select data-af="attributeType" data-aidx="${idx}">
-                  ${attrs.map((a) => `<option value="${escapeHtml(a.id)}" ${a.id === row.attributeType ? 'selected' : ''}>${escapeHtml(a.nameZh)}</option>`).join('')}
+                  ${(row.actionType === 'TActionPlayerModifyAttribute'
+                    ? (cat.mechanicSchema?.playerAttributes || [
+                      { id: 'Gold', nameZh: '金币 (Gold)' },
+                      { id: 'HealthMax', nameZh: '生命上限 (HealthMax)' },
+                      { id: 'Income', nameZh: '每小时收入 (Income)' },
+                      { id: 'Experience', nameZh: '经验 (Experience)' },
+                      { id: 'Prestige', nameZh: '声望 (Prestige)' },
+                      { id: 'HealthRegen', nameZh: '生命再生 (HealthRegen)' },
+                      { id: 'PercentDamageReduction', nameZh: '百分比减伤 (PercentDamageReduction)' },
+                    ])
+                    : attrs).map((a) => `<option value="${escapeHtml(a.id)}" ${a.id === row.attributeType ? 'selected' : ''}>${escapeHtml(a.nameZh)}</option>`).join('')}
                 </select>
                 <select data-af="operation" data-aidx="${idx}">
                   <option value="Add" ${row.operation === 'Add' ? 'selected' : ''}>+ 增加</option>
@@ -694,11 +775,17 @@
               </div>
             </label>
             <label class="field">
-              <span>持续时长</span>
-              <select data-af="duration" data-aidx="${idx}">
-                <option value="Combat" ${row.duration === 'Combat' ? 'selected' : ''}>仅本场战斗生效</option>
-                <option value="Permanent" ${row.duration === 'Permanent' ? 'selected' : ''}>整局游戏永久保留</option>
-              </select>
+              <span>持续时长（战中 Buff 默认本战结束复原，防永久滚雪球）</span>
+              <div class="inline-pair">
+                <select data-af="duration" data-aidx="${idx}">
+                  <option value="Combat" ${row.duration === 'Combat' ? 'selected' : ''}>仅本场战斗生效（UntilEndOfCombat）</option>
+                  <option value="TimedCombat" ${row.duration === 'TimedCombat' ? 'selected' : ''}>战斗内限时（毫秒后复原）</option>
+                  <option value="UntilEndOfHour" ${row.duration === 'UntilEndOfHour' ? 'selected' : ''}>持续至本小时结束</option>
+                  <option value="UntilEndOfDay" ${row.duration === 'UntilEndOfDay' ? 'selected' : ''}>持续至本日结束</option>
+                  <option value="Permanent" ${row.duration === 'Permanent' ? 'selected' : ''}>整局游戏永久保留</option>
+                </select>
+                ${row.duration === 'TimedCombat' ? `<input type="number" data-af="durationMs" data-aidx="${idx}" value="${escapeHtml(safeNumAttr(row.durationMs ?? 2000))}" min="500" max="60000" step="500" placeholder="毫秒 ms" />` : ''}
+              </div>
             </label>` : ''}
             ${isEnchant ? `
             <label class="field">
@@ -726,8 +813,18 @@
         if (f === 'actionType') {
           const isP = PLAYER_ACTIONS.has(el.value);
           v14.builderState.actions[i].targetMode = isP ? (isSelfPlayerAction(el.value) ? 'SelfPlayer' : 'OpponentPlayer') : 'Neighbor';
+          if (el.value === 'TActionPlayerModifyAttribute') {
+            v14.builderState.actions[i].attributeType = 'Gold';
+            v14.builderState.actions[i].duration = 'Permanent';
+          } else if (el.value === 'TActionCardModifyAttribute') {
+            v14.builderState.actions[i].attributeType = 'DamageAmount';
+            v14.builderState.actions[i].duration = 'Combat';
+          }
           renderBuilderActionsList();
-        } else if (f === 'valueMode') {
+        } else if (f === 'attributeType' && v14.builderState.actions[i].actionType === 'TActionPlayerModifyAttribute') {
+          v14.builderState.actions[i].duration = PERMANENT_PLAYER_ATTRS.has(el.value) ? 'Permanent' : 'Combat';
+          renderBuilderActionsList();
+        } else if (f === 'valueMode' || f === 'duration') {
           renderBuilderActionsList();
         }
         updateAffixBuilderPreview();
@@ -818,7 +915,7 @@
       if (p?.$type === 'TPrerequisitePlayer') {
         if (preserveOpt) preserveOpt.hidden = true;
         const cond = p.subject?.conditions;
-        const attr = cond?.attributeType || 'Gold';
+        const attr = cond?.attribute || cond?.attributeType || 'Gold';
         const op = cond?.comparisonOperator || 'GreaterThanOrEqual';
         const cv = typeof cond?.comparisonValue === 'number' ? cond.comparisonValue : (cond?.comparisonValue?.value ?? 20);
         sel.value = 'playerAttr';

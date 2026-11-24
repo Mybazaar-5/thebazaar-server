@@ -356,6 +356,11 @@ internal static class CombatPatch
     // ── 1. CombatState.GoToNextState 安全切态兜底（P1-29：移除盲切 Loot）───────
     private static void PatchCombatStateGoNext(SafeHarmonyPatcher patcher)
     {
+        if (BazaarLauncherPlugin.IsStrictBareClientAuditModeActive())
+        {
+            BazaarLauncherPlugin.Log?.LogInfo("[StrictBareClientAuditMode] 已禁用 CombatState.GoToNextState (H-7) 兜底切态干预");
+            return;
+        }
         var combatState = AccessTools.TypeByName("TheBazaar.CombatState");
         var go = combatState == null ? null : AccessTools.Method(combatState, "GoToNextState");
         if (go == null) return;

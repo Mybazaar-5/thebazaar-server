@@ -605,14 +605,21 @@ public sealed class AuditWave2EncountersTests
             Assert.True(checkShop.HasPlayableEncounterPayload(tpl!), $"直效/纯 XP 遭遇 {directId} ({tpl!.InternalName}) 应通过 HasPlayableEncounterPayload");
         }
 
-        // 3. 端到端选中 Study (Default Option)（纯 XP=2 无 SpawnContext）与 Borrow (Day 1-2)（TTriggerOnCardSelected + XP=1）：
-        // 必须即刻生效、发放 XP 并直接推进下一小时回到 Choice，绝不卡死在空 Encounter 界面
+        // 3. Wave 4A #1 架构根治同步更新：选中 Study (Default Option) 与 Borrow (Day 1-2) 等直效/纯 XP 事件遭遇后，
+        //    先立刻执行直效动作并安全落地 ERunState.Encounter（CanExit=true，避免同包 Choice -> Choice 绕过客户端沙尘门控软锁），
+        //    随后玩家点击 ExitEncounterCommand 离场结算延迟 XP 并推进至下一小时 Choice 且候选项非空。
         {
             var (runStudy, engineStudy) = CreateStartedRun(day: 1, hour: 1, seed: 16001);
             int xpBefore = runStudy.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0);
             var studyEnc = InjectChoiceEncounter(runStudy, "ce38f4a2-f156-4082-b8ce-e8956c71fc0d");
             var outcome = engineStudy.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(studyEnc.InstanceId) });
             Assert.Null(outcome.Error);
+            Assert.Equal(ERunState.Encounter, runStudy.State);
+            Assert.True(runStudy.SelectionRules.CanExit);
+            Assert.Equal(2, runStudy.PendingEncounterExitXp);
+
+            var exitOutcome = engineStudy.Handle(new ExitCurrentStateCommand());
+            Assert.Null(exitOutcome.Error);
             Assert.Equal(ERunState.Choice, runStudy.State);
             Assert.Equal(2u, runStudy.Hour);
             Assert.Equal(xpBefore + 2, runStudy.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0));
@@ -625,9 +632,14 @@ public sealed class AuditWave2EncountersTests
             var borrowEnc = InjectChoiceEncounter(runBorrow, "036ce025-fc8a-4924-b1bd-a4f6f470ebc7");
             var outcome = engineBorrow.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(borrowEnc.InstanceId) });
             Assert.Null(outcome.Error);
+            Assert.Equal(ERunState.Encounter, runBorrow.State);
+            Assert.True(runBorrow.SelectionRules.CanExit);
+            Assert.True(runBorrow.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0) > goldBefore, "Borrow (Day 1-2) 选中后应立刻执行 TTriggerOnCardSelected 发放金币");
+
+            var exitOutcome = engineBorrow.Handle(new ExitCurrentStateCommand());
+            Assert.Null(exitOutcome.Error);
             Assert.Equal(ERunState.Choice, runBorrow.State);
             Assert.Equal(2u, runBorrow.Hour);
-            Assert.True(runBorrow.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0) > goldBefore, "Borrow (Day 1-2) 选中后应立刻执行 TTriggerOnCardSelected 发放金币");
             Assert.Equal(xpBefore + 1, runBorrow.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0));
         }
     }

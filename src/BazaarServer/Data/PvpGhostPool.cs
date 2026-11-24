@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Frozen;
 using System.Security.Cryptography;
 using System.Text;
@@ -11,6 +12,7 @@ using BazaarGameShared.Domain.Core.Types;
 using BazaarServer.Game;
 using BazaarServer.Mods;
 using BazaarServer.Storage;
+using Microsoft.Win32.SafeHandles;
 
 namespace BazaarServer.Data;
 
@@ -177,35 +179,177 @@ public sealed class PvpGhostPool
 
     private readonly record struct BucketKey(string Partition, int Day);
 
+    [Flags]
+    private enum GhostEntryFlags : byte
+    {
+        None = 0,
+        IsPlayerGhost = 1 << 0,
+        IsCustomRule = 1 << 1,
+        IsRealCommunityGhost = 1 << 2,
+        IsFull10Slots = 1 << 3,
+        IsHighPower = 1 << 4,
+    }
+
+    private const byte PowerBucketNormal = 0;
+    private const byte PowerBucketStrong = 1;
+    private const byte PowerBucketWeak = 2;
+    private const byte PowerBucketMetaBoss = 3;
+
+    public const int DefaultLruCacheCapacity = 256;
+
+    /// <summary>
+    /// Wave 4A #7：轻量索引项。磁盘静态 JSONL 样本仅保留文件字节偏移 + 长度与筛选元数据（不常驻 GhostItem/Dictionary 对象图），
+    /// 内存注入/SQLite 真人镜像样本则直接持有 InMemoryBoard，双轨统一进入分桶与严格等概率抽样。
+    /// </summary>
+    private sealed class GhostIndexEntry
+    {
+        public string BoardId { get; init; } = "";
+        public string Partition { get; init; } = StandardPartition;
+        public long FileOffset { get; init; } = -1;
+        public int ByteLength { get; init; }
+        public int HealthMax { get; init; }
+        public ushort Day { get; init; }
+        public byte Level { get; init; }
+        public byte Wins { get; init; }
+        public byte PowerBucketCode { get; init; }
+        public GhostEntryFlags Flags { get; init; }
+        public GhostBoard? InMemoryBoard { get; init; }
+
+        public bool IsPlayerGhost => (Flags & GhostEntryFlags.IsPlayerGhost) != 0;
+        public bool IsCustomRule => (Flags & GhostEntryFlags.IsCustomRule) != 0;
+        public bool IsRealCommunityGhost => (Flags & GhostEntryFlags.IsRealCommunityGhost) != 0;
+        public bool IsFull10Slots => (Flags & GhostEntryFlags.IsFull10Slots) != 0;
+        public bool IsHighPower => (Flags & GhostEntryFlags.IsHighPower) != 0;
+        public bool IsDiskBacked => InMemoryBoard == null && FileOffset >= 0 && ByteLength > 0;
+    }
+
     private sealed class DayPartitionBucket
     {
-        public required GhostBoard[] All { get; init; }
-        public required GhostBoard[] StaticPreferred { get; init; }
-        public required GhostBoard[] RealCommunityPreferred { get; init; }
-        public required GhostBoard[] PlayerGhosts { get; init; }
-        public required GhostBoard[] HighPowerBoards { get; init; }
+        public required GhostIndexEntry[] All { get; init; }
+        public required GhostIndexEntry[] StaticPreferred { get; init; }
+        public required GhostIndexEntry[] RealCommunityPreferred { get; init; }
+        public required GhostIndexEntry[] PlayerGhosts { get; init; }
+        public required GhostIndexEntry[] HighPowerBoards { get; init; }
     }
 
     private sealed class GhostIndexSnapshot
     {
         public required FrozenDictionary<BucketKey, DayPartitionBucket> Buckets { get; init; }
-        public required GhostBoard[] StandardAll { get; init; }
-        public required GhostBoard[] HighDayStrongOrMeta { get; init; }
+        public required GhostIndexEntry[] StandardAll { get; init; }
+        public required GhostIndexEntry[] HighDayStrongOrMeta { get; init; }
         public required int TotalCount { get; init; }
         public required int PlayerGhostCount { get; init; }
         public required int CustomRuleGhostCount { get; init; }
+        public required int DiskIndexedCount { get; init; }
     }
 
-    private readonly Dictionary<BucketKey, List<GhostBoard>> _mutableBuckets = new();
-    private readonly List<GhostBoard> _all = new();
+    /// <summary>有界线程安全 LRU 热点缓存（按 FileOffset 键缓存按需反序列化的 GhostBoard，锁内仅操作 O(1) 字典与链表指针）。</summary>
+    private sealed class BoundedGhostLruCache
+    {
+        private readonly int _capacity;
+        private readonly object _lock = new();
+        private readonly Dictionary<long, LinkedListNode<(long Key, GhostBoard Value)>> _map;
+        private readonly LinkedList<(long Key, GhostBoard Value)> _order = new();
+        private long _hits;
+        private long _misses;
+
+        public BoundedGhostLruCache(int capacity)
+        {
+            _capacity = Math.Max(16, capacity);
+            _map = new Dictionary<long, LinkedListNode<(long Key, GhostBoard Value)>>(_capacity);
+        }
+
+        public int Capacity => _capacity;
+
+        public int Count
+        {
+            get { lock (_lock) return _map.Count; }
+        }
+
+        public long HitCount => Volatile.Read(ref _hits);
+        public long MissCount => Volatile.Read(ref _misses);
+
+        public bool TryGet(long offset, out GhostBoard? board)
+        {
+            lock (_lock)
+            {
+                if (_map.TryGetValue(offset, out var node))
+                {
+                    if (!ReferenceEquals(_order.First, node))
+                    {
+                        _order.Remove(node);
+                        _order.AddFirst(node);
+                    }
+                    Interlocked.Increment(ref _hits);
+                    board = node.Value.Value;
+                    return true;
+                }
+            }
+            Interlocked.Increment(ref _misses);
+            board = null;
+            return false;
+        }
+
+        public void Put(long offset, GhostBoard board)
+        {
+            lock (_lock)
+            {
+                if (_map.TryGetValue(offset, out var existing))
+                {
+                    existing.Value = (offset, board);
+                    if (!ReferenceEquals(_order.First, existing))
+                    {
+                        _order.Remove(existing);
+                        _order.AddFirst(existing);
+                    }
+                    return;
+                }
+
+                if (_map.Count >= _capacity && _order.Last != null)
+                {
+                    var tail = _order.Last;
+                    _order.RemoveLast();
+                    _map.Remove(tail.Value.Key);
+                    tail.Value = (offset, board);
+                    _order.AddFirst(tail);
+                    _map[offset] = tail;
+                    return;
+                }
+
+                var node = new LinkedListNode<(long Key, GhostBoard Value)>((offset, board));
+                _order.AddFirst(node);
+                _map[offset] = node;
+            }
+        }
+    }
+
+    private readonly Dictionary<BucketKey, List<GhostIndexEntry>> _mutableBuckets = new();
+    private readonly List<GhostIndexEntry> _all = new();
     private readonly HashSet<string> _knownBoardIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _writeLock = new();
+    private readonly BoundedGhostLruCache _lru;
+    private string? _sourceFilePath;
 
     private volatile GhostIndexSnapshot _index = BuildEmptySnapshot();
+
+    public PvpGhostPool()
+        : this(DefaultLruCacheCapacity)
+    {
+    }
+
+    public PvpGhostPool(int lruCacheCapacity)
+    {
+        _lru = new BoundedGhostLruCache(lruCacheCapacity);
+    }
 
     public int Count => _index.TotalCount;
     public int PlayerGhostCount => _index.PlayerGhostCount;
     public int CustomRuleGhostCount => _index.CustomRuleGhostCount;
+    public int DiskIndexedCount => _index.DiskIndexedCount;
+    public int CachedMaterializedCount => _lru.Count;
+    public int LruCapacity => _lru.Capacity;
+    public long LruHitCount => _lru.HitCount;
+    public long LruMissCount => _lru.MissCount;
 
     public static PvpGhostPool Load(string dataRoot)
     {
@@ -217,26 +361,483 @@ public sealed class PvpGhostPool
             return pool;
         }
 
+        pool._sourceFilePath = path;
         int rawLines = 0;
         int droppedDirty = 0;
-        foreach (string line in File.ReadLines(path))
+
+        // Wave 4A #7：单遍 FileStream 字节扫描 + 零堆分配 Utf8JsonReader，按精确 (FileOffset, ByteLength) 建轻量索引，
+        // 彻底避免全量留存 29,555 个 GhostBoard/GhostItem/Dictionary 对象图（堆内存由 ~523MB 降至 <15MB，冷启 <0.5s）。
+        var reusableItemCounts = new Dictionary<string, int>(16, StringComparer.OrdinalIgnoreCase);
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufferSize: 256 * 1024, FileOptions.SequentialScan))
         {
-            if (string.IsNullOrWhiteSpace(line)) continue;
-            rawLines++;
-            var board = ParseLine(line);
-            if (board == null || !IsCleanStaticGhostForLoad(board))
+            byte[] buf = ArrayPool<byte>.Shared.Rent(256 * 1024);
+            try
             {
-                droppedDirty++;
-                continue;
+                int buffered = 0;
+                long bufStartOffset = 0;
+                bool isFirstLine = true;
+
+                while (true)
+                {
+                    if (buffered == buf.Length)
+                    {
+                        byte[] bigger = ArrayPool<byte>.Shared.Rent(buf.Length * 2);
+                        Buffer.BlockCopy(buf, 0, bigger, 0, buffered);
+                        ArrayPool<byte>.Shared.Return(buf);
+                        buf = bigger;
+                    }
+
+                    int read = fs.Read(buf, buffered, buf.Length - buffered);
+                    int total = buffered + read;
+                    int pos = 0;
+
+                    while (pos < total)
+                    {
+                        int nlRel = Array.IndexOf(buf, (byte)'\n', pos, total - pos);
+                        if (nlRel < 0)
+                        {
+                            if (read > 0)
+                                break; // 行跨缓冲边界，留待下轮续读
+                            nlRel = total; // 文件尾最后一行无换行符
+                        }
+
+                        int lineStart = pos;
+                        int lineEnd = nlRel;
+                        if (lineEnd > lineStart && buf[lineEnd - 1] == (byte)'\r')
+                            lineEnd--;
+
+                        if (isFirstLine)
+                        {
+                            isFirstLine = false;
+                            if (lineEnd - lineStart >= 3 && buf[lineStart] == 0xEF && buf[lineStart + 1] == 0xBB && buf[lineStart + 2] == 0xBF)
+                                lineStart += 3;
+                        }
+
+                        while (lineStart < lineEnd && IsAsciiWhitespace(buf[lineStart])) lineStart++;
+                        while (lineEnd > lineStart && IsAsciiWhitespace(buf[lineEnd - 1])) lineEnd--;
+
+                        int lineLen = lineEnd - lineStart;
+                        if (lineLen > 0)
+                        {
+                            rawLines++;
+                            long lineOffset = bufStartOffset + lineStart;
+                            var entry = TryIndexUtf8Line(buf.AsSpan(lineStart, lineLen), lineOffset, lineLen, reusableItemCounts);
+                            if (entry == null)
+                                droppedDirty++;
+                            else
+                                pool.AddEntryUnlocked(entry);
+                        }
+
+                        pos = nlRel < total ? nlRel + 1 : total;
+                    }
+
+                    if (pos < total)
+                    {
+                        int remaining = total - pos;
+                        Buffer.BlockCopy(buf, pos, buf, 0, remaining);
+                        buffered = remaining;
+                        bufStartOffset += pos;
+                    }
+                    else
+                    {
+                        buffered = 0;
+                        bufStartOffset += total;
+                    }
+
+                    if (read == 0)
+                        break;
+                }
             }
-            pool.AddBoardUnlocked(board);
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
         }
 
         pool.RebuildReadIndexUnlocked();
         Console.WriteLine(
-            $"[PvpGhostPool] loaded {pool._all.Count}/{rawLines} clean ghost boards (dropped {droppedDirty} dirty/incomplete) " +
-            $"from {path} ({pool._mutableBuckets.Count} partition-day buckets)");
+            $"[PvpGhostPool] indexed {pool._all.Count}/{rawLines} clean ghost boards (dropped {droppedDirty} dirty/incomplete, " +
+            $"disk-offset mode, LRU={pool._lru.Capacity}) from {path} ({pool._mutableBuckets.Count} partition-day buckets)");
         return pool;
+    }
+
+    private static bool IsAsciiWhitespace(byte b)
+        => b == (byte)' ' || b == (byte)'\t' || b == (byte)'\r' || b == (byte)'\n';
+
+    private static bool IsRealCommunitySource(string? source)
+        => !string.IsNullOrEmpty(source)
+        && (source.StartsWith("real_", StringComparison.OrdinalIgnoreCase)
+            || source.StartsWith("bazaarplusplus", StringComparison.OrdinalIgnoreCase)
+            || source.StartsWith("compass", StringComparison.OrdinalIgnoreCase)
+            || source.StartsWith("bazaarhub", StringComparison.OrdinalIgnoreCase));
+
+    private static byte EncodePowerBucket(string? powerBucket)
+    {
+        if (string.IsNullOrWhiteSpace(powerBucket)) return PowerBucketNormal;
+        if (powerBucket.Equals("Strong", StringComparison.OrdinalIgnoreCase)) return PowerBucketStrong;
+        if (powerBucket.Equals("Weak", StringComparison.OrdinalIgnoreCase)) return PowerBucketWeak;
+        if (powerBucket.Equals("MetaBoss", StringComparison.OrdinalIgnoreCase)) return PowerBucketMetaBoss;
+        return PowerBucketNormal;
+    }
+
+    private static bool MatchesPowerBucketCode(byte code, string[] buckets)
+    {
+        string name = code switch
+        {
+            PowerBucketStrong => "Strong",
+            PowerBucketWeak => "Weak",
+            PowerBucketMetaBoss => "MetaBoss",
+            _ => "Normal",
+        };
+        for (int i = 0; i < buckets.Length; i++)
+        {
+            if (string.Equals(buckets[i], name, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool PropEquals(ref Utf8JsonReader reader, ReadOnlySpan<byte> camel, ReadOnlySpan<byte> pascal)
+        => reader.ValueTextEquals(camel) || reader.ValueTextEquals(pascal);
+
+    /// <summary>
+    /// 零 JsonDocument 分配的 Utf8JsonReader 单遍行索引器：100% 精确复现 IsCleanStaticGhostForLoad 清洗判定并产出极轻量的 GhostIndexEntry。
+    /// </summary>
+    private static GhostIndexEntry? TryIndexUtf8Line(
+        ReadOnlySpan<byte> utf8Line,
+        long fileOffset,
+        int byteLength,
+        Dictionary<string, int> reusableItemCounts)
+    {
+        try
+        {
+            var reader = new Utf8JsonReader(utf8Line, isFinalBlock: true, state: default);
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+                return null;
+
+            string boardId = "";
+            int day = 1;
+            string hero = "Vanessa";
+            int level = 1;
+            int healthMax = GameDefaults.StartingHealth;
+            int wins = 0;
+            string powerBucket = "Normal";
+            string source = "";
+            string persona = "";
+            bool isPlayerGhost = false;
+            bool isCustomRule = false;
+            string? poolPartition = null;
+
+            int itemCount = 0;
+            int totalWidth = 0;
+            bool allWidth1 = true;
+            bool hasInvalidOrTripleItem = false;
+            int skillCount = 0;
+
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.EndObject)
+                    break;
+                if (reader.TokenType != JsonTokenType.PropertyName)
+                    continue;
+
+                if (PropEquals(ref reader, "boardId"u8, "BoardId"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.String)
+                        boardId = reader.GetString() ?? "";
+                }
+                else if (PropEquals(ref reader, "day"u8, "Day"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out int d))
+                        day = Math.Max(1, d);
+                }
+                else if (PropEquals(ref reader, "hero"u8, "Hero"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.String)
+                        hero = reader.GetString() ?? "Vanessa";
+                }
+                else if (PropEquals(ref reader, "level"u8, "Level"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out int lv))
+                        level = lv;
+                }
+                else if (PropEquals(ref reader, "healthMax"u8, "HealthMax"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out int hp))
+                        healthMax = Math.Max(100, hp);
+                }
+                else if (PropEquals(ref reader, "wins"u8, "Wins"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out int w))
+                        wins = w;
+                }
+                else if (PropEquals(ref reader, "powerBucket"u8, "PowerBucket"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.String)
+                        powerBucket = reader.GetString() ?? "Normal";
+                }
+                else if (PropEquals(ref reader, "source"u8, "Source"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.String)
+                        source = reader.GetString() ?? "";
+                }
+                else if (PropEquals(ref reader, "persona"u8, "Persona"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.String)
+                        persona = reader.GetString() ?? "";
+                }
+                else if (PropEquals(ref reader, "isPlayerGhost"u8, "IsPlayerGhost"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType is JsonTokenType.True or JsonTokenType.False)
+                        isPlayerGhost = reader.GetBoolean();
+                }
+                else if (PropEquals(ref reader, "isCustomRule"u8, "IsCustomRule"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType is JsonTokenType.True or JsonTokenType.False)
+                        isCustomRule = reader.GetBoolean();
+                }
+                else if (PropEquals(ref reader, "poolPartition"u8, "PoolPartition"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.String)
+                        poolPartition = reader.GetString();
+                }
+                else if (PropEquals(ref reader, "items"u8, "Items"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.StartArray)
+                    {
+                        reusableItemCounts.Clear();
+                        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                        {
+                            if (reader.TokenType != JsonTokenType.StartObject)
+                            {
+                                reader.Skip();
+                                continue;
+                            }
+                            int itemWidth = 1;
+                            string? tplId = null;
+                            while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+                            {
+                                if (reader.TokenType != JsonTokenType.PropertyName) continue;
+                                if (PropEquals(ref reader, "width"u8, "Width"u8))
+                                {
+                                    reader.Read();
+                                    if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out int iw))
+                                        itemWidth = iw;
+                                }
+                                else if (PropEquals(ref reader, "templateId"u8, "TemplateId"u8))
+                                {
+                                    reader.Read();
+                                    if (reader.TokenType == JsonTokenType.String)
+                                        tplId = reader.GetString();
+                                }
+                                else
+                                {
+                                    reader.Read();
+                                    reader.Skip();
+                                }
+                            }
+                            itemCount++;
+                            int clampedW = Math.Clamp(itemWidth, 1, 3);
+                            totalWidth += clampedW;
+                            if (clampedW != 1) allWidth1 = false;
+
+                            if (string.IsNullOrWhiteSpace(tplId))
+                            {
+                                hasInvalidOrTripleItem = true;
+                            }
+                            else
+                            {
+                                int cnt = reusableItemCounts.GetValueOrDefault(tplId, 0) + 1;
+                                reusableItemCounts[tplId] = cnt;
+                                if (cnt >= 3) hasInvalidOrTripleItem = true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        reader.Skip();
+                    }
+                }
+                else if (PropEquals(ref reader, "skills"u8, "Skills"u8))
+                {
+                    reader.Read();
+                    if (reader.TokenType == JsonTokenType.StartArray)
+                    {
+                        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                        {
+                            skillCount++;
+                            reader.Skip();
+                        }
+                    }
+                    else
+                    {
+                        reader.Skip();
+                    }
+                }
+                else
+                {
+                    reader.Read();
+                    reader.Skip();
+                }
+            }
+
+            // 100% 等价复现 IsCleanStaticGhostForLoad 清洗规则
+            if (itemCount == 0 || hasInvalidOrTripleItem) return null;
+            var (minHp, maxHp, maxLv) = GetSaneBoundsForDay(day);
+            int effectiveMinHp = isPlayerGhost ? Math.Min(100, minHp) : minHp;
+            int effectiveMaxHp = (isPlayerGhost && day == 1) ? 550 : maxHp;
+            int effectiveMaxLv = (isPlayerGhost && day == 1) ? 2 : maxLv;
+            if (healthMax < effectiveMinHp || healthMax > effectiveMaxHp || level < 1 || level > effectiveMaxLv)
+                return null;
+            if (!IsSupportedClientHero(hero)) return null;
+            if (!string.IsNullOrEmpty(persona) && IsJunkSyntheticPersona(persona, day))
+                return null;
+
+            bool isSyntheticAi = string.Equals(source, "synthetic_selfplay", StringComparison.OrdinalIgnoreCase);
+            if (isSyntheticAi)
+            {
+                if (day >= 3 && level < day) return null;
+                if (day >= 4 && skillCount == 0) return null;
+                if (day >= 5 && itemCount >= 8 && allWidth1) return null;
+            }
+
+            bool widthOk = day switch
+            {
+                <= 1 => level <= 2 && healthMax <= 550 && totalWidth >= 2,
+                2 => totalWidth >= 4,
+                3 => totalWidth >= 5,
+                4 => totalWidth >= 6,
+                _ => totalWidth >= 8,
+            };
+            if (!widthOk) return null;
+
+            string normPartition = NormalizePartition(poolPartition, isCustomRule);
+            if (string.Equals(normPartition, StandardPartition, StringComparison.Ordinal))
+                normPartition = StandardPartition; // 共享常量引用减少堆分配
+
+            byte pbCode = EncodePowerBucket(powerBucket);
+            var flags = GhostEntryFlags.None;
+            if (isPlayerGhost) flags |= GhostEntryFlags.IsPlayerGhost;
+            if (isCustomRule) flags |= GhostEntryFlags.IsCustomRule;
+            if (!isPlayerGhost && IsRealCommunitySource(source)) flags |= GhostEntryFlags.IsRealCommunityGhost;
+            if (day >= 4 && totalWidth >= 10) flags |= GhostEntryFlags.IsFull10Slots;
+            if (pbCode is PowerBucketStrong or PowerBucketMetaBoss) flags |= GhostEntryFlags.IsHighPower;
+
+            return new GhostIndexEntry
+            {
+                BoardId = boardId,
+                Partition = normPartition,
+                FileOffset = fileOffset,
+                ByteLength = byteLength,
+                HealthMax = healthMax,
+                Day = (ushort)Math.Clamp(day, 1, 99),
+                Level = (byte)Math.Clamp(level, 1, byte.MaxValue),
+                Wins = (byte)Math.Clamp(wins, 0, byte.MaxValue),
+                PowerBucketCode = pbCode,
+                Flags = flags,
+                InMemoryBoard = null,
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static GhostIndexEntry CreateInMemoryEntry(GhostBoard board)
+    {
+        int clampedDay = Math.Clamp(board.Day, 1, 99);
+        string partition = NormalizePartition(board.PoolPartition, board.IsCustomRule);
+        if (string.Equals(partition, StandardPartition, StringComparison.Ordinal))
+            partition = StandardPartition;
+
+        byte pbCode = EncodePowerBucket(board.PowerBucket);
+        var flags = GhostEntryFlags.None;
+        if (board.IsPlayerGhost) flags |= GhostEntryFlags.IsPlayerGhost;
+        if (board.IsCustomRule) flags |= GhostEntryFlags.IsCustomRule;
+        if (board.IsRealCommunityGhost) flags |= GhostEntryFlags.IsRealCommunityGhost;
+        if (clampedDay >= 4 && GetTotalSlotWidth(board, null) >= 10) flags |= GhostEntryFlags.IsFull10Slots;
+        if (pbCode is PowerBucketStrong or PowerBucketMetaBoss) flags |= GhostEntryFlags.IsHighPower;
+
+        return new GhostIndexEntry
+        {
+            BoardId = board.BoardId ?? "",
+            Partition = partition,
+            FileOffset = -1,
+            ByteLength = 0,
+            HealthMax = board.HealthMax,
+            Day = (ushort)clampedDay,
+            Level = (byte)Math.Clamp(board.Level, 1, byte.MaxValue),
+            Wins = (byte)Math.Clamp(board.Wins, 0, byte.MaxValue),
+            PowerBucketCode = pbCode,
+            Flags = flags,
+            InMemoryBoard = board,
+        };
+    }
+
+    private GhostBoard? MaterializeEntry(GhostIndexEntry entry)
+    {
+        if (entry.InMemoryBoard != null)
+            return entry.InMemoryBoard;
+        if (!entry.IsDiskBacked)
+            return null;
+
+        if (_lru.TryGet(entry.FileOffset, out var cached) && cached != null)
+            return cached;
+
+        string? filePath = _sourceFilePath;
+        if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
+            return null;
+
+        byte[] rented = ArrayPool<byte>.Shared.Rent(entry.ByteLength);
+        try
+        {
+            using SafeFileHandle handle = File.OpenHandle(
+                filePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                FileOptions.RandomAccess);
+
+            int totalRead = 0;
+            while (totalRead < entry.ByteLength)
+            {
+                int n = RandomAccess.Read(
+                    handle,
+                    rented.AsSpan(totalRead, entry.ByteLength - totalRead),
+                    entry.FileOffset + totalRead);
+                if (n <= 0) break;
+                totalRead += n;
+            }
+            if (totalRead != entry.ByteLength)
+                return null;
+
+            var board = ParseLineUtf8(rented.AsSpan(0, totalRead));
+            if (board != null)
+                _lru.Put(entry.FileOffset, board);
+            return board;
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     /// <summary>
@@ -707,9 +1308,8 @@ public sealed class PvpGhostPool
                 if (picked != null) return picked;
             }
 
-            var baseStrong = snap.HighDayStrongOrMeta.Length > 0
-                ? snap.HighDayStrongOrMeta[rng.Next(snap.HighDayStrongOrMeta.Length)]
-                : PickStandardBucketOrFallback(snap, Math.Clamp(effectiveDay, 10, 15), playerWins, playerLosses, rng, repo);
+            GhostBoard? baseStrong = TryMaterializeRandom(snap.HighDayStrongOrMeta, rng, repo)
+                ?? PickStandardBucketOrFallback(snap, Math.Clamp(effectiveDay, 10, 15), playerWins, playerLosses, rng, repo);
             return BuildScaledEndlessGhost(baseStrong, effectiveDay, rng, repo);
         }
 
@@ -737,7 +1337,21 @@ public sealed class PvpGhostPool
         return PickStandardBucketOrFallback(snap, effectiveDay, playerWins, playerLosses, rng, repo);
     }
 
-    private static GhostBoard PickStandardBucketOrFallback(
+    private GhostBoard? TryMaterializeRandom(GhostIndexEntry[] entries, Random rng, GameDataRepository? repo)
+    {
+        if (entries.Length == 0) return null;
+        int maxAttempts = Math.Min(entries.Length, 12);
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            var cand = entries[rng.Next(entries.Length)];
+            var board = MaterializeEntry(cand);
+            if (board != null && !HasInvalidRepoItem(board, repo))
+                return board;
+        }
+        return null;
+    }
+
+    private GhostBoard PickStandardBucketOrFallback(
         GhostIndexSnapshot snap,
         int day,
         int playerWins,
@@ -768,19 +1382,26 @@ public sealed class PvpGhostPool
             return BuildFallbackGhost(1, rng, repo);
 
         // 全标准集内按合理区间回退
-        var eligible = new List<GhostBoard>();
-        foreach (var b in snap.StandardAll)
+        var (minHp, maxHp, maxLv) = GetSaneBoundsForDay(day);
+        var eligible = new List<GhostIndexEntry>();
+        foreach (var e in snap.StandardAll)
         {
-            if (IsSaneGhostForDay(b, day) && !HasInvalidRepoItem(b, repo))
-                eligible.Add(b);
+            int effMinHp = e.IsPlayerGhost ? Math.Min(100, minHp) : minHp;
+            int effMaxHp = (e.IsPlayerGhost && day == 1) ? 550 : maxHp;
+            int effMaxLv = (e.IsPlayerGhost && day == 1) ? 2 : maxLv;
+            if (e.HealthMax >= effMinHp && e.HealthMax <= effMaxHp && e.Level >= 1 && e.Level <= effMaxLv)
+                eligible.Add(e);
         }
         if (eligible.Count > 0)
-            return PickByMedianBandDistribution(eligible, Array.Empty<GhostBoard>(), day, rng);
+        {
+            var picked = PickByMedianBandDistribution(eligible, day, rng, repo);
+            if (picked != null) return picked;
+        }
 
         return BuildFallbackGhost(day, rng, repo);
     }
 
-    private static GhostBoard? PickFromBucket(
+    private GhostBoard? PickFromBucket(
         DayPartitionBucket bucket,
         int day,
         int playerWins,
@@ -790,7 +1411,7 @@ public sealed class PvpGhostPool
         bool isStandardPartition = true)
     {
         // 真实社区/天梯盘面（巴扎++ 十胜库 / 外部天梯统计源实测盘）享有 90% 压倒性优先权，彻底告别胡扯 AI
-        GhostBoard[] staticSource;
+        GhostIndexEntry[] staticSource;
         if (bucket.RealCommunityPreferred.Length > 0
             && (bucket.RealCommunityPreferred.Length >= 30 || rng.NextDouble() < 0.90))
         {
@@ -808,25 +1429,24 @@ public sealed class PvpGhostPool
                 ? ["Strong", "Normal", "MetaBoss"]
                 : ["Normal", "Strong"];
 
-        var tier1 = new List<GhostBoard>();
-        var tier2 = new List<GhostBoard>();
-        var fallback = new List<GhostBoard>();
+        var tier1 = new List<GhostIndexEntry>();
+        var tier2 = new List<GhostIndexEntry>();
+        var fallback = new List<GhostIndexEntry>();
         var seenBoardIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        void ConsiderCandidate(GhostBoard b)
+        void ConsiderCandidate(GhostIndexEntry e)
         {
-            if (!string.IsNullOrEmpty(b.BoardId) && !seenBoardIds.Add(b.BoardId)) return;
-            if (HasInvalidRepoItem(b, repo)) return;
+            if (!string.IsNullOrEmpty(e.BoardId) && !seenBoardIds.Add(e.BoardId)) return;
             // D2-P1-10：仅标准分区施加 Day 1 血量/等级上限拦截，允许高血自定义/词条分区正常匹配 Day 1 同分区对手
-            if (isStandardPartition && day <= 1 && (b.Level > 2 || b.HealthMax > 550)) return;
+            if (isStandardPartition && day <= 1 && (e.Level > 2 || e.HealthMax > 550)) return;
 
-            fallback.Add(b);
-            bool bucketHit = ContainsBucket(preferredBuckets, b.PowerBucket);
-            int winDiff = Math.Abs(b.Wins - playerWins);
+            fallback.Add(e);
+            bool bucketHit = MatchesPowerBucketCode(e.PowerBucketCode, preferredBuckets);
+            int winDiff = Math.Abs(e.Wins - playerWins);
             if (bucketHit && winDiff <= 1)
-                tier1.Add(b);
+                tier1.Add(e);
             else if (bucketHit || winDiff <= 2)
-                tier2.Add(b);
+                tier2.Add(e);
         }
 
         // 所有真实盘面（社区/天梯实盘 + 本服 SQLite 真人镜像）进入同一候选池，严格按 1:1 盘面等概率参与筛选与抽样
@@ -835,10 +1455,22 @@ public sealed class PvpGhostPool
         for (int i = 0; i < bucket.PlayerGhosts.Length; i++)
             ConsiderCandidate(bucket.PlayerGhosts[i]);
 
-        var chosenPool = tier1.Count > 0 ? tier1 : (tier2.Count > 0 ? tier2 : fallback);
-        if (chosenPool.Count == 0) return null;
-
-        return PickByMedianBandDistribution(chosenPool, Array.Empty<GhostBoard>(), day, rng);
+        // 按优先级逐级做严格等概率拒绝采样（单次抽中才按偏移读盘并校验 HasInvalidRepoItem，数学分布 100% 等价）
+        if (tier1.Count > 0)
+        {
+            var picked = PickByMedianBandDistribution(tier1, day, rng, repo);
+            if (picked != null) return picked;
+        }
+        if (tier2.Count > 0)
+        {
+            var picked = PickByMedianBandDistribution(tier2, day, rng, repo);
+            if (picked != null) return picked;
+        }
+        if (fallback.Count > 0)
+        {
+            return PickByMedianBandDistribution(fallback, day, rng, repo);
+        }
+        return null;
     }
 
     private static bool ContainsBucket(string[] buckets, string target)
@@ -958,70 +1590,112 @@ public sealed class PvpGhostPool
         return ValidFallbackEnchantments[rng.Next(ValidFallbackEnchantments.Length)];
     }
 
-    private static GhostBoard PickByMedianBandDistribution(
-        IReadOnlyList<GhostBoard> staticPool,
-        IReadOnlyList<GhostBoard> playerGhosts,
+    private GhostBoard? PickByMedianBandDistribution(
+        List<GhostIndexEntry> candidates,
         int day,
-        Random rng)
+        Random rng,
+        GameDataRepository? repo)
     {
+        if (candidates.Count == 0) return null;
         double median = GetExpectedMedianHealthForDay(day);
         int normalMin = (int)Math.Round(median * 0.70);
         int normalMax = (int)Math.Round(median * 1.80);
         int tailMin = (int)Math.Round(median * 2.20);
 
-        bool IsNormal(GhostBoard b) => b.HealthMax >= normalMin && b.HealthMax <= normalMax;
-        bool IsUltraTail(GhostBoard b) => b.HealthMax > tailMin;
-        bool IsMidBand(GhostBoard b) => !IsNormal(b) && !IsUltraTail(b);
+        var normalAll = new List<GhostIndexEntry>();
+        var ultraTail = new List<GhostIndexEntry>();
+        var midAll = new List<GhostIndexEntry>();
 
-        var normalAll = staticPool.Concat(playerGhosts).Where(IsNormal).ToList();
-        var ultraTail = staticPool.Concat(playerGhosts).Where(IsUltraTail).ToList();
-        var midAll = staticPool.Concat(playerGhosts).Where(IsMidBand).ToList();
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            var e = candidates[i];
+            if (e.HealthMax >= normalMin && e.HealthMax <= normalMax)
+                normalAll.Add(e);
+            else if (e.HealthMax > tailMin)
+                ultraTail.Add(e);
+            else
+                midAll.Add(e);
+        }
 
         // 所有真人数据（社区/天梯实盘与本服真人镜像）在各血量带内严格等概率均匀抽样，无额外倾斜权重
         double roll = rng.NextDouble();
         if (roll < 0.03 && ultraTail.Count > 0)
-            return ultraTail[rng.Next(ultraTail.Count)];
+        {
+            var picked = DrawValidFromBand(ultraTail, rng, repo);
+            if (picked != null) return picked;
+        }
 
         if (roll < 0.05 && midAll.Count > 0)
-            return midAll[rng.Next(midAll.Count)];
+        {
+            var picked = DrawValidFromBand(midAll, rng, repo);
+            if (picked != null) return picked;
+        }
 
         if (normalAll.Count > 0)
-            return normalAll[rng.Next(normalAll.Count)];
+        {
+            var picked = DrawValidFromBand(normalAll, rng, repo);
+            if (picked != null) return picked;
+        }
 
         if (midAll.Count > 0)
-            return midAll[rng.Next(midAll.Count)];
+        {
+            var picked = DrawValidFromBand(midAll, rng, repo);
+            if (picked != null) return picked;
+        }
 
-        int total = staticPool.Count + playerGhosts.Count;
-        int pickIdx = rng.Next(total);
-        return pickIdx < staticPool.Count
-            ? staticPool[pickIdx]
-            : playerGhosts[pickIdx - staticPool.Count];
+        if (ultraTail.Count > 0)
+        {
+            var picked = DrawValidFromBand(ultraTail, rng, repo);
+            if (picked != null) return picked;
+        }
+
+        return null;
+    }
+
+    private GhostBoard? DrawValidFromBand(List<GhostIndexEntry> band, Random rng, GameDataRepository? repo)
+    {
+        // 无放回均匀拒绝采样：抽中不合法项则 swap-remove，保证对剩余合法项保持严格均匀概率分布
+        while (band.Count > 0)
+        {
+            int idx = rng.Next(band.Count);
+            var entry = band[idx];
+            var board = MaterializeEntry(entry);
+            if (board != null && !HasInvalidRepoItem(board, repo))
+                return board;
+
+            int last = band.Count - 1;
+            band[idx] = band[last];
+            band.RemoveAt(last);
+        }
+        return null;
     }
 
     private bool AddBoardUnlocked(GhostBoard board)
+        => AddEntryUnlocked(CreateInMemoryEntry(board));
+
+    private bool AddEntryUnlocked(GhostIndexEntry entry)
     {
-        if (!string.IsNullOrEmpty(board.BoardId) && !_knownBoardIds.Add(board.BoardId))
+        if (!string.IsNullOrEmpty(entry.BoardId) && !_knownBoardIds.Add(entry.BoardId))
             return false;
 
-        int bucketDay = Math.Clamp(board.Day, 1, 99);
-        string partition = NormalizePartition(board.PoolPartition, board.IsCustomRule);
-        var key = new BucketKey(partition, bucketDay);
+        int bucketDay = Math.Clamp((int)entry.Day, 1, 99);
+        var key = new BucketKey(entry.Partition, bucketDay);
         if (!_mutableBuckets.TryGetValue(key, out var list))
         {
-            list = new List<GhostBoard>();
+            list = new List<GhostIndexEntry>();
             _mutableBuckets[key] = list;
         }
-        list.Add(board);
-        _all.Add(board);
+        list.Add(entry);
+        _all.Add(entry);
         TrimDayBucketUnlocked(list);
         return true;
     }
 
-    private void TrimDayBucketUnlocked(List<GhostBoard> dayList)
+    private void TrimDayBucketUnlocked(List<GhostIndexEntry> dayList)
     {
         while (dayList.Count > MaxBoardsPerDayBucket)
         {
-            int victimIdx = dayList.FindIndex(IsEvictablePlayerGhost);
+            int victimIdx = dayList.FindIndex(IsEvictablePlayerEntry);
             if (victimIdx < 0)
                 break;
 
@@ -1036,37 +1710,34 @@ public sealed class PvpGhostPool
     private void RebuildReadIndexUnlocked()
     {
         var buckets = new Dictionary<BucketKey, DayPartitionBucket>(_mutableBuckets.Count);
-        var standardAll = new List<GhostBoard>();
-        var highDayStrong = new List<GhostBoard>();
+        var standardAll = new List<GhostIndexEntry>();
+        var highDayStrong = new List<GhostIndexEntry>();
         int playerCount = 0;
         int customCount = 0;
+        int diskCount = 0;
 
         foreach (var (key, list) in _mutableBuckets)
         {
             var allArr = list.ToArray();
-            var playerList = new List<GhostBoard>();
-            var full10List = new List<GhostBoard>();
-            var realCommAll = new List<GhostBoard>();
-            var realCommFull10 = new List<GhostBoard>();
-            var highPower = new List<GhostBoard>();
+            var playerList = new List<GhostIndexEntry>();
+            var full10List = new List<GhostIndexEntry>();
+            var realCommAll = new List<GhostIndexEntry>();
+            var realCommFull10 = new List<GhostIndexEntry>();
+            var highPower = new List<GhostIndexEntry>();
 
             for (int i = 0; i < allArr.Length; i++)
             {
-                var b = allArr[i];
-                if (b.IsPlayerGhost) playerList.Add(b);
-                bool isFull10 = key.Day >= 4 && GetTotalSlotWidth(b, null) >= 10;
-                if (isFull10)
-                    full10List.Add(b);
-                if (b.IsRealCommunityGhost)
+                var e = allArr[i];
+                if (e.IsPlayerGhost) playerList.Add(e);
+                if (e.IsFull10Slots)
+                    full10List.Add(e);
+                if (e.IsRealCommunityGhost)
                 {
-                    realCommAll.Add(b);
-                    if (isFull10) realCommFull10.Add(b);
+                    realCommAll.Add(e);
+                    if (e.IsFull10Slots) realCommFull10.Add(e);
                 }
-                if (string.Equals(b.PowerBucket, "Strong", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(b.PowerBucket, "MetaBoss", StringComparison.OrdinalIgnoreCase))
-                {
-                    highPower.Add(b);
-                }
+                if (e.IsHighPower)
+                    highPower.Add(e);
             }
 
             buckets[key] = new DayPartitionBucket
@@ -1090,8 +1761,10 @@ public sealed class PvpGhostPool
 
         for (int i = 0; i < _all.Count; i++)
         {
-            if (_all[i].IsPlayerGhost) playerCount++;
-            if (_all[i].IsCustomRule) customCount++;
+            var e = _all[i];
+            if (e.IsPlayerGhost) playerCount++;
+            if (e.IsCustomRule) customCount++;
+            if (e.IsDiskBacked) diskCount++;
         }
 
         _index = new GhostIndexSnapshot
@@ -1102,17 +1775,19 @@ public sealed class PvpGhostPool
             TotalCount = _all.Count,
             PlayerGhostCount = playerCount,
             CustomRuleGhostCount = customCount,
+            DiskIndexedCount = diskCount,
         };
     }
 
     private static GhostIndexSnapshot BuildEmptySnapshot() => new()
     {
         Buckets = FrozenDictionary<BucketKey, DayPartitionBucket>.Empty,
-        StandardAll = Array.Empty<GhostBoard>(),
-        HighDayStrongOrMeta = Array.Empty<GhostBoard>(),
+        StandardAll = Array.Empty<GhostIndexEntry>(),
+        HighDayStrongOrMeta = Array.Empty<GhostIndexEntry>(),
         TotalCount = 0,
         PlayerGhostCount = 0,
         CustomRuleGhostCount = 0,
+        DiskIndexedCount = 0,
     };
 
     private static string NormalizePartition(string? partition, bool isCustomRule)
@@ -1128,9 +1803,9 @@ public sealed class PvpGhostPool
         return isCustomRule ? "custom" : StandardPartition;
     }
 
-    private static bool IsEvictablePlayerGhost(GhostBoard board)
-        => board.IsPlayerGhost ||
-           board.BoardId.StartsWith("player_", StringComparison.OrdinalIgnoreCase);
+    private static bool IsEvictablePlayerEntry(GhostIndexEntry entry)
+        => entry.IsPlayerGhost ||
+           entry.BoardId.StartsWith("player_", StringComparison.OrdinalIgnoreCase);
 
     private static GhostBoard? ParseDbRow(Persistence.PvpGhostRow row)
     {
@@ -1193,77 +1868,41 @@ public sealed class PvpGhostPool
         return null;
     }
 
-    private static GhostBoard? ParseLine(string json)
+    private static GhostBoard? ParseLineUtf8(ReadOnlySpan<byte> utf8Json)
     {
         try
         {
-            using var doc = JsonDocument.Parse(json);
-            var r = doc.RootElement;
-            var items = new List<GhostItem>();
-            if (r.TryGetProperty("items", out var itemsEl) && itemsEl.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var it in itemsEl.EnumerateArray())
-                {
-                    var perm = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-                    if (it.TryGetProperty("permanentAttributes", out var pa) && pa.ValueKind == JsonValueKind.Object)
-                    {
-                        foreach (var kv in pa.EnumerateObject())
-                        {
-                            if (kv.Value.ValueKind == JsonValueKind.Number && kv.Value.TryGetInt32(out int v))
-                                perm[kv.Name] = v;
-                        }
-                    }
-                    items.Add(new GhostItem
-                    {
-                        Slot = GetInt(it, "slot", 0),
-                        Width = GetInt(it, "width", 1),
-                        TemplateId = GetStr(it, "templateId") ?? "",
-                        InternalName = GetStr(it, "internalName") ?? "",
-                        ZhName = GetStr(it, "zhName") ?? "",
-                        Tier = GetStr(it, "tier") ?? "Bronze",
-                        Enchantment = GetStr(it, "enchantment"),
-                        PermanentAttributes = perm,
-                    });
-                }
-            }
-
-            var skills = new List<GhostSkill>();
-            if (r.TryGetProperty("skills", out var skillsEl) && skillsEl.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var sk in skillsEl.EnumerateArray())
-                {
-                    skills.Add(new GhostSkill
-                    {
-                        TemplateId = GetStr(sk, "templateId") ?? "",
-                        InternalName = GetStr(sk, "internalName") ?? "",
-                        ZhName = GetStr(sk, "zhName") ?? "",
-                        Tier = GetStr(sk, "tier") ?? "Bronze",
-                    });
-                }
-            }
-
-            int day = Math.Max(1, GetInt(r, "day", 1));
+            var board = JsonSerializer.Deserialize<GhostBoard>(utf8Json, JsonOpts);
+            if (board == null) return null;
+            int day = Math.Max(1, board.Day);
+            int healthMax = Math.Max(100, board.HealthMax);
+            string hero = string.IsNullOrWhiteSpace(board.Hero) ? "Vanessa" : board.Hero;
+            string powerBucket = string.IsNullOrWhiteSpace(board.PowerBucket) ? "Normal" : board.PowerBucket;
+            string normPartition = NormalizePartition(board.PoolPartition, board.IsCustomRule);
             return new GhostBoard
             {
-                BoardId = GetStr(r, "boardId") ?? "",
+                BoardId = board.BoardId ?? "",
                 Day = day,
-                Hero = GetStr(r, "hero") ?? "Vanessa",
-                Level = GetInt(r, "level", 1),
-                HealthMax = Math.Max(100, GetInt(r, "healthMax", GameDefaults.StartingHealth)),
-                Prestige = GetInt(r, "prestige", 20),
-                Wins = GetInt(r, "wins", 0),
-                Losses = GetInt(r, "losses", 0),
-                UnlockedSlotsMask = GetInt(r, "unlockedSlotsMask", DefaultUnlockedMaskForDay(day)),
-                PowerBucket = GetStr(r, "powerBucket") ?? "Normal",
-                EstimatedWinRate = r.TryGetProperty("estimatedWinRate", out var ew) && ew.TryGetDouble(out double d) ? d : 0.5,
-                Source = GetStr(r, "source") ?? "",
-                Persona = GetStr(r, "persona") ?? "",
-                Archetype = GetStr(r, "archetype") ?? "",
-                IsPlayerGhost = false,
-                IsCustomRule = false,
-                PoolPartition = StandardPartition,
-                Items = items,
-                Skills = skills,
+                SourceDay = board.SourceDay,
+                TargetDay = board.TargetDay,
+                Hero = hero,
+                Level = Math.Max(1, board.Level),
+                HealthMax = healthMax,
+                Prestige = board.Prestige > 0 ? board.Prestige : 20,
+                Wins = board.Wins,
+                Losses = board.Losses,
+                UnlockedSlotsMask = board.UnlockedSlotsMask > 0 ? board.UnlockedSlotsMask : DefaultUnlockedMaskForDay(day),
+                PowerBucket = powerBucket,
+                EstimatedWinRate = board.EstimatedWinRate > 0 ? board.EstimatedWinRate : 0.5,
+                Source = board.Source ?? "",
+                Persona = board.Persona ?? "",
+                Archetype = board.Archetype ?? "",
+                IsPlayerGhost = board.IsPlayerGhost,
+                IsCustomRule = board.IsCustomRule,
+                PoolPartition = normPartition,
+                Items = board.Items ?? new List<GhostItem>(),
+                Skills = board.Skills ?? new List<GhostSkill>(),
+                SocketEffects = board.SocketEffects,
             };
         }
         catch
@@ -1355,7 +1994,7 @@ public sealed class PvpGhostPool
         string safeHero = parsedHero.ToString();
         string label = ghost.IsPlayerGhost
             ? $"{safeHero}(真人镜像)"
-            : $"{safeHero}镜像({ghost.PowerBucket})";
+            : $"{safeHero}镜像";
 
         var ps = new PlayerState(
             "pvp_" + ghost.BoardId,

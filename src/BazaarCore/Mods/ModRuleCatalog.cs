@@ -221,11 +221,17 @@ public static class ModRuleCatalog
             .OrderBy(t => t, StringComparer.Ordinal)
             .Select(t => new CatalogItem(t, t switch
             {
-                "TCombatDuration" => "本场战斗持续",
-                "TDeterminantDuration" => "固定毫秒时长",
+                "TDeterminantDuration" => "持续至战斗/小时/当日结束",
+                "TCombatDuration" => "战斗内固定毫秒时长",
                 "TVariableDuration" => "动态引用时长",
                 _ => t
-            }, "持续时长节点", true))
+            }, t switch
+            {
+                "TDeterminantDuration" => "通过 durationType 指定 UntilEndOfCombat（本场战斗）/ UntilEndOfHour / UntilEndOfDay",
+                "TCombatDuration" => "通过 durationInMs 指定战斗内限时毫秒数，到期自动撤销",
+                "TVariableDuration" => "按规则表达式动态计算持续时长",
+                _ => "持续时长节点"
+            }, true))
             .ToList();
 
         return new
@@ -654,7 +660,17 @@ public static class ModRuleCatalog
                 ["$type"] = "TActionCardModifyAttribute",
                 ["attributeType"] = "DamageAmount",
                 ["operation"] = "Add",
-                ["value"] = new Dictionary<string, object> { ["$type"] = "TReferenceValueCardAttribute", ["attributeType"] = "Custom_0" },
+                ["duration"] = new Dictionary<string, object>
+                {
+                    ["$type"] = "TDeterminantDuration",
+                    ["durationType"] = "UntilEndOfCombat"
+                },
+                ["value"] = new Dictionary<string, object>
+                {
+                    ["$type"] = "TReferenceValueCardAttribute",
+                    ["attributeType"] = "Custom_0",
+                    ["target"] = new Dictionary<string, object> { ["$type"] = "TTargetCardSelf" }
+                },
                 ["target"] = new Dictionary<string, object> { ["$type"] = "TTargetCardSelf" }
             }
         }),
@@ -692,12 +708,12 @@ public static class ModRuleCatalog
                     ["$type"] = "TPrerequisitePlayer",
                     ["subject"] = new Dictionary<string, object>
                     {
-                        ["$type"] = "TTargetPlayerAbsolute",
-                        ["targetMode"] = "Player",
+                        ["$type"] = "TTargetPlayerRelative",
+                        ["targetMode"] = "Self",
                         ["conditions"] = new Dictionary<string, object>
                         {
                             ["$type"] = "TPlayerConditionalAttribute",
-                            ["attributeType"] = "Gold",
+                            ["attribute"] = "Gold",
                             ["comparisonOperator"] = "GreaterThanOrEqual",
                             ["comparisonValue"] = new Dictionary<string, object> { ["$type"] = "TFixedValue", ["value"] = 20.0 }
                         }

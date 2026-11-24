@@ -398,8 +398,10 @@ public static class CombatSimConverter
         int oppMaxHp = timeline.Count > 0 ? Math.Max(1, timeline[0].P2MaxHp) : 100;
         var rewardTracker = BuildRewardTracker(sim, oppMaxHp, result.Player2RemainingHp, pveGoldReceived, pveXpReceived);
 
-        // 首帧玩家基线：将开战瞬发状态（护盾/灼烧/剧毒/狂暴）清零，确保 TTriggerOnFightStarted 生效即跳数
-        CombatTickState? prevSnap = timeline.Count > 0 ? CreateInitialPlayerBaseline(timeline[0]) : null;
+        // Wave 4A #5：首帧玩家基线全字段对齐 firstSnap，并依据 TimeMs == 0 的开战瞬发事件精确回推开战前基线，
+        // 既彻底消除 RageMax/EnragedDurationMax/TempoGainCooldownMax/先天 HealthRegen 等首帧虚假差分，
+        // 又完整保留 TTriggerOnFightStarted 瞬发护盾/灼烧/剧毒/再生/怒气/狂暴/节拍/喜悦的真实跳数。
+        CombatTickState? prevSnap = timeline.Count > 0 ? CreateInitialPlayerBaseline(timeline[0], result.Events) : null;
         var prevQuestProgress = new Dictionary<(string CardId, int GroupIdx, int EntryIdx), int>();
         var questCompletedCount = new Dictionary<string, int>(StringComparer.Ordinal);
         var itemActionCredits = new Dictionary<(int TimeMs, string CardInstanceId, EActionCommandType ActionType), int>();
@@ -665,42 +667,137 @@ public static class CombatSimConverter
         }
     }
 
-    private static CombatTickState CreateInitialPlayerBaseline(CombatTickState firstSnap)
+    public static CombatTickState CreateInitialPlayerBaseline(
+        CombatTickState firstSnap,
+        IReadOnlyList<CombatEvent>? events = null)
     {
+        // 仅对 TimeMs == 0 实际发生过的开战瞬发事件逆推开战前基线；无 TimeMs == 0 变更的字段全部严格对齐 firstSnap，彻底消灭首帧虚假差分。
+        int p1ShieldDelta = 0, p2ShieldDelta = 0;
+        int p1BurnDelta = 0, p2BurnDelta = 0;
+        int p1PoisonDelta = 0, p2PoisonDelta = 0;
+        int p1RegenDelta = 0, p2RegenDelta = 0;
+        int p1RageDelta = 0, p2RageDelta = 0;
+        int p1TempoDelta = 0, p2TempoDelta = 0;
+        int p1JoyDelta = 0, p2JoyDelta = 0;
+        int p1HpNetDelta = 0, p2HpNetDelta = 0;
+        bool p1EnragedAtStart = false, p2EnragedAtStart = false;
+        bool p1HasStartHpChange = false, p2HasStartHpChange = false;
+
+        if (events != null)
+        {
+            for (int i = 0; i < events.Count; i++)
+            {
+                var ev = events[i];
+                if (ev.TimeMs > 0) break;
+                if (ev.TimeMs < 0) continue;
+
+                bool isP1 = string.Equals(ev.TargetPlayerId, "player", StringComparison.OrdinalIgnoreCase);
+                int amt = Math.Max(0, (int)Math.Round(ev.Value));
+                switch (ev.Type)
+                {
+                    case CombatEventType.ShieldApplied:
+                        if (isP1) p1ShieldDelta += amt; else p2ShieldDelta += amt;
+                        break;
+                    case CombatEventType.BurnApplied:
+                        if (isP1) p1BurnDelta += amt; else p2BurnDelta += amt;
+                        break;
+                    case CombatEventType.BurnRemoved:
+                        if (isP1) p1BurnDelta -= amt; else p2BurnDelta -= amt;
+                        break;
+                    case CombatEventType.PoisonApplied:
+                        if (isP1) p1PoisonDelta += amt; else p2PoisonDelta += amt;
+                        break;
+                    case CombatEventType.PoisonRemoved:
+                        if (isP1) p1PoisonDelta -= amt; else p2PoisonDelta -= amt;
+                        break;
+                    case CombatEventType.RegenApplied:
+                        if (isP1) p1RegenDelta += amt; else p2RegenDelta += amt;
+                        break;
+                    case CombatEventType.PlayerRageApplied:
+                        if (isP1) p1RageDelta += amt; else p2RageDelta += amt;
+                        break;
+                    case CombatEventType.PlayerEnraged:
+                        if (isP1) p1EnragedAtStart = true; else p2EnragedAtStart = true;
+                        break;
+                    case CombatEventType.PlayerTempoApplied:
+                        if (isP1) p1TempoDelta += amt; else p2TempoDelta += amt;
+                        break;
+                    case CombatEventType.PlayerTempoRemoved:
+                        if (isP1) p1TempoDelta -= amt; else p2TempoDelta -= amt;
+                        break;
+                    case CombatEventType.PlayerJoyApplied:
+                        if (isP1) p1JoyDelta += amt; else p2JoyDelta += amt;
+                        break;
+                    case CombatEventType.DamageApplied:
+                        {
+                            int hpDmg = ev.HpDamage > 0 ? ev.HpDamage : (ev.ShieldAbsorbed > 0 ? 0 : amt);
+                            if (hpDmg > 0)
+                            {
+                                if (isP1) { p1HpNetDelta -= hpDmg; p1HasStartHpChange = true; }
+                                else { p2HpNetDelta -= hpDmg; p2HasStartHpChange = true; }
+                            }
+                            if (ev.ShieldAbsorbed > 0)
+                            {
+                                if (isP1) p1ShieldDelta -= ev.ShieldAbsorbed;
+                                else p2ShieldDelta -= ev.ShieldAbsorbed;
+                            }
+                            break;
+                        }
+                    case CombatEventType.HealApplied:
+                        {
+                            int restored = ev.EffectiveHpRestored ?? amt;
+                            if (restored > 0)
+                            {
+                                if (isP1) { p1HpNetDelta += restored; p1HasStartHpChange = true; }
+                                else { p2HpNetDelta += restored; p2HasStartHpChange = true; }
+                            }
+                            break;
+                        }
+                }
+            }
+        }
+
+        int p1InitHp = p1HasStartHpChange
+            ? Math.Clamp(firstSnap.P1Hp - p1HpNetDelta, 0, Math.Max(firstSnap.P1MaxHp, firstSnap.P1Hp))
+            : firstSnap.P1Hp;
+        int p2InitHp = p2HasStartHpChange
+            ? Math.Clamp(firstSnap.P2Hp - p2HpNetDelta, 0, Math.Max(firstSnap.P2MaxHp, firstSnap.P2Hp))
+            : firstSnap.P2Hp;
+
         return new CombatTickState
         {
             TimeMs = 0,
-            P1Hp = firstSnap.P1MaxHp > 0 ? firstSnap.P1MaxHp : firstSnap.P1Hp,
+            P1Hp = p1InitHp,
             P1MaxHp = firstSnap.P1MaxHp,
-            P1Shield = 0,
-            P1Burn = 0,
-            P1Poison = 0,
-            P1Regen = 0,
-            P1Rage = 0,
-            P1RageMax = 100,
-            P1Enraged = false,
-            P1EnragedDuration = 0,
-            P1EnragedDurationMax = 0,
-            P1Tempo = 0,
-            P1TempoGainCooldownMax = 0,
-            P1Joy = 0,
-            P1PortraitIndex = 0,
-            P2Hp = firstSnap.P2MaxHp > 0 ? firstSnap.P2MaxHp : firstSnap.P2Hp,
+            P1Shield = Math.Max(0, firstSnap.P1Shield - p1ShieldDelta),
+            P1Burn = Math.Max(0, firstSnap.P1Burn - p1BurnDelta),
+            P1Poison = Math.Max(0, firstSnap.P1Poison - p1PoisonDelta),
+            P1Regen = Math.Max(0, firstSnap.P1Regen - p1RegenDelta),
+            P1Rage = Math.Max(0, firstSnap.P1Rage - p1RageDelta),
+            P1RageMax = firstSnap.P1RageMax,
+            P1Enraged = p1EnragedAtStart ? false : firstSnap.P1Enraged,
+            P1EnragedDuration = p1EnragedAtStart ? 0 : firstSnap.P1EnragedDuration,
+            P1EnragedDurationMax = firstSnap.P1EnragedDurationMax,
+            P1Tempo = Math.Max(0, firstSnap.P1Tempo - p1TempoDelta),
+            P1TempoGainCooldownMax = firstSnap.P1TempoGainCooldownMax,
+            P1Joy = Math.Max(0, firstSnap.P1Joy - p1JoyDelta),
+            P1PortraitIndex = p1EnragedAtStart ? 0 : firstSnap.P1PortraitIndex,
+            P2Hp = p2InitHp,
             P2MaxHp = firstSnap.P2MaxHp,
-            P2Shield = 0,
-            P2Burn = 0,
-            P2Poison = 0,
-            P2Regen = 0,
-            P2Rage = 0,
-            P2RageMax = 100,
-            P2Enraged = false,
-            P2EnragedDuration = 0,
-            P2EnragedDurationMax = 0,
-            P2Tempo = 0,
-            P2TempoGainCooldownMax = 0,
-            P2Joy = 0,
-            P2PortraitIndex = 0,
-            SandstormActive = false,
+            P2Shield = Math.Max(0, firstSnap.P2Shield - p2ShieldDelta),
+            P2Burn = Math.Max(0, firstSnap.P2Burn - p2BurnDelta),
+            P2Poison = Math.Max(0, firstSnap.P2Poison - p2PoisonDelta),
+            P2Regen = Math.Max(0, firstSnap.P2Regen - p2RegenDelta),
+            P2Rage = Math.Max(0, firstSnap.P2Rage - p2RageDelta),
+            P2RageMax = firstSnap.P2RageMax,
+            P2Enraged = p2EnragedAtStart ? false : firstSnap.P2Enraged,
+            P2EnragedDuration = p2EnragedAtStart ? 0 : firstSnap.P2EnragedDuration,
+            P2EnragedDurationMax = firstSnap.P2EnragedDurationMax,
+            P2Tempo = Math.Max(0, firstSnap.P2Tempo - p2TempoDelta),
+            P2TempoGainCooldownMax = firstSnap.P2TempoGainCooldownMax,
+            P2Joy = Math.Max(0, firstSnap.P2Joy - p2JoyDelta),
+            P2PortraitIndex = p2EnragedAtStart ? 0 : firstSnap.P2PortraitIndex,
+            SandstormActive = firstSnap.SandstormActive,
             SandstormNextDamage = firstSnap.SandstormNextDamage,
         };
     }

@@ -588,7 +588,7 @@ public sealed class V13_2_CombatSmoothDragLootEventTests
         var pvpOpp = outcome.CombatSpawnSim!.CurrentState!.PvpOpponent;
         Assert.NotNull(pvpOpp);
         Assert.Equal(EHero.Jules, pvpOpp!.Hero);
-        Assert.Equal("ghost_syn_d05_jules_locked_test", pvpOpp.PlayerLoadout?.accountId);
+        Assert.Equal("ghost_Jules_d5_syn_d05_jules_locked_test", pvpOpp.PlayerLoadout?.accountId);
     }
 
     // ── 修复 9：第 9 天神庙探险多小时 ReplacementSet 全链 + 门票消耗验证 ────────

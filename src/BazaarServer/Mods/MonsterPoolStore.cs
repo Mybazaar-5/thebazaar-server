@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using BazaarCore.Data;
 using BazaarServer.Data;
 
 namespace BazaarServer.Mods;
@@ -16,10 +17,13 @@ public sealed class MonsterPoolStore
         List<MonsterTemplate> ReadOnlyListSnapshot);
 
     private volatile Snapshot _snapshot;
+    private volatile GameDataRepository? _sourceRepo;
+    private int _replaceCount;
 
-    public MonsterPoolStore(IEnumerable<MonsterTemplate>? initial = null)
+    public MonsterPoolStore(IEnumerable<MonsterTemplate>? initial = null, GameDataRepository? sourceRepo = null)
     {
         _snapshot = BuildSnapshot(initial);
+        _sourceRepo = sourceRepo;
     }
 
     /// <summary>当前生效的不可变野怪快照数组。</summary>
@@ -28,15 +32,24 @@ public sealed class MonsterPoolStore
     /// <summary>当前野怪模板总数。</summary>
     public int Count => _snapshot.Items.Length;
 
+    /// <summary>Wave 4A #7：累计触发 Replace 重建的次数（用于验证冷启零重复建池）。</summary>
+    public int ReplaceCount => Volatile.Read(ref _replaceCount);
+
+    /// <summary>Wave 4A #7：判断当前野怪池快照是否已与目标 ActiveRepository 对齐。</summary>
+    public bool IsSyncedWith(GameDataRepository repo)
+        => ReferenceEquals(_sourceRepo, repo);
+
     /// <summary>
     /// 返回当前快照对应的永不就地修改的 <see cref="List{T}"/> 视图（零拷贝、多线程只读枚举 100% 线程安全，向后兼容现有 List 签名）。
     /// </summary>
     public List<MonsterTemplate> SnapshotList() => _snapshot.ReadOnlyListSnapshot;
 
     /// <summary>原子替换野怪池快照（绝不修改任何旧快照实例）。</summary>
-    public void Replace(IEnumerable<MonsterTemplate>? monsters)
+    public void Replace(IEnumerable<MonsterTemplate>? monsters, GameDataRepository? sourceRepo = null)
     {
         _snapshot = BuildSnapshot(monsters);
+        _sourceRepo = sourceRepo;
+        Interlocked.Increment(ref _replaceCount);
     }
 
     private static Snapshot BuildSnapshot(IEnumerable<MonsterTemplate>? src)

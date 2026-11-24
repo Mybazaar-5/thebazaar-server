@@ -1978,18 +1978,8 @@ public sealed class EncounterStepEngine
         bool recordForceSync = false,
         bool forceAll = false)
     {
-        var keys = new HashSet<string>(core.BaseAttributes.Keys, StringComparer.OrdinalIgnoreCase);
-        foreach (var k in core.PermanentAdd.Keys) keys.Add(k);
-        foreach (var k in core.PermanentMult.Keys) keys.Add(k);
-        foreach (var k in core.HourAdd.Keys) keys.Add(k);
-        foreach (var k in core.HourMult.Keys) keys.Add(k);
-        foreach (var k in core.DayAdd.Keys) keys.Add(k);
-        foreach (var k in core.DayMult.Keys) keys.Add(k);
-        foreach (var k in core.AuraAdd.Keys) keys.Add(k);
-        foreach (var k in core.AuraMult.Keys) keys.Add(k);
-
         bool anyChanged = false;
-        foreach (string key in keys)
+        foreach (string key in core.EnumeratePresentAttributeKeys())
         {
             if (Enum.TryParse<ECardAttributeType>(key, out var attrType))
             {

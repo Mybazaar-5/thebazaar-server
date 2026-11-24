@@ -445,6 +445,7 @@ internal sealed class CardTextureCache
 
             if (bytes == null)
             {
+                BareClientAuditRuntime.NotifyCardArtLoadFailure("CardTextureCache", localPath, "read_or_magic_validation_failed");
                 MainThreadDispatcher.Enqueue(() => _inFlight.Complete(key, static () => null));
                 return;
             }
@@ -455,7 +456,11 @@ internal sealed class CardTextureCache
                 bool usedFirst = false;
                 try
                 {
-                    firstLease = DecodeAndRegisterOnMain(capturedGen, key, bytes);
+                    firstLease = DecodeAndRegisterOnMain(capturedGen, key, bytes, localPath);
+                    if (firstLease == null)
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CardTextureCache", localPath, "decode_or_register_returned_null");
+                    }
                     _inFlight.Complete(key, () =>
                     {
                         if (!usedFirst)
@@ -471,6 +476,7 @@ internal sealed class CardTextureCache
                 }
                 catch (Exception ex)
                 {
+                    BareClientAuditRuntime.NotifyCardArtLoadFailure("CardTextureCache", localPath, "decode_exception:" + ex.GetType().Name);
                     DiagLog.SwallowOnce("CardTextureCache.DecodeOnMain", ex);
                     _inFlight.Complete(key, static () => null);
                 }
@@ -794,6 +800,10 @@ internal sealed class CardTextureCache
             var fi = new FileInfo(localPath);
             if (!fi.Exists || fi.Length < 16 || fi.Length > MaxImageFileBytes)
             {
+                BareClientAuditRuntime.NotifyCardArtLoadFailure(
+                    "CardTextureCache",
+                    localPath,
+                    !fi.Exists ? "file_not_found" : $"file_size_out_of_range({fi.Length})");
                 return null;
             }
 
@@ -802,18 +812,21 @@ internal sealed class CardTextureCache
             {
                 if (IsWebpMagic(bytes))
                 {
+                    BareClientAuditRuntime.NotifyCardArtLoadFailure("CardTextureCache", localPath, "unsupported_webp_format");
                     BazaarLauncherPlugin.Log?.LogWarning($"[CardTextureCache] 跳过不支持的 WebP 资产（Unity 运行期不支持 WebP 解码，请将 Mod 资产转换为 PNG 或 JPEG）：{localPath}");
                 }
                 else
                 {
+                    BareClientAuditRuntime.NotifyCardArtLoadFailure("CardTextureCache", localPath, "invalid_image_magic");
                     BazaarLauncherPlugin.Log?.LogWarning($"[CardTextureCache] 跳过非合法 PNG/JPEG 文件: {localPath}");
                 }
                 return null;
             }
             return bytes;
         }
-        catch
+        catch (Exception ex)
         {
+            BareClientAuditRuntime.NotifyCardArtLoadFailure("CardTextureCache", localPath, "read_exception:" + ex.GetType().Name);
             return null;
         }
     }
@@ -836,7 +849,7 @@ internal sealed class CardTextureCache
             && b[8] == (byte)'W' && b[9] == (byte)'E' && b[10] == (byte)'B' && b[11] == (byte)'P';
     }
 
-    private TextureLease<CacheEntry> DecodeAndRegisterOnMain(long expectedGeneration, string key, byte[] bytes)
+    private TextureLease<CacheEntry> DecodeAndRegisterOnMain(long expectedGeneration, string key, byte[] bytes, string localPath = null)
     {
         if (_pool.Generation != expectedGeneration)
         {
@@ -865,6 +878,10 @@ internal sealed class CardTextureCache
             bool loaded = ImageConversion.LoadImage(tex, bytes, markNonReadable: false);
             if (!loaded || tex.width <= 8 || tex.height <= 8)
             {
+                BareClientAuditRuntime.NotifyCardArtLoadFailure(
+                    "CardTextureCache",
+                    localPath ?? key,
+                    !loaded ? "unity_load_image_false" : $"decoded_dimensions_too_small({tex.width}x{tex.height})");
                 UnityEngine.Object.Destroy(tex);
                 return null;
             }

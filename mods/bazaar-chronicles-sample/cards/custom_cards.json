@@ -139,7 +139,10 @@
             "operation": "Add",
             "value": {
               "$type": "TReferenceValueCardAttribute",
-              "attributeType": "GoldGainAmount"
+              "attributeType": "GoldGainAmount",
+              "target": {
+                "$type": "TTargetCardSelf"
+              }
             },
             "target": {
               "$type": "TTargetPlayerRelative",
@@ -169,9 +172,16 @@
             "$type": "TActionCardModifyAttribute",
             "attributeType": "DamageAmount",
             "operation": "Add",
+            "duration": {
+              "$type": "TDeterminantDuration",
+              "durationType": "UntilEndOfCombat"
+            },
             "value": {
               "$type": "TReferenceValueCardAttribute",
-              "attributeType": "Custom_0"
+              "attributeType": "Custom_0",
+              "target": {
+                "$type": "TTargetCardSelf"
+              }
             },
             "target": {
               "$type": "TTargetCardSelf"
@@ -313,11 +323,11 @@
             {
               "$type": "TPrerequisitePlayer",
               "subject": {
-                "$type": "TTargetPlayerAbsolute",
-                "targetMode": "Player",
+                "$type": "TTargetPlayerRelative",
+                "targetMode": "Self",
                 "conditions": {
                   "$type": "TPlayerConditionalAttribute",
-                  "attributeType": "Gold",
+                  "attribute": "Gold",
                   "comparisonOperator": "GreaterThanOrEqual",
                   "comparisonValue": {
                     "$type": "TFixedValue",
@@ -622,7 +632,10 @@
             "operation": "Add",
             "value": {
               "$type": "TReferenceValueCardAttribute",
-              "attributeType": "Custom_1"
+              "attributeType": "Custom_1",
+              "target": {
+                "$type": "TTargetCardSelf"
+              }
             },
             "target": {
               "$type": "TTargetPlayerRelative",
@@ -642,6 +655,10 @@
             "value": {
               "$type": "TReferenceValuePlayerAttribute",
               "attributeType": "Gold",
+              "target": {
+                "$type": "TTargetPlayerRelative",
+                "targetMode": "Self"
+              },
               "modifier": {
                 "modifyMode": "Multiply",
                 "value": {
@@ -665,6 +682,10 @@
             "value": {
               "$type": "TReferenceValuePlayerAttribute",
               "attributeType": "Gold",
+              "target": {
+                "$type": "TTargetPlayerRelative",
+                "targetMode": "Self"
+              },
               "modifier": {
                 "modifyMode": "Multiply",
                 "value": {
@@ -768,7 +789,10 @@
             "operation": "Add",
             "value": {
               "$type": "TReferenceValueCardAttribute",
-              "attributeType": "Custom_1"
+              "attributeType": "Custom_1",
+              "target": {
+                "$type": "TTargetCardSelf"
+              }
             },
             "target": {
               "$type": "TTargetPlayerRelative",
@@ -788,6 +812,10 @@
             "value": {
               "$type": "TReferenceValuePlayerAttribute",
               "attributeType": "Gold",
+              "target": {
+                "$type": "TTargetPlayerRelative",
+                "targetMode": "Self"
+              },
               "modifier": {
                 "modifyMode": "Multiply",
                 "value": {
@@ -907,7 +935,10 @@
             "$type": "TActionPlayerShieldApply",
             "value": {
               "$type": "TReferenceValueCardAttribute",
-              "attributeType": "Custom_0"
+              "attributeType": "Custom_0",
+              "target": {
+                "$type": "TTargetCardSelf"
+              }
             },
             "target": {
               "$type": "TTargetPlayerRelative",
@@ -927,9 +958,16 @@
             "$type": "TActionCardModifyAttribute",
             "attributeType": "BurnApplyAmount",
             "operation": "Add",
+            "duration": {
+              "$type": "TDeterminantDuration",
+              "durationType": "UntilEndOfCombat"
+            },
             "value": {
               "$type": "TReferenceValueCardAttribute",
-              "attributeType": "Custom_1"
+              "attributeType": "Custom_1",
+              "target": {
+                "$type": "TTargetCardSelf"
+              }
             },
             "target": {
               "$type": "TTargetCardSection",

@@ -2355,9 +2355,11 @@ public sealed class RunEngine
             return;
         }
 
-        // 3. P0-16 直效/纯 XP 事件遭遇（无 SpawnContext 与 NextEncounterOnSelection，含 TTriggerOnCardSelected 或 ExperienceAwardUponSelection > 0）：
-        //    如 Borrow (Day 1-2) / Invest in Yourself×3 / Trophy Hunt×3 / Snack Time / Regenerative Tincture / Study (Default Option)
-        //    直效动作已在 ExecuteEncounterCardSelection 中执行完毕，此处即时结算经验、清架并推进小时（或弹 LevelUp），避免卡在空 Encounter 界面！
+        // 3. Wave 4A #1 架构根治：直效/纯 XP 事件遭遇（无 SpawnContext 与 NextEncounterOnSelection，含 TTriggerOnCardSelected 或 ExperienceAwardUponSelection > 0）
+        //    严禁在同包中跳过 Encounter 态直接 Choice -> Choice（会绕过客户端 TransitionOutComponent 的 VisualSequenceGate，导致
+        //    BoardManager: PlayRevealAnimations skipped (spawned=True / dealt=True)，在 Hour 5 -> Hour 6 更会永久锁死 _waitForNewDayTransition 致 PvP 空白与整板锁死）。
+        //    改为统一落地标准 ERunState.Encounter（保留顶栏事件肖像、CanExit=true、清空刷新态、延迟至离场结算 PendingEncounterExitXp），
+        //    使所有直效发卡（如 Candy Stash 巧克力入储物箱）与纯 XP/属性收益平稳展示，玩家点击离开后由 Encounter -> Choice 走原生沙尘门控安全翻牌。
         if (cardType == ECardType.EventEncounter)
         {
             bool hasSpawnCtx = (coreTpl?.SelectionContext?.SpawnContext ?? tpl?.SelectionContext?.SpawnContext) != null;
@@ -2370,13 +2372,40 @@ public sealed class RunEngine
 
             if (!hasSpawnCtx && !hasNextEnc && (hasDirectCardSelected || directXp > 0))
             {
+                o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: true));
+                _run.State = ERunState.Encounter;
+                _run.CurrentEncounterId = encId;
+                _run.SelectionsMadeInCurrentContext = 0;
+                _run.CurrentMaxSelections = null;
                 _run.PendingEncounterExitXp = directXp;
-                FlushPendingEncounterExitXp(o.Events);
-                _run.CurrentEncounterCoreCard = null;
-                _run.CurrentEncounterId = null;
-                _run.ParentEncounterTemplateId = null;
-                o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: false));
-                ExitEncounterOrAdvance(o, nextOnExit: null, exitingRootId: encId, exitingStepId: encId);
+                _run.CurrentEncounterCoreCard = CreateEncounterCoreCard(encId);
+                _run.SelectionRules = new TSelectionContextRules
+                {
+                    CanSelectMultiple = false,
+                    SelectionIsFree = true,
+                    CanExit = true,
+                    RerollRules = null,
+                };
+                _run.BaseRerollCost = null;
+                _run.RerollCost = 0;
+                _run.RerollsRemaining = 0;
+
+                string? directBoardOverride = coreTpl?.BoardOverride ?? tpl?.BoardOverride;
+                string? directPresentation = coreTpl?.Presentation ?? tpl?.Presentation;
+                if (!string.IsNullOrWhiteSpace(directBoardOverride))
+                {
+                    _run.CurrentBoardId = directBoardOverride;
+                    o.Events.Add(new GameSimEventBoardOverridden(directBoardOverride, directPresentation));
+                }
+                else if (!string.IsNullOrWhiteSpace(_run.CurrentBoardId) && string.IsNullOrWhiteSpace(_run.ActiveReplacementSetId))
+                {
+                    ResetBoardOverrideIfNeeded(o.Events);
+                }
+
+                RecalculateAurasAndSyncBoard(o.Events);
+                ReconcileAndVerifyBoardInvariants("EnterDirectEncounter", o.DirtyCardIds, o.Events);
+                o.Events.Add(new GameSimEventStateTransitioned(ERunState.Encounter, ResolveClientTransitionEncounterId(encId)));
+                TriggerOnEncounterEnteredAndDealt(encId, o.Events);
                 return;
             }
         }
@@ -3058,6 +3087,11 @@ public sealed class RunEngine
         {
             events.Add(new GameSimEventInterruptStateExited(ERunState.LevelUp, true));
         }
+        // Wave 4A #1：清除延迟推进至 Hour 6 PvP 标记，继续完成延后的 AdvanceHourOrDay（此时所有连升已清空，安全切至 Hour 6 Choice）
+        if (_run.PendingAdvanceHourAfterLevelUp)
+        {
+            _run.PendingAdvanceHourAfterLevelUp = false;
+        }
         AdvanceHourOrDay(events);
         EmitPostLevelUpSocketsUnlockedIfNeeded(prevSubState, events);
     }
@@ -3199,14 +3233,15 @@ public sealed class RunEngine
                     // #15 锦标赛 AI 机器人公平同步房间开局预设（血量差值、初始装备、初始技能）
                     ApplyTournamentRulesToAiBot(p2Core, tourneyLobby.Rules);
                 }
-                // 仅当严格复用了预览幽灵时才保留预览 accountId；若极端兜底重抽了新幽灵，使用新幽灵自己的 BoardId 避免旧 accountId + 新英雄张冠李戴
+                EHero oppHero = PvpGhostPool.ParseHero(ghost.Hero);
+                // Wave 4A #1 (H-1) & #11：非锦标赛幽灵 accountId 嵌入 Day 与 BoardId 确保跨天必异触发客户端原生 PvpOpponentChanged；
+                // 名牌展示去除 ({ghost.PowerBucket}) 英文后缀，仅下发干净英雄名（锦标赛保留 OpponentUsername）。
                 string oppAccountId = tourneyAssignment?.OpponentAccountId
                     ?? (canUseLockedGhost ? _run.CurrentPvpOpponent?.PlayerLoadout?.accountId : null)
-                    ?? (!string.IsNullOrWhiteSpace(ghost.BoardId) ? $"ghost_{ghost.BoardId}" : $"ghost_{Guid.NewGuid():N}");
+                    ?? $"ghost_{oppHero}_d{_run.Day}_{(!string.IsNullOrWhiteSpace(ghost.BoardId) ? ghost.BoardId : Guid.NewGuid().ToString("N"))}";
                 string oppDisplayName = tourneyAssignment != null
                     ? tourneyAssignment.OpponentUsername
-                    : (string.IsNullOrWhiteSpace(ghost.Hero) ? "Challenger" : $"{ghost.Hero} ({ghost.PowerBucket})");
-                EHero oppHero = PvpGhostPool.ParseHero(ghost.Hero);
+                    : (string.IsNullOrWhiteSpace(ghost.Hero) ? "Challenger" : ghost.Hero);
                 pvpInfo = BuildRichSimPvpOpponent(
                     displayName: oppDisplayName,
                     accountId: oppAccountId,
@@ -3602,6 +3637,17 @@ public sealed class RunEngine
         }
         _run.OpponentAttributes[EPlayerAttributeType.HealthMax] = p2Core.HealthMax;
         _run.OpponentAttributes[EPlayerAttributeType.Health] = p2Core.HealthMax;
+        // Wave 4A #5：同步开战首帧静态上限（RageMax / EnragedDurationMax / TempoGainCooldownMax）到 CombatSpawnSim，
+        // 保证客户端开战前即拥有与首帧快照一致的初始上限，彻底避免依赖首帧虚假差分。
+        if (result.Timeline.Count > 0)
+        {
+            var t0 = result.Timeline[0];
+            _run.OpponentAttributes[EPlayerAttributeType.RageMax] = t0.P2RageMax;
+            if (t0.P2EnragedDurationMax > 0)
+                _run.OpponentAttributes[EPlayerAttributeType.EnragedDurationMax] = t0.P2EnragedDurationMax;
+            if (t0.P2TempoGainCooldownMax > 0)
+                _run.OpponentAttributes[EPlayerAttributeType.TempoGainCooldownMax] = t0.P2TempoGainCooldownMax;
+        }
 
         var spawnEvents = new List<IGameSimEvent>(o.Events);
         o.Events.Clear();
@@ -4548,15 +4594,18 @@ public sealed class RunEngine
             // P0-16：以持久化 LastCompletedPvpDay 替代脆弱的 Victories + Defeats < Day，根治 BossRush 里程碑日与同步 PvP 平局跨天死循环
             uint pvpHour = (uint)_mode.HoursInADay;
             Console.WriteLine($"[RunEngine][WARN] Prevented skipping Day {_run.Day} Hour {pvpHour} PvP! (LastCompletedPvpDay={_run.LastCompletedPvpDay}, V={_run.Victories}, D={_run.Defeats}, Day={_run.Day})");
+            // Wave 4A #1：若此时存在待消费升级，严禁先将 Hour 推进至 HoursInADay 再进 LevelUp（否则客户端 ProcessLevelUpState 提前置死 _waitForNewDayTransition），
+            // 保持旧小时 (< HoursInADay) 先进入 LevelUp，待全部连升结束后再正式推进至 Hour 6 PvP。
+            if (_run.PendingLevelUp)
+            {
+                _run.PendingAdvanceHourAfterLevelUp = true;
+                ConsumeNextPendingLevelUpToEvents(events);
+                return;
+            }
             _run.Hour = pvpHour;
             _run.RerollCost = 0;
             _run.RerollsRemaining = 0;
             events.Add(new GameSimEventRunHourChanged(_run.Hour));
-            if (_run.PendingLevelUp)
-            {
-                PushChoiceAndEnterLevelUp(events);
-                return;
-            }
             _run.SelectionsMadeInCurrentContext = 0;
             events.AddRange(DealHourEncountersAndClearActive());
             return;
@@ -4564,6 +4613,29 @@ public sealed class RunEngine
 
         // P0-1 根治：仅当本小时尚未通过遭遇离场/战斗/推进获取过每小时经验时才补发 ExperiencePerHour，彻底消灭每小时双份经验
         bool needAdvanceHourXp = !_run.GainedHourXpThisHour && !_run.GainedAdvanceHourXpThisHour;
+
+        // Wave 4A #1（第二条同源致命链根治）：即将推进至 Hour 6（HoursInADay，PvP 小时）前，
+        // 先结算旧小时的推进经验并检测升级：若触发升级（含连升多级），保持旧小时 (< HoursInADay) 不发 RunHourChanged(HoursInADay)，
+        // 置持久化标记 PendingAdvanceHourAfterLevelUp=true 直接进入 LevelUp；全部升级完成后再由 AdvanceAfterSubStateToEvents
+        // 二次调用 AdvanceHourOrDay 正式切至 Hour 6 Choice，彻底杜绝裸客户端 ProcessLevelUpState 提前设死 _waitForNewDayTransition 导致 Hour 6 空桌软锁。
+        if (!newDay && nextHour == (uint)_mode.HoursInADay)
+        {
+            if (needAdvanceHourXp && _mode.ExperiencePerHour > 0)
+            {
+                _run.GainedAdvanceHourXpThisHour = true;
+                needAdvanceHourXp = false;
+                GrantExperienceToList(events, _mode.ExperiencePerHour, EExperienceType.Hour);
+            }
+            if (_run.PendingLevelUp)
+            {
+                _run.PendingAdvanceHourAfterLevelUp = true;
+                ConsumeNextPendingLevelUpToEvents(events);
+                return;
+            }
+        }
+
+        uint prevHourBeforeAdvance = _run.Hour;
+        _run.PendingAdvanceHourAfterLevelUp = false;
         _run.Hour = nextHour;
         _run.RerollCost = _run.IsSandboxRun && _run.CustomRules.SandboxFreeInfiniteReroll ? 0u : 2u;
         _run.RerollsRemaining = 3;
@@ -4676,21 +4748,42 @@ public sealed class RunEngine
             ApplyOutOfCombatBatch(p1Day, dayBatch, events, syncBoardDiffs: true, xpType: EExperienceType.Hour);
         }
 
-        events.Add(new GameSimEventRunHourChanged(_run.Hour));
+        bool isEnteringPvpHour = !newDay && _run.Hour == (uint)_mode.HoursInADay;
+        var hourEffects = new List<IGameSimEvent>();
 
-        // 2. 新小时开始派发 TTriggerOnHourStarted（产衍生卡/涨属性/重算光环）
-        var p1Hour = BuildCorePlayerFromRun();
-        var hourBatch = OutOfCombatController.OnHourStarted(
-            p1Hour, _repo, _rng, clearEndOfHourModifiers: false,
-            currentEncounterId: _run.CurrentEncounterId,
-            activeEncounterCard: _run.CurrentEncounterCoreCard);
-        ApplyOutOfCombatBatch(p1Hour, hourBatch, events, syncBoardDiffs: true, xpType: EExperienceType.Hour);
+        // 2. 新小时开始派发 TTriggerOnHourStarted（产衍生卡/涨属性/重算光环；同 (Day, Hour) 去重避免极端升级延迟重试时双发）
+        var currentDayHour = (_run.Day, _run.Hour);
+        if (_run.HourStartEffectsDispatchedFor != currentDayHour)
+        {
+            _run.HourStartEffectsDispatchedFor = currentDayHour;
+            var p1Hour = BuildCorePlayerFromRun();
+            var hourBatch = OutOfCombatController.OnHourStarted(
+                p1Hour, _repo, _rng, clearEndOfHourModifiers: false,
+                currentEncounterId: _run.CurrentEncounterId,
+                activeEncounterCard: _run.CurrentEncounterCoreCard);
+            ApplyOutOfCombatBatch(p1Hour, hourBatch, hourEffects, syncBoardDiffs: true, xpType: EExperienceType.Hour);
+        }
 
         // 3. 若刚结束的旧小时尚未获得过小时推进经验，则发放固定 ExperiencePerHour（+1 XP）
         if (needAdvanceHourXp && _mode.ExperiencePerHour > 0)
         {
-            GrantExperienceToList(events, _mode.ExperiencePerHour, EExperienceType.Hour);
+            GrantExperienceToList(hourEffects, _mode.ExperiencePerHour, EExperienceType.Hour);
         }
+
+        // Wave 4A #1 极端边界保护：若进入 Hour 6 时 OnHourStarted 自身触发了升级，暂不发送 RunHourChanged(6) 且回退旧小时先进入 LevelUp，
+        // 避免客户端在非 Choice 态见到 Hour == HoursInADay 提前锁死 _waitForNewDayTransition。
+        if (isEnteringPvpHour && _run.PendingLevelUp)
+        {
+            events.AddRange(hourEffects);
+            _run.Hour = prevHourBeforeAdvance;
+            _run.GainedAdvanceHourXpThisHour = true;
+            _run.PendingAdvanceHourAfterLevelUp = true;
+            ConsumeNextPendingLevelUpToEvents(events);
+            return;
+        }
+
+        events.Add(new GameSimEventRunHourChanged(_run.Hour));
+        events.AddRange(hourEffects);
 
         // 4. 若小时推进时升级经验足够，先把新小时的 Choice 现场压入 SuspendedStates 再进入 LevelUp，
         //    确保升级结束后恢复至新小时 Choice；Day 6/9/10 Hour 1 持对应探险门票时直接在 Choice 下发第 4 张探险入口卡。
@@ -8626,12 +8719,13 @@ public sealed class RunEngine
         }
 
         var ghost = _run.PendingPvpGhost ?? BuildEmergencyFallbackGhost(day, ghostPartition, _rng);
+        EHero oppHero = PvpGhostPool.ParseHero(ghost.Hero);
+        // Wave 4A #1 (H-1) & #11：非锦标赛幽灵 accountId 嵌入 Day 与 BoardId 保证跨天必异；名牌去除 ({ghost.PowerBucket}) 仅下发干净英雄名
         string oppAccountId = tourneyAssignment?.OpponentAccountId
-            ?? (!string.IsNullOrWhiteSpace(ghost.BoardId) ? $"ghost_{ghost.BoardId}" : $"ghost_{Guid.NewGuid():N}");
+            ?? $"ghost_{oppHero}_d{_run.Day}_{(!string.IsNullOrWhiteSpace(ghost.BoardId) ? ghost.BoardId : Guid.NewGuid().ToString("N"))}";
         string oppDisplayName = tourneyAssignment != null
             ? tourneyAssignment.OpponentUsername
-            : (string.IsNullOrWhiteSpace(ghost.Hero) ? "Challenger" : $"{ghost.Hero} ({ghost.PowerBucket})");
-        EHero oppHero = PvpGhostPool.ParseHero(ghost.Hero);
+            : (string.IsNullOrWhiteSpace(ghost.Hero) ? "Challenger" : ghost.Hero);
 
         int previewHp = Math.Max(100, ghost.HealthMax);
         if (tourneyLobby != null && tourneyAssignment is { OpponentIsBot: true })
@@ -9630,7 +9724,7 @@ public sealed class RunEngine
         }
         else
         {
-            string safeAccId = string.IsNullOrWhiteSpace(accountId) ? $"ghost_{hero}" : accountId;
+            string safeAccId = string.IsNullOrWhiteSpace(accountId) ? $"ghost_{hero}_d{_run.Day}_{Guid.NewGuid():N}" : accountId;
             loadout = new BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout
             {
                 accountId = safeAccId,

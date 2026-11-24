@@ -381,7 +381,8 @@ public static class AbilityExecutor
 
             case "TTriggerOnCardAttributeChanged":
             {
-                if (!string.IsNullOrEmpty(trigger.AttributeChanged) && !string.Equals(trigger.AttributeChanged, changedAttr, StringComparison.OrdinalIgnoreCase))
+                var attrFilter = trigger.ResolveAttributeChangedFilter(isPlayer: false);
+                if (!string.IsNullOrEmpty(attrFilter) && !string.Equals(attrFilter, changedAttr, StringComparison.OrdinalIgnoreCase))
                     return false;
                 if (trigger.ChangeType == "Gain" && curVal <= prevVal) return false;
                 if (trigger.ChangeType == "Loss" && curVal >= prevVal) return false;
@@ -398,9 +399,10 @@ public static class AbilityExecutor
                     : trigger.CurrentValue;
                 if (expectedCur.HasValue)
                 {
-                    if (!string.IsNullOrEmpty(trigger.ComparisonOperator))
+                    var cmpOp = trigger.ResolveComparisonOperator();
+                    if (!string.IsNullOrEmpty(cmpOp))
                     {
-                        if (!ValueAndConditionEvaluator.Compare(curVal, trigger.ComparisonOperator, expectedCur.Value))
+                        if (!ValueAndConditionEvaluator.Compare(curVal, cmpOp, expectedCur.Value))
                             return false;
                     }
                     else if (Math.Abs(curVal - expectedCur.Value) > 1e-6)
@@ -420,7 +422,8 @@ public static class AbilityExecutor
 
             case "TTriggerOnPlayerAttributeChanged":
             {
-                if (!string.IsNullOrEmpty(trigger.AttributeType) && !string.Equals(trigger.AttributeType, changedAttr, StringComparison.OrdinalIgnoreCase))
+                var attrFilter = trigger.ResolveAttributeChangedFilter(isPlayer: true);
+                if (!string.IsNullOrEmpty(attrFilter) && !string.Equals(attrFilter, changedAttr, StringComparison.OrdinalIgnoreCase))
                     return false;
                 if (trigger.ChangeType == "Gain" && curVal <= prevVal) return false;
                 if (trigger.ChangeType == "Loss" && curVal >= prevVal) return false;
@@ -431,9 +434,10 @@ public static class AbilityExecutor
 
             case "TTriggerOnPlayerDamaged":
             {
-                if (trigger.ComparisonAmount.HasValue && !string.IsNullOrEmpty(trigger.ComparisonOperator))
+                var cmpOp = trigger.ResolveComparisonOperator();
+                if (trigger.ComparisonAmount.HasValue && !string.IsNullOrEmpty(cmpOp))
                 {
-                    if (!ValueAndConditionEvaluator.Compare(curVal, trigger.ComparisonOperator, trigger.ComparisonAmount.Value))
+                    if (!ValueAndConditionEvaluator.Compare(curVal, cmpOp, trigger.ComparisonAmount.Value))
                         return false;
                 }
                 bool pOk = trigger.Subject == null || (eventSubjectPlayer != null && TargetResolver.ResolvePlayers(trigger.Subject, ctx.WithCards(ownerCard)).Contains(eventSubjectPlayer));
@@ -446,7 +450,7 @@ public static class AbilityExecutor
                 if (curVal <= 0) return false;
                 if (trigger.ComparisonAmount.HasValue)
                 {
-                    var op = string.IsNullOrEmpty(trigger.ComparisonOperator) ? "GreaterThan" : trigger.ComparisonOperator;
+                    var op = trigger.ResolveComparisonOperator("GreaterThan");
                     if (!ValueAndConditionEvaluator.Compare(curVal, op, trigger.ComparisonAmount.Value))
                         return false;
                 }
@@ -464,7 +468,7 @@ public static class AbilityExecutor
                     : trigger.GetFixedComparisonValue() ?? trigger.ComparisonAmount;
                 if (cmpAmt.HasValue)
                 {
-                    var op = string.IsNullOrEmpty(trigger.ComparisonOperator) ? "GreaterThan" : trigger.ComparisonOperator;
+                    var op = trigger.ResolveComparisonOperator("GreaterThan");
                     if (!ValueAndConditionEvaluator.Compare(curVal, op, cmpAmt.Value))
                         return false;
                 }
@@ -482,7 +486,7 @@ public static class AbilityExecutor
                 if (targetLevel.HasValue && targetLevel.Value > 0)
                 {
                     double levelVal = curVal > 0 ? curVal : (eventSubjectPlayer?.Level ?? ownerPlayer.Level);
-                    var op = string.IsNullOrEmpty(trigger.ComparisonOperator) ? "LessThanOrEqual" : trigger.ComparisonOperator;
+                    var op = trigger.ResolveComparisonOperator("LessThanOrEqual");
                     if (!ValueAndConditionEvaluator.Compare(levelVal, op, targetLevel.Value))
                         return false;
                 }
@@ -1272,7 +1276,7 @@ public static class AbilityExecutor
                     var valNode = action.GetValueNode(GameDatabaseLoader.JsonOptions);
                     double val = valNode != null ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx) : (action.GetFixedNumericValue() ?? 0);
                     if (double.IsNaN(val) || double.IsInfinity(val)) val = 0;
-                    var attr = action.AttributeType ?? "Gold";
+                    var attr = action.ResolvePlayerAttributeName("Gold");
                     var op = action.Operation ?? "Add";
                     var durationTarget = ResolveDurationTarget(action.Duration, ctx.Scope);
                     bool isTimedCombat = ctx.Scope == RuleScope.InCombat && action.Duration?.Type == "TCombatDuration";
@@ -1312,7 +1316,7 @@ public static class AbilityExecutor
                         ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx)
                         : (!perTargetEval ? (action.GetFixedNumericValue() ?? 0) : 0);
                     if (double.IsNaN(sharedVal) || double.IsInfinity(sharedVal)) sharedVal = 0;
-                    var attr = action.AttributeType ?? "DamageAmount";
+                    var attr = action.ResolveCardAttributeName("DamageAmount");
                     var op = action.Operation ?? "Add";
                     var durationTarget = ResolveDurationTarget(action.Duration, ctx.Scope);
                     bool isTimedCombat = ctx.Scope == RuleScope.InCombat
@@ -2955,7 +2959,7 @@ public static class AbilityExecutor
             var valNode = cost.GetValueNode(GameDatabaseLoader.JsonOptions);
             double rawAmt = valNode != null ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx) : (cost.GetFixedNumericValue() ?? 0);
             double amt = SafeMath.ClampFinite(rawAmt, 0.0, SafeMath.DefaultCombatMax, 0.0);
-            var attr = cost.PlayerAttributeType ?? "Gold";
+            var attr = cost.ResolveCostPlayerAttributeName("Gold");
             double prevAttr = ctx.SelfPlayer.GetAttribute(attr);
             if (prevAttr + 1e-9 < amt) return false;
             if (amt > 0)
@@ -2974,7 +2978,7 @@ public static class AbilityExecutor
             var valNode = cost.GetValueNode(GameDatabaseLoader.JsonOptions);
             double rawAmt = valNode != null ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx) : (cost.GetFixedNumericValue() ?? 0);
             double amt = SafeMath.ClampFinite(rawAmt, 0.0, SafeMath.DefaultCombatMax, 0.0);
-            var attr = cost.CardAttributeType ?? cost.AttributeType ?? "Ammo";
+            var attr = cost.ResolveCostCardAttributeName("Ammo");
             var targetCard = cost.Target != null
                 ? ResolveActionTargets(cost.Target, ctx).FirstOrDefault()
                 : sourceCard;

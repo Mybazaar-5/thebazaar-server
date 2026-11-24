@@ -177,6 +177,13 @@ public sealed class RunState
     /// <summary>待消费的升级奖励次数（支持单次连升多级逐级发放，以及在遭遇战内延后至退场结算）。</summary>
     public int PendingLevelUps { get; set; }
 
+    /// <summary>Wave 4A #1：Hour 5→6 推进因触发升级而暂缓切至 HoursInADay，待全部连升结束后再推进至 Hour 6 PvP。</summary>
+    public bool PendingAdvanceHourAfterLevelUp { get; set; }
+
+    /// <summary>Wave 4A #1：记录已派发过 OnHourStarted 的 (Day, Hour)，防止极端边界回退重试时重复派发同小时起始效果。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public (uint Day, uint Hour)? HourStartEffectsDispatchedFor { get; set; }
+
     /// <summary>向后兼容计算属性：是否存在待消费的升级奖励。</summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public bool PendingLevelUp => PendingLevelUps > 0;
@@ -1155,6 +1162,7 @@ public sealed class RunState
             bool omitPlacement = movedExistingIds.Contains(c.InstanceId);
             sim.Cards[c.InstanceId] = RunSnapshotSerializer.ToSimCard(c, clearPendingForceSync: true, omitPlacement: omitPlacement);
         }
+        SanitizeWireEventsAndCards(sim);
         return sim;
     }
 
@@ -1286,7 +1294,185 @@ public sealed class RunState
                     omitPlacement: movedExistingIds.Contains(entry.InstanceId));
         }
 
+        SanitizeWireEventsAndCards(sim);
         return sim;
+    }
+
+    /// <summary>
+    /// Wave 4A #1 反向审计服务端发包硬不变量守卫（根治裸客户端 H-2 / H-4 / H-5a / P1-44）：
+    /// 1) H-2：剔除对同包已 CardSpawned 或 CardDisposed 实体发出的冗余 CardMoved，防止客户端 OnCardMoved 抛 KeyNotFoundException 或瞬移残影；
+    /// 2) H-4：确保 CardTransformed 与 CardTransformReverted 引用的新/原实体在 sim.Cards 中全部存在，防止 simUpdates[id] 缺键崩解；
+    /// 3) H-5a：剔除孤立 PlayerSkillEquipped（目标卡既不在 sim.Cards 也不在 run.Cards，或同帧已被销毁且未重生），并为现存技能补齐 sim.Cards；
+    /// 4) P1-44：同一玩家同一 TemplateId 在单包内禁止重复 CardSpawned + PlayerSkillEquipped 导致重复技能叠层与客户端异常。
+    /// </summary>
+    internal void SanitizeWireEventsAndCards(GameSim sim)
+    {
+        if (sim.Events.Count == 0) return;
+
+        var spawnedIds = new HashSet<string>(StringComparer.Ordinal);
+        var spawnedMetaById = new Dictionary<string, (ECombatantId Owner, string TemplateId)>(StringComparer.Ordinal);
+        var disposedIds = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < sim.Events.Count; i++)
+        {
+            switch (sim.Events[i])
+            {
+                case GameSimEventCardSpawned sp when !string.IsNullOrEmpty(sp.InstanceId):
+                    spawnedIds.Add(sp.InstanceId);
+                    spawnedMetaById[sp.InstanceId] = (sp.CombatantId, sp.TemplateId ?? string.Empty);
+                    break;
+                case GameSimEventCardDisposed dp when !string.IsNullOrEmpty(dp.InstanceId):
+                    disposedIds.Add(dp.InstanceId);
+                    break;
+            }
+        }
+
+        // H-4：先补齐所有变形/还原事件目标卡在 sim.Cards 中的缺失条目
+        for (int i = 0; i < sim.Events.Count; i++)
+        {
+            switch (sim.Events[i])
+            {
+                case GameSimEventCardTransformed tr:
+                    if (tr.TransformedCards != null)
+                    {
+                        foreach (var tc in tr.TransformedCards)
+                        {
+                            if (tc == null || string.IsNullOrEmpty(tc.InstanceId)) continue;
+                            if (!sim.Cards.ContainsKey(tc.InstanceId))
+                            {
+                                if (Cards.TryGetValue(tc.InstanceId, out var ce))
+                                    sim.Cards[tc.InstanceId] = RunSnapshotSerializer.ToSimCard(ce, clearPendingForceSync: false, omitPlacement: false);
+                                else
+                                    sim.Cards[tc.InstanceId] = new SimUpdateCard
+                                    {
+                                        InstanceId = tc.InstanceId,
+                                        Placement = new CardDeltaPlacement
+                                        {
+                                            Owner = tc.CombatantId,
+                                            Section = tc.Section,
+                                            Socket = tc.Socket,
+                                        },
+                                    };
+                            }
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(tr.OriginalInstanceId)
+                        && !sim.Cards.ContainsKey(tr.OriginalInstanceId)
+                        && Cards.TryGetValue(tr.OriginalInstanceId, out var origEntry))
+                    {
+                        sim.Cards[tr.OriginalInstanceId] = RunSnapshotSerializer.ToSimCard(origEntry, clearPendingForceSync: false, omitPlacement: false);
+                    }
+                    break;
+
+                case GameSimEventCardTransformReverted rev when rev.OriginalCard != null && !string.IsNullOrEmpty(rev.OriginalCard.InstanceId):
+                    if (!sim.Cards.ContainsKey(rev.OriginalCard.InstanceId))
+                    {
+                        if (Cards.TryGetValue(rev.OriginalCard.InstanceId, out var revEntry))
+                            sim.Cards[rev.OriginalCard.InstanceId] = RunSnapshotSerializer.ToSimCard(revEntry, clearPendingForceSync: false, omitPlacement: false);
+                        else
+                            sim.Cards[rev.OriginalCard.InstanceId] = new SimUpdateCard
+                            {
+                                InstanceId = rev.OriginalCard.InstanceId,
+                                Placement = new CardDeltaPlacement
+                                {
+                                    Owner = rev.OriginalCard.CombatantId,
+                                    Section = rev.OriginalCard.Section,
+                                    Socket = rev.OriginalCard.Socket,
+                                },
+                            };
+                    }
+                    break;
+            }
+        }
+
+        // 统计重复技能（P1-44）与孤立技能（H-5a）
+        var seenSkillInstanceIds = new HashSet<string>(StringComparer.Ordinal);
+        var seenSkillOwnerTemplates = new HashSet<(ECombatantId Owner, string TemplateId)>();
+        var duplicateSpawnSkillIds = new HashSet<string>(StringComparer.Ordinal);
+        var dropIndices = new HashSet<int>();
+
+        for (int i = 0; i < sim.Events.Count; i++)
+        {
+            switch (sim.Events[i])
+            {
+                case GameSimEventCardMoved mv when !string.IsNullOrEmpty(mv.InstanceId):
+                    // H-2：同帧刚 Spawned 或已 Disposed 的实体严禁混发 CardMoved
+                    if (spawnedIds.Contains(mv.InstanceId) || disposedIds.Contains(mv.InstanceId))
+                        dropIndices.Add(i);
+                    break;
+
+                case GameSimEventPlayerSkillEquipped sk:
+                {
+                    string sid = sk.InstanceId ?? string.Empty;
+                    bool disposedWithoutSpawn = disposedIds.Contains(sid) && !spawnedIds.Contains(sid);
+                    bool inCards = !string.IsNullOrEmpty(sid) && Cards.TryGetValue(sid, out _);
+                    bool inSim = !string.IsNullOrEmpty(sid) && sim.Cards.ContainsKey(sid);
+                    if (string.IsNullOrEmpty(sid) || disposedWithoutSpawn || (!inSim && !inCards))
+                    {
+                        // H-5a：孤立 PlayerSkillEquipped，直接剔除
+                        dropIndices.Add(i);
+                        break;
+                    }
+
+                    if (!inSim && Cards.TryGetValue(sid, out var backfilled))
+                        sim.Cards[sid] = RunSnapshotSerializer.ToSimCard(backfilled, clearPendingForceSync: false, omitPlacement: false);
+
+                    // P1-44：同一实体重复装配，或同一玩家同 TemplateId 在本包重复装配不同新生成技能实例时去重
+                    if (!seenSkillInstanceIds.Add(sid))
+                    {
+                        dropIndices.Add(i);
+                        break;
+                    }
+
+                    string tplIdStr = string.Empty;
+                    ECombatantId owner = ECombatantId.Player;
+                    if (Cards.TryGetValue(sid, out var ce))
+                    {
+                        tplIdStr = !string.IsNullOrWhiteSpace(ce.CustomCardId) ? ce.CustomCardId! : ce.TemplateId.ToString("D");
+                        owner = ce.Owner ?? ECombatantId.Player;
+                    }
+                    else if (spawnedMetaById.TryGetValue(sid, out var spMeta))
+                    {
+                        tplIdStr = spMeta.TemplateId;
+                        owner = spMeta.Owner;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(tplIdStr)
+                        && !seenSkillOwnerTemplates.Add((owner, tplIdStr.ToLowerInvariant())))
+                    {
+                        dropIndices.Add(i);
+                        if (spawnedIds.Contains(sid))
+                            duplicateSpawnSkillIds.Add(sid);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (duplicateSpawnSkillIds.Count > 0)
+        {
+            for (int i = 0; i < sim.Events.Count; i++)
+            {
+                if (sim.Events[i] is GameSimEventCardSpawned sp
+                    && sp.Type == ECardType.Skill
+                    && !string.IsNullOrEmpty(sp.InstanceId)
+                    && duplicateSpawnSkillIds.Contains(sp.InstanceId))
+                {
+                    dropIndices.Add(i);
+                }
+            }
+        }
+
+        if (dropIndices.Count > 0)
+        {
+            var filtered = new List<IGameSimEvent>(sim.Events.Count - dropIndices.Count);
+            for (int i = 0; i < sim.Events.Count; i++)
+            {
+                if (!dropIndices.Contains(i))
+                    filtered.Add(sim.Events[i]);
+            }
+            sim.Events.Clear();
+            sim.Events.AddRange(filtered);
+        }
     }
 
     /// <summary>
@@ -1840,17 +2026,9 @@ public sealed class RunState
             }
         }
 
-        // 4. 汇总全部可渲染属性键（固定核心键 + CoreCard 动态键 + QuestProgress 键）
+        // 4. 汇总全部可渲染属性键（固定核心键 + CardInstance 权威全层键 + QuestProgress 键）
         var candidateKeys = new HashSet<string>(RenderableCardAttributeNames, StringComparer.OrdinalIgnoreCase);
-        foreach (var k in core.BaseAttributes.Keys) candidateKeys.Add(k);
-        foreach (var k in core.PermanentAdd.Keys) candidateKeys.Add(k);
-        foreach (var k in core.PermanentMult.Keys) candidateKeys.Add(k);
-        foreach (var k in core.HourAdd.Keys) candidateKeys.Add(k);
-        foreach (var k in core.HourMult.Keys) candidateKeys.Add(k);
-        foreach (var k in core.DayAdd.Keys) candidateKeys.Add(k);
-        foreach (var k in core.DayMult.Keys) candidateKeys.Add(k);
-        foreach (var k in core.AuraAdd.Keys) candidateKeys.Add(k);
-        foreach (var k in core.AuraMult.Keys) candidateKeys.Add(k);
+        foreach (var k in core.EnumeratePresentAttributeKeys()) candidateKeys.Add(k);
         foreach (var k in core.QuestProgress.Keys) candidateKeys.Add(k);
 
         foreach (string key in candidateKeys)
@@ -1960,12 +2138,20 @@ public sealed class RunState
     private static bool HasAnyAttributeModifier(CardInstance core, string key)
         => core.PermanentAdd.ContainsKey(key)
         || core.PermanentMult.ContainsKey(key)
+        || core.PermanentAdditiveMult.ContainsKey(key)
         || core.HourAdd.ContainsKey(key)
         || core.HourMult.ContainsKey(key)
+        || core.HourAdditiveMult.ContainsKey(key)
         || core.DayAdd.ContainsKey(key)
         || core.DayMult.ContainsKey(key)
+        || core.DayAdditiveMult.ContainsKey(key)
         || core.AuraAdd.ContainsKey(key)
-        || core.AuraMult.ContainsKey(key);
+        || core.AuraMult.ContainsKey(key)
+        || core.AuraAdditiveMult.ContainsKey(key)
+        || core.EnchantmentBaseAttributes.ContainsKey(key)
+        || core.EnchantmentAuraAdd.ContainsKey(key)
+        || core.EnchantmentAuraMult.ContainsKey(key)
+        || core.EnchantmentAuraAdditiveMult.ContainsKey(key);
 
     private static bool HasPositiveBuyPriceAdd(CardInstance core)
         => (core.PermanentAdd.GetValueOrDefault("BuyPrice", 0)

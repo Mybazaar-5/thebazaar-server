@@ -4088,11 +4088,17 @@ public sealed class ShopEngine
         if (needsLocalAuraPreview)
         {
             int origSlot = inst.StartSlot;
-            var preview = new PlayerState("shelf_preview", "shelf_preview", _run.Hero.ToString(), GameDefaults.StartingHealth, GameDefaults.StartingPrestige, 0, 10)
+            int maxHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, GameDefaults.StartingHealth);
+            int prestige = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, GameDefaults.StartingPrestige);
+            int gold = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0);
+            int income = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Income, 0);
+            var preview = new PlayerState("shelf_preview", "shelf_preview", _run.Hero.ToString(), maxHp, prestige, gold, 10)
             {
                 Day = (int)_run.Day,
                 Hour = (int)_run.Hour,
+                Level = Math.Max(1, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Level, 1)),
             };
+            preview.Attributes["Income"] = income;
             if (entry.Type == ECardType.Skill)
                 preview.Skills.Add(inst);
             else if (entry.Type == ECardType.SocketEffect)
@@ -4107,13 +4113,9 @@ public sealed class ShopEngine
         if (entry.Type == ECardType.Item)
             entry.Size = ParseSize(inst.EffectiveSize.ToString());
 
-        var keys = new HashSet<string>(inst.BaseAttributes.Keys, StringComparer.OrdinalIgnoreCase);
-        foreach (string k in inst.PermanentAdd.Keys) keys.Add(k);
-        foreach (string k in inst.PermanentMult.Keys) keys.Add(k);
-        foreach (string k in inst.AuraAdd.Keys) keys.Add(k);
-        foreach (string k in inst.AuraMult.Keys) keys.Add(k);
-
-        foreach (string k in keys)
+        // Wave 4A #6：统一复用 CardInstance.EnumeratePresentAttributeKeys()，完整覆盖附魔独立隔离层与限时层，
+        // 根治货架附魔物品（如 Fiery/Toxic/Shielded/Restorative/Obsidian 等）衍生属性显示 0、买进手牌才正常的分裂问题
+        foreach (string k in inst.EnumeratePresentAttributeKeys())
         {
             if (k.Equals("Value", StringComparison.OrdinalIgnoreCase)) continue;
             if (!Enum.TryParse<ECardAttributeType>(k, true, out var at)) continue;
@@ -4121,7 +4123,7 @@ public sealed class ShopEngine
             int val = at == ECardAttributeType.Flying
                 ? Math.Max(inst.IsFlying ? 1 : 0, (int)Math.Round(inst.GetAttribute(k)))
                 : (int)Math.Round(inst.GetAttribute(k));
-            if (val != 0 || entry.Attributes.ContainsKey(at) || inst.BaseAttributes.ContainsKey(k))
+            if (val != 0 || entry.Attributes.ContainsKey(at) || inst.BaseAttributes.ContainsKey(k) || inst.EnchantmentBaseAttributes.ContainsKey(k))
                 entry.Attributes[at] = val;
         }
         if (inst.IsFlying)

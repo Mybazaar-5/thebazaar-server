@@ -31,14 +31,25 @@ internal static class TournamentLocalizationPatch
         public string[] OriginalOptions;
     }
 
+    private sealed class OriginalHeroNameMemento
+    {
+        public string OriginalName;
+        public int UsernameId;
+    }
+
     private static bool _applied;
     private static readonly HashSet<string> _loggedOnce = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<(Type, string), MemberInfo> _memberCache = new();
     private static readonly ConditionalWeakTable<TMP_Text, OriginalTextMemento> _tmpMementos = new();
     private static readonly ConditionalWeakTable<TMP_Dropdown, OriginalDropdownMemento> _dropdownMementos = new();
+    private static readonly ConditionalWeakTable<object, OriginalHeroNameMemento> _heroBannerNameMementos = new();
     private static readonly object _trackedLock = new();
     private static readonly List<WeakReference<TMP_Text>> _trackedTmps = new();
     private static readonly List<WeakReference<TMP_Dropdown>> _trackedDropdowns = new();
+    private static readonly List<WeakReference<object>> _trackedHeroBanners = new();
+    private static MethodInfo _heroBannerSetHeroNameMethod;
+    private static PropertyInfo _dataRunConfigProp;
+    [ThreadStatic] private static bool _replayingHeroBannerName;
 
     private static readonly Dictionary<string, string> ExactEnglishToZh = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -200,12 +211,14 @@ internal static class TournamentLocalizationPatch
         {
             // 注册基础内置兜底表到四层词典低优先层（让外挂 custom_zh_overlay.json 与 Mod 词典优先覆盖）
             LocalizationOverlayModule.Instance?.RegisterExactOverrides("zh-CN", ExactEnglishToZh, null, priority: 20);
+            LocalizationOverlayModule.Instance?.RegisterExactOverrides("zh-CN", PvpNameplateFormatter.BuiltInNameplateChineseEntries, null, priority: 15);
 
             PatchEncounterBanPopup(patcher);
             PatchTournamentHostSettingsView(patcher);
             PatchTournamentLobbyView(patcher);
             PatchOtherTournamentViews(patcher);
-            BazaarLauncherPlugin.Log?.LogInfo("TournamentLocalizationPatch（四层词典联动版）已加载");
+            PatchPvpNameplateViews(patcher);
+            BazaarLauncherPlugin.Log?.LogInfo("TournamentLocalizationPatch（四层词典联动 + PvP VS 名牌对齐版）已加载");
         }
         catch (Exception ex)
         {
@@ -272,6 +285,149 @@ internal static class TournamentLocalizationPatch
         patcher.TryPatch(queueType, "SetStarting", postfix: queue, optional: true);
     }
 
+    /// <summary>
+    /// Wave 4C（任务 #11）：PvP VS 名牌中文展示对齐。
+    /// 统一拦截 DataExtensions.GetOpponentDisplayName 与 HeroBannerController.SetHeroName / SetHeroLabel，
+    /// 仅在中文态清洗 (Normal)/(Strong)/(MetaBoss) 等模式后缀并汉化英雄名与段位/头衔，英文态无损保留原值。
+    /// </summary>
+    private static void PatchPvpNameplateViews(SafeHarmonyPatcher patcher)
+    {
+        var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
+        _dataRunConfigProp = dataType?.GetProperty("RunConfiguration", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+
+        var dataExtType = GameInspector.FindTypeSafe("TheBazaar.DataExtensions");
+        var getOppName = dataExtType == null ? null : AccessTools.Method(dataExtType, "GetOpponentDisplayName");
+        if (getOppName != null)
+        {
+            patcher.TryPatchMethod(
+                getOppName,
+                postfix: AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(GetOpponentDisplayNamePostfix)),
+                optional: true,
+                label: "PvpNameplate.DataExtensions.GetOpponentDisplayName");
+        }
+
+        var bannerType = GameInspector.FindTypeSafe("TheBazaar.HeroBannerController");
+        if (bannerType != null)
+        {
+            _heroBannerSetHeroNameMethod = AccessTools.Method(bannerType, "SetHeroName", new[] { typeof(string), typeof(int) });
+            if (_heroBannerSetHeroNameMethod != null)
+            {
+                patcher.TryPatchMethod(
+                    _heroBannerSetHeroNameMethod,
+                    prefix: AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(HeroBannerSetHeroNamePrefix)),
+                    optional: true,
+                    label: "PvpNameplate.HeroBannerController.SetHeroName");
+            }
+
+            var setLabel = AccessTools.Method(bannerType, "SetHeroLabel", new[] { typeof(string) });
+            if (setLabel != null)
+            {
+                patcher.TryPatchMethod(
+                    setLabel,
+                    postfix: AccessTools.Method(typeof(TournamentLocalizationPatch), nameof(HeroBannerSetHeroLabelPostfix)),
+                    optional: true,
+                    label: "PvpNameplate.HeroBannerController.SetHeroLabel");
+            }
+        }
+    }
+
+    private static bool IsTournamentRunActive()
+    {
+        try
+        {
+            object cfg = _dataRunConfigProp?.GetValue(null);
+            if (cfg == null) return false;
+            object runType = GameInspector.GetMember(cfg, "RunType");
+            return runType != null && string.Equals(runType.ToString(), "Tournament", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void GetOpponentDisplayNamePostfix(ref string __result)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(__result) || !IsChineseActive()) return;
+            __result = PvpNameplateFormatter.FormatOpponentName(__result, isChineseLocale: true, isTournament: IsTournamentRunActive());
+        }
+        catch (Exception ex)
+        {
+            LogOnce("GetOpponentDisplayNamePostfix", "GetOpponentDisplayNamePostfix error: " + ex.Message);
+        }
+    }
+
+    private static void HeroBannerSetHeroNamePrefix(object __instance, ref string newName, int usernameId)
+    {
+        try
+        {
+            if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+
+            if (!_replayingHeroBannerName)
+            {
+                if (_heroBannerNameMementos.TryGetValue(__instance, out var existing))
+                {
+                    existing.OriginalName = newName ?? string.Empty;
+                    existing.UsernameId = usernameId;
+                }
+                else
+                {
+                    _heroBannerNameMementos.Add(__instance, new OriginalHeroNameMemento
+                    {
+                        OriginalName = newName ?? string.Empty,
+                        UsernameId = usernameId,
+                    });
+                    lock (_trackedLock)
+                    {
+                        _trackedHeroBanners.Add(new WeakReference<object>(__instance));
+                    }
+                }
+            }
+
+            if (IsChineseActive() && !string.IsNullOrEmpty(newName))
+            {
+                newName = PvpNameplateFormatter.FormatOpponentName(newName, isChineseLocale: true, isTournament: IsTournamentRunActive());
+            }
+        }
+        catch (Exception ex)
+        {
+            LogOnce("HeroBannerSetHeroNamePrefix", "HeroBannerSetHeroNamePrefix error: " + ex.Message);
+        }
+    }
+
+    private static void HeroBannerSetHeroLabelPostfix(object __instance)
+    {
+        try
+        {
+            if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+            if (!IsChineseActive()) return;
+
+            var labelTmp = GetFieldOrProp<TMP_Text>(__instance, "_heroLabel");
+            if (labelTmp == null) return;
+
+            string rawEng = GetFieldOrProp<string>(__instance, "_heroTitleEng");
+            string currentText = labelTmp.text ?? string.Empty;
+
+            // 先优先基于四层外挂词典翻译，再由 PvpNameplateFormatter 彻底兜底段位/头衔英文（Bronze/Diamond/Wandering/Gilded 等）
+            string candidate = currentText;
+            if (!string.IsNullOrWhiteSpace(rawEng) && TryTranslateString(rawEng, null, "HeroBannerController", out string dictZh))
+            {
+                candidate = dictZh;
+            }
+            string formatted = PvpNameplateFormatter.FormatTitleOrRankLabel(candidate, isChineseLocale: true);
+            if (!string.Equals(labelTmp.text, formatted, StringComparison.Ordinal))
+            {
+                labelTmp.text = formatted;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogOnce("HeroBannerSetHeroLabelPostfix", "HeroBannerSetHeroLabelPostfix error: " + ex.Message);
+        }
+    }
+
     private static bool IsChineseActive()
         => LocalizationOverlayModule.IsChineseLocale(LocalizationOverlayModule.DetectCurrentGameLocale());
 
@@ -281,6 +437,7 @@ internal static class TournamentLocalizationPatch
         bool toZh = LocalizationOverlayModule.IsChineseLocale(newLocale);
         List<TMP_Text> aliveTmps = new();
         List<TMP_Dropdown> aliveDropdowns = new();
+        List<object> aliveHeroBanners = new();
 
         lock (_trackedLock)
         {
@@ -293,6 +450,13 @@ internal static class TournamentLocalizationPatch
             {
                 if (_trackedDropdowns[i].TryGetTarget(out var d) && d != null) aliveDropdowns.Add(d);
                 else _trackedDropdowns.RemoveAt(i);
+            }
+            for (int i = _trackedHeroBanners.Count - 1; i >= 0; i--)
+            {
+                if (_trackedHeroBanners[i].TryGetTarget(out var hb) && hb != null && !(hb is UnityEngine.Object huo && huo == null))
+                    aliveHeroBanners.Add(hb);
+                else
+                    _trackedHeroBanners.RemoveAt(i);
             }
         }
 
@@ -338,6 +502,25 @@ internal static class TournamentLocalizationPatch
                 if (changed) dd.RefreshShownValue();
             }
             catch { }
+        }
+
+        if (_heroBannerSetHeroNameMethod != null)
+        {
+            for (int i = 0; i < aliveHeroBanners.Count; i++)
+            {
+                var hb = aliveHeroBanners[i];
+                if (!_heroBannerNameMementos.TryGetValue(hb, out var hmem)) continue;
+                try
+                {
+                    _replayingHeroBannerName = true;
+                    _heroBannerSetHeroNameMethod.Invoke(hb, new object[] { hmem.OriginalName, hmem.UsernameId });
+                }
+                catch { }
+                finally
+                {
+                    _replayingHeroBannerName = false;
+                }
+            }
         }
     }
 

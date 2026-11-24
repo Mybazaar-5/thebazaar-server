@@ -1556,7 +1556,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null)
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.Item3D", binding.LocalImagePath, "texture_lease_null", binding.CustomCardId ?? binding.TemplateId);
+                        return;
+                    }
                     if (visualsComp == null || agent == null || !agent.HasContext || agent.Epoch != capturedEpoch
                         || !LiveCardMatchesAgent(visualsComp, agent))
                     {
@@ -1575,6 +1579,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     {
                         agent.TakePrimaryLease(ref lease);
                         agent.MarkApplied(curMatId, binding.LocalImagePath);
+                    }
+                    else
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.Item3D", binding.LocalImagePath, "apply_urp_material_failed", binding.CustomCardId ?? binding.TemplateId);
                     }
                 }
                 catch (Exception ex)
@@ -1626,7 +1634,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null)
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.SkillIconPrefix", binding.LocalImagePath, "texture_lease_null", binding.CustomCardId ?? binding.TemplateId);
+                        return;
+                    }
                     if (__instance == null || agent == null || !agent.HasContext || agent.Epoch != capturedEpoch) return;
 
                     if (!finishedSync)
@@ -1808,7 +1820,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null)
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.Skill3D", binding.LocalImagePath, "texture_lease_null", binding.CustomCardId ?? binding.TemplateId);
+                        return;
+                    }
                     if (skillComp == null || agent == null || agent.Epoch != epoch) return;
 
                     if (_skillIconUpdaterType != null)
@@ -2019,7 +2035,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null)
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.PreviewItem2D", binding.LocalImagePath, "texture_lease_null", binding.CustomCardId ?? binding.TemplateId);
+                        return;
+                    }
                     if (previewComp == null || agent == null || agent.Epoch != epoch) return;
 
                     Material mat = _previewItemMaterialField?.GetValue(previewComp) as Material;
@@ -2039,6 +2059,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                         agent.EnsureOriginalPreviewRawImage(rawImg);
                         rawImg.texture = lease.Asset.Texture;
                         agent.TakePrimaryLease(ref lease);
+                    }
+                    else
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.PreviewItem2D", binding.LocalImagePath, "no_valid_material_or_rawimage", binding.CustomCardId ?? binding.TemplateId);
                     }
                 }
                 catch (Exception ex)
@@ -2120,7 +2144,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null)
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.PreviewSkill2D", binding.LocalImagePath, "texture_lease_null", binding.CustomCardId ?? binding.TemplateId);
+                        return;
+                    }
                     if (previewComp == null || agent == null || agent.Epoch != epoch) return;
 
                     RawImage rawImg = _previewCardImageField?.GetValue(previewComp) as RawImage;
@@ -2210,7 +2238,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null)
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.PreviewEncounter2D", binding.LocalImagePath, "texture_lease_null", binding.CustomCardId ?? binding.TemplateId);
+                        return;
+                    }
                     if (previewComp == null || agent == null || agent.Epoch != epoch) return;
 
                     Image portraitImg = _previewEncounterPortraitField?.GetValue(previewComp) as Image;
@@ -2221,6 +2253,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                         portraitImg.sprite = sp;
                         portraitImg.enabled = true;
                         agent.TakePrimaryLease(ref lease);
+                    }
+                    else if (sp == null)
+                    {
+                        BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.PreviewEncounter2D", binding.LocalImagePath, "sprite_create_failed", binding.CustomCardId ?? binding.TemplateId);
                     }
                 }
                 catch (Exception ex)
@@ -2333,7 +2369,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                     try
                     {
-                        if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                        if (lease == null || lease.Asset == null || lease.Asset.Texture == null)
+                        {
+                            BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.EncounterPortrait", pBinding.LocalImagePath, "texture_lease_null", pBinding.CustomCardId ?? pBinding.TemplateId);
+                            return;
+                        }
                         if (encComp == null || agent == null || agent.Epoch != epoch) return;
 
                         SpriteRenderer sr = _encounterPortraitRendererField?.GetValue(encComp) as SpriteRenderer;
@@ -2353,6 +2393,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                             }
                             agent.TakePrimaryLease(ref lease);
                             return;
+                        }
+                        if (sp == null)
+                        {
+                            BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.EncounterPortrait", pBinding.LocalImagePath, "sprite_create_failed", pBinding.CustomCardId ?? pBinding.TemplateId);
                         }
                     }
                     catch (Exception ex)
@@ -2374,7 +2418,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                     try
                     {
-                        if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                        if (lease == null || lease.Asset == null || lease.Asset.Texture == null)
+                        {
+                            BareClientAuditRuntime.NotifyCardArtLoadFailure("CustomContentVisualModule.EncounterBackground", bgBinding.LocalImagePath, "texture_lease_null", bgBinding.CustomCardId ?? bgBinding.TemplateId);
+                            return;
+                        }
                         if (encComp == null || agent == null || agent.Epoch != epoch) return;
 
                         // D4-P1-8：优先通过 MaterialPropertyBlock 写 backgroundRenderer，严禁访问 bgMr.material 触发隐式材质克隆显存泄漏！

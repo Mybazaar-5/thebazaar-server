@@ -391,9 +391,10 @@ public sealed class AuditWave2ProtocolTests
         Assert.Equal(beastIdx, portraitUpdates[0].Index);
         Assert.Null(portraitUpdates[^1].Index);
 
-        // 2. 战斗玩家属性补齐 EnragedDuration / EnragedDurationMax 差分
+        // 2. 战斗玩家属性补齐 EnragedDuration 差分，且 Wave 4A #5 首帧基线全字段对齐后恒定 EnragedDurationMax==5000 绝不再发首帧虚假 0->5000 差分
         Assert.Contains(sim.Frames, f => f.PlayerUpdates?.Attributes.ContainsKey(EPlayerAttributeType.EnragedDuration) == true);
-        Assert.Contains(sim.Frames, f => f.PlayerUpdates?.Attributes.TryGetValue(EPlayerAttributeType.EnragedDurationMax, out var u) == true && u.CurrentValue == 5000);
+        Assert.Equal(5000, res.Timeline[0].P1EnragedDurationMax);
+        Assert.False(sim.Frames[0].PlayerUpdates?.Attributes.ContainsKey(EPlayerAttributeType.EnragedDurationMax) == true);
 
         // 3. ECardStats.RageAdded 精准统计
         Assert.True(sim.CardStats.TryGetValue(rageTotem.InstanceId, out var rageStats));
@@ -486,8 +487,9 @@ public sealed class AuditWave2ProtocolTests
               && e.Source == new InstanceId(tempoSpender.InstanceId)
               && e.Target is EffectTargetPlayer tp && tp.Target == ECombatantId.Player);
 
-        // TempoGainCooldownMax 与 Joy 属性同步 + JoyAdded 统计
-        Assert.Contains(sim.Frames, f => f.PlayerUpdates?.Attributes.TryGetValue(EPlayerAttributeType.TempoGainCooldownMax, out var u) == true && u.CurrentValue == 2000);
+        // TempoGainCooldownMax（首帧对齐 2000 无虚假 0->2000 差分）与 Joy 瞬发属性同步 + JoyAdded 统计
+        Assert.Equal(2000, res.Timeline[0].P1TempoGainCooldownMax);
+        Assert.False(sim.Frames[0].PlayerUpdates?.Attributes.ContainsKey(EPlayerAttributeType.TempoGainCooldownMax) == true);
         Assert.Contains(sim.Frames, f => f.PlayerUpdates?.Attributes.TryGetValue(EPlayerAttributeType.Joy, out var u) == true && u.CurrentValue == 15);
         Assert.Equal(15, sim.CardStats[tempoJoyStarter.InstanceId].GetValueOrDefault(ECardStats.JoyAdded, 0));
     }

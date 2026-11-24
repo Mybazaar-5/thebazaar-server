@@ -540,34 +540,59 @@ public sealed class CardInstance
     }
 
     /// <summary>
-    /// 收集当前在该卡牌任一属性层中存在的全部属性键集合（P1-11，用于精确判定附魔移除或限时修饰到期后彻底消失的属性键）。
+    /// 单一权威属性键枚举（Wave 4A #6）：完整覆盖基础层、永久/小时/日/战斗/光环各加乘层以及附魔独立隔离层
+    /// （BaseAttributes、Permanent*/Hour*/Day*/Combat*/Aura*、EnchantmentBaseAttributes、EnchantmentAura*），
+    /// 供商店货架预览、局外状态同步、RunState/RunSnapshotSerializer 与战斗转换器统一复用，彻底消除属性层漏扫导致的显示分裂。
+    /// </summary>
+    public IEnumerable<string> EnumeratePresentAttributeKeys()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        static IEnumerable<string> YieldNew(Dictionary<string, double> dict, HashSet<string> seenSet)
+        {
+            if (dict.Count == 0) yield break;
+            foreach (var k in dict.Keys)
+            {
+                if (seenSet.Add(k))
+                    yield return k;
+            }
+        }
+
+        foreach (var k in YieldNew(BaseAttributes, seen)) yield return k;
+        foreach (var k in YieldNew(PermanentAdd, seen)) yield return k;
+        foreach (var k in YieldNew(PermanentMult, seen)) yield return k;
+        foreach (var k in YieldNew(PermanentAdditiveMult, seen)) yield return k;
+        foreach (var k in YieldNew(HourAdd, seen)) yield return k;
+        foreach (var k in YieldNew(HourMult, seen)) yield return k;
+        foreach (var k in YieldNew(HourAdditiveMult, seen)) yield return k;
+        foreach (var k in YieldNew(DayAdd, seen)) yield return k;
+        foreach (var k in YieldNew(DayMult, seen)) yield return k;
+        foreach (var k in YieldNew(DayAdditiveMult, seen)) yield return k;
+        foreach (var k in YieldNew(CombatAdd, seen)) yield return k;
+        foreach (var k in YieldNew(CombatMult, seen)) yield return k;
+        foreach (var k in YieldNew(CombatAdditiveMult, seen)) yield return k;
+        if (CombatZeroMultCount.Count > 0)
+        {
+            foreach (var k in CombatZeroMultCount.Keys)
+            {
+                if (seen.Add(k))
+                    yield return k;
+            }
+        }
+        foreach (var k in YieldNew(AuraAdd, seen)) yield return k;
+        foreach (var k in YieldNew(AuraMult, seen)) yield return k;
+        foreach (var k in YieldNew(AuraAdditiveMult, seen)) yield return k;
+        foreach (var k in YieldNew(EnchantmentBaseAttributes, seen)) yield return k;
+        foreach (var k in YieldNew(EnchantmentAuraAdd, seen)) yield return k;
+        foreach (var k in YieldNew(EnchantmentAuraMult, seen)) yield return k;
+        foreach (var k in YieldNew(EnchantmentAuraAdditiveMult, seen)) yield return k;
+    }
+
+    /// <summary>
+    /// 收集当前在该卡牌任一属性层中存在的全部属性键集合（P1-11，复用权威枚举 <see cref="EnumeratePresentAttributeKeys"/>）。
     /// </summary>
     public HashSet<string> GetActiveAttributeKeys()
-    {
-        var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var k in BaseAttributes.Keys) keys.Add(k);
-        foreach (var k in PermanentAdd.Keys) keys.Add(k);
-        foreach (var k in PermanentMult.Keys) keys.Add(k);
-        foreach (var k in PermanentAdditiveMult.Keys) keys.Add(k);
-        foreach (var k in HourAdd.Keys) keys.Add(k);
-        foreach (var k in HourMult.Keys) keys.Add(k);
-        foreach (var k in HourAdditiveMult.Keys) keys.Add(k);
-        foreach (var k in DayAdd.Keys) keys.Add(k);
-        foreach (var k in DayMult.Keys) keys.Add(k);
-        foreach (var k in DayAdditiveMult.Keys) keys.Add(k);
-        foreach (var k in CombatAdd.Keys) keys.Add(k);
-        foreach (var k in CombatMult.Keys) keys.Add(k);
-        foreach (var k in CombatAdditiveMult.Keys) keys.Add(k);
-        foreach (var k in CombatZeroMultCount.Keys) keys.Add(k);
-        foreach (var k in AuraAdd.Keys) keys.Add(k);
-        foreach (var k in AuraMult.Keys) keys.Add(k);
-        foreach (var k in AuraAdditiveMult.Keys) keys.Add(k);
-        foreach (var k in EnchantmentBaseAttributes.Keys) keys.Add(k);
-        foreach (var k in EnchantmentAuraAdd.Keys) keys.Add(k);
-        foreach (var k in EnchantmentAuraMult.Keys) keys.Add(k);
-        foreach (var k in EnchantmentAuraAdditiveMult.Keys) keys.Add(k);
-        return keys;
-    }
+        => new(EnumeratePresentAttributeKeys(), StringComparer.OrdinalIgnoreCase);
 
     /// <summary>判断指定属性键当前是否仍存在于该卡牌任一属性层中（P1-11）。</summary>
     public bool HasAnyAttributeKey(string attr)

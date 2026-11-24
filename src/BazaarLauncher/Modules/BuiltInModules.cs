@@ -246,3 +246,24 @@ internal sealed class DiagTrafficDumpModule : BuiltInModuleBase
 
     protected override void OnDisableCore() => TrafficDump.ResetAppliedFlag();
 }
+
+/// <summary>模块 12（诊断，默认关闭）：严格裸协议黑匣子观测模块（Diag.BareClientAuditModule）。</summary>
+internal sealed class DiagBareClientAuditModule : BuiltInModuleBase
+{
+    public DiagBareClientAuditModule()
+        : base("bazaar.diag.bare_client_audit", "裸协议黑匣子观测器（默认关闭）", "Diagnostics",
+            "在 StrictBareClientAuditMode 开启后禁用客户端自愈看门狗，以纯只读模式采集协议/异常/购入属性跳变/卡图失败/>10s锁死并异步写入 logs/bare_client_audit.jsonl。",
+            defaultEnabled: false,
+            supportsHotReload: false)
+    { }
+
+    protected override void OnEnableWithPatcher(SafeHarmonyPatcher patcher)
+    {
+        BareClientAuditRuntime.Start(patcher);
+    }
+
+    protected override void OnDisableCore()
+    {
+        BareClientAuditRuntime.Shutdown();
+    }
+}

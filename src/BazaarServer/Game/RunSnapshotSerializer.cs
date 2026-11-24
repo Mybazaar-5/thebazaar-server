@@ -70,6 +70,7 @@ public static class RunSnapshotSerializer
         public bool StartSelectionDone { get; set; }
         public bool PendingLevelUp { get; set; }
         public int PendingLevelUps { get; set; }
+        public bool PendingAdvanceHourAfterLevelUp { get; set; }
         public int PendingEncounterExitXp { get; set; }
         public bool GainedHourXpThisHour { get; set; }
         public bool GainedAdvanceHourXpThisHour { get; set; }
@@ -438,6 +439,7 @@ public static class RunSnapshotSerializer
             StartSelectionDone = startSelectionDone ?? (run.StartSelectionDone || run.Day > 1 || run.Hour > 1),
             PendingLevelUp = effectivePendingLevelUps > 0,
             PendingLevelUps = effectivePendingLevelUps,
+            PendingAdvanceHourAfterLevelUp = run.PendingAdvanceHourAfterLevelUp,
             PendingEncounterExitXp = Math.Max(0, run.PendingEncounterExitXp),
             GainedHourXpThisHour = run.GainedHourXpThisHour,
             GainedAdvanceHourXpThisHour = run.GainedAdvanceHourXpThisHour,
@@ -754,6 +756,7 @@ public static class RunSnapshotSerializer
             RerollsRemaining = dto.RerollsRemaining,
             UnlockedSlots = dto.UnlockedSlots == 0 ? (ushort)0b00_0111_1000 : dto.UnlockedSlots,
             PendingLevelUps = restoredPendingLevelUps,
+            PendingAdvanceHourAfterLevelUp = dto.PendingAdvanceHourAfterLevelUp,
             PendingEncounterExitXp = Math.Max(0, dto.PendingEncounterExitXp),
             GainedHourXpThisHour = dto.GainedHourXpThisHour,
             GainedAdvanceHourXpThisHour = dto.GainedAdvanceHourXpThisHour,

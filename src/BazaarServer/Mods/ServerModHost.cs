@@ -803,14 +803,17 @@ public sealed class ServerModHost
 
     private void SyncBoundPoolsLocked()
     {
-        if (_boundCardPool != null)
+        // Wave 4A #7：若 CardPool / MonsterPoolStore 已由同一 ActiveRepository（与 VisualBindings）构建，跳过启动期无意义重复建池
+        var activeRepo = _registry.ActiveRepository;
+        var visualBindings = _registry.VisualBindingsByCustomId;
+        if (_boundCardPool != null && !_boundCardPool.IsSyncedWith(activeRepo, visualBindings))
         {
-            _boundCardPool.ApplyRepositoryOverlay(_registry.ActiveRepository, _registry.VisualBindingsByCustomId);
+            _boundCardPool.ApplyRepositoryOverlay(activeRepo, visualBindings);
         }
-        if (_boundMonsterStore != null)
+        if (_boundMonsterStore != null && !_boundMonsterStore.IsSyncedWith(activeRepo))
         {
-            var refreshed = MonsterPool.FromRepository(_registry.ActiveRepository);
-            _boundMonsterStore.Replace(refreshed);
+            var refreshed = MonsterPool.FromRepository(activeRepo);
+            _boundMonsterStore.Replace(refreshed, activeRepo);
         }
     }
 

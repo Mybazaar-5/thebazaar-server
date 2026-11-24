@@ -1383,6 +1383,7 @@ internal static partial class CompatAuditPatch
     /// </summary>
     internal static void RefreshActiveMainMenuUiFromData()
     {
+        if (BazaarLauncherPlugin.IsStrictBareClientAuditModeActive()) return;
         try
         {
             string scene = GameInspector.GetActiveSceneName();

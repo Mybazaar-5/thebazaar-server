@@ -60,6 +60,83 @@ public static partial class ModValidator
         "$schema", "note", "comment", "baseVisualNote", "tier", "displayNameEn", "affectsStandardGhostPool"
     };
 
+    // Wave 4B 语义闸门 1：使用官方标准字段 "attribute" 的条件节点集合
+    private static readonly HashSet<string> ConditionalUsingAttributeField = new(StringComparer.Ordinal)
+    {
+        "TPlayerConditionalAttribute",
+        "TCardConditionalAttribute"
+    };
+
+    // Wave 4B 语义闸门 1：使用官方标准字段 "attributeType" 的极值条件节点集合
+    private static readonly HashSet<string> ConditionalUsingAttributeTypeField = new(StringComparer.Ordinal)
+    {
+        "TPlayerConditionalAttributeHighest",
+        "TPlayerConditionalAttributeLowest",
+        "TCardConditionalAttributeHighest",
+        "TCardConditionalAttributeLowest"
+    };
+
+    // Wave 4B 语义闸门 2：任何场景都必须显式声明 target 的玩家数值引用节点
+    private static readonly HashSet<string> PlayerReferenceTypesRequiringTarget = new(StringComparer.Ordinal)
+    {
+        "TReferenceValuePlayerAttribute",
+        "TReferenceValuePlayerAttributeUnscaled"
+    };
+
+    // Wave 4B 语义闸门 2：非 Aura 场景必须显式声明 target 的卡牌数值引用节点（Aura 中 target==null 允许作为合法逐目标 CurrentTargetCard 语义）
+    private static readonly HashSet<string> CardReferenceTypesRequiringTargetOutsideAura = new(StringComparer.Ordinal)
+    {
+        "TReferenceValueCardAttribute",
+        "TReferenceValueCardAttributeUnscaled",
+        "TReferenceValueCardAttributeAggregate",
+        "TReferenceValueCardCount",
+        "TReferenceValueUniqueCardCount",
+        "TReferenceValueCardTagCount",
+        "TReferenceValueCardHeroCount"
+    };
+
+    // Wave 4B 语义闸门 3：战中触发器白名单（触发后修改战斗属性若缺 duration 会意外进入 Permanent 层跨场滚雪球）
+    private static readonly HashSet<string> CombatTriggerTypes = new(StringComparer.Ordinal)
+    {
+        "TTriggerOnCardFired", "TTriggerOnItemUsed", "TTriggerOnBeforeItemUsed",
+        "TTriggerOnFightStarted", "TTriggerOnCardCritted",
+        "TTriggerOnCardPerformedBurn", "TTriggerOnCardPerformedShield", "TTriggerOnCardPerformedDamage",
+        "TTriggerOnCardPerformedHaste", "TTriggerOnCardPerformedSlow", "TTriggerOnCardPerformedFreeze",
+        "TTriggerOnCardPerformedHeal", "TTriggerOnCardPerformedOverHeal", "TTriggerOnCardPerformedRegen",
+        "TTriggerOnCardPerformedPoison", "TTriggerOnCardPerformedReload", "TTriggerOnCardPerformedDestruction",
+        "TTriggerOnPlayerDamaged", "TTriggerOnPlayerDied", "TTriggerOnPlayerEnraged", "TTriggerOnPlayerEnrageEnded",
+        "TTriggerOnPlayerAttributeChanged", "TTriggerOnPlayerLifeStealed", "TTriggerOnPlayerShielded",
+        "TTriggerOnCardAttributeChanged", "TTriggerOnCardCharged",
+        "TTriggerOnCardStartedFlying", "TTriggerOnCardStoppedFlying",
+        "TTriggerOnBeforeCardDestroyed", "TTriggerOnCardDisabled", "TTriggerOnCardRepaired",
+        "TTriggerOnSandstorm"
+    };
+
+    // 战中天然永久的玩家经济/成长属性（如开火产金币、经验、声望、收入、自定义计数槽）
+    private static readonly HashSet<string> InherentlyPermanentPlayerAttributes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Gold", "Income", "Experience", "Prestige", "Level",
+        "Custom_0", "Custom_1", "Custom_2", "Custom_3", "Custom_4", "Custom_5", "Custom_6", "Custom_7", "Custom_8"
+    };
+
+    // 战中天然永久或实时状态类的卡牌属性（如售价成长、弹药上限调整、冻结/减速扣减与自定义计数槽）
+    private static readonly HashSet<string> InherentlyPermanentOrTransientStateCardAttributes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "BuyPrice", "SellPrice", "AmmoMax", "Ammo", "Freeze", "Slow", "Haste",
+        "Custom_0", "Custom_1", "Custom_2", "Custom_3", "Custom_4", "Custom_5", "Custom_6", "Custom_7", "Custom_8"
+    };
+
+    private static readonly string[] CombatTempIntentKeywords =
+    [
+        "本场战斗", "本战", "战斗中", "战斗期间", "直到战斗结束", "此场战斗",
+        "for the fight", "this fight", "until end of combat", "for this combat"
+    ];
+
+    private static readonly string[] ExplicitPermanentIntentKeywords =
+    [
+        "永久", "本局", "跨场", "permanently", "permanent", "for the rest of the run"
+    ];
+
     [GeneratedRegex(@"\{([^}]+)\}", RegexOptions.CultureInvariant)]
     private static partial Regex PlaceholderTokenRegex();
 
@@ -908,7 +985,16 @@ public static partial class ModValidator
         string modId = pkg.Manifest.Id;
         var jsonOpts = GameDatabaseLoader.JsonOptions;
 
-        void CheckAbilityMap(string ownerId, Dictionary<string, AbilityDefinition>? abilities)
+        static string CombineTooltipText(string? desc, IEnumerable<string>? activeTips, IEnumerable<string>? passiveTips)
+        {
+            var parts = new List<string>();
+            if (!string.IsNullOrWhiteSpace(desc)) parts.Add(desc);
+            if (activeTips != null) parts.AddRange(activeTips.Where(s => !string.IsNullOrWhiteSpace(s)));
+            if (passiveTips != null) parts.AddRange(passiveTips.Where(s => !string.IsNullOrWhiteSpace(s)));
+            return string.Join("\n", parts);
+        }
+
+        void CheckAbilityMap(string ownerId, Dictionary<string, AbilityDefinition>? abilities, string? ownerTooltipContext = null)
         {
             if (abilities == null) return;
             foreach (var (abKey, ab) in abilities)
@@ -925,10 +1011,13 @@ public static partial class ModValidator
                             $"规则 '{loc}' 使用了未受支持的触发器 $type='{trigType}'。",
                             ownerId, GateId: 4, FixHintZh: "请查阅 GET /api/workshop/rule-catalog 选用引擎支持的 TTrigger* 类型。"));
                     }
-                    InspectRuleNodeRecursive(ab.Trigger, modId, ownerId, loc + ".trigger", jsonOpts, issues);
+                    InspectRuleNodeRecursive(ab.Trigger, modId, ownerId, loc + ".trigger", jsonOpts, issues, inAura: false);
                 }
                 if (ab.Action != null)
-                    InspectRuleNodeRecursive(ab.Action, modId, ownerId, loc + ".action", jsonOpts, issues);
+                {
+                    InspectRuleNodeRecursive(ab.Action, modId, ownerId, loc + ".action", jsonOpts, issues, inAura: false);
+                    CheckCombatModifyAttributeDuration(ab.Trigger, ab.Action, modId, ownerId, loc, ownerTooltipContext, issues);
+                }
                 CheckPrerequisites(modId, ownerId, loc + ".prerequisites", ab.Prerequisites, jsonOpts, issues);
             }
         }
@@ -941,7 +1030,7 @@ public static partial class ModValidator
                 if (au == null) continue;
                 string loc = $"{ownerId}.auras.{auKey}";
                 if (au.Action != null)
-                    InspectRuleNodeRecursive(au.Action, modId, ownerId, loc + ".action", jsonOpts, issues);
+                    InspectRuleNodeRecursive(au.Action, modId, ownerId, loc + ".action", jsonOpts, issues, inAura: true);
                 CheckPrerequisites(modId, ownerId, loc + ".prerequisites", au.Prerequisites, jsonOpts, issues);
             }
         }
@@ -949,14 +1038,18 @@ public static partial class ModValidator
         void CheckCardRules(CustomCardDefinition card)
         {
             string cid = string.IsNullOrWhiteSpace(card.CustomId) ? "<unnamed>" : card.CustomId.Trim();
-            CheckAbilityMap(cid, card.Abilities);
+            string cardTextCtx = CombineTooltipText(card.DescZh, card.ActiveTooltipsZh, card.PassiveTooltipsZh);
+            CheckAbilityMap(cid, card.Abilities, cardTextCtx);
             CheckAuraMap(cid, card.Auras);
             if (card.Enchantments != null)
             {
                 foreach (var (ek, ed) in card.Enchantments)
                 {
                     if (ed == null) continue;
-                    CheckAbilityMap($"{cid}.enchant.{ek}", ed.Abilities);
+                    string? enchCtx = (card.EnchantTooltipsZh != null && card.EnchantTooltipsZh.TryGetValue(ek, out var eTips))
+                        ? CombineTooltipText(null, eTips, null)
+                        : null;
+                    CheckAbilityMap($"{cid}.enchant.{ek}", ed.Abilities, enchCtx);
                     CheckAuraMap($"{cid}.enchant.{ek}", ed.Auras);
                 }
             }
@@ -973,10 +1066,10 @@ public static partial class ModValidator
                         if (qe.Update?.Value != null) InspectRuleNodeRecursive(qe.Update.Value, modId, cid, $"{cid}.quests[{qi}].update", jsonOpts, issues);
                         if (qe.Reward != null)
                         {
-                            CheckAbilityMap($"{cid}.quests[{qi}].reward", qe.Reward.Abilities);
+                            CheckAbilityMap($"{cid}.quests[{qi}].reward", qe.Reward.Abilities, cardTextCtx);
                             CheckAuraMap($"{cid}.quests[{qi}].reward", qe.Reward.Auras);
                         }
-                        CheckAbilityMap($"{cid}.quests[{qi}].completion", qe.CompletionEffects);
+                        CheckAbilityMap($"{cid}.quests[{qi}].completion", qe.CompletionEffects, cardTextCtx);
                     }
                 }
             }
@@ -999,14 +1092,18 @@ public static partial class ModValidator
         foreach (var p in pkg.Patches)
         {
             string pid = string.IsNullOrWhiteSpace(p.TargetTemplateId) ? "<patch>" : p.TargetTemplateId.Trim();
-            CheckAbilityMap(pid, p.AbilitiesOverride);
+            string patchTextCtx = CombineTooltipText(p.DescZh, p.ActiveTooltipsZh, p.PassiveTooltipsZh);
+            CheckAbilityMap(pid, p.AbilitiesOverride, patchTextCtx);
             CheckAuraMap(pid, p.AurasOverride);
             if (p.EnchantmentOverrides != null)
             {
                 foreach (var (ek, ed) in p.EnchantmentOverrides)
                 {
                     if (ed == null) continue;
-                    CheckAbilityMap($"{pid}.enchant.{ek}", ed.Abilities);
+                    string? enchCtx = (p.EnchantTooltipsZh != null && p.EnchantTooltipsZh.TryGetValue(ek, out var eTips))
+                        ? CombineTooltipText(null, eTips, null)
+                        : null;
+                    CheckAbilityMap($"{pid}.enchant.{ek}", ed.Abilities, enchCtx);
                     CheckAuraMap($"{pid}.enchant.{ek}", ed.Auras);
                 }
             }
@@ -1106,7 +1203,8 @@ public static partial class ModValidator
         string path,
         JsonSerializerOptions jsonOpts,
         List<ModValidationIssue> issues,
-        int depth = 0)
+        int depth = 0,
+        bool inAura = false)
     {
         if (depth > 32) return;
 
@@ -1125,6 +1223,79 @@ public static partial class ModValidator
                 $"规则节点 '{path}' 使用了未登记的非法类型 \"$type\": \"{typeName}\"。",
                 targetId, GateId: 4,
                 FixHintZh: "请对照 /api/workshop/rule-catalog 或 docs/skills/bazaar-mod-creator/references/rule_types_cheatsheet.md 替换为官方已登记的 $type。"));
+        }
+
+        // ── Wave 4B 语义闸门 1：条件属性字段名校验（拦截 TPlayerConditionalAttribute/TCardConditionalAttribute 误写 attributeType 或缺失 attribute） ──
+        if (ConditionalUsingAttributeField.Contains(typeName))
+        {
+            bool hasAttr = !string.IsNullOrWhiteSpace(node.Attribute);
+            bool hasAttrType = !string.IsNullOrWhiteSpace(node.AttributeType);
+            if (!hasAttr)
+            {
+                string hint = hasAttrType
+                    ? $"{typeName} 的官方标准属性字段为 \"attribute\" 而非 \"attributeType\"（误写会导致引擎与客户端静默回退默认属性）。请将 \"attributeType\": \"{node.AttributeType}\" 修正为 \"attribute\": \"{node.AttributeType}\"。"
+                    : $"{typeName} 缺失必需的 \"attribute\" 字段，请补齐目标属性名（例如 \"attribute\": \"Gold\" 或 \"DamageAmount\"）。";
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Error,
+                    modId,
+                    "CONDITIONAL_ATTRIBUTE_FIELD_INVALID",
+                    $"规则节点 '{path}' ({typeName}) {(hasAttrType ? $"误用了 \"attributeType\": \"{node.AttributeType}\" 且缺失标准字段 \"attribute\"" : "缺失必需字段 \"attribute\"")}。",
+                    targetId,
+                    GateId: 4,
+                    FixHintZh: hint));
+            }
+            else if (hasAttrType)
+            {
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Error,
+                    modId,
+                    "CONDITIONAL_ATTRIBUTE_FIELD_INVALID",
+                    $"规则节点 '{path}' ({typeName}) 同时填写了 \"attribute\" 与非标准字段 \"attributeType\"，存在字段歧义。",
+                    targetId,
+                    GateId: 4,
+                    FixHintZh: $"请仅保留官方标准字段 \"attribute\": \"{node.Attribute}\"，并移除冗余的 \"attributeType\"。"));
+            }
+        }
+        else if (ConditionalUsingAttributeTypeField.Contains(typeName))
+        {
+            bool hasAttrType = !string.IsNullOrWhiteSpace(node.AttributeType);
+            bool hasAttr = !string.IsNullOrWhiteSpace(node.Attribute);
+            if (!hasAttrType || hasAttr)
+            {
+                string suggested = !string.IsNullOrWhiteSpace(node.AttributeType) ? node.AttributeType! : (node.Attribute ?? "HealthMax");
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Error,
+                    modId,
+                    "CONDITIONAL_ATTRIBUTE_FIELD_INVALID",
+                    $"规则节点 '{path}' ({typeName}) 极值条件属性字段异常（应仅使用 \"attributeType\"）。",
+                    targetId,
+                    GateId: 4,
+                    FixHintZh: $"请将属性字段统一写为 \"attributeType\": \"{suggested}\"，并移除非标准的 \"attribute\" 字段。"));
+            }
+        }
+
+        // ── Wave 4B 语义闸门 2：TReferenceValue* 缺失 target 拦截（与引擎及官方 BazaarGameShared 100% 对齐，放行 Aura 合法逐目标与 TReferenceValueAttributeChange） ──
+        if (PlayerReferenceTypesRequiringTarget.Contains(typeName) && node.Target == null)
+        {
+            issues.Add(new ModValidationIssue(
+                ModValidationSeverity.Error,
+                modId,
+                "REFERENCE_VALUE_MISSING_TARGET",
+                $"规则节点 '{path}' ({typeName}) 缺失必需的 \"target\" 目标节点，运行时将静默返回 0（DefaultValue）。",
+                targetId,
+                GateId: 4,
+                FixHintZh: "请显式补充 \"target\": { \"$type\": \"TTargetPlayerRelative\", \"targetMode\": \"Self\" }（或 \"Opponent\" / TTargetPlayerAbsolute）。"));
+        }
+        else if (CardReferenceTypesRequiringTargetOutsideAura.Contains(typeName) && node.Target == null && !inAura)
+        {
+            issues.Add(new ModValidationIssue(
+                ModValidationSeverity.Error,
+                modId,
+                "REFERENCE_VALUE_MISSING_TARGET",
+                $"规则节点 '{path}' ({typeName}) 在非光环上下文中缺失必需的 \"target\" 目标节点，运行时将无法定位目标卡牌而静默返回 0。",
+                targetId,
+                GateId: 4,
+                FixHintZh: "若需读取本卡自身属性，请补齐 \"target\": { \"$type\": \"TTargetCardSelf\" }；若统计场上卡牌，请补齐 TTargetCardSection 等目标选择器。"));
         }
 
         // 检查 ExtensionData 中的拼写错误/未知属性
@@ -1149,49 +1320,151 @@ public static partial class ModValidator
         }
 
         // 递归所有强类型及延迟 JsonElement 子节点
-        void Visit(RuleNode? child, string suffix)
+        void Visit(RuleNode? child, string suffix, bool childInAura)
         {
-            if (child != null) InspectRuleNodeRecursive(child, modId, targetId, $"{path}.{suffix}", jsonOpts, issues, depth + 1);
+            if (child != null) InspectRuleNodeRecursive(child, modId, targetId, $"{path}.{suffix}", jsonOpts, issues, depth + 1, childInAura);
         }
 
-        void VisitList(List<RuleNode>? children, string suffix)
+        void VisitList(List<RuleNode>? children, string suffix, bool childInAura)
         {
             if (children == null) return;
             for (int i = 0; i < children.Count; i++)
-                Visit(children[i], $"{suffix}[{i}]");
+                Visit(children[i], $"{suffix}[{i}]", childInAura);
         }
 
-        Visit(node.ReferenceValue, "referenceValue");
-        Visit(node.Target, "target");
-        Visit(node.TargetPlayer, "targetPlayer");
-        Visit(node.TargetCount, "targetCount");
-        Visit(node.Source, "source");
-        Visit(node.Subject, "subject");
-        Visit(node.SubjectOther, "subjectOther");
-        Visit(node.Duration, "duration");
-        Visit(node.Cost, "cost");
-        Visit(node.Limit, "limit");
-        Visit(node.SpawnContext, "spawnContext");
-        Visit(node.SelectionContextRules, "selectionContextRules");
-        Visit(node.Modifier?.Value, "modifier.value");
+        Visit(node.ReferenceValue, "referenceValue", inAura);
+        Visit(node.Target, "target", inAura);
+        Visit(node.TargetPlayer, "targetPlayer", inAura);
+        Visit(node.TargetCount, "targetCount", inAura);
+        Visit(node.Source, "source", inAura);
+        Visit(node.Subject, "subject", inAura);
+        Visit(node.SubjectOther, "subjectOther", inAura);
+        Visit(node.Duration, "duration", inAura);
+        Visit(node.Cost, "cost", inAura);
+        Visit(node.Limit, "limit", inAura);
+        Visit(node.SpawnContext, "spawnContext", inAura);
+        Visit(node.SelectionContextRules, "selectionContextRules", inAura);
+        Visit(node.Modifier?.Value, "modifier.value", inAura);
 
-        VisitList(node.Actions, "actions");
-        VisitList(node.Triggers, "triggers");
-        VisitList(node.Groups, "groups");
-        VisitList(node.Filters, "filters");
-        VisitList(node.Behaviors, "behaviors");
+        VisitList(node.Actions, "actions", inAura);
+        VisitList(node.Triggers, "triggers", false);
+        VisitList(node.Groups, "groups", inAura);
+        VisitList(node.Filters, "filters", inAura);
+        VisitList(node.Behaviors, "behaviors", inAura);
         CheckPrerequisites(modId, targetId, $"{path}.prerequisites", node.Prerequisites, jsonOpts, issues);
 
         if (node.Attributes != null)
         {
             foreach (var (ak, av) in node.Attributes)
-                Visit(av, $"attributes.{ak}");
+                Visit(av, $"attributes.{ak}", inAura);
         }
 
-        try { Visit(node.GetValueNode(jsonOpts), "value"); } catch { }
-        try { Visit(node.GetComparisonValueNode(jsonOpts), "comparisonValue"); } catch { }
-        try { VisitList(node.GetConditionList(jsonOpts), "conditions"); } catch { }
-        try { VisitList(node.GetConstraintList(jsonOpts), "constraints"); } catch { }
+        try { Visit(node.GetValueNode(jsonOpts), "value", inAura); } catch { }
+        try { Visit(node.GetComparisonValueNode(jsonOpts), "comparisonValue", inAura); } catch { }
+        try { VisitList(node.GetConditionList(jsonOpts), "conditions", inAura); } catch { }
+        try { VisitList(node.GetConstraintList(jsonOpts), "constraints", inAura); } catch { }
+    }
+
+    // ── Wave 4B 语义闸门 3：战中触发修改属性缺失 duration 意外永久化检查 ──
+    private static bool IsCombatTrigger(RuleNode? trigger, int depth = 0)
+    {
+        if (trigger == null || depth > 8) return false;
+        string t = (trigger.Type ?? string.Empty).Trim();
+        if (CombatTriggerTypes.Contains(t)) return true;
+        if (string.Equals(t, "TTriggerOr", StringComparison.Ordinal) && trigger.Triggers != null)
+        {
+            for (int i = 0; i < trigger.Triggers.Count; i++)
+            {
+                if (IsCombatTrigger(trigger.Triggers[i], depth + 1))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool ContainsAnyKeyword(string? text, string[] keywords)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        for (int i = 0; i < keywords.Length; i++)
+        {
+            if (text.Contains(keywords[i], StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static void CheckCombatModifyAttributeDuration(
+        RuleNode? trigger,
+        RuleNode action,
+        string modId,
+        string ownerId,
+        string abilityPath,
+        string? ownerTooltipContext,
+        List<ModValidationIssue> issues)
+    {
+        if (!IsCombatTrigger(trigger)) return;
+
+        bool hasTempIntent = ContainsAnyKeyword(ownerTooltipContext, CombatTempIntentKeywords);
+        bool hasPermIntent = ContainsAnyKeyword(ownerTooltipContext, ExplicitPermanentIntentKeywords);
+
+        foreach (var act in FlattenActions(action))
+        {
+            bool isCardMod = string.Equals(act.Type, "TActionCardModifyAttribute", StringComparison.Ordinal);
+            bool isPlayerMod = string.Equals(act.Type, "TActionPlayerModifyAttribute", StringComparison.Ordinal);
+            if (!isCardMod && !isPlayerMod) continue;
+
+            string attr = (act.AttributeType ?? act.Attribute ?? string.Empty).Trim();
+
+            if (act.Duration != null)
+            {
+                if (string.Equals(act.Duration.Type, "TCombatDuration", StringComparison.Ordinal)
+                    && act.Duration.DurationInMs is null or <= 0)
+                {
+                    issues.Add(new ModValidationIssue(
+                        ModValidationSeverity.Warning,
+                        modId,
+                        "COMBAT_MODIFY_ATTR_MISSING_DURATION",
+                        $"战中规则 '{abilityPath}' 的 {act.Type}({attr}) 使用了未指定 durationInMs 的 TCombatDuration（引擎默认 1000ms 后即撤销，并非整场战斗）。",
+                        ownerId,
+                        GateId: 4,
+                        FixHintZh: "若希望本场战斗全程生效并在战后复原，请改为 \"duration\": { \"$type\": \"TDeterminantDuration\", \"durationType\": \"UntilEndOfCombat\" }；若确实需要按毫秒限时生效，请显式填写 durationInMs（如 2000）。"));
+                }
+                continue;
+            }
+
+            // 放行战中天然永久的经济/计数属性与实时状态扣减，绝不误杀
+            if (isPlayerMod && InherentlyPermanentPlayerAttributes.Contains(attr))
+                continue;
+            if (isCardMod && InherentlyPermanentOrTransientStateCardAttributes.Contains(attr))
+                continue;
+
+            // 文案显式声明为永久成长且未夹带矛盾的“本场战斗”字样：识别为合法永久成长，不误杀
+            if (hasPermIntent && !hasTempIntent)
+                continue;
+
+            if (hasTempIntent)
+            {
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Error,
+                    modId,
+                    "COMBAT_MODIFY_ATTR_MISSING_DURATION",
+                    $"战中规则 '{abilityPath}' 的 {act.Type}({attr}) 缺失 duration（文案描述为本场战斗临时效果，未设 duration 将落入 Permanent 层导致跨场永久滚雪球）。",
+                    ownerId,
+                    GateId: 4,
+                    FixHintZh: "请在动作对象上显式添加 \"duration\": { \"$type\": \"TDeterminantDuration\", \"durationType\": \"UntilEndOfCombat\" }。"));
+            }
+            else
+            {
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Warning,
+                    modId,
+                    "COMBAT_MODIFY_ATTR_MISSING_DURATION",
+                    $"战中规则 '{abilityPath}'（触发器 {trigger?.Type}）执行 {act.Type}({attr}) 时未显式声明 duration，将落入 Permanent 层在战后永久保留并跨场叠加。",
+                    ownerId,
+                    GateId: 4,
+                    FixHintZh: "若意图仅本场战斗生效，请补齐 \"duration\": { \"$type\": \"TDeterminantDuration\", \"durationType\": \"UntilEndOfCombat\" }；若确实设计为跨场永久成长，请在卡牌文案中明确注明「永久」以消除告警。"));
+            }
+        }
     }
 
     private static void RunGate5NumericAndLoopSafety(ModPackage pkg, GameDataRepository baseRepo, List<ModValidationIssue> issues)

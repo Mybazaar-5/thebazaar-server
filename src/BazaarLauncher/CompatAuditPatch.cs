@@ -281,6 +281,11 @@ internal static partial class CompatAuditPatch
 
     internal static void ApplyGameSimGroup(SafeHarmonyPatcher patcher)
     {
+        if (BazaarLauncherPlugin.IsStrictBareClientAuditModeActive())
+        {
+            BazaarLauncherPlugin.Log?.LogInfo("[StrictBareClientAuditMode] 已彻底禁用 CompatAuditPatch.GameSim 自愈与翻牌/解锁看门狗");
+            return;
+        }
         if (_gameSimApplied || patcher == null) return;
         _gameSimApplied = true;
         _mainThreadId = Thread.CurrentThread.ManagedThreadId;
@@ -305,6 +310,11 @@ internal static partial class CompatAuditPatch
 
     internal static void ApplyPedestalAndHintGroup(SafeHarmonyPatcher patcher)
     {
+        if (BazaarLauncherPlugin.IsStrictBareClientAuditModeActive())
+        {
+            BazaarLauncherPlugin.Log?.LogInfo("[StrictBareClientAuditMode] 已彻底禁用 CompatAuditPatch.PedestalAndHints 自愈干预");
+            return;
+        }
         if (_pedestalHintsApplied || patcher == null) return;
         _pedestalHintsApplied = true;
         _mainThreadId = Thread.CurrentThread.ManagedThreadId;
@@ -320,6 +330,11 @@ internal static partial class CompatAuditPatch
 
     internal static void ApplyEncounterAndChallengeGroup(SafeHarmonyPatcher patcher)
     {
+        if (BazaarLauncherPlugin.IsStrictBareClientAuditModeActive())
+        {
+            BazaarLauncherPlugin.Log?.LogInfo("[StrictBareClientAuditMode] 已彻底禁用 CompatAuditPatch.EncounterAndChallenges 自愈与多页刷新干预");
+            return;
+        }
         if (_encounterApplied || patcher == null) return;
         _encounterApplied = true;
         _mainThreadId = Thread.CurrentThread.ManagedThreadId;

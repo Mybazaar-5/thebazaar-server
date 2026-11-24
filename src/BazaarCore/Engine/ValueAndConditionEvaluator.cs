@@ -87,13 +87,13 @@ public static class ValueAndConditionEvaluator
             ? (node.DefaultValue ?? 0)
             : node.Type switch
             {
-                "TReferenceValueCardAttribute" => targets[0].HasAttribute(node.AttributeType ?? "Ammo")
-                    ? GetCardAttr(targets[0], node.AttributeType ?? "Ammo", ctx, unscaled: false)
+                "TReferenceValueCardAttribute" => targets[0].HasAttribute(node.ResolveCardAttributeName("Ammo"))
+                    ? GetCardAttr(targets[0], node.ResolveCardAttributeName("Ammo"), ctx, unscaled: false)
                     : (node.DefaultValue ?? 0),
-                "TReferenceValueCardAttributeUnscaled" => targets[0].HasAttribute(node.AttributeType ?? "Ammo")
-                    ? GetCardAttr(targets[0], node.AttributeType ?? "Ammo", ctx, unscaled: true)
+                "TReferenceValueCardAttributeUnscaled" => targets[0].HasAttribute(node.ResolveCardAttributeName("Ammo"))
+                    ? GetCardAttr(targets[0], node.ResolveCardAttributeName("Ammo"), ctx, unscaled: true)
                     : (node.DefaultValue ?? 0),
-                "TReferenceValueCardAttributeAggregate" => targets.Sum(c => c.HasAttribute(node.AttributeType ?? "Ammo") ? GetCardAttr(c, node.AttributeType ?? "Ammo", ctx, unscaled: false) : 0),
+                "TReferenceValueCardAttributeAggregate" => targets.Sum(c => c.HasAttribute(node.ResolveCardAttributeName("Ammo")) ? GetCardAttr(c, node.ResolveCardAttributeName("Ammo"), ctx, unscaled: false) : 0),
                 "TReferenceValueCardCount" => targets.Count,
                 "TReferenceValueUniqueCardCount" => targets.Select(c => c.Template.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
                 "TReferenceValueCardTagCount" => CountTags(targets, node.Distinct ?? true),
@@ -185,7 +185,7 @@ public static class ValueAndConditionEvaluator
 
     private static double EvaluateCardAttr(RuleNode node, RuleExecutionContext ctx, bool unscaled, bool aggregate)
     {
-        var attr = node.AttributeType ?? "Ammo";
+        var attr = node.ResolveCardAttributeName("Ammo");
         var cards = ResolveValueTargets(node.Target, ctx);
         if (cards.Count == 0) return node.DefaultValue ?? 0;
 
@@ -208,7 +208,7 @@ public static class ValueAndConditionEvaluator
     private static double EvaluatePlayerAttr(RuleNode node, RuleExecutionContext ctx, bool unscaled)
     {
         if (node.Target == null) return node.DefaultValue ?? 0;
-        var attr = node.AttributeType ?? "Burn";
+        var attr = node.ResolvePlayerAttributeName("Burn");
         var players = TargetResolver.ResolvePlayers(node.Target, ctx);
         if (players.Count == 0) return node.DefaultValue ?? 0;
         double raw = unscaled ? players[0].GetAttributeUnscaled(attr) : players[0].GetAttribute(attr);
@@ -322,7 +322,7 @@ public static class ValueAndConditionEvaluator
             case "TPrerequisiteCardCount":
             {
                 int count = AbilityExecutor.ResolveActionTargets(p.Subject ?? DefaultSelfCardTarget, ctx, int.MaxValue).Count;
-                return Compare(count, p.Comparison, p.Amount ?? 0);
+                return Compare(count, p.ResolveComparisonOperator(preferComparisonField: true), p.Amount ?? 0);
             }
             case "TPrerequisitePlayer":
             {
@@ -336,9 +336,10 @@ public static class ValueAndConditionEvaluator
             }
             case "TPrerequisiteCardAttributeComparator":
             {
+                var op = p.ResolveComparisonOperator("Equal", preferComparisonField: true);
                 if (p.SubjectOther == null && string.IsNullOrEmpty(p.AttributeOther))
                 {
-                    return (p.Comparison ?? "Equal") is "Equal" or "GreaterThanOrEqual" or "LessThanOrEqual";
+                    return op is "Equal" or "GreaterThanOrEqual" or "LessThanOrEqual";
                 }
 
                 var leftCards = AbilityExecutor.ResolveActionTargets(p.Subject ?? DefaultSelfCardTarget, ctx, int.MaxValue);
@@ -346,11 +347,11 @@ public static class ValueAndConditionEvaluator
                     ? leftCards
                     : AbilityExecutor.ResolveActionTargets(p.SubjectOther, ctx, int.MaxValue);
 
-                var leftAttr = p.Attribute ?? "Ammo";
-                var rightAttr = p.AttributeOther ?? leftAttr;
+                var leftAttr = p.ResolveCardAttributeName("Ammo", preferAttributeField: true);
+                var rightAttr = string.IsNullOrWhiteSpace(p.AttributeOther) ? leftAttr : p.AttributeOther;
                 var leftVals = leftCards.Select(c => GetCardAttr(c, leftAttr, ctx)).ToList();
                 var rightVals = rightCards.Select(c => GetCardAttr(c, rightAttr, ctx)).ToList();
-                return leftVals.All(a => rightVals.All(o => Compare(a, p.Comparison, o)));
+                return leftVals.All(a => rightVals.All(o => Compare(a, op, o)));
             }
             default:
                 return true;
@@ -472,7 +473,7 @@ public static class ValueAndConditionEvaluator
             case "TCardConditionalAttributeHighest":
             {
                 // 严格对齐官方反编译 TCardConditionalAttributeHighest.cs:20-29（int num = 0; val > num；全员 <= 0 返回空集）
-                string attr = cond.AttributeType ?? "Ammo";
+                string attr = cond.ResolveCardAttributeName("Ammo");
                 int bestIdx = -1;
                 double bestVal = 0;
                 for (int i = 0; i < pairs.Count; i++)
@@ -489,7 +490,7 @@ public static class ValueAndConditionEvaluator
 
             case "TCardConditionalAttributeLowest":
             {
-                string attr = cond.AttributeType ?? "Ammo";
+                string attr = cond.ResolveCardAttributeName("Ammo");
                 int bestIdx = -1;
                 double bestVal = 0;
                 for (int i = 0; i < pairs.Count; i++)
@@ -587,8 +588,8 @@ public static class ValueAndConditionEvaluator
             "TCardConditionalTriggerSource" => ApplyNegation(ReferenceEquals(card, ctx.TriggerSourceCard), cond.IsNot),
             "TCardConditionalTriggerEffectOwner" => EvaluateTriggerEffectOwner(cond, ctx),
             "TCardConditionalState" => MatchListOperator(cond.States, cond.Operator, st => MatchCardState(card, st)),
-            "TCardConditionalAttributeHighest" => IsExtremeAttr(card, owner, cond.AttributeType ?? "Ammo", highest: true, ctx),
-            "TCardConditionalAttributeLowest" => IsExtremeAttr(card, owner, cond.AttributeType ?? "Ammo", highest: false, ctx),
+            "TCardConditionalAttributeHighest" => IsExtremeAttr(card, owner, cond.ResolveCardAttributeName("Ammo"), highest: true, ctx),
+            "TCardConditionalAttributeLowest" => IsExtremeAttr(card, owner, cond.ResolveCardAttributeName("Ammo"), highest: false, ctx),
             "TCardConditionalSizeLargest" => IsExtremeSize(card, owner, largest: true, ctx),
             "TCardConditionalSizeSmallest" => IsExtremeSize(card, owner, largest: false, ctx),
             _ => true
@@ -597,8 +598,8 @@ public static class ValueAndConditionEvaluator
 
     private static bool EvaluateCardAttributeCondition(RuleNode cond, CardInstance card, RuleExecutionContext ctx)
     {
-        var attr = cond.Attribute ?? "Ammo";
-        var op = cond.ComparisonOperator ?? cond.Comparison;
+        var attr = cond.ResolveCardAttributeName("Ammo", preferAttributeField: true);
+        var op = cond.ResolveComparisonOperator();
         if (!card.HasAttribute(attr))
         {
             // 被动无冷却卡（未声明 CooldownMax 或 CooldownMax<=0）在显式判等 CooldownMax == 0 时按 0 匹配，
@@ -739,7 +740,7 @@ public static class ValueAndConditionEvaluator
         targetingCtx.TriggerSourceCard = null;
         targetingCtx.TriggerTargetCard = null;
         var compareTargets = TargetResolver.ResolveCards(cond.Target, targetingCtx, int.MaxValue);
-        string op = cond.Comparison ?? cond.ComparisonOperator ?? "LessThan";
+        string op = cond.ResolveComparisonOperator("LessThan", preferComparisonField: true)!;
         int mySize = (int)card.EffectiveSize;
         foreach (var t in compareTargets)
         {
@@ -837,7 +838,7 @@ public static class ValueAndConditionEvaluator
             case "TPlayerConditionalAttributeHighest":
             {
                 // 严格对齐官方反编译 TPlayerConditionalAttributeHighest.cs:51-60（int num = 0; val > num）
-                string attr = cond.AttributeType ?? "HealthMax";
+                string attr = cond.ResolvePlayerAttributeName("HealthMax");
                 PlayerState? best = null;
                 double bestVal = 0;
                 for (int i = 0; i < players.Count; i++)
@@ -855,7 +856,7 @@ public static class ValueAndConditionEvaluator
 
             case "TPlayerConditionalAttributeLowest":
             {
-                string attr = cond.AttributeType ?? "HealthMax";
+                string attr = cond.ResolvePlayerAttributeName("HealthMax");
                 PlayerState? best = null;
                 double bestVal = 0;
                 for (int i = 0; i < players.Count; i++)
@@ -892,11 +893,11 @@ public static class ValueAndConditionEvaluator
             "TPlayerConditionalAnd" => cond.GetConditionList(GameDatabaseLoader.JsonOptions).All(c => EvaluatePlayerCondition(c, player, ctx, poolOverride)),
             "TPlayerConditionalOr" => cond.GetConditionList(GameDatabaseLoader.JsonOptions).Any(c => EvaluatePlayerCondition(c, player, ctx, poolOverride)),
             "TPlayerConditionalAttribute" => Compare(
-                Math.Round(player.GetAttribute(cond.Attribute ?? "Burn"), MidpointRounding.AwayFromZero),
-                cond.ComparisonOperator ?? cond.Comparison,
+                Math.Round(player.GetAttribute(cond.ResolvePlayerAttributeName("Burn", preferAttributeField: true)), MidpointRounding.AwayFromZero),
+                cond.ResolveComparisonOperator(),
                 EvaluateComparisonValue(cond, ctx, 0)),
-            "TPlayerConditionalAttributeHighest" => IsExtremePlayerAttr(player, cond.AttributeType ?? "HealthMax", highest: true, ctx, poolOverride),
-            "TPlayerConditionalAttributeLowest" => IsExtremePlayerAttr(player, cond.AttributeType ?? "HealthMax", highest: false, ctx, poolOverride),
+            "TPlayerConditionalAttributeHighest" => IsExtremePlayerAttr(player, cond.ResolvePlayerAttributeName("HealthMax"), highest: true, ctx, poolOverride),
+            "TPlayerConditionalAttributeLowest" => IsExtremePlayerAttr(player, cond.ResolvePlayerAttributeName("HealthMax"), highest: false, ctx, poolOverride),
             _ => EvaluateRunOrPlayerCondition(cond, ctx)
         };
     }
@@ -954,8 +955,8 @@ public static class ValueAndConditionEvaluator
         {
             "TRunConditionalAnd" => cond.GetConditionList(GameDatabaseLoader.JsonOptions).All(c => EvaluateRunOrPlayerCondition(c, ctx)),
             "TRunConditionalOr" => cond.GetConditionList(GameDatabaseLoader.JsonOptions).Any(c => EvaluateRunOrPlayerCondition(c, ctx)),
-            "TRunConditionalCurrentDay" => Compare(ctx.CurrentDay, cond.ComparisonOperator, cond.CurrentDay ?? 0),
-            "TRunConditionalCurrentHour" => Compare(ctx.CurrentHour, cond.ComparisonOperator, cond.CurrentHour ?? 0),
+            "TRunConditionalCurrentDay" => Compare(ctx.CurrentDay, cond.ResolveComparisonOperator(), cond.CurrentDay ?? 0),
+            "TRunConditionalCurrentHour" => Compare(ctx.CurrentHour, cond.ResolveComparisonOperator(), cond.CurrentHour ?? 0),
             "TRunConditionalPlayerHero" => MatchListOperator(
                 cond.Heroes,
                 cond.Operator,

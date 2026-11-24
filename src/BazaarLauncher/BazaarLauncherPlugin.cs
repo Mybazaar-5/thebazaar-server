@@ -46,6 +46,14 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
     internal static ConfigEntry<bool> RequireGameDriverToken;
     internal static ConfigEntry<string> GameDriverToken;
     internal static ConfigEntry<bool> EnableCombatAudit;
+    internal static ConfigEntry<bool> StrictBareClientAuditMode { get; private set; }
+
+    internal static bool IsStrictBareClientAuditModeActive()
+    {
+        bool cfg = StrictBareClientAuditMode != null && StrictBareClientAuditMode.Value;
+        string env = Environment.GetEnvironmentVariable(BareClientAuditPolicy.EnvVarName);
+        return BareClientAuditPolicy.IsStrictAuditEnabled(cfg, env);
+    }
 
     private void Awake()
     {
@@ -84,14 +92,20 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
         Host.RegisterAndLoad(visualModule);
         Host.RegisterAndLoad(nativeUiModule);
         Host.RegisterAndLoad(new CollectionUnlockModule(), enabledOverride: UnlockEverything.Value);
+        bool strictBareAudit = IsStrictBareClientAuditModeActive();
+        bool? compatSelfHealingOverride = BareClientAuditPolicy.ShouldInstallCompatSelfHealingPatches(strictBareAudit)
+            ? (bool?)null
+            : false;
+
         Host.RegisterAndLoad(new CombatSyncModule());
-        Host.RegisterAndLoad(new CompatGameSimModule());
-        Host.RegisterAndLoad(new CompatHintEnchantModule());
-        Host.RegisterAndLoad(new CompatEncounterAssetModule());
+        Host.RegisterAndLoad(new CompatGameSimModule(), enabledOverride: compatSelfHealingOverride);
+        Host.RegisterAndLoad(new CompatHintEnchantModule(), enabledOverride: compatSelfHealingOverride);
+        Host.RegisterAndLoad(new CompatEncounterAssetModule(), enabledOverride: compatSelfHealingOverride);
         Host.RegisterAndLoad(new WorkshopUiModule());
         Host.RegisterAndLoad(new DiagInspectorModule());
         Host.RegisterAndLoad(new DiagGameDriverModule(), enabledOverride: GameDriver.ShouldAutoEnable());
         Host.RegisterAndLoad(new DiagTrafficDumpModule(), enabledOverride: DumpTraffic.Value);
+        Host.RegisterAndLoad(new DiagBareClientAuditModule(), enabledOverride: BareClientAuditPolicy.ShouldInstallBareAuditObserver(strictBareAudit));
 
         // 3. 扫描并热加载 BepInEx/plugins/BazaarMods/*.dll 与 BepInEx/mods/ 下的第三方扩展 Mod
         int extCount = Host.DiscoverAndLoadExternalMods();
@@ -111,6 +125,7 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
     private void OnDestroy()
     {
         try { Host?.ShutdownAll(); } catch { }
+        try { BareClientAuditRuntime.Shutdown(); } catch { }
         try { CardBadgeArtLibrary.ReleaseAllOnMain(); } catch { }
         try { CompatAuditPatch.ReleasePrivateCjkFontOnMain(); } catch { }
         try { HttpClientHub.Shutdown(); } catch { }
@@ -162,6 +177,8 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
             "可选固定驱动访问 Token；非空时所有本地驱动请求必须携带 X-Bazaar-Token 或 Authorization: Bearer。");
         EnableCombatAudit = Config.Bind("Diagnostics", "EnableCombatAudit", false,
             "是否记录每场战斗全帧触发明细审计（默认关闭以消除生产进战 GC 开销）。");
+        StrictBareClientAuditMode = Config.Bind("Diagnostics", "StrictBareClientAuditMode", false,
+            "严格裸协议黑匣子观测模式：开启后禁用 CompatAuditPatch/H-7 全部翻牌/解锁/自愈看门狗，仅做只读黑匣子采集并异步写入 logs/bare_client_audit.jsonl（默认关闭，正常玩家零开销）。");
 
         DumpTraffic = Config.Bind("Debug", "DumpTraffic", false,
             "把 /sessions、/commands 的原始字节落盘（差分测试用）。");

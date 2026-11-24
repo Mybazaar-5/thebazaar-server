@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -11,15 +12,12 @@ using BazaarServer.Game;
 using BazaarServer.Mods;
 using BazaarServer.TempoNet;
 
+// Wave 4A #10：记录服务端进程启动单调时间戳，确保 /healthz uptime 反映真实进程运行时长而非宿主机开机时长
+long serverStartTimestamp = Stopwatch.GetTimestamp();
+
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Logging.ClearProviders();
-builder.Logging.AddSimpleConsole(o =>
-{
-    o.SingleLine = true;
-    o.TimestampFormat = "HH:mm:ss.fff ";
-});
-builder.Logging.SetMinimumLevel(LogLevel.Information);
+BazaarServerRuntimeDiagnostics.ConfigureLogging(builder.Logging);
 
 // 持久化：账号与对局状态存 SQLite（必须先于 AccountStore 注册）
 string stateDir = Environment.GetEnvironmentVariable("BAZAAR_STATE") ?? Path.Combine(AppContext.BaseDirectory, "state");
@@ -137,7 +135,7 @@ var cardPool = CardPool.FromRepository(
     dataRoot,
     validWhitelistOverride: validVisualWhitelist,
     visualBindings: modHost.VisualBindingsByCustomId);
-var monsterPoolStore = new MonsterPoolStore(MonsterPool.FromRepository(modHost.ActiveRepository));
+var monsterPoolStore = new MonsterPoolStore(MonsterPool.FromRepository(modHost.ActiveRepository), modHost.ActiveRepository);
 var ghostPool = PvpGhostPool.Load(dataRoot);
 modHost.BindPools(cardPool, monsterPoolStore);
 
@@ -301,7 +299,7 @@ app.UseStaticFiles(new StaticFileOptions
 app.MapGet("/healthz", () => Results.Json(new
 {
     ok = true,
-    uptime = Environment.TickCount64 / 1000,
+    uptime = BazaarServerRuntimeDiagnostics.ComputeProcessUptimeSeconds(serverStartTimestamp),
     loadedCards = cardPool.TotalCards,
     totalTemplates = modHost.ActiveRepository.CardsById.Count,
     enabledMods = modHost.EnabledModCount,
@@ -324,6 +322,32 @@ Console.WriteLine($" listening : http://{bindHost}:{port}");
 Console.WriteLine("======================================================");
 
 app.Run();
+
+/// <summary>Wave 4A #8 / #10：集中管理服务端日志降噪过滤与真实进程运行时长计算（便于单元测试直调验证）。</summary>
+public static class BazaarServerRuntimeDiagnostics
+{
+    public static void ConfigureLogging(ILoggingBuilder logging)
+    {
+        ArgumentNullException.ThrowIfNull(logging);
+        logging.ClearProviders();
+        logging.AddSimpleConsole(o =>
+        {
+            o.SingleLine = true;
+            o.TimestampFormat = "HH:mm:ss.fff ";
+        });
+        logging.SetMinimumLevel(LogLevel.Information);
+        // Wave 4A #8：抑制 ASP.NET Core / Kestrel / Hosting 框架逐请求 Info 日志刷屏，保留清晰业务日志
+        logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
+        logging.AddFilter("Microsoft.Hosting.Lifetime", LogLevel.Warning);
+    }
+
+    public static long ComputeProcessUptimeSeconds(long startTimestamp, long? nowTimestamp = null)
+    {
+        long end = nowTimestamp ?? Stopwatch.GetTimestamp();
+        if (end <= startTimestamp) return 0L;
+        return (long)Stopwatch.GetElapsedTime(startTimestamp, end).TotalSeconds;
+    }
+}
 
 public static class BazaarStaticDataPipeline
 {

@@ -1378,15 +1378,7 @@ public static class OutOfCombatController
     private static Dictionary<string, double> SnapshotSingleCardAttributes(CardInstance card)
     {
         var keys = new HashSet<string>(CoreCardAttributes, StringComparer.OrdinalIgnoreCase);
-        foreach (var k in card.BaseAttributes.Keys) keys.Add(k);
-        foreach (var k in card.PermanentAdd.Keys) keys.Add(k);
-        foreach (var k in card.HourAdd.Keys) keys.Add(k);
-        foreach (var k in card.DayAdd.Keys) keys.Add(k);
-        foreach (var k in card.AuraAdd.Keys) keys.Add(k);
-        foreach (var k in card.PermanentMult.Keys) keys.Add(k);
-        foreach (var k in card.HourMult.Keys) keys.Add(k);
-        foreach (var k in card.DayMult.Keys) keys.Add(k);
-        foreach (var k in card.AuraMult.Keys) keys.Add(k);
+        foreach (var k in card.EnumeratePresentAttributeKeys()) keys.Add(k);
 
         var snap = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
         foreach (var k in keys)
@@ -1431,11 +1423,7 @@ public static class OutOfCombatController
             }
 
             var afterKeys = new HashSet<string>(beforeMap.Keys, StringComparer.OrdinalIgnoreCase);
-            foreach (var k in card.BaseAttributes.Keys) afterKeys.Add(k);
-            foreach (var k in card.PermanentAdd.Keys) afterKeys.Add(k);
-            foreach (var k in card.HourAdd.Keys) afterKeys.Add(k);
-            foreach (var k in card.DayAdd.Keys) afterKeys.Add(k);
-            foreach (var k in card.AuraAdd.Keys) afterKeys.Add(k);
+            foreach (var k in card.EnumeratePresentAttributeKeys()) afterKeys.Add(k);
 
             foreach (var k in afterKeys)
             {

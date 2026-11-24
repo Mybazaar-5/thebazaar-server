@@ -341,7 +341,7 @@ public static class AuraEngine
                 var act = aura.Action;
                 if (act != null
                     && string.Equals(act.Type, "TAuraActionCardModifyAttribute", StringComparison.Ordinal)
-                    && string.Equals(act.AttributeType, "Flying", StringComparison.OrdinalIgnoreCase))
+                    && string.Equals(act.ResolveCardAttributeName(string.Empty), "Flying", StringComparison.OrdinalIgnoreCase))
                     return true;
             }
         }
@@ -753,7 +753,7 @@ public static class AuraEngine
                     ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx)
                     : (!perTargetEval ? (action.GetFixedNumericValue() ?? 0) : 0);
                 if (double.IsNaN(sharedVal) || double.IsInfinity(sharedVal)) sharedVal = 0;
-                var attr = action.AttributeType ?? "Custom_0";
+                var attr = action.ResolveCardAttributeName("Custom_0");
                 var op = action.Operation ?? "Add";
                 var targets = TargetResolver.ResolveCards(action.Target, ctx);
                 for (int i = 0; i < targets.Count; i++)
@@ -783,7 +783,7 @@ public static class AuraEngine
                 var valNode = action.GetValueNode(GameDatabaseLoader.JsonOptions);
                 double val = valNode != null ? ValueAndConditionEvaluator.EvaluateValue(valNode, ctx) : (action.GetFixedNumericValue() ?? 0);
                 if (double.IsNaN(val) || double.IsInfinity(val)) val = 0;
-                var attr = action.AttributeType ?? "HealthMax";
+                var attr = action.ResolvePlayerAttributeName("HealthMax");
                 var op = action.Operation ?? "Add";
                 var targets = TargetResolver.ResolvePlayers(action.Target, ctx);
                 for (int i = 0; i < targets.Count; i++)

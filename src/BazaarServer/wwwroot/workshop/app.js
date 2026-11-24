@@ -278,6 +278,7 @@
 
   const state = {
     meta: null,
+    tokenBoxManualExpanded: false,
     catalog: null,
     mods: [],
     communityMods: [],
@@ -374,6 +375,27 @@
     window.WorkshopV14?.onReady?.();
   }
 
+  function syncTokenBoxVisibility(meta) {
+    const box = $('tokenBox');
+    const toggleBtn = $('btnToggleTokenBox');
+    if (!box) return;
+    const isLocalRw = !!(meta && meta.canWrite && meta.mode !== 'token-rw' && (meta.mode === 'local-rw' || !meta.mode));
+    if (isLocalRw) {
+      const expanded = !!state.tokenBoxManualExpanded;
+      box.classList.toggle('hidden', !expanded);
+      box.classList.toggle('token-box-collapsed', !expanded);
+      if (toggleBtn) {
+        toggleBtn.classList.remove('hidden');
+        toggleBtn.textContent = expanded ? '收起口令' : '🔑 口令';
+        toggleBtn.title = expanded ? '收起公网管理口令输入框' : '当前为本机全功能模式，无需口令；点击可按需展开';
+      }
+    } else {
+      box.classList.remove('hidden');
+      box.classList.remove('token-box-collapsed');
+      if (toggleBtn) toggleBtn.classList.add('hidden');
+    }
+  }
+
   async function loadMeta() {
     const res = await apiFetch('/api/workshop/meta');
     if (!res.ok) return;
@@ -386,6 +408,7 @@
       badge.classList.add('readonly');
       badge.textContent = '🔒 公网只读沙盒';
     }
+    syncTokenBoxVisibility(res.data);
     const vfxCnt = res.data.vfxKeyCount ?? 133;
     $('metaStatsText').textContent = `原版库 ${res.data.baseCardCount} 张（白名单 ${res.data.whitelistedCardCount} 张 · ${vfxCnt} 特效） · 已启用 ${res.data.enabledMods} 个 Mod`;
   }
@@ -1860,6 +1883,12 @@
       b.addEventListener('click', () => switchSubTab(b.dataset.sub));
     });
 
+    $('btnToggleTokenBox')?.addEventListener('click', () => {
+      state.tokenBoxManualExpanded = !state.tokenBoxManualExpanded;
+      syncTokenBoxVisibility(state.meta);
+      if (state.tokenBoxManualExpanded) $('workshopTokenInput')?.focus();
+    });
+
     $('btnApplyToken').addEventListener('click', async () => {
       state.token = $('workshopTokenInput').value.trim();
       try { localStorage.removeItem('bazaar_workshop_token'); } catch { }
@@ -2436,8 +2465,35 @@
           }
         });
       };
+      const fixRuleTree = (node, inAura) => {
+        if (!node || typeof node !== 'object') return;
+        if (Array.isArray(node)) { node.forEach((x) => fixRuleTree(x, inAura)); return; }
+        const t = node.$type;
+        if ((t === 'TPlayerConditionalAttribute' || t === 'TCardConditionalAttribute') && !node.attribute && node.attributeType) {
+          node.attribute = node.attributeType;
+          delete node.attributeType;
+          fixed++;
+        }
+        if ((t === 'TReferenceValuePlayerAttribute' || t === 'TReferenceValuePlayerAttributeUnscaled') && !node.target) {
+          node.target = { $type: 'TTargetPlayerRelative', targetMode: 'Self' };
+          fixed++;
+        }
+        if (!inAura && (t === 'TReferenceValueCardAttribute' || t === 'TReferenceValueCardAttributeUnscaled') && !node.target) {
+          node.target = { $type: 'TTargetCardSelf' };
+          fixed++;
+        }
+        Object.keys(node).forEach((k) => {
+          if (k === 'prerequisites') fixRuleTree(node[k], false);
+          else fixRuleTree(node[k], inAura);
+        });
+      };
       (state.workspace.cards || []).forEach((c) => {
         fixAttrMap(c.attributes);
+        Object.values(c.abilities || {}).forEach((ab) => fixRuleTree(ab, false));
+        Object.values(c.auras || {}).forEach((au) => {
+          if (au?.prerequisites) fixRuleTree(au.prerequisites, false);
+          if (au?.action) fixRuleTree(au.action, true);
+        });
         if (c.tiers) {
           const abIds = Object.keys(c.abilities || {});
           const auIds = Object.keys(c.auras || {});

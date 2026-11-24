@@ -432,7 +432,23 @@ public sealed class CardPool
             Localization = activeRepo.Localization,
             ReferencedCardIds = referencedIds,
         };
+        _lastAppliedRepo = activeRepo;
+        _lastAppliedVisualBindings = visualBindings;
+        Interlocked.Increment(ref _overlayApplyCount);
     }
+
+    private volatile GameDataRepository? _lastAppliedRepo;
+    private volatile IReadOnlyDictionary<string, CustomCardVisualBinding>? _lastAppliedVisualBindings;
+    private int _overlayApplyCount;
+
+    /// <summary>Wave 4A #7：累计执行 ApplyRepositoryOverlay 的次数（用于观测与验证冷启零重复建池）。</summary>
+    public int OverlayApplyCount => Volatile.Read(ref _overlayApplyCount);
+
+    /// <summary>Wave 4A #7：判断当前卡池是否已与目标 ActiveRepository 及视觉绑定引用完全对齐。</summary>
+    public bool IsSyncedWith(
+        GameDataRepository repo,
+        IReadOnlyDictionary<string, CustomCardVisualBinding>? visualBindings)
+        => ReferenceEquals(_lastAppliedRepo, repo) && ReferenceEquals(_lastAppliedVisualBindings, visualBindings);
 
     /// <summary>解析自定义卡或内置缺失白名单官方子卡对应的合法原版视觉载体 GUID；若本身即为原版 GUID 则原样返回。</summary>
     public string ResolveSafeWireTemplateId(string? templateId)

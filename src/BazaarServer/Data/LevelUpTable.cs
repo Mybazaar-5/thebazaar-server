@@ -531,7 +531,7 @@ public sealed class LevelUpTable
             {
                 while (result.Count < totalLimit && gs.RemainingPicks > 0)
                 {
-                    var picked = gs.PickOne(result, rng);
+                    var picked = gs.PickOneWithRepo(result, rng, ctx.Repo);
                     if (picked == null) break;
                     result.Add(picked.Value);
                 }
@@ -542,13 +542,13 @@ public sealed class LevelUpTable
             var weighted = groupStates
                 .Where(s => s.Group.RandomWeight > 0 && s.HasRemaining(result))
                 .ToList();
-            FillWeightedFromGroups(weighted, totalLimit, result, rng);
+            FillWeightedFromGroups(weighted, totalLimit, result, rng, ctx.Repo);
             return result;
         }
 
         // Top-level Random 模式（如 Lv9 / Lv18 附魔台与稀有事件抽取）：所有可用组按权重加权抽取
         var randomEligible = groupStates.Where(s => s.HasRemaining(result)).ToList();
-        FillWeightedFromGroups(randomEligible, totalLimit, result, rng);
+        FillWeightedFromGroups(randomEligible, totalLimit, result, rng, ctx.Repo);
         return result;
     }
 
@@ -556,7 +556,8 @@ public sealed class LevelUpTable
         List<GroupDrawState> groups,
         int totalLimit,
         List<(string TemplateId, CardTier Tier)> result,
-        Random rng)
+        Random rng,
+        GameDataRepository? repo)
     {
         while (result.Count < totalLimit)
         {
@@ -581,7 +582,7 @@ public sealed class LevelUpTable
                 }
             }
 
-            var picked = chosen.PickOne(result, rng);
+            var picked = chosen.PickOneWithRepo(result, rng, repo);
             if (picked == null)
             {
                 groups.Remove(chosen);
@@ -833,7 +834,15 @@ public sealed class LevelUpTable
         public bool HasRemaining(IReadOnlyCollection<(string TemplateId, CardTier Tier)> alreadyPicked)
             => RemainingPicks > 0 && AvailableCandidates(alreadyPicked).Count > 0;
 
-        public (string TemplateId, CardTier Tier)? PickOne(IReadOnlyCollection<(string TemplateId, CardTier Tier)> alreadyPicked, Random rng)
+        public (string TemplateId, CardTier Tier)? PickOne(
+            IReadOnlyCollection<(string TemplateId, CardTier Tier)> alreadyPicked,
+            Random rng)
+            => PickOneWithRepo(alreadyPicked, rng, repo: null);
+
+        public (string TemplateId, CardTier Tier)? PickOneWithRepo(
+            IReadOnlyCollection<(string TemplateId, CardTier Tier)> alreadyPicked,
+            Random rng,
+            GameDataRepository? repo)
         {
             if (RemainingPicks <= 0) return null;
             var avail = AvailableCandidates(alreadyPicked);
@@ -855,11 +864,61 @@ public sealed class LevelUpTable
             }
             else
             {
-                chosen = avail[rng.Next(avail.Count)];
+                // Wave 4A #11：同屏 ArtKey 视觉多样性优先抽样——优先从未在已选结果中出现过相同 ArtKey 的候选中等概率抽取
+                // （如全部 ArtKey 均已出现则取已出现次数最少的最小桶），彻底避免升级 4 选 1 连续摇出 4 张同款青铜宝箱图。
+                chosen = PickWithArtKeyDiversity(avail, alreadyPicked, rng, repo);
             }
 
             RemainingPicks--;
             return chosen;
+        }
+
+        private static (string TemplateId, CardTier Tier) PickWithArtKeyDiversity(
+            List<(string TemplateId, CardTier Tier)> avail,
+            IReadOnlyCollection<(string TemplateId, CardTier Tier)> alreadyPicked,
+            Random rng,
+            GameDataRepository? repo)
+        {
+            if (repo == null || avail.Count <= 1 || alreadyPicked.Count == 0)
+                return avail[rng.Next(avail.Count)];
+
+            var artKeyCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var picked in alreadyPicked)
+            {
+                string? artKey = repo.GetCard(picked.TemplateId)?.ArtKey;
+                if (!string.IsNullOrWhiteSpace(artKey))
+                {
+                    artKeyCounts[artKey] = artKeyCounts.GetValueOrDefault(artKey, 0) + 1;
+                }
+            }
+            if (artKeyCounts.Count == 0)
+                return avail[rng.Next(avail.Count)];
+
+            int minCount = int.MaxValue;
+            for (int i = 0; i < avail.Count; i++)
+            {
+                string? artKey = repo.GetCard(avail[i].TemplateId)?.ArtKey;
+                int count = !string.IsNullOrWhiteSpace(artKey)
+                    ? artKeyCounts.GetValueOrDefault(artKey, 0)
+                    : 0;
+                if (count < minCount)
+                    minCount = count;
+            }
+
+            var diversePool = new List<(string TemplateId, CardTier Tier)>(avail.Count);
+            for (int i = 0; i < avail.Count; i++)
+            {
+                string? artKey = repo.GetCard(avail[i].TemplateId)?.ArtKey;
+                int count = !string.IsNullOrWhiteSpace(artKey)
+                    ? artKeyCounts.GetValueOrDefault(artKey, 0)
+                    : 0;
+                if (count == minCount)
+                    diversePool.Add(avail[i]);
+            }
+
+            return diversePool.Count > 0
+                ? diversePool[rng.Next(diversePool.Count)]
+                : avail[rng.Next(avail.Count)];
         }
 
         private List<(string TemplateId, CardTier Tier)> AvailableCandidates(IReadOnlyCollection<(string TemplateId, CardTier Tier)> alreadyPicked)

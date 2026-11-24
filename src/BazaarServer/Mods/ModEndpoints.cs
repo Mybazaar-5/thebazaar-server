@@ -410,9 +410,18 @@ public static class ModEndpoints
         string effectiveModSetHash = run != null
             ? modView.EffectiveModSetHash
             : modHost.ModSetHash;
+        string resolvedModHash = !string.IsNullOrEmpty(effectiveModSetHash) ? effectiveModSetHash : modHost.ModSetHash;
 
+        // Wave 4A #8：为 /api/mods/active-bindings 生成基于 RunId + VisualBindingsRevision + EffectiveModSetHash 的稳定 ETag，
+        // 命中 If-None-Match 时直接 304 Not Modified 早退，避免高频轮询重复构建绑定表与目录。
+        string etag = ComputeActiveBindingsEtag(run?.RunId, revision, resolvedModHash);
         ctx.Response.Headers["X-Visual-Bindings-Rev"] = revision.ToString();
-        ctx.Response.Headers["X-Mod-Set-Hash"] = effectiveModSetHash;
+        ctx.Response.Headers["X-Mod-Set-Hash"] = resolvedModHash;
+        ctx.Response.Headers[HeaderNames.ETag] = etag;
+        ctx.Response.Headers[HeaderNames.CacheControl] = "no-cache";
+
+        if (IsNotModified(ctx.Request, etag))
+            return Results.StatusCode(StatusCodes.Status304NotModified);
 
         var bindings = modHost.CollectActiveVisualBindings(run);
         return Results.Json(new
@@ -420,11 +429,34 @@ public static class ModEndpoints
             ok = true,
             runId = run?.RunId,
             revision,
-            modSetHash = !string.IsNullOrEmpty(effectiveModSetHash) ? effectiveModSetHash : modHost.ModSetHash,
+            modSetHash = resolvedModHash,
             bindingCount = bindings.Count,
             bindings,
             templateCatalog = modHost.GetVisualCatalogForRun(run),
         }, JsonOpts);
+    }
+
+    public static string ComputeActiveBindingsEtag(string? runId, int revision, string? modSetHash)
+    {
+        string safeRun = string.IsNullOrWhiteSpace(runId) ? "global" : runId.Trim();
+        string safeHash = string.IsNullOrWhiteSpace(modSetHash) ? "none" : modSetHash.Trim();
+        string raw = $"{safeRun}:{revision}:{safeHash}";
+        string digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(raw)))[..24].ToLowerInvariant();
+        return $"\"ab-{revision}-{digest}\"";
+    }
+
+    public static bool MatchesIfNoneMatchHeader(string? ifNoneMatchHeader, string etag)
+    {
+        if (string.IsNullOrWhiteSpace(ifNoneMatchHeader)) return false;
+        foreach (string part in ifNoneMatchHeader.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (part == "*") return true;
+            if (string.Equals(part, etag, StringComparison.Ordinal)) return true;
+            string unweak = part.StartsWith("W/", StringComparison.OrdinalIgnoreCase) ? part[2..].Trim() : part;
+            string targetUnweak = etag.StartsWith("W/", StringComparison.OrdinalIgnoreCase) ? etag[2..].Trim() : etag;
+            if (string.Equals(unweak, targetUnweak, StringComparison.Ordinal)) return true;
+        }
+        return false;
     }
 
     private static SessionRegistry.Handle? TryFindHandleByAccountId(
@@ -446,14 +478,8 @@ public static class ModEndpoints
             return false;
         foreach (string? raw in values)
         {
-            if (string.IsNullOrWhiteSpace(raw)) continue;
-            string trimmed = raw.Trim();
-            if (trimmed == "*" ||
-                string.Equals(trimmed, etag, StringComparison.Ordinal) ||
-                string.Equals(trimmed.TrimStart('W', '/'), etag, StringComparison.Ordinal))
-            {
+            if (MatchesIfNoneMatchHeader(raw, etag))
                 return true;
-            }
         }
         return false;
     }
