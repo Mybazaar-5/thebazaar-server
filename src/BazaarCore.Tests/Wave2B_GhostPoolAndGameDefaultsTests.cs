@@ -553,4 +553,127 @@ public sealed class Wave2B_GhostPoolAndGameDefaultsTests
         Assert.False(skillEntry.PendingForceSyncAttributes.ContainsKey(ECardAttributeType.Ammo));
         Assert.False(skillEntry.PendingForceSyncAttributes.ContainsKey(ECardAttributeType.Flying));
     }
+
+    [Fact]
+    public void PvpGhostPool_EqualProbabilityAcrossRealHumanSources_NoLiveHumanOrCustomMonopoly()
+    {
+        var fx = TestInfrastructure.SharedGameDataFixture.Shared;
+        var repo = fx.Repo;
+        var smallItem = repo.CardsById.Values.First(c =>
+            c.Type == "Item" &&
+            c.CardSize == CardSize.Small &&
+            !c.InternalName.Contains("TEST", StringComparison.OrdinalIgnoreCase));
+
+        string tempDir = Path.Combine(Path.GetTempPath(), $"bazaar_eqprob_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        string? prevEnvGhosts = Environment.GetEnvironmentVariable("BAZAAR_GHOSTS");
+        try
+        {
+            string jsonlPath = Path.Combine(tempDir, "ghost_pool_balanced.jsonl");
+            var lines = new List<string>(200);
+            for (int i = 0; i < 200; i++)
+            {
+                var board = new PvpGhostPool.GhostBoard
+                {
+                    BoardId = $"bhub_real_{i:D4}",
+                    Day = 1,
+                    Hero = "Vanessa",
+                    Level = 1,
+                    HealthMax = 300,
+                    Prestige = 20,
+                    Wins = 0,
+                    Losses = 0,
+                    UnlockedSlotsMask = GameDefaults.InitialUnlockedSlotsMask,
+                    PowerBucket = "Normal",
+                    EstimatedWinRate = 0.5,
+                    Source = "real_bazaarhub",
+                    Persona = "RealOfficial",
+                    Items =
+                    [
+                        new PvpGhostPool.GhostItem { Slot = 3, Width = 1, TemplateId = smallItem.Id, InternalName = smallItem.InternalName, Tier = "Bronze" },
+                        new PvpGhostPool.GhostItem { Slot = 4, Width = 1, TemplateId = smallItem.Id, InternalName = smallItem.InternalName, Tier = "Bronze" },
+                    ],
+                };
+                lines.Add(System.Text.Json.JsonSerializer.Serialize(board, new System.Text.Json.JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
+                }));
+            }
+            File.WriteAllLines(jsonlPath, lines);
+
+            Environment.SetEnvironmentVariable("BAZAAR_GHOSTS", null);
+            var ghostPool = PvpGhostPool.Load(tempDir);
+            Assert.Equal(200, ghostPool.Count);
+
+            using var db = new Persistence(Path.Combine(tempDir, "test.db"));
+            RunState MakeDay1Run(string runId)
+            {
+                var r = new RunState
+                {
+                    RunId = runId,
+                    Hero = EHero.Vanessa,
+                    Day = 1,
+                    Victories = 0,
+                    Defeats = 0,
+                    UnlockedSlots = GameDefaults.InitialUnlockedSlotsMask,
+                };
+                r.PlayerAttributes[EPlayerAttributeType.HealthMax] = 300;
+                r.PlayerAttributes[EPlayerAttributeType.Level] = 1;
+                r.PlayerAttributes[EPlayerAttributeType.Prestige] = 20;
+                r.Cards[$"i1_{runId}"] = new RunState.CardEntry
+                {
+                    InstanceId = $"i1_{runId}",
+                    TemplateId = Guid.Parse(smallItem.Id),
+                    Type = ECardType.Item,
+                    Size = ECardSize.Small,
+                    Tier = ETier.Bronze,
+                    Owner = ECombatantId.Player,
+                    Section = EInventorySection.Hand,
+                    Socket = EContainerSocketId.Socket_3,
+                };
+                r.Cards[$"i2_{runId}"] = new RunState.CardEntry
+                {
+                    InstanceId = $"i2_{runId}",
+                    TemplateId = Guid.Parse(smallItem.Id),
+                    Type = ECardType.Item,
+                    Size = ECardSize.Small,
+                    Tier = ETier.Bronze,
+                    Owner = ECombatantId.Player,
+                    Section = EInventorySection.Hand,
+                    Socket = EContainerSocketId.Socket_4,
+                };
+                return r;
+            }
+
+            Assert.NotNull(ghostPool.RecordPlayerGhost(MakeDay1Run("std_human"), db, isCustomRule: false, poolPartition: PvpGhostPool.StandardPartition));
+            for (int k = 1; k <= 3; k++)
+                Assert.NotNull(ghostPool.RecordPlayerGhost(MakeDay1Run($"cst_human_{k}"), db, isCustomRule: true, poolPartition: "custom"));
+
+            // 1. Standard 分区：200 实盘 + 1 本服真人，理论占比 1/201 ≈ 0.5%（旧 0.65 偏置会打出 ~1300 次）
+            var rngStd = new Random(20261124);
+            int stdPlayerHits = 0;
+            for (int i = 0; i < 2000; i++)
+            {
+                var opp = ghostPool.PickOpponent(1, 0, 0, rngStd, repo, includeCustomRuleGhosts: false, poolPartition: PvpGhostPool.StandardPartition);
+                Assert.False(opp.IsCustomRule);
+                if (opp.IsPlayerGhost) stdPlayerHits++;
+            }
+            Assert.InRange(stdPlayerHits, 1, 45);
+
+            // 2. Custom 分区：3 条自录 + 201 标准实盘，理论占比 3/204 ≈ 1.47%（旧 >=3 垄断会打出 2000/2000 = 100%）
+            var rngCst = new Random(20261125);
+            int customHits = 0;
+            for (int i = 0; i < 2000; i++)
+            {
+                var opp = ghostPool.PickOpponent(1, 0, 0, rngCst, repo, includeCustomRuleGhosts: true, poolPartition: "custom");
+                if (opp.IsCustomRule) customHits++;
+            }
+            Assert.InRange(customHits, 5, 90);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("BAZAAR_GHOSTS", prevEnvGhosts);
+            try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
 }

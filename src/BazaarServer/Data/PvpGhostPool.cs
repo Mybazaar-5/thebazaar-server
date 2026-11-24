@@ -713,15 +713,19 @@ public sealed class PvpGhostPool
             return BuildScaledEndlessGhost(baseStrong, effectiveDay, rng, repo);
         }
 
-        // 2. 非标准专属分区优先匹配同分区同日真人镜像，不足时只读借用标准静态池（绝不反向污染标准池）
+        // 2. 非标准专属分区：同分区真人镜像与标准实盘池按实际样本量等概率混合（绝不反向污染标准池，也不让少量自录盘面垄断）
         if (!string.Equals(targetPartition, StandardPartition, StringComparison.OrdinalIgnoreCase)
             && !string.Equals(targetPartition, "none", StringComparison.OrdinalIgnoreCase))
         {
             if (snap.Buckets.TryGetValue(new BucketKey(targetPartition, effectiveDay), out var customBucket)
                 && customBucket.All.Length > 0)
             {
-                // 同分区样本充足（>=3）或 50% 概率优先展示同模式真人对手
-                if (customBucket.All.Length >= 3 || rng.NextDouble() < 0.50)
+                int customCount = customBucket.All.Length;
+                int standardCount = snap.Buckets.TryGetValue(new BucketKey(StandardPartition, effectiveDay), out var stdBucket)
+                    ? stdBucket.All.Length
+                    : 0;
+                int combinedCount = customCount + standardCount;
+                if (standardCount == 0 || rng.Next(combinedCount) < customCount)
                 {
                     var picked = PickFromBucket(customBucket, effectiveDay, playerWins, playerLosses, rng, repo, isStandardPartition: false);
                     if (picked != null) return picked;
@@ -807,13 +811,14 @@ public sealed class PvpGhostPool
         var tier1 = new List<GhostBoard>();
         var tier2 = new List<GhostBoard>();
         var fallback = new List<GhostBoard>();
+        var seenBoardIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        for (int i = 0; i < staticSource.Length; i++)
+        void ConsiderCandidate(GhostBoard b)
         {
-            var b = staticSource[i];
-            if (HasInvalidRepoItem(b, repo)) continue;
+            if (!string.IsNullOrEmpty(b.BoardId) && !seenBoardIds.Add(b.BoardId)) return;
+            if (HasInvalidRepoItem(b, repo)) return;
             // D2-P1-10：仅标准分区施加 Day 1 血量/等级上限拦截，允许高血自定义/词条分区正常匹配 Day 1 同分区对手
-            if (isStandardPartition && day <= 1 && (b.Level > 2 || b.HealthMax > 550)) continue;
+            if (isStandardPartition && day <= 1 && (b.Level > 2 || b.HealthMax > 550)) return;
 
             fallback.Add(b);
             bool bucketHit = ContainsBucket(preferredBuckets, b.PowerBucket);
@@ -824,23 +829,16 @@ public sealed class PvpGhostPool
                 tier2.Add(b);
         }
 
+        // 所有真实盘面（社区/天梯实盘 + 本服 SQLite 真人镜像）进入同一候选池，严格按 1:1 盘面等概率参与筛选与抽样
+        for (int i = 0; i < staticSource.Length; i++)
+            ConsiderCandidate(staticSource[i]);
+        for (int i = 0; i < bucket.PlayerGhosts.Length; i++)
+            ConsiderCandidate(bucket.PlayerGhosts[i]);
+
         var chosenPool = tier1.Count > 0 ? tier1 : (tier2.Count > 0 ? tier2 : fallback);
         if (chosenPool.Count == 0) return null;
 
-        var closePlayers = new List<GhostBoard>();
-        var anyPlayers = new List<GhostBoard>();
-        for (int i = 0; i < bucket.PlayerGhosts.Length; i++)
-        {
-            var p = bucket.PlayerGhosts[i];
-            if (HasInvalidRepoItem(p, repo)) continue;
-            if (isStandardPartition && day <= 1 && (p.Level > 2 || p.HealthMax > 550)) continue;
-            anyPlayers.Add(p);
-            if (Math.Abs(p.Wins - playerWins) <= 2)
-                closePlayers.Add(p);
-        }
-
-        var playerPool = closePlayers.Count > 0 ? closePlayers : anyPlayers;
-        return PickByMedianBandDistribution(chosenPool, playerPool, day, rng);
+        return PickByMedianBandDistribution(chosenPool, Array.Empty<GhostBoard>(), day, rng);
     }
 
     private static bool ContainsBucket(string[] buckets, string target)
@@ -975,38 +973,29 @@ public sealed class PvpGhostPool
         bool IsUltraTail(GhostBoard b) => b.HealthMax > tailMin;
         bool IsMidBand(GhostBoard b) => !IsNormal(b) && !IsUltraTail(b);
 
-        var normalStatic = staticPool.Where(IsNormal).ToList();
-        var normalPlayers = playerGhosts.Where(IsNormal).ToList();
+        var normalAll = staticPool.Concat(playerGhosts).Where(IsNormal).ToList();
         var ultraTail = staticPool.Concat(playerGhosts).Where(IsUltraTail).ToList();
-        var midStatic = staticPool.Where(IsMidBand).ToList();
-        var midPlayers = playerGhosts.Where(IsMidBand).ToList();
+        var midAll = staticPool.Concat(playerGhosts).Where(IsMidBand).ToList();
 
-        const double liveHumanPreference = 0.65;
+        // 所有真人数据（社区/天梯实盘与本服真人镜像）在各血量带内严格等概率均匀抽样，无额外倾斜权重
         double roll = rng.NextDouble();
         if (roll < 0.03 && ultraTail.Count > 0)
             return ultraTail[rng.Next(ultraTail.Count)];
 
-        if (roll < 0.05 && (midStatic.Count > 0 || midPlayers.Count > 0))
-        {
-            if (midPlayers.Count > 0 && (midStatic.Count == 0 || rng.NextDouble() < liveHumanPreference))
-                return midPlayers[rng.Next(midPlayers.Count)];
-            if (midStatic.Count > 0)
-                return midStatic[rng.Next(midStatic.Count)];
-        }
+        if (roll < 0.05 && midAll.Count > 0)
+            return midAll[rng.Next(midAll.Count)];
 
-        if (normalPlayers.Count > 0 && (normalStatic.Count == 0 || rng.NextDouble() < liveHumanPreference))
-            return normalPlayers[rng.Next(normalPlayers.Count)];
-        if (normalStatic.Count > 0)
-            return normalStatic[rng.Next(normalStatic.Count)];
+        if (normalAll.Count > 0)
+            return normalAll[rng.Next(normalAll.Count)];
 
-        if (midPlayers.Count > 0 && (midStatic.Count == 0 || rng.NextDouble() < liveHumanPreference))
-            return midPlayers[rng.Next(midPlayers.Count)];
-        if (midStatic.Count > 0)
-            return midStatic[rng.Next(midStatic.Count)];
+        if (midAll.Count > 0)
+            return midAll[rng.Next(midAll.Count)];
 
-        if (playerGhosts.Count > 0 && (staticPool.Count == 0 || rng.NextDouble() < liveHumanPreference))
-            return playerGhosts[rng.Next(playerGhosts.Count)];
-        return staticPool[rng.Next(staticPool.Count)];
+        int total = staticPool.Count + playerGhosts.Count;
+        int pickIdx = rng.Next(total);
+        return pickIdx < staticPool.Count
+            ? staticPool[pickIdx]
+            : playerGhosts[pickIdx - staticPool.Count];
     }
 
     private bool AddBoardUnlocked(GhostBoard board)
