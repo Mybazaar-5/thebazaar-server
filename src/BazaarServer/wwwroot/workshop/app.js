@@ -1,13 +1,13 @@
 (() => {
   'use strict';
 
-  // 动态前缀兼容：http://127.0.0.1:8080/workshop 与 http://<YOUR_SERVER_IP>:8080/workshop/
+  // 动态前缀兼容：http://127.0.0.1:8080/workshop 与 https://example.com/bz/workshop/
   const API_BASE = window.location.pathname
     .replace(/\/workshop(\/.*)?$/i, '')
     .replace(/\/$/, '');
   const apiUrl = (path) => `${API_BASE}${path}`;
 
-  const TIERS = ['Bronze', 'Silver', 'Gold', 'Diamond'];
+  const TIERS = ['Bronze', 'Silver', 'Gold', 'Diamond', 'Legendary'];
   const DURATION_ATTRS = new Set(['CooldownMax', 'HasteAmount', 'SlowAmount', 'FreezeAmount', 'ChargeAmount']);
   const MATRIX_ATTRS = [
     { key: 'CooldownMax', label: '冷却时间（填秒）', isSec: true },
@@ -22,23 +22,42 @@
     { key: 'HasteAmount', label: '加速（填秒）', isSec: true },
     { key: 'ChargeAmount', label: '充能（填秒）', isSec: true },
     { key: 'PercentCooldownReduction', label: '冷却缩减（%）', isSec: false },
-    { key: 'Custom_0', label: '特殊数值 1', isSec: false },
-    { key: 'Custom_1', label: '特殊数值 2', isSec: false },
-    { key: 'Custom_2', label: '特殊数值 3', isSec: false },
+    { key: 'Custom_0', label: '自定义数值 Custom_0', isSec: false },
+    { key: 'Custom_1', label: '自定义数值 Custom_1', isSec: false },
+    { key: 'Custom_2', label: '自定义数值 Custom_2', isSec: false },
+    { key: 'Custom_3', label: '计数槽 Custom_3（默认徽章）', isSec: false },
+    { key: 'Custom_4', label: '自定义数值 Custom_4', isSec: false },
+    { key: 'Custom_5', label: '自定义数值 Custom_5', isSec: false },
+    { key: 'Custom_6', label: '自定义数值 Custom_6', isSec: false },
+    { key: 'Custom_7', label: '自定义数值 Custom_7', isSec: false },
+    { key: 'Custom_8', label: '自定义数值 Custom_8', isSec: false },
   ];
 
-  // 官方标准买卖价表（严格对齐官方 gamemodes.json StandardPrices）
+  // 官方五阶权威标准买卖价表（优先由 /api/workshop/rule-catalog 下发同步，静态兜底严格对齐 GameModeModels.cs）
   const STANDARD_PRICES = {
-    Small:  { Bronze: [2, 1], Silver: [4, 2],  Gold: [8, 4],  Diamond: [16, 8] },
-    Medium: { Bronze: [4, 2], Silver: [8, 4],  Gold: [16, 8], Diamond: [32, 16] },
-    Large:  { Bronze: [6, 3], Silver: [12, 6], Gold: [24, 12], Diamond: [48, 24] },
-    Skill:  { Bronze: [5, 2], Silver: [10, 5], Gold: [20, 10], Diamond: [40, 20] },
+    Small:  { Bronze: [2, 1], Silver: [4, 2],  Gold: [8, 4],  Diamond: [16, 8],  Legendary: [24, 12] },
+    Medium: { Bronze: [4, 2], Silver: [8, 4],  Gold: [16, 8], Diamond: [32, 16], Legendary: [48, 24] },
+    Large:  { Bronze: [6, 3], Silver: [12, 6], Gold: [24, 12], Diamond: [48, 24], Legendary: [64, 32] },
+    Skill:  { Bronze: [5, 2], Silver: [10, 5], Gold: [20, 10], Diamond: [40, 20], Legendary: [50, 25] },
   };
   const SIZE_ZH_MAP = { Small: '小型(1格)', Medium: '中型(2格)', Large: '大型(3格)' };
   const TYPE_ZH_MAP = {
     Item: '物品', Skill: '技能', EventEncounter: '奇遇',
     EncounterStep: '奇遇选项', CombatEncounter: '野怪', PedestalEncounter: '基座',
   };
+
+  function syncStandardPricesFromCatalog(serverPrices) {
+    if (!serverPrices || typeof serverPrices !== 'object') return;
+    ['Small', 'Medium', 'Large', 'Skill'].forEach((k) => {
+      if (!serverPrices[k]) return;
+      TIERS.forEach((t) => {
+        const pair = serverPrices[k][t];
+        if (pair && Number.isFinite(Number(pair.buy)) && Number.isFinite(Number(pair.sell))) {
+          STANDARD_PRICES[k][t] = [Number(pair.buy), Number(pair.sell)];
+        }
+      });
+    });
+  }
 
   function getStandardPriceKey(card) {
     if (!card) return 'Medium';
@@ -54,6 +73,8 @@
     const abIds = Object.keys(card.abilities || {});
     const auIds = Object.keys(card.auras || {});
     TIERS.forEach((t) => {
+      // 保留既有 4 阶必生成；Legendary 仅当原本存在或起始即为 Legendary 时自动写入，避免无谓膨胀
+      if (t === 'Legendary' && !card.tiers.Legendary && card.startingTier !== 'Legendary') return;
       if (!card.tiers[t]) card.tiers[t] = { attributes: {}, abilityIds: [...abIds], auraIds: [...auIds] };
       card.tiers[t].attributes = card.tiers[t].attributes || {};
       card.tiers[t].attributes.BuyPrice = table[t][0];
@@ -79,7 +100,41 @@
     const key = getStandardPriceKey(card);
     const table = STANDARD_PRICES[key];
     const kindLabel = key === 'Skill' ? '技能' : (SIZE_ZH_MAP[key] || key);
-    return `当前自动定价（${kindLabel}）：青铜 买${table.Bronze[0]}/卖${table.Bronze[1]}金 · 白银 买${table.Silver[0]}/卖${table.Silver[1]}金 · 黄金 买${table.Gold[0]}/卖${table.Gold[1]}金 · 钻石 买${table.Diamond[0]}/卖${table.Diamond[1]}金`;
+    return `当前自动定价（${kindLabel}）：青铜 买${table.Bronze[0]}/卖${table.Bronze[1]}金 · 白银 买${table.Silver[0]}/卖${table.Silver[1]}金 · 黄金 买${table.Gold[0]}/卖${table.Gold[1]}金 · 钻石 买${table.Diamond[0]}/卖${table.Diamond[1]}金 · 传说 买${table.Legendary[0]}/卖${table.Legendary[1]}金`;
+  }
+
+  function safeNumAttr(v) {
+    if (v === null || v === undefined || v === '') return '';
+    const n = Number(v);
+    return Number.isFinite(n) ? String(n) : '';
+  }
+
+  function loadUploaderSecrets() {
+    try {
+      const raw = sessionStorage.getItem('bazaar_community_uploader_secrets');
+      const parsed = raw ? JSON.parse(raw) : {};
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveUploaderSecret(modId, secret) {
+    if (!modId || !secret) return;
+    state.uploaderSecrets[modId.toLowerCase()] = secret;
+    try {
+      sessionStorage.setItem('bazaar_community_uploader_secrets', JSON.stringify(state.uploaderSecrets));
+    } catch { }
+  }
+
+  function getUploaderSecretForMod(modId) {
+    const manual = ($('communityUploaderSecret')?.value || '').trim();
+    if (manual) return manual;
+    if (modId && state.uploaderSecrets[modId.toLowerCase()]) {
+      return state.uploaderSecrets[modId.toLowerCase()];
+    }
+    const vals = Object.values(state.uploaderSecrets);
+    return vals.length ? vals[vals.length - 1] : '';
   }
 
   function randomBase36(len = 6) {
@@ -114,6 +169,108 @@
     return { w: 512, h: 512, desc: '中型 / 技能方图 512×512' };
   }
 
+  // 附魔比例数值实时预览计算（严格对齐 ResolvedPreviewAttrOp：支持 attributes + TAuraActionCardModifyAttribute + modifier.multiplier/addOffset）
+  function applyEnchantmentPreviewToAttrs(baseAttrs, enchData) {
+    const eff = Object.assign({}, baseAttrs || {});
+    const diffs = [];
+    if (!enchData || typeof enchData !== 'object') return { attrs: eff, diffs };
+
+    const recordDiff = (attrKey, before, after) => {
+      if (!Number.isFinite(after)) return;
+      if (before === undefined || Math.abs(after - before) > 1e-6) {
+        diffs.push({ key: attrKey, before, after });
+      }
+    };
+
+    if (enchData.attributes && typeof enchData.attributes === 'object') {
+      Object.entries(enchData.attributes).forEach(([k, v]) => {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return;
+        const prev = eff[k];
+        if (k === 'CritChance' || k === 'Multicast' || k === 'Lifesteal') {
+          eff[k] = (Number(prev) || 0) + n;
+        } else if (prev === undefined) {
+          eff[k] = n;
+        } else {
+          eff[k] = n;
+        }
+        recordDiff(k, prev, eff[k]);
+      });
+    }
+
+    const auras = enchData.auras && typeof enchData.auras === 'object' ? Object.values(enchData.auras) : [];
+    auras.forEach((au) => {
+      const act = au?.action;
+      if (!act || act.$type !== 'TAuraActionCardModifyAttribute') return;
+      const targetType = act.target?.$type;
+      if (targetType && targetType !== 'TTargetCardSelf') return;
+      const attrKey = act.attributeType;
+      if (!attrKey) return;
+
+      let rhs = null;
+      const valNode = act.value;
+      if (typeof valNode === 'number' && Number.isFinite(valNode)) {
+        rhs = valNode;
+      } else if (valNode?.$type === 'TFixedValue' && Number.isFinite(Number(valNode.value))) {
+        rhs = Number(valNode.value);
+      } else if (valNode?.$type === 'TReferenceValueCardAttribute') {
+        const srcKey = valNode.attributeType || attrKey;
+        const srcVal = Number(baseAttrs?.[srcKey] ?? eff[srcKey] ?? 0);
+        if (Number.isFinite(srcVal)) {
+          let mult = 1;
+          let addOff = 0;
+          const mod = valNode.modifier;
+          if (mod) {
+            if (Number.isFinite(Number(mod.multiplier))) mult = Number(mod.multiplier);
+            if (Number.isFinite(Number(mod.addOffset))) addOff = Number(mod.addOffset);
+            if (mod.modifyMode === 'Multiply' && mod.value !== undefined) {
+              const mv = typeof mod.value === 'number' ? mod.value : Number(mod.value?.value);
+              if (Number.isFinite(mv)) mult = mv;
+            } else if (mod.modifyMode === 'Add' && mod.value !== undefined) {
+              const av = typeof mod.value === 'number' ? mod.value : Number(mod.value?.value);
+              if (Number.isFinite(av)) addOff = av;
+            }
+          }
+          rhs = srcVal * mult + addOff;
+        }
+      }
+      if (rhs === null || !Number.isFinite(rhs)) return;
+
+      const prev = eff[attrKey];
+      const cur = Number.isFinite(Number(prev)) ? Number(prev) : (attrKey === 'Multicast' ? 1 : 0);
+      const op = act.operation || 'Add';
+      let next = cur;
+      if (op === 'Add') next = cur + rhs;
+      else if (op === 'Subtract') next = cur - rhs;
+      else if (op === 'Multiply') next = cur * rhs;
+      else if (op === 'Set') next = rhs;
+      eff[attrKey] = Math.round(next * 100) / 100;
+      recordDiff(attrKey, prev, eff[attrKey]);
+    });
+
+    return { attrs: eff, diffs };
+  }
+
+  function renderCounterBadgesOnPreview(displays, attrs) {
+    const box = $('pvCounterBadges');
+    if (!box) return;
+    const list = Array.isArray(displays) ? displays.filter(Boolean).slice(0, 4) : [];
+    if (!list.length) {
+      box.classList.add('hidden');
+      box.innerHTML = '';
+      return;
+    }
+    box.classList.remove('hidden');
+    box.innerHTML = list.map((cd) => {
+      const label = cd.labelZh || cd.syncAttribute || 'Custom_3';
+      const val = attrs?.[cd.syncAttribute] ?? 0;
+      const maxVal = cd.maxAttr ? (attrs?.[cd.maxAttr] ?? cd.maxAttr) : (cd.maxConst ?? cd.maxParam ?? '');
+      const color = /^#[0-9a-fA-F]{3,8}$/.test(String(cd.colorHex || '')) ? cd.colorHex : '#d8a444';
+      const suffix = maxVal !== '' ? ` ${val}/${maxVal}` : ` ${val}${cd.unit || ''}`;
+      return `<span class="bc-counter-pill" style="border-color:${escapeHtml(color)}">${escapeHtml(label)}${escapeHtml(suffix)}</span>`;
+    }).join('');
+  }
+
   // 默认合规原版白名单奇遇载体（经过 valid_card_ids.json 核验）
   const DEFAULT_EVENT_VISUAL = '11287697-dd45-4edc-9539-780a26001043';
   const DEFAULT_STEP_VISUAL = '0659ca31-9f4d-412e-84b2-d535b502afa6';
@@ -134,9 +291,24 @@
     previewTier: 'Bronze',
     previewEnchant: '',
     lastValidation: null,
-    token: localStorage.getItem('bazaar_workshop_token') || sessionStorage.getItem('bazaar_workshop_token') || '',
+    vanillaBlueprintCache: Object.create(null),
+    uploaderSecrets: loadUploaderSecrets(),
+    lastIssuedSecret: '',
+    // 安全铁律：管理员 Token 仅存 sessionStorage，绝不落 localStorage 明文持久
+    token: sessionStorage.getItem('bazaar_workshop_token') || '',
     searchTimer: null,
   };
+
+  async function ensureVanillaBlueprint(templateId) {
+    if (!templateId) return null;
+    if (state.vanillaBlueprintCache[templateId]) return state.vanillaBlueprintCache[templateId];
+    const res = await apiFetch(`/api/workshop/base-cards/${encodeURIComponent(templateId)}`);
+    if (res.ok && res.data?.card) {
+      state.vanillaBlueprintCache[templateId] = res.data;
+      return res.data;
+    }
+    return null;
+  }
 
   const $ = (id) => document.getElementById(id);
 
@@ -166,7 +338,7 @@
     const resp = await fetch(apiUrl(path), { ...options, headers });
     const ct = resp.headers.get('content-type') || '';
     const data = ct.includes('application/json') ? await resp.json() : await resp.text();
-    return { ok: resp.ok, status: resp.status, data };
+    return { ok: resp.ok, status: resp.status, data, headers: resp.headers };
   }
 
   function markDirty(isDirty = true) {
@@ -186,6 +358,8 @@
 
   // ── 初始化加载 ────────────────────────────────────────────────────────────
   async function init() {
+    // 清理历史遗留 localStorage 管理员 Token 明文，防止长期驻留
+    try { localStorage.removeItem('bazaar_workshop_token'); } catch { }
     $('workshopTokenInput').value = state.token;
     const savedPlayer = localStorage.getItem('bazaar_community_player_name') || '';
     if ($('communityPlayerName')) $('communityPlayerName').value = savedPlayer;
@@ -207,18 +381,20 @@
     const badge = $('accessBadge');
     if (res.data.canWrite) {
       badge.classList.remove('readonly');
-      badge.textContent = res.data.mode === 'token-rw' ? '🔓 口令已解锁读写' : '🟢 本机全功能读写';
+      badge.textContent = res.data.mode === 'token-rw' ? '🔓 口令已解锁读写（本会话有效）' : '🟢 本机全功能读写';
     } else {
       badge.classList.add('readonly');
       badge.textContent = '🔒 公网只读沙盒';
     }
-    $('metaStatsText').textContent = `原版库 ${res.data.baseCardCount} 张（白名单 ${res.data.whitelistedCardCount} 张） · 已启用 ${res.data.enabledMods} 个 Mod`;
+    const vfxCnt = res.data.vfxKeyCount ?? 133;
+    $('metaStatsText').textContent = `原版库 ${res.data.baseCardCount} 张（白名单 ${res.data.whitelistedCardCount} 张 · ${vfxCnt} 特效） · 已启用 ${res.data.enabledMods} 个 Mod`;
   }
 
   async function loadRuleCatalog() {
     const res = await apiFetch('/api/workshop/rule-catalog');
     if (!res.ok) return;
     state.catalog = res.data;
+    syncStandardPricesFromCatalog(res.data.standardPrices);
 
     // 填充英雄下拉框
     const heroSel = $('baseFilterHero');
@@ -253,6 +429,7 @@
     if (!res.ok) return;
     state.mods = res.data.mods || [];
     renderModList();
+    window.WorkshopV14?.onModsListUpdated?.();
   }
 
   function renderModList() {
@@ -266,6 +443,7 @@
       const statusBadge = m.loaded
         ? '<span class="badge badge-green">已发布生效</span>'
         : (m.enabled ? '<span class="badge badge-red">校验未通过</span>' : '<span class="badge badge-yellow">草稿未启用</span>');
+      const mechCount = m.mechanicCount ?? m.customMechanicCount ?? 0;
       return `
         <div class="mod-item ${selected}" data-mod-id="${escapeHtml(m.id)}">
           <div class="mod-item-head">
@@ -276,8 +454,9 @@
             <span>v${escapeHtml(m.version)}</span>
             <span>新卡 ${m.cardCount}</span>
             <span>补丁 ${m.patchCount || 0}</span>
+            <span>机制 ${mechCount}</span>
             <span>奇遇 ${m.eventCount}</span>
-            <span>PNG ${m.assetCount}</span>
+            <span>贴图 ${m.assetCount}</span>
           </div>
         </div>
       `;
@@ -331,6 +510,7 @@
     $('mfScope').value = mf.scope || 'multiplayer-safe';
     $('mfLoadOrder').value = mf.loadOrder ?? 100;
     $('mfDesc').value = mf.description || '';
+    if ($('mfDependencies')) $('mfDependencies').value = (mf.dependencies || []).join(', ');
     updateCounts();
   }
 
@@ -341,24 +521,55 @@
     $('cntPatches').textContent = ws.patches.length;
     if ($('cntMechanics')) $('cntMechanics').textContent = (ws.mechanics || []).length;
     $('cntEvents').textContent = ws.events.length;
+    const mCnt = (ws.monsters || []).length;
+    const mdCnt = (ws.modes || []).length;
+    const mutCnt = (ws.mutators || []).length;
+    if ($('cntExtras')) $('cntExtras').textContent = mCnt + mdCnt + mutCnt;
+    if ($('cntMonsters')) $('cntMonsters').textContent = mCnt;
+    if ($('cntModes')) $('cntModes').textContent = mdCnt;
+    if ($('cntMutators')) $('cntMutators').textContent = mutCnt;
     $('cntAssets').textContent = state.assets.length;
     $('mineCardNum').textContent = ws.cards.length;
     $('minePatchNum').textContent = ws.patches.length;
   }
 
   function readManifestForm() {
-    if (!state.workspace) return;
+    if (!state.workspace) return false;
     const mf = state.workspace.manifest;
-    mf.id = $('mfId').value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
-    mf.name = $('mfName').value.trim();
-    mf.version = $('mfVersion').value.trim() || '1.0.0';
-    mf.author = $('mfAuthor').value.trim();
-    mf.scope = $('mfScope').value;
-    mf.loadOrder = parseInt($('mfLoadOrder').value, 10) || 100;
-    mf.description = $('mfDesc').value.trim();
+    const nextId = $('mfId').value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const nextName = $('mfName').value.trim();
+    const nextVersion = $('mfVersion').value.trim() || '1.0.0';
+    const nextAuthor = $('mfAuthor').value.trim();
+    const nextScope = $('mfScope').value;
+    const nextLoadOrder = parseInt($('mfLoadOrder').value, 10) || 100;
+    const nextDesc = $('mfDesc').value.trim();
+    const nextDeps = $('mfDependencies')
+      ? $('mfDependencies').value.split(',').map((s) => s.trim()).filter(Boolean)
+      : (mf.dependencies || []);
+
+    const changed = (mf.id || '') !== nextId
+      || (mf.name || '') !== nextName
+      || (mf.version || '1.0.0') !== nextVersion
+      || (mf.author || '') !== nextAuthor
+      || (mf.scope || 'multiplayer-safe') !== nextScope
+      || (mf.loadOrder ?? 100) !== nextLoadOrder
+      || (mf.description || '') !== nextDesc
+      || JSON.stringify(mf.dependencies || []) !== JSON.stringify(nextDeps);
+
+    if (!changed) return false;
+
+    mf.id = nextId;
+    mf.name = nextName;
+    mf.version = nextVersion;
+    mf.author = nextAuthor;
+    mf.scope = nextScope;
+    mf.loadOrder = nextLoadOrder;
+    mf.description = nextDesc;
+    mf.dependencies = nextDeps;
     mf.affectsGhostPool = false;
     $('currentModTitle').textContent = `${mf.name || mf.id} (${mf.id})`;
     markDirty(true);
+    return true;
   }
 
   async function saveDraft() {
@@ -552,8 +763,15 @@
     $('ceTags').value = (card.tags || []).join(', ');
     $('ceHiddenTags').value = (card.hiddenTags || []).join(', ');
     $('ceDescZh').value = card.descZh || '';
+    if ($('ceDescEn')) $('ceDescEn').value = card.descEn || '';
+    if ($('ceAccentColor')) $('ceAccentColor').value = card.accentColor || '';
+    if ($('ceCustomBgArtFile')) $('ceCustomBgArtFile').value = card.customBgArtFile || '';
+    if ($('ceBoardOverride')) $('ceBoardOverride').value = card.boardOverride || '';
+    if ($('cePresentation')) $('cePresentation').value = card.presentation || '';
     $('ceActiveTips').value = (card.activeTooltipsZh || []).join('\n');
     $('cePassiveTips').value = (card.passiveTooltipsZh || []).join('\n');
+    if ($('ceActiveTipsEn')) $('ceActiveTipsEn').value = (card.activeTooltipsEn || []).join('\n');
+    if ($('cePassiveTipsEn')) $('cePassiveTipsEn').value = (card.passiveTooltipsEn || []).join('\n');
 
     const useAutoPrice = isCardUsingStandardPrices(card);
     if ($('ceAutoPriceChk')) $('ceAutoPriceChk').checked = useAutoPrice;
@@ -586,14 +804,33 @@
   }
 
   function populatePatchCardForm(patch) {
-    $('peHeading').textContent = patch.titleZh || patch.targetTemplateId;
+    const bp = state.vanillaBlueprintCache[patch.targetTemplateId];
+    $('peHeading').textContent = patch.titleZh || bp?.titleZh || patch.targetTemplateId;
     $('peTargetId').value = patch.targetTemplateId || '';
     $('peNote').value = patch.note || '';
     $('peStartingTier').value = patch.startingTier || '';
+    if ($('peSpawningEligibility')) $('peSpawningEligibility').value = patch.spawningEligibility || '';
     $('peTitleZh').value = patch.titleZh || '';
+    if ($('peTitleEn')) $('peTitleEn').value = patch.titleEn || '';
+    if ($('peHeroes')) $('peHeroes').value = (patch.heroes || []).join(', ');
     $('peAddTags').value = (patch.addTags || []).join(', ');
     $('peRemoveTags').value = (patch.removeTags || []).join(', ');
+    if ($('peAddHiddenTags')) $('peAddHiddenTags').value = (patch.addHiddenTags || []).join(', ');
+    if ($('peRemoveHiddenTags')) $('peRemoveHiddenTags').value = (patch.removeHiddenTags || []).join(', ');
     $('peDescZh').value = patch.descZh || '';
+    if ($('peDescEn')) $('peDescEn').value = patch.descEn || '';
+    if ($('peActiveTips')) $('peActiveTips').value = (patch.activeTooltipsZh || []).join('\n');
+    if ($('pePassiveTips')) $('pePassiveTips').value = (patch.passiveTooltipsZh || []).join('\n');
+    if ($('peAccentColor')) $('peAccentColor').value = patch.accentColor || '';
+    if ($('peBoardOverride')) $('peBoardOverride').value = patch.boardOverride || '';
+    if ($('pePresentation')) $('pePresentation').value = patch.presentation || '';
+
+    if ($('artHintText')) {
+      const spec = getArtSpecForCard(bp?.card || null);
+      $('artHintText').textContent = bp?.card
+        ? `当前原位补丁自动裁切目标（按原版 ${bp.card.type}/${bp.card.size}）：${spec.desc}。`
+        : '正在加载原版卡尺寸信息以自动匹配裁切目标...';
+    }
 
     const fakeTiers = {};
     TIERS.forEach((t) => {
@@ -608,6 +845,20 @@
       updateLivePreviewFromPatch(patch);
     });
     updateLivePreviewFromPatch(patch);
+
+    if (!bp && patch.targetTemplateId) {
+      ensureVanillaBlueprint(patch.targetTemplateId).then((loaded) => {
+        if (!loaded) return;
+        const activePatch = state.workspace?.patches?.[state.selectedPatchIdx];
+        if (activePatch !== patch) return;
+        $('peHeading').textContent = patch.titleZh || loaded.titleZh || patch.targetTemplateId;
+        if ($('artHintText')) {
+          const spec = getArtSpecForCard(loaded.card);
+          $('artHintText').textContent = `当前原位补丁自动裁切目标（按原版 ${loaded.card.type}/${loaded.card.size}）：${spec.desc}。`;
+        }
+        updateLivePreviewFromPatch(patch);
+      });
+    }
   }
 
   function renderTierMatrix(tbody, tiersMap, onChange, hidePriceRows = false) {
@@ -616,7 +867,7 @@
       const cells = TIERS.map((t) => {
         const raw = tiersMap?.[t]?.attributes?.[m.key];
         const disp = raw === undefined || raw === null ? '' : (m.isSec ? (raw / 1000) : raw);
-        return `<td><input type="number" step="${m.isSec ? '0.1' : '1'}" data-tier="${t}" data-attr="${m.key}" data-sec="${m.isSec ? '1' : '0'}" value="${disp}" placeholder="-" /></td>`;
+        return `<td><input type="number" step="${m.isSec ? '0.1' : '1'}" data-tier="${escapeHtml(t)}" data-attr="${escapeHtml(m.key)}" data-sec="${m.isSec ? '1' : '0'}" value="${escapeHtml(safeNumAttr(disp))}" placeholder="-" /></td>`;
       }).join('');
       return `<tr><td>${escapeHtml(m.label)}</td>${cells}</tr>`;
     }).join('');
@@ -696,6 +947,25 @@
     });
   }
 
+  function renderEnchantDiffChips(diffs) {
+    const el = $('pvEnchantDiff');
+    if (!el) return;
+    if (!diffs || !diffs.length) {
+      el.classList.add('hidden');
+      el.innerHTML = '';
+      return;
+    }
+    el.classList.remove('hidden');
+    el.innerHTML = diffs.slice(0, 6).map((d) => {
+      const meta = MATRIX_ATTRS.find((m) => m.key === d.key);
+      const name = meta ? meta.label.replace(/（.*）/, '') : d.key;
+      const text = d.before !== undefined
+        ? `${name} ${formatAttrDisp(d.key, d.before)} → ${formatAttrDisp(d.key, d.after)}`
+        : `${name} +${formatAttrDisp(d.key, d.after)}`;
+      return `<span>${escapeHtml(text)}</span>`;
+    }).join('');
+  }
+
   function updateLivePreview(card) {
     const frame = $('liveCardFrame');
     frame.className = `bazaar-card tier-${state.previewTier}`;
@@ -707,10 +977,18 @@
       $('pvTooltips').textContent = '从左侧检索原版卡开始创作';
       $('pvArtImg').classList.add('hidden');
       $('pvArtPlaceholder').classList.remove('hidden');
+      $('pvEnchantBanner')?.classList.add('hidden');
+      renderEnchantDiffChips([]);
+      renderCounterBadgesOnPreview([], {});
+      $('upgradePreviewBox')?.classList.add('hidden');
       return;
     }
 
-    const attrs = mergeAttrsForTier(card, state.previewTier);
+    const baseAttrs = mergeAttrsForTier(card, state.previewTier);
+    const pvEnch = state.previewEnchant || '';
+    const enchData = pvEnch ? card.enchantments?.[pvEnch] : null;
+    const { attrs, diffs } = applyEnchantmentPreviewToAttrs(baseAttrs, enchData);
+
     const exclNote = card.spawningEligibility === 'GuidOnly' ? ' · 联动限定' : (card.spawningEligibility === 'Never' ? ' · 暂不投放' : '');
     $('pvTitle').textContent = card.titleZh || card.customId;
     $('pvSize').textContent = `${TYPE_ZH_MAP[card.type] || card.type} · ${SIZE_ZH_MAP[card.size] || card.size}${exclNote}`;
@@ -728,15 +1006,15 @@
       ...(card.passiveTooltipsZh || []).map((l) => `<div>[被动] ${escapeHtml(renderTooltipPreview(l, attrs))}</div>`),
     ];
 
-    // 实时附魔横幅与附魔词条预览
+    // 实时附魔横幅、比例属性变化芯片与附魔词条预览
     const enchBanner = $('pvEnchantBanner');
-    const pvEnch = state.previewEnchant || '';
     if (pvEnch) {
       const enchZh = lookupZhName(state.catalog?.enchantments, pvEnch);
       if (enchBanner) {
         enchBanner.textContent = `✨ 附魔预览：${enchZh}`;
         enchBanner.classList.remove('hidden');
       }
+      renderEnchantDiffChips(diffs);
       const enchTips = card.enchantTooltipsZh?.[pvEnch] || [];
       if (enchTips.length) {
         enchTips.forEach((l) => {
@@ -745,14 +1023,16 @@
       } else {
         lines.push(`<div class="bc-ench-tip muted">✨ [${escapeHtml(enchZh)}] 尚未配置此附魔（可在中间「13 种官方附魔配置」一键生成）</div>`);
       }
-    } else if (enchBanner) {
-      enchBanner.classList.add('hidden');
+    } else {
+      if (enchBanner) enchBanner.classList.add('hidden');
+      renderEnchantDiffChips([]);
     }
 
     $('pvTooltips').innerHTML = lines.length
       ? lines.join('')
       : escapeHtml(card.descZh || '（填写主动/被动文案即可实时预览数值渲染）');
 
+    renderCounterBadgesOnPreview(card.counterDisplays || [], attrs);
     renderUpgradePreviewBox(card);
 
     if (card.customArtFile && state.currentModId) {
@@ -766,17 +1046,89 @@
     }
   }
 
+  function mergePatchEffectiveCard(patch) {
+    const bp = state.vanillaBlueprintCache[patch.targetTemplateId];
+    const baseCard = bp?.card || null;
+    const mergedTiers = {};
+    TIERS.forEach((t) => {
+      const bAttrs = baseCard?.tiers?.[t]?.attributes || {};
+      const oAttrs = patch.tierAttributeOverrides?.[t] || {};
+      if (Object.keys(bAttrs).length || Object.keys(oAttrs).length) {
+        mergedTiers[t] = { attributes: Object.assign({}, baseCard?.attributes || {}, patch.attributeOverrides || {}, bAttrs, oAttrs) };
+      }
+    });
+    const baseTags = new Set(baseCard?.tags || []);
+    (patch.removeTags || []).forEach((t) => baseTags.delete(t));
+    (patch.addTags || []).forEach((t) => baseTags.add(t));
+    return {
+      titleZh: patch.titleZh || bp?.titleZh || `原位补丁 (${patch.targetTemplateId.slice(0, 8)}…)`,
+      type: baseCard?.type || 'Item',
+      size: baseCard?.size || 'Medium',
+      heroes: patch.heroes?.length ? patch.heroes : (baseCard?.heroes || []),
+      tags: Array.from(baseTags),
+      attributes: Object.assign({}, baseCard?.attributes || {}, patch.attributeOverrides || {}),
+      tiers: mergedTiers,
+      activeTooltipsZh: patch.activeTooltipsZh?.length ? patch.activeTooltipsZh : [],
+      passiveTooltipsZh: patch.passiveTooltipsZh?.length ? patch.passiveTooltipsZh : [],
+      enchantments: Object.assign({}, baseCard?.enchantments || {}, patch.enchantmentOverrides || {}),
+      enchantTooltipsZh: patch.enchantTooltipsZh || {},
+      counterDisplays: patch.counterDisplaysOverride || [],
+      customArtFile: patch.customArtFile || null,
+    };
+  }
+
   function updateLivePreviewFromPatch(patch) {
-    const attrs = (patch.tierAttributeOverrides && patch.tierAttributeOverrides[state.previewTier]) || {};
+    const effCard = mergePatchEffectiveCard(patch);
+    const baseAttrs = mergeAttrsForTier(effCard, state.previewTier);
+    const pvEnch = state.previewEnchant || '';
+    const enchData = pvEnch ? effCard.enchantments?.[pvEnch] : null;
+    const { attrs, diffs } = applyEnchantmentPreviewToAttrs(baseAttrs, enchData);
+
     const frame = $('liveCardFrame');
     frame.className = `bazaar-card tier-${state.previewTier}`;
-    $('pvTitle').textContent = patch.titleZh || `原位补丁 (${patch.targetTemplateId.slice(0, 8)}…)`;
-    $('pvSize').textContent = '原位 Patch';
+    $('pvTitle').textContent = effCard.titleZh;
+    $('pvSize').textContent = `原位 Patch · ${TYPE_ZH_MAP[effCard.type] || effCard.type} · ${SIZE_ZH_MAP[effCard.size] || effCard.size}`;
     $('pvCooldown').textContent = attrs.CooldownMax ? `${(attrs.CooldownMax / 1000).toFixed(1)} 秒` : '沿用原版';
-    $('pvTags').innerHTML = (patch.addTags || []).map((t) => `<span>+${escapeHtml(t)}</span>`).join('');
-    $('pvTooltips').textContent = patch.note || patch.descZh || '仅覆写你填写的差量数值，其他属性完全继承原版卡。';
-    $('pvBuyPrice').textContent = `买 ${attrs.BuyPrice ?? '原版'}g`;
-    $('pvHero').textContent = 'Vanilla Patch';
+    $('pvTags').innerHTML = effCard.tags.map((t) => `<span>${escapeHtml(lookupZhName(state.catalog?.tags, t))}</span>`).join('');
+    $('pvBuyPrice').textContent = `买 ${attrs.BuyPrice ?? '原版'}金 / 卖 ${attrs.SellPrice ?? '原版'}金`;
+    $('pvHero').textContent = effCard.heroes.length
+      ? effCard.heroes.map((h) => lookupZhName(state.catalog?.heroes, h)).join(' / ')
+      : '沿用原版英雄';
+
+    const lines = [
+      ...(effCard.activeTooltipsZh || []).map((l) => `<div>[主动] ${escapeHtml(renderTooltipPreview(l, attrs))}</div>`),
+      ...(effCard.passiveTooltipsZh || []).map((l) => `<div>[被动] ${escapeHtml(renderTooltipPreview(l, attrs))}</div>`),
+    ];
+    const enchBanner = $('pvEnchantBanner');
+    if (pvEnch) {
+      const enchZh = lookupZhName(state.catalog?.enchantments, pvEnch);
+      if (enchBanner) {
+        enchBanner.textContent = `✨ 附魔预览：${enchZh}`;
+        enchBanner.classList.remove('hidden');
+      }
+      renderEnchantDiffChips(diffs);
+      const enchTips = effCard.enchantTooltipsZh?.[pvEnch] || [];
+      enchTips.forEach((l) => lines.push(`<div class="bc-ench-tip">✨ [${escapeHtml(enchZh)}] ${escapeHtml(renderTooltipPreview(l, attrs))}</div>`));
+    } else {
+      if (enchBanner) enchBanner.classList.add('hidden');
+      renderEnchantDiffChips([]);
+    }
+    $('pvTooltips').innerHTML = lines.length
+      ? lines.join('')
+      : escapeHtml(patch.note || patch.descZh || '仅覆写你填写的差量数值，其他属性完全继承原版卡。');
+
+    renderCounterBadgesOnPreview(effCard.counterDisplays, attrs);
+    renderUpgradePreviewBox(Object.keys(effCard.tiers).length ? effCard : null);
+
+    if (patch.customArtFile && state.currentModId) {
+      const img = $('pvArtImg');
+      img.src = apiUrl(`/api/workshop/mods/${encodeURIComponent(state.currentModId)}/assets/${patch.customArtFile}?t=${Date.now()}`);
+      img.classList.remove('hidden');
+      $('pvArtPlaceholder').classList.add('hidden');
+    } else {
+      $('pvArtImg').classList.add('hidden');
+      $('pvArtPlaceholder').classList.remove('hidden');
+    }
   }
 
   function mergeAttrsForTier(card, targetTier) {
@@ -788,8 +1140,8 @@
     return out;
   }
 
-  const TIER_ZH_MAP = { Bronze: '青铜', Silver: '白银', Gold: '黄金', Diamond: '钻石' };
-  const NEXT_TIER_MAP = { Bronze: 'Silver', Silver: 'Gold', Gold: 'Diamond', Diamond: null };
+  const TIER_ZH_MAP = { Bronze: '青铜', Silver: '白银', Gold: '黄金', Diamond: '钻石', Legendary: '传说' };
+  const NEXT_TIER_MAP = { Bronze: 'Silver', Silver: 'Gold', Gold: 'Diamond', Diamond: 'Legendary', Legendary: null };
 
   function formatAttrDisp(key, val) {
     if (val === undefined || val === null) return '-';
@@ -829,9 +1181,9 @@
     const tipLines = $('upgradeTipLines');
 
     if (!nextTier) {
-      titleEl.textContent = '💎 已达最高品质（钻石 Diamond）';
+      titleEl.textContent = '🔥 已达最高品质（传说 Legendary）';
       priceEl.textContent = '满阶状态';
-      diffGrid.innerHTML = '<span class="muted">点击上方「铜 / 银 / 金」按钮即可预览各阶升级对比效果。</span>';
+      diffGrid.innerHTML = '<span class="muted">点击上方「铜 / 银 / 金 / 钻」按钮即可预览各阶升级对比效果。</span>';
       tipLines.innerHTML = '';
       return;
     }
@@ -889,8 +1241,13 @@
       return;
     }
 
-    // 使用浏览器 Canvas 自动裁切并转为合规 PNG（Small 1格 512×1024 竖图；Large 3格 768×512 横图；Medium 2格 / Skill 512×512 方图）
-    const artSpec = getArtSpecForCard(card);
+    // 使用浏览器 Canvas 自动裁切并转为合规 PNG（原位 Patch 按原版卡 Type/Size 精准裁切，绝不错裁 512×512）
+    let targetCardMeta = card;
+    if (!targetCardMeta && patch) {
+      const bp = await ensureVanillaBlueprint(patch.targetTemplateId);
+      targetCardMeta = bp?.card || null;
+    }
+    const artSpec = getArtSpecForCard(targetCardMeta);
     const targetW = artSpec.w;
     const targetH = artSpec.h;
 
@@ -926,6 +1283,7 @@
         card.artRect = { width: res.data.width, height: res.data.height, cropMode: 'cover' };
       } else if (patch) {
         patch.customArtFile = res.data.logicalPath;
+        patch.artRect = { width: res.data.width, height: res.data.height, cropMode: 'cover' };
       }
       state.assets = state.assets.filter((a) => a.logicalPath !== res.data.logicalPath);
       state.assets.push(res.data);
@@ -934,6 +1292,7 @@
       markDirty(true);
       updateCounts();
       if (card) updateLivePreview(card);
+      else if (patch) updateLivePreviewFromPatch(patch);
       toast('PNG 卡图已自动裁切并绑定成功！');
     } catch (ex) {
       toast(`处理图片失败：${ex.message}`, 'err');
@@ -971,12 +1330,33 @@
 
     $('evId').value = ev.eventId || '';
     $('evBaseVisualId').value = ev.baseVisualTemplateId || DEFAULT_EVENT_VISUAL;
+    if ($('evType')) $('evType').value = ev.eventType || 'EventEncounter';
     $('evTitleZh').value = ev.titleZh || '';
+    if ($('evTitleEn')) $('evTitleEn').value = ev.titleEn || '';
     $('evHeroes').value = (ev.heroes || ['Common']).join(', ');
     $('evMinDay').value = ev.minDay ?? 2;
     $('evMaxDay').value = ev.maxDay ?? 10;
     $('evWeight').value = ev.weight ?? 5;
+    const rawHours = ev.hours ?? ev.allowedHours ?? ev.schedule?.hours;
+    if ($('evHours')) $('evHours').value = Array.isArray(rawHours) ? rawHours.join(', ') : '';
+    if ($('evDifficultySlot')) $('evDifficultySlot').value = ev.difficultySlot || '';
+    if ($('evOncePerRun')) $('evOncePerRun').checked = !!ev.oncePerRun;
+    if ($('evChainOnly')) $('evChainOnly').checked = !!ev.chainOnly;
     $('evDescZh').value = ev.descZh || '';
+    if ($('evDescEn')) $('evDescEn').value = ev.descEn || '';
+    if ($('evStartingTier')) $('evStartingTier').value = ev.startingTier || '';
+    if ($('evCustomArtFile')) $('evCustomArtFile').value = ev.customArtFile || '';
+    if ($('evCustomBgArtFile')) $('evCustomBgArtFile').value = ev.customBgArtFile || '';
+    if ($('evBoardOverride')) $('evBoardOverride').value = ev.boardOverride || '';
+    if ($('evPresentation')) $('evPresentation').value = ev.presentation || '';
+    if ($('evRewardCombatGold')) $('evRewardCombatGold').value = ev.rewardCombatGold ?? '';
+    if ($('evRewardCombatXp')) $('evRewardCombatXp').value = ev.rewardCombatXp ?? '';
+    if ($('evCombatMonsterJson')) {
+      $('evCombatMonsterJson').value = ev.combatMonster ? JSON.stringify(ev.combatMonster, null, 2) : '';
+    }
+    if ($('evCombatMonsterWrap')) {
+      $('evCombatMonsterWrap').classList.toggle('hidden', (ev.eventType || 'EventEncounter') !== 'CombatEncounter');
+    }
 
     const stepsBox = $('eventStepsContainer');
     const allEventIds = (state.workspace.events || []).map((e) => e.eventId);
@@ -1028,7 +1408,7 @@
           </div>
           <div class="form-grid">
             <label class="field"><span>选项标题 *</span><input type="text" class="st-title" value="${escapeHtml(st.titleZh || '')}" /></label>
-            <label class="field"><span>需要花费金币（0 表示免费）</span><input type="number" class="st-price" min="0" value="${buyPrice}" /></label>
+            <label class="field"><span>需要花费金币（0 表示免费）</span><input type="number" class="st-price" min="0" value="${escapeHtml(safeNumAttr(buyPrice))}" /></label>
             <label class="field span-2"><span>选项说明 *</span><input type="text" class="st-desc" value="${escapeHtml(st.descZh || '')}" /></label>
             <label class="field span-2"><span>选完后的流程</span><select class="st-next">${optionsHtml}</select></label>
           </div>
@@ -1311,7 +1691,10 @@
     const grid = $('communityModGrid');
     if (!grid) return;
     const playerName = getCommunityPlayerName();
-    const headers = playerName ? { 'X-Player-Name': encodeURIComponent(playerName) } : {};
+    const headers = {};
+    if (playerName) headers['X-Player-Name'] = encodeURIComponent(playerName);
+    const sec = getUploaderSecretForMod('');
+    if (sec) headers['X-Uploader-Secret'] = sec;
     const res = await apiFetch('/api/community/mods', { headers });
     if (!res.ok) {
       grid.innerHTML = `<div class="empty-hint">加载社区 Mod 列表失败（HTTP ${res.status}）</div>`;
@@ -1339,7 +1722,8 @@
         : '<span class="badge badge-blue">社区</span>';
       const authorText = m.uploaderName || m.author || '玩家';
       const dlHref = apiUrl(`/api/community/mods/${encodeURIComponent(m.modId)}/download`);
-      const canDelete = !!m.canDelete;
+      const hasLocalSecret = Boolean(getUploaderSecretForMod(m.modId));
+      const canDelete = Boolean(m.canDelete || hasLocalSecret);
       let adminToggleBtn = '';
       if (isAdmin || m.canToggleServerDefault) {
         if (m.isServerDefault) {
@@ -1351,6 +1735,7 @@
       const delBtn = canDelete
         ? `<button class="btn btn-danger btn-xs" data-comm-act="delete" data-id="${escapeHtml(m.modId)}">删除</button>`
         : '';
+      const mechCount = m.mechanicCount ?? m.customMechanicCount ?? 0;
       return `
         <div class="community-card">
           <div class="mod-item-head">
@@ -1361,6 +1746,7 @@
             <span>v${escapeHtml(m.version || '1.0.0')}</span>
             <span>作者：${escapeHtml(authorText)}</span>
             <span>新卡 ${m.customCardCount || 0}</span>
+            <span>机制 ${mechCount}</span>
             <span>奇遇 ${m.customEventCount || 0}</span>
             <span>卡图 ${m.assetCount || 0}</span>
             <span>下载 ${m.downloadCount || 0}</span>
@@ -1380,6 +1766,15 @@
     });
   }
 
+  function showUploaderSecretBanner(modId, secret) {
+    const banner = $('communitySecretBanner');
+    const txt = $('communitySecretText');
+    if (!banner || !txt || !secret) return;
+    state.lastIssuedSecret = secret;
+    txt.textContent = `🔑 已为「${modId}」签发作者管理凭证（仅保存在当前会话中，如需后续更新或删除请妥善复制备份）：${secret}`;
+    banner.classList.remove('hidden');
+  }
+
   async function uploadCommunityZipFile(file) {
     let playerName = getCommunityPlayerName();
     if (!playerName) {
@@ -1391,19 +1786,31 @@
     }
     const fd = new FormData();
     fd.append('file', file, file.name);
+    const headers = { 'X-Player-Name': encodeURIComponent(playerName) };
+    const guessedModId = file.name.replace(/(-[0-9].*)?\.bazaarmod\.zip$/i, '').replace(/\.zip$/i, '');
+    const existingSecret = getUploaderSecretForMod(guessedModId);
+    if (existingSecret) headers['X-Uploader-Secret'] = existingSecret;
+
     toast('正在上传并执行安全检测与 25 场模拟对战，请稍候...');
     const res = await apiFetch('/api/community/mods/upload', {
       method: 'POST',
-      headers: { 'X-Player-Name': encodeURIComponent(playerName) },
+      headers,
       body: fd
     });
     if (!res.ok) {
       toast(res.data?.messageZh || res.data?.error || `上传未通过（HTTP ${res.status}）`, 'err');
-      if (res.data?.validation) {
+      const valReport = res.data?.validation || res.data?.report;
+      if (valReport) {
         switchTab('validate');
-        renderValidationReport(res.data.validation);
+        renderValidationReport(valReport);
       }
       return;
+    }
+    const issuedSecret = res.data?.uploaderSecret || res.headers?.get('X-Uploader-Secret') || '';
+    const uploadedModId = res.data?.mod?.modId || guessedModId;
+    if (issuedSecret && uploadedModId) {
+      saveUploaderSecret(uploadedModId, issuedSecret);
+      showUploaderSecretBanner(uploadedModId, issuedSecret);
     }
     toast(res.data?.messageZh || '上传成功！现在大家都可以下载或开房选用了。', 'ok');
     await loadCommunityMods();
@@ -1412,7 +1819,10 @@
   async function handleCommunityModAction(action, modId) {
     if (!modId) return;
     const playerName = getCommunityPlayerName();
-    const headers = playerName ? { 'X-Player-Name': encodeURIComponent(playerName) } : {};
+    const headers = {};
+    if (playerName) headers['X-Player-Name'] = encodeURIComponent(playerName);
+    const secret = getUploaderSecretForMod(modId);
+    if (secret) headers['X-Uploader-Secret'] = secret;
 
     if (action === 'delete') {
       if (!confirm(`确定删除社区 Mod「${modId}」吗？`)) return;
@@ -1452,10 +1862,11 @@
 
     $('btnApplyToken').addEventListener('click', async () => {
       state.token = $('workshopTokenInput').value.trim();
-      localStorage.setItem('bazaar_workshop_token', state.token);
-      sessionStorage.setItem('bazaar_workshop_token', state.token);
+      try { localStorage.removeItem('bazaar_workshop_token'); } catch { }
+      if (state.token) sessionStorage.setItem('bazaar_workshop_token', state.token);
+      else sessionStorage.removeItem('bazaar_workshop_token');
       await Promise.all([loadMeta(), loadCommunityMods()]);
-      toast(state.meta?.canWrite ? '已解锁公网写权限（已持久化记住）！' : '口令未匹配或服务端未开启 Token 写权限。', state.meta?.canWrite ? 'ok' : 'err');
+      toast(state.meta?.canWrite ? '已解锁公网写权限（仅当前浏览器会话有效）！' : '口令未匹配或服务端未开启 Token 写权限。', state.meta?.canWrite ? 'ok' : 'err');
     });
 
     $('btnQuickSave').addEventListener('click', saveDraft);
@@ -1477,6 +1888,19 @@
     $('communityPlayerName')?.addEventListener('change', () => {
       getCommunityPlayerName();
       loadCommunityMods();
+    });
+    $('communityUploaderSecret')?.addEventListener('change', loadCommunityMods);
+    $('btnCopyUploaderSecret')?.addEventListener('click', async () => {
+      if (!state.lastIssuedSecret) return;
+      try {
+        await navigator.clipboard.writeText(state.lastIssuedSecret);
+        toast('已复制 X-Uploader-Secret 管理凭证到剪贴板！');
+      } catch {
+        toast('请手动选中横幅中的凭证文本复制。', 'err');
+      }
+    });
+    $('btnDismissSecretBanner')?.addEventListener('click', () => {
+      $('communitySecretBanner')?.classList.add('hidden');
     });
 
     // 新建空白 Mod
@@ -1513,11 +1937,41 @@
       await saveDraft();
     });
 
-    // 导出与删除 Mod
-    $('btnExportCurrentZip').addEventListener('click', () => {
+    // 导出与删除 Mod（改用 fetch，优雅捕获 HTTP 422 病包阻断并支持可选草稿备份导出）
+    async function downloadWorkshopZip(allowDraft = false) {
       if (!state.currentModId) return;
-      window.location.href = apiUrl(`/api/workshop/mods/${encodeURIComponent(state.currentModId)}/export`);
-    });
+      const qs = allowDraft ? '?allowDraft=true' : '';
+      const headers = state.token ? { 'X-Workshop-Token': state.token } : {};
+      const resp = await fetch(apiUrl(`/api/workshop/mods/${encodeURIComponent(state.currentModId)}/export${qs}`), { headers });
+      if (!resp.ok) {
+        const ct = resp.headers.get('content-type') || '';
+        const errData = ct.includes('application/json') ? await resp.json() : { error: await resp.text() };
+        toast(errData.messageZh || errData.error || `导出失败（HTTP ${resp.status}）`, 'err');
+        const valReport = errData.validation || errData.report;
+        if (valReport) {
+          switchTab('validate');
+          renderValidationReport(valReport);
+        }
+        if (resp.status === 422 && !allowDraft && confirm('当前 Mod 存在未修复的体检错误，禁止作为成品发布导出。\n是否仍要导出仅用于个人备份的未完成草稿包（带 isDraftExport 标记）？')) {
+          await downloadWorkshopZip(true);
+        }
+        return;
+      }
+      const blob = await resp.blob();
+      const disp = resp.headers.get('content-disposition') || '';
+      const m = /filename\*?=(?:UTF-8''|"?)([^";\r\n"]+)/i.exec(disp);
+      const fname = m ? decodeURIComponent(m[1]) : `${state.currentModId}.bazaarmod.zip`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast(allowDraft ? '已导出未完成草稿备份包。' : '已安全打包导出 .bazaarmod.zip！');
+    }
+    $('btnExportCurrentZip').addEventListener('click', () => downloadWorkshopZip(false));
     $('btnDeleteCurrentMod').addEventListener('click', async () => {
       if (!state.currentModId) return;
       if (!confirm(`确认永久删除草稿 Mod「${state.currentModId}」吗？此操作不可撤销。`)) return;
@@ -1667,8 +2121,15 @@
     bindCe('ceTags', (c, v) => { c.tags = v.split(',').map((s) => s.trim()).filter(Boolean); });
     bindCe('ceHiddenTags', (c, v) => { c.hiddenTags = v.split(',').map((s) => s.trim()).filter(Boolean); });
     bindCe('ceDescZh', (c, v) => { c.descZh = v; });
+    bindCe('ceDescEn', (c, v) => { c.descEn = v.trim() || null; });
+    bindCe('ceAccentColor', (c, v) => { c.accentColor = v.trim() || null; });
+    bindCe('ceCustomBgArtFile', (c, v) => { c.customBgArtFile = v.trim() || null; });
+    bindCe('ceBoardOverride', (c, v) => { c.boardOverride = v.trim() || null; });
+    bindCe('cePresentation', (c, v) => { c.presentation = v.trim() || null; });
     bindCe('ceActiveTips', (c, v) => { c.activeTooltipsZh = v.split('\n').map((s) => s.trim()).filter(Boolean); });
     bindCe('cePassiveTips', (c, v) => { c.passiveTooltipsZh = v.split('\n').map((s) => s.trim()).filter(Boolean); });
+    bindCe('ceActiveTipsEn', (c, v) => { const arr = v.split('\n').map((s) => s.trim()).filter(Boolean); c.activeTooltipsEn = arr.length ? arr : null; });
+    bindCe('cePassiveTipsEn', (c, v) => { const arr = v.split('\n').map((s) => s.trim()).filter(Boolean); c.passiveTooltipsEn = arr.length ? arr : null; });
 
     // 占位符快捷芯片
     $('placeholderChips').querySelectorAll('.chip').forEach((ch) => {
@@ -1679,7 +2140,7 @@
       });
     });
 
-    // 1x/2x/4x/8x 自动推算四阶数值
+    // 1x/2x/4x/8x/12x 自动推算五阶数值（含 Legendary）
     $('btnAutoScaleTiers').addEventListener('click', () => {
       const card = state.workspace?.cards[state.selectedCardIdx];
       if (!card || !card.tiers?.Bronze?.attributes) {
@@ -1687,21 +2148,21 @@
         return;
       }
       const b = card.tiers.Bronze.attributes;
-      const mults = { Silver: 2, Gold: 4, Diamond: 8 };
+      const mults = { Silver: 2, Gold: 4, Diamond: 8, Legendary: 12 };
       const keepAutoPrice = $('ceAutoPriceChk')?.checked;
       Object.entries(mults).forEach(([t, mult]) => {
         card.tiers[t] = card.tiers[t] || { attributes: {}, abilityIds: Object.keys(card.abilities || {}), auraIds: Object.keys(card.auras || {}) };
         Object.entries(b).forEach(([k, v]) => {
           if (keepAutoPrice && (k === 'BuyPrice' || k === 'SellPrice')) return;
-          if (k === 'CooldownMax') card.tiers[t].attributes[k] = Math.max(1000, v - (mult >= 4 ? 500 : 0));
-          else if (k === 'HasteAmount' || k === 'ChargeAmount') card.tiers[t].attributes[k] = v + (mult === 2 ? 200 : mult === 4 ? 500 : 1000);
+          if (k === 'CooldownMax') card.tiers[t].attributes[k] = Math.max(1000, v - (mult >= 12 ? 1000 : mult >= 4 ? 500 : 0));
+          else if (k === 'HasteAmount' || k === 'ChargeAmount') card.tiers[t].attributes[k] = v + (mult === 2 ? 200 : mult === 4 ? 500 : mult === 8 ? 1000 : 1500);
           else card.tiers[t].attributes[k] = Math.round(v * mult);
         });
       });
       if (keepAutoPrice) applyStandardPricesToCard(card);
       markDirty(true);
       populateCustomCardForm(card);
-      toast('已按标准 1x/2x/4x/8x 阶梯自动推算四阶数值！');
+      toast('已按标准 1x/2x/4x/8x/12x 阶梯自动推算五阶数值！');
     });
 
     // 添加中文效果积木预设
@@ -1755,7 +2216,7 @@
     });
 
     // Patch 表单同步
-    const bindPe = (id, fn) => $(id).addEventListener('input', () => {
+    const bindPe = (id, fn) => $(id)?.addEventListener('input', () => {
       const patch = state.workspace?.patches[state.selectedPatchIdx];
       if (!patch) return;
       fn(patch, $(id).value);
@@ -1765,10 +2226,21 @@
     });
     bindPe('peNote', (p, v) => { p.note = v; });
     bindPe('peStartingTier', (p, v) => { p.startingTier = v || null; });
+    bindPe('peSpawningEligibility', (p, v) => { p.spawningEligibility = v || null; });
     bindPe('peTitleZh', (p, v) => { p.titleZh = v || null; });
+    bindPe('peTitleEn', (p, v) => { p.titleEn = v.trim() || null; });
+    bindPe('peHeroes', (p, v) => { const arr = v.split(',').map((s) => s.trim()).filter(Boolean); p.heroes = arr.length ? arr : null; });
     bindPe('peAddTags', (p, v) => { p.addTags = v.split(',').map((s) => s.trim()).filter(Boolean); });
     bindPe('peRemoveTags', (p, v) => { p.removeTags = v.split(',').map((s) => s.trim()).filter(Boolean); });
+    bindPe('peAddHiddenTags', (p, v) => { p.addHiddenTags = v.split(',').map((s) => s.trim()).filter(Boolean); });
+    bindPe('peRemoveHiddenTags', (p, v) => { p.removeHiddenTags = v.split(',').map((s) => s.trim()).filter(Boolean); });
     bindPe('peDescZh', (p, v) => { p.descZh = v || null; });
+    bindPe('peDescEn', (p, v) => { p.descEn = v.trim() || null; });
+    bindPe('peActiveTips', (p, v) => { const arr = v.split('\n').map((s) => s.trim()).filter(Boolean); p.activeTooltipsZh = arr.length ? arr : null; });
+    bindPe('pePassiveTips', (p, v) => { const arr = v.split('\n').map((s) => s.trim()).filter(Boolean); p.passiveTooltipsZh = arr.length ? arr : null; });
+    bindPe('peAccentColor', (p, v) => { p.accentColor = v.trim() || null; });
+    bindPe('peBoardOverride', (p, v) => { p.boardOverride = v.trim() || null; });
+    bindPe('pePresentation', (p, v) => { p.presentation = v.trim() || null; });
     $('btnDeletePatch').addEventListener('click', () => {
       if (!state.workspace || state.selectedPatchIdx < 0) return;
       state.workspace.patches.splice(state.selectedPatchIdx, 1);
@@ -1794,6 +2266,7 @@
       state.previewEnchant = $('previewEnchantSelect').value || '';
       const card = state.workspace?.cards[state.selectedCardIdx];
       if (card) updateLivePreview(card);
+      else if (state.workspace?.patches[state.selectedPatchIdx]) updateLivePreviewFromPatch(state.workspace.patches[state.selectedPatchIdx]);
     });
 
     $('btnChooseArt').addEventListener('click', () => $('artFileInput').click());
@@ -1802,10 +2275,18 @@
     });
     $('btnClearArt').addEventListener('click', () => {
       const card = state.workspace?.cards[state.selectedCardIdx];
-      if (!card) return;
-      card.customArtFile = null;
-      markDirty(true);
-      updateLivePreview(card);
+      const patch = state.workspace?.patches[state.selectedPatchIdx];
+      if (card) {
+        card.customArtFile = null;
+        card.artRect = null;
+        markDirty(true);
+        updateLivePreview(card);
+      } else if (patch) {
+        patch.customArtFile = null;
+        patch.artRect = null;
+        markDirty(true);
+        updateLivePreviewFromPatch(patch);
+      }
     });
 
     // 奇遇编辑事件
@@ -1850,22 +2331,57 @@
       renderEventDag();
     });
 
-    const bindEv = (id, fn) => $(id).addEventListener('input', () => {
+    const bindEv = (id, fn, evt = 'input') => $(id)?.addEventListener(evt, () => {
       const ev = state.workspace?.events[state.selectedEventIdx];
       if (!ev) return;
-      fn(ev, $(id).value);
+      fn(ev, $(id));
       markDirty(true);
       renderEventList();
       renderEventDag();
     });
-    bindEv('evId', (e, v) => { e.eventId = v.trim(); });
-    bindEv('evBaseVisualId', (e, v) => { e.baseVisualTemplateId = v.trim(); });
-    bindEv('evTitleZh', (e, v) => { e.titleZh = v; });
-    bindEv('evHeroes', (e, v) => { e.heroes = v.split(',').map((s) => s.trim()).filter(Boolean); });
-    bindEv('evMinDay', (e, v) => { e.minDay = parseInt(v, 10) || 1; });
-    bindEv('evMaxDay', (e, v) => { e.maxDay = parseInt(v, 10) || 99; });
-    bindEv('evWeight', (e, v) => { e.weight = parseFloat(v) || 0; });
-    bindEv('evDescZh', (e, v) => { e.descZh = v; });
+    bindEv('evId', (e, el) => { e.eventId = el.value.trim(); });
+    bindEv('evBaseVisualId', (e, el) => { e.baseVisualTemplateId = el.value.trim(); });
+    bindEv('evType', (e, el) => {
+      e.eventType = el.value || 'EventEncounter';
+      $('evCombatMonsterWrap')?.classList.toggle('hidden', e.eventType !== 'CombatEncounter');
+    }, 'change');
+    bindEv('evTitleZh', (e, el) => { e.titleZh = el.value; });
+    bindEv('evTitleEn', (e, el) => { e.titleEn = el.value.trim() || null; });
+    bindEv('evHeroes', (e, el) => { e.heroes = el.value.split(',').map((s) => s.trim()).filter(Boolean); });
+    bindEv('evMinDay', (e, el) => { e.minDay = parseInt(el.value, 10) || 1; });
+    bindEv('evMaxDay', (e, el) => { e.maxDay = parseInt(el.value, 10) || 99; });
+    bindEv('evWeight', (e, el) => { e.weight = parseFloat(el.value) || 0; });
+    // 严格对齐 CustomEventDefinition [JsonPropertyName("hours")]
+    bindEv('evHours', (e, el) => {
+      const arr = el.value.split(/[,，\s]+/).map((s) => parseInt(s, 10)).filter((n) => Number.isInteger(n) && n >= 0 && n <= 6);
+      e.hours = arr.length ? arr : null;
+      delete e.allowedHours;
+    }, 'change');
+    bindEv('evDifficultySlot', (e, el) => { e.difficultySlot = el.value || null; }, 'change');
+    bindEv('evOncePerRun', (e, el) => { e.oncePerRun = !!el.checked; }, 'change');
+    bindEv('evChainOnly', (e, el) => { e.chainOnly = !!el.checked; }, 'change');
+    bindEv('evDescZh', (e, el) => { e.descZh = el.value; });
+    bindEv('evDescEn', (e, el) => { e.descEn = el.value.trim() || null; });
+    bindEv('evStartingTier', (e, el) => { e.startingTier = el.value || null; }, 'change');
+    bindEv('evCustomArtFile', (e, el) => { e.customArtFile = el.value.trim() || null; });
+    bindEv('evCustomBgArtFile', (e, el) => { e.customBgArtFile = el.value.trim() || null; });
+    bindEv('evBoardOverride', (e, el) => { e.boardOverride = el.value.trim() || null; });
+    bindEv('evPresentation', (e, el) => { e.presentation = el.value.trim() || null; });
+    bindEv('evRewardCombatGold', (e, el) => { e.rewardCombatGold = el.value === '' ? null : parseInt(el.value, 10); });
+    bindEv('evRewardCombatXp', (e, el) => { e.rewardCombatXp = el.value === '' ? null : parseInt(el.value, 10); });
+    $('evCombatMonsterJson')?.addEventListener('change', () => {
+      const ev = state.workspace?.events[state.selectedEventIdx];
+      if (!ev) return;
+      const raw = $('evCombatMonsterJson').value.trim();
+      if (!raw) { ev.combatMonster = null; markDirty(true); return; }
+      try {
+        ev.combatMonster = JSON.parse(raw);
+        markDirty(true);
+        toast('已更新战斗野怪模板 JSON。');
+      } catch (ex) {
+        toast(`野怪 JSON 语法错误：${ex.message}`, 'err');
+      }
+    });
 
     $('btnAddEventStep').addEventListener('click', () => {
       const ev = state.workspace?.events[state.selectedEventIdx];
@@ -1907,27 +2423,51 @@
       renderEventDag();
     });
 
-    // 一键标准化修复（补齐 abilityIds/auraIds、修正冷却秒转 ms）
+    // 一键标准化修复（同时覆盖 cards、patches 与 events.steps：补齐 abilityIds/auraIds、冷却秒转 ms、补 TTriggerOnCardSelected）
     $('btnAutoFixCommon').addEventListener('click', () => {
       if (!state.workspace) return;
       let fixed = 0;
+      const fixAttrMap = (attrs) => {
+        if (!attrs) return;
+        DURATION_ATTRS.forEach((k) => {
+          if (attrs[k] > 0 && attrs[k] <= 60) {
+            attrs[k] = Math.round(attrs[k] * 1000);
+            fixed++;
+          }
+        });
+      };
       (state.workspace.cards || []).forEach((c) => {
+        fixAttrMap(c.attributes);
         if (c.tiers) {
           const abIds = Object.keys(c.abilities || {});
           const auIds = Object.keys(c.auras || {});
           Object.values(c.tiers).forEach((td) => {
             if (abIds.length && (!td.abilityIds || !td.abilityIds.length)) { td.abilityIds = [...abIds]; fixed++; }
             if (auIds.length && (!td.auraIds || !td.auraIds.length)) { td.auraIds = [...auIds]; fixed++; }
-            if (td.attributes?.CooldownMax > 0 && td.attributes.CooldownMax <= 60) {
-              td.attributes.CooldownMax = Math.round(td.attributes.CooldownMax * 1000);
-              fixed++;
-            }
+            fixAttrMap(td.attributes);
           });
         }
       });
+      (state.workspace.patches || []).forEach((p) => {
+        fixAttrMap(p.attributeOverrides);
+        if (p.tierAttributeOverrides) {
+          Object.values(p.tierAttributeOverrides).forEach(fixAttrMap);
+        }
+      });
+      (state.workspace.events || []).forEach((ev) => {
+        (ev.steps || []).forEach((st) => {
+          fixAttrMap(st.attributes);
+          Object.values(st.abilities || {}).forEach((ab) => {
+            if (!ab.trigger || !ab.trigger.$type) {
+              ab.trigger = { $type: 'TTriggerOnCardSelected' };
+              fixed++;
+            }
+          });
+        });
+      });
       if (fixed > 0) {
         markDirty(true);
-        toast(`已自动标准化修复 ${fixed} 处常见问题，正在重新跑 10 道体检...`);
+        toast(`已自动标准化修复 ${fixed} 处常见问题（含卡牌、补丁与事件步骤），正在重新跑 10 道体检...`);
       } else {
         toast('未发现需要自动修复的常见格式问题。');
       }
@@ -1955,9 +2495,10 @@
     const res = await apiFetch('/api/workshop/mods/import', { method: 'POST', body: fd });
     if (!res.ok) {
       toast(res.data?.error || `导入被拦截（HTTP ${res.status}）`, 'err');
-      if (res.data?.validation) {
+      const valReport = res.data?.validation || res.data?.report;
+      if (valReport) {
         switchTab('validate');
-        renderValidationReport(res.data.validation);
+        renderValidationReport(valReport);
       }
       return;
     }
@@ -1973,6 +2514,7 @@
     apiUrl,
     toast,
     escapeHtml,
+    safeNumAttr,
     markDirty,
     switchTab,
     updateCounts,
@@ -1986,6 +2528,9 @@
     updateLivePreviewFromPatch,
     saveDraft,
     loadMeta,
+    ensureVanillaBlueprint,
+    applyEnchantmentPreviewToAttrs,
+    renderCounterBadgesOnPreview,
     generateUniqueCardId,
     MATRIX_ATTRS,
     TIERS,

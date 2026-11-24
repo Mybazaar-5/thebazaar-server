@@ -16,6 +16,7 @@ using Microsoft.Extensions.Logging;
 
 namespace BazaarCore.Tests;
 
+[Xunit.Collection("GlobalStaticState")]
 public sealed class V8CosmeticsChestsTests
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };

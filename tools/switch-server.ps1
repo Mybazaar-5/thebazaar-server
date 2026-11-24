@@ -7,7 +7,7 @@ param(
 )
 
 if ([string]::IsNullOrWhiteSpace($GameDir)) {
-    foreach ($d in @("C:\Program Files (x86)\Steam\steamapps\common\The Bazaar","D:\SteamLibrary\steamapps\common\The Bazaar","E:\SteamLibrary\steamapps\common\The Bazaar")) {
+    foreach ($d in @("C:\Program Files (x86)\Steam\steamapps\common\The Bazaar","<THE_BAZAAR_GAME_DIR>","<THE_BAZAAR_GAME_DIR>")) {
         if (Test-Path (Join-Path $d "TheBazaar.exe")) { $GameDir = $d; break }
     }
 }
@@ -27,7 +27,7 @@ switch ($Target) {
         Write-Host "已切换至本机自有服: $url" -ForegroundColor Green
     }
     "remote" {
-        $url = if ($CustomUrl) { $CustomUrl } else { throw "请通过 -CustomUrl 指定你部署的远程服务器地址，例如: -CustomUrl http://1.2.3.4:8080" }
+        $url = if ($CustomUrl) { $CustomUrl } else { throw "请通过 -CustomUrl 指定你部署的远程服务器地址，例如: -CustomUrl http://203.0.113.10:8080" }
         $content = [regex]::Replace($content, '(?m)^Enabled\s*=.*$', 'Enabled = true')
         $content = [regex]::Replace($content, '(?m)^ServerBase\s*=.*$', "ServerBase = $url")
         Write-Host "已切换至云端自有服: $url" -ForegroundColor Green

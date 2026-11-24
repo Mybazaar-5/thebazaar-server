@@ -52,12 +52,20 @@ internal sealed partial class ModContentSyncClient
     private readonly List<IDisposable> _syncedRoomBundleTextHandles = new();
     private readonly List<IDisposable> _syncedCardTextHandles = new();
     private List<ServerModEntry> _serverMods = new();
+    private readonly List<IDisposable> _syncedReplayBindingHandles = new();
     private List<ServerCustomContentItem> _customContents = new();
+    private HashSet<string> _globalDonorTemplateIds = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _roomDonorTemplateIds = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _activeDonorTemplateIds = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> _donorTemplateIds = new(StringComparer.OrdinalIgnoreCase);
-    private int _syncInFlight;
+    private long _syncGeneration;
+    private long _roomBundleSyncEpoch;
+    private CancellationTokenSource _serverSyncCts;
     private int _activeBindingsInFlight;
     private int _activeBindingsResyncQueued;
     private long _lastAutoBindingsTickMs;
+    private long _lastRevSyncTickMs;
+    private string _lastVisualBindingsRev = string.Empty;
     private string _lastModSetHash = string.Empty;
     private string _lastOverlaySha256 = string.Empty;
     private string _lastSyncSummary = "尚未同步";
@@ -69,32 +77,80 @@ internal sealed partial class ModContentSyncClient
     internal string LastOverlaySha256 => _lastOverlaySha256;
     internal string LastSyncSummary => _lastSyncSummary;
     internal DateTime LastSyncUtc => _lastSyncUtc;
+    internal string LastVisualBindingsRev => _lastVisualBindingsRev;
 
-    internal string CurrentServerCacheDir
+    internal static string GetServerCacheDirForUrl(string baseUrl)
+    {
+        string key = string.IsNullOrWhiteSpace(baseUrl)
+            ? "default"
+            : ComputeSha256Hex(Encoding.UTF8.GetBytes(baseUrl.Trim().TrimEnd('/').ToLowerInvariant())).Substring(0, 12);
+        string dir = Path.Combine(ModuleHost.CacheDirectory, "srv_" + key);
+        try { Directory.CreateDirectory(dir); } catch { }
+        return dir;
+    }
+
+    internal static string GetOverlayCachePathForUrl(string baseUrl)
+        => Path.Combine(GetServerCacheDirForUrl(baseUrl), "custom_zh_overlay.json");
+
+    internal string CurrentServerCacheDir => GetServerCacheDirForUrl(NameAuth.GetServerBaseUrl());
+
+    /// <summary>D7-P1-02：与 BazaarHub 共享统一的按 SHA-256 内容寻址 CAS 资产池（BepInEx\config\BazaarModCache\assets\）。</summary>
+    internal string SharedAssetsCacheDir
     {
         get
         {
-            string baseUrl = NameAuth.GetServerBaseUrl();
-            string key = string.IsNullOrWhiteSpace(baseUrl)
-                ? "default"
-                : ComputeSha256Hex(Encoding.UTF8.GetBytes(baseUrl.ToLowerInvariant())).Substring(0, 12);
-            string dir = Path.Combine(ModuleHost.CacheDirectory, "srv_" + key);
+            string dir = Path.Combine(ModuleHost.CacheDirectory, "assets");
             try { Directory.CreateDirectory(dir); } catch { }
             return dir;
         }
     }
 
-    internal string AssetsCacheDir
-    {
-        get
-        {
-            string dir = Path.Combine(CurrentServerCacheDir, "assets");
-            try { Directory.CreateDirectory(dir); } catch { }
-            return dir;
-        }
-    }
+    internal string AssetsCacheDir => SharedAssetsCacheDir;
+
+    internal string LegacyServerAssetsCacheDir => Path.Combine(CurrentServerCacheDir, "assets");
 
     internal string OverlayCachePath => Path.Combine(CurrentServerCacheDir, "custom_zh_overlay.json");
+
+    internal long AdvanceSyncGenerationForTest() => Interlocked.Increment(ref _syncGeneration);
+    internal bool IsSyncGenerationCurrent(long generation) => Volatile.Read(ref _syncGeneration) == generation;
+    internal long AdvanceRoomBundleEpochForTest() => Interlocked.Increment(ref _roomBundleSyncEpoch);
+    internal bool IsRoomBundleEpochCurrent(long epoch) => Volatile.Read(ref _roomBundleSyncEpoch) == epoch;
+
+    private void RebuildDonorTemplateIdsLocked()
+    {
+        var merged = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string id in _globalDonorTemplateIds) merged.Add(id);
+        foreach (string id in _roomDonorTemplateIds) merged.Add(id);
+        foreach (string id in _activeDonorTemplateIds) merged.Add(id);
+        _donorTemplateIds = merged;
+    }
+
+    private (long Generation, CancellationToken Token) BeginNewServerSyncGeneration()
+    {
+        CancellationTokenSource oldCts;
+        CancellationTokenSource nextCts = CancellationTokenSource.CreateLinkedTokenSource(HttpClientHub.ShutdownToken);
+        long gen;
+        lock (_sync)
+        {
+            gen = Interlocked.Increment(ref _syncGeneration);
+            oldCts = _serverSyncCts;
+            _serverSyncCts = nextCts;
+        }
+        if (oldCts != null)
+        {
+            try { oldCts.Cancel(); } catch { }
+            try { oldCts.Dispose(); } catch { }
+        }
+        return (gen, nextCts.Token);
+    }
+
+    private CancellationToken GetCurrentServerSyncToken()
+    {
+        lock (_sync)
+        {
+            return _serverSyncCts != null ? _serverSyncCts.Token : HttpClientHub.ShutdownToken;
+        }
+    }
 
     internal IReadOnlyList<ServerModEntry> GetServerModsSnapshot()
     {
@@ -112,46 +168,88 @@ internal sealed partial class ModContentSyncClient
         }
     }
 
-    /// <summary>触发后台全量异步同步（/api/mods/manifest + /api/localization/overlay + /api/mods/active-bindings）。</summary>
+    /// <summary>触发后台全量异步同步（P0-29：单调 SyncGeneration + 独立 CTS，切服先取消旧任务绝不静默丢弃新服）。</summary>
     internal void TriggerFullSyncInBackground(bool forceDownload = false)
     {
-        if (Interlocked.CompareExchange(ref _syncInFlight, 1, 0) != 0)
-        {
-            return;
-        }
+        var (gen, syncCt) = BeginNewServerSyncGeneration();
 
         _ = Task.Run(async () =>
         {
             try
             {
-                await SyncAllAsync(forceDownload, HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                await SyncAllInternalAsync(forceDownload, gen, syncCt).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
                 BazaarLauncherPlugin.Log?.LogWarning("[ModSync] 后台同步异常: " + ex.Message);
             }
-            finally
-            {
-                Interlocked.Exchange(ref _syncInFlight, 0);
-            }
         });
     }
 
-    /// <summary>同步当前活跃对局的自定义实例视觉与文案绑定（/api/mods/active-bindings）。</summary>
-    internal void TriggerActiveBindingsSyncInBackground(string runId = null)
+    /// <summary>D3-P1-13：由常驻 CloudGuard 响应头感知 X-Visual-Bindings-Rev 变更，节流触发活跃绑定同步。</summary>
+    internal void NotifyVisualBindingsRevObserved(string observedRev)
     {
+        if (string.IsNullOrWhiteSpace(observedRev)) return;
+        if (BazaarLauncherPlugin.AcceptServerMods != null && !BazaarLauncherPlugin.AcceptServerMods.Value) return;
+        if (string.Equals(_lastVisualBindingsRev, observedRev, StringComparison.Ordinal)) return;
+
+        long nowMs = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
+        long prevMs = Interlocked.Read(ref _lastRevSyncTickMs);
+        if (nowMs - prevMs < 1500)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref _lastRevSyncTickMs, nowMs);
+        _lastVisualBindingsRev = observedRev;
+        TriggerActiveBindingsSyncInBackground();
+    }
+
+    /// <summary>P0-29：退出对局返回主大厅时清理局内活跃绑定与回放绑定快照，防止跨局残留。</summary>
+    internal void OnReturnedToMainMenu()
+    {
+        bool hadAny;
+        lock (_sync)
+        {
+            hadAny = _syncedActiveBindingHandles.Count > 0
+                || _syncedReplayBindingHandles.Count > 0
+                || _activeDonorTemplateIds.Count > 0;
+            DisposeHandlesLocked(_syncedActiveBindingHandles);
+            DisposeHandlesLocked(_syncedReplayBindingHandles);
+            _activeDonorTemplateIds.Clear();
+            _lastVisualBindingsRev = string.Empty;
+            RebuildDonorTemplateIdsLocked();
+        }
+        if (hadAny)
+        {
+            NotifyVisualAndLocaleChanged("return-main-menu");
+        }
+    }
+
+    /// <summary>同步当前活跃对局或观战目标的自定义实例视觉与文案绑定（/api/mods/active-bindings）。</summary>
+    internal void TriggerActiveBindingsSyncInBackground(string runId = null, string accountId = null, string watchCode = null)
+    {
+        if (BazaarLauncherPlugin.AcceptServerMods != null && !BazaarLauncherPlugin.AcceptServerMods.Value)
+        {
+            ClearSyncedServerMods();
+            return;
+        }
+
         if (Interlocked.CompareExchange(ref _activeBindingsInFlight, 1, 0) != 0)
         {
             Interlocked.Exchange(ref _activeBindingsResyncQueued, 1);
             return;
         }
 
+        CancellationToken syncCt = GetCurrentServerSyncToken();
+        long capturedGen = Volatile.Read(ref _syncGeneration);
+
         _ = Task.Run(async () =>
         {
             try
             {
-                await SyncActiveBindingsAsync(runId, HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                await SyncActiveBindingsInternalAsync(runId, accountId, watchCode, capturedGen, syncCt).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
@@ -161,9 +259,9 @@ internal sealed partial class ModContentSyncClient
             finally
             {
                 Interlocked.Exchange(ref _activeBindingsInFlight, 0);
-                if (Interlocked.Exchange(ref _activeBindingsResyncQueued, 0) != 0)
+                if (Interlocked.Exchange(ref _activeBindingsResyncQueued, 0) != 0 && IsSyncGenerationCurrent(capturedGen))
                 {
-                    TriggerActiveBindingsSyncInBackground(runId);
+                    TriggerActiveBindingsSyncInBackground(runId, accountId, watchCode);
                 }
             }
         });
@@ -213,10 +311,16 @@ internal sealed partial class ModContentSyncClient
     }
 
     /// <summary>执行一次完整的 Mod 清单、PNG 资产、四层中文词典和活跃绑定同步。</summary>
-    internal async Task<bool> SyncAllAsync(bool forceRefresh = false, CancellationToken ct = default)
+    internal Task<bool> SyncAllAsync(bool forceRefresh = false, CancellationToken ct = default)
+    {
+        long gen = Volatile.Read(ref _syncGeneration);
+        return SyncAllInternalAsync(forceRefresh, gen, ct);
+    }
+
+    private async Task<bool> SyncAllInternalAsync(bool forceRefresh, long capturedGen, CancellationToken ct)
     {
         string baseUrl = NameAuth.GetServerBaseUrl();
-        if (string.IsNullOrWhiteSpace(baseUrl))
+        if (string.IsNullOrWhiteSpace(baseUrl) || ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen))
         {
             return false;
         }
@@ -226,7 +330,8 @@ internal sealed partial class ModContentSyncClient
         int enabledMods = 0;
 
         // 1. 拉取外挂四层中文词典 /api/localization/overlay（回退 /api/localization/zh-overlay）
-        await SyncLocalizationOverlayAsync(forceRefresh, ct).ConfigureAwait(false);
+        await SyncLocalizationOverlayAsync(forceRefresh, capturedGen, ct).ConfigureAwait(false);
+        if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return false;
 
         // 若用户关闭「允许接收服务器下发的 Mod」，清掉已注册的服务端 Mod 贴图与文案并直接结束
         if (BazaarLauncherPlugin.AcceptServerMods != null && !BazaarLauncherPlugin.AcceptServerMods.Value)
@@ -239,6 +344,8 @@ internal sealed partial class ModContentSyncClient
 
         // 2. 拉取服务端 Mod 清单 /api/mods/manifest
         var manifestResp = await NameAuth.GetJsonAsync("/api/mods/manifest", ct).ConfigureAwait(false);
+        if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return false;
+
         if (manifestResp.Ok && !string.IsNullOrWhiteSpace(manifestResp.Body))
         {
             var root = JObject.Parse(manifestResp.Body);
@@ -271,12 +378,13 @@ internal sealed partial class ModContentSyncClient
                 }
             }
 
-            // 按 SHA-256 增量下载自定义 PNG 资产
+            // 按 SHA-256 增量下载自定义 PNG/JPEG 资产到统一共享 CAS 池
             var shaToLocalPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (root["assets"] is JArray assetsArr)
             {
                 foreach (var token in assetsArr)
                 {
+                    if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return false;
                     if (token is not JObject ao) continue;
                     string sha = NormalizeSha((string)(ao["sha256"] ?? ao["hash"]));
                     if (string.IsNullOrEmpty(sha)) continue;
@@ -313,15 +421,17 @@ internal sealed partial class ModContentSyncClient
                 }
             }
 
-            // 额外解析 customEvents / customSkills 摘要目录用于工坊展示
-            AppendCatalogSummary(root["customSkills"] as JArray, "Skill", parsedContents);
+            // D3-P2-06：服务端已在 customCards 中按 cardType 统一承载 Item/Skill，移除废弃的 customSkills 死分支
             AppendCatalogSummary(root["customEvents"] as JArray, "EventEncounter", parsedContents);
 
-            ApplySyncedVisualAndTextHandles(newVisualBindings, newTextOverrides, isActiveBinding: false);
+            if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return false;
+
+            ApplySyncedVisualAndTextHandles(newVisualBindings, newTextOverrides, isActiveBinding: false, capturedGen);
             bindingCount = newVisualBindings.Count;
 
             lock (_sync)
             {
+                if (!IsSyncGenerationCurrent(capturedGen)) return false;
                 _serverMods = parsedMods;
                 _customContents = parsedContents;
                 var donors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -330,13 +440,15 @@ internal sealed partial class ModContentSyncClient
                     if (!string.IsNullOrWhiteSpace(item.BaseVisualTemplateId))
                         donors.Add(item.BaseVisualTemplateId.Trim());
                 }
-                _donorTemplateIds = donors;
+                _globalDonorTemplateIds = donors;
+                RebuildDonorTemplateIdsLocked();
+                _lastModSetHash = modSetHash;
             }
-            _lastModSetHash = modSetHash;
         }
 
         // 3. 拉取当前活跃对局实例绑定
-        await SyncActiveBindingsAsync(null, ct).ConfigureAwait(false);
+        await SyncActiveBindingsInternalAsync(null, null, null, capturedGen, ct).ConfigureAwait(false);
+        if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return false;
 
         _lastSyncUtc = DateTime.UtcNow;
         _lastSyncSummary = $"已同步 {enabledMods} 个 Mod / {bindingCount} 条视觉绑定 / 缓存 {downloadedPngs} 张贴图";
@@ -350,12 +462,38 @@ internal sealed partial class ModContentSyncClient
         return true;
     }
 
-    /// <summary>同步当前对局实例级绑定：优先 /api/mods/active-bindings，兼容 /api/runs/{runId}/visual-bindings。</summary>
-    internal async Task SyncActiveBindingsAsync(string runId = null, CancellationToken ct = default)
+    /// <summary>同步当前对局或观战目标的实例级绑定（P0-26 支援 ?watchCode=&amp;runId=&amp;accountId=；D3-P1-13 尊重 AcceptServerMods）。</summary>
+    internal Task SyncActiveBindingsAsync(
+        string runId = null,
+        CancellationToken ct = default,
+        string accountId = null,
+        string watchCode = null)
     {
-        string path = string.IsNullOrWhiteSpace(runId)
-            ? "/api/mods/active-bindings"
-            : $"/api/mods/active-bindings?runId={Uri.EscapeDataString(runId)}";
+        long gen = Volatile.Read(ref _syncGeneration);
+        return SyncActiveBindingsInternalAsync(runId, accountId, watchCode, gen, ct);
+    }
+
+    private async Task SyncActiveBindingsInternalAsync(
+        string runId,
+        string accountId,
+        string watchCode,
+        long capturedGen,
+        CancellationToken ct)
+    {
+        // D3-P1-13：严格尊重 AcceptServerMods = false
+        if (BazaarLauncherPlugin.AcceptServerMods != null && !BazaarLauncherPlugin.AcceptServerMods.Value)
+        {
+            ClearSyncedServerMods();
+            return;
+        }
+
+        if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return;
+
+        var qp = new List<string>(3);
+        if (!string.IsNullOrWhiteSpace(watchCode)) qp.Add("watchCode=" + Uri.EscapeDataString(watchCode.Trim()));
+        if (!string.IsNullOrWhiteSpace(runId)) qp.Add("runId=" + Uri.EscapeDataString(runId.Trim()));
+        if (!string.IsNullOrWhiteSpace(accountId)) qp.Add("accountId=" + Uri.EscapeDataString(accountId.Trim()));
+        string path = qp.Count > 0 ? "/api/mods/active-bindings?" + string.Join("&", qp) : "/api/mods/active-bindings";
 
         var resp = await NameAuth.GetJsonAsync(path, ct).ConfigureAwait(false);
         if (!resp.Ok && !string.IsNullOrWhiteSpace(runId))
@@ -363,12 +501,36 @@ internal sealed partial class ModContentSyncClient
             resp = await NameAuth.GetJsonAsync($"/api/runs/{Uri.EscapeDataString(runId)}/visual-bindings", ct).ConfigureAwait(false);
         }
         if (!resp.Ok || string.IsNullOrWhiteSpace(resp.Body)) return;
+        if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return;
 
         var root = JObject.Parse(resp.Body);
+        string rev = (string)(root["revision"] ?? root["visualBindingsRev"]);
+        if (!string.IsNullOrWhiteSpace(rev)) _lastVisualBindingsRev = rev;
+
         var shaToPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var visuals = new List<CardVisualBinding>();
         var texts = new List<CardTextOverride>();
-        var dummyContents = new List<ServerCustomContentItem>();
+        var activeContents = new List<ServerCustomContentItem>();
+        var activeDonors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // P0-18：同步解析 templateCatalog 更新 _activeDonorTemplateIds 并补充模板级绑定
+        JToken catalogToken = root["templateCatalog"] ?? root["templates"];
+        if (catalogToken is JObject catObj)
+        {
+            foreach (var prop in catObj.Properties())
+            {
+                if (prop.Value is not JObject bo) continue;
+                await ExtractBindingObjectAsync(bo, prop.Name, isActiveBinding: false, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
+            }
+        }
+        else if (catalogToken is JArray catArr)
+        {
+            foreach (var token in catArr)
+            {
+                if (token is not JObject bo) continue;
+                await ExtractBindingObjectAsync(bo, null, isActiveBinding: false, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
+            }
+        }
 
         JToken mapToken = root["bindings"] ?? root["activeBindings"] ?? root;
         if (mapToken is JObject mapObj)
@@ -376,7 +538,7 @@ internal sealed partial class ModContentSyncClient
             foreach (var prop in mapObj.Properties())
             {
                 if (prop.Value is not JObject bo) continue;
-                await ExtractBindingObjectAsync(bo, prop.Name, isActiveBinding: true, shaToPath, dummyContents, visuals, texts, false, ct).ConfigureAwait(false);
+                await ExtractBindingObjectAsync(bo, prop.Name, isActiveBinding: true, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
             }
         }
         else if (mapToken is JArray arr)
@@ -384,20 +546,130 @@ internal sealed partial class ModContentSyncClient
             foreach (var token in arr)
             {
                 if (token is not JObject bo) continue;
-                await ExtractBindingObjectAsync(bo, null, isActiveBinding: true, shaToPath, dummyContents, visuals, texts, false, ct).ConfigureAwait(false);
+                await ExtractBindingObjectAsync(bo, null, isActiveBinding: true, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
             }
         }
 
-        ApplySyncedVisualAndTextHandles(visuals, texts, isActiveBinding: true);
+        if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return;
+
+        foreach (var item in activeContents)
+        {
+            if (!string.IsNullOrWhiteSpace(item.BaseVisualTemplateId))
+            {
+                activeDonors.Add(item.BaseVisualTemplateId.Trim());
+            }
+        }
+
+        lock (_sync)
+        {
+            if (!IsSyncGenerationCurrent(capturedGen)) return;
+            _activeDonorTemplateIds = activeDonors;
+            RebuildDonorTemplateIdsLocked();
+        }
+
+        ApplySyncedVisualAndTextHandles(visuals, texts, isActiveBinding: true, capturedGen);
     }
 
-    private async Task SyncLocalizationOverlayAsync(bool forceRefresh, CancellationToken ct)
+    /// <summary>P0-26：消费战报回放记录内嵌的 visualBindings / visualBindingsJson 快照，以独立句柄组还原历史卡图与双语文案。</summary>
+    internal async Task ApplyReplayVisualBindingsSnapshotAsync(JToken visualBindingsToken, CancellationToken ct = default)
+    {
+        if (visualBindingsToken == null || visualBindingsToken.Type == JTokenType.Null)
+        {
+            ClearReplayVisualBindings();
+            return;
+        }
+        if (BazaarLauncherPlugin.AcceptServerMods != null && !BazaarLauncherPlugin.AcceptServerMods.Value)
+        {
+            return;
+        }
+
+        JToken parsed = visualBindingsToken;
+        if (visualBindingsToken.Type == JTokenType.String)
+        {
+            string raw = visualBindingsToken.Value<string>();
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                ClearReplayVisualBindings();
+                return;
+            }
+            try { parsed = JToken.Parse(raw); }
+            catch { return; }
+        }
+
+        var shaToPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var visuals = new List<CardVisualBinding>();
+        var texts = new List<CardTextOverride>();
+        var dummy = new List<ServerCustomContentItem>();
+
+        JToken inner = parsed is JObject jo && (jo["bindings"] != null || jo["visualBindings"] != null)
+            ? (jo["bindings"] ?? jo["visualBindings"])
+            : parsed;
+
+        if (inner is JObject mapObj)
+        {
+            foreach (var prop in mapObj.Properties())
+            {
+                if (prop.Value is not JObject bo) continue;
+                await ExtractBindingObjectAsync(bo, prop.Name, isActiveBinding: true, shaToPath, dummy, visuals, texts, false, ct).ConfigureAwait(false);
+            }
+        }
+        else if (inner is JArray arr)
+        {
+            foreach (var token in arr)
+            {
+                if (token is not JObject bo) continue;
+                await ExtractBindingObjectAsync(bo, null, isActiveBinding: true, shaToPath, dummy, visuals, texts, false, ct).ConfigureAwait(false);
+            }
+        }
+
+        var visualReg = BazaarLauncherPlugin.Host?.VisualRegistry;
+        var l10nReg = BazaarLauncherPlugin.Host?.LocalizationRegistry;
+        lock (_sync)
+        {
+            DisposeHandlesLocked(_syncedReplayBindingHandles);
+            if (visualReg != null)
+            {
+                foreach (var v in visuals)
+                {
+                    v.Priority = Math.Max(v.Priority, 600);
+                    _syncedReplayBindingHandles.Add(visualReg.RegisterVisualBinding(v));
+                }
+            }
+            if (l10nReg != null)
+            {
+                foreach (var t in texts)
+                {
+                    t.Priority = Math.Max(t.Priority, 600);
+                    _syncedReplayBindingHandles.Add(l10nReg.RegisterCardTextOverride(t));
+                }
+            }
+        }
+        NotifyVisualAndLocaleChanged("replay-bindings");
+    }
+
+    internal void ClearReplayVisualBindings()
+    {
+        bool hadAny;
+        lock (_sync)
+        {
+            hadAny = _syncedReplayBindingHandles.Count > 0;
+            DisposeHandlesLocked(_syncedReplayBindingHandles);
+        }
+        if (hadAny)
+        {
+            NotifyVisualAndLocaleChanged("clear-replay-bindings");
+        }
+    }
+
+    private async Task SyncLocalizationOverlayAsync(bool forceRefresh, long capturedGen, CancellationToken ct)
     {
         var resp = await NameAuth.GetJsonAsync("/api/localization/overlay", ct).ConfigureAwait(false);
         if (!resp.Ok)
         {
             resp = await NameAuth.GetJsonAsync("/api/localization/zh-overlay?locale=zh-CN", ct).ConfigureAwait(false);
         }
+
+        if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return;
 
         if (resp.Ok && !string.IsNullOrWhiteSpace(resp.Body))
         {
@@ -451,9 +723,12 @@ internal sealed partial class ModContentSyncClient
         string cardType = (string)(bo["cardType"] ?? bo["type"]) ?? "Item";
         string size = (string)(bo["size"] ?? bo["Size"]) ?? "Medium";
         string nameZh = (string)(bo["nameZh"] ?? bo["titleZh"] ?? bo["title"]) ?? string.Empty;
+        string titleEn = (string)(bo["titleEn"] ?? bo["nameEn"]) ?? string.Empty;
         string descZh = (string)(bo["descZh"] ?? bo["descriptionZh"] ?? bo["description"]) ?? string.Empty;
-        // 对齐服务端 CustomCardVisualBinding.CustomArtSha256 (JSON 字段名 customArtSha256)
+        string descEn = (string)(bo["descEn"] ?? bo["descriptionEn"]) ?? string.Empty;
+        // 对齐服务端 CustomCardVisualBinding.CustomArtSha256 与 CustomBgArtSha256（D3-P1-11）
         string artSha = NormalizeSha((string)(bo["customArtSha256"] ?? bo["customArtHash"] ?? bo["artSha256"] ?? bo["sha256"]));
+        string bgArtSha = NormalizeSha((string)(bo["customBgArtSha256"] ?? bo["bgArtSha256"]));
 
         string localArtPath = string.Empty;
         if (!string.IsNullOrEmpty(artSha))
@@ -464,6 +739,19 @@ internal sealed partial class ModContentSyncClient
                 if (!string.IsNullOrEmpty(localArtPath))
                 {
                     shaCache[artSha] = localArtPath;
+                }
+            }
+        }
+
+        string localBgArtPath = string.Empty;
+        if (!string.IsNullOrEmpty(bgArtSha))
+        {
+            if (!shaCache.TryGetValue(bgArtSha, out localBgArtPath))
+            {
+                localBgArtPath = await EnsureAssetCachedAsync(bgArtSha, forceRefresh, ct).ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(localBgArtPath))
+                {
+                    shaCache[bgArtSha] = localBgArtPath;
                 }
             }
         }
@@ -481,13 +769,23 @@ internal sealed partial class ModContentSyncClient
             LocalArtPath = localArtPath,
         });
 
-        // 若 customId 借用原版载体模板（customId != baseTemplateId），模板级绑定严禁把 TemplateId 设为 baseTemplateId，
-        // 否则会劫持正常对局里原版载体卡的卡图与文案；仅在显式覆盖原版模板或实例级绑定时匹配。
+        bool? explicitPatch = (bool?)bo["isPatchOverride"];
+        bool? explicitBorrow = (bool?)bo["isCustomBorrowShell"];
+        bool isPatchOverride = explicitPatch
+            ?? (!string.IsNullOrWhiteSpace(baseTemplateId)
+                && string.Equals(customId, baseTemplateId, StringComparison.OrdinalIgnoreCase));
+        bool isCustomBorrowShell = explicitBorrow
+            ?? (!isPatchOverride && !string.IsNullOrWhiteSpace(customId));
+
+        // 仅原位 Patch（isPatchOverride == true 或 customId == baseTemplateId）允许模板级覆盖
         bool isDirectTemplateOverride = string.IsNullOrWhiteSpace(instanceId)
             && !string.IsNullOrWhiteSpace(baseTemplateId)
-            && string.Equals(customId, baseTemplateId, StringComparison.OrdinalIgnoreCase);
+            && (isPatchOverride || string.Equals(customId, baseTemplateId, StringComparison.OrdinalIgnoreCase));
 
-        if (!string.IsNullOrEmpty(localArtPath))
+        CardVisualTarget resolvedTarget = MapVisualTarget((string)bo["visualTarget"], cardType);
+        CardMonsterPreviewInfo monsterPreview = ParseMonsterPreview(bo["monsterPreview"] as JObject);
+
+        if (!string.IsNullOrEmpty(localArtPath) || monsterPreview != null)
         {
             visuals.Add(new CardVisualBinding
             {
@@ -495,28 +793,45 @@ internal sealed partial class ModContentSyncClient
                 InstanceId = instanceId,
                 CustomCardId = customId,
                 TemplateId = isDirectTemplateOverride ? baseTemplateId : null,
-                Target = ParseVisualTarget(cardType, (string)bo["visualTarget"]),
+                Target = resolvedTarget,
                 LocalImagePath = localArtPath,
                 ContentSha256 = artSha,
+                BgArtPath = string.IsNullOrEmpty(localBgArtPath) ? null : localBgArtPath,
+                BgArtSha256 = string.IsNullOrEmpty(bgArtSha) ? null : bgArtSha,
+                IsPatchOverride = isPatchOverride,
+                IsCustomBorrowShell = isCustomBorrowShell,
+                MonsterPreview = monsterPreview,
                 DisableParallaxPremium = (bool?)bo["disableParallaxPremium"] ?? true,
                 Priority = string.IsNullOrWhiteSpace(instanceId) ? 100 : 500,
             });
         }
 
-        string[] activeTips = ReadStringArray(bo["activeTooltipsZh"] ?? bo["activeTooltips"]);
-        string[] passiveTips = ReadStringArray(bo["passiveTooltipsZh"] ?? bo["passiveTooltips"]);
-        // 对齐服务端 ModModels.cs [JsonPropertyName("tags")]，并兼容 extraDisplayTags / displayTags
-        string[] extraTags = ReadStringArray(bo["tags"] ?? bo["extraDisplayTags"] ?? bo["displayTags"]);
-        Dictionary<string, string[]> enchantTips = null;
-        if (bo["enchantTooltipsZh"] is JObject enchObj)
+        // D3-P1-11：独立奇遇/野怪背景图绑定
+        if (!string.IsNullOrEmpty(localBgArtPath))
         {
-            enchantTips = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
-            foreach (var ep in enchObj.Properties())
+            visuals.Add(new CardVisualBinding
             {
-                var arr = ReadStringArray(ep.Value);
-                if (arr != null && arr.Length > 0) enchantTips[ep.Name] = arr;
-            }
+                ModId = modId,
+                InstanceId = instanceId,
+                CustomCardId = customId,
+                TemplateId = isDirectTemplateOverride ? baseTemplateId : null,
+                Target = CardVisualTarget.EncounterBackground,
+                LocalImagePath = localBgArtPath,
+                ContentSha256 = bgArtSha,
+                IsPatchOverride = isPatchOverride,
+                IsCustomBorrowShell = isCustomBorrowShell,
+                DisableParallaxPremium = true,
+                Priority = string.IsNullOrWhiteSpace(instanceId) ? 100 : 500,
+            });
         }
+
+        string[] activeTips = ReadStringArray(bo["activeTooltipsZh"] ?? bo["activeTooltips"]);
+        string[] activeTipsEn = ReadStringArray(bo["activeTooltipsEn"]);
+        string[] passiveTips = ReadStringArray(bo["passiveTooltipsZh"] ?? bo["passiveTooltips"]);
+        string[] passiveTipsEn = ReadStringArray(bo["passiveTooltipsEn"]);
+        string[] extraTags = ReadStringArray(bo["tags"] ?? bo["extraDisplayTags"] ?? bo["displayTags"]);
+        Dictionary<string, string[]> enchantTips = ParseEnchantTooltipsMap(bo["enchantTooltipsZh"] as JObject);
+        Dictionary<string, string[]> enchantTipsEn = ParseEnchantTooltipsMap(bo["enchantTooltipsEn"] as JObject);
 
         Dictionary<string, Dictionary<string, double>> tierAttrs = null;
         if (bo["tierAttributes"] is JObject taObj)
@@ -554,12 +869,26 @@ internal sealed partial class ModContentSyncClient
                     {
                         double.TryParse(opObj["value"].ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out opVal);
                     }
+                    double? srcMult = null;
+                    if (opObj["sourceMultiplier"] != null &&
+                        double.TryParse(opObj["sourceMultiplier"].ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double sm))
+                    {
+                        srcMult = sm;
+                    }
+                    double? srcOffset = null;
+                    if (opObj["sourceAddOffset"] != null &&
+                        double.TryParse(opObj["sourceAddOffset"].ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double so))
+                    {
+                        srcOffset = so;
+                    }
                     opList.Add(new CardPreviewAttrOp
                     {
                         Attribute = attrName,
                         Operation = ((string)opObj["operation"])?.Trim() ?? "Set",
                         Value = opVal,
                         SourceAttribute = ((string)opObj["sourceAttribute"])?.Trim(),
+                        SourceMultiplier = srcMult,
+                        SourceAddOffset = srcOffset,
                     });
                 }
                 enchPreviewOps[ep.Name] = opList.ToArray();
@@ -573,17 +902,18 @@ internal sealed partial class ModContentSyncClient
             foreach (var item in cdArr)
             {
                 if (item is not JObject cdo) continue;
-                string syncAttr = ((string)cdo["syncAttribute"])?.Trim();
+                string syncAttr = ((string)(cdo["syncAttribute"] ?? cdo["attr"]))?.Trim();
                 if (string.IsNullOrEmpty(syncAttr)) continue;
                 cdList.Add(new CardCounterDisplayInfo
                 {
-                    LabelZh = ((string)cdo["labelZh"])?.Trim() ?? string.Empty,
+                    LabelZh = ((string)(cdo["labelZh"] ?? cdo["label"]))?.Trim() ?? string.Empty,
                     SyncAttribute = syncAttr,
                     MaxValue = (int?)cdo["maxValue"],
-                    ColorHex = ((string)cdo["colorHex"])?.Trim(),
+                    MaxAttr = ((string)cdo["maxAttr"])?.Trim(),
+                    ColorHex = ((string)(cdo["colorHex"] ?? cdo["accentColor"]))?.Trim(),
                     HideWhenZero = (bool?)cdo["hideWhenZero"] ?? false,
                     Style = ((string)cdo["style"])?.Trim(),
-                    ValueType = ((string)cdo["valueType"])?.Trim(),
+                    ValueType = ((string)(cdo["valueType"] ?? cdo["valueFormat"]))?.Trim(),
                     Format = ((string)cdo["format"])?.Trim(),
                     Unit = ((string)cdo["unit"])?.Trim(),
                     Position = ((string)cdo["position"])?.Trim(),
@@ -592,13 +922,20 @@ internal sealed partial class ModContentSyncClient
             if (cdList.Count > 0) counterDisplays = cdList.ToArray();
         }
 
-        if (!string.IsNullOrWhiteSpace(nameZh) || !string.IsNullOrWhiteSpace(descZh)
+        if (!string.IsNullOrWhiteSpace(nameZh) || !string.IsNullOrWhiteSpace(titleEn)
+            || !string.IsNullOrWhiteSpace(descZh) || !string.IsNullOrWhiteSpace(descEn)
             || (activeTips != null && activeTips.Length > 0)
+            || (activeTipsEn != null && activeTipsEn.Length > 0)
             || (passiveTips != null && passiveTips.Length > 0)
+            || (passiveTipsEn != null && passiveTipsEn.Length > 0)
             || (enchantTips != null && enchantTips.Count > 0)
+            || (enchantTipsEn != null && enchantTipsEn.Count > 0)
+            || (extraTags != null && extraTags.Length > 0)
             || (tierAttrs != null && tierAttrs.Count > 0)
             || (enchPreviewOps != null && enchPreviewOps.Count > 0)
-            || (counterDisplays != null && counterDisplays.Length > 0))
+            || (counterDisplays != null && counterDisplays.Length > 0)
+            || monsterPreview != null
+            || isCustomBorrowShell)
         {
             texts.Add(new CardTextOverride
             {
@@ -608,14 +945,22 @@ internal sealed partial class ModContentSyncClient
                 TemplateId = isDirectTemplateOverride ? baseTemplateId : null,
                 Locale = "zh-CN",
                 Title = string.IsNullOrWhiteSpace(nameZh) ? null : nameZh,
+                TitleEn = string.IsNullOrWhiteSpace(titleEn) ? null : titleEn,
                 Description = string.IsNullOrWhiteSpace(descZh) ? null : descZh,
+                DescriptionEn = string.IsNullOrWhiteSpace(descEn) ? null : descEn,
                 ActiveTooltips = activeTips,
+                ActiveTooltipsEn = activeTipsEn,
                 PassiveTooltips = passiveTips,
+                PassiveTooltipsEn = passiveTipsEn,
                 EnchantmentTooltips = enchantTips,
+                EnchantmentTooltipsEn = enchantTipsEn,
                 ExtraDisplayTags = extraTags,
                 TierAttributes = tierAttrs,
                 EnchantmentPreviewOps = enchPreviewOps,
                 CounterDisplays = counterDisplays,
+                IsPatchOverride = isPatchOverride,
+                IsCustomBorrowShell = isCustomBorrowShell,
+                MonsterPreview = monsterPreview,
                 Priority = string.IsNullOrWhiteSpace(instanceId) ? 100 : 500,
             });
         }
@@ -624,13 +969,16 @@ internal sealed partial class ModContentSyncClient
     private void ApplySyncedVisualAndTextHandles(
         List<CardVisualBinding> visuals,
         List<CardTextOverride> texts,
-        bool isActiveBinding)
+        bool isActiveBinding,
+        long expectedGeneration)
     {
         var visualReg = BazaarLauncherPlugin.Host?.VisualRegistry;
         var l10nReg = BazaarLauncherPlugin.Host?.LocalizationRegistry;
 
         lock (_sync)
         {
+            if (!IsSyncGenerationCurrent(expectedGeneration)) return;
+
             var targetVisualList = isActiveBinding ? _syncedActiveBindingHandles : _syncedVisualHandles;
             DisposeHandlesLocked(targetVisualList);
             if (!isActiveBinding) DisposeHandlesLocked(_syncedCardTextHandles);
@@ -665,48 +1013,93 @@ internal sealed partial class ModContentSyncClient
 
     private async Task<string> EnsureAssetCachedAsync(string sha256, bool forceDownload, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(sha256) || sha256.Length < 16) return string.Empty;
-
-        string targetPath = Path.Combine(AssetsCacheDir, sha256 + ".png");
-        if (!forceDownload && File.Exists(targetPath))
+        if (!SafePathAndZipGuard.TryNormalizeSha256Hex(sha256, out string validSha))
         {
-            try
+            if (!string.IsNullOrWhiteSpace(sha256))
             {
-                byte[] existing = File.ReadAllBytes(targetPath);
-                if (existing.Length > 16 && string.Equals(ComputeSha256Hex(existing), sha256, StringComparison.OrdinalIgnoreCase))
+                BazaarLauncherPlugin.Log?.LogWarning($"[ModSync] 拦截非法资产 SHA-256 哈希：{sha256}");
+            }
+            return string.Empty;
+        }
+
+        // D7-P1-02：优先命中 Hub 与 Launcher 共享 CAS 资产池（.png / .jpg / .jpeg），平滑兼容旧按服私有目录
+        if (!forceDownload)
+        {
+            string[] probeDirs = { SharedAssetsCacheDir, LegacyServerAssetsCacheDir };
+            string[] probeExts = { ".png", ".jpg", ".jpeg" };
+            foreach (string dir in probeDirs)
+            {
+                if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) continue;
+                foreach (string ext in probeExts)
                 {
-                    return targetPath;
+                    string candidate;
+                    try { candidate = SafePathAndZipGuard.ResolveSafeChildPath(dir, validSha + ext); }
+                    catch { continue; }
+                    if (!File.Exists(candidate)) continue;
+                    try
+                    {
+                        var fi = new FileInfo(candidate);
+                        if (fi.Length > 16 && fi.Length <= SafePathAndZipGuard.MaxAssetImageBytes)
+                        {
+                            byte[] existing = File.ReadAllBytes(candidate);
+                            if (existing.Length > 16 && string.Equals(ComputeSha256Hex(existing), validSha, StringComparison.OrdinalIgnoreCase))
+                            {
+                                return candidate;
+                            }
+                        }
+                    }
+                    catch { }
                 }
             }
-            catch { }
         }
 
         string baseUrl = NameAuth.GetServerBaseUrl();
         if (string.IsNullOrWhiteSpace(baseUrl)) return string.Empty;
 
+        string tmp = string.Empty;
         try
         {
             using var linked = HttpClientHub.CreateLinkedCts(ct);
-            using var req = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/api/mods/assets/{Uri.EscapeDataString(sha256)}");
+            using var req = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/api/mods/assets/{Uri.EscapeDataString(validSha)}");
             NameAuth.ApplyAuthHeaders(req);
 
             using var resp = await HttpClientHub.DownloadClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, linked.Token).ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode) return string.Empty;
 
-            byte[] bytes = await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-            if (bytes == null || bytes.Length < 16 || bytes.Length > 8 * 1024 * 1024)
+            byte[] bytes = await SafePathAndZipGuard.ReadHttpContentWithLimitAsync(
+                resp.Content,
+                SafePathAndZipGuard.MaxAssetImageBytes,
+                linked.Token).ConfigureAwait(false);
+            if (bytes == null || bytes.Length < 16 || bytes.Length > SafePathAndZipGuard.MaxAssetImageBytes)
             {
+                return string.Empty;
+            }
+
+            // P0-28 方案 A：拦截 WebP 并按魔数选择 .png 或 .jpg 存入统一共享 CAS 池
+            if (!Modules.CardTextureCache.IsSupportedImageMagic(bytes))
+            {
+                if (Modules.CardTextureCache.IsWebpMagic(bytes))
+                {
+                    BazaarLauncherPlugin.Log?.LogWarning($"[ModSync] 跳过不支持的 WebP 资产 {validSha}（Unity 运行期仅支持 PNG/JPEG）");
+                }
+                else
+                {
+                    BazaarLauncherPlugin.Log?.LogWarning($"[ModSync] 跳过非合法 PNG/JPEG 资产 {validSha}");
+                }
                 return string.Empty;
             }
 
             string actualSha = ComputeSha256Hex(bytes);
-            if (!string.Equals(actualSha, sha256, StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(actualSha, validSha, StringComparison.OrdinalIgnoreCase))
             {
-                BazaarLauncherPlugin.Log?.LogWarning($"[ModSync] PNG 资产 SHA-256 校验失败: expected={sha256}, actual={actualSha}");
+                BazaarLauncherPlugin.Log?.LogWarning($"[ModSync] 图片资产 SHA-256 校验失败: expected={validSha}, actual={actualSha}");
                 return string.Empty;
             }
 
-            string tmp = targetPath + ".tmp";
+            string finalExt = (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) ? ".jpg" : ".png";
+            string targetPath = SafePathAndZipGuard.ResolveSafeChildPath(SharedAssetsCacheDir, validSha + finalExt);
+            tmp = targetPath + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
+
             File.WriteAllBytes(tmp, bytes);
             if (File.Exists(targetPath))
             {
@@ -722,7 +1115,8 @@ internal sealed partial class ModContentSyncClient
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log?.LogWarning($"[ModSync] 下载资产 {sha256} 失败: {ex.Message}");
+            try { if (!string.IsNullOrEmpty(tmp) && File.Exists(tmp)) File.Delete(tmp); } catch { }
+            BazaarLauncherPlugin.Log?.LogWarning($"[ModSync] 下载资产 {validSha} 失败: {ex.Message}");
             return string.Empty;
         }
     }
@@ -749,13 +1143,29 @@ internal sealed partial class ModContentSyncClient
         }
     }
 
-    private static CardVisualTarget ParseVisualTarget(string cardType, string explicitTarget)
+    /// <summary>
+    /// 统一映射服务端 VisualTarget（支持 plan_w2a Rev 2 枚举值 ItemArt/SkillIcon/EncounterPortrait/EncounterBackground
+    /// 以及兼容别名 "card" / "event" / "monster"）。
+    /// </summary>
+    internal static CardVisualTarget MapVisualTarget(string explicitTarget, string cardType)
     {
         if (!string.IsNullOrWhiteSpace(explicitTarget))
         {
-            if (Enum.TryParse<CardVisualTarget>(explicitTarget, ignoreCase: true, out var parsed))
+            string norm = explicitTarget.Trim();
+            if (Enum.TryParse<CardVisualTarget>(norm, ignoreCase: true, out var parsed))
             {
                 return parsed;
+            }
+            if (string.Equals(norm, "card", StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Equals(cardType, "Skill", StringComparison.OrdinalIgnoreCase)
+                    ? CardVisualTarget.SkillIcon
+                    : CardVisualTarget.ItemArt;
+            }
+            if (string.Equals(norm, "event", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(norm, "monster", StringComparison.OrdinalIgnoreCase))
+            {
+                return CardVisualTarget.EncounterPortrait;
             }
         }
 
@@ -763,11 +1173,85 @@ internal sealed partial class ModContentSyncClient
         {
             return CardVisualTarget.SkillIcon;
         }
-        if (cardType != null && cardType.IndexOf("Encounter", StringComparison.OrdinalIgnoreCase) >= 0)
+        if (cardType != null &&
+            (cardType.IndexOf("Encounter", StringComparison.OrdinalIgnoreCase) >= 0 ||
+             string.Equals(cardType, "Event", StringComparison.OrdinalIgnoreCase)))
         {
             return CardVisualTarget.EncounterPortrait;
         }
         return CardVisualTarget.ItemArt;
+    }
+
+    internal static Dictionary<string, string[]> ParseEnchantTooltipsMap(JObject enchObj)
+    {
+        if (enchObj == null) return null;
+        var map = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var ep in enchObj.Properties())
+        {
+            if (ep.Value == null) continue;
+            if (ep.Value.Type == JTokenType.String)
+            {
+                string single = ep.Value.Value<string>();
+                if (!string.IsNullOrWhiteSpace(single))
+                {
+                    map[ep.Name] = new[] { single.Trim() };
+                }
+            }
+            else
+            {
+                var arr = ReadStringArray(ep.Value);
+                if (arr != null && arr.Length > 0) map[ep.Name] = arr;
+            }
+        }
+        return map.Count > 0 ? map : null;
+    }
+
+    internal static CardMonsterPreviewInfo ParseMonsterPreview(JObject mpObj)
+    {
+        if (mpObj == null) return null;
+        var info = new CardMonsterPreviewInfo
+        {
+            MonsterId = ((string)mpObj["monsterId"])?.Trim() ?? string.Empty,
+            NameZh = ((string)mpObj["nameZh"])?.Trim() ?? string.Empty,
+            NameEn = ((string)mpObj["nameEn"])?.Trim(),
+            Day = (int?)mpObj["day"] ?? 0,
+            Level = (int?)mpObj["level"] ?? 0,
+            HealthMax = (int?)mpObj["healthMax"] ?? 0,
+            StartingTier = ((string)mpObj["startingTier"])?.Trim() ?? "Bronze",
+            RewardGold = (int?)(mpObj["rewardGold"] ?? mpObj["goldReward"]) ?? 0,
+            RewardXp = (int?)(mpObj["rewardXp"] ?? mpObj["xpReward"]) ?? 0,
+            Items = ParseMonsterLoadoutArray(mpObj["items"] as JArray ?? mpObj["boardItems"] as JArray),
+            Skills = ParseMonsterLoadoutArray(mpObj["skills"] as JArray ?? mpObj["boardSkills"] as JArray),
+        };
+        if (info.HealthMax <= 0 && info.Items.Length == 0 && info.Skills.Length == 0 && info.Level <= 0)
+        {
+            return null;
+        }
+        return info;
+    }
+
+    private static CardMonsterLoadoutItemInfo[] ParseMonsterLoadoutArray(JArray arr)
+    {
+        if (arr == null || arr.Count == 0) return Array.Empty<CardMonsterLoadoutItemInfo>();
+        var list = new List<CardMonsterLoadoutItemInfo>(arr.Count);
+        foreach (var token in arr)
+        {
+            if (token is not JObject jo) continue;
+            string cardId = ((string)(jo["cardId"] ?? jo["customCardId"] ?? jo["templateId"]))?.Trim() ?? string.Empty;
+            string wireId = ((string)(jo["wireTemplateId"] ?? jo["templateId"]))?.Trim();
+            if (string.IsNullOrEmpty(cardId) && string.IsNullOrEmpty(wireId)) continue;
+            list.Add(new CardMonsterLoadoutItemInfo
+            {
+                CardId = cardId,
+                WireTemplateId = wireId,
+                Tier = ((string)jo["tier"])?.Trim() ?? "Bronze",
+                Size = ((string)jo["size"])?.Trim(),
+                Enchantment = ((string)jo["enchantment"])?.Trim(),
+                TitleZh = ((string)jo["titleZh"])?.Trim(),
+                TitleEn = ((string)jo["titleEn"])?.Trim(),
+            });
+        }
+        return list.ToArray();
     }
 
     private static string[] ReadStringArray(JToken token)
@@ -784,13 +1268,9 @@ internal sealed partial class ModContentSyncClient
 
     private static string NormalizeSha(string raw)
     {
-        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
-        string s = raw.Trim();
-        if (s.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
-        {
-            s = s.Substring(7);
-        }
-        return s.Trim().ToLowerInvariant();
+        return SafePathAndZipGuard.TryNormalizeSha256Hex(raw, out string validSha)
+            ? validSha
+            : string.Empty;
     }
 
     private static string ComputeSha256Hex(byte[] bytes)

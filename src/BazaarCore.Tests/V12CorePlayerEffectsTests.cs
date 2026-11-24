@@ -16,8 +16,6 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V12CorePlayerEffectsTests
 {
-    private const string AuthoritativeDbPath = @"e:\thebazaar\dist\data\GameData.db";
-
     private const string EliEncounterId = "0ff275f7-60ef-4428-acb6-1a138d03152d";
     private const string EliGroup1SkillId = "afe451fd-7726-4ed6-9ad9-48d917a12012";
     private const string LangxianId = "53099361-599f-4c1a-ad4a-d2fbb491b756";
@@ -38,12 +36,7 @@ public sealed class V12CorePlayerEffectsTests
     private const string BaseTempoEffectId = "e8478722-1851-4b05-9749-1480352ff710";
     private const string EnragePortraitEffectId = "d2ba43c2-0ba9-4299-b737-7594caa507ea";
 
-    private static readonly Lazy<GameDataRepository> SharedRepo = new(() =>
-    {
-        if (File.Exists(AuthoritativeDbPath))
-            return GameDatabaseLoader.Load(AuthoritativeDbPath);
-        return GameDatabaseLoader.Load();
-    });
+    private static readonly Lazy<GameDataRepository> SharedRepo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static CardInstance MakeCard(GameDataRepository repo, string id, CardTier? tier = null)
     {

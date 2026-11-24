@@ -1,4 +1,6 @@
 using System.Collections.Frozen;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using BazaarCore.Data;
@@ -7,6 +9,7 @@ using BazaarCore.Models;
 using BazaarCore.Runtime;
 using BazaarGameShared.Domain.Core.Types;
 using BazaarServer.Game;
+using BazaarServer.Mods;
 using BazaarServer.Storage;
 
 namespace BazaarServer.Data;
@@ -15,17 +18,42 @@ namespace BazaarServer.Data;
 /// 高性能分区 PvP 镜像池（支持无锁只读分桶查询、加载期脏数据清洗、模式分区隔离与无尽高层强化镜像生成）：
 /// - 按 <c>(PoolPartition, Day)</c> 预建不可变只读分桶索引，彻底消除高并发全局锁 LINQ 扫描瓶颈；
 /// - 加载期即剔除 Day 1 超血/Lv2+ 脏样本与 Day 4/5+ 残缺盘面，直降内存占用并修复 #9 / #25；
-/// - 严格依据 <see cref="CustomRunRuleSet.ResolveGhostPoolPartition"/> 隔离标准池与自定义/新模式/沙盒局。
+/// - 严格依据 <see cref="ResolveGhostPoolPartitionLocal"/>（合流胶水 #5 委派 ServerModHost）统一隔离标准池与自定义/新模式/Mod/沙盒局。
 /// </summary>
 public sealed class PvpGhostPool
 {
     public const int MaxBoardsPerDayBucket = 2500;
     public const string StandardPartition = "standard";
 
-    private static readonly HashSet<string> SupportedClientHeroes = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> SupportedClientHeroes = new(HeroNames.PlayableHeroes, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>D2-P1-02 / P0-30：精确判断对局是否包含真正的自定义 Mod 卡（排除原版卡与原位 Patch 卡）。</summary>
+    public static bool HasTrueCustomCard(RunState? run)
     {
-        "Vanessa", "Dooley", "Pygmalien", "Mak", "Karnok", "Jules", "Stelle", "Hero8",
-    };
+        if (run == null) return false;
+        foreach (var c in run.Cards.Values)
+        {
+            if (!string.IsNullOrWhiteSpace(c.CustomCardId) &&
+                !string.Equals(c.CustomCardId, c.TemplateId.ToString(), StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// P0-30（合流胶水 #5）：统一幽灵池分区解析，直接委托单一权威纯函数 ServerModHost.ResolveEffectiveGhostPoolPartition。
+    /// </summary>
+    public static string ResolveGhostPoolPartitionLocal(
+        CustomRunRuleSet? rules,
+        bool hasTrueCustomCardInRun,
+        ServerModHost? modHost)
+        => ServerModHost.ResolveEffectiveGhostPoolPartition(rules, rules?.SelectedModIds, hasTrueCustomCardInRun, modHost);
+
+    /// <summary>D3-P1-12（合流胶水 #5）：统一有效 Mod 集哈希，直接委托单一权威函数 ServerModHost.ComputeEffectiveModSetHash。</summary>
+    public static string ComputeEffectiveModHashLocal(IReadOnlyList<string>? selectedModIds, ServerModHost? modHost)
+        => ServerModHost.ComputeEffectiveModSetHash(selectedModIds, modHost);
 
     private static readonly string[] ValidFallbackEnchantments =
     [
@@ -64,6 +92,12 @@ public sealed class PvpGhostPool
         public string Tier { get; init; } = "Bronze";
         public string? Enchantment { get; init; }
         public Dictionary<string, int> PermanentAttributes { get; init; } = new();
+        // D2-P1-10：向后兼容补齐 6 类真实战力字段（严守 CardInstance 实码边界，仅持久化真实存在的双层 Add/Mult、任务与标签）
+        public Dictionary<string, double>? PermanentAdd { get; init; }
+        public Dictionary<string, double>? PermanentMult { get; init; }
+        public List<string>? CompletedQuests { get; init; }
+        public Dictionary<string, double>? QuestProgress { get; init; }
+        public List<string>? ExtraTags { get; init; }
     }
 
     public sealed class GhostSkill
@@ -72,19 +106,41 @@ public sealed class PvpGhostPool
         public string InternalName { get; init; } = "";
         public string ZhName { get; init; } = "";
         public string Tier { get; init; } = "Bronze";
+        // D2-P1-10：成长型技能永久属性与标签
+        public Dictionary<string, int>? PermanentAttributes { get; init; }
+        public Dictionary<string, double>? PermanentAdd { get; init; }
+        public Dictionary<string, double>? PermanentMult { get; init; }
+        public List<string>? ExtraTags { get; init; }
+    }
+
+    public sealed class GhostSocketEffect
+    {
+        public int Slot { get; init; }
+        public string TemplateId { get; init; } = "";
+        public string Tier { get; init; } = "Bronze";
+        public string? Enchantment { get; init; }
+        public Dictionary<string, int>? PermanentAttributes { get; init; }
     }
 
     public sealed class GhostBoard
     {
         public string BoardId { get; init; } = "";
         public int Day { get; init; } = 1;
+        /// <summary>P0-43：镜像原始录制天数（0 表示历史未填字段，等价于 Day）。</summary>
+        public int SourceDay { get; init; }
+        /// <summary>P0-43：无尽爬塔外推目标挑战层数（0 表示未外推，等价于 Day）。</summary>
+        public int TargetDay { get; init; }
+        [JsonIgnore]
+        public int EffectiveSourceDay => SourceDay > 0 ? SourceDay : Math.Max(1, Day);
+        [JsonIgnore]
+        public int EffectiveTargetDay => TargetDay > 0 ? TargetDay : Math.Max(1, Day);
         public string Hero { get; init; } = "Vanessa";
         public int Level { get; init; } = 1;
-        public int HealthMax { get; init; } = 250;
-        public int Prestige { get; init; } = 20;
+        public int HealthMax { get; init; } = GameDefaults.StartingHealth;
+        public int Prestige { get; init; } = GameDefaults.StartingPrestige;
         public int Wins { get; init; }
         public int Losses { get; init; }
-        public int UnlockedSlotsMask { get; init; } = 120;
+        public int UnlockedSlotsMask { get; init; } = GameDefaults.InitialUnlockedSlotsMask;
         public string PowerBucket { get; init; } = "Normal";
         public double EstimatedWinRate { get; init; } = 0.5;
         public string Source { get; init; } = "";
@@ -95,8 +151,9 @@ public sealed class PvpGhostPool
         public string PoolPartition { get; init; } = StandardPartition;
         public List<GhostItem> Items { get; init; } = new();
         public List<GhostSkill> Skills { get; init; } = new();
+        public List<GhostSocketEffect>? SocketEffects { get; init; }
 
-        /// <summary>是否来自真实玩家社区/天梯数据源（巴扎罗盘 / 巴扎++ 十胜库 / BazaarHub 实盘）。</summary>
+        /// <summary>是否来自真实玩家社区/天梯数据源（外部天梯统计源 / 巴扎++ 十胜库 / BazaarHub 实盘）。</summary>
         [JsonIgnore]
         public bool IsRealCommunityGhost =>
             !IsPlayerGhost &&
@@ -115,6 +172,7 @@ public sealed class PvpGhostPool
         public string? PoolPartition { get; set; }
         public List<GhostItem> Items { get; set; } = new();
         public List<GhostSkill> Skills { get; set; } = new();
+        public List<GhostSocketEffect>? SocketEffects { get; set; }
     }
 
     private readonly record struct BucketKey(string Partition, int Day);
@@ -366,25 +424,48 @@ public sealed class PvpGhostPool
             int width = Math.Clamp((int)entry.Size, 1, 3);
 
             var perm = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, double>? permAdd = null;
+            Dictionary<string, double>? permMult = null;
+            List<string>? completedQuests = null;
+            Dictionary<string, double>? questProgress = null;
+            List<string>? extraTags = null;
+
             if (entry.CoreCard != null)
             {
+                var core = entry.CoreCard;
                 // 仅持久化 CoreCard 真实永久修改层（PermanentAdd / PermanentMult），绝不拷入含光环（Aura）/ 限时层（Hour/Day）
-                // 或已按 PercentCooldownReduction 折算后的 CooldownMax，彻底杜绝真人 PvP 镜像双倍光环叠算与双重冷却缩减
-                var permKeys = new HashSet<string>(entry.CoreCard.PermanentAdd.Keys, StringComparer.OrdinalIgnoreCase);
-                foreach (var mk in entry.CoreCard.PermanentMult.Keys)
+                var permKeys = new HashSet<string>(core.PermanentAdd.Keys, StringComparer.OrdinalIgnoreCase);
+                foreach (var mk in core.PermanentMult.Keys)
                     permKeys.Add(mk);
 
                 foreach (string key in permKeys)
                 {
                     if (IsDerivedGhostAttributeKey(key))
                         continue;
-                    double baseVal = entry.CoreCard.BaseAttributes.GetValueOrDefault(key, 0);
-                    double addVal = entry.CoreCard.PermanentAdd.GetValueOrDefault(key, 0);
-                    double mult = entry.CoreCard.PermanentMult.GetValueOrDefault(key, 1.0);
+                    double baseVal = core.BaseAttributes.GetValueOrDefault(key, 0);
+                    double addVal = core.PermanentAdd.GetValueOrDefault(key, 0);
+                    double mult = core.PermanentMult.GetValueOrDefault(key, 1.0);
+                    if (Math.Abs(addVal) > 1e-6)
+                    {
+                        permAdd ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                        permAdd[key] = addVal;
+                    }
+                    if (Math.Abs(mult - 1.0) > 1e-6)
+                    {
+                        permMult ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                        permMult[key] = mult;
+                    }
                     int unscaled = (int)Math.Round((baseVal + addVal) * mult);
                     if (Math.Abs(unscaled - baseVal) > 0.001)
                         perm[key] = unscaled;
                 }
+
+                if (core.CompletedQuests.Count > 0)
+                    completedQuests = core.CompletedQuests.ToList();
+                if (core.QuestProgress.Count > 0)
+                    questProgress = new Dictionary<string, double>(core.QuestProgress, StringComparer.OrdinalIgnoreCase);
+                if (core.ExtraTags.Count > 0)
+                    extraTags = core.ExtraTags.ToList();
             }
             else
             {
@@ -407,6 +488,11 @@ public sealed class PvpGhostPool
                 Tier = entry.Tier.ToString(),
                 Enchantment = entry.Enchantment?.ToString(),
                 PermanentAttributes = perm,
+                PermanentAdd = permAdd,
+                PermanentMult = permMult,
+                CompletedQuests = completedQuests,
+                QuestProgress = questProgress,
+                ExtraTags = extraTags,
             });
         }
 
@@ -415,19 +501,93 @@ public sealed class PvpGhostPool
 
         var skills = run.Cards.Values
             .Where(c => c.Owner == ECombatantId.Player && c.Type == ECardType.Skill)
-            .Select(c => new GhostSkill
+            .Select(c =>
             {
-                TemplateId = string.IsNullOrWhiteSpace(c.CustomCardId) ? c.TemplateId.ToString() : c.CustomCardId!,
-                InternalName = "",
-                ZhName = "",
-                Tier = c.Tier.ToString(),
+                Dictionary<string, int>? skPerm = null;
+                Dictionary<string, double>? skAdd = null;
+                Dictionary<string, double>? skMult = null;
+                List<string>? skTags = null;
+                if (c.CoreCard != null)
+                {
+                    var core = c.CoreCard;
+                    var keys = new HashSet<string>(core.PermanentAdd.Keys, StringComparer.OrdinalIgnoreCase);
+                    foreach (var mk in core.PermanentMult.Keys) keys.Add(mk);
+                    foreach (string key in keys)
+                    {
+                        if (IsDerivedGhostAttributeKey(key)) continue;
+                        double baseVal = core.BaseAttributes.GetValueOrDefault(key, 0);
+                        double addVal = core.PermanentAdd.GetValueOrDefault(key, 0);
+                        double mult = core.PermanentMult.GetValueOrDefault(key, 1.0);
+                        if (Math.Abs(addVal) > 1e-6)
+                        {
+                            skAdd ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                            skAdd[key] = addVal;
+                        }
+                        if (Math.Abs(mult - 1.0) > 1e-6)
+                        {
+                            skMult ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                            skMult[key] = mult;
+                        }
+                        int unscaled = (int)Math.Round((baseVal + addVal) * mult);
+                        if (Math.Abs(unscaled - baseVal) > 0.001)
+                        {
+                            skPerm ??= new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                            skPerm[key] = unscaled;
+                        }
+                    }
+                    if (core.ExtraTags.Count > 0)
+                        skTags = core.ExtraTags.ToList();
+                }
+                return new GhostSkill
+                {
+                    TemplateId = string.IsNullOrWhiteSpace(c.CustomCardId) ? c.TemplateId.ToString() : c.CustomCardId!,
+                    InternalName = "",
+                    ZhName = "",
+                    Tier = c.Tier.ToString(),
+                    PermanentAttributes = skPerm,
+                    PermanentAdd = skAdd,
+                    PermanentMult = skMult,
+                    ExtraTags = skTags,
+                };
+            })
+            .ToList();
+
+        var socketEffects = run.Cards.Values
+            .Where(c => c.Owner == ECombatantId.Player && c.Type == ECardType.SocketEffect)
+            .OrderBy(c => c.Socket.HasValue ? (int)c.Socket.Value : 99)
+            .Select(c =>
+            {
+                Dictionary<string, int>? sePerm = null;
+                if (c.CoreCard != null && (c.CoreCard.PermanentAdd.Count > 0 || c.CoreCard.PermanentMult.Count > 0))
+                {
+                    sePerm = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var k in c.CoreCard.PermanentAdd.Keys.Concat(c.CoreCard.PermanentMult.Keys).Distinct(StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (IsDerivedGhostAttributeKey(k)) continue;
+                        double baseVal = c.CoreCard.BaseAttributes.GetValueOrDefault(k, 0);
+                        double addVal = c.CoreCard.PermanentAdd.GetValueOrDefault(k, 0);
+                        double mult = c.CoreCard.PermanentMult.GetValueOrDefault(k, 1.0);
+                        int unscaled = (int)Math.Round((baseVal + addVal) * mult);
+                        if (Math.Abs(unscaled - baseVal) > 0.001)
+                            sePerm[k] = unscaled;
+                    }
+                    if (sePerm.Count == 0) sePerm = null;
+                }
+                return new GhostSocketEffect
+                {
+                    Slot = Math.Clamp(c.Socket.HasValue ? (int)c.Socket.Value : (c.CoreCard?.StartSlot ?? 0), 0, 9),
+                    TemplateId = string.IsNullOrWhiteSpace(c.CustomCardId) ? c.TemplateId.ToString() : c.CustomCardId!,
+                    Tier = c.Tier.ToString(),
+                    Enchantment = c.Enchantment?.ToString(),
+                    PermanentAttributes = sePerm,
+                };
             })
             .ToList();
 
         int wins = (int)run.Victories;
         int losses = (int)run.Defeats;
-        int healthMax = Math.Max(100, run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, 250));
-        int prestige = run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 20);
+        int healthMax = Math.Max(100, run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, GameDefaults.StartingHealth));
+        int prestige = run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, GameDefaults.StartingPrestige);
         int level = Math.Max(1, run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Level, 1));
         int unlockedSlots = run.UnlockedSlots > 0 ? run.UnlockedSlots : DefaultUnlockedMaskForDay(day);
         string hero = run.Hero == EHero.Common ? "Vanessa" : run.Hero.ToString();
@@ -448,6 +608,7 @@ public sealed class PvpGhostPool
             PoolPartition = resolvedPartition,
             Items = items,
             Skills = skills,
+            SocketEffects = socketEffects.Count > 0 ? socketEffects : null,
         };
 
         var board = new GhostBoard
@@ -468,17 +629,42 @@ public sealed class PvpGhostPool
             PoolPartition = resolvedPartition,
             Items = items,
             Skills = skills,
+            SocketEffects = socketEffects.Count > 0 ? socketEffects : null,
         };
 
         // 标准分区拒绝超血脏镜像；自定义/无尽高分区分允许其真实强度入专属分区，绝不污染标准池
         if (!effectiveCustom && !IsSaneGhostForDay(board, day))
             return null;
 
+        string effectiveModeId = run.CustomRules?.SpecialModeId switch
+        {
+            ESpecialModeId.EndlessTower => "endless_tower",
+            ESpecialModeId.BossRush => "boss_rush",
+            ESpecialModeId.DailyChallenge => "daily",
+            ESpecialModeId.CrossHeroMayhem => "cross_hero",
+            ESpecialModeId.MutatorChallenge => "mutator",
+            _ => effectiveCustom ? resolvedPartition : StandardPartition,
+        };
+
         string boardJson = JsonSerializer.Serialize(payload, JsonOpts);
         var now = DateTime.UtcNow;
 
+        // D2-P1-10：完整传入全部 14 参（显式传入 ModeId 与 PoolPartition），杜绝自定义/Mod/无尽幽灵误落 SQLite standard 分区
         db.InsertPvpGhost(new Persistence.PvpGhostRow(
-            0, day, hero, wins, losses, healthMax, prestige, level, unlockedSlots, boardJson, now, effectiveCustom));
+            Id: 0,
+            Day: day,
+            Hero: hero,
+            Wins: wins,
+            Losses: losses,
+            HealthMax: healthMax,
+            Prestige: prestige,
+            Level: level,
+            UnlockedSlots: unlockedSlots,
+            BoardJson: boardJson,
+            CreatedAt: now,
+            IsCustomRule: effectiveCustom,
+            ModeId: effectiveModeId,
+            PoolPartition: resolvedPartition));
 
         lock (_writeLock)
         {
@@ -517,7 +703,7 @@ public sealed class PvpGhostPool
             if (snap.Buckets.TryGetValue(new BucketKey("endless_tower", effectiveDay), out var endlessBucket)
                 && endlessBucket.All.Length >= 5)
             {
-                var picked = PickFromBucket(endlessBucket, effectiveDay, playerWins, playerLosses, rng, repo);
+                var picked = PickFromBucket(endlessBucket, effectiveDay, playerWins, playerLosses, rng, repo, isStandardPartition: false);
                 if (picked != null) return picked;
             }
 
@@ -537,7 +723,7 @@ public sealed class PvpGhostPool
                 // 同分区样本充足（>=3）或 50% 概率优先展示同模式真人对手
                 if (customBucket.All.Length >= 3 || rng.NextDouble() < 0.50)
                 {
-                    var picked = PickFromBucket(customBucket, effectiveDay, playerWins, playerLosses, rng, repo);
+                    var picked = PickFromBucket(customBucket, effectiveDay, playerWins, playerLosses, rng, repo, isStandardPartition: false);
                     if (picked != null) return picked;
                 }
             }
@@ -557,7 +743,7 @@ public sealed class PvpGhostPool
     {
         if (snap.Buckets.TryGetValue(new BucketKey(StandardPartition, day), out var exactBucket))
         {
-            var picked = PickFromBucket(exactBucket, day, playerWins, playerLosses, rng, repo);
+            var picked = PickFromBucket(exactBucket, day, playerWins, playerLosses, rng, repo, isStandardPartition: true);
             if (picked != null) return picked;
         }
 
@@ -568,7 +754,7 @@ public sealed class PvpGhostPool
             {
                 if (snap.Buckets.TryGetValue(new BucketKey(StandardPartition, probe), out var nearBucket))
                 {
-                    var picked = PickFromBucket(nearBucket, probe, playerWins, playerLosses, rng, repo);
+                    var picked = PickFromBucket(nearBucket, probe, playerWins, playerLosses, rng, repo, isStandardPartition: true);
                     if (picked != null) return picked;
                 }
             }
@@ -596,9 +782,10 @@ public sealed class PvpGhostPool
         int playerWins,
         int playerLosses,
         Random rng,
-        GameDataRepository? repo)
+        GameDataRepository? repo,
+        bool isStandardPartition = true)
     {
-        // 真实社区/天梯盘面（巴扎++ 十胜库 / 巴扎罗盘实测盘）享有 90% 压倒性优先权，彻底告别胡扯 AI
+        // 真实社区/天梯盘面（巴扎++ 十胜库 / 外部天梯统计源实测盘）享有 90% 压倒性优先权，彻底告别胡扯 AI
         GhostBoard[] staticSource;
         if (bucket.RealCommunityPreferred.Length > 0
             && (bucket.RealCommunityPreferred.Length >= 30 || rng.NextDouble() < 0.90))
@@ -625,7 +812,8 @@ public sealed class PvpGhostPool
         {
             var b = staticSource[i];
             if (HasInvalidRepoItem(b, repo)) continue;
-            if (day <= 1 && (b.Level > 2 || b.HealthMax > 550)) continue;
+            // D2-P1-10：仅标准分区施加 Day 1 血量/等级上限拦截，允许高血自定义/词条分区正常匹配 Day 1 同分区对手
+            if (isStandardPartition && day <= 1 && (b.Level > 2 || b.HealthMax > 550)) continue;
 
             fallback.Add(b);
             bool bucketHit = ContainsBucket(preferredBuckets, b.PowerBucket);
@@ -645,7 +833,7 @@ public sealed class PvpGhostPool
         {
             var p = bucket.PlayerGhosts[i];
             if (HasInvalidRepoItem(p, repo)) continue;
-            if (day <= 1 && (p.Level > 2 || p.HealthMax > 550)) continue;
+            if (isStandardPartition && day <= 1 && (p.Level > 2 || p.HealthMax > 550)) continue;
             anyPlayers.Add(p);
             if (Math.Abs(p.Wins - playerWins) <= 2)
                 closePlayers.Add(p);
@@ -672,6 +860,23 @@ public sealed class PvpGhostPool
         {
             if (repo.GetCard(board.Items[i].TemplateId) == null)
                 return true;
+        }
+        // D2-P1-10：同步校验 Skills 与 SocketEffects，任一模板在当前 repo 中缺失即拒绝抽中
+        if (board.Skills != null)
+        {
+            for (int i = 0; i < board.Skills.Count; i++)
+            {
+                if (repo.GetCard(board.Skills[i].TemplateId) == null)
+                    return true;
+            }
+        }
+        if (board.SocketEffects != null)
+        {
+            for (int i = 0; i < board.SocketEffects.Count; i++)
+            {
+                if (repo.GetCard(board.SocketEffects[i].TemplateId) == null)
+                    return true;
+            }
         }
         return false;
     }
@@ -713,6 +918,11 @@ public sealed class PvpGhostPool
                 Tier = targetTier.ToString(),
                 Enchantment = ench,
                 PermanentAttributes = new Dictionary<string, int>(it.PermanentAttributes, StringComparer.OrdinalIgnoreCase),
+                PermanentAdd = it.PermanentAdd != null ? new Dictionary<string, double>(it.PermanentAdd, StringComparer.OrdinalIgnoreCase) : null,
+                PermanentMult = it.PermanentMult != null ? new Dictionary<string, double>(it.PermanentMult, StringComparer.OrdinalIgnoreCase) : null,
+                CompletedQuests = it.CompletedQuests != null ? new List<string>(it.CompletedQuests) : null,
+                QuestProgress = it.QuestProgress != null ? new Dictionary<string, double>(it.QuestProgress, StringComparer.OrdinalIgnoreCase) : null,
+                ExtraTags = it.ExtraTags != null ? new List<string>(it.ExtraTags) : null,
             });
         }
 
@@ -720,6 +930,8 @@ public sealed class PvpGhostPool
         {
             BoardId = $"endless_d{targetDay}_{source.BoardId}",
             Day = targetDay,
+            SourceDay = source.EffectiveSourceDay,
+            TargetDay = targetDay,
             Hero = source.Hero,
             Level = Math.Max(source.Level, targetDay),
             HealthMax = source.HealthMax, // 具体倍率由 CombatModifiers.FromRulesAndDay 统一缩放，防止双重乘算
@@ -734,6 +946,7 @@ public sealed class PvpGhostPool
             PoolPartition = "endless_tower",
             Items = upgradedItems,
             Skills = new List<GhostSkill>(source.Skills),
+            SocketEffects = source.SocketEffects != null ? new List<GhostSocketEffect>(source.SocketEffects) : null,
         };
     }
 
@@ -941,7 +1154,11 @@ public sealed class PvpGhostPool
                 ? $"player_db_{row.Id}_d{row.Day}"
                 : payload.BoardId;
             bool isCustom = row.IsCustomRule || payload.IsCustomRule;
-            string partition = NormalizePartition(payload.PoolPartition, isCustom);
+            string partition = NormalizePartition(
+                !string.IsNullOrWhiteSpace(row.PoolPartition) && !string.Equals(row.PoolPartition, StandardPartition, StringComparison.OrdinalIgnoreCase)
+                    ? row.PoolPartition
+                    : (payload.PoolPartition ?? row.PoolPartition),
+                isCustom);
 
             return new GhostBoard
             {
@@ -961,6 +1178,7 @@ public sealed class PvpGhostPool
                 PoolPartition = partition,
                 Items = payload.Items ?? new List<GhostItem>(),
                 Skills = payload.Skills ?? new List<GhostSkill>(),
+                SocketEffects = payload.SocketEffects,
             };
         }
         catch
@@ -1042,7 +1260,7 @@ public sealed class PvpGhostPool
                 Day = day,
                 Hero = GetStr(r, "hero") ?? "Vanessa",
                 Level = GetInt(r, "level", 1),
-                HealthMax = Math.Max(100, GetInt(r, "healthMax", 250)),
+                HealthMax = Math.Max(100, GetInt(r, "healthMax", GameDefaults.StartingHealth)),
                 Prestige = GetInt(r, "prestige", 20),
                 Wins = GetInt(r, "wins", 0),
                 Losses = GetInt(r, "losses", 0),
@@ -1172,15 +1390,68 @@ public sealed class PvpGhostPool
             if (tpl == null) continue;
             string prefix = tpl.Id.Length >= 6 ? tpl.Id[..6] : tpl.Id;
             var card = new CardInstance(tpl, TierHelper.ParseTier(it.Tier), it.Enchantment, $"opp_{itemIdx++}_{it.Slot}_{prefix}");
-            foreach (var (ak, av) in it.PermanentAttributes)
+
+            // D2-P1-10：优先无损还原 PermanentAdd / PermanentMult 双层；历史 JSONL 缺省时平滑回退 PermanentAttributes
+            bool hasLayeredPerm = (it.PermanentAdd is { Count: > 0 }) || (it.PermanentMult is { Count: > 0 });
+            if (hasLayeredPerm)
             {
-                if (IsDerivedGhostAttributeKey(ak))
-                    continue;
-                double baseVal = card.BaseAttributes.GetValueOrDefault(ak, 0);
-                double delta = av - baseVal;
-                if (Math.Abs(delta) > 0.001)
-                    card.PermanentAdd[ak] = delta;
+                if (it.PermanentAdd != null)
+                {
+                    foreach (var (ak, av) in it.PermanentAdd)
+                    {
+                        if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(av) && Math.Abs(av) > 1e-6)
+                            card.PermanentAdd[ak] = av;
+                    }
+                }
+                if (it.PermanentMult != null)
+                {
+                    foreach (var (ak, mv) in it.PermanentMult)
+                    {
+                        if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(mv) && Math.Abs(mv - 1.0) > 1e-6)
+                            card.PermanentMult[ak] = mv;
+                    }
+                }
             }
+            else if (it.PermanentAttributes != null)
+            {
+                foreach (var (ak, av) in it.PermanentAttributes)
+                {
+                    if (IsDerivedGhostAttributeKey(ak))
+                        continue;
+                    double baseVal = card.BaseAttributes.GetValueOrDefault(ak, 0);
+                    double delta = av - baseVal;
+                    if (Math.Abs(delta) > 0.001)
+                        card.PermanentAdd[ak] = delta;
+                }
+            }
+
+            if (it.QuestProgress is { Count: > 0 })
+            {
+                foreach (var (qk, qv) in it.QuestProgress)
+                {
+                    if (!string.IsNullOrWhiteSpace(qk) && double.IsFinite(qv))
+                        card.QuestProgress[qk] = qv;
+                }
+            }
+            if (it.CompletedQuests is { Count: > 0 })
+            {
+                foreach (string qid in it.CompletedQuests)
+                {
+                    if (!string.IsNullOrWhiteSpace(qid))
+                        card.CompletedQuests.Add(qid);
+                }
+                // 激活已完成任务对应的奖励能力与属性
+                card.RebuildTierAndEnchantmentData();
+            }
+            if (it.ExtraTags is { Count: > 0 })
+            {
+                foreach (string tag in it.ExtraTags)
+                {
+                    if (!string.IsNullOrWhiteSpace(tag))
+                        card.ExtraTags.Add(tag);
+                }
+            }
+
             if (!ps.Hand.TryPlaceOrShift(card, Math.Clamp(it.Slot, 0, 9)))
                 ps.Hand.TryAddAuto(card);
         }
@@ -1191,7 +1462,75 @@ public sealed class PvpGhostPool
             var tpl = repo.GetCard(sk.TemplateId);
             if (tpl == null) continue;
             string prefix = tpl.Id.Length >= 6 ? tpl.Id[..6] : tpl.Id;
-            ps.Skills.Add(new CardInstance(tpl, TierHelper.ParseTier(sk.Tier), null, $"oppskl_{skillIdx++}_{prefix}"));
+            var skillCard = new CardInstance(tpl, TierHelper.ParseTier(sk.Tier), null, $"oppskl_{skillIdx++}_{prefix}");
+            bool hasSkLayered = (sk.PermanentAdd is { Count: > 0 }) || (sk.PermanentMult is { Count: > 0 });
+            if (hasSkLayered)
+            {
+                if (sk.PermanentAdd != null)
+                {
+                    foreach (var (ak, av) in sk.PermanentAdd)
+                    {
+                        if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(av) && Math.Abs(av) > 1e-6)
+                            skillCard.PermanentAdd[ak] = av;
+                    }
+                }
+                if (sk.PermanentMult != null)
+                {
+                    foreach (var (ak, mv) in sk.PermanentMult)
+                    {
+                        if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(mv) && Math.Abs(mv - 1.0) > 1e-6)
+                            skillCard.PermanentMult[ak] = mv;
+                    }
+                }
+            }
+            else if (sk.PermanentAttributes is { Count: > 0 })
+            {
+                foreach (var (ak, av) in sk.PermanentAttributes)
+                {
+                    if (IsDerivedGhostAttributeKey(ak)) continue;
+                    double baseVal = skillCard.BaseAttributes.GetValueOrDefault(ak, 0);
+                    double delta = av - baseVal;
+                    if (Math.Abs(delta) > 0.001)
+                        skillCard.PermanentAdd[ak] = delta;
+                }
+            }
+            if (sk.ExtraTags is { Count: > 0 })
+            {
+                foreach (string tag in sk.ExtraTags)
+                {
+                    if (!string.IsNullOrWhiteSpace(tag))
+                        skillCard.ExtraTags.Add(tag);
+                }
+            }
+            ps.Skills.Add(skillCard);
+        }
+
+        // D2-P1-10：还原 Jules 炉灶/冷格等 SocketEffects
+        if (ghost.SocketEffects is { Count: > 0 })
+        {
+            int seIdx = 0;
+            foreach (var se in ghost.SocketEffects)
+            {
+                var tpl = repo.GetCard(se.TemplateId);
+                if (tpl == null) continue;
+                string prefix = tpl.Id.Length >= 6 ? tpl.Id[..6] : tpl.Id;
+                var seCard = new CardInstance(tpl, TierHelper.ParseTier(se.Tier), se.Enchantment, $"oppse_{seIdx++}_{se.Slot}_{prefix}")
+                {
+                    StartSlot = Math.Clamp(se.Slot, 0, 9),
+                };
+                if (se.PermanentAttributes is { Count: > 0 })
+                {
+                    foreach (var (ak, av) in se.PermanentAttributes)
+                    {
+                        if (IsDerivedGhostAttributeKey(ak)) continue;
+                        double baseVal = seCard.BaseAttributes.GetValueOrDefault(ak, 0);
+                        double delta = av - baseVal;
+                        if (Math.Abs(delta) > 0.001)
+                            seCard.PermanentAdd[ak] = delta;
+                    }
+                }
+                ps.SocketEffects.Add(seCard);
+            }
         }
 
         ps.PrepareForCombat();
@@ -1200,23 +1539,37 @@ public sealed class PvpGhostPool
 
     private static GhostBoard BuildFallbackGhost(int day, Random rng, GameDataRepository? repo)
     {
-        var heroes = new[] { "Vanessa", "Dooley", "Pygmalien", "Mak", "Karnok", "Jules", "Stelle", "Hero8" };
+        var heroes = HeroNames.PlayableHeroes;
         string hero = heroes[rng.Next(heroes.Length)];
         int clampedDay = Math.Max(1, day);
+        int unlockedMask = DefaultUnlockedMaskForDay(clampedDay);
         var (minHp, maxHp, _) = GetSaneBoundsForDay(clampedDay);
         int hp = clampedDay == 1
-            ? 250
-            : Math.Clamp(250 + (clampedDay - 1) * 350, minHp, maxHp);
+            ? GameDefaults.StartingHealth
+            : Math.Clamp(GameDefaults.StartingHealth + (clampedDay - 1) * 350, minHp, maxHp);
+
+        // D2-P2-06：严格在 DefaultUnlockedMaskForDay(clampedDay) 已解锁连续槽位内落子（如 Day 1 仅限槽位 3..6），零越界
+        int minSlot = 0;
+        while (minSlot < 10 && (unlockedMask & (1 << minSlot)) == 0) minSlot++;
+        int maxExclusiveSlot = minSlot;
+        while (maxExclusiveSlot < 10 && (unlockedMask & (1 << maxExclusiveSlot)) != 0) maxExclusiveSlot++;
+
         var items = new List<GhostItem>();
-        if (repo != null)
+        if (repo != null && maxExclusiveSlot > minSlot)
         {
             var pool = repo.GetSpawnableItemsForHero(hero).Where(c => c.CardSize != CardSize.Large).ToList();
-            int slot = 3;
-            for (int i = 0; i < 3 && pool.Count > 0 && slot < 7; i++)
+            int slot = minSlot;
+            for (int i = 0; i < 3 && pool.Count > 0 && slot < maxExclusiveSlot; i++)
             {
                 var tpl = pool[rng.Next(pool.Count)];
                 int w = tpl.CardSize == CardSize.Medium ? 2 : 1;
-                if (slot + w > 8) break;
+                if (slot + w > maxExclusiveSlot)
+                {
+                    var smallOnly = pool.Where(c => c.CardSize == CardSize.Small).ToList();
+                    if (smallOnly.Count == 0 || slot + 1 > maxExclusiveSlot) break;
+                    tpl = smallOnly[rng.Next(smallOnly.Count)];
+                    w = 1;
+                }
                 items.Add(new GhostItem
                 {
                     Slot = slot,
@@ -1236,7 +1589,7 @@ public sealed class PvpGhostPool
             Level = Math.Clamp(clampedDay + 1, 2, 20),
             HealthMax = hp,
             Prestige = 20,
-            UnlockedSlotsMask = DefaultUnlockedMaskForDay(clampedDay),
+            UnlockedSlotsMask = unlockedMask,
             PowerBucket = "Normal",
             PoolPartition = StandardPartition,
             Items = items,

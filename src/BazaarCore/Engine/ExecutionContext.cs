@@ -25,6 +25,8 @@ public enum DurationTarget
 public sealed class ActiveExecutionState
 {
     public string? AbilityId { get; set; }
+    /// <summary>D1-P1-09：当前正在执行的 AbilityDefinition 对象引用（供附魔隔离域零碰撞判定）。</summary>
+    public AbilityDefinition? Ability { get; set; }
     public string? ActionType { get; set; }
     /// <summary>引起当前反应/能力执行的真实触发源卡牌实例 ID（P1-08，用于 CombatEvent.TriggerSourceCardInstanceId 精确透传）。</summary>
     public string? TriggerSourceCardInstanceId { get; set; }
@@ -42,7 +44,19 @@ public sealed class ActiveExecutionState
     public bool CurrentCastDidCrit { get; set; }
     /// <summary>同一顶层触发/施放链共享的执行上下文 ID（P2-10，用于 CombatSimEventEffectExecuted/AuraExecuted 因果链聚合）。</summary>
     public string? ExecutionContextId { get; set; }
+    /// <summary>D1-P1-15：非 CardFired（如 CanCrit 隐藏标签卡多动作链）同次执行内暴击去重状态。</summary>
+    public string? LastNonCastCritExecId { get; set; }
+    public CardInstance? LastNonCastCritCard { get; set; }
 }
+
+/// <summary>
+/// P0-01：TActionGameDealCards 强类型发牌载荷，完整透传解析后的 SelectionContextRules 与原始 RuleNode 兼容视图。
+/// </summary>
+public sealed record DealtCardsPayload(
+    List<CardInstance> Cards,
+    string SpawnMode,
+    SelectionRulesData? SelectionContextRules,
+    RuleNode? RawSelectionContextRules = null);
 
 /// <summary>
 /// 统一规则执行与求值上下文，同时兼容局内事件（商店/事件/卖牌/升级）和战斗即时结算。
@@ -64,6 +78,8 @@ public sealed class RuleExecutionContext
     public string CombatType { get; set; } = "PVP";
     public string PlayMode { get; set; } = "Unranked";
     public string? CurrentEncounterId { get; set; }
+    /// <summary>D1-P1-06：本局已访问遭遇模板 ID 集合（供 TRunConditionalHasVisitedEncounter 跨局外/光环/商店统一求值）。</summary>
+    public IReadOnlyCollection<string>? VisitedEncounterIds { get; set; }
 
     public CardInstance? SelfCard { get; set; }
     public CardInstance? TriggerSourceCard { get; set; }
@@ -86,6 +102,8 @@ public sealed class RuleExecutionContext
 
     // 供局外商店/发牌动作回调钩子
     public Action<List<CardInstance>, string>? OnDealCardsToSelection { get; set; }
+    /// <summary>P0-01：强类型发牌回调（优先于 OnDealCardsToSelection 触发，完整透传 SelectionContextRules）。</summary>
+    public Action<DealtCardsPayload>? OnDealCardsToSelectionWithRules { get; set; }
     public Action<string>? OnRerollEncounter { get; set; }
     /// <summary>带可选 SpawnCount 覆盖的重掷回调（P1-17，优先于 OnRerollEncounter 触发以保留刷新槽位数语义）。</summary>
     public Action<string, int?>? OnRerollEncounterWithCount { get; set; }
@@ -103,11 +121,19 @@ public sealed class RuleExecutionContext
     /// <summary>带暴击标记的护盾施加回调（P1-07；优先于 3 参 OnShieldApplied 调用，向后兼容既有绑定）。</summary>
     public Action<PlayerState, int, bool, CardInstance?>? OnShieldAppliedWithCrit { get; set; }
     public Action<PlayerState, int, CardInstance?>? OnBurnApplied { get; set; }
+    /// <summary>D1-P1-15：带暴击标记的灼烧施加回调（优先于 3 参 OnBurnApplied 触发）。</summary>
+    public Action<PlayerState, int, bool, CardInstance?>? OnBurnAppliedWithCrit { get; set; }
     public Action<PlayerState, int, CardInstance?>? OnPoisonApplied { get; set; }
+    /// <summary>D1-P1-15：带暴击标记的剧毒施加回调（优先于 3 参 OnPoisonApplied 触发）。</summary>
+    public Action<PlayerState, int, bool, CardInstance?>? OnPoisonAppliedWithCrit { get; set; }
     public Action<PlayerState, int, CardInstance?>? OnHealApplied { get; set; }
     /// <summary>带暴击标记的治疗施加回调（P1-07；优先于 3 参 OnHealApplied 调用，向后兼容既有绑定）。</summary>
     public Action<PlayerState, int, bool, CardInstance?>? OnHealAppliedWithCrit { get; set; }
+    /// <summary>D1-P1-15：复活治疗专用回调（先清零目标残余 overkill 再按统一治疗管线保底恢复 >= 1 HP，事件与血量 100% 一致）。</summary>
+    public Action<PlayerState, int, bool, CardInstance?>? OnReviveHealApplied { get; set; }
     public Action<PlayerState, int, CardInstance?, DurationTarget>? OnRegenApplied { get; set; }
+    /// <summary>D1-P1-15：带暴击标记的再生施加回调（优先于 4 参 OnRegenApplied 触发）。</summary>
+    public Action<PlayerState, int, bool, CardInstance?, DurationTarget>? OnRegenAppliedWithCrit { get; set; }
     public Action<CardInstance, int, CardInstance?>? OnHasteApplied { get; set; }
     public Action<CardInstance, int, CardInstance?>? OnSlowApplied { get; set; }
     public Action<CardInstance, int, CardInstance?>? OnFreezeApplied { get; set; }
@@ -119,6 +145,10 @@ public sealed class RuleExecutionContext
     public Action<CardInstance, string, double, double, double>? OnQuestUpdated { get; set; }
     public Action<CardInstance, string, string, double, int>? OnTimedCardAttributeModifierApplied { get; set; }
     public Action<PlayerState, string, string, double, int>? OnTimedPlayerAttributeModifierApplied { get; set; }
+    /// <summary>D1-P1-07：携带唯一 tokenId 的限时卡牌属性修饰回调（供 CombatSimulator 到期零除法精准摘除）。</summary>
+    public Action<CardInstance, string, string, double, int, int>? OnTimedCardAttributeModifierWithTokenApplied { get; set; }
+    /// <summary>D1-P1-07：携带唯一 tokenId 的限时玩家属性修饰回调。</summary>
+    public Action<PlayerState, string, string, double, int, int>? OnTimedPlayerAttributeModifierWithTokenApplied { get; set; }
     public Action<PlayerState, CardInstance>? OnCardSpawned { get; set; }
     public Action<PlayerState, CardInstance, CardInstance>? OnCardTransformed { get; set; }
     /// <summary>
@@ -129,6 +159,8 @@ public sealed class RuleExecutionContext
     public Action<PlayerState, CardInstance>? OnCardDestroyed { get; set; }
     public Action<PlayerState, CardInstance>? OnCardUpgraded { get; set; }
     public Action<PlayerState, CardInstance>? OnCardEnchanted { get; set; }
+    /// <summary>D1-P1-11：统一棋盘/卡牌结构拓扑变更回调（附魔/移除附魔/升级/变形/毁坏/修复/任务解锁后同步刷触发索引与光环）。</summary>
+    public Action<PlayerState, CardInstance>? OnBoardTopologyChanged { get; set; }
     /// <summary>
     /// V14 通用卡牌状态变更事前拦截回调（参数：targetCard, sourceCard, changeKind[Disable/Destroy/Repair/Transform], reason）。
     /// 返回 false 表示拦截并取消该次状态变更（例如拦截对不可复原卡牌的 Repair）。
@@ -200,6 +232,7 @@ public sealed class RuleExecutionContext
             CombatType = CombatType,
             PlayMode = PlayMode,
             CurrentEncounterId = CurrentEncounterId,
+            VisitedEncounterIds = VisitedEncounterIds,
             SelfCard = selfCard,
             TriggerSourceCard = sourceCard ?? TriggerSourceCard,
             TriggerTargetCard = targetCard ?? TriggerTargetCard,
@@ -214,6 +247,7 @@ public sealed class RuleExecutionContext
             CustomRules = CustomRules,
             ActiveExecution = ActiveExecution,
             OnDealCardsToSelection = OnDealCardsToSelection,
+            OnDealCardsToSelectionWithRules = OnDealCardsToSelectionWithRules,
             OnRerollEncounter = OnRerollEncounter,
             OnRerollEncounterWithCount = OnRerollEncounterWithCount,
             OnExitSelection = OnExitSelection,
@@ -224,10 +258,14 @@ public sealed class RuleExecutionContext
             OnShieldApplied = OnShieldApplied,
             OnShieldAppliedWithCrit = OnShieldAppliedWithCrit,
             OnBurnApplied = OnBurnApplied,
+            OnBurnAppliedWithCrit = OnBurnAppliedWithCrit,
             OnPoisonApplied = OnPoisonApplied,
+            OnPoisonAppliedWithCrit = OnPoisonAppliedWithCrit,
             OnHealApplied = OnHealApplied,
             OnHealAppliedWithCrit = OnHealAppliedWithCrit,
+            OnReviveHealApplied = OnReviveHealApplied,
             OnRegenApplied = OnRegenApplied,
+            OnRegenAppliedWithCrit = OnRegenAppliedWithCrit,
             OnHasteApplied = OnHasteApplied,
             OnSlowApplied = OnSlowApplied,
             OnFreezeApplied = OnFreezeApplied,
@@ -239,12 +277,15 @@ public sealed class RuleExecutionContext
             OnQuestUpdated = OnQuestUpdated,
             OnTimedCardAttributeModifierApplied = OnTimedCardAttributeModifierApplied,
             OnTimedPlayerAttributeModifierApplied = OnTimedPlayerAttributeModifierApplied,
+            OnTimedCardAttributeModifierWithTokenApplied = OnTimedCardAttributeModifierWithTokenApplied,
+            OnTimedPlayerAttributeModifierWithTokenApplied = OnTimedPlayerAttributeModifierWithTokenApplied,
             OnCardSpawned = OnCardSpawned,
             OnCardTransformed = OnCardTransformed,
             OnCardTransformBatch = OnCardTransformBatch,
             OnCardDestroyed = OnCardDestroyed,
             OnCardUpgraded = OnCardUpgraded,
             OnCardEnchanted = OnCardEnchanted,
+            OnBoardTopologyChanged = OnBoardTopologyChanged,
             OnBeforeCardStateChange = OnBeforeCardStateChange,
             OnUnknownRuleType = OnUnknownRuleType
         };

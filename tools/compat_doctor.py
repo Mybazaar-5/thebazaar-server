@@ -35,8 +35,8 @@ from collections import Counter, defaultdict
 from typing import Any
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-MAIN_REPO_FALLBACK = pathlib.Path(r"e:\thebazaar")
-DEFAULT_STEAM_DIR = pathlib.Path(r"D:\SteamLibrary\steamapps\common\The Bazaar")
+MAIN_REPO_FALLBACK = pathlib.Path(r".")
+DEFAULT_STEAM_DIR = pathlib.Path(r"<THE_BAZAAR_GAME_DIR>")
 
 CATALOG_MAGIC_V2 = 0x0DE38942
 TARGET_CARD_TYPES = (

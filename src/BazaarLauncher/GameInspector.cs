@@ -477,7 +477,6 @@ internal static class GameInspector
                     ["canSelectMultiple"] = GetMember(selRules, "CanSelectMultiple"),
                     ["selectionIsFree"] = GetMember(selRules, "SelectionIsFree"),
                     ["canExit"] = GetMember(selRules, "CanExit"),
-                    ["maxSelections"] = GetMember(selRules, "MaxSelections"),
                     ["willAutoSellOnExit"] = GetMember(selRules, "WillAutoSellOnExit"),
                 };
             }

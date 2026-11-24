@@ -10,7 +10,7 @@ namespace BazaarHub.Services;
 /// 1. 无损读写 BepInEx\config\local.thebazaar.bazaarlauncher.cfg（保留全部注释与未知段落）；
 /// 2. 以无 BOM UTF-8 读写游戏根目录 player-name.txt；
 /// 3. 生成「机器名_用户名」防撞号专属昵称；
-/// 4. 切换远程自建服 / 本地单机离线版 / 自定义服务器 / 纯净官方原版；
+/// 4. 切换外置预设远程服（可选）/ 本地单机离线版 / 自定义服务器 / 纯净官方原版；
 /// 5. 读写启动器自身偏好设置（hub-settings.json）。
 /// </summary>
 public sealed class LauncherConfigService
@@ -48,25 +48,36 @@ public sealed class LauncherConfigService
         Path.Combine(gameDir, LauncherConstants.PlayerNameFileName);
 
     /// <summary>
-    /// 加载启动器自身偏好设置。
+    /// 加载启动器自身偏好设置；若旧偏好指向已不存在的外置预设模式则自动归一化至本地单机模式。
     /// </summary>
-    public HubPreferences LoadHubPreferences(string? customSettingsPath = null)
+    public HubPreferences LoadHubPreferences(string? customSettingsPath = null, HubPresetConfig? preset = null)
     {
+        HubPresetConfig activePreset = preset ?? HubPresetRegistry.Current;
         string path = customSettingsPath ?? GetHubSettingsPath();
+        HubPreferences prefs;
         if (!File.Exists(path))
         {
-            return new HubPreferences();
+            prefs = new HubPreferences { SelectedMode = activePreset.DefaultMode };
+            return prefs;
         }
 
         try
         {
             string json = File.ReadAllText(path, Encoding.UTF8);
-            return JsonSerializer.Deserialize<HubPreferences>(json, JsonOptions) ?? new HubPreferences();
+            prefs = JsonSerializer.Deserialize<HubPreferences>(json, JsonOptions)
+                ?? new HubPreferences { SelectedMode = activePreset.DefaultMode };
         }
         catch
         {
-            return new HubPreferences();
+            prefs = new HubPreferences { SelectedMode = activePreset.DefaultMode };
         }
+
+        if (prefs.SelectedMode == ServerMode.PresetRemote && !activePreset.HasPresetRemote)
+        {
+            prefs.SelectedMode = ServerMode.LocalStandalone;
+        }
+
+        return prefs;
     }
 
     /// <summary>
@@ -81,17 +92,30 @@ public sealed class LauncherConfigService
             Directory.CreateDirectory(dir);
         }
 
-        string tmpPath = path + ".tmp";
+        string tmpPath = $"{path}.{Guid.NewGuid():N}.tmp";
         string json = JsonSerializer.Serialize(preferences, JsonOptions);
-        File.WriteAllText(tmpPath, json, Utf8NoBom);
-        File.Move(tmpPath, path, overwrite: true);
+        try
+        {
+            File.WriteAllText(tmpPath, json, Utf8NoBom);
+            File.Move(tmpPath, path, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+            throw;
+        }
     }
 
     /// <summary>
     /// 读取指定游戏目录下的客户端自建服配置快照。
     /// </summary>
-    public LauncherConfigSnapshot ReadSnapshot(string gameDir)
+    public LauncherConfigSnapshot ReadSnapshot(string gameDir, HubPresetConfig? preset = null)
     {
+        HubPresetConfig activePreset = preset ?? HubPresetRegistry.Current;
+        string defaultBase = activePreset.HasPresetRemote
+            ? activePreset.PresetRemoteUrl
+            : LauncherConstants.LocalStandaloneUrl;
+
         string cfgPath = GetLauncherConfigPath(gameDir);
         IniDocument doc = IniDocument.LoadOrEmpty(cfgPath);
 
@@ -113,7 +137,7 @@ public sealed class LauncherConfigService
         return new LauncherConfigSnapshot
         {
             Enabled = doc.GetBool("General", "Enabled", true),
-            ServerBase = doc.GetValue("General", "ServerBase") ?? LauncherConstants.CloudTencentUrl,
+            ServerBase = doc.GetValue("General", "ServerBase") ?? defaultBase,
             AcceptServerMods = doc.GetBool("General", "AcceptServerMods", true),
             ConfigPlayerName = doc.GetValue("General", "PlayerName") ?? string.Empty,
             PlayerNameFileValue = nameFromFile,
@@ -137,8 +161,10 @@ public sealed class LauncherConfigService
         string? playerName,
         bool? bypassSteam = null,
         bool? unlockEverything = null,
-        bool? acceptServerMods = null)
+        bool? acceptServerMods = null,
+        HubPresetConfig? preset = null)
     {
+        HubPresetConfig activePreset = preset ?? HubPresetRegistry.Current;
         string cfgPath = GetLauncherConfigPath(gameDir);
         IniDocument doc = File.Exists(cfgPath)
             ? IniDocument.LoadOrEmpty(cfgPath)
@@ -151,9 +177,12 @@ public sealed class LauncherConfigService
 
         switch (mode)
         {
-            case ServerMode.CloudTencent:
+            case ServerMode.PresetRemote:
                 doc.SetValue("General", "Enabled", "true");
-                doc.SetValue("General", "ServerBase", LauncherConstants.CloudTencentUrl);
+                doc.SetValue(
+                    "General",
+                    "ServerBase",
+                    activePreset.HasPresetRemote ? activePreset.PresetRemoteUrl : LauncherConstants.LocalStandaloneUrl);
                 break;
 
             case ServerMode.LocalStandalone:
@@ -195,7 +224,7 @@ public sealed class LauncherConfigService
         }
 
         doc.SaveAtomic(cfgPath);
-        return ReadSnapshot(gameDir);
+        return ReadSnapshot(gameDir, activePreset);
     }
 
     /// <summary>
@@ -211,9 +240,17 @@ public sealed class LauncherConfigService
         }
 
         string path = GetPlayerNameFilePath(gameDir);
-        string tmpPath = path + ".tmp";
-        File.WriteAllText(tmpPath, sanitized, Utf8NoBom);
-        File.Move(tmpPath, path, overwrite: true);
+        string tmpPath = $"{path}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(tmpPath, sanitized, Utf8NoBom);
+            File.Move(tmpPath, path, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+            throw;
+        }
     }
 
     /// <summary>
@@ -274,16 +311,22 @@ public sealed class LauncherConfigService
     }
 
     /// <summary>
-    /// 根据所选模式解析有效服务器基址（纯净官方原版返回空字符串）。
+    /// 根据所选模式解析有效服务器基址（纯净官方原版返回空字符串；未配置外置预设时回落单机地址）。
     /// </summary>
-    public static string ResolveServerBase(ServerMode mode, string? customServerUrl) => mode switch
+    public static string ResolveServerBase(ServerMode mode, string? customServerUrl, HubPresetConfig? preset = null)
     {
-        ServerMode.CloudTencent => LauncherConstants.CloudTencentUrl,
-        ServerMode.LocalStandalone => LauncherConstants.LocalStandaloneUrl,
-        ServerMode.CustomServer => NormalizeServerUrl(customServerUrl),
-        ServerMode.PureOfficial => string.Empty,
-        _ => LauncherConstants.CloudTencentUrl
-    };
+        HubPresetConfig activePreset = preset ?? HubPresetRegistry.Current;
+        return mode switch
+        {
+            ServerMode.PresetRemote => activePreset.HasPresetRemote
+                ? activePreset.PresetRemoteUrl
+                : LauncherConstants.LocalStandaloneUrl,
+            ServerMode.LocalStandalone => LauncherConstants.LocalStandaloneUrl,
+            ServerMode.CustomServer => NormalizeServerUrl(customServerUrl),
+            ServerMode.PureOfficial => string.Empty,
+            _ => LauncherConstants.LocalStandaloneUrl
+        };
+    }
 
     private static string SanitizePlayerName(string raw)
     {
@@ -315,12 +358,12 @@ public sealed class LauncherConfigService
     }
 
     /// <summary>
-    /// 创建结构完整且带中文注释的默认 BazaarLauncher 配置文件（仅当游戏目录尚无 cfg 时使用）。
+    /// 创建结构完整且带中文注释的默认 BazaarLauncher 配置文件（仅当游戏目录尚无 cfg 时使用，默认单机地址）。
     /// </summary>
     public static IniDocument CreateDefaultLauncherIni()
     {
-        const string template = """
-## Settings file was created by plugin BazaarLauncher v2.0.0
+        string template = $"""
+## Settings file was created by plugin BazaarLauncher v{LauncherConstants.HubVersion}
 ## Plugin GUID: local.thebazaar.bazaarlauncher
 
 [Combat]
@@ -354,9 +397,9 @@ DumpDir =
 # Default value: true
 Enabled = true
 
-## 自建服基址。本地调试用 http://127.0.0.1:8080
+## 自建服基址。单机默认 http://127.0.0.1:8080；联机请填写远程服务器地址
 # Setting type: String
-# Default value: http://<YOUR_SERVER_IP>:8080/
+# Default value: http://127.0.0.1:8080
 ServerBase = http://127.0.0.1:8080
 
 ## 玩家名（账号名）。留空则读游戏目录 player-name.txt，再退回系统用户名。
@@ -390,6 +433,11 @@ BackgroundFps = 20
 # Setting type: Boolean
 # Default value: true
 LazyLoadCosmetics = true
+
+## 高并发战斗特效降载：高倍速或多触发流派战斗时限制并发粒子数量，提升 1% Low 帧率。
+# Setting type: Boolean
+# Default value: false
+ReduceHighConcurrencyVfx = false
 
 """;
         return IniDocument.Parse(template);

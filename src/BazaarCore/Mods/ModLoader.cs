@@ -24,7 +24,13 @@ public static class ModLoader
 
     private static readonly HashSet<string> SupportedImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".png", ".webp", ".jpg", ".jpeg"
+        ".png", ".jpg", ".jpeg"
+    };
+
+    /// <summary>P0-28（方案 A）：显式登记以便送入 Gate #8 报 ASSET_FORMAT_UNSUPPORTED_FOR_UNITY，严禁静默跳过导致漏检。</summary>
+    private static readonly HashSet<string> ExplicitlyRejectedImageExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".webp"
     };
 
     /// <summary>
@@ -120,12 +126,14 @@ public static class ModLoader
         ScanAssets(pkg, issues);
         LoadArtManifestExpectations(pkg, issues);
 
-        // 2. 加载自定义卡牌、原位补丁(patches/*.json)、事件、可选独立野怪与自定义模式
+        // 2. 加载自定义卡牌、原位补丁(patches/*.json)、事件、可选独立野怪、自定义模式与自定义突变词条(P0-22)
         LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Cards, "cards"), pkg.Cards, "CARD_JSON_ERROR", "cards", issues);
         LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Patches, "patches"), pkg.Patches, "PATCH_JSON_ERROR", "patches", issues);
         LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Events, "events"), pkg.Events, "EVENT_JSON_ERROR", "events", issues);
         LoadJsonEntries(pkg, Path.Combine(fullDir, "monsters"), pkg.Monsters, "MONSTER_JSON_ERROR", "monsters", issues);
-        LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Modes, "modes"), pkg.Modes, "MODE_JSON_ERROR", "modes", issues, skipMutatorOnlyFiles: true);
+        string modesTarget = ResolveContentTarget(fullDir, manifest.ContentRoots.Modes, "modes");
+        LoadJsonEntries(pkg, modesTarget, pkg.Modes, "MODE_JSON_ERROR", "modes", issues, skipMutatorOnlyFiles: true);
+        LoadCustomMutators(pkg, modesTarget, issues);
         LoadJsonEntries(pkg, ResolveContentTarget(fullDir, manifest.ContentRoots.Mechanics, "mechanics"), pkg.Mechanics, "MECHANIC_JSON_ERROR", "mechanics", issues);
 
         // 3. 加载 Mod 自定义中文词典（localization/zh-CN.json）
@@ -153,19 +161,95 @@ public static class ModLoader
                 pkgMechMap[m.Id.Trim()] = m;
         }
 
-        void RegisterBinding(CustomCardDefinition card)
+        var pkgCardMap = new Dictionary<string, CustomCardDefinition>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < pkg.Cards.Count; i++)
+        {
+            var c = pkg.Cards[i];
+            if (c != null && !string.IsNullOrWhiteSpace(c.CustomId))
+                pkgCardMap[c.CustomId.Trim()] = c;
+        }
+
+        void ResolveArt(string? rawArt, out string? normalizedPath, out string? sha256)
+        {
+            normalizedPath = null;
+            sha256 = null;
+            if (string.IsNullOrWhiteSpace(rawArt)) return;
+            normalizedPath = ModValidator.NormalizeLogicalPath(rawArt);
+            if (pkg.AssetsByLogicalPath.TryGetValue(normalizedPath, out var asset))
+                sha256 = asset.Sha256;
+        }
+
+        CustomMonsterPreviewBinding BuildMonsterPreview(MonsterTemplate mon, CustomEventDefinition? parentEvent)
+        {
+            var preview = new CustomMonsterPreviewBinding
+            {
+                MonsterId = mon.Id,
+                NameZh = !string.IsNullOrWhiteSpace(parentEvent?.TitleZh)
+                    ? parentEvent!.TitleZh
+                    : (!string.IsNullOrWhiteSpace(mon.InternalName) ? mon.InternalName : mon.Id),
+                NameEn = !string.IsNullOrWhiteSpace(parentEvent?.TitleEn)
+                    ? parentEvent!.TitleEn
+                    : mon.InternalName,
+                MinDay = parentEvent != null && parentEvent.MinDay > 1 ? parentEvent.MinDay : null,
+                MaxDay = parentEvent != null && parentEvent.MaxDay is >= 1 and < 99 ? parentEvent.MaxDay : null,
+                DifficultySlot = parentEvent?.DifficultySlot,
+                Level = mon.Player != null ? (int)Math.Round(mon.Player.Attributes.GetValueOrDefault("Level", 1)) : 1,
+                HealthMax = mon.Player != null ? (int)Math.Round(mon.Player.Attributes.GetValueOrDefault("HealthMax", 300)) : 300,
+                StartingTier = !string.IsNullOrWhiteSpace(parentEvent?.StartingTier) ? parentEvent!.StartingTier! : "Bronze",
+                RewardGold = parentEvent?.RewardCombatGold ?? 0,
+                RewardXp = parentEvent?.RewardCombatXp ?? 0
+            };
+
+            if (mon.Player != null)
+            {
+                if (mon.Player.Hand?.Items != null)
+                {
+                    foreach (var item in mon.Player.Hand.Items)
+                    {
+                        if (item == null || string.IsNullOrWhiteSpace(item.TemplateId)) continue;
+                        string tid = item.TemplateId.Trim();
+                        pkgCardMap.TryGetValue(tid, out var modCard);
+                        preview.Items.Add(new CustomMonsterLoadoutItemBinding
+                        {
+                            CardId = tid,
+                            WireTemplateId = modCard?.BaseVisualTemplateId ?? tid,
+                            Size = !string.IsNullOrWhiteSpace(modCard?.Size) ? modCard!.Size : "Small",
+                            Tier = !string.IsNullOrWhiteSpace(item.Tier) ? item.Tier : "Bronze",
+                            Enchantment = item.EnchantmentType,
+                            TitleZh = modCard?.TitleZh,
+                            TitleEn = modCard?.TitleEn
+                        });
+                    }
+                }
+                if (mon.Player.Skills != null)
+                {
+                    foreach (var sk in mon.Player.Skills)
+                    {
+                        if (sk == null || string.IsNullOrWhiteSpace(sk.TemplateId)) continue;
+                        string tid = sk.TemplateId.Trim();
+                        pkgCardMap.TryGetValue(tid, out var modSkill);
+                        preview.Skills.Add(new CustomMonsterLoadoutItemBinding
+                        {
+                            CardId = tid,
+                            WireTemplateId = modSkill?.BaseVisualTemplateId ?? tid,
+                            Size = "Small",
+                            Tier = !string.IsNullOrWhiteSpace(sk.Tier) ? sk.Tier : "Bronze",
+                            Enchantment = sk.EnchantmentType,
+                            TitleZh = modSkill?.TitleZh,
+                            TitleEn = modSkill?.TitleEn
+                        });
+                    }
+                }
+            }
+            return preview;
+        }
+
+        void RegisterBinding(CustomCardDefinition card, CustomMonsterPreviewBinding? monsterPreview = null)
         {
             if (string.IsNullOrWhiteSpace(card.CustomId)) return;
             string cid = card.CustomId.Trim();
-            string? artSha256 = null;
-            string? normalizedArt = null;
-
-            if (!string.IsNullOrWhiteSpace(card.CustomArtFile))
-            {
-                normalizedArt = ModValidator.NormalizeLogicalPath(card.CustomArtFile);
-                if (pkg.AssetsByLogicalPath.TryGetValue(normalizedArt, out var asset))
-                    artSha256 = asset.Sha256;
-            }
+            ResolveArt(card.CustomArtFile, out string? normalizedArt, out string? artSha256);
+            ResolveArt(card.CustomBgArtFile, out string? normalizedBgArt, out string? bgArtSha256);
 
             var resolvedDisplays = ModRegistry.ResolveCounterDisplaysForCard(
                 card.CounterDisplays,
@@ -187,8 +271,21 @@ public static class ModLoader
                     kv => kv.Key,
                     kv => new List<string>(kv.Value),
                     StringComparer.OrdinalIgnoreCase),
+                TitleEn = !string.IsNullOrWhiteSpace(card.TitleEn) ? card.TitleEn : null,
+                DescEn = !string.IsNullOrWhiteSpace(card.DescEn) ? card.DescEn : null,
+                ActiveTooltipsEn = card.ActiveTooltipsEn is { Count: > 0 } ? new List<string>(card.ActiveTooltipsEn) : null,
+                PassiveTooltipsEn = card.PassiveTooltipsEn is { Count: > 0 } ? new List<string>(card.PassiveTooltipsEn) : null,
+                EnchantTooltipsEn = card.EnchantTooltipsEn is { Count: > 0 }
+                    ? card.EnchantTooltipsEn.ToDictionary(kv => kv.Key, kv => new List<string>(kv.Value), StringComparer.OrdinalIgnoreCase)
+                    : null,
                 CustomArtFile = normalizedArt,
                 CustomArtSha256 = artSha256,
+                CustomBgArtFile = normalizedBgArt,
+                CustomBgArtSha256 = bgArtSha256,
+                VisualTarget = CustomCardVisualBinding.ResolveDefaultVisualTarget(card.Type),
+                IsPatchOverride = false,
+                IsCustomBorrowShell = !string.IsNullOrWhiteSpace(card.BaseVisualTemplateId),
+                MonsterPreview = monsterPreview,
                 ArtRect = card.ArtRect != null
                     ? new CustomCardArtRect { Width = card.ArtRect.Width, Height = card.ArtRect.Height, CropMode = card.ArtRect.CropMode }
                     : null,
@@ -211,19 +308,19 @@ public static class ModLoader
                     running[k] = v;
             }
             bool started = false;
+            string startTierNorm = string.IsNullOrWhiteSpace(card.StartingTier) ? "Bronze" : card.StartingTier.Trim();
             foreach (var tierName in new[] { "Bronze", "Silver", "Gold", "Diamond", "Legendary" })
             {
                 bool hasExplicit = card.Tiers.TryGetValue(tierName, out var td) && td != null;
-                if (hasExplicit)
-                {
+                if (hasExplicit || string.Equals(tierName, startTierNorm, StringComparison.OrdinalIgnoreCase))
                     started = true;
-                    if (td!.Attributes != null)
-                    {
-                        foreach (var (k, v) in td.Attributes)
-                            running[k] = v;
-                    }
+                if (hasExplicit && td!.Attributes != null)
+                {
+                    foreach (var (k, v) in td.Attributes)
+                        running[k] = v;
                 }
-                if (started && running.Count > 0 && (hasExplicit || !tierName.Equals("Legendary", StringComparison.OrdinalIgnoreCase)))
+                // D3-P1-01：从 StartingTier 起完整补齐至 Legendary 五阶底表
+                if (started && running.Count > 0)
                     res[tierName] = new Dictionary<string, double>(running, StringComparer.OrdinalIgnoreCase);
             }
             return res.Count > 0 ? res : null;
@@ -238,29 +335,64 @@ public static class ModLoader
         for (int i = 0; i < pkg.Cards.Count; i++)
             RegisterBinding(pkg.Cards[i]);
 
+        var boundMonsterIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < pkg.Events.Count; i++)
         {
             var ev = pkg.Events[i];
-            RegisterBinding(ev.ToCardDefinition());
+            CustomMonsterPreviewBinding? monPreview = null;
+            if (ev.CombatMonster != null)
+            {
+                monPreview = BuildMonsterPreview(ev.CombatMonster, ev);
+                if (!string.IsNullOrWhiteSpace(ev.CombatMonster.Id))
+                    boundMonsterIds.Add(ev.CombatMonster.Id.Trim());
+            }
+            RegisterBinding(ev.ToCardDefinition(), monPreview);
             for (int j = 0; j < ev.Steps.Count; j++)
                 RegisterBinding(ev.Steps[j]);
         }
 
+        // P0-21：补齐独立 pkg.Monsters 视觉绑定（确保不遗漏独立野怪的 MonsterPreview）
+        for (int i = 0; i < pkg.Monsters.Count; i++)
+        {
+            var mon = pkg.Monsters[i];
+            if (mon == null || string.IsNullOrWhiteSpace(mon.Id)) continue;
+            string mid = mon.Id.Trim();
+            if (pkg.VisualBindingsByCustomId.ContainsKey(mid) || boundMonsterIds.Contains(mid))
+                continue;
+
+            var preview = BuildMonsterPreview(mon, null);
+            pkg.VisualBindingsByCustomId[mid] = new CustomCardVisualBinding
+            {
+                CustomTemplateId = mid,
+                ModId = modId,
+                BaseVisualTemplateId = string.Empty,
+                CardType = "CombatEncounter",
+                Size = "Medium",
+                TitleZh = preview.NameZh,
+                TitleEn = preview.NameEn,
+                DescZh = string.Empty,
+                VisualTarget = "EncounterPortrait",
+                IsPatchOverride = false,
+                IsCustomBorrowShell = false,
+                MonsterPreview = preview
+            };
+        }
+
+        // P0-25：任意字段改动 Patch 均生成 IsPatchOverride=true 视觉绑定（不仅限于文本/贴图改动）
         for (int i = 0; i < pkg.Patches.Count; i++)
         {
             var patch = pkg.Patches[i];
-            if (string.IsNullOrWhiteSpace(patch.TargetTemplateId) || !patch.HasVisualOrTextOverride)
+            if (string.IsNullOrWhiteSpace(patch.TargetTemplateId) || !patch.HasAnyMutation)
                 continue;
 
             string tid = patch.TargetTemplateId.Trim();
-            string? artSha256 = null;
-            string? normalizedArt = null;
-            if (!string.IsNullOrWhiteSpace(patch.CustomArtFile))
-            {
-                normalizedArt = ModValidator.NormalizeLogicalPath(patch.CustomArtFile);
-                if (pkg.AssetsByLogicalPath.TryGetValue(normalizedArt, out var asset))
-                    artSha256 = asset.Sha256;
-            }
+            ResolveArt(patch.CustomArtFile, out string? normalizedArt, out string? artSha256);
+            ResolveArt(patch.CustomBgArtFile, out string? normalizedBgArt, out string? bgArtSha256);
+
+            var patchDisplays = ModRegistry.ResolveCounterDisplaysForCard(
+                patch.CounterDisplaysOverride,
+                patch.CustomMechanicsOverride,
+                pkgMechMap);
 
             pkg.VisualBindingsByCustomId[tid] = new CustomCardVisualBinding
             {
@@ -276,86 +408,55 @@ public static class ModLoader
                 EnchantTooltipsZh = patch.EnchantTooltipsZh != null
                     ? patch.EnchantTooltipsZh.ToDictionary(kv => kv.Key, kv => new List<string>(kv.Value), StringComparer.OrdinalIgnoreCase)
                     : new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase),
+                TitleEn = !string.IsNullOrWhiteSpace(patch.TitleEn) ? patch.TitleEn : null,
+                DescEn = !string.IsNullOrWhiteSpace(patch.DescEn) ? patch.DescEn : null,
+                ActiveTooltipsEn = patch.ActiveTooltipsEn is { Count: > 0 } ? new List<string>(patch.ActiveTooltipsEn) : null,
+                PassiveTooltipsEn = patch.PassiveTooltipsEn is { Count: > 0 } ? new List<string>(patch.PassiveTooltipsEn) : null,
+                EnchantTooltipsEn = patch.EnchantTooltipsEn is { Count: > 0 }
+                    ? patch.EnchantTooltipsEn.ToDictionary(kv => kv.Key, kv => new List<string>(kv.Value), StringComparer.OrdinalIgnoreCase)
+                    : null,
                 CustomArtFile = normalizedArt,
                 CustomArtSha256 = artSha256,
+                CustomBgArtFile = normalizedBgArt,
+                CustomBgArtSha256 = bgArtSha256,
+                VisualTarget = "ItemArt",
+                IsPatchOverride = true,
+                IsCustomBorrowShell = false,
                 ArtRect = patch.ArtRect != null
                     ? new CustomCardArtRect { Width = patch.ArtRect.Width, Height = patch.ArtRect.Height, CropMode = patch.ArtRect.CropMode }
                     : null,
                 Tags = new List<string>(patch.AddTags),
-                AccentColor = patch.AccentColor
+                AccentColor = patch.AccentColor,
+                CounterDisplays = patchDisplays.Count > 0 ? patchDisplays : null
             };
         }
     }
 
     /// <summary>
-    /// 计算单个 ModPackage 的确定性 SHA-256 指纹（用于热重载变化检测与客户端资产同步校验）。
+    /// D3-P1-08：对整包规范化确定性 JSON（Manifest + 排序后的 Cards/Patches/Events/Monsters/Modes/CustomMutators/Mechanics/Assets/LocalizationOverlay）求 SHA-256。
+    /// 任意数值、词条、机制、模式或贴图变更 100% 导致包哈希精确变化。
     /// </summary>
     public static string ComputePackageHash(ModPackage pkg)
     {
-        var sb = new StringBuilder(1024);
-        sb.Append(pkg.Manifest.Id).Append('|')
-          .Append(pkg.Manifest.Version).Append('|')
-          .Append(pkg.Manifest.Scope).Append('|')
-          .Append(pkg.Manifest.AffectsGhostPool).Append('\n');
-
-        foreach (var card in pkg.Cards.OrderBy(c => c.CustomId, StringComparer.OrdinalIgnoreCase))
+        var canonicalPayload = new
         {
-            sb.Append("C:").Append(card.CustomId).Append('|')
-              .Append(card.BaseVisualTemplateId).Append('|')
-              .Append(card.Type).Append('|')
-              .Append(card.Size).Append('|')
-              .Append(card.TitleZh).Append('|')
-              .Append(card.DescZh).Append('|')
-              .Append(card.CustomArtFile ?? string.Empty).Append('\n');
-        }
+            manifest = pkg.Manifest,
+            cards = pkg.Cards.OrderBy(c => c.CustomId, StringComparer.OrdinalIgnoreCase).ToList(),
+            patches = pkg.Patches.OrderBy(p => p.TargetTemplateId, StringComparer.OrdinalIgnoreCase).ToList(),
+            events = pkg.Events.OrderBy(e => e.EventId, StringComparer.OrdinalIgnoreCase).ToList(),
+            monsters = pkg.Monsters.OrderBy(m => m.Id, StringComparer.OrdinalIgnoreCase).ToList(),
+            modes = pkg.Modes.OrderBy(m => m.ModeId, StringComparer.OrdinalIgnoreCase).ToList(),
+            customMutators = pkg.CustomMutators.OrderBy(m => m.Id, StringComparer.OrdinalIgnoreCase).ToList(),
+            mechanics = pkg.Mechanics.OrderBy(m => m.Id, StringComparer.OrdinalIgnoreCase).ToList(),
+            assets = pkg.AssetsByLogicalPath
+                .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(kv => new { path = kv.Key, sha256 = kv.Value.Sha256, bytes = kv.Value.Bytes, contentType = kv.Value.ContentType })
+                .ToList(),
+            localizationOverlay = pkg.LocalizationOverlay
+        };
 
-        foreach (var patch in pkg.Patches.OrderBy(p => p.TargetTemplateId, StringComparer.OrdinalIgnoreCase))
-        {
-            string patchRaw = JsonSerializer.Serialize(patch, ModJsonOptions);
-            sb.Append("P:").Append(patch.TargetTemplateId).Append('=')
-              .Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(patchRaw))).ToLowerInvariant()).Append('\n');
-        }
-
-        foreach (var ev in pkg.Events.OrderBy(e => e.EventId, StringComparer.OrdinalIgnoreCase))
-        {
-            sb.Append("E:").Append(ev.EventId).Append('|')
-              .Append(ev.BaseVisualTemplateId).Append('|')
-              .Append(ev.TitleZh).Append('|')
-              .Append(ev.Steps.Count).Append('\n');
-        }
-
-        foreach (var mon in pkg.Monsters.OrderBy(m => m.Id, StringComparer.OrdinalIgnoreCase))
-        {
-            double hp = mon.Player?.Attributes.GetValueOrDefault("HealthMax", 0) ?? 0;
-            sb.Append("M:").Append(mon.Id).Append('|').Append(mon.InternalName).Append('|').Append(hp).Append('\n');
-        }
-
-        foreach (var mode in pkg.Modes.OrderBy(m => m.ModeId, StringComparer.OrdinalIgnoreCase))
-        {
-            sb.Append("G:").Append(mode.ModeId).Append('|')
-              .Append(mode.BasePreset).Append('|')
-              .Append(mode.BaseSpecialMode).Append('\n');
-        }
-
-        foreach (var mech in pkg.Mechanics.OrderBy(m => m.Id, StringComparer.OrdinalIgnoreCase))
-        {
-            string mechRaw = JsonSerializer.Serialize(mech, ModJsonOptions);
-            sb.Append("X:").Append(mech.Id).Append('=')
-              .Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(mechRaw))).ToLowerInvariant()).Append('\n');
-        }
-
-        foreach (var kv in pkg.AssetsByLogicalPath.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
-        {
-            sb.Append("A:").Append(kv.Key).Append('=').Append(kv.Value.Sha256).Append('\n');
-        }
-
-        if (pkg.LocalizationOverlay != null)
-        {
-            string locJson = JsonSerializer.Serialize(pkg.LocalizationOverlay, ModJsonOptions);
-            sb.Append("L:").Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(locJson))).ToLowerInvariant()).Append('\n');
-        }
-
-        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString()));
+        string canonicalJson = JsonSerializer.Serialize(canonicalPayload, ModJsonOptions);
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonicalJson));
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
@@ -384,10 +485,19 @@ public static class ModLoader
         {
             string fullFile = files[i];
             string ext = Path.GetExtension(fullFile);
-            if (!SupportedImageExtensions.Contains(ext))
+            bool isSupportedExt = SupportedImageExtensions.Contains(ext);
+            bool isRejectedExt = ExplicitlyRejectedImageExtensions.Contains(ext);
+            if (!isSupportedExt && !isRejectedExt)
                 continue;
 
             string relPath = ModValidator.NormalizeLogicalPath(Path.GetRelativePath(fullModRoot, fullFile));
+            string fallbackContentType = ext.ToLowerInvariant() switch
+            {
+                ".webp" => "image/webp",
+                ".jpg" or ".jpeg" => "image/jpeg",
+                ".png" => "image/png",
+                _ => "application/octet-stream"
+            };
             try
             {
                 var fi = new FileInfo(fullFile);
@@ -402,7 +512,7 @@ public static class ModLoader
                         Bytes = fi.Length,
                         Width = 0,
                         Height = 0,
-                        ContentType = ext.Equals(".webp", StringComparison.OrdinalIgnoreCase) ? "image/webp" : "image/png"
+                        ContentType = fallbackContentType
                     };
                     continue;
                 }
@@ -420,7 +530,11 @@ public static class ModLoader
                     Bytes = bytes.LongLength,
                     Width = headerOk ? w : 0,
                     Height = headerOk ? h : 0,
-                    ContentType = headerOk ? contentType : (ext.Equals(".webp", StringComparison.OrdinalIgnoreCase) ? "image/webp" : "application/octet-stream")
+                    ContentType = headerOk
+                        ? contentType
+                        : (string.Equals(contentType, "image/webp", StringComparison.OrdinalIgnoreCase) || isRejectedExt
+                            ? "image/webp"
+                            : "application/octet-stream")
                 };
             }
             catch (Exception ex)
@@ -582,6 +696,83 @@ public static class ModLoader
                     errorCode,
                     $"解析文件 '{rel}' 失败：{ex.Message}",
                     rel));
+            }
+        }
+    }
+
+    /// <summary>
+    /// P0-22：从 modes 目录解析所有自定义肉鸽突变词条（兼容 { "mutators": [...] } 与数组/单对象形式，完整映射 custom_mutators.json）。
+    /// </summary>
+    private static void LoadCustomMutators(ModPackage pkg, string modesTargetPathOrDir, List<ModValidationIssue> issues)
+    {
+        bool isSingleFile = File.Exists(modesTargetPathOrDir);
+        bool isDir = !isSingleFile && Directory.Exists(modesTargetPathOrDir);
+        if (!isSingleFile && !isDir) return;
+
+        string fullModRoot = Path.GetFullPath(pkg.RootDirectory);
+        string fullTarget = Path.GetFullPath(modesTargetPathOrDir);
+        if (!IsPathInsideRoot(fullTarget, fullModRoot)) return;
+
+        string[] files = isSingleFile
+            ? new[] { fullTarget }
+            : Directory.GetFiles(fullTarget, "*.json", SearchOption.AllDirectories);
+        Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < files.Length; i++)
+        {
+            string file = files[i];
+            string rel = ModValidator.NormalizeLogicalPath(Path.GetRelativePath(fullModRoot, file));
+            string fileName = Path.GetFileName(file);
+            bool isMutatorNamed = fileName.Contains("mutator", StringComparison.OrdinalIgnoreCase);
+
+            try
+            {
+                string raw = File.ReadAllText(file, Encoding.UTF8);
+                using var doc = JsonDocument.Parse(raw, new JsonDocumentOptions
+                {
+                    CommentHandling = JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true
+                });
+
+                List<CustomMutatorDefinition>? defs = null;
+                if (doc.RootElement.ValueKind == JsonValueKind.Object
+                    && TryGetPropertyIgnoreCase(doc.RootElement, "mutators", out var mutArr)
+                    && mutArr.ValueKind == JsonValueKind.Array)
+                {
+                    defs = mutArr.Deserialize<List<CustomMutatorDefinition>>(ModJsonOptions);
+                }
+                else if (isMutatorNamed && doc.RootElement.ValueKind == JsonValueKind.Array)
+                {
+                    defs = JsonSerializer.Deserialize<List<CustomMutatorDefinition>>(raw, ModJsonOptions);
+                }
+                else if (isMutatorNamed && doc.RootElement.ValueKind == JsonValueKind.Object
+                    && !TryGetPropertyIgnoreCase(doc.RootElement, "modeId", out _)
+                    && TryGetPropertyIgnoreCase(doc.RootElement, "id", out _))
+                {
+                    var single = JsonSerializer.Deserialize<CustomMutatorDefinition>(raw, ModJsonOptions);
+                    if (single != null) defs = new List<CustomMutatorDefinition> { single };
+                }
+
+                if (defs == null) continue;
+                for (int j = 0; j < defs.Count; j++)
+                {
+                    var d = defs[j];
+                    if (d == null || string.IsNullOrWhiteSpace(d.Id)) continue;
+                    string id = d.Id.Trim();
+                    if (!seenIds.Add(id)) continue;
+                    pkg.CustomMutators.Add(d.ToMetadata(pkg.Manifest.Id));
+                }
+            }
+            catch (Exception ex)
+            {
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Error,
+                    pkg.Manifest.Id,
+                    "MUTATOR_JSON_ERROR",
+                    $"解析自定义突变词条文件 '{rel}' 失败：{ex.Message}",
+                    rel,
+                    GateId: 1));
             }
         }
     }

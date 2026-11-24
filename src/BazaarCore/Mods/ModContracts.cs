@@ -1,4 +1,5 @@
 using System.Collections.Frozen;
+using BazaarCore.Combat;
 using BazaarCore.Data;
 using BazaarCore.Engine;
 using BazaarCore.Models;
@@ -35,14 +36,104 @@ public interface ICustomTriggerHandler
 }
 
 /// <summary>
-/// 自定义游戏模式生命周期钩子扩展点。
+/// P0-22：自定义游戏模式开局与每日阶段通用调整载体（供 RunEngine / ShopEngine 统一消费）。
+/// </summary>
+public sealed class GameModeRunSetupAdjustment
+{
+    public int StartingGoldDelta { get; set; }
+    public int StartingIncomeDelta { get; set; }
+    public int StartingHealthDelta { get; set; }
+    public int? MaxDaysOverride { get; set; }
+    public double ShopPriceMultiplier { get; set; } = 1.0;
+    public bool FreeFirstShopReroll { get; set; }
+    public List<string> ForcedMutatorIds { get; } = new();
+}
+
+/// <summary>
+/// 自定义游戏模式生命周期钩子扩展点（保留既有 3 回调 100% 向后兼容，补充带默认实现的 P0-22 钩子）。
 /// </summary>
 public interface IGameModeHook
 {
     string ModeId { get; }
-    void OnRunInitializing(CustomRunRuleSet rules, GameModeData modeClone);
-    void OnDayHourScheduleResolving(int day, int hour, IList<string> candidateEncounterIds);
-    void OnCombatStarting(PlayerState player, PlayerState opponent, ref bool sandstormEnabled);
+    CustomModeDefinition? Definition => null;
+    void OnRunInitializing(CustomRunRuleSet rules, GameModeData modeClone) { }
+    void OnDayHourScheduleResolving(int day, int hour, IList<string> candidateEncounterIds) { }
+    void OnCombatStarting(PlayerState player, PlayerState opponent, ref bool sandstormEnabled) { }
+
+    void OnRunSetup(GameModeRunSetupAdjustment adjustment, CustomRunRuleSet? rules) { }
+    void OnDayStart(int day, GameModeRunSetupAdjustment dayAdjustment) { }
+    void OnShopGenerated(int day, int hour, IList<string> offeredCardIds) { }
+    void OnCombatModifiersBuilt(CombatModifiers modifiers, int day, bool isPvp) { }
+}
+
+/// <summary>
+/// P0-22：针对 JSON 声明式 CustomModeDefinition 的通用默认模式钩子实现（零单 Mod 硬编码）。
+/// </summary>
+public sealed class DeclarativeGameModeHook : IGameModeHook
+{
+    private readonly CustomModeDefinition _def;
+
+    public DeclarativeGameModeHook(CustomModeDefinition definition)
+    {
+        _def = definition ?? throw new ArgumentNullException(nameof(definition));
+    }
+
+    public string ModeId => _def.ModeId;
+    public CustomModeDefinition? Definition => _def;
+
+    public void OnRunInitializing(CustomRunRuleSet rules, GameModeData modeClone)
+    {
+        if (rules == null) return;
+        if (_def.RuleOverrides != null)
+        {
+            var ov = _def.RuleOverrides;
+            if (ov.StartingGold != 15) rules.StartingGold = ov.StartingGold;
+            if (ov.StartingIncome != 5) rules.StartingIncome = ov.StartingIncome;
+            if (ov.StartingHealth != 300) rules.StartingHealth = ov.StartingHealth;
+            if (ov.StartingPrestige != 20) rules.StartingPrestige = ov.StartingPrestige;
+            if (Math.Abs(ov.ShopPriceMultiplier - 1.0) > 1e-6) rules.ShopPriceMultiplier = ov.ShopPriceMultiplier;
+            if (Math.Abs(ov.EnemyStatMultiplier - 1.0) > 1e-6) rules.EnemyStatMultiplier = ov.EnemyStatMultiplier;
+            if (ov.DisableFatesRevive) rules.DisableFatesRevive = true;
+        }
+
+        if (_def.MutatorIds is { Count: > 0 })
+        {
+            foreach (var mid in _def.MutatorIds)
+            {
+                if (!string.IsNullOrWhiteSpace(mid)
+                    && !rules.MutatorIds.Contains(mid.Trim(), StringComparer.OrdinalIgnoreCase))
+                {
+                    rules.MutatorIds.Add(mid.Trim());
+                }
+            }
+        }
+    }
+
+    public void OnRunSetup(GameModeRunSetupAdjustment adjustment, CustomRunRuleSet? rules)
+    {
+        if (adjustment == null) return;
+        if (_def.RuleOverrides != null)
+        {
+            var ov = _def.RuleOverrides;
+            if (ov.StartingGold != 15) adjustment.StartingGoldDelta += ov.StartingGold - 15;
+            if (ov.StartingIncome != 5) adjustment.StartingIncomeDelta += ov.StartingIncome - 5;
+            if (ov.StartingHealth != 300) adjustment.StartingHealthDelta += ov.StartingHealth - 300;
+            if (Math.Abs(ov.ShopPriceMultiplier - 1.0) > 1e-6)
+                adjustment.ShopPriceMultiplier = Math.Clamp(adjustment.ShopPriceMultiplier * ov.ShopPriceMultiplier, 0.2, 5.0);
+            if (ov.EndlessMaxDay > 11) adjustment.MaxDaysOverride = ov.EndlessMaxDay;
+        }
+        if (_def.MutatorIds is { Count: > 0 })
+        {
+            foreach (var mid in _def.MutatorIds)
+            {
+                if (!string.IsNullOrWhiteSpace(mid)
+                    && !adjustment.ForcedMutatorIds.Contains(mid.Trim(), StringComparer.OrdinalIgnoreCase))
+                {
+                    adjustment.ForcedMutatorIds.Add(mid.Trim());
+                }
+            }
+        }
+    }
 }
 
 /// <summary>

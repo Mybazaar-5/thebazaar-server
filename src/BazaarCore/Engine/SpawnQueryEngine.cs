@@ -1529,7 +1529,7 @@ public static class SpawnQueryEngine
         if (rawSum <= 1e-9)
             return (bronze, silver, gold, diamond);
 
-        double bonus = (Math.Clamp(rules.ShopHighTierBonusPct, 0.0, 60.0) / 100.0) * rawSum;
+        double bonus = (Math.Clamp(rules.ShopHighTierBonusPct, 0.0, 100.0) / 100.0) * rawSum;
         if (rules.PresetId == EGameModePreset.ExtremeRoguelike)
         {
             double take = Math.Min(bronze + silver, bonus);

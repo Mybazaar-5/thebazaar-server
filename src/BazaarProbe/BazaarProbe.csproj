@@ -5,9 +5,8 @@
     <Nullable>disable</Nullable>
     <AssemblyName>BazaarProbe</AssemblyName>
     <RootNamespace>BazaarProbe</RootNamespace>
-    <NoWarn>$(NoWarn);CS0168;CS0219;MSB3277;NU1701</NoWarn>
+    <NoWarn>$(NoWarn);MSB3277;NU1701</NoWarn>
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
-    <RestorePackages>false</RestorePackages>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="BazaarGameShared"><HintPath>..\..\ext\Managed\BazaarGameShared.dll</HintPath><Private>true</Private></Reference>

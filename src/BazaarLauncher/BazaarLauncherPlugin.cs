@@ -37,6 +37,7 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
     internal static ConfigEntry<int> MenuFpsLimit;
     internal static ConfigEntry<int> BackgroundFps;
     internal static ConfigEntry<bool> LazyLoadCosmetics;
+    internal static ConfigEntry<bool> ReduceHighConcurrencyVfx { get; private set; }
     internal static ConfigEntry<bool> MigratedV12_1Defaults;
 
     // 诊断与安全配置（默认安全关闭，彻底修复 P0-2 / P1-5）
@@ -59,6 +60,7 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
         }
 
         HttpClientHub.ResetForStartup();
+        ModEventBus.BindMainThread();
         MainThreadDispatcher.EnsureInstalled();
 
         Host = new ModuleHost();
@@ -97,13 +99,20 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
         // 4. 异步预拉取服务端 Mod 清单、PNG 资产缓存与四层中文词典
         ModContentSyncClient.Instance.TriggerFullSyncInBackground(forceDownload: false);
 
+        string pluginVer = typeof(BazaarLauncherPlugin).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            is System.Reflection.AssemblyInformationalVersionAttribute[] attrs && attrs.Length > 0
+            ? attrs[0].InformationalVersion.Split('+')[0]
+            : (typeof(BazaarLauncherPlugin).Assembly.GetName().Version?.ToString(3) ?? "15.4.0");
         Log.LogInfo(
-            $"BazaarLauncher 15.4.0 (BazaarModKit) 启动就绪 -> {ServerBase.Value} | 玩家={PlayerIdentity.ResolveName()} | 外部扩展={extCount}");
+            $"BazaarLauncher {pluginVer} (BazaarModKit) 启动就绪 -> {ServerBase.Value} | 玩家={PlayerIdentity.ResolveName()} | 外部扩展={extCount}");
     }
 
     private void OnDestroy()
     {
         try { Host?.ShutdownAll(); } catch { }
+        try { CardBadgeArtLibrary.ReleaseAllOnMain(); } catch { }
+        try { CompatAuditPatch.ReleasePrivateCjkFontOnMain(); } catch { }
         try { HttpClientHub.Shutdown(); } catch { }
         try { MainThreadDispatcher.Shutdown(); } catch { }
         Host = null;
@@ -113,8 +122,9 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
     {
         Enabled = Config.Bind("General", "Enabled", true,
             "总开关。false = 完全按原版行为运行（连官方服）。");
+        // D4-P2-6：清除硬编码私服公网 IP，默认指向本地回环自建服（联机地址由用户配置或 BazaarHub 写入）
         ServerBase = Config.Bind("General", "ServerBase", "http://127.0.0.1:8080",
-            "自建服基址。单机默认 http://127.0.0.1:8080；远程自建服请改为 http://<你的服务器IP>:8080");
+            "自建服基址。默认 http://127.0.0.1:8080，联机可由配置或 BazaarHub 覆盖。");
         AcceptServerMods = Config.Bind("General", "AcceptServerMods", true,
             "是否允许接收当前服务器下发的 Mod 贴图与文案（关闭后不加载服务器下发的 Mod 资源）。");
         PlayerName = Config.Bind("General", "PlayerName", "",
@@ -137,6 +147,8 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
             "游戏窗口失去焦点切到后台时的降频帧率（默认 20 FPS 释放 GPU，0 = 不降频）。");
         LazyLoadCosmetics = Config.Bind("Performance", "LazyLoadCosmetics", true,
             "按需懒加载藏品：启动时仅加载当前穿戴装扮，跳过未穿戴 3D 藏品全量预加载，打开藏品柜时按需加载。");
+        ReduceHighConcurrencyVfx = Config.Bind("Performance", "ReduceHighConcurrencyVfx", false,
+            "高并发战斗特效节流开关（降低大场面粒子开销，与 F8 性能设置及 BazaarHub 共享配置键）。");
         MigratedV12_1Defaults = Config.Bind("CustomGameplay", "MigratedV12_1Defaults", false,
             "内部标记：是否已完成 V12.1 野怪多选一与开局倾向默认生效迁移。");
 
@@ -183,25 +195,37 @@ public sealed class BazaarLauncherPlugin : BaseUnityPlugin
         }
 
         normalizedUrl = trimmed;
+        // P0-29 & D4-P1-6：先捕获旧服地址，严格按 6 步有序事务执行热切服（绝不先覆盖地址导致误删新服缓存）
+        string oldServerBase = ServerBase?.Value ?? string.Empty;
+
         if (ServerBase != null)
         {
             ServerBase.Value = normalizedUrl;
-            try { ServerBase.ConfigFile?.Save(); } catch { }
+            try { ServerBase.ConfigFile?.Save(); }
+            catch (Exception ex) { Log?.LogWarning("[TrySwitchServerBase] 保存 ServerBase 配置失败: " + ex.Message); }
         }
         if (Enabled != null && !Enabled.Value)
         {
             Enabled.Value = true;
-            try { Enabled.ConfigFile?.Save(); } catch { }
+            try { Enabled.ConfigFile?.Save(); }
+            catch (Exception ex) { Log?.LogWarning("[TrySwitchServerBase] 保存 Enabled 配置失败: " + ex.Message); }
         }
 
-        // 完整热切服事务：1) 重设游戏原生 TheBazaar.Config 五大端点；2) 清空旧服 JWT/账号缓存并触发新服鉴权；
-        // 3) 清空旧服 Mod 与 server_overlay 并拉取新服清单；4) 重置 CustomGameplayUI 远端状态与 SSE 订阅。
-        try { ApplyUrls(GameInspector.FindTypeSafe("TheBazaar.Config")); } catch { }
-        try { NameAuth.OnServerChanged(); } catch { }
-        ModContentSyncClient.Instance.OnServerChanged();
+        // 完整热切服事务：1) 重设游戏原生 TheBazaar.Config 五大端点；2) 清空旧服 JWT/原生 Token 缓存并重签；
+        // 3) 按 oldServerBase 删旧服缓存并推进 SyncGeneration 取消旧任务再同步新服；4) 重置 CustomGameplayUI 远端状态与 SSE。
+        try { ApplyUrls(GameInspector.FindTypeSafe("TheBazaar.Config")); }
+        catch (Exception ex) { Log?.LogWarning("[TrySwitchServerBase] ApplyUrls 失败: " + ex.Message); }
+
+        try { NameAuth.OnServerChanged(); }
+        catch (Exception ex) { Log?.LogWarning("[TrySwitchServerBase] NameAuth.OnServerChanged 失败: " + ex.Message); }
+
+        try { ModContentSyncClient.Instance.OnServerChanged(oldServerBase); }
+        catch (Exception ex) { Log?.LogWarning("[TrySwitchServerBase] ModContentSyncClient.OnServerChanged 失败: " + ex.Message); }
+
         MainThreadDispatcher.Enqueue(() =>
         {
-            try { CustomGameplayUI.Instance?.OnServerBaseSwitched(); } catch { }
+            try { CustomGameplayUI.Instance?.OnServerBaseSwitched(); }
+            catch (Exception ex) { Log?.LogWarning("[TrySwitchServerBase] OnServerBaseSwitched 失败: " + ex.Message); }
         });
         return true;
     }

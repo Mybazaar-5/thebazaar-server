@@ -7,6 +7,38 @@ using HarmonyLib;
 namespace BazaarLauncher;
 
 /// <summary>
+/// D4-P2-7：零 Unity 依赖的值类型回退实例化内核（防止 Harmony Prefix 返回 null 给值类型返回槽触发拆箱 NRE）。
+/// 先尝试 Activator.CreateInstance，若失败再退回 FormatterServices.GetUninitializedObject。
+/// </summary>
+public static class NoSteamTicketFallbackCore
+{
+    public static bool TryCreateFallbackValue(Type targetType, out object value)
+    {
+        value = null;
+        if (targetType == null) return false;
+        if (!targetType.IsValueType)
+            return true;
+
+        try
+        {
+            value = Activator.CreateInstance(targetType);
+            if (value != null) return true;
+        }
+        catch { }
+
+        try
+        {
+            value = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(targetType);
+            return value != null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}
+
+/// <summary>
 /// 摘掉 Steam 依赖（修复 P1-6 值类型 CSteamID 拆箱 NRE 风险与热重载状态清理）。
 /// </summary>
 internal static class NoSteam
@@ -153,13 +185,31 @@ internal static class NoSteam
             string name = PlayerIdentity.ResolveName();
             string ticket = PlayerIdentity.FakeSteamTicket(name);
             _cachedSteamTicketType ??= AccessTools.TypeByName("TheBazaar.Steam.SteamModule+SteamTicket");
-            __result = _cachedSteamTicketType != null
-                ? Activator.CreateInstance(_cachedSteamTicketType, new object[] { ticket })
-                : null;
+            if (_cachedSteamTicketType != null)
+            {
+                object created = null;
+                try { created = Activator.CreateInstance(_cachedSteamTicketType, new object[] { ticket }); }
+                catch { }
+                // D4-P1-3 & D4-P2-7：防御结构体类型返回 null 引发拆箱 NullReferenceException，经统一回退内核构造零值结构体
+                if (created == null && _cachedSteamTicketType.IsValueType)
+                {
+                    NoSteamTicketFallbackCore.TryCreateFallbackValue(_cachedSteamTicketType, out created);
+                }
+                __result = created;
+            }
+            else
+            {
+                __result = null;
+            }
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogError("NoSteam FakeTicket 失败: " + ex);
+            if (_cachedSteamTicketType != null && _cachedSteamTicketType.IsValueType &&
+                NoSteamTicketFallbackCore.TryCreateFallbackValue(_cachedSteamTicketType, out var fallback))
+            {
+                __result = fallback;
+            }
         }
         return false;
     }

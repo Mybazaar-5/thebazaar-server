@@ -42,6 +42,7 @@ namespace BazaarCore.Tests;
 ///   4) #11 RunSnapshotSerializer.ToSimCard 与 SyncEntryFromCoreCardAndDiff 精确同步 Burn / BurnReference HiddenTags
 ///   5) #13、#15、#16、#19 建房默认 8 人、AI 公平继承房间预设、多真人回合同步屏障及超时解锁、Persistence 清理旧脏镜像
 /// </summary>
+[Collection("GlobalStaticState")]
 public sealed class V10RunAndTournamentSyncTests
 {
     private const string PolShopId = "065f6793-8607-4f02-abfe-db6afb221ab2";
@@ -69,32 +70,17 @@ public sealed class V10RunAndTournamentSyncTests
 
     private static readonly Lazy<Fx> RealFixture = new(() =>
     {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 10 && !string.IsNullOrEmpty(dir); i++, dir = Directory.GetParent(dir)?.FullName)
-        {
-            string candidate = Path.Combine(dir, "dist", "data");
-            string candidateDb = Path.Combine(candidate, "GameData.db");
-            if (File.Exists(candidateDb) && new FileInfo(candidateDb).Length > 1024 * 1024)
-            {
-                dir = candidate;
-                break;
-            }
-        }
-        string fallbackDb = Path.Combine(dir ?? "", "GameData.db");
-        if (string.IsNullOrEmpty(dir) || !File.Exists(fallbackDb) || new FileInfo(fallbackDb).Length <= 1024 * 1024)
-            dir = @"e:\thebazaar\dist\data";
-
-        string dbPath = Path.Combine(dir, "GameData.db");
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new Fx
         {
-            DataDir = dir,
-            DbPath = dbPath,
-            Pool = CardPool.Load(dbPath),
-            Monsters = MonsterPool.Load(dbPath),
-            LevelUps = LevelUpTable.Load(dbPath),
-            Mode = GameModeConfig.Load(dbPath),
-            Repo = GameDatabaseLoader.Load(dbPath, null),
-            Ghosts = PvpGhostPool.Load(dir),
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
         };
     });
 
@@ -322,47 +308,20 @@ public sealed class V10RunAndTournamentSyncTests
 
     private sealed class OverlayContext : IDisposable
     {
-        private readonly string _dir;
-        public CardPool Pool { get; }
-        public List<BazaarServer.Data.MonsterTemplate> Monsters { get; }
-        public LevelUpTable LevelUps { get; }
-        public GameModeConfig Mode { get; }
-        public GameDataRepository Repo { get; }
-        public PvpGhostPool Ghosts { get; }
+        private readonly TestInfrastructure.SharedTestOverlay _inner;
+        public CardPool Pool => _inner.Pool;
+        public List<BazaarServer.Data.MonsterTemplate> Monsters => _inner.Monsters;
+        public LevelUpTable LevelUps => _inner.LevelUps;
+        public GameModeConfig Mode => _inner.Mode;
+        public GameDataRepository Repo => _inner.Repo;
+        public PvpGhostPool Ghosts => _inner.Ghosts;
 
         public OverlayContext(IEnumerable<(string Id, string Json)> cards)
         {
-            var fx = RealFixture.Value;
-            _dir = Path.Combine(Path.GetTempPath(), "bz_v10_" + Guid.NewGuid().ToString("N")[..8]);
-            Directory.CreateDirectory(_dir);
-            string dbCopy = Path.Combine(_dir, "GameData.db");
-            File.Copy(fx.DbPath, dbCopy, overwrite: true);
-
-            using (var conn = new SqliteConnection($"Data Source={dbCopy}"))
-            {
-                conn.Open();
-                foreach (var (id, json) in cards)
-                {
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "INSERT OR REPLACE INTO cards (Id, Data) VALUES ($id, $data);";
-                    cmd.Parameters.AddWithValue("$id", id);
-                    cmd.Parameters.AddWithValue("$data", System.Text.Encoding.UTF8.GetBytes(json));
-                    cmd.ExecuteNonQuery();
-                }
-            }
-
-            Pool = CardPool.Load(dbCopy);
-            Monsters = fx.Monsters;
-            LevelUps = fx.LevelUps;
-            Mode = fx.Mode;
-            Repo = GameDatabaseLoader.Load(dbCopy, null);
-            Ghosts = fx.Ghosts;
+            _inner = TestInfrastructure.SharedGameDataFixture.Shared.CreateMemoryOverlay(customCards: cards);
         }
 
-        public void Dispose()
-        {
-            try { Directory.Delete(_dir, recursive: true); } catch { }
-        }
+        public void Dispose() => _inner.Dispose();
     }
 
     // ── 0. 跨分支接口约定：断点续玩 LevelUp 空货架自愈必须传目标新等级 2（绝不再减成 1） ──
@@ -796,8 +755,8 @@ public sealed class V10RunAndTournamentSyncTests
         var cannon = AddOwnedItem(run, fx.Repo, fx.Pool, CannonId, EInventorySection.Hand, slot: 4, ETier.Bronze, enchantment: null);
 
         // 给两件物品分别附上 Fiery 附魔，调用 SyncEntryFromCoreCardAndDiff 后再调用 ToSimCard
-        talisman.CoreCard!.ApplyEnchantment("Fiery", preventOverride: false, isTemporary: false);
-        cannon.CoreCard!.ApplyEnchantment("Fiery", preventOverride: false, isTemporary: false);
+        talisman.CoreCard!.ApplyEnchantment("Fiery", BazaarCore.Engine.DurationTarget.Permanent, preventOverride: false);
+        cannon.CoreCard!.ApplyEnchantment("Fiery", BazaarCore.Engine.DurationTarget.Permanent, preventOverride: false);
 
         run.SyncEntryFromCoreCardAndDiff(talisman, fx.Repo.GameMode.StandardPrices);
         run.SyncEntryFromCoreCardAndDiff(cannon, fx.Repo.GameMode.StandardPrices);
@@ -1149,6 +1108,30 @@ public sealed class V10RunAndTournamentSyncTests
                     lobbies: lobbies, sessions: sessions, seed: 1509);
                 botEng.Handle(new CheatCommand { Args = ["hour", "6"] });
                 botEng.Handle(new CheatCommand { Args = ["deal"] });
+                // 确定性防 Flake：RunEngine.ApplyTournamentBotRules 仅在 AI 幽灵真实棋盘可放入 Cutlass(2格) 时注入 startingItems；
+                // 使用与生产完全一致的 ToPlayerState + CountFreeUnlockedSlots/TryAddAuto 判定，避免总空位>=2但被碎片化或模板真实格宽占满导致偶发失败。
+                if (botRun.PendingPvpGhost != null)
+                {
+                    var cutlassTpl = fx.Repo.GetCard(CutlassId)!;
+                    bool CanFitCutlass(PvpGhostPool.GhostBoard g)
+                    {
+                        var ps = PvpGhostPool.ToPlayerState(g, fx.Repo);
+                        var probeCard = new CardInstance(cutlassTpl, CardTier.Silver, null, "probe_cutlass");
+                        return ps.Hand.CountFreeUnlockedSlots() >= probeCard.SlotWidth && ps.Hand.TryAddAuto(probeCard);
+                    }
+                    if (!CanFitCutlass(botRun.PendingPvpGhost))
+                    {
+                        for (int probe = 1; probe <= 64; probe++)
+                        {
+                            var cand = fx.Ghosts.PickOpponent(1, 0, 0, new Random(15090 + probe), fx.Repo);
+                            if (cand != null && CanFitCutlass(cand))
+                            {
+                                botRun.PendingPvpGhost = cand;
+                                break;
+                            }
+                        }
+                    }
+                }
                 var botPvpCard = botRun.Cards[Assert.Single(botRun.SelectionSet)];
                 var botPvpOut = botEng.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(botPvpCard.InstanceId) });
                 Assert.Null(botPvpOut.Error);

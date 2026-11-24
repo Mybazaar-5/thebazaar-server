@@ -37,6 +37,10 @@ public sealed class EncounterStepResult
     public bool TransitionsToSubEncounter { get; set; }
     public int GoldSpent { get; set; }
     public int ExperienceAwarded { get; set; }
+    /// <summary>D2-P1-09：奇遇步骤内直接 +Level 的级数，交由 RunEngine 统一执行升级加血/解锁格/OnPlayerLeveledUp 闭环。</summary>
+    public int DirectLevelsGained { get; set; }
+    /// <summary>D2-P1-09：奇遇步骤内声望扣至 &lt;= 0，交由 RunEngine 统一触发 Fates 救援或判负。</summary>
+    public bool PrestigeReachedZero { get; set; }
     public int? MaxSelections { get; set; }
 
     public List<string> ChangeLogs { get; } = new();
@@ -146,6 +150,10 @@ public sealed class EncounterStepEngine
             MaxSelections = _shop.CurrentMaxSelections,
         };
 
+        // D2-P1-09：订阅 AbilityExecutor 局外 1:N / 链式 / Skill 因果变形回调，彻底消灭“销毁 A + 独立新生 B 误配对变形”
+        var transformBatches = new Dictionary<CardInstance, List<CardInstance>>();
+        var producedToRoot = new Dictionary<CardInstance, CardInstance>();
+
         var stepArchetypeResolver = ResolveStepArchetypeResolver();
         var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, playerState, playerState, _rng)
         {
@@ -158,6 +166,33 @@ public sealed class EncounterStepEngine
             SelectionCards = shelfCards,
             ArchetypeResolver = stepArchetypeResolver,
             CustomRules = _run.CustomRules,
+            OnCardTransformBatch = (ownerPs, oldCard, placedAll, _, _, _, _) =>
+            {
+                if (!ReferenceEquals(ownerPs, playerState) || oldCard == null) return;
+                CardInstance root = producedToRoot.TryGetValue(oldCard, out var prevRoot) ? prevRoot : oldCard;
+                if (!transformBatches.TryGetValue(root, out var list))
+                {
+                    list = new List<CardInstance>();
+                    transformBatches[root] = list;
+                }
+                else if (!ReferenceEquals(root, oldCard))
+                {
+                    // 步内链式变形 A -> B -> C：移除中间产物 B，归并最终产物 C 到根卡 A 下
+                    list.Remove(oldCard);
+                }
+
+                if (placedAll != null)
+                {
+                    foreach (var newCard in placedAll)
+                    {
+                        if (newCard == null) continue;
+                        newCard.TransformedFromInstanceId ??= root.InstanceId;
+                        if (!list.Contains(newCard))
+                            list.Add(newCard);
+                        producedToRoot[newCard] = root;
+                    }
+                }
+            },
             OnRerollEncounter = rerollType =>
             {
                 result.RerollTriggered = true;
@@ -179,6 +214,18 @@ public sealed class EncounterStepEngine
                 // P1-01：TActionExitReplacementSet 主动退出当前替换遭遇集，恢复常规事件池
                 _run.ClearActiveReplacementSet();
                 result.ChangeLogs.Add("ExitReplacementSet");
+            },
+            OnDealCardsToSelectionWithRules = payload =>
+            {
+                ApplyDealtCardsToSelection(
+                    payload.Cards,
+                    payload.SpawnMode,
+                    payload.RawSelectionContextRules,
+                    result,
+                    playerState: playerState,
+                    hasExplicitSpawnContext: true,
+                    typedRules: payload.SelectionContextRules);
+                RefreshShelfCards(shelfCards, shelfByCore);
             },
             OnDealCardsToSelection = (dealtCards, spawnMode) =>
             {
@@ -279,9 +326,9 @@ public sealed class EncounterStepEngine
             }
         }
 
-        // 4. 将 PlayerState 变动（含 Hour/Day 限时层）无损回写 RunState，并生成完整增量事件与变更日志
+        // 4. 将 PlayerState 变动（含 Hour/Day/Aura 全部 9 层）无损回写 RunState，并生成完整增量事件与变更日志
         SyncPlayerAttributesBack(playerState, prevEffectivePlayerAttrs, result, grantExperienceWithSource, stepEntry.InstanceId);
-        SyncOwnedCardsBack(playerState, ownedByCore, initialHandSet, initialStashSet, initialSkillSet, initialSocketSet, prevCardSnapshot, result, stepEntry.InstanceId);
+        SyncOwnedCardsBack(playerState, ownedByCore, initialHandSet, initialStashSet, initialSkillSet, initialSocketSet, prevCardSnapshot, result, stepEntry.InstanceId, transformBatches);
         SyncShelfChangesBack(shelfByCore, result);
 
         // 5. 结算 ExperienceAwardUponSelection（对齐小时基础 XP 闸门，防止与母遭遇 PendingEncounterExitXp 或 AdvanceHourOrDay 重复发）
@@ -432,16 +479,24 @@ public sealed class EncounterStepEngine
                     ? ShopEngine.BuildOwnedMaxTiers(_run, ctx.SelfPlayer)
                     : null;
                 bool stepAllowPlayerDup = ShopEngine.HasAllowPlayerDuplicatesBehavior(action.SpawnContext);
-                bool stepIsFree = action.SelectionContextRules?.ExtensionData is { Count: > 0 } ruleExt
-                    ? GetExtBool(ruleExt, "SelectionIsFree", _run.SelectionRules.SelectionIsFree)
-                    : (string.Equals(action.SpawnMode ?? "Replace", "Replace", StringComparison.OrdinalIgnoreCase) && !isStepMerchant
-                        ? true
-                        : _run.SelectionRules.SelectionIsFree);
+                var typedStepRules = action.GetSelectionContextRulesData();
+                bool stepIsFree = typedStepRules != null
+                    ? typedStepRules.SelectionIsFree
+                    : (action.SelectionContextRules?.ExtensionData is { Count: > 0 } ruleExt
+                        ? GetExtBool(ruleExt, "SelectionIsFree", _run.SelectionRules.SelectionIsFree)
+                        : (string.Equals(action.SpawnMode ?? "Replace", "Replace", StringComparison.OrdinalIgnoreCase) && !isStepMerchant
+                            ? true
+                            : _run.SelectionRules.SelectionIsFree));
                 bool stepIsPaid = !stepIsFree;
                 bool stepIsReplace = string.Equals(action.SpawnMode ?? "Replace", "Replace", StringComparison.OrdinalIgnoreCase);
                 bool stepAllowDup = (stepIsFree && _run.SelectionRules.CanSelectMultiple)
                                  || ShopEngine.HasAllowDuplicatesBehavior(action.SpawnContext);
-                if (action.SelectionContextRules?.ExtensionData is { Count: > 0 } dupRuleExt)
+                if (typedStepRules != null)
+                {
+                    if (stepIsFree && typedStepRules.CanSelectMultiple)
+                        stepAllowDup = true;
+                }
+                else if (action.SelectionContextRules?.ExtensionData is { Count: > 0 } dupRuleExt)
                 {
                     bool stepCanMulti = GetExtBool(dupRuleExt, "CanSelectMultiple", _run.SelectionRules.CanSelectMultiple);
                     if (stepIsFree && stepCanMulti)
@@ -515,7 +570,8 @@ public sealed class EncounterStepEngine
                     playerState: ctx.SelfPlayer,
                     hasExplicitSpawnContext: action.SpawnContext != null,
                     spawnContextNode: action.SpawnContext,
-                    evalCtx: ctx);
+                    evalCtx: ctx,
+                    typedRules: typedStepRules);
                 refreshShelfCards?.Invoke();
                 return;
 
@@ -553,7 +609,8 @@ public sealed class EncounterStepEngine
         PlayerState? playerState = null,
         bool hasExplicitSpawnContext = false,
         RuleNode? spawnContextNode = null,
-        RuleExecutionContext? evalCtx = null)
+        RuleExecutionContext? evalCtx = null,
+        SelectionRulesData? typedRules = null)
     {
         bool isReplaceMode = string.Equals(spawnMode, "Replace", StringComparison.OrdinalIgnoreCase);
         bool isMerchant = IsCurrentEncounterMerchant();
@@ -562,17 +619,23 @@ public sealed class EncounterStepEngine
             result.Events.AddRange(_shop.ClearShelf());
         }
 
-        // Bug #4：非商人奇遇通过 Replace 发牌（尤其是免费选物品事件）若未显式给出 CanSelectMultiple=true 或 rulesNode 为空，
-        // 严禁继承旧规则的 CanSelectMultiple=true，强制默认单选免费可退出（选 1 件即完成选择）。
+        // Bug #4 / P0-01：优先消费强类型 SelectionRulesData，完整透传全部 7 项官方选择规则；
+        // 若规则为空且为非商人 Replace，强制默认单选免费可退出并清空旧重随规则。
         bool defaultSingleFreeForReplace = isReplaceMode && !isMerchant;
-        if (rulesNode != null)
+        if (typedRules != null)
+        {
+            ApplySelectionRulesData(_run, _shop, typedRules, defaultSingleFreeForReplace);
+        }
+        else if (rulesNode != null)
         {
             ApplyRuleNodeToSelectionRules(rulesNode, defaultSingleFreeForReplace);
         }
         else if (defaultSingleFreeForReplace)
         {
-            // 修复 #4 残留：rulesNode 为空时清空旧上下文的 RerollRules / WillAutoSellOnExit / NextEncounterOnExit，绝不误继承
             _shop.SetCurrentMaxSelections(1);
+            _run.BaseRerollCost = null;
+            _run.RerollCost = 0;
+            _run.RerollsRemaining = 0;
             _run.SelectionRules = new TSelectionContextRules
             {
                 CanSelectMultiple = false,
@@ -611,7 +674,7 @@ public sealed class EncounterStepEngine
         var runPrereqCtx = evalCtx ?? new RuleExecutionContext(
             _repo,
             RuleScope.OutOfCombat,
-            playerState ?? new PlayerState("p1", "Player", _run.Hero.ToString(), 250, 20, 0, 10),
+            playerState ?? new PlayerState("p1", "Player", _run.Hero.ToString(), GameDefaults.StartingHealth, GameDefaults.StartingPrestige, 0, 10),
             null,
             _rng)
         {
@@ -624,6 +687,16 @@ public sealed class EncounterStepEngine
         foreach (var inst in dealtCards)
         {
             if (!_pool.IsPlayerSpawnableId(inst.Template.Id, allowGuidOnly: true)) continue;
+            // D2-P1-09：补齐动态遭遇池（含 PedestalEncounter）与 ExclusionSet 过滤，防已淘汰/调试/非白昼遭遇混入
+            var dealtPoolTpl = _pool.Get(inst.Template.Id);
+            if (inst.Template.Type is "EventEncounter" or "PedestalEncounter")
+            {
+                if (_run.ExclusionSet.Contains(inst.Template.Id)) continue;
+                if (dealtPoolTpl != null && CardPool.IsExcludedDevOrStoryTemplate(dealtPoolTpl)) continue;
+                if (!ShopEngine.HasExplicitIdListFor(spawnContextNode, inst.Template.Id) &&
+                    CardPool.IsExcludedFromDynamicEncounterPool(inst.Template.Id, inst.Template.InternalName, dealtPoolTpl))
+                    continue;
+            }
             // P1-25：过滤已过期探险门票（覆盖 Browse All Tickets / Surprise Me / [Jungle Ruins] Grab the Loot 等全部发卡点）
             if (CardPool.IsExpeditionTicketExpired(inst.Template.Id, (int)_run.Day, (int)_run.Hour))
                 continue;
@@ -732,6 +805,76 @@ public sealed class EncounterStepEngine
 
         // 统一在发牌与自适应多选上限确定后回填 result.MaxSelections
         result.MaxSelections = _shop.CurrentMaxSelections;
+    }
+
+    /// <summary>
+    /// P0-01：将强类型 <see cref="SelectionRulesData"/> 统一落盘至 <see cref="RunState.SelectionRules"/> 与 <see cref="ShopEngine"/>，
+    /// 供 EncounterStepEngine 与 RunEngine.ConsumeOutOfCombatBatchRequests 共享同一口径。
+    /// </summary>
+    public static void ApplySelectionRulesData(
+        RunState run,
+        ShopEngine shop,
+        SelectionRulesData rules,
+        bool defaultSingleFreeForReplace = false)
+    {
+        ArgumentNullException.ThrowIfNull(run);
+        ArgumentNullException.ThrowIfNull(shop);
+        ArgumentNullException.ThrowIfNull(rules);
+
+        bool canSelectMultiple = rules.CanSelectMultiple;
+        if (rules.MaxSelections is int explicitMax)
+            canSelectMultiple = explicitMax > 1;
+
+        if (rules.MaxSelections.HasValue)
+        {
+            shop.SetCurrentMaxSelections(Math.Max(1, rules.MaxSelections.Value));
+        }
+        else if (canSelectMultiple)
+        {
+            shop.SetCurrentMaxSelections(null);
+        }
+        else if (defaultSingleFreeForReplace)
+        {
+            shop.SetCurrentMaxSelections(1);
+        }
+
+        Guid? nextOnExit = run.SelectionRules.NextEncounterOnExit;
+        if (rules.NextEncounterOnExit.HasValue &&
+            rules.NextEncounterOnExit.Value.ValueKind == JsonValueKind.String &&
+            Guid.TryParse(rules.NextEncounterOnExit.Value.GetString(), out var g))
+        {
+            nextOnExit = g;
+        }
+        else if (defaultSingleFreeForReplace)
+        {
+            nextOnExit = null;
+        }
+
+        RerollRules? reroll = null;
+        if (rules.RerollRules != null)
+        {
+            var (resolvedRules, startingCost, rerollsRemaining) = ShopEngine.ResolveRerollSettings(rules.RerollRules);
+            reroll = resolvedRules;
+            run.BaseRerollCost = startingCost;
+            run.RerollCost = shop.ComputeEffectiveRerollCost(startingCost);
+            run.RerollsRemaining = rerollsRemaining;
+        }
+        else
+        {
+            run.BaseRerollCost = null;
+            run.RerollCost = 0;
+            run.RerollsRemaining = 0;
+        }
+
+        run.SelectionRules = new TSelectionContextRules
+        {
+            CanSelectMultiple = canSelectMultiple,
+            SelectionIsFree = rules.SelectionIsFree,
+            CanExit = rules.CanExit,
+            RerollRules = reroll,
+            WillAutoSellOnExit = rules.WillAutoSellOnExit,
+            NextEncounterOnExit = nextOnExit,
+        };
     }
 
     private void ApplyRuleNodeToSelectionRules(RuleNode node, bool defaultSingleFreeForReplace = false)
@@ -944,10 +1087,10 @@ public sealed class EncounterStepEngine
         HashSet<CardInstance> SocketSet
     ) BuildSyncedPlayerState()
     {
-        int hpMax = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, 250);
+        int hpMax = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, GameDefaults.StartingHealth);
         int hp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, hpMax);
-        int prestige = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 20);
-        int gold = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 8);
+        int prestige = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, GameDefaults.StartingPrestige);
+        int gold = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, GameDefaults.StartingGold);
         int level = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Level, 1);
 
         var ps = new PlayerState("player", "Player", _run.Hero.ToString(), hpMax, prestige, gold, 10)
@@ -959,27 +1102,14 @@ public sealed class EncounterStepEngine
             Losses = (int)_run.Defeats,
             FatesUsed = _run.HasVisitedFates,
         };
-        // P0-1 & V14.2：同时从 _run.PlayerAttributes 剥离小时/天限时层与局外光环层，确保 Aura 与 UntilEndOfDay/Hour 临时增益完全幂等
-        foreach (var (ak, av) in _run.PlayerAttributes)
+        if (_run.ExclusionSetInitialized)
         {
-            string key = ak.ToString();
-            double baseVal = av;
-            double mult = _run.PlayerHourMult.GetValueOrDefault(key, 1.0)
-                        * _run.PlayerDayMult.GetValueOrDefault(key, 1.0)
-                        * _run.PlayerAuraMult.GetValueOrDefault(key, 1.0);
-            if (Math.Abs(mult) > 1e-6 && Math.Abs(mult - 1.0) > 1e-6)
-                baseVal /= mult;
-            baseVal -= _run.PlayerHourAdd.GetValueOrDefault(key, 0.0)
-                     + _run.PlayerDayAdd.GetValueOrDefault(key, 0.0)
-                     + _run.PlayerAuraAdd.GetValueOrDefault(key, 0.0);
-            ps.Attributes[key] = baseVal;
+            ps.InitializeExclusionSet(null);
+            foreach (string exId in _run.ExclusionSet)
+                ps.ExclusionSet.Add(exId);
         }
-        foreach (var (k, v) in _run.PlayerHourAdd) ps.HourAdd[k] = v;
-        foreach (var (k, v) in _run.PlayerHourMult) ps.HourMult[k] = v;
-        foreach (var (k, v) in _run.PlayerDayAdd) ps.DayAdd[k] = v;
-        foreach (var (k, v) in _run.PlayerDayMult) ps.DayMult[k] = v;
-        foreach (var (k, v) in _run.PlayerAuraAdd) ps.AuraAdd[k] = v;
-        foreach (var (k, v) in _run.PlayerAuraMult) ps.AuraMult[k] = v;
+        // D2-P1-08：使用单一共享正向分层装配器，0 反除、0 双重乘算，完整装载 Hour/Day/Aura 全部 9 层
+        _run.ApplyLayeredPlayerStateTo(ps);
 
         ps.CurrentHealth = Math.Clamp(hp, 0, Math.Max(1, ps.HealthMax));
         ps.Hand.UnlockedMask = _run.UnlockedSlots;
@@ -1128,9 +1258,10 @@ public sealed class EncounterStepEngine
 
     private CardInstance BuildStepCardInstance(RunState.CardEntry entry, BazaarCore.Models.CardTemplate? coreTpl)
     {
+        // D3-P1-10：支持非 GUID 自定义 Mod 步骤卡
         var tpl = coreTpl ?? new BazaarCore.Models.CardTemplate
         {
-            Id = entry.TemplateId.ToString(),
+            Id = RunState.ResolveCoreTemplateId(entry),
             Type = entry.Type.ToString(),
             Size = entry.Size.ToString(),
             StartingTier = entry.Tier.ToString(),
@@ -1174,15 +1305,8 @@ public sealed class EncounterStepEngine
     {
         if (attrType == EPlayerAttributeType.Health)
             return ps.CurrentHealth;
-        string key = attrType.ToString();
-        double baseVal = ps.Attributes.GetValueOrDefault(key, 0.0);
-        return (baseVal
-                + ps.AuraAdd.GetValueOrDefault(key, 0.0)
-                + ps.HourAdd.GetValueOrDefault(key, 0.0)
-                + ps.DayAdd.GetValueOrDefault(key, 0.0))
-               * ps.AuraMult.GetValueOrDefault(key, 1.0)
-               * ps.HourMult.GetValueOrDefault(key, 1.0)
-               * ps.DayMult.GetValueOrDefault(key, 1.0);
+        // D2-P1-08：直接走 PlayerState.GetAttribute 权威公式（完整包含 Hour/Day/Combat/Aura 四层 Add + AdditiveMult + PureMult）
+        return ps.GetAttribute(attrType.ToString());
     }
 
     private static Dictionary<string, double> CaptureEffectivePlayerAttributes(PlayerState ps)
@@ -1193,13 +1317,6 @@ public sealed class EncounterStepEngine
         return snap;
     }
 
-    private static void CopyLayerDict(Dictionary<string, double> src, Dictionary<string, double> dst)
-    {
-        dst.Clear();
-        foreach (var (k, v) in src)
-            dst[k] = v;
-    }
-
     private void SyncPlayerAttributesBack(
         PlayerState ps,
         Dictionary<string, double> prevEffectiveAttrs,
@@ -1207,16 +1324,28 @@ public sealed class EncounterStepEngine
         Func<int, string?, List<IGameSimEvent>>? grantExperience = null,
         string? sourceInstanceId = null)
     {
+        // 同步动态 ExclusionSet 变更
+        if (ps.ExclusionSetInitialized || ps.ExclusionSet.Count > 0)
+        {
+            _run.ExclusionSetInitialized = true;
+            _run.ExclusionSet.Clear();
+            foreach (string exId in ps.ExclusionSet)
+                _run.ExclusionSet.Add(exId);
+        }
+
         // Health 特殊处理：PlayerState.CurrentHealth 反映当前血量
         ps.Attributes["Health"] = ps.CurrentHealth;
 
-        // V14.2 关键修复：完整回写玩家局外限时层（UntilEndOfHour / UntilEndOfDay），确保咖啡店 Relax 等临时属性持久化并带入战斗
-        CopyLayerDict(ps.HourAdd, _run.PlayerHourAdd);
-        CopyLayerDict(ps.HourMult, _run.PlayerHourMult);
-        CopyLayerDict(ps.DayAdd, _run.PlayerDayAdd);
-        CopyLayerDict(ps.DayMult, _run.PlayerDayMult);
+        // D2-P1-08：经统一正向回写器精确提取全部 9 张修饰层（PureMult 与 AdditiveMult 分离，含 Aura 层）与永久基础值
+        int prevLevelInRun = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Level, 1);
+        double prevLevelBase = _run.BasePlayerAttributes.TryGetValue("Level", out double lb) ? lb : prevLevelInRun;
+        int prevXpInRun = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0);
+        double prevXpBase = _run.BasePlayerAttributes.TryGetValue("Experience", out double xb) ? xb : prevXpInRun;
+
+        _run.CaptureLayeredPlayerStateFrom(ps, captureBaseValues: true, includeAllExistingAttrs: false);
 
         int deferredXpDelta = 0;
+        int deferredLevelDelta = 0;
         int healthMaxDeltaForHeal = 0;
         bool healthExplicitlyChanged = false;
 
@@ -1224,9 +1353,9 @@ public sealed class EncounterStepEngine
         {
             string key = attrType.ToString();
             bool hasInAnyLayer = ps.Attributes.ContainsKey(key)
-                              || ps.HourAdd.ContainsKey(key) || ps.HourMult.ContainsKey(key)
-                              || ps.DayAdd.ContainsKey(key) || ps.DayMult.ContainsKey(key)
-                              || ps.AuraAdd.ContainsKey(key) || ps.AuraMult.ContainsKey(key);
+                              || ps.HourAdd.ContainsKey(key) || ps.HourMult.ContainsKey(key) || ps.HourAdditiveMult.ContainsKey(key)
+                              || ps.DayAdd.ContainsKey(key) || ps.DayMult.ContainsKey(key) || ps.DayAdditiveMult.ContainsKey(key)
+                              || ps.AuraAdd.ContainsKey(key) || ps.AuraMult.ContainsKey(key) || ps.AuraAdditiveMult.ContainsKey(key);
             if (!hasInAnyLayer && attrType != EPlayerAttributeType.Health) continue;
 
             double effectiveVal = ComputeEffectivePlayerAttr(ps, attrType);
@@ -1234,20 +1363,71 @@ public sealed class EncounterStepEngine
             bool changedInStep = !prevEffectiveAttrs.TryGetValue(key, out double prevVal) || Math.Abs(effectiveVal - prevVal) > 1e-6;
             if (!changedInStep) continue;
 
-            int newInt = (int)Math.Round(effectiveVal);
-            int oldInt = _run.PlayerAttributes.TryGetValue(attrType, out int oldV) ? oldV : 0;
-            if (newInt == oldInt) continue;
-
-            int delta = newInt - oldInt;
-            // 奇遇步骤内直接加经验（如 Trip Him Up +2 XP / Join the Cult +3 XP）延迟到属性同步循环完成后再经 grantExperience 正规结算升级、PendingLevelUps 与格位解锁，
-            // 防止后续遍历到 Level/HealthMax 时被旧值覆写回降。
-            if (attrType == EPlayerAttributeType.Experience && delta > 0 && grantExperience != null)
+            bool hasModifierLayer = ps.HourAdd.ContainsKey(key) || ps.HourMult.ContainsKey(key) || ps.HourAdditiveMult.ContainsKey(key)
+                                 || ps.DayAdd.ContainsKey(key) || ps.DayMult.ContainsKey(key) || ps.DayAdditiveMult.ContainsKey(key)
+                                 || ps.AuraAdd.ContainsKey(key) || ps.AuraMult.ContainsKey(key) || ps.AuraAdditiveMult.ContainsKey(key);
+            int? minBound = attrType switch
             {
-                deferredXpDelta += delta;
+                EPlayerAttributeType.Gold or EPlayerAttributeType.Prestige or EPlayerAttributeType.Experience => 0,
+                EPlayerAttributeType.HealthMax or EPlayerAttributeType.Level => 1,
+                _ => null,
+            };
+
+            int oldInt = prevEffectiveAttrs.TryGetValue(key, out double pVal)
+                ? (int)Math.Round(pVal)
+                : (_run.PlayerAttributes.TryGetValue(attrType, out int oldV) ? oldV : 0);
+            int rawNewInt = (int)Math.Round(effectiveVal);
+            // D2-P1-09：统一强钳制（Gold >= 0、Prestige >= 0、Experience >= 0、HealthMax >= 1）
+            int newInt = minBound.HasValue ? Math.Max(minBound.Value, rawNewInt) : rawNewInt;
+            if (newInt == oldInt && !(attrType == EPlayerAttributeType.Prestige && newInt == 0 && rawNewInt <= 0 && oldInt > 0))
+            {
+                // D2-P1-08：仅当永久基础值本身越界（或无修饰层）时才下钳 BasePlayerAttributes；
+                // 若因临时/光环减益（如 HourMult=0.0 或负 DayAdd）拉低有效展示值，绝不摧毁合法的永久基础值！
+                if (rawNewInt != newInt)
+                {
+                    double rawBase = ps.Attributes.GetValueOrDefault(key, 0.0);
+                    if (!hasModifierLayer || (minBound.HasValue && rawBase < minBound.Value))
+                    {
+                        _run.BasePlayerAttributes[key] = minBound ?? newInt;
+                    }
+                    _run.PlayerAttributes[attrType] = newInt;
+                    _run.LastDerivedPlayerAttributes[attrType] = newInt;
+                }
                 continue;
             }
 
+            int delta = newInt - oldInt;
+            // 奇遇步骤内直接加经验延迟到属性同步循环完成后经 grantExperience 正规结算升级
+            if (attrType == EPlayerAttributeType.Experience && delta > 0 && grantExperience != null)
+            {
+                _run.PlayerAttributes[EPlayerAttributeType.Experience] = prevXpInRun;
+                _run.BasePlayerAttributes["Experience"] = prevXpBase;
+                _run.LastDerivedPlayerAttributes[EPlayerAttributeType.Experience] = prevXpInRun;
+                deferredXpDelta += delta;
+                continue;
+            }
+            // D2-P1-09：奇遇步骤内直接 +Level 交由 RunEngine 走完整升级加血/开槽/PendingLevelUps/OnPlayerLeveledUp 闭环
+            if (attrType == EPlayerAttributeType.Level && delta > 0)
+            {
+                _run.PlayerAttributes[EPlayerAttributeType.Level] = prevLevelInRun;
+                _run.BasePlayerAttributes["Level"] = prevLevelBase;
+                _run.LastDerivedPlayerAttributes[EPlayerAttributeType.Level] = prevLevelInRun;
+                deferredLevelDelta += delta;
+                continue;
+            }
+
+            if (rawNewInt != newInt)
+            {
+                // D2-P1-08：永久基础值合法但被临时/光环减益拉低触底时，仅钳制展示值，绝不抹杀永久基础值
+                double rawBase = ps.Attributes.GetValueOrDefault(key, 0.0);
+                if (!hasModifierLayer || (minBound.HasValue && rawBase < minBound.Value))
+                {
+                    _run.BasePlayerAttributes[key] = minBound ?? newInt;
+                }
+            }
             _run.PlayerAttributes[attrType] = newInt;
+            _run.LastDerivedPlayerAttributes[attrType] = newInt;
+
             if (attrType == EPlayerAttributeType.HealthMax && delta > 0)
                 healthMaxDeltaForHeal = delta;
             if (attrType == EPlayerAttributeType.Health)
@@ -1259,17 +1439,30 @@ public sealed class EncounterStepEngine
             if (attrType == EPlayerAttributeType.Income && delta > 0)
                 result.Events.Add(new GameSimEventPlayerIncomeGained((uint)delta));
             else if (attrType == EPlayerAttributeType.Prestige)
+            {
                 result.Events.Add(new GameSimEventPlayerPrestigeChanged(delta));
+                if (newInt <= 0)
+                    result.PrestigeReachedZero = true;
+            }
         }
 
-        // 若最大生命值因临时/永久增益上涨且 Health 未单独结算，同步抬升当前生命值并钳制在最新 HealthMax 内
-        if (healthMaxDeltaForHeal > 0 && !healthExplicitlyChanged)
+        // D2-P1-09：无论 HealthMax 上涨还是下降，始终同步更新并下钳 Health <= HealthMax（HealthMax >= 1）
+        int maxHp = Math.Max(1, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, GameDefaults.StartingHealth));
+        int oldHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, maxHp);
+        int targetHp = (healthMaxDeltaForHeal > 0 && !healthExplicitlyChanged)
+            ? Math.Clamp(oldHp + healthMaxDeltaForHeal, 0, maxHp)
+            : Math.Clamp(oldHp, 0, maxHp);
+        if (targetHp != oldHp)
         {
-            int maxHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, 250);
-            int oldHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, maxHp);
-            int newHp = Math.Clamp(oldHp + healthMaxDeltaForHeal, 0, Math.Max(1, maxHp));
-            if (newHp != oldHp)
-                _run.PlayerAttributes[EPlayerAttributeType.Health] = newHp;
+            _run.PlayerAttributes[EPlayerAttributeType.Health] = targetHp;
+            _run.BasePlayerAttributes["Health"] = targetHp;
+            _run.LastDerivedPlayerAttributes[EPlayerAttributeType.Health] = targetHp;
+        }
+
+        if (deferredLevelDelta > 0)
+        {
+            result.DirectLevelsGained += deferredLevelDelta;
+            result.ChangeLogs.Add($"Level+{deferredLevelDelta}");
         }
 
         if (deferredXpDelta > 0 && grantExperience != null)
@@ -1288,7 +1481,8 @@ public sealed class EncounterStepEngine
         HashSet<CardInstance> initialSocketEffects,
         Dictionary<CardInstance, CardSnap> prevSnap,
         EncounterStepResult result,
-        string? sourceInstanceId = null)
+        string? sourceInstanceId = null,
+        Dictionary<CardInstance, List<CardInstance>>? transformBatches = null)
     {
         var currentHand = new HashSet<CardInstance>(ps.Hand.Cards);
         var currentStash = new HashSet<CardInstance>(ps.Stash.Cards);
@@ -1296,7 +1490,17 @@ public sealed class EncounterStepEngine
         var currentSocketEffects = new HashSet<CardInstance>(ps.SocketEffects);
         var matchedReplacements = new HashSet<CardInstance>();
 
-        // 1. 检查已存在卡牌的销毁、变阶、附魔、属性与标签更新
+        bool IsStillOwnedInPs(CardInstance c)
+            => !c.IsDestroyed && (currentHand.Contains(c) || currentStash.Contains(c) || currentSkills.Contains(c) || currentSocketEffects.Contains(c));
+
+        EInventorySection? ResolveCurrentSection(CardInstance c)
+        {
+            if (currentStash.Contains(c)) return EInventorySection.Stash;
+            if (currentSkills.Contains(c)) return null;
+            return EInventorySection.Hand;
+        }
+
+        // 1. 检查已存在卡牌的因果变形（1:N / Skill / 同槽 SocketEffect）、销毁、变阶、附魔增删、属性与标签更新
         foreach (var (core, entry) in ownedByCore)
         {
             bool stillPresent = currentHand.Contains(core)
@@ -1305,51 +1509,72 @@ public sealed class EncounterStepEngine
                              || currentSocketEffects.Contains(core);
             if (!stillPresent || core.IsDestroyed)
             {
-                // 判断是否被 TActionCardTransform 变形为另一张新卡（优先同槽位，其次同区未匹配新卡）
-                CardInstance? replacement = null;
-                if (initialHand.Contains(core))
+                // D2-P1-09：严格按因果来源对账（OnCardTransformBatch -> TransformedFromInstanceId -> 同槽 SocketEffect），
+                // 彻底根除“同步骤内销毁 A + 独立新生 B 被误配对为变形”
+                var causalReplacements = new List<CardInstance>();
+                if (transformBatches != null && transformBatches.TryGetValue(core, out var batchTargets))
                 {
-                    replacement = ps.Hand.Cards.FirstOrDefault(c => !ownedByCore.ContainsKey(c) && !matchedReplacements.Contains(c) && c.StartSlot == core.StartSlot)
-                                  ?? ps.Hand.Cards.FirstOrDefault(c => !ownedByCore.ContainsKey(c) && !matchedReplacements.Contains(c));
+                    foreach (var t in batchTargets)
+                    {
+                        if (t != null && !ownedByCore.ContainsKey(t) && !matchedReplacements.Contains(t) && IsStillOwnedInPs(t))
+                            causalReplacements.Add(t);
+                    }
                 }
-                if (replacement == null && initialStash.Contains(core))
+                if (causalReplacements.Count == 0)
                 {
-                    replacement = ps.Stash.Cards.FirstOrDefault(c => !ownedByCore.ContainsKey(c) && !matchedReplacements.Contains(c) && c.StartSlot == core.StartSlot)
-                                  ?? ps.Stash.Cards.FirstOrDefault(c => !ownedByCore.ContainsKey(c) && !matchedReplacements.Contains(c));
+                    // 次级因果：直接检查 TransformedFromInstanceId == entry.InstanceId（覆盖非 batch 路径设置的因果标签）
+                    foreach (var cand in ps.Hand.Cards.Concat(ps.Stash.Cards).Concat(ps.Skills).Concat(ps.SocketEffects))
+                    {
+                        if (!ownedByCore.ContainsKey(cand) &&
+                            !matchedReplacements.Contains(cand) &&
+                            !cand.IsDestroyed &&
+                            string.Equals(cand.TransformedFromInstanceId, entry.InstanceId, StringComparison.Ordinal))
+                        {
+                            causalReplacements.Add(cand);
+                        }
+                    }
                 }
-                if (replacement == null && initialSocketEffects.Contains(core))
+                if (causalReplacements.Count == 0 && initialSocketEffects.Contains(core))
                 {
-                    replacement = ps.SocketEffects.FirstOrDefault(c => !ownedByCore.ContainsKey(c) && !matchedReplacements.Contains(c) && c.StartSlot == core.StartSlot)
-                                  ?? ps.SocketEffects.FirstOrDefault(c => !ownedByCore.ContainsKey(c) && !matchedReplacements.Contains(c));
+                    // 同槽位覆盖旧 SocketEffect（如音符覆盖灶台）必须合成为 CardTransformed
+                    var sameSlotSe = ps.SocketEffects.FirstOrDefault(c =>
+                        !ownedByCore.ContainsKey(c) && !matchedReplacements.Contains(c) && !c.IsDestroyed && c.StartSlot == core.StartSlot);
+                    if (sameSlotSe != null)
+                        causalReplacements.Add(sameSlotSe);
                 }
 
                 RemoveEntryFromGridsAndDict(entry);
 
-                if (replacement != null)
+                if (causalReplacements.Count > 0)
                 {
                     _run.TrackReagentTransformIfApplicable(core, entry);
-                    matchedReplacements.Add(replacement);
-                    var sec = ps.Stash.Cards.Contains(replacement)
-                        ? EInventorySection.Stash
-                        : (ps.Skills.Contains(replacement) ? (EInventorySection?)null : EInventorySection.Hand);
-                    var newEntry = RegisterNewOwnedCoreCard(replacement, sec, result, isTransform: true);
-                    if (newEntry != null)
+                    var transformItems = new List<SimEventCardTransformation>(causalReplacements.Count);
+                    foreach (var replacement in causalReplacements)
                     {
-                        result.TransformedCards.Add(newEntry);
+                        matchedReplacements.Add(replacement);
+                        replacement.TransformedFromInstanceId = null;
+                        var sec = ResolveCurrentSection(replacement);
+                        var newEntry = RegisterNewOwnedCoreCard(replacement, sec, result, isTransform: true);
+                        if (newEntry != null)
+                        {
+                            result.TransformedCards.Add(newEntry);
+                            transformItems.Add(new SimEventCardTransformation(
+                                newEntry.InstanceId,
+                                newEntry.TemplateId.ToString(),
+                                newEntry.Type,
+                                ECombatantId.Player,
+                                newEntry.Section,
+                                newEntry.Socket));
+                        }
+                    }
+
+                    if (transformItems.Count > 0)
+                    {
                         result.Events.Add(new GameSimEventCardTransformed(
                             "step_" + entry.InstanceId,
                             entry.InstanceId,
-                            new List<SimEventCardTransformation>
-                            {
-                                new SimEventCardTransformation(
-                                    newEntry.InstanceId,
-                                    newEntry.TemplateId.ToString(),
-                                    newEntry.Type,
-                                    ECombatantId.Player,
-                                    newEntry.Section,
-                                    newEntry.Socket)
-                            }));
-                        result.ChangeLogs.Add($"Transform:{entry.TemplateId}->{newEntry.TemplateId}");
+                            transformItems));
+                        result.ChangeLogs.Add($"Transform:{entry.TemplateId}->{string.Join(",", transformItems.Select(x => x.TemplateId))}");
                     }
                     else
                     {
@@ -1374,26 +1599,49 @@ public sealed class EncounterStepEngine
                     result.ChangeLogs.Add($"Upgrade:{entry.InstanceId}->{entry.Tier}");
                     result.ModifiedCardIds.Add(entry.InstanceId);
                 }
-                if (!string.Equals(core.Enchantment, snap.Enchantment, StringComparison.OrdinalIgnoreCase) &&
-                    !string.IsNullOrEmpty(core.Enchantment) &&
-                    Enum.TryParse<EEnchantmentType>(core.Enchantment, true, out var enchEnum))
+                if (!string.Equals(core.Enchantment, snap.Enchantment, StringComparison.OrdinalIgnoreCase))
                 {
-                    entry.Enchantment = enchEnum;
-                    result.Events.Add(new GameSimEventCardEnchanted
+                    if (!string.IsNullOrEmpty(core.Enchantment) &&
+                        Enum.TryParse<EEnchantmentType>(core.Enchantment, true, out var enchEnum))
                     {
-                        InstanceId = entry.InstanceId,
-                        EnchantmentType = enchEnum,
-                        IsReverted = false,
-                    });
-                    result.ChangeLogs.Add($"Enchant:{entry.InstanceId}->{enchEnum}");
-                    result.ModifiedCardIds.Add(entry.InstanceId);
+                        entry.Enchantment = enchEnum;
+                        result.Events.Add(new GameSimEventCardEnchanted
+                        {
+                            InstanceId = entry.InstanceId,
+                            EnchantmentType = enchEnum,
+                            IsReverted = false,
+                        });
+                        result.ChangeLogs.Add($"Enchant:{entry.InstanceId}->{enchEnum}");
+                        result.ModifiedCardIds.Add(entry.InstanceId);
+                    }
+                    else if (string.IsNullOrEmpty(core.Enchantment) && !string.IsNullOrEmpty(snap.Enchantment))
+                    {
+                        // D2-P1-09：补齐附魔移除（Disenchant/Revert）同步，发射 IsReverted=true
+                        entry.Enchantment = null;
+                        result.Events.Add(new GameSimEventCardEnchanted
+                        {
+                            InstanceId = entry.InstanceId,
+                            EnchantmentType = null,
+                            IsReverted = true,
+                        });
+                        result.ChangeLogs.Add($"Disenchant:{entry.InstanceId}");
+                        result.ModifiedCardIds.Add(entry.InstanceId);
+                    }
                 }
             }
 
-            foreach (var tag in core.ExtraTags)
+            // D1-P1-14：与 RunState 同步口径对齐，全量比对 core.GetAllTags() 避免残留已移除标签
+            var expectedTags = new HashSet<ECardTag>();
+            foreach (string rawTag in core.GetAllTags())
             {
-                if (Enum.TryParse<ECardTag>(tag, true, out var et))
-                    entry.Tags.Add(et);
+                if (Enum.TryParse<ECardTag>(rawTag, true, out var parsedTag))
+                    expectedTags.Add(parsedTag);
+            }
+            if (!entry.Tags.SetEquals(expectedTags))
+            {
+                entry.Tags.Clear();
+                foreach (var t in expectedTags) entry.Tags.Add(t);
+                result.ModifiedCardIds.Add(entry.InstanceId);
             }
 
             bool forceAllAttrs = result.ModifiedCardIds.Contains(entry.InstanceId) && !string.IsNullOrWhiteSpace(entry.CustomCardId);
@@ -1504,16 +1752,27 @@ public sealed class EncounterStepEngine
             : _shop.NewId(prefix);
 
         EContainerSocketId? socket = null;
+        RunState.CardEntry? overwrittenSocketEffect = null;
         var displacedNeighbors = new List<(RunState.CardEntry Entry, EInventorySection Section, EContainerSocketId NewSocket)>();
         if (cardType == ECardType.SocketEffect)
         {
-            // 客户端要求 SocketEffect 挂在 Owner=Player, Section=Hand 下，且必须有 0..9 有效 LeftSocketId（但不占 HandGrid）
+            // D2-P1-09：严格尊重 UnlockedSlots；若目标槽已有旧 SocketEffect，以同槽覆盖合成为 CardTransformed（绝不落未解锁槽或重叠 CardSpawned）
+            _run.HandGrid.UnlockedMask = _run.UnlockedSlots;
             section = EInventorySection.Hand;
-            int resolvedSlot = core.StartSlot is >= 0 and <= 9
+            int resolvedSlot = (core.StartSlot is >= 0 and <= 9 && _run.HandGrid.IsSlotUnlocked(core.StartSlot))
                 ? core.StartSlot
                 : FindFreeSocketEffectSlot();
+            if (resolvedSlot < 0)
+                return null;
             core.StartSlot = resolvedSlot;
             socket = (EContainerSocketId)resolvedSlot;
+            overwrittenSocketEffect = _run.Cards.Values.FirstOrDefault(c =>
+                c.Owner == ECombatantId.Player &&
+                c.Type == ECardType.SocketEffect &&
+                c.Socket == socket &&
+                !string.Equals(c.InstanceId, instId, StringComparison.Ordinal));
+            if (overwrittenSocketEffect != null)
+                RemoveEntryFromGridsAndDict(overwrittenSocketEffect);
         }
         else if (cardType != ECardType.Skill && section.HasValue)
         {
@@ -1554,11 +1813,16 @@ public sealed class EncounterStepEngine
 
             if (!placed)
             {
-                // 手牌与仓库全满时禁止注册 Section=Hand, Socket=null 的幽灵卡，按标准卖价折算金币并跳过注册
-                var (_, autoSellGold) = ShopEngine.PriceFor(
-                    ShopEngine.ParseSize(core.Template.Size),
-                    ShopEngine.ParseTier(core.Tier.ToString()),
-                    _repo.GameMode.StandardPrices);
+                // 手牌与仓库全满时禁止注册 Section=Hand, Socket=null 的幽灵卡，按权威卖价（含 Value 与双倍经济）折算金币并跳过注册
+                var tempEntry = new RunState.CardEntry
+                {
+                    InstanceId = instId,
+                    Type = cardType,
+                    Size = ShopEngine.ParseSize(core.Template.Size),
+                    Tier = ShopEngine.ParseTier(core.Tier.ToString()),
+                    CoreCard = core,
+                };
+                int autoSellGold = RunState.ResolveAuthoritativeSellPrice(tempEntry, core, _repo.GameMode.StandardPrices, _run.CustomRules);
                 if (autoSellGold > 0)
                     _run.AddPlayerGold(autoSellGold);
                 result.ChangeLogs.Add($"OverflowAutoSell:{core.Template.Id}:+{autoSellGold}g");
@@ -1600,9 +1864,7 @@ public sealed class EncounterStepEngine
             : (Guid.TryParse(core.Template.Id, out var directGuid)
                 ? directGuid
                 : Guid.Parse("5e17cfc3-25c0-4a74-8a33-07ee972e6f6e"));
-        string? customCardId = !string.Equals(core.Template.Id, wireGuid.ToString(), StringComparison.OrdinalIgnoreCase)
-            ? core.Template.Id
-            : null;
+        string? customCardId = RunState.ResolveCustomCardId(core.Template.Id, wireGuid, _pool.Get(core.Template.Id));
         if (customCardId != null)
             _run.VisualBindingsRevision++;
 
@@ -1639,18 +1901,38 @@ public sealed class EncounterStepEngine
         }
         if (!isTransform)
         {
-            result.Events.Add(new GameSimEventCardSpawned(
-                instId,
-                entry.TemplateId.ToString(),
-                entry.Type,
-                ECombatantId.Player,
-                entry.Section,
-                entry.Socket));
+            if (overwrittenSocketEffect != null)
+            {
+                result.Events.Add(new GameSimEventCardTransformed(
+                    "skt_ovr_" + overwrittenSocketEffect.InstanceId,
+                    overwrittenSocketEffect.InstanceId,
+                    new List<SimEventCardTransformation>
+                    {
+                        new(
+                            instId,
+                            entry.TemplateId.ToString(),
+                            entry.Type,
+                            ECombatantId.Player,
+                            entry.Section,
+                            entry.Socket)
+                    }));
+                result.ChangeLogs.Add($"SocketEffectOverwrite:{overwrittenSocketEffect.InstanceId}->{instId}");
+            }
+            else
+            {
+                result.Events.Add(new GameSimEventCardSpawned(
+                    instId,
+                    entry.TemplateId.ToString(),
+                    entry.Type,
+                    ECombatantId.Player,
+                    entry.Section,
+                    entry.Socket));
 
-            if (cardType == ECardType.Skill)
-                result.Events.Add(new GameSimEventPlayerSkillEquipped(instId, ECombatantId.Player));
+                if (cardType == ECardType.Skill)
+                    result.Events.Add(new GameSimEventPlayerSkillEquipped(instId, ECombatantId.Player));
 
-            result.ChangeLogs.Add($"Spawn:{entry.Type}:{entry.TemplateId}");
+                result.ChangeLogs.Add($"Spawn:{entry.Type}:{entry.TemplateId}");
+            }
         }
 
         return entry;
@@ -1658,17 +1940,25 @@ public sealed class EncounterStepEngine
 
     private int FindFreeSocketEffectSlot()
     {
+        // D2-P1-09：严格尊重 UnlockedSlots，先找已解锁空槽，全满时退回首个已解锁槽位以触发同槽覆盖，绝不落未解锁槽
+        _run.HandGrid.UnlockedMask = _run.UnlockedSlots;
         var used = new HashSet<int>();
         foreach (var c in _run.Cards.Values)
         {
             if (c.Owner == ECombatantId.Player && c.Type == ECardType.SocketEffect && c.Socket.HasValue)
                 used.Add((int)c.Socket.Value);
         }
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < BoardGrid.Capacity; i++)
         {
-            if (!used.Contains(i)) return i;
+            if (_run.HandGrid.IsSlotUnlocked(i) && !used.Contains(i))
+                return i;
         }
-        return 0;
+        for (int i = 0; i < BoardGrid.Capacity; i++)
+        {
+            if (_run.HandGrid.IsSlotUnlocked(i))
+                return i;
+        }
+        return -1;
     }
 
     private void RemoveEntryFromGridsAndDict(RunState.CardEntry entry)
@@ -1885,14 +2175,42 @@ public sealed class EncounterStepEngine
     }
 
     /// <summary>
+    /// D2-P1-07：零副作用只读校验探险房间准入前提（房间合法性、资产白名单及可选门票持有检查），
+    /// 供 RunEngine 在修改 Visited* 与摘除货架卡前先行拦截。
+    /// </summary>
+    public bool CanEnterExpeditionRoom(string roomEncounterId, bool requireMatchingTicket, out string? errorMessage)
+    {
+        if (string.IsNullOrWhiteSpace(roomEncounterId) || !CardPool.IsExpeditionRoomTemplate(roomEncounterId))
+        {
+            errorMessage = $"未知的探险房间：{roomEncounterId}";
+            return false;
+        }
+        if (!_pool.IsAssetValid(roomEncounterId) || (_pool.Get(roomEncounterId) == null && _repo.GetCard(roomEncounterId) == null))
+        {
+            errorMessage = $"探险房间资源缺失或无效：{roomEncounterId}";
+            return false;
+        }
+        if (requireMatchingTicket)
+        {
+            bool hasTicket = FindHeldExpeditionTickets(_run)
+                .Any(t => string.Equals(t.RoomEncounterId, roomEncounterId, StringComparison.OrdinalIgnoreCase));
+            if (!hasTicket)
+            {
+                errorMessage = "未持有进入该探险房间所需的门票";
+                return false;
+            }
+        }
+        errorMessage = null;
+        return true;
+    }
+
+    /// <summary>
     /// 直接切入指定 Expedition 房间遭遇：可选自动消耗对应门票并调用 ShopEngine.DealEncounterShelf 展开房间分支步骤。
     /// </summary>
     public EncounterStepResult EnterExpeditionRoom(string roomEncounterId, bool consumeMatchingTicket = true)
     {
-        if (string.IsNullOrWhiteSpace(roomEncounterId) || !CardPool.IsExpeditionRoomTemplate(roomEncounterId))
-            return EncounterStepResult.Fail($"未知的探险房间：{roomEncounterId}");
-        if (!_pool.IsAssetValid(roomEncounterId) || (_pool.Get(roomEncounterId) == null && _repo.GetCard(roomEncounterId) == null))
-            return EncounterStepResult.Fail($"探险房间资源缺失或无效：{roomEncounterId}");
+        if (!CanEnterExpeditionRoom(roomEncounterId, requireMatchingTicket: false, out string? err))
+            return EncounterStepResult.Fail(err ?? $"进入探险房间 {roomEncounterId} 失败");
 
         var result = new EncounterStepResult
         {

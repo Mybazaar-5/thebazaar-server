@@ -33,6 +33,7 @@ internal sealed class ModuleHost
     private readonly object _sync = new();
     private readonly List<ModContainer> _containers = new();
     private readonly Dictionary<string, ModContainer> _byId = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _loadedAssemblySha256 = new(StringComparer.OrdinalIgnoreCase);
 
     internal ModEventBus EventBus { get; } = new();
     internal ModConfigRootStore ConfigStore { get; } = new();
@@ -178,11 +179,15 @@ internal sealed class ModuleHost
         int count = DiscoverAndLoadExternalMods();
         VisualRegistry?.InvalidateVisualCache(null);
         LocalizationRegistry?.NotifyLocaleReloaded("external-reload");
+        MainThreadDispatcher.Enqueue(() =>
+        {
+            BazaarLauncher.Modules.CustomContentVisualModule.Instance?.ReapplyActiveVisualsOnMainThread();
+        });
         BazaarLauncherPlugin.Log?.LogInfo($"[ModuleHost] 外部 Mod 热重载完成，当前加载外部扩展数: {count}");
         return count;
     }
 
-    /// <summary>游戏内动态开关指定模块（立即持久化配置并触发 OnEnable / OnDisable）。</summary>
+    /// <summary>游戏内动态开关指定模块（立即持久化配置并触发 OnEnable / OnDisable 与视觉/文案热重绘）。</summary>
     internal bool SetModuleEnabled(string modId, bool enabled)
     {
         ModContainer container;
@@ -195,7 +200,17 @@ internal sealed class ModuleHost
         }
 
         ConfigStore.SetModuleEnabled(modId, enabled);
-        return container.SetEnabled(enabled);
+        bool ok = container.SetEnabled(enabled);
+        if (ok)
+        {
+            VisualRegistry?.InvalidateVisualCache(null);
+            LocalizationRegistry?.NotifyLocaleReloaded("module-toggle");
+            MainThreadDispatcher.Enqueue(() =>
+            {
+                BazaarLauncher.Modules.CustomContentVisualModule.Instance?.ReapplyActiveVisualsOnMainThread();
+            });
+        }
+        return ok;
     }
 
     /// <summary>尝试将已被熔断的模块解除隔离并重新启用。</summary>
@@ -300,6 +315,20 @@ internal sealed class ModuleHost
         try
         {
             byte[] rawBytes = File.ReadAllBytes(dllPath);
+            // D4-P2-5：按文件 SHA-256 去重，防止相同扩展 DLL 在不同扫描目录下被重复 Assembly.Load
+            string sha256;
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                sha256 = BitConverter.ToString(sha.ComputeHash(rawBytes)).Replace("-", string.Empty);
+            }
+            lock (_sync)
+            {
+                if (!_loadedAssemblySha256.Add(sha256))
+                {
+                    BazaarLauncherPlugin.Log?.LogDebug($"[ModuleHost] 跳过重复 DLL（SHA-256 已加载）: {dllPath}");
+                    return 0;
+                }
+            }
             Assembly asm = Assembly.Load(rawBytes);
             int count = 0;
 
@@ -469,9 +498,17 @@ internal sealed class ModuleHost
                     foreach (var token in arr)
                     {
                         if (token is not JObject jo) continue;
-                        string imgRel = (string)(jo["image"] ?? jo["localImagePath"] ?? jo["art"]);
+                        string imgRel = (string)(jo["image"] ?? jo["localImagePath"] ?? jo["art"] ?? jo["customArtFile"]);
                         string templateId = (string)(jo["templateId"] ?? jo["baseVisualTemplateId"]);
                         string customId = (string)(jo["customId"] ?? jo["id"]);
+                        bool explicitPatch = jo["isPatchOverride"]?.Value<bool>() ?? false;
+                        // P0-29：非原位 Patch 严禁写入模板级 TemplateId 覆盖，防止本地 Mod 污染所有同底座原版卡
+                        bool isDirectTemplateOverride = explicitPatch
+                            || string.IsNullOrWhiteSpace(customId)
+                            || string.Equals(customId, templateId, StringComparison.OrdinalIgnoreCase);
+                        bool isCustomBorrowShell = !isDirectTemplateOverride && !string.IsNullOrWhiteSpace(customId);
+                        string effectiveTemplateId = isDirectTemplateOverride ? templateId : null;
+
                         if (!string.IsNullOrWhiteSpace(imgRel))
                         {
                             string fullImg = Path.IsPathRooted(imgRel) ? imgRel : Path.Combine(Manifest.RootDirectory, imgRel);
@@ -481,25 +518,34 @@ internal sealed class ModuleHost
                                 {
                                     ModId = Manifest.Id,
                                     CustomCardId = customId,
-                                    TemplateId = templateId,
+                                    TemplateId = effectiveTemplateId,
                                     LocalImagePath = fullImg,
+                                    IsPatchOverride = explicitPatch,
+                                    IsCustomBorrowShell = isCustomBorrowShell,
                                     Priority = 150,
                                 }));
                             }
                         }
 
                         string titleZh = (string)(jo["titleZh"] ?? jo["nameZh"]);
+                        string titleEn = (string)(jo["titleEn"] ?? jo["nameEn"]);
                         string descZh = (string)(jo["descZh"] ?? jo["descriptionZh"]);
-                        if (!string.IsNullOrWhiteSpace(titleZh) || !string.IsNullOrWhiteSpace(descZh))
+                        string descEn = (string)(jo["descEn"] ?? jo["descriptionEn"]);
+                        if (!string.IsNullOrWhiteSpace(titleZh) || !string.IsNullOrWhiteSpace(titleEn)
+                            || !string.IsNullOrWhiteSpace(descZh) || !string.IsNullOrWhiteSpace(descEn))
                         {
                             _ctx.TrackDisposable(_ctx.Localization.RegisterCardTextOverride(new CardTextOverride
                             {
                                 ModId = Manifest.Id,
                                 CustomCardId = customId,
-                                TemplateId = templateId,
+                                TemplateId = effectiveTemplateId,
                                 Locale = "zh-CN",
                                 Title = titleZh,
+                                TitleEn = titleEn,
                                 Description = descZh,
+                                DescriptionEn = descEn,
+                                IsPatchOverride = explicitPatch,
+                                IsCustomBorrowShell = isCustomBorrowShell,
                                 Priority = 150,
                             }));
                         }
@@ -547,30 +593,35 @@ internal sealed class ModuleHost
         public void LoadAndActivateIfEnabled()
         {
             var sw = Stopwatch.StartNew();
-            try
+            Action postUnlockCleanup = null;
+            lock (_lock)
             {
-                _context = new ModContextImpl(_host, this);
-                _mod.OnLoad(_context);
-                State = ModLifecycleState.Loaded;
-                if (Enabled)
+                try
                 {
-                    ActivateInternal();
+                    _context = new ModContextImpl(_host, this);
+                    _mod.OnLoad(_context);
+                    State = ModLifecycleState.Loaded;
+                    if (Enabled)
+                    {
+                        ActivateInternal();
+                    }
+                    else
+                    {
+                        State = ModLifecycleState.Disabled;
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    State = ModLifecycleState.Disabled;
+                    postUnlockCleanup = PrepareQuarantineLocked("OnLoad", ex);
+                }
+                finally
+                {
+                    sw.Stop();
+                    LoadDurationMs = Math.Round(sw.Elapsed.TotalMilliseconds, 2);
+                    LastUpdatedUtc = DateTime.UtcNow;
                 }
             }
-            catch (Exception ex)
-            {
-                QuarantineInternal("OnLoad", ex);
-            }
-            finally
-            {
-                sw.Stop();
-                LoadDurationMs = Math.Round(sw.Elapsed.TotalMilliseconds, 2);
-                LastUpdatedUtc = DateTime.UtcNow;
-            }
+            postUnlockCleanup?.Invoke();
         }
 
         public bool SetEnabled(bool targetEnabled)
@@ -640,6 +691,7 @@ internal sealed class ModuleHost
 
         public void RecordRuntimeFault(string phase, Exception ex)
         {
+            Action postUnlockCleanup = null;
             lock (_lock)
             {
                 FaultCount++;
@@ -657,9 +709,11 @@ internal sealed class ModuleHost
 
                 if (_recentFaultTimestamps.Count >= CircuitBreakerThreshold && State != ModLifecycleState.Quarantined)
                 {
-                    QuarantineInternal($"熔断({CircuitBreakerThreshold}次/{CircuitBreakerWindow.TotalSeconds:0}s)", ex);
+                    postUnlockCleanup = PrepareQuarantineLocked($"熔断({CircuitBreakerThreshold}次/{CircuitBreakerWindow.TotalSeconds:0}s)", ex);
                 }
             }
+            // D4-P2-5：严格在释放 _lock 之后再执行外部模块 OnDisable 与 UI 提示，彻底根除锁内重入死锁
+            postUnlockCleanup?.Invoke();
         }
 
         public void TrackDisposable(IDisposable disposable)
@@ -761,13 +815,57 @@ internal sealed class ModuleHost
             LastUpdatedUtc = DateTime.UtcNow;
         }
 
-        private void QuarantineInternal(string phase, Exception ex)
+        /// <summary>
+        /// D4-P2-5：锁内仅完成状态切换、CTS 取消与资源摘除，返回需在释放 _lock 后执行的外部 OnDisable / Toast 委托，
+        /// 彻底避免锁内回调外部代码引发死锁或非主线程访问 Unity UI 崩溃。
+        /// </summary>
+        private Action PrepareQuarantineLocked(string phase, Exception ex)
         {
             FaultCount++;
             LastError = $"[{phase}] {ex.GetType().Name}: {ex.Message}";
             BazaarLauncherPlugin.Log?.LogError($"[ModSandbox:{Manifest.Id}] 触发崩溃隔离熔断 -> {LastError}");
-            DeactivateInternal(ModLifecycleState.Quarantined);
-            _host.UiHost?.ShowToast($"模块「{Manifest.Name}」发生异常已自动隔离，游戏可继续运行", isError: true);
+            try { _modCts.Cancel(); } catch { }
+            var disposablesCopy = new List<IDisposable>(_trackedDisposables);
+            _trackedDisposables.Clear();
+            State = ModLifecycleState.Quarantined;
+            LastUpdatedUtc = DateTime.UtcNow;
+
+            return () =>
+            {
+                void RunCleanup()
+                {
+                    try { _mod.OnDisable(); }
+                    catch (Exception dex)
+                    {
+                        BazaarLauncherPlugin.Log?.LogWarning($"[ModuleHost:{Manifest.Id}] Quarantine OnDisable 异常: {dex.Message}");
+                    }
+                    if (_mod is IBuiltInPatchModule builtIn && builtIn.Patcher != null)
+                    {
+                        try { builtIn.Patcher.UnpatchAll(); } catch { }
+                    }
+                    for (int i = disposablesCopy.Count - 1; i >= 0; i--)
+                    {
+                        try { disposablesCopy[i]?.Dispose(); } catch { }
+                    }
+                    try
+                    {
+                        _host.UiHost?.ShowToast($"模块「{Manifest.Name}」发生异常已自动隔离，游戏可继续运行", isError: true);
+                    }
+                    catch { }
+                }
+
+                if (MainThreadDispatcher.IsOnMainThread)
+                    RunCleanup();
+                else
+                    MainThreadDispatcher.Enqueue(RunCleanup);
+            };
+        }
+
+        private void QuarantineInternal(string phase, Exception ex)
+        {
+            // 兼容 SetEnabled / ResetAndReenable 锁内同步调用路径：锁内更新态，通过 MainThreadDispatcher 延后执行外部 OnDisable
+            var cleanup = PrepareQuarantineLocked(phase, ex);
+            MainThreadDispatcher.Enqueue(cleanup);
         }
 
         private void DisposeTrackedLocked()

@@ -7,6 +7,7 @@ using BazaarCore.Data;
 using BazaarCore.Engine;
 using BazaarCore.Models;
 using BazaarCore.Runtime;
+using BazaarCore.Tests.TestInfrastructure;
 using BazaarGameShared.Domain.Core;
 using BazaarGameShared.Domain.Core.Types;
 using BazaarGameShared.Domain.Runs;
@@ -27,6 +28,7 @@ namespace BazaarCore.Tests;
 /// #7/#10/#14 官方 6 小时制（H1/2/4/5 = 1商+2发育，H3 = 左铜/中银/右金三梯度且剔除测试怪）、
 /// 以及 #19 PvpGhostPool 全天数血量等级门卫（保留 MaxBoardsPerDayBucket = 2500）。
 /// </summary>
+[Collection("GlobalStaticState")]
 public sealed class V10ScheduleLevelMonstersTests
 {
     private const string PolShopId = "065f6793-8607-4f02-abfe-db6afb221ab2";
@@ -52,30 +54,17 @@ public sealed class V10ScheduleLevelMonstersTests
 
     private static readonly Lazy<Fx> RealFixture = new(() =>
     {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 10 && !string.IsNullOrEmpty(dir); i++, dir = Directory.GetParent(dir)?.FullName)
-        {
-            string candidate = Path.Combine(dir, "dist", "data");
-            if (File.Exists(Path.Combine(candidate, "GameData.db")))
-            {
-                dir = candidate;
-                break;
-            }
-        }
-        if (string.IsNullOrEmpty(dir) || !File.Exists(Path.Combine(dir, "GameData.db")))
-            dir = @"e:\thebazaar\dist\data";
-
-        string dbPath = Path.Combine(dir, "GameData.db");
+        var shared = SharedGameDataFixture.Shared;
         return new Fx
         {
-            DataDir = dir,
-            DbPath = dbPath,
-            Pool = CardPool.Load(dbPath),
-            Monsters = MonsterPool.Load(dbPath),
-            LevelUps = LevelUpTable.Load(dbPath),
-            Mode = GameModeConfig.Load(dbPath),
-            Repo = GameDatabaseLoader.Load(dbPath, null),
-            Ghosts = PvpGhostPool.Load(dir),
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
         };
     });
 
@@ -226,70 +215,20 @@ public sealed class V10ScheduleLevelMonstersTests
 
     private sealed class OverlayContext : IDisposable
     {
-        private readonly string _dir;
-        public CardPool Pool { get; }
-        public List<BazaarServer.Data.MonsterTemplate> Monsters { get; }
-        public LevelUpTable LevelUps { get; }
-        public GameModeConfig Mode { get; }
-        public GameDataRepository Repo { get; }
-        public PvpGhostPool Ghosts { get; }
+        private readonly SharedTestOverlay _inner;
+        public CardPool Pool => _inner.Pool;
+        public List<BazaarServer.Data.MonsterTemplate> Monsters => _inner.Monsters;
+        public LevelUpTable LevelUps => _inner.LevelUps;
+        public GameModeConfig Mode => _inner.Mode;
+        public GameDataRepository Repo => _inner.Repo;
+        public PvpGhostPool Ghosts => _inner.Ghosts;
 
         public OverlayContext(IEnumerable<(string Id, string Json)> customCards)
         {
-            var fx = RealFixture.Value;
-            _dir = Path.Combine(Path.GetTempPath(), "bazaar_v10_" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(_dir);
-            string dbPath = Path.Combine(_dir, "GameData.db");
-            File.Copy(fx.DbPath, dbPath, overwrite: true);
-
-            var wl = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            string srcWlPath = Path.Combine(fx.DataDir, "valid_card_ids.json");
-            if (File.Exists(srcWlPath))
-            {
-                using var doc = JsonDocument.Parse(File.ReadAllText(srcWlPath));
-                var arr = doc.RootElement.ValueKind == JsonValueKind.Array
-                    ? doc.RootElement
-                    : doc.RootElement.GetProperty("valid_ids");
-                foreach (var el in arr.EnumerateArray())
-                    if (el.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(el.GetString()))
-                        wl.Add(el.GetString()!);
-            }
-
-            using (var conn = new SqliteConnection($"Data Source={dbPath}"))
-            {
-                conn.Open();
-                foreach (var (id, json) in customCards)
-                {
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "INSERT OR REPLACE INTO cards (Id, Data) VALUES ($id, $data)";
-                    cmd.Parameters.AddWithValue("$id", id);
-                    cmd.Parameters.AddWithValue("$data", System.Text.Encoding.UTF8.GetBytes(json));
-                    cmd.ExecuteNonQuery();
-                    wl.Add(id);
-                }
-            }
-
-            if (wl.Count > 0)
-                File.WriteAllText(Path.Combine(_dir, "valid_card_ids.json"), JsonSerializer.Serialize(wl.ToList()));
-
-            Pool = CardPool.Load(dbPath);
-            Monsters = MonsterPool.Load(dbPath);
-            LevelUps = LevelUpTable.Load(dbPath);
-            Mode = GameModeConfig.Load(dbPath);
-            Repo = GameDatabaseLoader.Load(dbPath, null);
-            Ghosts = fx.Ghosts;
+            _inner = SharedGameDataFixture.Shared.CreateMemoryOverlay(customCards: customCards);
         }
 
-        public void Dispose()
-        {
-            SqliteConnection.ClearAllPools();
-            try
-            {
-                if (Directory.Exists(_dir))
-                    Directory.Delete(_dir, recursive: true);
-            }
-            catch { }
-        }
+        public void Dispose() => _inner.Dispose();
     }
 
     // ── 1. #9 修复 level_ups 1~30 级错位 1 级 + 附魔台分组不截断 + 瓦内莎真实奖励 ──
@@ -443,7 +382,10 @@ public sealed class V10ScheduleLevelMonstersTests
             CoreCard = wpnCore,
         };
 
-        // P0-1 官方单份经验规则：H1 Pol(+1=1) -> H2 zeroEv(+1=2) -> H3 Fanged Inglet(+3=5) -> H4 Study(+2=7) -> H5 Pol(+1=8) 触发 Lv1 -> Lv2（+100 HP，弹出 Shiny! 与 Pip）
+        // 主路径：现行官方默认 StartingExperience=3（H1 Pol +1=4 -> H2 zeroEv +1=5 -> H3 Fanged Inglet +3=8 立刻触发 Lv1 -> Lv2，+100 HP 并弹出 Shiny! 与 Pip）
+        Assert.Equal(ov.Mode.StartingExperience, run.PlayerAttributes[EPlayerAttributeType.Experience]);
+        Assert.Equal(3, ov.Mode.StartingExperience);
+
         var pol1 = InjectChoiceEncounter(run, ov.Pool, PolShopId);
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol1.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
@@ -456,7 +398,21 @@ public sealed class V10ScheduleLevelMonstersTests
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(mobOpt.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
 
-        // Hour 4 选 Study (ce38f4a2, +2 XP -> 累计 7 XP)，Hour 5 选 Pol (+1 XP -> 累计 8 XP 触发 Lv2)
+        // H3 击败 Fanged Inglet (+3 XP -> 累计 8 XP) 退出战利品立刻拦截进入 LevelUp：血量精确 +100，弹窗选项为 Shiny! 与 Pip
+        Assert.Equal(3u, run.Hour);
+        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
+        Assert.Equal(baseHp + 100, run.PlayerAttributes[EPlayerAttributeType.HealthMax]);
+        Assert.Equal(ERunState.LevelUp, run.State);
+        Assert.Equal(2, run.SelectionSet.Count);
+        var lvlChoiceTpls = run.SelectionSet.Select(id => run.Cards[id].TemplateId.ToString()).ToList();
+        Assert.Contains(lvlChoiceTpls, id => id.StartsWith("e286d583", StringComparison.OrdinalIgnoreCase)); // Shiny!
+        Assert.Contains(lvlChoiceTpls, id => id.StartsWith("e2fc8bd4", StringComparison.OrdinalIgnoreCase)); // Pip
+
+        // 完成 Lv2 升级弹层后推进至 Hour 4 -> Hour 5 -> Hour 6 Choice 进入 Day 1 PvP
+        Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
+        Assert.Equal(ERunState.Choice, run.State);
+        Assert.Equal(4u, run.Hour);
+
         const string studyDefaultId = "ce38f4a2-f156-4082-b8ce-e8956c71fc0d";
         var study4 = InjectChoiceEncounter(run, ov.Pool, studyDefaultId);
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(study4.InstanceId) }).Error);
@@ -467,24 +423,71 @@ public sealed class V10ScheduleLevelMonstersTests
         Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pol5.InstanceId) }).Error);
         Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
 
-        // 验证真实 Lv1 -> Lv2 升级（Hour 5 商店退出攒满 8 XP 立刻拦截进入 LevelUp，退出后再推进至 Hour 6）：血量精确 +100（而非旧错位 +150），弹窗选项为 Shiny! 与 Pip
-        Assert.Equal(5u, run.Hour);
-        Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
-        Assert.Equal(baseHp + 100, run.PlayerAttributes[EPlayerAttributeType.HealthMax]);
-        Assert.Equal(ERunState.LevelUp, run.State);
-        Assert.Equal(2, run.SelectionSet.Count);
-        var lvlChoiceTpls = run.SelectionSet.Select(id => run.Cards[id].TemplateId.ToString()).ToList();
-        Assert.Contains(lvlChoiceTpls, id => id.StartsWith("e286d583", StringComparison.OrdinalIgnoreCase)); // Shiny!
-        Assert.Contains(lvlChoiceTpls, id => id.StartsWith("e2fc8bd4", StringComparison.OrdinalIgnoreCase)); // Pip
-
-        // 完成 Lv2 升级弹层后推进至 Hour 6 Choice 进入 Day 1 PvP
-        Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
         Assert.Equal(ERunState.Choice, run.State);
         Assert.Equal(6u, run.Hour);
 
         var pvpCard = run.Cards[Assert.Single(run.SelectionSet)];
         var pvpOut = engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(pvpCard.InstanceId) });
         Assert.Null(pvpOut.Error);
+
+        // 兼容路径：自定义 StartingExperience=0 时，H1(+1)->H2(+1)->H3(+3)->H4 Study(+2)->H5 Pol(+1)=8 同样在 H5 精准拦截 LevelUp 并推进至 H6 PvP
+        var (runZero, engineZero) = CreateStartedEngine(
+            ov.Pool, ov.Monsters, ov.LevelUps, ov.Mode, ov.Repo, ov.Ghosts,
+            rules: new CustomRunRuleSet { StartingExperience = 0 },
+            seed: 304);
+        int baseHpZero = runZero.PlayerAttributes[EPlayerAttributeType.HealthMax];
+        Assert.Equal(0, runZero.PlayerAttributes[EPlayerAttributeType.Experience]);
+
+        var wpnCoreZero = new CardInstance(wpnTpl, CardTier.Bronze, null, "v10_hero_wpn_z");
+        Assert.True(runZero.HandGrid.TryPlaceOrShift(wpnCoreZero, 3));
+        runZero.Cards[wpnCoreZero.InstanceId] = new RunState.CardEntry
+        {
+            InstanceId = wpnCoreZero.InstanceId,
+            TemplateId = Guid.Parse(wpnTpl.Id),
+            Type = ECardType.Item,
+            Size = ECardSize.Small,
+            Tier = ETier.Bronze,
+            Owner = ECombatantId.Player,
+            Section = EInventorySection.Hand,
+            Socket = EContainerSocketId.Socket_3,
+            CoreCard = wpnCoreZero,
+        };
+
+        var zPol1 = InjectChoiceEncounter(runZero, ov.Pool, PolShopId);
+        Assert.Null(engineZero.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(zPol1.InstanceId) }).Error);
+        Assert.Null(engineZero.Handle(new ExitCurrentStateCommand()).Error);
+
+        var zZeroEv = InjectChoiceEncounter(runZero, ov.Pool, "a0000001-0001-4001-8001-000000000001");
+        Assert.Null(engineZero.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(zZeroEv.InstanceId) }).Error);
+        Assert.Null(engineZero.Handle(new ExitCurrentStateCommand()).Error);
+
+        var zMob = InjectChoiceEncounter(runZero, ov.Pool, FangedIngletCombatId, ECardType.CombatEncounter);
+        Assert.Null(engineZero.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(zMob.InstanceId) }).Error);
+        Assert.Null(engineZero.Handle(new ExitCurrentStateCommand()).Error);
+
+        var zStudy4 = InjectChoiceEncounter(runZero, ov.Pool, studyDefaultId);
+        Assert.Null(engineZero.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(zStudy4.InstanceId) }).Error);
+        if (runZero.State != ERunState.Choice)
+            Assert.Null(engineZero.Handle(new ExitCurrentStateCommand()).Error);
+
+        var zPol5 = InjectChoiceEncounter(runZero, ov.Pool, PolShopId);
+        Assert.Null(engineZero.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(zPol5.InstanceId) }).Error);
+        Assert.Null(engineZero.Handle(new ExitCurrentStateCommand()).Error);
+
+        Assert.Equal(5u, runZero.Hour);
+        Assert.Equal(2, runZero.PlayerAttributes[EPlayerAttributeType.Level]);
+        Assert.Equal(baseHpZero + 100, runZero.PlayerAttributes[EPlayerAttributeType.HealthMax]);
+        Assert.Equal(ERunState.LevelUp, runZero.State);
+        Assert.Equal(2, runZero.SelectionSet.Count);
+        var zLvlChoices = runZero.SelectionSet.Select(id => runZero.Cards[id].TemplateId.ToString()).ToList();
+        Assert.Contains(zLvlChoices, id => id.StartsWith("e286d583", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(zLvlChoices, id => id.StartsWith("e2fc8bd4", StringComparison.OrdinalIgnoreCase));
+
+        Assert.Null(engineZero.Handle(new ExitCurrentStateCommand()).Error);
+        Assert.Equal(ERunState.Choice, runZero.State);
+        Assert.Equal(6u, runZero.Hour);
+        var zPvpCard = runZero.Cards[Assert.Single(runZero.SelectionSet)];
+        Assert.Null(engineZero.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(zPvpCard.InstanceId) }).Error);
     }
 
     // ── 2. #5 & #18 全拿多选免费事件（Grab the Loot / Mystery Bundle）可拿满 3 件 vs 单选事件限拿 1 件 ──

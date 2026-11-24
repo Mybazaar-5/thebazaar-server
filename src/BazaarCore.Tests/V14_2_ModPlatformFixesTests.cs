@@ -28,6 +28,7 @@ namespace BazaarCore.Tests;
 /// 6. 自定义卡升阶基础伤害随品阶同步（覆盖借皮载体表）+ FindFuseTarget 按 CustomCardId 严格隔离防误合；
 /// 7. 任意自定义机制通用实时叠层同步（Custom_0..Custom_8 逐帧下发 + CardAttributeModified 脉冲 + 显式/自动推导 CounterDisplays）。
 /// </summary>
+[Xunit.Collection("GlobalStaticState")]
 public sealed class V14_2_ModPlatformFixesTests
 {
     private const string ZSwordDonorId = "34476196-7d30-4664-8fe3-e99411022a86";
@@ -53,45 +54,19 @@ public sealed class V14_2_ModPlatformFixesTests
 
     private static Fixture LoadFixture()
     {
-        var cur = new DirectoryInfo(AppContext.BaseDirectory);
-        string? repoRoot = null;
-        while (cur != null)
-        {
-            if (File.Exists(Path.Combine(cur.FullName, "Bazaar.sln")))
-            {
-                repoRoot = cur.FullName;
-                break;
-            }
-            cur = cur.Parent;
-        }
-        Assert.False(string.IsNullOrWhiteSpace(repoRoot), "未定位到 Bazaar.sln 根目录");
-        string dataDir = Path.Combine(repoRoot!, "dist", "data");
-        string modsRoot = Path.Combine(repoRoot!, "mods");
-        string dbPath = Path.Combine(dataDir, "GameData.db");
-        string? zhPath = SteamPathResolver.ResolveZhCnTranslationPath(dataDir);
-        var baseRepo = GameDatabaseLoader.Load(dbPath, zhPath);
-
-        var wl = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        using (var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(dataDir, "valid_card_ids.json"), Encoding.UTF8)))
-        {
-            var arr = doc.RootElement.ValueKind == JsonValueKind.Array ? doc.RootElement : doc.RootElement.GetProperty("valid_ids");
-            foreach (var it in arr.EnumerateArray())
-                if (it.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(it.GetString()))
-                    wl.Add(it.GetString()!);
-        }
-
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new Fixture(
-            repoRoot!,
-            dataDir,
-            modsRoot,
-            dbPath,
-            baseRepo,
-            wl,
-            CardPool.Load(dbPath),
-            MonsterPool.Load(dbPath),
-            LevelUpTable.Load(dbPath),
-            GameModeConfig.Load(dbPath),
-            PvpGhostPool.Load(dataDir));
+            shared.RepoRoot,
+            shared.DataDir,
+            shared.ModsRoot,
+            shared.DbPath,
+            shared.Repo,
+            shared.CreateValidCardIdsCopy(),
+            shared.CreateIsolatedCardPool(),
+            shared.CreateMonstersCopy(),
+            shared.LevelUps,
+            shared.Mode,
+            shared.Ghosts);
     }
 
     private static ModRegistry LoadWorkspaceMods(Fixture fx)

@@ -17,6 +17,7 @@ namespace BazaarServer.Endpoints;
 public static class DebugDump
 {
     private static readonly ConcurrentDictionary<string, int> _counters = new(StringComparer.Ordinal);
+    private const int MaxTrackedCounterSessions = 2048;
     private static readonly object _lock = new();
 
     public static bool Enabled { get; } = ResolveEnabled();
@@ -41,7 +42,7 @@ public static class DebugDump
         {
             dir = Path.Combine(AppContext.BaseDirectory, "dump");
         }
-        try { Directory.CreateDirectory(dir); } catch { }
+        // D8-P2-05：默认禁用期间严禁在静态构造函数预先创建空 dump 目录，推迟至 Write 真正落盘时懒创建
         return dir;
     }
 
@@ -58,11 +59,14 @@ public static class DebugDump
             string summary = Summarize(message);
 
             string shortSid = (sid ?? "nosid").Length > 12 ? sid[..12] : (sid ?? "nosid");
+            if (_counters.Count >= MaxTrackedCounterSessions && !_counters.ContainsKey(shortSid))
+                _counters.Clear();
             int n = _counters.AddOrUpdate(shortSid, 1, (_, v) => v + 1);
             string stem = $"{DateTime.UtcNow:HHmmss-fff}-{shortSid}-{n:D4}-rid{rid}";
 
             lock (_lock)
             {
+                Directory.CreateDirectory(Dir);
                 File.WriteAllBytes(Path.Combine(Dir, stem + ".bin"), payload);
                 File.WriteAllText(Path.Combine(Dir, stem + ".json"),
                     $"SUMMARY: {summary}\n\nJSON: {json}", Encoding.UTF8);

@@ -27,6 +27,7 @@ namespace BazaarCore.Tests;
 /// PvP 真人镜像零双倍光环叠算与双重冷却缩减、Resume 切板事件与货架折扣持久化还原、
 /// 以及奇遇步骤满格防幽灵卡等真实闭环场景。
 /// </summary>
+[Collection("GlobalStaticState")]
 public sealed class V15_3_ParityAuditFixesTests
 {
     private sealed class SharedData
@@ -42,33 +43,21 @@ public sealed class V15_3_ParityAuditFixesTests
     }
 
     private static string ResolveDataDir()
-    {
-        string? cur = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && !string.IsNullOrEmpty(cur); i++)
-        {
-            string cand = Path.Combine(cur, "dist", "data");
-            if (File.Exists(Path.Combine(cand, "GameData.db")))
-                return cand;
-            cur = Path.GetDirectoryName(cur);
-        }
-        throw new DirectoryNotFoundException("无法定位 dist/data/GameData.db");
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataDir();
 
     private static readonly Lazy<SharedData> Fx = new(() =>
     {
-        string dir = ResolveDataDir();
-        var repo = GameDatabaseLoader.Load(Path.Combine(dir, "GameData.db"), null);
-        var pool = CardPool.FromRepository(repo, dir);
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new SharedData
         {
-            DataDir = dir,
-            Repo = repo,
-            Pool = pool,
-            Monsters = MonsterPool.FromRepository(repo),
-            LevelUps = LevelUpTable.FromRepository(repo),
-            Mode = GameModeConfig.FromRepository(repo),
-            Ghosts = PvpGhostPool.Load(dir),
-            Arch = CardArchetypeIndex.Build(pool, repo),
+            DataDir = shared.DataDir,
+            Repo = shared.Repo,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Ghosts = shared.Ghosts,
+            Arch = shared.ArchetypeIndex,
         };
     });
 

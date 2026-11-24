@@ -11,17 +11,14 @@ using BazaarServer.Game;
 
 namespace BazaarCore.Tests;
 
+[Xunit.Collection("ShopEngineStaticState")]
 public sealed class V8TaxonomyLootTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
 
     private static string ResolveDataPath(string fileName)
-    {
-        for (string? dir = AppContext.BaseDirectory; dir != null; dir = Directory.GetParent(dir)?.FullName)
-            if (File.Exists(Path.Combine(dir, "dist", "data", fileName))) return Path.Combine(dir, "dist", "data", fileName);
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static RunState NewRun(EHero hero = EHero.Vanessa, uint day = 1, uint hour = 1) => new()
     {

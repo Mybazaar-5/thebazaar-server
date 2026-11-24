@@ -10,12 +10,13 @@
         "size": "Small",
         "startingTier": "Bronze",
         "spawningEligibility": "Always",
-        "heroes": ["Vanessa", "Common"],
+        "heroes": ["Vanessa"],
         "tags": ["Weapon", "Tool"],
         "hiddenTags": ["Damage", "Haste"],
         "titleZh": "风暴弯刀",
         "titleEn": "Storm Kukri",
         "descZh": "基于原版弯刀改造的高频短刃，命中时额外为右侧物品提速。",
+        "descEn": "A high-tempo blade forged from the classic Kukri that hastes the item to its right.",
         "activeTooltipsZh": [
           "造成 {attr.DamageAmount} 点伤害，并使右侧相邻物品加速 {attr.HasteAmount} 秒"
         ],
@@ -42,6 +43,11 @@
             "attributes": { "BuyPrice": 16, "SellPrice": 8, "CooldownMax": 3000, "DamageAmount": 112, "HasteAmount": 2000, "HasteTargets": 1 },
             "abilityIds": ["0", "1"],
             "auraIds": ["0"]
+          },
+          "Legendary": {
+            "attributes": { "BuyPrice": 24, "SellPrice": 12, "CooldownMax": 2500, "DamageAmount": 168, "HasteAmount": 2500, "HasteTargets": 1 },
+            "abilityIds": ["0", "1"],
+            "auraIds": ["0"]
           }
         },
         "abilities": {
@@ -49,7 +55,12 @@
             "id": "0",
             "trigger": { "$type": "TTriggerOnCardFired" },
             "activeIn": "HandOnly",
-            "action": { "$type": "TActionPlayerDamage", "target": { "$type": "TTargetPlayerRelative", "targetMode": "Opponent" } }
+            "action": { "$type": "TActionPlayerDamage", "target": { "$type": "TTargetPlayerRelative", "targetMode": "Opponent" } },
+            "vfxConfig": {
+              "vfxOverrideKey": "Slash",
+              "vfxShouldPlay": true,
+              "vfxIsTakeover": false
+            }
           },
           "1": {
             "id": "1",
@@ -95,14 +106,27 @@
     "patches": [
       {
         "targetTemplateId": "03b1fd16-6b0d-4847-a76f-6c586f7c5958",
-        "note": "原位调整原版弯刀：缩短冷却并追加 Tool 标签",
+        "note": "原位调整原版弯刀：缩短冷却、追加 Tool 标签并挂装 5 阶数值与实时计数徽章",
         "addTags": ["Tool"],
         "tierAttributeOverrides": {
-          "Bronze": { "CooldownMax": 3500, "DamageAmount": 16 },
-          "Silver": { "CooldownMax": 3500, "DamageAmount": 32 },
-          "Gold": { "CooldownMax": 3000, "DamageAmount": 64 },
-          "Diamond": { "CooldownMax": 3000, "DamageAmount": 128 }
-        }
+          "Bronze": { "CooldownMax": 3500, "DamageAmount": 16, "Custom_3": 0 },
+          "Silver": { "CooldownMax": 3500, "DamageAmount": 32, "Custom_3": 0 },
+          "Gold": { "CooldownMax": 3000, "DamageAmount": 64, "Custom_3": 0 },
+          "Diamond": { "CooldownMax": 3000, "DamageAmount": 128, "Custom_3": 0 },
+          "Legendary": { "CooldownMax": 2500, "DamageAmount": 192, "Custom_3": 0 }
+        },
+        "counterDisplaysOverride": [
+          {
+            "labelZh": "剑意",
+            "syncAttribute": "Custom_3",
+            "maxConst": 5,
+            "colorHex": "#F97316",
+            "style": "pips",
+            "valueType": "progress",
+            "position": "bottom",
+            "hideWhenZero": false
+          }
+        ]
       }
     ]
   }

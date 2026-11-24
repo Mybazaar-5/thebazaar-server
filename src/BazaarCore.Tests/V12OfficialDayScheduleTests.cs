@@ -26,6 +26,7 @@ namespace BazaarCore.Tests;
 /// V12 官方每日怪物调度（Day 1..10+ 精选三槽名册 &amp; Hour 1/2/4/5 三槽对齐 &amp; 同日去重 &amp; 动态 ExclusionSet）
 /// 与服务端 #19（父级遭遇头像 ParentEncounterTemplateId 跨子步同步、挂起恢复、新旧快照前后向兼容及战前零残留清理）综合测试套件。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V12OfficialDayScheduleTests
 {
     private const string CutlassId = "1b955b8d-0ea6-4437-935c-d588be5898c1";
@@ -59,110 +60,40 @@ public sealed class V12OfficialDayScheduleTests
 
     private static readonly Lazy<Fx> RealFixture = new(() =>
     {
-        string? dataDir = Environment.GetEnvironmentVariable("BAZAAR_DATA_DIR");
-        if (string.IsNullOrWhiteSpace(dataDir) || !File.Exists(Path.Combine(dataDir, "GameData.db")))
-        {
-            string? probe = AppContext.BaseDirectory;
-            for (int i = 0; i < 10 && !string.IsNullOrEmpty(probe); i++, probe = Directory.GetParent(probe)?.FullName)
-            {
-                string candidate = Path.Combine(probe, "dist", "data");
-                if (File.Exists(Path.Combine(candidate, "GameData.db")))
-                {
-                    dataDir = candidate;
-                    break;
-                }
-            }
-        }
-        if (string.IsNullOrWhiteSpace(dataDir) || !File.Exists(Path.Combine(dataDir, "GameData.db")))
-            dataDir = @"e:\thebazaar\dist\data";
-
-        string dbPath = Path.Combine(dataDir, "GameData.db");
-        var validIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        string wlPath = Path.Combine(dataDir, "valid_card_ids.json");
-        if (File.Exists(wlPath))
-        {
-            using var doc = JsonDocument.Parse(File.ReadAllText(wlPath));
-            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                doc.RootElement.TryGetProperty("valid_ids", out var arr) &&
-                arr.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var el in arr.EnumerateArray())
-                {
-                    string? id = el.GetString();
-                    if (!string.IsNullOrWhiteSpace(id)) validIds.Add(id);
-                }
-            }
-        }
-
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new Fx
         {
-            DataDir = dataDir,
-            DbPath = dbPath,
-            Pool = CardPool.Load(dbPath),
-            Monsters = MonsterPool.Load(dbPath),
-            LevelUps = LevelUpTable.Load(dbPath),
-            Mode = GameModeConfig.Load(dbPath),
-            Repo = GameDatabaseLoader.Load(dbPath, null),
-            Ghosts = PvpGhostPool.Load(dataDir),
-            ValidCardIds = validIds,
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
+            ValidCardIds = shared.CreateValidCardIdsCopy(),
         };
     });
 
-    /// <summary>独立复制 GameData.db + 白名单写入合成遭遇/子步模板的临时测试夹具，绝不污染真实资产。</summary>
+    /// <summary>零拷贝内存叠加合成遭遇/子步模板的隔离测试夹具，绝不污染共享底盘。</summary>
     private sealed class OverlayFixture : IDisposable
     {
-        public string TempDir { get; }
-        public string DbPath { get; }
-        public CardPool Pool { get; }
-        public List<BazaarServer.Data.MonsterTemplate> Monsters { get; }
-        public LevelUpTable LevelUps { get; }
-        public GameModeConfig Mode { get; }
-        public GameDataRepository Repo { get; }
-        public PvpGhostPool Ghosts { get; }
+        private readonly TestInfrastructure.SharedTestOverlay _inner;
+        public string TempDir => _inner.TempDir;
+        public string DbPath => TestInfrastructure.SharedGameDataFixture.Shared.DbPath;
+        public CardPool Pool => _inner.Pool;
+        public List<BazaarServer.Data.MonsterTemplate> Monsters => _inner.Monsters;
+        public LevelUpTable LevelUps => _inner.LevelUps;
+        public GameModeConfig Mode => _inner.Mode;
+        public GameDataRepository Repo => _inner.Repo;
+        public PvpGhostPool Ghosts => _inner.Ghosts;
 
         public OverlayFixture(params (string Id, string Json)[] customCards)
         {
-            var real = RealFixture.Value;
-            TempDir = Path.Combine(Path.GetTempPath(), "bazaar_v12_test_" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(TempDir);
-            DbPath = Path.Combine(TempDir, "GameData.db");
-            File.Copy(real.DbPath, DbPath, overwrite: true);
-
-            var wl = new HashSet<string>(real.ValidCardIds, StringComparer.OrdinalIgnoreCase);
-            using (var conn = new SqliteConnection($"Data Source={DbPath}"))
-            {
-                conn.Open();
-                foreach (var (id, json) in customCards)
-                {
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "INSERT OR REPLACE INTO cards (Id, Data) VALUES ($id, $data)";
-                    cmd.Parameters.AddWithValue("$id", id);
-                    cmd.Parameters.AddWithValue("$data", Encoding.UTF8.GetBytes(json));
-                    cmd.ExecuteNonQuery();
-                    wl.Add(id);
-                }
-            }
-
-            File.WriteAllText(
-                Path.Combine(TempDir, "valid_card_ids.json"),
-                JsonSerializer.Serialize(new { valid_ids = wl.ToArray() }));
-
-            Pool = CardPool.Load(DbPath);
-            Monsters = real.Monsters;
-            LevelUps = real.LevelUps;
-            Mode = real.Mode;
-            Repo = GameDatabaseLoader.Load(DbPath, null);
-            Ghosts = real.Ghosts;
+            _inner = TestInfrastructure.SharedGameDataFixture.Shared.CreateMemoryOverlay(customCards: customCards);
         }
 
-        public void Dispose()
-        {
-            SqliteConnection.ClearAllPools();
-            if (Directory.Exists(TempDir))
-            {
-                try { Directory.Delete(TempDir, recursive: true); } catch { }
-            }
-        }
+        public void Dispose() => _inner.Dispose();
     }
 
     private static (RunState Run, RunEngine Engine) CreateStartedEngine(

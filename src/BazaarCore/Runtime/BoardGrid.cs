@@ -1249,6 +1249,164 @@ public sealed class BoardGrid
         return true;
     }
 
+    /// <summary>
+    /// P0-06：只读预检当前网格（或指定溢出网格）在移出 <paramref name="oldCard"/> 后是否能完整容纳
+    /// 首个替换产物 <paramref name="firstReplacement"/>，全程零副作用、不修改任何卡牌槽位。
+    /// </summary>
+    public bool CanReplaceCard(CardInstance oldCard, CardInstance firstReplacement, BoardGrid? overflowGrid = null)
+    {
+        if (oldCard == null || firstReplacement == null || !Cards.Contains(oldCard))
+            return false;
+
+        int reqWidth = firstReplacement.SlotWidth;
+        if (reqWidth <= 0 || reqWidth > Capacity)
+            return false;
+
+        int usedWithoutOld = 0;
+        for (int i = 0; i < Cards.Count; i++)
+        {
+            if (!ReferenceEquals(Cards[i], oldCard))
+                usedWithoutOld += Cards[i].SlotWidth;
+        }
+
+        if (usedWithoutOld + reqWidth <= UnlockedCount)
+        {
+            if (oldCard.StartSlot >= 0 && CanFitWidthAt(reqWidth, oldCard.StartSlot, ignoring: oldCard))
+                return true;
+
+            for (int s = 0; s <= Capacity - reqWidth; s++)
+            {
+                if (CanFitWidthAt(reqWidth, s, ignoring: oldCard))
+                    return true;
+            }
+
+            var others = Cards.Where(c => !ReferenceEquals(c, oldCard)).OrderBy(c => c.StartSlot).ToList();
+            for (int candidateSlot = 0; candidateSlot <= Capacity - reqWidth; candidateSlot++)
+            {
+                if (!CanFitUnlockedOnly(candidateSlot, reqWidth)) continue;
+                if (TryBacktrackFit(others, candidateSlot, reqWidth, out _))
+                    return true;
+            }
+        }
+
+        return overflowGrid != null && overflowGrid.CanFit(reqWidth);
+    }
+
+    /// <summary>
+    /// P0-06：原子将 <paramref name="oldCard"/> 替换为 1..N 张产物卡：
+    /// 1) 完整快照本盘与溢出盘所有卡牌的原始 StartSlot；
+    /// 2) 首个产物优先落回原槽并支持挤位，若本盘与溢出盘皆放不下则原子回滚两盘全部状态（含被位移邻居与原卡）并返回 false；
+    /// 3) 第 2..N 产物优先填入原卡腾出连续槽段，其次本盘自动落位，再其次溢出盘；未落位产物置 StartSlot=-1 且不记入输出集合。
+    /// </summary>
+    public bool TryReplaceCards(
+        CardInstance oldCard,
+        IReadOnlyList<CardInstance> replacements,
+        BoardGrid? overflowGrid,
+        out List<CardInstance> placedPrimary,
+        out List<CardInstance> placedOverflow)
+    {
+        var primaryOut = new List<CardInstance>();
+        var overflowOut = new List<CardInstance>();
+        placedPrimary = primaryOut;
+        placedOverflow = overflowOut;
+
+        if (oldCard == null || replacements == null || replacements.Count == 0 || !Cards.Contains(oldCard))
+            return false;
+
+        var primarySnapshot = new List<(CardInstance Card, int SavedStartSlot)>(Cards.Count);
+        for (int i = 0; i < Cards.Count; i++)
+            primarySnapshot.Add((Cards[i], Cards[i].StartSlot));
+
+        List<(CardInstance Card, int SavedStartSlot)>? overflowSnapshot = null;
+        if (overflowGrid != null)
+        {
+            overflowSnapshot = new List<(CardInstance Card, int SavedStartSlot)>(overflowGrid.Cards.Count);
+            for (int i = 0; i < overflowGrid.Cards.Count; i++)
+                overflowSnapshot.Add((overflowGrid.Cards[i], overflowGrid.Cards[i].StartSlot));
+        }
+
+        void Rollback()
+        {
+            Cards.Clear();
+            for (int i = 0; i < primarySnapshot.Count; i++)
+            {
+                var (c, savedSlot) = primarySnapshot[i];
+                c.StartSlot = savedSlot;
+                Cards.Add(c);
+            }
+            SortCards();
+
+            if (overflowGrid != null && overflowSnapshot != null)
+            {
+                overflowGrid.Cards.Clear();
+                for (int i = 0; i < overflowSnapshot.Count; i++)
+                {
+                    var (c, savedSlot) = overflowSnapshot[i];
+                    c.StartSlot = savedSlot;
+                    overflowGrid.Cards.Add(c);
+                }
+                overflowGrid.SortCards();
+            }
+
+            for (int i = 0; i < replacements.Count; i++)
+                replacements[i].StartSlot = -1;
+            primaryOut.Clear();
+            overflowOut.Clear();
+        }
+
+        int origSlot = oldCard.StartSlot;
+        int origWidth = oldCard.SlotWidth;
+        Remove(oldCard);
+
+        var r0 = replacements[0];
+        bool firstInPrimary = (origSlot >= 0 && TryPlaceWithDisplaceOrSwap(r0, origSlot)) || TryAddAuto(r0);
+        bool firstInOverflow = !firstInPrimary && overflowGrid != null && overflowGrid.TryAddAuto(r0);
+        if (!firstInPrimary && !firstInOverflow)
+        {
+            Rollback();
+            return false;
+        }
+
+        if (firstInPrimary) primaryOut.Add(r0);
+        else overflowOut.Add(r0);
+
+        int nextVacatedSlot = firstInPrimary ? r0.StartSlot + r0.SlotWidth : origSlot;
+        int vacatedEnd = origSlot >= 0 ? origSlot + origWidth : 0;
+
+        for (int i = 1; i < replacements.Count; i++)
+        {
+            var r = replacements[i];
+            bool inPrimary = false;
+            if (origSlot >= 0
+                && nextVacatedSlot >= 0
+                && nextVacatedSlot + r.SlotWidth <= vacatedEnd
+                && TryPlaceOrShift(r, nextVacatedSlot))
+            {
+                inPrimary = true;
+                nextVacatedSlot = r.StartSlot + r.SlotWidth;
+            }
+            else if (TryAddAuto(r))
+            {
+                inPrimary = true;
+            }
+
+            if (inPrimary)
+            {
+                primaryOut.Add(r);
+            }
+            else if (overflowGrid != null && overflowGrid.TryAddAuto(r))
+            {
+                overflowOut.Add(r);
+            }
+            else
+            {
+                r.StartSlot = -1;
+            }
+        }
+
+        return true;
+    }
+
     /// <summary>获取严格相邻的左侧卡牌（右边界紧贴 origin.StartSlot）。</summary>
     public CardInstance? GetLeftNeighbor(CardInstance origin, bool includeDestroyed = false)
     {
@@ -1428,5 +1586,142 @@ public sealed class BoardGrid
             }
         }
         return idx == others.Count;
+    }
+
+    /// <summary>
+    /// D1-P1-13 (#118-4)：卡牌因 Tiny 变更导致宽度扩张后重新协调棋盘布局（同时覆盖局外与战中双场景）：
+    /// 1) 清除 card.EffectiveCombatWidthCap 并校验当前网格；若合法无重叠则零挪动直接返回；
+    /// 2) 优先在当前 UnlockedMask 内左右无重叠重排全部在场卡；
+    /// 3) 局外（overflowGrid != null）若总宽度超 UnlockedCount，将最右非目标卡安全迁入 overflowGrid；
+    /// 4) 战中（overflowGrid == null）若总目标宽度超 UnlockedCount（如 10 张 Tiny 同时解除变宽），
+    ///    采用确定性零重叠保底策略：锁定其余卡零重叠并将超宽卡的 EffectiveCombatWidthCap 钳制为当前可用连续空槽宽（下限 1），
+    ///    绝不销毁/驱逐在场卡、绝不产生非法重叠、绝不死循环或抛异常。
+    /// 返回被迁入 overflowGrid 的溢出卡牌列表（战中恒为空列表）。
+    /// </summary>
+    public List<CardInstance> ReconcileWidthChange(CardInstance card, BoardGrid? overflowGrid = null)
+    {
+        var overflowed = new List<CardInstance>();
+        if (card == null || !Cards.Contains(card)) return overflowed;
+
+        card.EffectiveCombatWidthCap = null;
+        if (ValidateInvariants(out _))
+            return overflowed;
+
+        // 1. 尝试在当前 UnlockedMask 内保持相对顺序整体紧密重排
+        var ordered = Cards.OrderBy(c => c.StartSlot).ToList();
+        if (TryPackAllInUnlocked(ordered, out var fullPositions))
+        {
+            foreach (var (c, pos) in fullPositions) c.StartSlot = pos;
+            SortCards();
+            return overflowed;
+        }
+
+        // 2. 局外允许溢出至 Stash：按最右非目标卡尝试外迁；仅当 overflowGrid.TryAddAuto 成功落袋后才从当前网格摘除，防双满丢卡
+        if (overflowGrid != null)
+        {
+            while (!TryPackAllInUnlocked(ordered, out fullPositions) && ordered.Count > 1)
+            {
+                bool movedOne = false;
+                for (int i = ordered.Count - 1; i >= 0; i--)
+                {
+                    var victim = ordered[i];
+                    if (ReferenceEquals(victim, card)) continue;
+
+                    int origSlot = victim.StartSlot;
+                    if (!overflowGrid.TryAddAuto(victim))
+                    {
+                        victim.StartSlot = origSlot;
+                        continue;
+                    }
+
+                    ordered.RemoveAt(i);
+                    Cards.Remove(victim);
+                    overflowed.Add(victim);
+                    movedOne = true;
+                    break;
+                }
+                if (!movedOne) break;
+            }
+
+            if (TryPackAllInUnlocked(ordered, out fullPositions))
+            {
+                foreach (var (c, pos) in fullPositions) c.StartSlot = pos;
+                SortCards();
+                return overflowed;
+            }
+        }
+
+        // 3. 战中容量溢出零重叠确定性保底（#118-4）：绝不驱逐/销毁卡，按可用预算压低目标卡及必要时其余扩张卡的 EffectiveCombatWidthCap
+        int unlockedSlots = UnlockedCount;
+        if (unlockedSlots <= 0)
+            return overflowed;
+
+        // 先尝试仅对触发变宽的 card 逐级压低 EffectiveCombatWidthCap（从 BaseSlotWidth - 1 降至 1）
+        for (int cap = card.BaseSlotWidth - 1; cap >= 1; cap--)
+        {
+            card.EffectiveCombatWidthCap = cap;
+            if (ValidateInvariants(out _))
+                return overflowed;
+            if (TryPackAllInUnlocked(ordered, out fullPositions))
+            {
+                foreach (var (c, pos) in fullPositions) c.StartSlot = pos;
+                SortCards();
+                return overflowed;
+            }
+        }
+
+        // 若多张卡同时解除 Tiny 导致总宽仍超限，统一对所有 SlotWidth > 1 的卡按从右到左逐格缩回至 1，确保 100% 零重叠
+        while (!TryPackAllInUnlocked(ordered, out fullPositions))
+        {
+            bool reduced = false;
+            for (int i = ordered.Count - 1; i >= 0; i--)
+            {
+                var c = ordered[i];
+                if (c.SlotWidth > 1)
+                {
+                    c.EffectiveCombatWidthCap = c.SlotWidth - 1;
+                    reduced = true;
+                    break;
+                }
+            }
+            if (!reduced) break;
+        }
+
+        if (TryPackAllInUnlocked(ordered, out fullPositions))
+        {
+            foreach (var (c, pos) in fullPositions) c.StartSlot = pos;
+            SortCards();
+        }
+
+        return overflowed;
+    }
+
+    private bool TryPackAllInUnlocked(List<CardInstance> ordered, out Dictionary<CardInstance, int> positions)
+    {
+        positions = new Dictionary<CardInstance, int>(ordered.Count);
+        int cursor = 0;
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            var c = ordered[i];
+            int w = c.SlotWidth;
+            bool placed = false;
+            while (cursor + w <= Capacity)
+            {
+                bool ok = true;
+                for (int s = cursor; s < cursor + w; s++)
+                {
+                    if (!IsSlotUnlocked(s)) { ok = false; cursor = s + 1; break; }
+                }
+                if (ok)
+                {
+                    positions[c] = cursor;
+                    cursor += w;
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) return false;
+        }
+        return true;
     }
 }

@@ -95,6 +95,7 @@ public sealed partial class GameLocatorService
         string doorstopPath = Path.Combine(normalized, "doorstop_config.ini");
         string bepCorePath = Path.Combine(normalized, "BepInEx", "core", "BepInEx.dll");
         string pluginPath = Path.Combine(normalized, LauncherConstants.PluginsRelativeDir, "BazaarLauncher.dll");
+        string sdkPath = Path.Combine(normalized, LauncherConstants.PluginsRelativeDir, "BazaarModSdk.dll");
         string bootConfigPath = Path.Combine(normalized, LauncherConstants.BootConfigRelativePath);
         string aaSettingsPath = Path.Combine(normalized, LauncherConstants.AddressablesSettingsRelativePath);
 
@@ -128,6 +129,7 @@ public sealed partial class GameLocatorService
             HasDoorstopConfig = File.Exists(doorstopPath),
             HasBepInExCore = File.Exists(bepCorePath),
             HasBazaarLauncherPlugin = File.Exists(pluginPath),
+            HasBazaarModSdk = File.Exists(sdkPath),
             HasBootConfig = File.Exists(bootConfigPath),
             HasAddressablesSettings = File.Exists(aaSettingsPath),
             LauncherPluginVersion = pluginVer,

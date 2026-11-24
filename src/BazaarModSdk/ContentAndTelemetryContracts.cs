@@ -52,6 +52,87 @@ public sealed class CardVisualBinding
 
     /// <summary>同级冲突时的覆盖优先级（越大越优先）。</summary>
     public int Priority { get; set; }
+
+    /// <summary>可选奇遇/野怪独立背景图本地路径。</summary>
+    public string? BgArtPath { get; set; }
+
+    /// <summary>可选奇遇/野怪独立背景图 SHA-256 哈希。</summary>
+    public string? BgArtSha256 { get; set; }
+
+    /// <summary>是否为原版卡原位 Patch 覆盖（true=改写原版卡，false=借壳新卡或纯视觉覆盖）。</summary>
+    public bool IsPatchOverride { get; set; }
+
+    /// <summary>是否为借用官方底座外壳的全新自定义卡。</summary>
+    public bool IsCustomBorrowShell { get; set; }
+
+    /// <summary>可选自定义野怪悬停预览数据（P0-21）。</summary>
+    public CardMonsterPreviewInfo? MonsterPreview { get; set; }
+}
+
+/// <summary>
+/// 自定义野怪悬停预览的单件装备或技能条目（严格对齐服务端 CustomMonsterLoadoutItemBinding）。
+/// </summary>
+public sealed class CardMonsterLoadoutItemInfo
+{
+    /// <summary>自定义卡牌逻辑 ID（或原版模板 ID）。</summary>
+    public string CardId { get; set; } = string.Empty;
+
+    /// <summary>传输层官方合法模板 GUID（用于 2D 预览实例化底层骨架）。</summary>
+    public string? WireTemplateId { get; set; }
+
+    /// <summary>卡牌品阶名称（Bronze / Silver / Gold / Diamond / Legendary）。</summary>
+    public string Tier { get; set; } = "Bronze";
+
+    /// <summary>物品占格尺寸（Small / Medium / Large，用于 10 槽棋盘居中排布）。</summary>
+    public string? Size { get; set; }
+
+    /// <summary>可选附魔名称。</summary>
+    public string? Enchantment { get; set; }
+
+    /// <summary>可选中文卡名。</summary>
+    public string? TitleZh { get; set; }
+
+    /// <summary>可选英文卡名。</summary>
+    public string? TitleEn { get; set; }
+}
+
+/// <summary>
+/// 自定义野怪悬停预览契约（P0-21，严格对齐服务端 CustomMonsterPreviewBinding）。
+/// </summary>
+public sealed class CardMonsterPreviewInfo
+{
+    /// <summary>野怪逻辑 ID。</summary>
+    public string MonsterId { get; set; } = string.Empty;
+
+    /// <summary>野怪中文名。</summary>
+    public string NameZh { get; set; } = string.Empty;
+
+    /// <summary>野怪英文名。</summary>
+    public string? NameEn { get; set; }
+
+    /// <summary>所属天数。</summary>
+    public int Day { get; set; }
+
+    /// <summary>野怪等级。</summary>
+    public int Level { get; set; }
+
+    /// <summary>野怪最大生命值。</summary>
+    public int HealthMax { get; set; }
+
+    /// <summary>野怪品阶。</summary>
+    public string StartingTier { get; set; } = "Bronze";
+
+    /// <summary>击败奖励金币数。</summary>
+    public int RewardGold { get; set; }
+
+    /// <summary>击败奖励经验值。</summary>
+    public int RewardXp { get; set; }
+
+    /// <summary>野怪棋盘物品列表。</summary>
+    public CardMonsterLoadoutItemInfo[] Items { get; set; } = Array.Empty<CardMonsterLoadoutItemInfo>();
+
+    /// <summary>野怪技能列表。</summary>
+    public CardMonsterLoadoutItemInfo[] Skills { get; set; } = Array.Empty<CardMonsterLoadoutItemInfo>();
 }
 
 /// <summary>
@@ -145,6 +226,8 @@ public sealed class CardCounterDisplayInfo
     public string SyncAttribute { get; set; } = "Custom_3";
     /// <summary>可选上限值（存在时按晶球/进度条或「当前/上限」展示）。</summary>
     public int? MaxValue { get; set; }
+    /// <summary>可选动态上限属性名（如 AmmoMax / Custom_4，运行时实时读取卡牌属性作为上限）。</summary>
+    public string? MaxAttr { get; set; }
     /// <summary>徽章主题高光色（十六进制如 "#F97316"）。</summary>
     public string? ColorHex { get; set; }
     /// <summary>为 true 时计数为 0 自动隐藏。</summary>
@@ -174,6 +257,10 @@ public sealed class CardPreviewAttrOp
     public double Value { get; set; }
     /// <summary>可选：动态引用当前卡牌另一属性（如 Shielded 引用 DamageAmount）。</summary>
     public string? SourceAttribute { get; set; }
+    /// <summary>可选：源属性比例乘数（D3-P1-02，缺省为 1.0）。</summary>
+    public double? SourceMultiplier { get; set; }
+    /// <summary>可选：源属性派生后的附加偏移量（D3-P1-02，缺省为 0.0）。</summary>
+    public double? SourceAddOffset { get; set; }
 }
 
 /// <summary>
@@ -199,19 +286,43 @@ public sealed class CardTextOverride
     /// <summary>覆盖标题（自动保留原版附魔与 Tiny 富文本前缀）。</summary>
     public string? Title { get; set; }
 
+    /// <summary>可选英文覆盖标题（P0-27 双语支持）。</summary>
+    public string? TitleEn { get; set; }
+
     /// <summary>覆盖基础描述（支持原版及 {attr.*} 动态属性占位符）。</summary>
     public string? Description { get; set; }
+
+    /// <summary>可选英文基础描述（P0-27 双语支持）。</summary>
+    public string? DescriptionEn { get; set; }
 
     /// <summary>覆盖主动触发词条列表。</summary>
     public string[]? ActiveTooltips { get; set; }
 
+    /// <summary>可选英文主动触发词条列表（P0-27 双语支持）。</summary>
+    public string[]? ActiveTooltipsEn { get; set; }
+
     /// <summary>覆盖被动/光环词条列表。</summary>
     public string[]? PassiveTooltips { get; set; }
+
+    /// <summary>可选英文被动/光环词条列表（P0-27 双语支持）。</summary>
+    public string[]? PassiveTooltipsEn { get; set; }
 
     /// <summary>按附魔名覆盖附魔词条列表。</summary>
     public Dictionary<string, string[]>? EnchantmentTooltips { get; set; }
 
-    /// <summary>附加纯展示标签（不改动底层 Card.Tags，确保联机协议与巴扎罗盘兼容）。</summary>
+    /// <summary>可选按附魔名覆盖英文附魔词条列表（P0-27 双语支持）。</summary>
+    public Dictionary<string, string[]>? EnchantmentTooltipsEn { get; set; }
+
+    /// <summary>是否为原版卡原位 Patch 覆盖。</summary>
+    public bool IsPatchOverride { get; set; }
+
+    /// <summary>是否为借用官方底座外壳的全新自定义卡（英文模式下绝不回退底座，且未配被动词条时屏蔽底座被动）。</summary>
+    public bool IsCustomBorrowShell { get; set; }
+
+    /// <summary>可选自定义野怪悬停预览数据（P0-21）。</summary>
+    public CardMonsterPreviewInfo? MonsterPreview { get; set; }
+
+    /// <summary>附加纯展示标签（不改动底层 Card.Tags，确保联机协议与第三方界面叠加层兼容）。</summary>
     public string[]? ExtraDisplayTags { get; set; }
 
     /// <summary>五阶属性表（Bronze/Silver/Gold/Diamond/Legendary），供局内自定义卡升阶对比与详情预览精准渲染各阶数值。</summary>

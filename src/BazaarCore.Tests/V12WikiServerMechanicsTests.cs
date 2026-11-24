@@ -27,6 +27,7 @@ namespace BazaarCore.Tests;
 /// Wiki / BazaarDB B 组（#42–#52 局外日程、经济、商店、升级掉落、奇遇事件 + #37 卖出音符 + #38 局外造访任务）
 /// 全量真值对照与服务端回归验证套件（全数直读 GameData.db + RunEngine 黑盒闭环）。
 /// </summary>
+[Collection("GlobalStaticState")]
 public sealed class V12WikiServerMechanicsTests
 {
     private const string CutlassId = "1b955b8d-0ea6-4437-935c-d588be5898c1";
@@ -100,35 +101,17 @@ public sealed class V12WikiServerMechanicsTests
 
     private static readonly Lazy<Fx> RealFixture = new(() =>
     {
-        string? dataDir = Environment.GetEnvironmentVariable("BAZAAR_DATA_DIR");
-        if (string.IsNullOrWhiteSpace(dataDir) || !File.Exists(Path.Combine(dataDir, "GameData.db")))
-        {
-            string? probe = AppContext.BaseDirectory;
-            for (int i = 0; i < 10 && !string.IsNullOrEmpty(probe); i++, probe = Directory.GetParent(probe)?.FullName)
-            {
-                string candidate = Path.Combine(probe, "dist", "data");
-                if (File.Exists(Path.Combine(candidate, "GameData.db")) &&
-                    new FileInfo(Path.Combine(candidate, "GameData.db")).Length > 1024 * 1024)
-                {
-                    dataDir = candidate;
-                    break;
-                }
-            }
-        }
-        if (string.IsNullOrWhiteSpace(dataDir) || !File.Exists(Path.Combine(dataDir, "GameData.db")))
-            dataDir = @"e:\thebazaar\dist\data";
-
-        string dbPath = Path.Combine(dataDir, "GameData.db");
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new Fx
         {
-            DataDir = dataDir,
-            DbPath = dbPath,
-            Pool = CardPool.Load(dbPath),
-            Monsters = MonsterPool.Load(dbPath),
-            LevelUps = LevelUpTable.Load(dbPath),
-            Mode = GameModeConfig.Load(dbPath),
-            Repo = GameDatabaseLoader.Load(dbPath, null),
-            Ghosts = PvpGhostPool.Load(dataDir),
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
         };
     });
 

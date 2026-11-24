@@ -216,9 +216,7 @@ public sealed class PerformanceTunerService
                     Directory.CreateDirectory(targetDir);
                 }
 
-                string tmpPath = targetPath + ".restore.tmp";
-                File.Copy(backupPath, tmpPath, overwrite: true);
-                File.Move(tmpPath, targetPath, overwrite: true);
+                AtomicFileWriter.CopyFileAtomic(backupPath, targetPath);
                 result.RestoredFiles.Add(relPath);
                 log?.Invoke($"[还原] 已逐字节恢复原版文件：{relPath}");
             }
@@ -364,10 +362,8 @@ public sealed class PerformanceTunerService
             Directory.CreateDirectory(dir);
         }
 
-        string tmpPath = manifestPath + ".tmp";
         string json = JsonSerializer.Serialize(manifest, ManifestJsonOptions);
-        File.WriteAllText(tmpPath, json, Utf8NoBom);
-        File.Move(tmpPath, manifestPath, overwrite: true);
+        AtomicFileWriter.WriteAllTextAtomic(manifestPath, json, Utf8NoBom);
     }
 
     private static void ApplyBootConfigOptimization(string bootConfigPath, PerformanceTuningOptions options)
@@ -425,9 +421,7 @@ public sealed class PerformanceTunerService
         }
 
         string serialized = string.Join(lineEnding, lines) + (trailingNewLine ? lineEnding : string.Empty);
-        string tmpPath = bootConfigPath + ".tmp";
-        File.WriteAllText(tmpPath, serialized, Utf8NoBom);
-        File.Move(tmpPath, bootConfigPath, overwrite: true);
+        AtomicFileWriter.WriteAllTextAtomic(bootConfigPath, serialized, Utf8NoBom);
     }
 
     private static void ApplyAddressablesOptimization(string settingsJsonPath)
@@ -443,9 +437,7 @@ public sealed class PerformanceTunerService
         obj["m_LogResourceManagerExceptions"] = false;
 
         string updated = obj.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
-        string tmpPath = settingsJsonPath + ".tmp";
-        File.WriteAllText(tmpPath, updated, Utf8NoBom);
-        File.Move(tmpPath, settingsJsonPath, overwrite: true);
+        AtomicFileWriter.WriteAllTextAtomic(settingsJsonPath, updated, Utf8NoBom);
     }
 
     private static void ApplyBepInExLoggingOptimization(string bepInExCfgPath)

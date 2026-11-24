@@ -790,21 +790,48 @@ public static class TempoNetEndpoints
         });
         app.MapGet("/api/game/loadgame", () => Results.Json(new { ok = true, save = (object?)null }, Json));
         app.MapPost("/api/game/savegame", () => Results.Json(new { ok = true }, Json));
-        app.MapDelete("/api/game/deleteactivesave", (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
+        app.MapDelete("/api/game/deleteactivesave", async (HttpContext ctx, AccountStore accounts, SessionStore sessions, Persistence db) =>
         {
             var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
             if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, Json);
 
             var acc = auth.Account!;
             string key = acc.AccountId.ToString("N");
-            var mem = sessions.GetByAccount(key);
-            if (mem != null)
+            // 遵循与 GameServerEndpoints 一致的全局锁序：AccountLock -> Session.Gate，防止并发命令在退赛后把旧快照写回复活
+            var accountLock = GameServerEndpoints.GetAccountSessionLock(key);
+            await accountLock.WaitAsync(ctx.RequestAborted);
+            try
             {
-                sessions.Remove(mem.Sid);
-                SessionRegistry.Detach(mem.Sid);
+                string? concededRunId = null;
+                var mem = sessions.GetByAccount(key);
+                if (mem != null)
+                {
+                    await mem.Gate.WaitAsync(ctx.RequestAborted);
+                    try
+                    {
+                        var handle = SessionRegistry.Get(mem.Sid);
+                        if (handle != null)
+                        {
+                            concededRunId = handle.Run.RunId;
+                            db.MarkRunEnded(concededRunId, BazaarGameShared.Domain.Runs.ERunState.EndRunDefeat, "conceded");
+                        }
+                        sessions.Remove(mem.Sid);
+                        SessionRegistry.Detach(mem.Sid);
+                        GameServerEndpoints.DetachRidCache(mem.Sid);
+                        GameServerEndpoints.DetachRunRidCache(concededRunId);
+                    }
+                    finally
+                    {
+                        mem.Gate.Release();
+                    }
+                }
+                db.ConcedeActiveRuns(acc.AccountId);
+                return Results.Json(new { ok = true }, Json);
             }
-            db.ConcedeActiveRuns(acc.AccountId);
-            return Results.Json(new { ok = true }, Json);
+            finally
+            {
+                accountLock.Release();
+            }
         });
         app.MapPost("/api/game/addghost", () => Results.Json(new { ok = true }, Json));
         app.MapGet("/api/game/getghost", () => Results.Json(new { ok = true, ghost = (object?)null }, Json));
@@ -856,8 +883,32 @@ public static class TempoNetEndpoints
         return true;
     }
 
+    private const int MaxChestGrantRateBuckets = 4096;
+
+    /// <summary>D8-P2-05：清理已过 60 秒窗口期的空宝箱发奖限流桶，防长跑内存无限增长。</summary>
+    public static int PurgeStaleRateBuckets()
+    {
+        long nowMs = Environment.TickCount64;
+        int removed = 0;
+        foreach (var (aid, q) in ChestGrantRateMap)
+        {
+            bool empty;
+            lock (q)
+            {
+                while (q.Count > 0 && nowMs - q.Peek() > 60_000)
+                    q.Dequeue();
+                empty = q.Count == 0;
+            }
+            if (empty && ChestGrantRateMap.TryRemove(aid, out _))
+                removed++;
+        }
+        return removed;
+    }
+
     private static bool CheckChestGrantRateLimit(Guid accountId)
     {
+        if (ChestGrantRateMap.Count >= MaxChestGrantRateBuckets && !ChestGrantRateMap.ContainsKey(accountId))
+            PurgeStaleRateBuckets();
         long nowMs = Environment.TickCount64;
         var queue = ChestGrantRateMap.GetOrAdd(accountId, _ => new Queue<long>());
         lock (queue)
@@ -889,7 +940,7 @@ public static class TempoNetEndpoints
         return System.Text.Encoding.UTF8.GetString(ms.ToArray());
     }
 
-    private static object? BuildActiveRunDto(AccountStore.Account acc, SessionStore sessions, Persistence db)
+    public static object? BuildActiveRunDto(AccountStore.Account acc, SessionStore sessions, Persistence db)
     {
         var memSession = sessions.GetByAccount(acc.AccountId.ToString("N"));
         if (memSession != null)
@@ -897,24 +948,25 @@ public static class TempoNetEndpoints
             var handle = SessionRegistry.Get(memSession.Sid);
             if (handle != null)
             {
-                if (Persistence.IsTerminalState(handle.Run.State))
+                // D8-P1-02：读取不可变 volatile RunPublicSummarySnapshot，彻底消除无锁跨线程直读他人 RunState 与 PlayerAttributes
+                var summary = handle.Run.PublicSummary;
+                if (summary.IsTerminal)
                     return null;
 
-                var r = handle.Run;
                 return new
                 {
                     AccountId = acc.AccountId,
-                    PlayMode = r.PlayMode,
-                    Type = r.PlayMode,
-                    TournamentSessionId = memSession.TournamentSessionId,
-                    HeroID = (r.Hero == EHero.Common ? EHero.Vanessa : r.Hero).ToString(),
-                    PlayerVictories = (int)r.Victories,
-                    RunId = r.RunId,
-                    Day = r.Day,
-                    Hour = r.Hour,
-                    CurrentPrestige = r.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 20),
-                    Victories = r.Victories,
-                    Defeats = r.Defeats,
+                    PlayMode = summary.PlayMode,
+                    Type = summary.PlayMode,
+                    TournamentSessionId = memSession.TournamentSessionId ?? summary.TournamentSessionId,
+                    HeroID = (summary.Hero == EHero.Common ? EHero.Vanessa : summary.Hero).ToString(),
+                    PlayerVictories = (int)summary.Victories,
+                    RunId = summary.RunId,
+                    Day = summary.Day,
+                    Hour = summary.Hour,
+                    CurrentPrestige = summary.Prestige,
+                    Victories = summary.Victories,
+                    Defeats = summary.Defeats,
                 };
             }
         }

@@ -199,6 +199,9 @@ public sealed class CustomEventSchedule
 
     [JsonPropertyName("chainOnly")]
     public bool ChainOnly { get; set; }
+
+    [JsonPropertyName("difficultySlot")]
+    public string? DifficultySlot { get; set; }
 }
 
 /// <summary>
@@ -289,9 +292,22 @@ public sealed class CustomCardDefinition
     [JsonPropertyName("enchantTooltipsZh")]
     public Dictionary<string, List<string>> EnchantTooltipsZh { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
+    [JsonPropertyName("activeTooltipsEn")]
+    public List<string>? ActiveTooltipsEn { get; set; }
+
+    [JsonPropertyName("passiveTooltipsEn")]
+    public List<string>? PassiveTooltipsEn { get; set; }
+
+    [JsonPropertyName("enchantTooltipsEn")]
+    public Dictionary<string, List<string>>? EnchantTooltipsEn { get; set; }
+
     /// <summary>Mod 目录内相对贴图路径（如 assets/ember_anvil.png）。</summary>
     [JsonPropertyName("customArtFile")]
     public string? CustomArtFile { get; set; }
+
+    /// <summary>D3-P1-12：可选奇遇/遭遇独立背景图路径（如 assets/event_bg.png）。</summary>
+    [JsonPropertyName("customBgArtFile")]
+    public string? CustomBgArtFile { get; set; }
 
     /// <summary>兼容嵌套对象 customArt（自动回填 CustomArtFile 与 ArtRect）。</summary>
     [JsonPropertyName("customArt")]
@@ -412,6 +428,18 @@ public sealed class CustomCardDefinition
     [JsonPropertyName("maxDay")]
     public int? ModMaxDay { get; set; }
 
+    /// <summary>P0-24：透传自定义奇遇允许出现的小时列表。</summary>
+    [JsonPropertyName("allowedHours")]
+    public List<int>? AllowedHours { get; set; }
+
+    /// <summary>P0-24：透传自定义奇遇每局仅出现一次标记。</summary>
+    [JsonPropertyName("isSingleSpawn")]
+    public bool? IsSingleSpawn { get; set; }
+
+    /// <summary>P0-21：透传自定义野怪遭遇难度槽位（Bronze / Silver / Gold / Any）。</summary>
+    [JsonPropertyName("difficultySlot")]
+    public string? ModDifficultySlot { get; set; }
+
     /// <summary>用于 Gate #1 静态检测非引擎废字段（如奇遇步骤中虚构的 effects / costGold）。</summary>
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? ExtensionData { get; set; }
@@ -474,25 +502,67 @@ public sealed class CustomCardDefinition
         }
 
         Dictionary<string, TierData>? clonedTiers = null;
-        if (Tiers != null)
+        if (Tiers != null && Tiers.Count > 0)
         {
             bool autoFillAbilities = Abilities.Count > 0 && !Tiers.Values.Any(t => t.AbilityIds.Count > 0);
             bool autoFillAuras = Auras.Count > 0 && !Tiers.Values.Any(t => t.AuraIds.Count > 0);
             var allAbilityKeys = autoFillAbilities ? Abilities.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList() : null;
             var allAuraKeys = autoFillAuras ? Auras.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList() : null;
 
+            // D3-P1-01：合并顶层 Attributes 与各阶 Tiers[tier].Attributes 作为完整底表，并从 StartingTier 起补齐至 Legendary
             clonedTiers = new Dictionary<string, TierData>(StringComparer.OrdinalIgnoreCase);
-            foreach (var (tk, tv) in Tiers)
+            var runningAttrs = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            if (Attributes != null)
             {
-                clonedTiers[tk] = new TierData
+                foreach (var (k, v) in Attributes)
+                    runningAttrs[k] = v;
+            }
+            var lastAbilityIds = allAbilityKeys != null ? new List<string>(allAbilityKeys) : new List<string>();
+            var lastAuraIds = allAuraKeys != null ? new List<string>(allAuraKeys) : new List<string>();
+            var lastTooltipIds = new List<int>();
+            bool started = false;
+            string startTierNorm = string.IsNullOrWhiteSpace(StartingTier) ? "Bronze" : StartingTier.Trim();
+
+            foreach (var tierName in new[] { "Bronze", "Silver", "Gold", "Diamond", "Legendary" })
+            {
+                bool hasExplicit = Tiers.TryGetValue(tierName, out var tv) && tv != null;
+                if (hasExplicit || string.Equals(tierName, startTierNorm, StringComparison.OrdinalIgnoreCase))
+                    started = true;
+
+                if (hasExplicit)
                 {
-                    Attributes = new Dictionary<string, double>(tv.Attributes, StringComparer.OrdinalIgnoreCase),
-                    AbilityIds = autoFillAbilities ? new List<string>(allAbilityKeys!) : new List<string>(tv.AbilityIds),
-                    AuraIds = autoFillAuras ? new List<string>(allAuraKeys!) : new List<string>(tv.AuraIds),
-                    TooltipIds = new List<int>(tv.TooltipIds)
-                };
+                    if (tv!.Attributes != null)
+                    {
+                        foreach (var (k, v) in tv.Attributes)
+                            runningAttrs[k] = v;
+                    }
+                    lastAbilityIds = autoFillAbilities ? new List<string>(allAbilityKeys!) : new List<string>(tv.AbilityIds);
+                    lastAuraIds = autoFillAuras ? new List<string>(allAuraKeys!) : new List<string>(tv.AuraIds);
+                    lastTooltipIds = new List<int>(tv.TooltipIds);
+                }
+
+                if (started)
+                {
+                    clonedTiers[tierName] = new TierData
+                    {
+                        Attributes = new Dictionary<string, double>(runningAttrs, StringComparer.OrdinalIgnoreCase),
+                        AbilityIds = new List<string>(lastAbilityIds),
+                        AuraIds = new List<string>(lastAuraIds),
+                        TooltipIds = new List<int>(lastTooltipIds)
+                    };
+                }
             }
         }
+
+        // P0-23：通用跨英雄自定义技能判定（Type=="Skill" 且未限定特定英雄或包含 Common/Any/All）
+        bool isSkill = string.Equals(Type, "Skill", StringComparison.OrdinalIgnoreCase);
+        bool isUniversalSkill = isSkill && (Heroes.Count == 0 || Heroes.Any(h =>
+            string.Equals(h, HeroNames.Common, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(h, "Any", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(h, "All", StringComparison.OrdinalIgnoreCase)));
+        var resolvedHeroes = Heroes.Count > 0 ? new List<string>(Heroes) : new List<string> { HeroNames.Common };
+        if (isUniversalSkill && !resolvedHeroes.Any(h => string.Equals(h, HeroNames.Common, StringComparison.OrdinalIgnoreCase)))
+            resolvedHeroes.Add(HeroNames.Common);
 
         return new CardTemplate
         {
@@ -504,12 +574,13 @@ public sealed class CustomCardDefinition
             InternalDescription = descText,
             StartingTier = StartingTier,
             Size = Size,
-            Heroes = Heroes.Count > 0 ? new List<string>(Heroes) : [HeroNames.Common],
+            Heroes = resolvedHeroes,
             Tags = new List<string>(Tags),
             HiddenTags = new List<string>(HiddenTags),
             ArtKey = baseVisualTemplate.ArtKey,
             AudioKey = baseVisualTemplate.AudioKey,
             SpawningEligibility = SpawningEligibility,
+            IsSingleSpawn = IsSingleSpawn,
             TranslationKey = OverlayLocalizationStore.ComputeOfficialMd5Hash(titleText),
             Localization = new LocalizationBlock
             {
@@ -540,6 +611,11 @@ public sealed class CustomCardDefinition
                 : null,
             ModMinDay = ModMinDay is >= 1 ? ModMinDay : null,
             ModMaxDay = ModMaxDay is >= 1 ? ModMaxDay : null,
+            IsCustomModCard = true,
+            IsUniversalCustomSkill = isUniversalSkill,
+            CustomModOrigin = modId,
+            AllowedHours = AllowedHours is { Count: > 0 } ? new List<int>(AllowedHours) : null,
+            ModDifficultySlot = string.IsNullOrWhiteSpace(ModDifficultySlot) ? null : ModDifficultySlot.Trim(),
             CustomMechanics = CustomMechanics is { Count: > 0 }
                 ? CustomMechanics.Select(m => new CardMechanicAttachment
                 {
@@ -604,11 +680,20 @@ public sealed class CustomEventDefinition
     [JsonPropertyName("titleZh")]
     public string TitleZh { get; set; } = string.Empty;
 
+    [JsonPropertyName("titleEn")]
+    public string? TitleEn { get; set; }
+
     [JsonPropertyName("descZh")]
     public string DescZh { get; set; } = string.Empty;
 
+    [JsonPropertyName("descEn")]
+    public string? DescEn { get; set; }
+
     [JsonPropertyName("heroes")]
     public List<string> Heroes { get; set; } = new();
+
+    [JsonPropertyName("startingTier")]
+    public string? StartingTier { get; set; }
 
     [JsonPropertyName("minDay")]
     public int MinDay { get; set; } = 1;
@@ -619,7 +704,23 @@ public sealed class CustomEventDefinition
     [JsonPropertyName("weight")]
     public double Weight { get; set; } = 1.0;
 
-    /// <summary>兼容嵌套调度配置 schedule（自动同步 MinDay/MaxDay/Weight）。</summary>
+    /// <summary>P0-24：允许出现的小时列表（透传自 schedule.hours）。</summary>
+    [JsonPropertyName("hours")]
+    public List<int>? AllowedHours { get; set; }
+
+    /// <summary>P0-24：每局仅出现一次（透传自 schedule.oncePerRun）。</summary>
+    [JsonPropertyName("oncePerRun")]
+    public bool OncePerRun { get; set; }
+
+    /// <summary>P0-24：仅允许由前序事件链触发（透传自 schedule.chainOnly -> SpawningEligibility="GuidOnly"）。</summary>
+    [JsonPropertyName("chainOnly")]
+    public bool ChainOnly { get; set; }
+
+    /// <summary>P0-21：自定义野怪遭遇的难度槽位（Bronze / Silver / Gold / Any）。</summary>
+    [JsonPropertyName("difficultySlot")]
+    public string? DifficultySlot { get; set; }
+
+    /// <summary>兼容嵌套调度配置 schedule（P0-24 完整透传 MinDay/MaxDay/Weight/Hours/OncePerRun/ChainOnly/DifficultySlot）。</summary>
     [JsonPropertyName("schedule")]
     public CustomEventSchedule? Schedule
     {
@@ -630,11 +731,25 @@ public sealed class CustomEventDefinition
             if (value.MinDay.HasValue) MinDay = value.MinDay.Value;
             if (value.MaxDay.HasValue) MaxDay = value.MaxDay.Value;
             if (value.Weight.HasValue) Weight = value.Weight.Value;
+            if (value.Hours is { Count: > 0 }) AllowedHours = new List<int>(value.Hours);
+            if (value.OncePerRun) OncePerRun = true;
+            if (value.ChainOnly) ChainOnly = true;
+            if (!string.IsNullOrWhiteSpace(value.DifficultySlot)) DifficultySlot = value.DifficultySlot.Trim();
         }
     }
 
     [JsonPropertyName("customArtFile")]
     public string? CustomArtFile { get; set; }
+
+    /// <summary>D3-P1-12：奇遇/遭遇独立背景图路径（如 assets/event_bg.png）。</summary>
+    [JsonPropertyName("customBgArtFile")]
+    public string? CustomBgArtFile { get; set; }
+
+    [JsonPropertyName("rewardCombatGold")]
+    public int? RewardCombatGold { get; set; }
+
+    [JsonPropertyName("rewardCombatXp")]
+    public int? RewardCombatXp { get; set; }
 
     /// <summary>该事件直接关联的子步骤卡牌列表（可自动注册为 EncounterStep 模板）。</summary>
     [JsonPropertyName("steps")]
@@ -670,24 +785,36 @@ public sealed class CustomEventDefinition
                 nextOptions.Add(new NextEncounterOption { Id = nid.Trim(), Weight = 1.0 });
         }
 
-        // 工坊约定：weight <= 0 表示“仅允许由上一奇遇跳转进入”，自动转为 GuidOnly 且不进入常规白昼随机池
-        bool isGuidOnly = double.IsFinite(Weight) && Weight <= 0.0;
+        // 工坊约定：chainOnly == true 或 weight <= 0 表示“仅允许由上一奇遇跳转进入”，自动转为 GuidOnly 且不进入常规白昼随机池
+        bool isGuidOnly = ChainOnly || (double.IsFinite(Weight) && Weight <= 0.0);
         double effectiveWeight = isGuidOnly
             ? 0.0
             : (double.IsFinite(Weight) ? Weight : 1.0);
+
+        string effectiveEventType = CombatMonster != null
+            ? "CombatEncounter"
+            : (!string.IsNullOrWhiteSpace(EventType) ? EventType.Trim() : "EventEncounter");
 
         return new CustomCardDefinition
         {
             CustomId = EventId,
             BaseVisualTemplateId = BaseVisualTemplateId,
-            Type = EventType,
+            Type = effectiveEventType,
             Size = "Medium",
-            StartingTier = "Bronze",
+            StartingTier = !string.IsNullOrWhiteSpace(StartingTier) ? StartingTier!.Trim() : "Bronze",
             SpawningEligibility = isGuidOnly ? "GuidOnly" : "Always",
+            IsSingleSpawn = OncePerRun ? true : null,
+            AllowedHours = AllowedHours is { Count: > 0 } ? new List<int>(AllowedHours) : null,
+            ModDifficultySlot = string.IsNullOrWhiteSpace(DifficultySlot) ? null : DifficultySlot.Trim(),
             Heroes = Heroes.Count > 0 ? new List<string>(Heroes) : [HeroNames.Common],
             TitleZh = TitleZh,
+            TitleEn = TitleEn,
             DescZh = DescZh,
+            DescEn = DescEn,
             CustomArtFile = CustomArtFile,
+            CustomBgArtFile = CustomBgArtFile,
+            RewardCombatGold = RewardCombatGold,
+            RewardCombatXp = RewardCombatXp,
             BoardOverride = string.IsNullOrWhiteSpace(BoardOverride) ? null : BoardOverride.Trim(),
             Presentation = string.IsNullOrWhiteSpace(Presentation) ? null : Presentation.Trim(),
             ModSpawnWeight = effectiveWeight,
@@ -732,6 +859,116 @@ public sealed class CustomModeDefinition
 }
 
 /// <summary>
+/// P0-22：自定义肉鸽突变词条 JSON 定义 DTO（1:1 映射 mods/&lt;mod-id&gt;/modes/*mutator*.json 及实样 custom_mutators.json）。
+/// </summary>
+public sealed class CustomMutatorDefinition
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("nameZh")]
+    public string NameZh { get; set; } = string.Empty;
+
+    [JsonPropertyName("nameEn")]
+    public string? NameEn { get; set; }
+
+    [JsonPropertyName("descriptionZh")]
+    public string DescriptionZh { get; set; } = string.Empty;
+
+    [JsonPropertyName("descZh")]
+    public string? DescZhAlias
+    {
+        get => null;
+        set { if (string.IsNullOrWhiteSpace(DescriptionZh) && !string.IsNullOrWhiteSpace(value)) DescriptionZh = value.Trim(); }
+    }
+
+    [JsonPropertyName("category")]
+    public string? Category { get; set; }
+
+    [JsonPropertyName("conflictGroup")]
+    public string? ConflictGroup { get; set; }
+
+    [JsonPropertyName("difficultyDelta")]
+    public double DifficultyDelta { get; set; }
+
+    [JsonPropertyName("scoreMultiplierDelta")]
+    public double? ScoreMultiplierDelta { get; set; }
+
+    [JsonPropertyName("isPositive")]
+    public bool? IsPositive { get; set; }
+
+    [JsonPropertyName("targetHook")]
+    public string? TargetHook { get; set; }
+
+    [JsonPropertyName("enabledByDefault")]
+    public bool EnabledByDefault { get; set; }
+
+    [JsonPropertyName("rules")]
+    public Dictionary<string, JsonElement>? Rules { get; set; }
+
+    public MutatorMetadata ToMetadata(string sourceModId)
+    {
+        var rulesObj = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        var numericParams = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+
+        if (Rules != null)
+        {
+            foreach (var (k, el) in Rules)
+            {
+                if (string.IsNullOrWhiteSpace(k)) continue;
+                switch (el.ValueKind)
+                {
+                    case JsonValueKind.Number when el.TryGetDouble(out double d) && double.IsFinite(d):
+                        rulesObj[k] = d;
+                        numericParams[k] = d;
+                        break;
+                    case JsonValueKind.True:
+                        rulesObj[k] = true;
+                        numericParams[k] = 1.0;
+                        break;
+                    case JsonValueKind.False:
+                        rulesObj[k] = false;
+                        numericParams[k] = 0.0;
+                        break;
+                    case JsonValueKind.String:
+                        rulesObj[k] = el.GetString();
+                        break;
+                    default:
+                        rulesObj[k] = el.Clone();
+                        break;
+                }
+            }
+        }
+
+        double scoreDelta = ScoreMultiplierDelta ?? (Math.Abs(DifficultyDelta) > 1e-6 ? Math.Round(DifficultyDelta * 0.15, 2) : 0.0);
+        bool isPos = IsPositive ?? (DifficultyDelta <= 0);
+        string targetHook = !string.IsNullOrWhiteSpace(TargetHook)
+            ? TargetHook!.Trim()
+            : (rulesObj.Keys.Any(k => k.StartsWith("combat", StringComparison.OrdinalIgnoreCase)
+                || k.Contains("sandstorm", StringComparison.OrdinalIgnoreCase)
+                || k.Contains("cooldown", StringComparison.OrdinalIgnoreCase))
+                ? "CombatSimulator"
+                : "RunEngine");
+
+        return new MutatorMetadata(
+            Id: Id.Trim(),
+            NameZh: !string.IsNullOrWhiteSpace(NameZh) ? NameZh.Trim() : Id.Trim(),
+            DescZh: DescriptionZh?.Trim() ?? string.Empty,
+            ConflictGroup: string.IsNullOrWhiteSpace(ConflictGroup) ? null : ConflictGroup.Trim(),
+            ScoreMultiplierDelta: double.IsFinite(scoreDelta) ? Math.Clamp(scoreDelta, -0.75, 2.0) : 0.0,
+            IsPositive: isPos,
+            TargetHook: targetHook,
+            Parameters: numericParams.Count > 0 ? numericParams : null,
+            SourceModId: sourceModId,
+            NameEn: string.IsNullOrWhiteSpace(NameEn) ? null : NameEn.Trim(),
+            Category: string.IsNullOrWhiteSpace(Category) ? null : Category.Trim(),
+            DifficultyDelta: double.IsFinite(DifficultyDelta) ? DifficultyDelta : 0.0,
+            EnabledByDefault: EnabledByDefault,
+            Rules: rulesObj.Count > 0 ? rulesObj : null);
+    }
+}
+
+/// <summary>
 /// 已按具体卡牌参数实例解析后的通用卡面实时数值徽章元数据（由服务端下发给客户端在卡牌 3D 层级渲染晶球/进度条/宝石/徽章）。
 /// </summary>
 public sealed class ResolvedCounterDisplay
@@ -744,6 +981,10 @@ public sealed class ResolvedCounterDisplay
 
     [JsonPropertyName("maxValue")]
     public int? MaxValue { get; set; }
+
+    /// <summary>D3-P1-06：可选动态上限属性名。</summary>
+    [JsonPropertyName("maxAttr")]
+    public string? MaxAttr { get; set; }
 
     [JsonPropertyName("colorHex")]
     public string? ColorHex { get; set; }
@@ -783,6 +1024,110 @@ public sealed class ResolvedPreviewAttrOp
 
     [JsonPropertyName("sourceAttribute")]
     public string? SourceAttribute { get; set; }
+
+    /// <summary>D3-P1-02：基于 SourceAttribute 派生时的比例乘数（如 0.5 表示 50%）。</summary>
+    [JsonPropertyName("sourceMultiplier")]
+    public double? SourceMultiplier { get; set; }
+
+    /// <summary>D3-P1-02：基于 SourceAttribute 派生时的固定加偏移。</summary>
+    [JsonPropertyName("sourceAddOffset")]
+    public double? SourceAddOffset { get; set; }
+}
+
+/// <summary>P0-21：自定义野怪预览结构（供客户端野怪面板 1:1 渲染血量/奖励/手牌/技能）。</summary>
+public sealed class CustomMonsterPreviewBinding
+{
+    [JsonPropertyName("monsterId")]
+    public string MonsterId { get; set; } = string.Empty;
+
+    [JsonPropertyName("nameZh")]
+    public string NameZh { get; set; } = string.Empty;
+
+    [JsonPropertyName("nameEn")]
+    public string? NameEn { get; set; }
+
+    [JsonPropertyName("minDay")]
+    public int? MinDay { get; set; }
+
+    [JsonPropertyName("maxDay")]
+    public int? MaxDay { get; set; }
+
+    [JsonPropertyName("difficultySlot")]
+    public string? DifficultySlot { get; set; }
+
+    [JsonPropertyName("level")]
+    public int Level { get; set; }
+
+    [JsonPropertyName("healthMax")]
+    public int HealthMax { get; set; }
+
+    [JsonPropertyName("startingTier")]
+    public string StartingTier { get; set; } = "Bronze";
+
+    [JsonPropertyName("rewardGold")]
+    public int RewardGold { get; set; }
+
+    [JsonPropertyName("rewardXp")]
+    public int RewardXp { get; set; }
+
+    [JsonPropertyName("items")]
+    public List<CustomMonsterLoadoutItemBinding> Items { get; set; } = new();
+
+    [JsonPropertyName("skills")]
+    public List<CustomMonsterLoadoutItemBinding> Skills { get; set; } = new();
+
+    public CustomMonsterPreviewBinding Clone() => new()
+    {
+        MonsterId = MonsterId,
+        NameZh = NameZh,
+        NameEn = NameEn,
+        MinDay = MinDay,
+        MaxDay = MaxDay,
+        DifficultySlot = DifficultySlot,
+        Level = Level,
+        HealthMax = HealthMax,
+        StartingTier = StartingTier,
+        RewardGold = RewardGold,
+        RewardXp = RewardXp,
+        Items = Items.Select(i => i.Clone()).ToList(),
+        Skills = Skills.Select(s => s.Clone()).ToList()
+    };
+}
+
+/// <summary>P0-21：自定义野怪单件装备/技能预览条目（含 Size 支撑客户端 SocketId 布局）。</summary>
+public sealed class CustomMonsterLoadoutItemBinding
+{
+    [JsonPropertyName("cardId")]
+    public string CardId { get; set; } = string.Empty;
+
+    [JsonPropertyName("wireTemplateId")]
+    public string? WireTemplateId { get; set; }
+
+    [JsonPropertyName("size")]
+    public string Size { get; set; } = "Small";
+
+    [JsonPropertyName("tier")]
+    public string Tier { get; set; } = "Bronze";
+
+    [JsonPropertyName("enchantment")]
+    public string? Enchantment { get; set; }
+
+    [JsonPropertyName("titleZh")]
+    public string? TitleZh { get; set; }
+
+    [JsonPropertyName("titleEn")]
+    public string? TitleEn { get; set; }
+
+    public CustomMonsterLoadoutItemBinding Clone() => new()
+    {
+        CardId = CardId,
+        WireTemplateId = WireTemplateId,
+        Size = Size,
+        Tier = Tier,
+        Enchantment = Enchantment,
+        TitleZh = TitleZh,
+        TitleEn = TitleEn
+    };
 }
 
 /// <summary>
@@ -790,6 +1135,18 @@ public sealed class ResolvedPreviewAttrOp
 /// </summary>
 public sealed class CustomCardVisualBinding
 {
+    public static string ResolveDefaultVisualTarget(string? cardType)
+    {
+        if (string.Equals(cardType, "Skill", StringComparison.OrdinalIgnoreCase))
+            return "SkillIcon";
+        if (string.Equals(cardType, "EventEncounter", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cardType, "CombatEncounter", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cardType, "PedestalEncounter", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cardType, "EncounterStep", StringComparison.OrdinalIgnoreCase))
+            return "EncounterPortrait";
+        return "ItemArt";
+    }
+
     [JsonPropertyName("instanceId")]
     public string? InstanceId { get; set; }
 
@@ -850,7 +1207,42 @@ public sealed class CustomCardVisualBinding
     [JsonPropertyName("accentColor")]
     public string? AccentColor { get; set; }
 
-    /// <summary>基于模板级绑定派生绑定到特定卡牌 InstanceId 的副本。</summary>
+    // ── Wave 2A §0.1 新增 11 个公开契约字段 ───────────────────────────────────
+
+    [JsonPropertyName("isPatchOverride")]
+    public bool IsPatchOverride { get; set; }
+
+    [JsonPropertyName("isCustomBorrowShell")]
+    public bool IsCustomBorrowShell { get; set; }
+
+    [JsonPropertyName("titleEn")]
+    public string? TitleEn { get; set; }
+
+    [JsonPropertyName("descEn")]
+    public string? DescEn { get; set; }
+
+    [JsonPropertyName("activeTooltipsEn")]
+    public List<string>? ActiveTooltipsEn { get; set; }
+
+    [JsonPropertyName("passiveTooltipsEn")]
+    public List<string>? PassiveTooltipsEn { get; set; }
+
+    [JsonPropertyName("enchantTooltipsEn")]
+    public Dictionary<string, List<string>>? EnchantTooltipsEn { get; set; }
+
+    [JsonPropertyName("visualTarget")]
+    public string VisualTarget { get; set; } = "ItemArt";
+
+    [JsonPropertyName("customBgArtFile")]
+    public string? CustomBgArtFile { get; set; }
+
+    [JsonPropertyName("customBgArtSha256")]
+    public string? CustomBgArtSha256 { get; set; }
+
+    [JsonPropertyName("monsterPreview")]
+    public CustomMonsterPreviewBinding? MonsterPreview { get; set; }
+
+    /// <summary>基于模板级绑定派生绑定到特定卡牌 InstanceId 的独立深拷贝副本（含全部 11 新属性与子对象新字段）。</summary>
     public CustomCardVisualBinding BindToInstance(string instanceId) => new()
     {
         InstanceId = instanceId,
@@ -869,6 +1261,17 @@ public sealed class CustomCardVisualBinding
         ArtRect = ArtRect != null ? new CustomCardArtRect { Width = ArtRect.Width, Height = ArtRect.Height, CropMode = ArtRect.CropMode } : null,
         Tags = new List<string>(Tags),
         AccentColor = AccentColor,
+        IsPatchOverride = IsPatchOverride,
+        IsCustomBorrowShell = IsCustomBorrowShell,
+        TitleEn = TitleEn,
+        DescEn = DescEn,
+        ActiveTooltipsEn = ActiveTooltipsEn != null ? new List<string>(ActiveTooltipsEn) : null,
+        PassiveTooltipsEn = PassiveTooltipsEn != null ? new List<string>(PassiveTooltipsEn) : null,
+        EnchantTooltipsEn = EnchantTooltipsEn?.ToDictionary(kv => kv.Key, kv => new List<string>(kv.Value), StringComparer.OrdinalIgnoreCase),
+        VisualTarget = string.IsNullOrWhiteSpace(VisualTarget) ? ResolveDefaultVisualTarget(CardType) : VisualTarget,
+        CustomBgArtFile = CustomBgArtFile,
+        CustomBgArtSha256 = CustomBgArtSha256,
+        MonsterPreview = MonsterPreview?.Clone(),
         TierAttributes = TierAttributes?.ToDictionary(
             kv => kv.Key,
             kv => new Dictionary<string, double>(kv.Value, StringComparer.OrdinalIgnoreCase),
@@ -880,7 +1283,9 @@ public sealed class CustomCardVisualBinding
                 Attribute = op.Attribute,
                 Operation = op.Operation,
                 Value = op.Value,
-                SourceAttribute = op.SourceAttribute
+                SourceAttribute = op.SourceAttribute,
+                SourceMultiplier = op.SourceMultiplier,
+                SourceAddOffset = op.SourceAddOffset
             }).ToList(),
             StringComparer.OrdinalIgnoreCase),
         CounterDisplays = CounterDisplays?.Select(cd => new ResolvedCounterDisplay
@@ -888,6 +1293,7 @@ public sealed class CustomCardVisualBinding
             LabelZh = cd.LabelZh,
             SyncAttribute = cd.SyncAttribute,
             MaxValue = cd.MaxValue,
+            MaxAttr = cd.MaxAttr,
             ColorHex = cd.ColorHex,
             HideWhenZero = cd.HideWhenZero,
             Style = cd.Style,
@@ -994,8 +1400,25 @@ public sealed class CardPatchDefinition
     [JsonPropertyName("enchantTooltipsZh")]
     public Dictionary<string, List<string>>? EnchantTooltipsZh { get; set; }
 
+    [JsonPropertyName("activeTooltipsEn")]
+    public List<string>? ActiveTooltipsEn { get; set; }
+
+    [JsonPropertyName("passiveTooltipsEn")]
+    public List<string>? PassiveTooltipsEn { get; set; }
+
+    [JsonPropertyName("enchantTooltipsEn")]
+    public Dictionary<string, List<string>>? EnchantTooltipsEn { get; set; }
+
     [JsonPropertyName("customArtFile")]
     public string? CustomArtFile { get; set; }
+
+    /// <summary>D3-P1-12：可选覆写奇遇/遭遇独立背景图。</summary>
+    [JsonPropertyName("customBgArtFile")]
+    public string? CustomBgArtFile { get; set; }
+
+    /// <summary>P0-25：可选覆写被魔改原版卡的实时计数徽章列表。</summary>
+    [JsonPropertyName("counterDisplaysOverride")]
+    public List<MechanicCounterDisplay>? CounterDisplaysOverride { get; set; }
 
     [JsonPropertyName("artRect")]
     public CustomCardArtRect? ArtRect { get; set; }
@@ -1064,7 +1487,19 @@ public sealed class CardPatchDefinition
         {
             cloned.Attributes ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
             foreach (var (k, v) in AttributeOverrides)
+            {
                 cloned.Attributes[k] = v;
+                // P0-25：同步覆写各阶已有同名基线键，防止原版卡 Tiers[*].Attributes 静默吞没顶层 attributeOverrides；
+                // 若同时提供更精细的 TierAttributeOverrides，将在下方优先覆写指定品阶。
+                if (cloned.Tiers != null)
+                {
+                    foreach (var td in cloned.Tiers.Values)
+                    {
+                        if (td?.Attributes != null && td.Attributes.ContainsKey(k))
+                            td.Attributes[k] = v;
+                    }
+                }
+            }
         }
 
         if (TierAttributeOverrides is { Count: > 0 })
@@ -1212,11 +1647,39 @@ public sealed class CardPatchDefinition
 
     public bool HasVisualOrTextOverride =>
         !string.IsNullOrWhiteSpace(TitleZh)
+        || !string.IsNullOrWhiteSpace(TitleEn)
         || !string.IsNullOrWhiteSpace(DescZh)
+        || !string.IsNullOrWhiteSpace(DescEn)
         || !string.IsNullOrWhiteSpace(CustomArtFile)
+        || !string.IsNullOrWhiteSpace(CustomBgArtFile)
         || (ActiveTooltipsZh is { Count: > 0 })
         || (PassiveTooltipsZh is { Count: > 0 })
-        || (EnchantTooltipsZh is { Count: > 0 });
+        || (EnchantTooltipsZh is { Count: > 0 })
+        || (ActiveTooltipsEn is { Count: > 0 })
+        || (PassiveTooltipsEn is { Count: > 0 })
+        || (EnchantTooltipsEn is { Count: > 0 })
+        || (CounterDisplaysOverride is { Count: > 0 })
+        || !string.IsNullOrWhiteSpace(AccentColor);
+
+    /// <summary>P0-25：只要补丁对目标原版卡存在任意字段改动（数值/阶位/标签/附魔/能力/光环/机制/文本/美术/计数器/切板等）均返回 true。</summary>
+    public bool HasAnyMutation =>
+        HasVisualOrTextOverride
+        || !string.IsNullOrWhiteSpace(StartingTier)
+        || !string.IsNullOrWhiteSpace(SpawningEligibility)
+        || (Heroes is { Count: > 0 })
+        || AddTags.Count > 0
+        || RemoveTags.Count > 0
+        || AddHiddenTags.Count > 0
+        || RemoveHiddenTags.Count > 0
+        || (AttributeOverrides is { Count: > 0 })
+        || (TierAttributeOverrides is { Count: > 0 })
+        || (EnchantmentOverrides is { Count: > 0 })
+        || (AbilitiesOverride is { Count: > 0 })
+        || (AurasOverride is { Count: > 0 })
+        || (CustomMechanicsOverride is { Count: > 0 })
+        || ArtRect != null
+        || !string.IsNullOrWhiteSpace(BoardOverride)
+        || !string.IsNullOrWhiteSpace(Presentation);
 }
 
 /// <summary>
@@ -1231,6 +1694,8 @@ public sealed class ModPackage
     public List<CustomEventDefinition> Events { get; } = new();
     public List<MonsterTemplate> Monsters { get; } = new();
     public List<CustomModeDefinition> Modes { get; } = new();
+    /// <summary>P0-22：本 Mod 注册的自定义肉鸽突变词条列表（来自 modes/*mutator*.json 或 modes/*.json 中的 mutators 数组）。</summary>
+    public List<MutatorMetadata> CustomMutators { get; } = new();
     /// <summary>V14 本 Mod 注册的开放声明式沙盒自定义机制定义列表（来自 mechanics/*.json）。</summary>
     public List<MechanicDefinition> Mechanics { get; } = new();
     public LocalizationOverlayDocument? LocalizationOverlay { get; set; }

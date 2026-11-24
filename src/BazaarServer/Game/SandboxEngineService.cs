@@ -149,7 +149,7 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
                 }
                 else if (Enum.TryParse<EEnchantmentType>(trimmedEnch, true, out var parsedEnch))
                 {
-                    coreCard.ApplyEnchantment(parsedEnch.ToString(), preventOverride: false, isTemporary: false);
+                    coreCard.ApplyEnchantment(parsedEnch.ToString(), DurationTarget.Permanent, preventOverride: false);
                     entry.Enchantment = parsedEnch;
                 }
                 else
@@ -226,7 +226,7 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         try
         {
             var run = handle.Run;
-            var (repo, _) = ResolveSandboxContext(handle);
+            var (repo, _, runtimeCtx) = ResolveSandboxContextWithRuntime(handle);
             int seed = req.Seed is int s && s != 0 ? s : Random.Shared.Next(1, int.MaxValue);
             string source = string.IsNullOrWhiteSpace(req.OpponentSource)
                 ? "self_mirror"
@@ -284,6 +284,7 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             }
 
             var modifiers = CombatModifiers.FromRulesAndDay(run.CustomRules, (int)run.Day, isBossRush: false, isPve: isPve);
+            // P0-17：显式透传局级不可变机制与管线拦截器快照（非 null），杜绝沙盒回退偷读全局静态 ModRuntimeHooks
             var simResult = CombatSimulator.Simulate(
                 repo,
                 p1Core,
@@ -294,7 +295,9 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
                 recordEvents: true,
                 syncPermanentChanges: false,
                 modifiers: modifiers,
-                sandstormEnabled: modifiers.SandstormEnabled);
+                sandstormEnabled: modifiers.SandstormEnabled,
+                mechanicDefinitionsOverride: runtimeCtx.MechanicsById,
+                pipelineInterceptorsOverride: runtimeCtx.PipelineInterceptors);
 
             bool playerWon = string.Equals(simResult.WinnerPlayerId, "player", StringComparison.OrdinalIgnoreCase);
             double seconds = Math.Max(0.1, simResult.DurationMs / 1000.0);
@@ -472,6 +475,12 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
 
     private (GameDataRepository Repo, CardPool Pool) ResolveSandboxContext(SessionRegistry.Handle handle)
     {
+        var (repo, pool, _) = ResolveSandboxContextWithRuntime(handle);
+        return (repo, pool);
+    }
+
+    private (GameDataRepository Repo, CardPool Pool, ModRuntimeContext RuntimeContext) ResolveSandboxContextWithRuntime(SessionRegistry.Handle handle)
+    {
         var run = handle.Run;
         var selected = run.CustomRules?.SelectedModIds;
         if (selected is { Count: > 0 })
@@ -481,15 +490,16 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
                 _pool,
                 handle.Engine.ActiveMonsters,
                 handle.Engine.ActiveArchetypeIndex ?? CardArchetypeIndex.Build(_pool, _modHost.ActiveRepository));
-            return (ctx.Repository, ctx.Pool);
+            return (ctx.Repository, ctx.Pool, ctx.RuntimeContext ?? _modHost.Registry.RuntimeContext);
         }
 
         // 未勾选额外 Mod 时优先复用当前热重载后的全局上下文，同时兼容引擎自身注入的隔离仓库
         var activeRepo = _modHost.ActiveRepository;
         var engineRepo = handle.Engine.ActiveRepository;
+        var runtimeCtx = _modHost.Registry.RuntimeContext;
         if (engineRepo != null && engineRepo.CardsById.Count > activeRepo.CardsById.Count)
-            return (engineRepo, handle.Engine.ActivePool);
-        return (activeRepo, _pool);
+            return (engineRepo, handle.Engine.ActivePool, runtimeCtx);
+        return (activeRepo, _pool, runtimeCtx);
     }
 
     private static void AppendSpawnEvents(List<IGameSimEvent> events, RunState.CardEntry entry)
@@ -779,12 +789,14 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         string key = (presetName ?? "default").Trim().ToLowerInvariant();
         string targetHero = key switch
         {
-            var s when s.Contains("pyg") || s.Contains("shield") => "Pygmalien",
-            var s when s.Contains("dooley") || s.Contains("tech") => "Dooley",
-            var s when s.Contains("mak") || s.Contains("poison") => "Mak",
-            var s when s.Contains("stelle") => "Stelle",
-            var s when s.Contains("jules") => "Jules",
-            _ => run.Hero == EHero.Common ? "Vanessa" : run.Hero.ToString(),
+            var s when s.Contains("pyg") || s.Contains("shield") => HeroNames.Pygmalien,
+            var s when s.Contains("dooley") || s.Contains("tech") => HeroNames.Dooley,
+            var s when s.Contains("mak") || s.Contains("poison") => HeroNames.Mak,
+            var s when s.Contains("stelle") => HeroNames.Stelle,
+            var s when s.Contains("jules") => HeroNames.Jules,
+            var s when s.Contains("karnok") || s.Contains("rage") => HeroNames.Karnok,
+            var s when s.Contains("hero8") || s.Contains("tempo") || s.Contains("music") => HeroNames.Hero8,
+            _ => run.Hero == EHero.Common ? HeroNames.Vanessa : run.Hero.ToString(),
         };
         string? keywordTag = key switch
         {
@@ -793,6 +805,8 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             var s when s.Contains("poison") => "Poison",
             var s when s.Contains("tech") => "Tech",
             var s when s.Contains("weapon") => "Weapon",
+            var s when s.Contains("rage") => "Rage",
+            var s when s.Contains("tempo") || s.Contains("music") => "Tempo",
             _ => null,
         };
 
@@ -875,10 +889,14 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
 
         var ps = new PlayerState(playerId, displayName, hero, hpMax, prestige, gold, income)
         {
+            Day = (int)Math.Max(1, run.Day),
+            Hour = (int)Math.Max(1, run.Hour),
             Level = Math.Max(1, run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Level, 1)),
             Wins = (int)run.Victories,
             Losses = (int)run.Defeats,
         };
+        // D2-P2-05：复用 RunState.ApplyLayeredPlayerStateTo 完整同步 Base/Hour/Day/Aura 玩家属性与 ExclusionSet
+        run.ApplyLayeredPlayerStateTo(ps);
         ps.Hand.UnlockedMask = run.UnlockedSlots > 0 ? run.UnlockedSlots : 1023;
         ps.Stash.UnlockedMask = 1023;
 
@@ -888,14 +906,9 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
         {
             var src = EnsureSandboxCoreCard(entry, repo);
             string cloneId = string.IsNullOrEmpty(idPrefix) ? entry.InstanceId : idPrefix + entry.InstanceId;
-            var clone = new CardInstance(src.Template, src.PermanentTier, src.PermanentEnchantment, cloneId)
-            {
-                StartSlot = entry.Socket.HasValue ? (int)entry.Socket.Value : src.StartSlot,
-            };
-            foreach (var (k, v) in src.PermanentAdd) clone.PermanentAdd[k] = v;
-            foreach (var (k, v) in src.PermanentMult) clone.PermanentMult[k] = v;
-            foreach (var t in src.ExtraTags) clone.ExtraTags.Add(t);
-            clone.RebuildTierAndEnchantmentData();
+            // D2-P2-05：使用 CloneNonCombatState 完整保留 Permanent/Day/Hour 三层属性、AdditiveMult、附魔层、标签增删集与任务状态，并同步纳入 Stash
+            var clone = src.CloneNonCombatState(cloneId);
+            clone.StartSlot = entry.Socket.HasValue ? (int)entry.Socket.Value : src.StartSlot;
             clone.RefillAmmoToMax();
 
             if (entry.Type == ECardType.Skill)
@@ -906,7 +919,13 @@ public sealed class SandboxEngineService : ISandboxEngineBridge
             {
                 ps.SocketEffects.Add(clone);
             }
-            else if (entry.Section != EInventorySection.Stash)
+            else if (entry.Section == EInventorySection.Stash)
+            {
+                int slot = entry.Socket.HasValue ? (int)entry.Socket.Value : 0;
+                if (!ps.Stash.TryPlaceOrShift(clone, slot))
+                    ps.Stash.TryAddAuto(clone);
+            }
+            else
             {
                 int slot = entry.Socket.HasValue ? (int)entry.Socket.Value : 0;
                 if (!ps.Hand.TryPlaceOrShift(clone, slot))

@@ -1,0 +1,107 @@
+{
+  "$schema": "../../../../docs/schemas/bazaar-mod.schema.json#/$defs/MechanicFile",
+  "schemaVersion": 1,
+  "modId": "demo-forge",
+  "mechanics": [
+    {
+      "id": "demo-forge:overcharge_burst",
+      "nameZh": "过载蓄能爆发",
+      "descZh": "每次开火叠加 1 层过载（同步显示至 Custom_3 晶球进度条）；叠满阈值后清空层数，释放多段灼炎冲击并为左右相邻已具备伤害的武器增加攻击力。",
+      "categoryZh": "蓄能/爆发",
+      "version": "1.0.0",
+      "tooltipTemplateZh": "每次开火叠加 1 层过载，满 {threshold} 层时触发 {hits} 段各 {burstDamage} 点火焰冲击，并使相邻武器伤害 +{buffDamage}",
+      "parameters": [
+        { "key": "threshold", "labelZh": "过载阈值", "type": "int", "defaultValue": 3, "min": 2, "max": 8 },
+        { "key": "hits", "labelZh": "爆发段数", "type": "int", "defaultValue": 2, "min": 1, "max": 5 },
+        { "key": "burstDamage", "labelZh": "单段伤害", "type": "int", "defaultValue": 25, "min": 5, "max": 500 },
+        { "key": "buffDamage", "labelZh": "相邻加攻", "type": "int", "defaultValue": 8, "min": 1, "max": 100 },
+        { "key": "vfx", "labelZh": "冲击特效", "type": "vfxKey", "defaultValue": "FireClaw" }
+      ],
+      "counterDisplay": {
+        "labelZh": "过载",
+        "syncAttribute": "Custom_3",
+        "maxParam": "threshold",
+        "colorHex": "#F97316",
+        "style": "pips",
+        "valueType": "progress",
+        "position": "bottom",
+        "hideWhenZero": false
+      },
+      "hooks": [
+        {
+          "id": "init_counter",
+          "hook": "OnFightStart",
+          "scope": "SelfCard",
+          "steps": [
+            {
+              "op": "ModifyCounter",
+              "target": "Self",
+              "key": "overcharge",
+              "operation": "Set",
+              "value": { "const": 0 },
+              "syncAttribute": "Custom_3"
+            }
+          ]
+        },
+        {
+          "id": "charge_and_burst",
+          "hook": "OnCardFired",
+          "scope": "SelfCard",
+          "maxTriggersPerCombat": 40,
+          "steps": [
+            {
+              "op": "ModifyCounter",
+              "target": "Self",
+              "key": "overcharge",
+              "operation": "Add",
+              "value": { "const": 1 },
+              "syncAttribute": "Custom_3"
+            },
+            {
+              "op": "If",
+              "condition": {
+                "left": { "counter": "overcharge", "source": "Self" },
+                "compare": "Gte",
+                "right": { "param": "threshold" }
+              },
+              "then": [
+                {
+                  "op": "ModifyCounter",
+                  "target": "Self",
+                  "key": "overcharge",
+                  "operation": "Set",
+                  "value": { "const": 0 },
+                  "syncAttribute": "Custom_3"
+                },
+                {
+                  "op": "Repeat",
+                  "count": { "param": "hits" },
+                  "initialDelayMs": { "const": 120 },
+                  "intervalMs": { "const": 150 },
+                  "steps": [
+                    {
+                      "op": "DealDamage",
+                      "playerTarget": "Opponent",
+                      "amount": { "param": "burstDamage" },
+                      "bypassShield": false,
+                      "vfxKeyParam": "vfx"
+                    }
+                  ]
+                },
+                {
+                  "op": "ModifyCardAttribute",
+                  "targetSpec": { "mode": "Adjacent", "requireTags": ["Weapon"] },
+                  "attribute": "DamageAmount",
+                  "operation": "Add",
+                  "value": { "param": "buffDamage" },
+                  "duration": "Combat",
+                  "grantIfMissing": false
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

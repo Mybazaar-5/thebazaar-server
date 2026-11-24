@@ -26,6 +26,7 @@ namespace BazaarCore.Tests;
 ///   6. Hour 6 保底：空池合成保底、Resume 自愈、中途升级压栈出栈生成全新 InstanceId、PickOpponent 异常兜底；
 ///   7. MoveItem 轻量增量回包：BuildDeltaGameSim 仅打包脏卡（体积大幅缩减）且准确覆盖光环变化卡。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V13_1_WikiParityAndHour6Tests
 {
     private const string TinyFurryCreatureId = "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a";
@@ -57,54 +58,18 @@ public sealed class V13_1_WikiParityAndHour6Tests
 
     private static readonly Lazy<RealDataFx> Fx = new(() =>
     {
-        string? resolvedDir = null;
-        string? probe = AppContext.BaseDirectory;
-        for (int i = 0; i < 10 && !string.IsNullOrEmpty(probe); i++, probe = Directory.GetParent(probe)?.FullName)
-        {
-            string candidate = Path.Combine(probe, "dist", "data");
-            string dbFile = Path.Combine(candidate, "GameData.db");
-            if (File.Exists(dbFile) && new FileInfo(dbFile).Length > 1024 * 1024)
-            {
-                resolvedDir = candidate;
-                break;
-            }
-        }
-        if (string.IsNullOrEmpty(resolvedDir))
-        {
-            string mainDist = @"e:\thebazaar\dist\data";
-            if (File.Exists(Path.Combine(mainDist, "GameData.db")) && new FileInfo(Path.Combine(mainDist, "GameData.db")).Length > 1024 * 1024)
-                resolvedDir = mainDist;
-        }
-        if (string.IsNullOrEmpty(resolvedDir))
-        {
-            string cacheDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "AppData", "LocalLow", "Tempo Storm", "The Bazaar", "prod", "cache");
-            if (File.Exists(Path.Combine(cacheDir, "GameData.db")))
-                resolvedDir = cacheDir;
-        }
-
-        Assert.False(string.IsNullOrEmpty(resolvedDir), "未找到有效 GameData.db，无法执行 V13.1 权威一致性验收测试。");
-        string dbPath = Path.Combine(resolvedDir!, "GameData.db");
-        var repo = GameDatabaseLoader.Load(dbPath, null);
-        var pool = CardPool.FromRepository(repo, resolvedDir);
-        var monsters = MonsterPool.FromRepository(repo);
-        var levelUps = LevelUpTable.FromRepository(repo);
-        var mode = GameModeConfig.FromRepository(repo);
-        var ghosts = PvpGhostPool.Load(resolvedDir!);
-        var archIdx = CardArchetypeIndex.Build(pool, repo);
-
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new RealDataFx
         {
-            DataDir = resolvedDir!,
-            DbPath = dbPath,
-            Pool = pool,
-            Monsters = monsters,
-            LevelUps = levelUps,
-            Mode = mode,
-            Repo = repo,
-            Ghosts = ghosts,
-            ArchetypeIndex = archIdx,
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
+            ArchetypeIndex = shared.ArchetypeIndex,
         };
     });
 
@@ -381,7 +346,8 @@ public sealed class V13_1_WikiParityAndHour6Tests
         Assert.NotNull(workshopTpl);
         Assert.False(IsMerchant(workshopTpl!.Id, workshopTpl, fx.Repo.GetCard(workshopTpl.Id)),
             "右槽免费事件 Workshop 不应因含 Shop 子串而被误判为商人");
-        Assert.True(doubleMerchantHours >= 0);
+        Assert.InRange(doubleMerchantHours, 0, totalRegularHours / 4);
+        Assert.True(totalRegularHours > 0);
         // 标准模式下基座出现率应控制在合理区间（不再是 30%~55% 满屏附魔台）
         double pedRate = (double)pedestalAppearances / totalRegularHours;
         Assert.True(pedRate <= 0.25, $"标准模式地图基座出现率应 <= 25%，实际: {pedRate:P1}");

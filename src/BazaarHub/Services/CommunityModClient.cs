@@ -21,16 +21,27 @@ public sealed record HubCommunityModItem(
     string DownloadUrl);
 
 /// <summary>
-/// BazaarHub 社区 Mod 客户端：拉取服务器社区 Mod 列表、下载解压到本地 BepInEx\mods\、以及打包上传本地 Mod。
+/// BazaarHub 社区 Mod 客户端：拉取服务器社区 Mod 列表、安全下载解压到本地 BepInEx\mods\、以及打包上传本地 Mod。
+/// 全量接入 SafePathAndZipGuard 防路径穿越、Linux 反斜杠目录崩溃、危险扩展名 Fail-Closed 与 Zip Bomb。
 /// </summary>
 public sealed class CommunityModClient : IDisposable
 {
-    private static readonly HashSet<string> ForbiddenExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".dll", ".exe", ".bat", ".cmd", ".ps1", ".sh", ".py", ".js", ".vbs", ".msi", ".so", ".dylib"
-    };
+    private readonly HttpClient _http;
+    private readonly bool _ownsClient;
 
-    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(45) };
+    public CommunityModClient(HttpClient? httpClient = null)
+    {
+        if (httpClient != null)
+        {
+            _http = httpClient;
+            _ownsClient = false;
+        }
+        else
+        {
+            _http = new HttpClient { Timeout = TimeSpan.FromSeconds(45) };
+            _ownsClient = true;
+        }
+    }
 
     public async Task<(bool Ok, List<HubCommunityModItem> Mods, string Message)> FetchListAsync(
         string serverBase,
@@ -92,28 +103,51 @@ public sealed class CommunityModClient : IDisposable
         CancellationToken ct = default)
     {
         string normalized = NormalizeBase(serverBase);
-        if (string.IsNullOrEmpty(normalized) || string.IsNullOrWhiteSpace(modId))
+        if (string.IsNullOrEmpty(normalized) || string.IsNullOrWhiteSpace(modId) || string.IsNullOrWhiteSpace(gameDir))
             return (false, "参数不完整", null);
 
         string cleanId = modId.Trim();
+        if (!SafePathAndZipGuard.IsValidModId(cleanId))
+        {
+            return (false, $"非法的 Mod ID（已拦截路径穿越风险）：{cleanId}", null);
+        }
+
         try
         {
-            using var resp = await _http.GetAsync($"{normalized}/api/community/mods/{Uri.EscapeDataString(cleanId)}/download", ct).ConfigureAwait(false);
+            using var resp = await _http.GetAsync(
+                $"{normalized}/api/community/mods/{Uri.EscapeDataString(cleanId)}/download",
+                HttpCompletionOption.ResponseHeadersRead,
+                ct).ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode)
                 return (false, $"下载失败（HTTP {(int)resp.StatusCode}）", null);
 
-            byte[] zipBytes = await resp.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
+            byte[] zipBytes = await SafePathAndZipGuard.ReadHttpContentWithLimitAsync(
+                resp.Content,
+                SafePathAndZipGuard.MaxCommunityZipBytes,
+                ct).ConfigureAwait(false);
             if (zipBytes.Length == 0)
                 return (false, "下载到的文件为空", null);
 
             string modsDir = Path.Combine(gameDir, "BepInEx", "mods");
             Directory.CreateDirectory(modsDir);
-            string targetDir = Path.Combine(modsDir, cleanId);
-            ExtractSafely(zipBytes, targetDir, cleanId);
+
+            // 先安全校验并原子解压（Fail-Closed：非法 ZIP / 危险扩展名 / Zip Bomb 绝不写入归档目录）
+            string targetDir = SafePathAndZipGuard.ExtractModZipSafely(zipBytes, modsDir, cleanId);
 
             string archiveDir = Path.Combine(gameDir, "BepInEx", "config", "BazaarModCache", "downloads");
             Directory.CreateDirectory(archiveDir);
-            await File.WriteAllBytesAsync(Path.Combine(archiveDir, $"{cleanId}.bazaarmod.zip"), zipBytes, ct).ConfigureAwait(false);
+            string archivePath = SafePathAndZipGuard.ResolveSafeChildPath(archiveDir, $"{cleanId}.bazaarmod.zip");
+            string tmpArchive = $"{archivePath}.{Guid.NewGuid():N}.tmp";
+            try
+            {
+                await File.WriteAllBytesAsync(tmpArchive, zipBytes, ct).ConfigureAwait(false);
+                File.Move(tmpArchive, archivePath, overwrite: true);
+            }
+            catch
+            {
+                try { if (File.Exists(tmpArchive)) File.Delete(tmpArchive); } catch { }
+                throw;
+            }
 
             return (true, $"已下载并保存到 {targetDir}", targetDir);
         }
@@ -143,6 +177,8 @@ public sealed class CommunityModClient : IDisposable
                 if (!File.Exists(manifestPath))
                     return (false, "所选文件夹内缺少 mod.json");
                 string modId = ReadModId(manifestPath, Path.GetFileName(localPathOrDir));
+                if (!SafePathAndZipGuard.IsValidModId(modId))
+                    return (false, $"Mod ID 不合法（仅允许字母、数字、点、下划线、连字符，且不得含 .. 或系统保留名）：{modId}");
                 zipBytes = PackFolderToZip(localPathOrDir, modId);
                 fileName = $"{modId}.bazaarmod.zip";
             }
@@ -196,9 +232,6 @@ public sealed class CommunityModClient : IDisposable
 
     private static string NormalizeBase(string url) => (url ?? string.Empty).Trim().TrimEnd('/');
 
-    /// <summary>
-    /// 对写入 HTTP 请求头的玩家昵称执行百分号编码，兼容中文及空格字符，同时保持常规 ASCII 昵称原样。
-    /// </summary>
     private static string EncodeHeaderPlayerName(string? playerName, string? fallback = null)
     {
         string raw = string.IsNullOrWhiteSpace(playerName)
@@ -233,6 +266,9 @@ public sealed class CommunityModClient : IDisposable
 
     private static byte[] PackFolderToZip(string sourceDir, string modId)
     {
+        if (!SafePathAndZipGuard.IsValidModId(modId))
+            throw new InvalidOperationException($"非法的 Mod ID：{modId}");
+
         using var ms = new MemoryStream();
         using (var archive = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true, Encoding.UTF8))
         {
@@ -244,7 +280,7 @@ public sealed class CommunityModClient : IDisposable
                     || rel.Contains("/obj/", StringComparison.OrdinalIgnoreCase)
                     || rel.Contains("/__pycache__/", StringComparison.OrdinalIgnoreCase))
                     continue;
-                if (ForbiddenExtensions.Contains(Path.GetExtension(rel)))
+                if (SafePathAndZipGuard.IsForbiddenExtension(rel))
                     continue;
                 var entry = archive.CreateEntry($"{modId}/{rel}", CompressionLevel.Optimal);
                 using var es = entry.Open();
@@ -255,41 +291,11 @@ public sealed class CommunityModClient : IDisposable
         return ms.ToArray();
     }
 
-    private static void ExtractSafely(byte[] zipBytes, string targetDir, string modId)
+    public void Dispose()
     {
-        string tempDir = targetDir + ".tmp_" + Guid.NewGuid().ToString("N")[..8];
-        try
+        if (_ownsClient)
         {
-            Directory.CreateDirectory(tempDir);
-            string guard = Path.GetFullPath(tempDir) + Path.DirectorySeparatorChar;
-            using (var ms = new MemoryStream(zipBytes))
-            using (var archive = new ZipArchive(ms, ZipArchiveMode.Read))
-            {
-                foreach (var entry in archive.Entries)
-                {
-                    if (string.IsNullOrEmpty(entry.Name) && entry.FullName.EndsWith('/')) continue;
-                    string rel = entry.FullName.Replace('\\', '/').TrimStart('/');
-                    if (string.IsNullOrWhiteSpace(rel) || rel.Contains("..")) continue;
-                    if (ForbiddenExtensions.Contains(Path.GetExtension(rel))) continue;
-                    if (rel.StartsWith(modId + "/", StringComparison.OrdinalIgnoreCase))
-                        rel = rel[(modId.Length + 1)..];
-                    if (string.IsNullOrWhiteSpace(rel)) continue;
-                    string dst = Path.GetFullPath(Path.Combine(tempDir, rel.Replace('/', Path.DirectorySeparatorChar)));
-                    if (!dst.StartsWith(guard, StringComparison.OrdinalIgnoreCase)) continue;
-                    Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-                    using var src = entry.Open();
-                    using var fs = File.Create(dst);
-                    src.CopyTo(fs);
-                }
-            }
-            if (Directory.Exists(targetDir)) Directory.Delete(targetDir, recursive: true);
-            Directory.Move(tempDir, targetDir);
-        }
-        finally
-        {
-            try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true); } catch { }
+            _http.Dispose();
         }
     }
-
-    public void Dispose() => _http.Dispose();
 }

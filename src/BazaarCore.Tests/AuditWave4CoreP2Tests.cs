@@ -19,21 +19,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class AuditWave4CoreP2Tests
 {
-    private static string ResolveDbPath()
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null)
-        {
-            var cand = Path.Combine(dir.FullName, "dist", "data", "GameData.db");
-            if (File.Exists(cand)) return cand;
-            dir = dir.Parent;
-        }
-        const string fallback = @"e:\thebazaar\dist\data\GameData.db";
-        if (File.Exists(fallback)) return fallback;
-        throw new FileNotFoundException("未找到测试用 GameData.db");
-    }
-
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load(ResolveDbPath()));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     // =========================================================================
     // P1-17 (Core)：TActionGameReroll 透传 SpawnCount 至 OutOfCombatBatchResult.RerollEntries

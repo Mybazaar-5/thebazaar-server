@@ -469,6 +469,12 @@ public static class OfficialDaySchedule
         var midCurated = ResolveValidSlotCandidates(roster.MidIds, pool, repo, bannedIds);
         var rightCurated = ResolveValidSlotCandidates(roster.RightIds, pool, repo, bannedIds);
 
+        // P0-21：将当日合法的自定义 Mod 野怪按 ModMinDay/ModMaxDay/ModDifficultySlot 并入对应难度槽位；
+        // 当无任何自定义野怪命中时，候选列表与官方原版 100% 一致，零额外 RNG 消耗。
+        AppendCustomSlotCandidates(leftCurated, GetEligibleCustomMonstersForSlot(effDay, 0, pool, repo, bannedIds));
+        AppendCustomSlotCandidates(midCurated, GetEligibleCustomMonstersForSlot(effDay, 1, pool, repo, bannedIds));
+        AppendCustomSlotCandidates(rightCurated, GetEligibleCustomMonstersForSlot(effDay, 2, pool, repo, bannedIds));
+
         var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var slots = new List<CardPool.CardTemplate>(count);
 
@@ -522,6 +528,150 @@ public static class OfficialDaySchedule
             .ThenBy(c => MonsterPool.GetEffectiveMonsterLevel(c, repo))
             .Take(count)
             .ToList();
+    }
+
+    /// <summary>
+    /// P0-21：筛选指定天数与难度槽位（0=左槽 / 1=中槽 / 2=右槽）中合法可出场的自定义 Mod 野怪遭遇。
+    /// 通用依据 <c>CardTemplate.IsCustomModCard</c>、<c>ModMinDay</c>、<c>ModMaxDay</c>、<c>ModDifficultySlot</c>
+    /// 与 <see cref="MonsterPool.IsPlayableCombatEncounter"/> 判定，零单卡/单 Mod 硬编码。
+    /// </summary>
+    public static IReadOnlyList<CardPool.CardTemplate> GetEligibleCustomMonstersForSlot(
+        int day,
+        int slotIndex,
+        CardPool pool,
+        GameDataRepository repo,
+        ISet<string>? bannedIds = null)
+    {
+        ArgumentNullException.ThrowIfNull(pool);
+        ArgumentNullException.ThrowIfNull(repo);
+
+        int effDay = Math.Max(1, day);
+        int normSlot = Math.Clamp(slotIndex, 0, 2);
+        var matched = new List<CardPool.CardTemplate>();
+
+        foreach (var tpl in pool.OfType("CombatEncounter"))
+        {
+            if (bannedIds != null && bannedIds.Contains(tpl.Id))
+                continue;
+
+            var core = repo.GetCard(tpl.Id);
+            bool isCustom = tpl.IsCustomModCard || (core != null && core.IsCustomModCard);
+            if (!isCustom)
+                continue;
+
+            if (!MonsterPool.IsPlayableCombatEncounter(tpl, pool, repo, requireAlwaysSpawning: true))
+                continue;
+
+            int minDay = core?.ModMinDay ?? tpl.ModMinDay ?? 1;
+            int maxDay = core?.ModMaxDay ?? tpl.ModMaxDay ?? 99;
+            if (effDay < minDay || effDay > maxDay)
+                continue;
+
+            if (!MatchesMonsterSlot(effDay, normSlot, tpl, core?.ModDifficultySlot))
+                continue;
+
+            matched.Add(tpl);
+        }
+
+        if (matched.Count > 1)
+        {
+            matched.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Id, b.Id));
+        }
+
+        return matched;
+    }
+
+    private static void AppendCustomSlotCandidates(
+        List<CardPool.CardTemplate> target,
+        IReadOnlyList<CardPool.CardTemplate> customCandidates)
+    {
+        if (customCandidates.Count == 0)
+            return;
+
+        var existingIds = new HashSet<string>(target.Select(c => c.Id), StringComparer.OrdinalIgnoreCase);
+        foreach (var cand in customCandidates)
+        {
+            if (existingIds.Add(cand.Id))
+                target.Add(cand);
+        }
+    }
+
+    private static bool MatchesMonsterSlot(
+        int effDay,
+        int normSlot,
+        CardPool.CardTemplate tpl,
+        string? difficultySlot)
+    {
+        if (!string.IsNullOrWhiteSpace(difficultySlot))
+        {
+            string hint = difficultySlot.Trim();
+            if (hint.Equals("Any", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("All", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (hint.Equals("Bronze", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("Left", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("Easy", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("0", StringComparison.Ordinal))
+            {
+                return normSlot == 0;
+            }
+
+            if (hint.Equals("Silver", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("Mid", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("Medium", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("1", StringComparison.Ordinal))
+            {
+                return normSlot == 1;
+            }
+
+            if (hint.Equals("Gold", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("Diamond", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("Legendary", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("Right", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("Hard", StringComparison.OrdinalIgnoreCase) ||
+                hint.Equals("2", StringComparison.Ordinal))
+            {
+                return normSlot == 2;
+            }
+        }
+
+        var tier = MonsterPool.GetMonsterTier(tpl);
+        if (effDay <= 1)
+        {
+            return tier <= CardTier.Bronze
+                ? normSlot is 0 or 1
+                : normSlot == 2;
+        }
+
+        if (effDay <= 10)
+        {
+            return normSlot switch
+            {
+                0 => tier <= CardTier.Bronze,
+                1 => tier == CardTier.Silver,
+                _ => tier >= CardTier.Gold,
+            };
+        }
+
+        if (effDay == 11)
+        {
+            return normSlot switch
+            {
+                0 => tier <= CardTier.Silver,
+                1 => tier == CardTier.Gold,
+                _ => tier >= CardTier.Diamond,
+            };
+        }
+
+        return normSlot switch
+        {
+            0 => tier <= CardTier.Gold,
+            1 => tier == CardTier.Diamond,
+            _ => tier >= CardTier.Legendary,
+        };
     }
 
     private static List<CardPool.CardTemplate> ResolveValidSlotCandidates(

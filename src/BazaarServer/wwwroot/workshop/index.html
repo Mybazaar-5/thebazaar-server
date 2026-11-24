@@ -134,6 +134,11 @@
                 <span>扩展包简介</span>
                 <textarea id="mfDesc" rows="3" placeholder="简单介绍一下这个扩展包新增了哪些卡牌、流派或奇遇事件..."></textarea>
               </label>
+              <div class="field span-2">
+                <span>前置依赖 Mod（可选，勾选后自动做拓扑排序并检测循环依赖）</span>
+                <div class="pill-picker" id="mfDepsPills"></div>
+                <input type="hidden" id="mfDependencies" />
+              </div>
             </div>
 
             <div class="safety-banner">
@@ -146,12 +151,71 @@
               <div class="metric-chip"><span>原版改卡补丁</span><strong id="cntPatches">0</strong></div>
               <div class="metric-chip"><span>自定义新机制</span><strong id="cntMechanics">0</strong></div>
               <div class="metric-chip"><span>奇遇联动事件</span><strong id="cntEvents">0</strong></div>
+              <div class="metric-chip"><span>野怪/模式/词条</span><strong id="cntExtras">0</strong></div>
               <div class="metric-chip"><span>自定义卡图</span><strong id="cntAssets">0</strong></div>
             </div>
 
             <div class="panel-footer-actions">
               <button class="btn btn-outline" id="btnOverviewSave">💾 保存修改</button>
               <button class="btn btn-gold" id="btnGoToCards">下一步：去制作或修改卡牌 →</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 进阶内容工坊：自定义野怪 / 玩法模式 / 肉鸽突变词条 / 汉化覆盖 -->
+        <div class="card-panel extra-studio-panel" id="extraContentStudio">
+          <div class="panel-header compact">
+            <div>
+              <h2>扩展内容工坊（野怪 / 模式 / 突变词条 / 汉化词典）</h2>
+              <p class="muted">支持表单与 JSON 双向编辑，保存后自动随 Mod 落盘并接受 10 道铁闸校验</p>
+            </div>
+            <div class="extra-subtabs" id="extraSubtabs">
+              <button type="button" class="extra-subtab active" data-extra="monsters">👹 自定义野怪 (<span id="cntMonsters">0</span>)</button>
+              <button type="button" class="extra-subtab" data-extra="modes">🎮 玩法模式 (<span id="cntModes">0</span>)</button>
+              <button type="button" class="extra-subtab" data-extra="mutators">🎲 突变词条 (<span id="cntMutators">0</span>)</button>
+              <button type="button" class="extra-subtab" data-extra="localization">🈳 汉化覆盖</button>
+            </div>
+          </div>
+
+          <div class="extra-pane active" id="extra-pane-monsters">
+            <div class="btn-row" style="margin-bottom:8px;">
+              <button type="button" class="btn btn-gold btn-xs" id="btnAddMonster">+ 新增野怪模板</button>
+            </div>
+            <div id="monstersStudioList" class="stack-gap"></div>
+          </div>
+
+          <div class="extra-pane" id="extra-pane-modes">
+            <div class="btn-row" style="margin-bottom:8px;">
+              <button type="button" class="btn btn-gold btn-xs" id="btnAddMode">+ 新增玩法模式</button>
+            </div>
+            <div id="modesStudioList" class="stack-gap"></div>
+          </div>
+
+          <div class="extra-pane" id="extra-pane-mutators">
+            <div class="btn-row" style="margin-bottom:8px;">
+              <button type="button" class="btn btn-gold btn-xs" id="btnAddMutator">+ 新增肉鸽突变词条</button>
+            </div>
+            <div id="mutatorsStudioList" class="stack-gap"></div>
+          </div>
+
+          <div class="extra-pane" id="extra-pane-localization">
+            <div class="form-grid" style="margin-bottom:8px;">
+              <label class="field">
+                <span>词典语言 locale</span>
+                <input type="text" id="locLocale" value="zh-CN" />
+              </label>
+              <label class="field">
+                <span>修订版本 revision</span>
+                <input type="text" id="locRevision" value="1.0.0" />
+              </label>
+              <label class="field span-2">
+                <span>扁平汉化键值 entries / 完整 LocalizationOverlayDocument JSON</span>
+                <textarea id="locRawJson" rows="7" spellcheck="false" placeholder='{"schemaVersion":1,"locale":"zh-CN","revision":"1.0.0","entries":{},"cardOverrides":{}}'></textarea>
+              </label>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn btn-outline btn-xs" id="btnApplyLocJson">应用汉化词典修改</button>
+              <button type="button" class="btn btn-subtle btn-xs" id="btnClearLocOverlay">清空汉化覆盖</button>
             </div>
           </div>
         </div>
@@ -165,9 +229,17 @@
             </div>
             <div class="btn-row community-toolbar">
               <input type="text" id="communityPlayerName" class="community-name-input" placeholder="你的昵称（上传用）" />
+              <input type="password" id="communityUploaderSecret" class="community-name-input" placeholder="作者凭证（更新/删除选填）" title="首次匿名上传后会生成 X-Uploader-Secret；换设备或刷新后可粘贴于此以更新或删除自己的作品" />
               <input type="file" id="communityZipInput" accept=".zip,.bazaarmod.zip" hidden />
               <button class="btn btn-gold btn-sm" id="btnCommunityUpload">⬆ 上传本地 Mod</button>
               <button class="btn btn-subtle btn-sm" id="btnCommunityRefresh">↻ 刷新</button>
+            </div>
+          </div>
+          <div class="secret-banner hidden" id="communitySecretBanner">
+            <span id="communitySecretText"></span>
+            <div class="btn-row">
+              <button type="button" class="btn btn-gold btn-xs" id="btnCopyUploaderSecret">📋 复制管理凭证</button>
+              <button type="button" class="btn btn-subtle btn-xs" id="btnDismissSecretBanner">关闭</button>
             </div>
           </div>
           <div class="community-grid" id="communityModGrid">
@@ -253,7 +325,7 @@
                   <h2 id="ceHeading" style="display:inline-block;margin-left:8px;">编辑卡牌</h2>
                 </div>
                 <div class="btn-row">
-                  <button class="btn btn-subtle btn-xs" id="btnAutoScaleTiers">⚡ 1x/2x/4x/8x 阶梯推算</button>
+                  <button class="btn btn-subtle btn-xs" id="btnAutoScaleTiers">⚡ 1x/2x/4x/8x/12x 五阶推算</button>
                   <button class="btn btn-danger btn-xs" id="btnDeleteCard">删除此卡</button>
                 </div>
               </div>
@@ -285,6 +357,7 @@
                     <option value="Silver">白银起步</option>
                     <option value="Gold">黄金起步</option>
                     <option value="Diamond">钻石起步</option>
+                    <option value="Legendary">传说起步 (Legendary)</option>
                   </select>
                 </label>
                 <label class="field span-2">
@@ -338,6 +411,34 @@
                       <span>英文备用名（可选）</span>
                       <input type="text" id="ceTitleEn" placeholder="留空自动沿用中文名" />
                     </label>
+                    <label class="field">
+                      <span>卡面主题强调色（accentColor）</span>
+                      <input type="text" id="ceAccentColor" placeholder="如 #F97316" />
+                    </label>
+                    <label class="field">
+                      <span>英文简介（descEn，可选双语）</span>
+                      <input type="text" id="ceDescEn" placeholder="Optional English description" />
+                    </label>
+                    <label class="field">
+                      <span>独立背景图路径（customBgArtFile）</span>
+                      <input type="text" id="ceCustomBgArtFile" placeholder="如 assets/card_bg.png" />
+                    </label>
+                    <label class="field">
+                      <span>切板覆写键（boardOverride）</span>
+                      <input type="text" id="ceBoardOverride" placeholder="可选" />
+                    </label>
+                    <label class="field">
+                      <span>演出键（presentation）</span>
+                      <input type="text" id="cePresentation" placeholder="可选" />
+                    </label>
+                    <label class="field">
+                      <span>英文主动效果（activeTooltipsEn，每行一条）</span>
+                      <textarea id="ceActiveTipsEn" rows="2" placeholder="Deal {attr.DamageAmount} Damage"></textarea>
+                    </label>
+                    <label class="field">
+                      <span>英文被动效果（passiveTooltipsEn，每行一条）</span>
+                      <textarea id="cePassiveTipsEn" rows="2" placeholder="Optional English passive tooltip"></textarea>
+                    </label>
                   </div>
                 </details>
 
@@ -359,9 +460,15 @@
                     <button type="button" class="chip" data-ins="{attr.HealAmount}">治疗</button>
                     <button type="button" class="chip" data-ins="{attr.HasteAmount}">加速秒</button>
                     <button type="button" class="chip" data-ins="{attr.ChargeAmount}">充能秒</button>
-                    <button type="button" class="chip" data-ins="{attr.Custom_0}">特殊数值1</button>
-                    <button type="button" class="chip" data-ins="{attr.Custom_1}">特殊数值2</button>
-                    <button type="button" class="chip" data-ins="{attr.Custom_2}">特殊数值3</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_0}">Custom_0</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_1}">Custom_1</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_2}">Custom_2</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_3}">Custom_3</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_4}">Custom_4</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_5}">Custom_5</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_6}">Custom_6</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_7}">Custom_7</button>
+                    <button type="button" class="chip" data-ins="{attr.Custom_8}">Custom_8</button>
                   </div>
                 </div>
                 <div class="form-grid">
@@ -376,16 +483,16 @@
                 </div>
               </div>
 
-              <!-- 四阶数值矩阵（默认自动遵循官方标准买卖价，冷却直接填秒！） -->
+              <!-- 五阶数值矩阵（默认自动遵循官方标准买卖价，冷却直接填秒！） -->
               <div class="sub-block">
                 <div class="sub-block-title">
-                  <span>四阶数值设置（冷却、加速、充能直接填<b>秒</b>即可，不需要的格子留空）</span>
+                  <span>五阶数值设置（含传说 Legendary；冷却、加速、充能直接填<b>秒</b>即可，不需要的格子留空）</span>
                   <label class="inline-check">
                     <input type="checkbox" id="ceAutoPriceChk" checked />
                     遵循官方标准买卖价（按尺寸与品质自动算，取消勾选可手动改价）
                   </label>
                 </div>
-                <div class="auto-price-strip" id="ceAutoPriceSummary">当前标准价：青铜 买2/卖1金 · 白银 买4/卖2金 · 黄金 买8/卖4金 · 钻石 买16/卖8金</div>
+                <div class="auto-price-strip" id="ceAutoPriceSummary">当前标准价：青铜 买2/卖1金 · 白银 买4/卖2金 · 黄金 买8/卖4金 · 钻石 买16/卖8金 · 传说 买24/卖12金</div>
                 <div class="table-wrap">
                   <table class="tier-table" id="ceTierTable">
                     <thead>
@@ -395,6 +502,7 @@
                         <th>白银 Silver</th>
                         <th>黄金 Gold</th>
                         <th>钻石 Diamond</th>
+                        <th>传说 Legendary</th>
                       </tr>
                     </thead>
                     <tbody id="ceTierTableBody"></tbody>
@@ -434,6 +542,15 @@
                 <div id="ceAttachedMechanicsList" class="mech-attach-list"></div>
               </div>
 
+              <!-- 卡牌级 3D 实时计数角标（counterDisplays，最多 4 槽） -->
+              <div class="sub-block" id="ceCounterDisplaysSection">
+                <div class="sub-block-title">
+                  <span>💠 卡面实时计数角标（counterDisplays，最多 4 槽，支持 maxAttr / 5 样式 / 6 值型）</span>
+                  <button type="button" class="btn btn-outline btn-xs" id="btnAddCardCounterDisplay">+ 添加计数角标</button>
+                </div>
+                <div id="ceCounterDisplaysList"></div>
+              </div>
+
               <!-- 13 种官方附魔可视化配置面板 -->
               <div class="sub-block" id="ceEnchantmentsSection">
                 <div class="sub-block-title">
@@ -471,6 +588,7 @@
                     <option value="Silver">白银起步</option>
                     <option value="Gold">黄金起步</option>
                     <option value="Diamond">钻石起步</option>
+                    <option value="Legendary">传说起步 (Legendary)</option>
                   </select>
                 </label>
                 <label class="field">
@@ -478,24 +596,74 @@
                   <input type="text" id="peTitleZh" placeholder="留空沿用原版译名" />
                 </label>
                 <label class="field">
+                  <span>修改获取方式（留空保持原版）</span>
+                  <select id="peSpawningEligibility">
+                    <option value="">（保持原版）</option>
+                    <option value="Always">商店正常刷新 (Always)</option>
+                    <option value="GuidOnly">仅限特殊场景联动 (GuidOnly)</option>
+                    <option value="Never">暂不投放 (Never)</option>
+                  </select>
+                </label>
+                <label class="field span-2">
                   <span>原版卡编号（自动锁定，无需修改）</span>
                   <input type="text" id="peTargetId" readonly />
                 </label>
+                <div class="field span-2">
+                  <span>覆盖所属英雄池（可选，留空保持原版；点击可重新指定）</span>
+                  <div class="pill-picker" id="peHeroPills"></div>
+                  <input type="hidden" id="peHeroes" />
+                </div>
                 <div class="field span-2">
                   <span>给原版卡额外添加标签（直接点击勾选）</span>
                   <div class="pill-picker" id="peAddTagPills"></div>
                   <input type="hidden" id="peAddTags" />
                 </div>
                 <details class="advanced-json span-2">
-                  <summary>更多原版卡改动（移除原有标签 / 修改中文简介）</summary>
+                  <summary>更多原版卡改动（移除标签 / 隐藏标签 / 双语文案 / 视觉切板覆盖）</summary>
                   <div class="form-grid" style="margin-top:8px;">
                     <label class="field">
                       <span>移除原有标签（多个用英文逗号隔开）</span>
                       <input type="text" id="peRemoveTags" placeholder="例如：Weapon" />
                     </label>
                     <label class="field">
+                      <span>添加/移除隐藏标签（addHiddenTags）</span>
+                      <input type="text" id="peAddHiddenTags" placeholder="例如：Burn, Damage" />
+                    </label>
+                    <label class="field">
+                      <span>移除隐藏标签（removeHiddenTags）</span>
+                      <input type="text" id="peRemoveHiddenTags" placeholder="例如：NonWeapon" />
+                    </label>
+                    <label class="field">
+                      <span>修改英文名（titleEn）</span>
+                      <input type="text" id="peTitleEn" placeholder="留空保持原版" />
+                    </label>
+                    <label class="field">
                       <span>修改中文简介（留空保持原版）</span>
                       <textarea id="peDescZh" rows="2"></textarea>
+                    </label>
+                    <label class="field">
+                      <span>修改英文简介（descEn）</span>
+                      <textarea id="peDescEn" rows="2"></textarea>
+                    </label>
+                    <label class="field">
+                      <span>覆盖主动效果文案（activeTooltipsZh，每行一条）</span>
+                      <textarea id="peActiveTips" rows="2" placeholder="留空沿用原版"></textarea>
+                    </label>
+                    <label class="field">
+                      <span>覆盖被动效果文案（passiveTooltipsZh，每行一条）</span>
+                      <textarea id="pePassiveTips" rows="2" placeholder="留空沿用原版"></textarea>
+                    </label>
+                    <label class="field">
+                      <span>强调色（accentColor）</span>
+                      <input type="text" id="peAccentColor" placeholder="如 #F97316" />
+                    </label>
+                    <label class="field">
+                      <span>切板覆写（boardOverride）</span>
+                      <input type="text" id="peBoardOverride" placeholder="可选" />
+                    </label>
+                    <label class="field span-2">
+                      <span>演出键（presentation）</span>
+                      <input type="text" id="pePresentation" placeholder="可选" />
                     </label>
                   </div>
                 </details>
@@ -503,10 +671,10 @@
 
               <div class="sub-block">
                 <div class="sub-block-title">
-                  <span>按品质调整数值（留空保持原版，冷却、加速、充能直接填<b>秒</b>）</span>
+                  <span>按五阶品质调整数值（留空保持原版，冷却、加速、充能直接填<b>秒</b>）</span>
                 </div>
                 <div class="table-wrap">
-                  <table class="tier-table">
+                  <table class="tier-table" id="peTierTable">
                     <thead>
                       <tr>
                         <th>属性</th>
@@ -514,6 +682,7 @@
                         <th>白银</th>
                         <th>黄金</th>
                         <th>钻石</th>
+                        <th>传说</th>
                       </tr>
                     </thead>
                     <tbody id="peTierTableBody"></tbody>
@@ -545,6 +714,28 @@
                 </div>
                 <div id="peAttachedMechanicsList" class="mech-attach-list"></div>
               </div>
+
+              <!-- 原位补丁 3D 实时计数角标覆写 -->
+              <div class="sub-block" id="peCounterDisplaysSection">
+                <div class="sub-block-title">
+                  <span>💠 覆写卡面实时计数角标（counterDisplaysOverride，最多 4 槽）</span>
+                  <button type="button" class="btn btn-outline btn-xs" id="btnAddPatchCounterDisplay">+ 添加计数角标</button>
+                </div>
+                <div id="peCounterDisplaysList"></div>
+              </div>
+
+              <!-- 原位补丁 13 种官方附魔覆写 -->
+              <div class="sub-block" id="peEnchantmentsSection">
+                <div class="sub-block-title">
+                  <span>✨ 覆写 13 种官方附魔（enchantmentOverrides）</span>
+                  <div class="btn-row">
+                    <button type="button" class="btn btn-gold btn-xs" id="btnPeAutoGenAllEnchants">🪄 智能生成 13 附魔覆写</button>
+                    <button type="button" class="btn btn-subtle btn-xs" id="btnPeClearAllEnchants">清空附魔覆写</button>
+                  </div>
+                </div>
+                <div class="pill-picker" id="peEnchantPills"></div>
+                <div id="peEnchantEditorPane" class="ench-editor-pane hidden"></div>
+              </div>
             </div>
           </div>
 
@@ -557,6 +748,7 @@
                 <button class="tier-dot" data-tier="Silver" title="白银">银</button>
                 <button class="tier-dot" data-tier="Gold" title="黄金">金</button>
                 <button class="tier-dot" data-tier="Diamond" title="钻石">钻</button>
+                <button class="tier-dot" data-tier="Legendary" title="传说">传</button>
               </div>
             </div>
 
@@ -574,9 +766,11 @@
                   <span class="bc-cd" id="pvCooldown">4.0 秒</span>
                 </div>
                 <div class="bc-ench-banner hidden" id="pvEnchantBanner"></div>
+                <div class="bc-ench-diff hidden" id="pvEnchantDiff"></div>
                 <div class="bc-art" id="pvArtBox">
                   <img id="pvArtImg" alt="卡图预览" class="hidden" />
                   <div class="bc-art-placeholder" id="pvArtPlaceholder">继承原版白名单 3D 卡面<br />或下方上传 PNG 替换</div>
+                  <div class="bc-counter-badges hidden" id="pvCounterBadges"></div>
                 </div>
                 <div class="bc-title" id="pvTitle">未选择卡牌</div>
                 <div class="bc-tags" id="pvTags"></div>
@@ -625,7 +819,7 @@
               <h2>开放机制列表</h2>
               <button class="btn btn-gold btn-xs" id="btnNewMechanic">+ 空白机制</button>
             </div>
-            <p class="muted" style="margin-bottom:8px;">不预制僵化数值玩法——任何开发者可基于 6 大通用管线钩子与隔离黑板自由发明全新机制，并自动暴露参数给卡牌工坊。</p>
+            <p class="muted" style="margin-bottom:8px;">不预制僵化数值玩法——任何开发者可基于 10 大通用管线钩子与隔离黑板自由发明全新机制，并自动暴露参数给卡牌工坊。</p>
 
             <div class="scaffold-box">
               <div class="sub-block-title"><span>📐 快速起步脚手架（纯结构模板）</span></div>
@@ -702,10 +896,34 @@
                 <div id="meParamsList" class="stack-gap"></div>
               </div>
 
-              <!-- 6 大通用管线钩子与步骤流 -->
+              <!-- 机制级 3D 卡面计数角标（counterDisplay） -->
+              <div class="sub-block" id="meCounterDisplaySection">
+                <div class="sub-block-title">
+                  <span>💠 卡面实时计数角标配置（counterDisplay，自动投影至客户端 3D 卡面）</span>
+                  <label class="inline-check"><input type="checkbox" id="meCdEnabled" /> 启用计数角标</label>
+                </div>
+                <div id="meCounterDisplayFields" class="form-grid hidden">
+                  <label class="field"><span>中文短标签（labelZh）</span><input type="text" id="meCdLabelZh" placeholder="如：过载 / 剑意" /></label>
+                  <label class="field"><span>同步属性槽（syncAttribute）</span><select id="meCdSyncAttr"></select></label>
+                  <label class="field"><span>绑定上限参数键（maxParam）</span><input type="text" id="meCdMaxParam" placeholder="如：threshold" /></label>
+                  <label class="field"><span>固定上限常量（maxConst）</span><input type="number" id="meCdMaxConst" placeholder="可选" /></label>
+                  <label class="field"><span>动态上限属性（maxAttr）</span><select id="meCdMaxAttr"></select></label>
+                  <label class="field"><span>主题色（colorHex）</span><input type="text" id="meCdColorHex" placeholder="#F97316" /></label>
+                  <label class="field"><span>视觉样式（style）</span><select id="meCdStyle"></select></label>
+                  <label class="field"><span>值语义类型（valueType）</span><select id="meCdValueType"></select></label>
+                  <label class="field"><span>锚点位置（position）</span><select id="meCdPosition"></select></label>
+                  <label class="field"><span>短单位后缀（unit）</span><input type="text" id="meCdUnit" placeholder="如：层 / 秒 / %" /></label>
+                  <label class="field"><span>格式模板（format）</span><input type="text" id="meCdFormat" placeholder="如：{label} {value}/{max}" /></label>
+                  <label class="field" style="justify-content:center;">
+                    <label class="inline-check"><input type="checkbox" id="meCdHideWhenZero" /> 层数为 0 时隐藏角标（hideWhenZero）</label>
+                  </label>
+                </div>
+              </div>
+
+              <!-- 10 大通用管线钩子与步骤流 -->
               <div class="sub-block">
                 <div class="sub-block-title">
-                  <span>🔌 通用战斗管线钩子 &amp; 受控步骤流（支持嵌套条件/多段重复/延迟/黑板/拦截）</span>
+                  <span>🔌 10 大通用战斗管线钩子 &amp; 受控步骤流（支持嵌套条件/多段重复/延迟/黑板/拦截）</span>
                   <button class="btn btn-gold btn-xs" id="btnAddMechHook">+ 添加管线钩子</button>
                 </div>
                 <div id="meHooksList" class="stack-gap"></div>
@@ -732,7 +950,7 @@
               <div class="shield-row"><b>1. 受控变更门面</b><span>禁止裸改底层对象，强防 NaN/负冷却/越界</span></div>
               <div class="shield-row"><b>2. 递归与步数预算</b><span>深度 ≤16 · 单钩子 ≤128 步 · 单帧 ≤500 步</span></div>
               <div class="shield-row"><b>3. 单机制异常熔断</b><span>异常或 3 次超预算仅熔断自身，零波及其他卡</span></div>
-              <div class="shield-row"><b>4. 官方协议投影</b><span>仅输出合法 CombatSim/VFX/Custom_0..3</span></div>
+              <div class="shield-row"><b>4. 官方协议投影</b><span>仅输出合法 CombatSim/133 VFX/Custom_0..8</span></div>
               <div class="shield-row"><b>5. 上线前对抗压测</b><span>高速伤害/DOT/摧毁/修复极端阵容真战斗检验</span></div>
             </div>
 
@@ -785,12 +1003,25 @@
                   <input type="text" id="evTitleZh" placeholder="例如：黑市神秘箱" />
                 </label>
                 <label class="field">
+                  <span>事件类型（eventType）</span>
+                  <select id="evType">
+                    <option value="EventEncounter">普通奇遇 (EventEncounter)</option>
+                    <option value="PedestalEncounter">强化基座 (PedestalEncounter)</option>
+                    <option value="EncounterStep">单步选项 (EncounterStep)</option>
+                    <option value="CombatEncounter">野怪战斗事件 (CombatEncounter)</option>
+                  </select>
+                </label>
+                <label class="field">
                   <span>出现天数区间（第几天 ~ 第几天）</span>
                   <div class="inline-pair">
                     <input type="number" id="evMinDay" min="1" max="99" value="2" />
                     <span>至</span>
                     <input type="number" id="evMaxDay" min="1" max="99" value="10" />
                   </div>
+                </label>
+                <label class="field">
+                  <span>允许出现小时（hours，逗号分隔 0~6，留空不限）</span>
+                  <input type="text" id="evHours" placeholder="例如：1, 2, 3, 4" />
                 </label>
                 <div class="field span-2">
                   <span>适用英雄（直接点击勾选；选「全英雄通用」表示任意英雄都能遇到）</span>
@@ -802,11 +1033,25 @@
                   <input type="number" id="evWeight" min="0" step="0.5" value="5" />
                 </label>
                 <label class="field">
+                  <span>难度槽位与调度开关</span>
+                  <div class="inline-pair">
+                    <select id="evDifficultySlot" style="width:auto;">
+                      <option value="">默认不限槽位</option>
+                      <option value="Any">Any</option>
+                      <option value="Bronze">Bronze</option>
+                      <option value="Silver">Silver</option>
+                      <option value="Gold">Gold</option>
+                    </select>
+                    <label class="inline-check"><input type="checkbox" id="evOncePerRun" /> 每局仅一次</label>
+                    <label class="inline-check"><input type="checkbox" id="evChainOnly" /> 仅链式触发</label>
+                  </div>
+                </label>
+                <label class="field span-2">
                   <span>奇遇剧情说明 *</span>
                   <input type="text" id="evDescZh" placeholder="描述玩家进入这个奇遇时看到的剧情..." />
                 </label>
                 <details class="advanced-json span-2">
-                  <summary>高级编号设置（系统已自动预生成防撞编号与原版奇遇底板，一般无需修改）</summary>
+                  <summary>高级编号、双语、独立背景图与野怪战斗配置（一般无需修改）</summary>
                   <div class="form-grid" style="margin-top:8px;">
                     <label class="field">
                       <span>事件唯一编号</span>
@@ -815,6 +1060,52 @@
                     <label class="field">
                       <span>原版奇遇外观底板编号</span>
                       <input type="text" id="evBaseVisualId" />
+                    </label>
+                    <label class="field">
+                      <span>英文名称（titleEn）</span>
+                      <input type="text" id="evTitleEn" placeholder="可选" />
+                    </label>
+                    <label class="field">
+                      <span>英文简介（descEn）</span>
+                      <input type="text" id="evDescEn" placeholder="可选" />
+                    </label>
+                    <label class="field">
+                      <span>起始品质（startingTier）</span>
+                      <select id="evStartingTier">
+                        <option value="">默认 Bronze</option>
+                        <option value="Bronze">Bronze</option>
+                        <option value="Silver">Silver</option>
+                        <option value="Gold">Gold</option>
+                        <option value="Diamond">Diamond</option>
+                        <option value="Legendary">Legendary</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>自定义事件立绘路径（customArtFile）</span>
+                      <input type="text" id="evCustomArtFile" placeholder="如 assets/event_art.png" />
+                    </label>
+                    <label class="field">
+                      <span>独立遭遇背景图（customBgArtFile）</span>
+                      <input type="text" id="evCustomBgArtFile" placeholder="如 assets/event_bg.png" />
+                    </label>
+                    <label class="field">
+                      <span>切板 / 演出键（boardOverride / presentation）</span>
+                      <div class="inline-pair">
+                        <input type="text" id="evBoardOverride" placeholder="boardOverride" />
+                        <input type="text" id="evPresentation" placeholder="presentation" />
+                      </div>
+                    </label>
+                    <label class="field">
+                      <span>战斗奖励金币（rewardCombatGold）</span>
+                      <input type="number" id="evRewardCombatGold" min="0" placeholder="可选" />
+                    </label>
+                    <label class="field">
+                      <span>战斗奖励经验（rewardCombatXp）</span>
+                      <input type="number" id="evRewardCombatXp" min="0" placeholder="可选" />
+                    </label>
+                    <label class="field span-2" id="evCombatMonsterWrap">
+                      <span>战斗野怪模板（combatMonster JSON，仅 CombatEncounter 生效）</span>
+                      <textarea id="evCombatMonsterJson" rows="4" spellcheck="false" placeholder='{"id":"my-mod:boss_1","internalName":"Boss","player":{"attributes":{"HealthMax":250},"hand":{"unlockedSlots":1023,"items":[]},"skills":[]}}'></textarea>
                     </label>
                   </div>
                 </details>
@@ -1074,8 +1365,11 @@ python tools/mod_sdk_cli.py unpack dist/mods/my-forge.bazaarmod.zip --into mods/
             <span>② 额外门槛条件（可选，不需要就保持“无门槛”）</span>
             <select id="abPrereqKind" class="select-sm">
               <option value="none">无额外门槛</option>
-              <option value="cardCount">场上拥有至少 N 张某标签物品</option>
-              <option value="playerAttr">玩家当前金币/生命/护盾满足条件</option>
+              <option value="cardCount">场上拥有至少 N 张某标签物品 (TPrerequisiteCardCount)</option>
+              <option value="playerAttr">玩家当前金币/生命/护盾满足条件 (TPrerequisitePlayer)</option>
+              <option value="run">局内天数/小时条件 (TPrerequisiteRun)</option>
+              <option value="cardAttrCmp">双卡属性比较 (TPrerequisiteCardAttributeComparator)</option>
+              <option value="preserve" hidden>保留原有复杂前置条件</option>
             </select>
           </div>
           <div id="abPrereqFields" class="form-grid hidden"></div>
@@ -1142,6 +1436,32 @@ python tools/mod_sdk_cli.py unpack dist/mods/my-forge.bazaarmod.zip --into mods/
                 <input type="text" id="abAuraValInput" value="10" placeholder="数字或属性名" />
               </div>
             </label>
+            <label class="field">
+              <span>生效位置（activeIn）</span>
+              <select id="abAuraActiveIn">
+                <option value="HandOnly">仅上阵在棋盘上时生效 (HandOnly)</option>
+                <option value="HandAndStash">棋盘和背包里都生效 (HandAndStash)</option>
+                <option value="StashOnly">仅放在背包里时生效 (StashOnly)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>光环专属特效（可选 vfxOverrideKey）</span>
+              <select id="abAuraVfxKey"><option value="">（无特殊特效）</option></select>
+            </label>
+          </div>
+          <div class="sub-block" style="margin-top:10px;">
+            <div class="sub-block-title">
+              <span>光环生效门槛条件（可选）</span>
+              <select id="abAuraPrereqKind" class="select-sm">
+                <option value="none">无额外门槛</option>
+                <option value="cardCount">场上拥有至少 N 张某标签物品</option>
+                <option value="playerAttr">玩家当前金币/生命/护盾满足条件</option>
+                <option value="run">局内天数/小时条件</option>
+                <option value="cardAttrCmp">双卡属性比较</option>
+                <option value="preserve" hidden>保留原有复杂前置条件</option>
+              </select>
+            </div>
+            <div id="abAuraPrereqFields" class="form-grid hidden"></div>
           </div>
         </div>
       </div>

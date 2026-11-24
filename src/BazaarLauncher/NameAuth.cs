@@ -103,13 +103,42 @@ internal static class NameAuth
         }
     }
 
-    /// <summary>切换服务器后清空旧服账号 ID 与 JWT 缓存，禁止回退读取游戏内旧服令牌，并在后台向新服静默重签。</summary>
+    /// <summary>D4-P1-6：切换服务器后清空旧服账号 ID 与原生 AccessTokenProvider 缓存 JWT，并在后台向新服静默重签。</summary>
     internal static void OnServerChanged()
     {
         _currentAccountId = null;
         _currentAccessToken = null;
         _ignoreGameCachedAuthUntilRelogin = true;
+        TrySyncNativeAccessTokenProvider(string.Empty, string.Empty, default);
         _ = Task.Run(() => EnsureAccountIdentityAsync(HttpClientHub.ShutdownToken));
+    }
+
+    /// <summary>D4-P1-6：将 JWT 同步写入原生 AccessTokenProvider.SetCachedTokens(string, string, DateTime)，消除切服原生通道 401。</summary>
+    private static void TrySyncNativeAccessTokenProvider(string accessToken, string refreshToken, DateTime expiresAtUtc)
+    {
+        try
+        {
+            var giType = AccessTools.TypeByName("TheBazaar.GameInstance");
+            var gi = giType?.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            if (gi == null) return;
+            var provider = giType.GetProperty("AccessTokenProvider", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(gi);
+            if (provider == null) return;
+
+            var setCached = provider.GetType().GetMethod(
+                "SetCachedTokens",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                null,
+                new[] { typeof(string), typeof(string), typeof(DateTime) },
+                null);
+            if (setCached != null)
+            {
+                setCached.Invoke(provider, new object[] { accessToken ?? string.Empty, refreshToken ?? string.Empty, expiresAtUtc });
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("[NameAuth] 同步原生 AccessTokenProvider 失败: " + ex.Message);
+        }
     }
 
     private static bool IsPureAscii(string s)
@@ -183,13 +212,14 @@ internal static class NameAuth
                         string newTok = (string)(lObj["accessToken"] ?? lObj["AccessToken"] ?? lObj["token"]);
                         string newAid = NormalizeAccountId((string)(lObj["accountId"] ?? lObj["AccountId"] ?? lObj["id"] ?? lObj["Id"]));
                         string newUser = (string)(lObj["username"] ?? lObj["Username"]);
-                        if (!string.IsNullOrWhiteSpace(newTok)) _currentAccessToken = newTok;
+                        if (!string.IsNullOrWhiteSpace(newTok))
+                        {
+                            _currentAccessToken = newTok;
+                            _ignoreGameCachedAuthUntilRelogin = false;
+                            TrySyncNativeAccessTokenProvider(newTok, string.Empty, DateTime.UtcNow.AddHours(12));
+                        }
                         if (!string.IsNullOrWhiteSpace(newAid) && newAid != "00000000000000000000000000000000") _currentAccountId = newAid;
                         if (!string.IsNullOrWhiteSpace(newUser)) _currentUsername = newUser;
-                        if (!string.IsNullOrWhiteSpace(_currentAccessToken))
-                        {
-                            _ignoreGameCachedAuthUntilRelogin = false;
-                        }
                     }
                 }
                 if (!string.IsNullOrWhiteSpace(_currentAccountId)) return;
@@ -537,9 +567,12 @@ internal static class NameAuth
         try
         {
             string tok = AccessTools.Property(loginResponseType, "AccessToken")?.GetValue(loginResponse)?.ToString();
+            string refreshTok = AccessTools.Property(loginResponseType, "RefreshToken")?.GetValue(loginResponse)?.ToString();
             if (!string.IsNullOrWhiteSpace(tok))
             {
                 _currentAccessToken = tok;
+                _ignoreGameCachedAuthUntilRelogin = false;
+                TrySyncNativeAccessTokenProvider(tok, refreshTok ?? string.Empty, DateTime.UtcNow.AddHours(12));
                 _ = Task.Run(async () =>
                 {
                     await EnsureAccountIdentityAsync(HttpClientHub.ShutdownToken).ConfigureAwait(false);
@@ -547,7 +580,10 @@ internal static class NameAuth
                 });
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("[NameAuth] 登录响应 Token 同步异常: " + ex.Message);
+        }
 
         BazaarLauncherPlugin.Log?.LogInfo("NameAuth: 自建服登录成功，已启动 Mod 与词典缓存同步");
 

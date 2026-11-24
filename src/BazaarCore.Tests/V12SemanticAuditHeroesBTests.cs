@@ -16,12 +16,16 @@ namespace BazaarCore.Tests;
 ///    TActionCardTransform* 多产物/Disabled 目标/Transform.Abilities、Quest CompletionEffects/Reward.Tags/Quest_1..7、
 ///    以及 TActionGameSpawnCards.Attributes(Tiny)。
 /// 2. 全量语义扫描：遍历 Shard B 全部 Always 物品与技能，逐 Ability / Aura / Quest 构造满足前提与目标的合成面板，
-///    触发对应机制并断言非零语义状态增量，输出审计报告至 e:\thebazaar\logs\v12_sem_audit_b.json。
+///    触发对应机制并断言非零语义状态增量，输出审计报告至临时目录（或 BAZAAR_AUDIT_OUT_DIR）。
 /// </summary>
 public sealed class V12SemanticAuditHeroesBTests
 {
-    private const string AuthoritativeDataDir = @"e:\thebazaar\dist\data";
-    private const string AuditLogPath = @"e:\thebazaar\logs\v12_sem_audit_b.json";
+    private static string ResolveAuditLogPath()
+    {
+        string outDir = Environment.GetEnvironmentVariable("BAZAAR_AUDIT_OUT_DIR")
+            ?? Path.Combine(Path.GetTempPath(), "bazaar_test_audit");
+        return Path.Combine(outDir, "v12_sem_audit_b.json");
+    }
 
     private static readonly string[] ShardBHeroes =
         ["Jules", "Stelle", "Karnok", "Hero8", "Common"];
@@ -33,15 +37,7 @@ public sealed class V12SemanticAuditHeroesBTests
         "Dragon", "Trap", "Instrument", "Loot", "Reagent"
     ];
 
-    private static readonly Lazy<GameDataRepository> RepoLazy = new(() =>
-    {
-        var envDir = Environment.GetEnvironmentVariable("BAZAAR_DATA_DIR");
-        if (!string.IsNullOrWhiteSpace(envDir) && Directory.Exists(envDir))
-            return GameDatabaseLoader.Load(Path.Combine(envDir, "GameData.db"), Path.Combine(envDir, "zh-CN.json"));
-        if (Directory.Exists(AuthoritativeDataDir))
-            return GameDatabaseLoader.Load(Path.Combine(AuthoritativeDataDir, "GameData.db"), Path.Combine(AuthoritativeDataDir, "zh-CN.json"));
-        return GameDatabaseLoader.Load();
-    });
+    private static readonly Lazy<GameDataRepository> RepoLazy = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static GameDataRepository Repo => RepoLazy.Value;
     private readonly ITestOutputHelper _output;
@@ -789,8 +785,9 @@ public sealed class V12SemanticAuditHeroesBTests
             if (!cardHadAnyFailure) report.SemanticVerifiedCards++;
         }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(AuditLogPath)!);
-        File.WriteAllText(AuditLogPath, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
+        string auditLogPath = ResolveAuditLogPath();
+        Directory.CreateDirectory(Path.GetDirectoryName(auditLogPath)!);
+        File.WriteAllText(auditLogPath, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
 
         _output.WriteLine($"ShardB Total={report.TotalShardBCards}, Verified={report.SemanticVerifiedCards}, Abilities={report.TotalAbilitiesAudited}, Auras={report.TotalAurasAudited}, Quests={report.TotalQuestsAudited}, NoOpAbs={report.UnexplainedSilentNoOpAbilities}, NoOpAuras={report.UnexplainedSilentNoOpAuras}, NoOpQuests={report.UnexplainedSilentNoOpQuests}");
         if (report.Failures.Count > 0)
@@ -1929,11 +1926,16 @@ public sealed class V12SemanticAuditHeroesBTests
             "TActionPlayerPoisonApply" => "PoisonApplyAmount",
             "TActionPlayerHeal" or "TActionPlayerReviveHeal" => "HealAmount",
             "TActionPlayerRegenApply" => "RegenApplyAmount",
+            "TActionCardSlow" => "SlowAmount",
+            "TActionCardFreeze" => "FreezeAmount",
+            "TActionCardHaste" => "HasteAmount",
+            "TActionCardCharge" => "ChargeAmount",
             _ => null
         };
         if (primaryAttr == null) return;
+        double seedVal = ab.Action.Type is "TActionCardSlow" or "TActionCardFreeze" or "TActionCardHaste" or "TActionCardCharge" ? 1000 : 10;
         if (card.GetAttribute(primaryAttr) <= 0 && (card.ActiveAbilities.Count > 1 || card.ActiveAuras.Count > 0))
-            card.PermanentAdd[primaryAttr] = 10;
+            card.PermanentAdd[primaryAttr] = seedVal;
     }
 
     private static void EnsureActionCostSatisfied(PlayerState p1, CardInstance card, RuleNode action)

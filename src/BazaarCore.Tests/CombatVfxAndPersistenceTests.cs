@@ -24,21 +24,13 @@ namespace BazaarCore.Tests;
 /// RunSnapshotSerializer 无损往返（含 HourAdd/DayAdd/Transform/SuspendedStates）、
 /// Persistence SQLite WAL + V3 迁移 + Resume/Concede、PvpGhostPool 真人入库及 AccountStore 生涯统计。
 /// </summary>
+[Collection("GlobalStaticState")]
 public sealed class CombatVfxAndPersistenceTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static string ResolveDataDir()
-    {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            string candidate = Path.Combine(dir, "dist", "data");
-            if (Directory.Exists(candidate)) return candidate;
-            dir = Directory.GetParent(dir)?.FullName;
-        }
-        return @"e:\thebazaar\dist\data";
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataDir();
 
     private static RunState.CardEntry MakeBoardItemEntry(
         string entryId,

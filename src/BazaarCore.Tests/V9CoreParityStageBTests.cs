@@ -24,10 +24,11 @@ namespace BazaarCore.Tests;
 /// 4. #12：CardInstance.ModifyAttribute("Ammo", ...) 严格受 [0, AmmoMax] 封顶；
 /// 5. #21：无 CooldownMax（EffectiveCooldownMs == 0）被动战斗触发器物品在 CombatSimulator 正常触发且战后保留。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V9CoreParityStageBTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
 
     private const string MittelId = "912c8b09-3b76-4aa1-8e21-245e0dfb5046";
     private const string JayJayId = "85db60ee-3619-4e39-bfb2-2f4ac56f172b";
@@ -41,16 +42,7 @@ public sealed class V9CoreParityStageBTests
     private const string DragonStatueId = "0152f1f7-1efd-40de-8de3-fdf936d793ed";
 
     private static string ResolveDataPath(string fileName)
-    {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            string candidate = Path.Combine(dir, "dist", "data", fileName);
-            if (File.Exists(candidate)) return candidate;
-            dir = Directory.GetParent(dir)?.FullName;
-        }
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static JsonElement JsonNumber(double val)
         => JsonDocument.Parse(val.ToString(System.Globalization.CultureInfo.InvariantCulture)).RootElement.Clone();

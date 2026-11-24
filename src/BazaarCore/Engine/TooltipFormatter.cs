@@ -81,8 +81,8 @@ public static partial class TooltipFormatter
             {
                 foreach (var entry in q.Entries)
                 {
-                    double prog = card.QuestProgress.GetValueOrDefault(entry.AttributeType, 0);
-                    bool done = card.CompletedQuests.Contains(entry.AttributeType);
+                    double prog = card.GetQuestProgress(entry.AttributeType);
+                    bool done = card.IsQuestCompleted(entry.AttributeType);
 
                     string? goalText = RenderLocalizedBlockFirstLine(entry.Localization, loc, card, ctx);
                     string? rewardText = RenderLocalizedBlockFirstLine(entry.Reward?.Localization, loc, card, ctx);
@@ -220,6 +220,13 @@ public static partial class TooltipFormatter
 
     private static RuleNode? ResolveAbilityAction(CardInstance card, string id)
     {
+        // D1-P2-02：优先扫描已激活能力（含已完成 Quest 奖励能力与附魔能力），再回退模板/附魔定义
+        for (int i = 0; i < card.ActiveAbilities.Count; i++)
+        {
+            var actAb = card.ActiveAbilities[i];
+            if (string.Equals(actAb.Id, id, StringComparison.Ordinal) && actAb.Action != null)
+                return actAb.Action;
+        }
         if (card.Template.Abilities.TryGetValue(id, out var ab) && ab.Action != null)
             return ab.Action;
         if (!string.IsNullOrEmpty(card.Enchantment) &&
@@ -232,6 +239,13 @@ public static partial class TooltipFormatter
 
     private static RuleNode? ResolveAuraAction(CardInstance card, string id)
     {
+        // D1-P2-02：优先扫描已激活光环（含已完成 Quest 奖励光环与附魔光环）
+        for (int i = 0; i < card.ActiveAuras.Count; i++)
+        {
+            var actAu = card.ActiveAuras[i];
+            if (string.Equals(actAu.Id, id, StringComparison.Ordinal) && actAu.Action != null)
+                return actAu.Action;
+        }
         if (card.Template.Auras.TryGetValue(id, out var au) && au.Action != null)
             return au.Action;
         if (!string.IsNullOrEmpty(card.Enchantment) &&
@@ -247,9 +261,19 @@ public static partial class TooltipFormatter
         var evalCtx = BuildEvalCtx(card, ctx);
         if (string.Equals(subKind, "targets", StringComparison.OrdinalIgnoreCase))
         {
-            double targets = action.TargetCount != null
-                ? ValueAndConditionEvaluator.EvaluateValue(action.TargetCount, evalCtx, 1)
-                : 1;
+            double targets;
+            if (action.TargetCount != null)
+            {
+                targets = ValueAndConditionEvaluator.EvaluateValue(action.TargetCount, evalCtx, 1);
+            }
+            else
+            {
+                // D1-P2-02：缺少显式 TargetCount 时回退检索对应动作的 *Targets 卡面属性
+                string? fallbackTargetsAttr = ResolveFallbackTargetsAttribute(action.Type);
+                targets = (!string.IsNullOrEmpty(fallbackTargetsAttr) && card.HasAttribute(fallbackTargetsAttr))
+                    ? card.GetAttribute(fallbackTargetsAttr)
+                    : 1;
+            }
             return $"{Math.Max(1, Math.Round(targets)):0}";
         }
 
@@ -267,6 +291,23 @@ public static partial class TooltipFormatter
         var val = ExtractActionDisplayNumber(action, card, evalCtx);
         return val.HasValue ? FormatNumber(val.Value, action, hasUnitSuffix, isZh) : "?";
     }
+
+    private static string? ResolveFallbackTargetsAttribute(string? actionType) => actionType switch
+    {
+        "TActionCardHaste" => "HasteTargets",
+        "TActionCardSlow" => "SlowTargets",
+        "TActionCardFreeze" => "FreezeTargets",
+        "TActionCardCharge" => "ChargeTargets",
+        "TActionCardReload" => "ReloadTargets",
+        "TActionCardBeginFlying" or "TActionCardStopFlying" or "TActionCardToggleFlying" => "FlyingTargets",
+        "TActionCardForceUse" => "ForceUseTargets",
+        "TActionCardUpgrade" => "UpgradeTargets",
+        "TActionCardDestroy" => "DestroyTargets",
+        "TActionCardDisable" => "DisableTargets",
+        "TActionCardEnchant" or "TActionCardEnchantRandom" => "EnchantTargets",
+        "TActionCardTransform" => "TransformTargets",
+        _ => null
+    };
 
     private static RuleExecutionContext BuildEvalCtx(CardInstance card, RuleExecutionContext? ctx)
     {

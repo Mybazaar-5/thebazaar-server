@@ -31,8 +31,6 @@ internal static class Unlocker
     private static FieldInfo _cmUnavailableField;
     private static MethodInfo _cmRebuildEquippedMethod;
     private static MethodInfo _cmLoadItemAsyncMethod;
-    private static FieldInfo _eventsCollectionUpdatedField;
-    private static FieldInfo _eventsCollectionsPopulatedField;
 
     private static readonly string[] Hero8SoAddressablesKeys =
     {
@@ -231,8 +229,8 @@ internal static class Unlocker
                 _cmIsLoadingField?.SetValue(cm, false);
             }
 
-            TriggerCollectionStaticEvent("CollectionAssetsUpdated", ref _eventsCollectionUpdatedField);
-            TriggerCollectionStaticEvent("CollectionsPopulated", ref _eventsCollectionsPopulatedField);
+            GameEventsBridge.TryTrigger("CollectionAssetsUpdated");
+            GameEventsBridge.TryTrigger("CollectionsPopulated");
 
             BazaarLauncherPlugin.Log?.LogInfo(
                 $"Unlocker 藏品懒加载生效：跳过 {skippedCount} 项未穿戴藏品后台全量预加载，改为打开藏品柜按需加载。");
@@ -253,21 +251,6 @@ internal static class Unlocker
             }
             catch { }
         }
-    }
-
-    private static void TriggerCollectionStaticEvent(string fieldName, ref FieldInfo cachedField)
-    {
-        try
-        {
-            if (cachedField == null)
-            {
-                var evType = AccessTools.TypeByName("TheBazaar.Events");
-                cachedField = evType?.GetField(fieldName, BindingFlags.Public | BindingFlags.Static);
-            }
-            var evObj = cachedField?.GetValue(null);
-            evObj?.GetType().GetMethod("Trigger", BindingFlags.Public | BindingFlags.Instance)?.Invoke(evObj, Type.EmptyTypes);
-        }
-        catch { }
     }
 
     private static bool RetryMissingCollectionItemsPrefix(ref Task<bool> __result)
@@ -734,11 +717,39 @@ internal static class Unlocker
         if (addrType == null || handle == null) return;
         try
         {
-            var isValidProp = handle.GetType().GetMethod("IsValid", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
-            if (isValidProp != null && isValidProp.Invoke(handle, null) is bool valid && !valid) return;
+            Type handleType = handle.GetType();
+            var isValidMethod = handleType.GetMethod("IsValid", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+            if (isValidMethod != null && isValidMethod.Invoke(handle, null) is bool valid && !valid) return;
 
-            foreach (var m in addrType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+            var methods = addrType.GetMethods(BindingFlags.Public | BindingFlags.Static);
+
+            // D4-P1-2：优先匹配泛型 Addressables.Release<TObject>(AsyncOperationHandle<TObject>) 并用 MakeGenericMethod 闭合释放
+            if (handleType.IsGenericType)
             {
+                Type[] genArgs = handleType.GetGenericArguments();
+                if (genArgs.Length == 1)
+                {
+                    for (int i = 0; i < methods.Length; i++)
+                    {
+                        var m = methods[i];
+                        if (m.Name != "Release" || !m.IsGenericMethodDefinition) continue;
+                        var ps = m.GetParameters();
+                        if (ps.Length != 1) continue;
+                        Type pType = ps[0].ParameterType;
+                        if (pType.IsGenericType && pType.GetGenericTypeDefinition() == handleType.GetGenericTypeDefinition())
+                        {
+                            var closed = m.MakeGenericMethod(genArgs[0]);
+                            closed.Invoke(null, new[] { handle });
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // 回退非泛型 Addressables.Release(AsyncOperationHandle)
+            for (int i = 0; i < methods.Length; i++)
+            {
+                var m = methods[i];
                 if (m.Name != "Release" || m.IsGenericMethodDefinition) continue;
                 var ps = m.GetParameters();
                 if (ps.Length == 1 && ps[0].ParameterType.IsInstanceOfType(handle))
@@ -747,8 +758,13 @@ internal static class Unlocker
                     return;
                 }
             }
+
+            BazaarLauncherPlugin.Log?.LogWarning($"[Unlocker] 未找到可匹配 {handleType.Name} 的 Addressables.Release 重载，跳过释放");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"[Unlocker] TryReleaseHandle 释放异常: {ex.Message}");
+        }
     }
 
     private static bool OwnsPlayableHeroPrefix(object[] __args, ref bool __result)

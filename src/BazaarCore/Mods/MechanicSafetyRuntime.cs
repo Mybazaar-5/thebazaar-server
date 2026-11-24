@@ -115,12 +115,13 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
     public const int MaxChainDepth = 16;
     public const int MaxStepsPerHook = 128;
     public const int MaxStepsPerTick = 500;
-    public const int MaxDelayedCallbacksPerCombat = 64;
+    /// <summary>D3-P2-02：延迟回调配额拆分单卡(32)/单阵营(64)/全局(128)三级分账，杜绝一方刷满饿死对手。</summary>
+    public const int MaxDelayedCallbacksPerCard = 32;
+    public const int MaxDelayedCallbacksPerSide = 64;
+    public const int MaxDelayedCallbacksPerCombat = 128;
     public const int MaxRepeatCount = 20;
     public const int CircuitBreakerBudgetFaultLimit = 3;
 
-    private const double MinCooldownMs = 1000.0;
-    private const double MaxCooldownMs = 60000.0;
     private const double MaxSafeScalar = 1_000_000.0;
 
     private sealed class ScheduledMechanicCallback
@@ -158,6 +159,11 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
     private int _tickStepsUsed;
     private int _currentHookStepsUsed;
     private int _delayedScheduledTotal;
+    private int _delayedScheduledP1;
+    private int _delayedScheduledP2;
+    private readonly Dictionary<CardInstance, int> _delayedScheduledByCard = new(ReferenceEqualityComparer.Instance);
+    private string? _activeChainMechanicId;
+    private CardInstance? _activeChainCard;
     private bool _abortCurrentHook;
 
     public List<MechanicDiagnostic> Diagnostics { get; } = new();
@@ -201,14 +207,42 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
     {
         if (hasCsharpInterceptors) return true;
         if (definitions == null || definitions.Count == 0) return false;
-        return SideHasCustomMechanics(p1) || SideHasCustomMechanics(p2);
+        return SideHasCustomMechanics(p1, definitions) || SideHasCustomMechanics(p2, definitions);
     }
 
-    private static bool SideHasCustomMechanics(PlayerState side)
+    /// <summary>P0-33：O(1) 判定新生成/变形产出的卡牌是否携带任意已注册机制。</summary>
+    public static bool CardNeedsMechanicRuntime(
+        CardInstance? card,
+        IReadOnlyDictionary<string, MechanicDefinition>? definitions)
     {
-        foreach (var c in side.EnumerateHandAndSkills())
+        if (card == null || definitions == null || definitions.Count == 0) return false;
+        var attachments = card.Template.CustomMechanics;
+        if (attachments == null || attachments.Count == 0) return false;
+        for (int i = 0; i < attachments.Count; i++)
         {
-            if (c.Template.CustomMechanics is { Count: > 0 })
+            var att = attachments[i];
+            if (att != null && att.Enabled && !string.IsNullOrWhiteSpace(att.MechanicId)
+                && definitions.ContainsKey(att.MechanicId.Trim()))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static IEnumerable<CardInstance> EnumerateAllMechanicContainers(PlayerState side)
+    {
+        for (int i = 0; i < side.Hand.Cards.Count; i++) yield return side.Hand.Cards[i];
+        for (int i = 0; i < side.Skills.Count; i++) yield return side.Skills[i];
+        for (int i = 0; i < side.SocketEffects.Count; i++) yield return side.SocketEffects[i];
+        for (int i = 0; i < side.Stash.Cards.Count; i++) yield return side.Stash.Cards[i];
+    }
+
+    private static bool SideHasCustomMechanics(PlayerState side, IReadOnlyDictionary<string, MechanicDefinition> definitions)
+    {
+        foreach (var c in EnumerateAllMechanicContainers(side))
+        {
+            if (CardNeedsMechanicRuntime(c, definitions))
                 return true;
         }
         return false;
@@ -216,39 +250,86 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
 
     private void BindSideCards(PlayerState owner, PlayerState opponent)
     {
-        foreach (var card in owner.EnumerateHandAndSkills())
+        foreach (var card in EnumerateAllMechanicContainers(owner))
         {
-            var attachments = card.Template.CustomMechanics;
-            if (attachments == null || attachments.Count == 0) continue;
-            for (int i = 0; i < attachments.Count; i++)
+            RegisterCardInternal(owner, opponent, card);
+        }
+    }
+
+    /// <summary>P0-33：战中动态为新生成/变形/到期还原的卡牌幂等注册机制绑定。</summary>
+    public bool RegisterCard(PlayerState owner, CardInstance? card)
+    {
+        if (owner == null || card == null) return false;
+        var opponent = ReferenceEquals(owner, _p1) ? _p2 : _p1;
+        return RegisterCardInternal(owner, opponent, card);
+    }
+
+    /// <summary>P0-33：战中动态注销离开棋盘/被变形替换的卡牌机制绑定，防止僵尸触发。</summary>
+    public int UnregisterCard(CardInstance? card)
+    {
+        if (card == null || _bindings.Count == 0) return 0;
+        return _bindings.RemoveAll(b => ReferenceEquals(b.Card, card)
+            || string.Equals(b.Card.InstanceId, card.InstanceId, StringComparison.Ordinal));
+    }
+
+    /// <summary>P0-33：战中变形原子替换机制绑定（先注销旧卡再注册新卡）。</summary>
+    public void ReplaceCard(PlayerState owner, CardInstance? oldCard, CardInstance? newCard)
+    {
+        UnregisterCard(oldCard);
+        RegisterCard(owner, newCard);
+    }
+
+    private bool RegisterCardInternal(PlayerState owner, PlayerState opponent, CardInstance card)
+    {
+        var attachments = card.Template.CustomMechanics;
+        if (attachments == null || attachments.Count == 0) return false;
+
+        bool addedAny = false;
+        for (int i = 0; i < attachments.Count; i++)
+        {
+            var att = attachments[i];
+            if (att == null || !att.Enabled || string.IsNullOrWhiteSpace(att.MechanicId)) continue;
+            string mechId = att.MechanicId.Trim();
+
+            // 幂等去重：同实例同机制只绑定一次
+            bool alreadyBound = false;
+            for (int b = 0; b < _bindings.Count; b++)
             {
-                var att = attachments[i];
-                if (att == null || !att.Enabled || string.IsNullOrWhiteSpace(att.MechanicId)) continue;
-                if (_definitions.TryGetValue(att.MechanicId.Trim(), out var def))
+                if (ReferenceEquals(_bindings[b].Card, card)
+                    && string.Equals(_bindings[b].Definition.Id, mechId, StringComparison.OrdinalIgnoreCase))
                 {
-                    _bindings.Add(new RegisteredCardMechanic
-                    {
-                        OwnerPlayer = owner,
-                        OpponentPlayer = opponent,
-                        Card = card,
-                        Attachment = att,
-                        Definition = def
-                    });
-                }
-                else
-                {
-                    Diagnostics.Add(new MechanicDiagnostic(
-                        "Warning",
-                        att.MechanicId,
-                        card.InstanceId,
-                        card.Template.Id,
-                        "Bind",
-                        "MECHANIC_NOT_REGISTERED",
-                        $"卡牌 '{card.Template.DisplayTitle}' 引用了未注册的机制 '{att.MechanicId}'，已安全跳过。",
-                        0));
+                    alreadyBound = true;
+                    break;
                 }
             }
+            if (alreadyBound) continue;
+
+            if (_definitions.TryGetValue(mechId, out var def))
+            {
+                _bindings.Add(new RegisteredCardMechanic
+                {
+                    OwnerPlayer = owner,
+                    OpponentPlayer = opponent,
+                    Card = card,
+                    Attachment = att,
+                    Definition = def
+                });
+                addedAny = true;
+            }
+            else
+            {
+                Diagnostics.Add(new MechanicDiagnostic(
+                    "Warning",
+                    att.MechanicId,
+                    card.InstanceId,
+                    card.Template.Id,
+                    "Bind",
+                    "MECHANIC_NOT_REGISTERED",
+                    $"卡牌 '{card.Template.DisplayTitle}' 引用了未注册的机制 '{att.MechanicId}'，已安全跳过。",
+                    TimeMs));
+            }
         }
+        return addedAny;
     }
 
     public void ResetTickBudget()
@@ -323,15 +404,18 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
         if (_currentChainDepth >= MaxChainDepth)
         {
             BudgetViolationsCount++;
-            Diagnostics.Add(new MechanicDiagnostic(
-                "Warning",
-                pipeEvent.CustomEventName ?? pipeEvent.HookName,
-                pipeEvent.SourceCard?.InstanceId,
-                pipeEvent.SourceCard?.Template.Id,
+            // D3-P2-02：MaxChainDepth 超限时触发真实故障登记与即时熔断，杜绝死循环反复刷屏却不熔断
+            string faultMechId = !string.IsNullOrWhiteSpace(_activeChainMechanicId)
+                ? _activeChainMechanicId!
+                : (pipeEvent.CustomEventName ?? pipeEvent.HookName);
+            var faultCard = _activeChainCard ?? pipeEvent.SourceCard;
+            RecordFault(
+                faultMechId,
+                faultCard,
                 pipeEvent.HookName,
                 "MAX_CHAIN_DEPTH",
-                $"管线事件 '{pipeEvent.HookName}' 达到最大递归深度 {MaxChainDepth}，已安全截断防死循环。",
-                TimeMs));
+                $"管线事件 '{pipeEvent.HookName}' 达到最大递归深度 {MaxChainDepth}，已安全截断并触发熔断防死循环。",
+                tripImmediately: true);
             return;
         }
 
@@ -362,8 +446,12 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
                     binding.HookTriggerCounts[hookKey] = fired + 1;
                     int prevSteps = _currentHookStepsUsed;
                     bool prevAbort = _abortCurrentHook;
+                    string? prevChainMech = _activeChainMechanicId;
+                    CardInstance? prevChainCard = _activeChainCard;
                     _currentHookStepsUsed = 0;
                     _abortCurrentHook = false;
+                    _activeChainMechanicId = mechId;
+                    _activeChainCard = binding.Card;
                     try
                     {
                         MechanicSandboxInterpreter.ExecuteSteps(
@@ -393,6 +481,8 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
                     {
                         _currentHookStepsUsed = prevSteps;
                         _abortCurrentHook = prevAbort;
+                        _activeChainMechanicId = prevChainMech;
+                        _activeChainCard = prevChainCard;
                     }
                 }
             }
@@ -507,20 +597,40 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
         if (!includeDisabledSelf && (binding.Card.IsDisabled || binding.Card.IsDestroyed))
             return false;
 
-        string scope = string.IsNullOrWhiteSpace(hookDef.Scope) ? "SelfCard" : hookDef.Scope;
+        string scope = string.IsNullOrWhiteSpace(hookDef.Scope) ? "SelfCard" : hookDef.Scope.Trim();
+        bool isCardTargetEvent = ev.TargetCard != null
+            && (ev.HookName.Equals("BeforeStatusApply", StringComparison.OrdinalIgnoreCase)
+                || ev.HookName.Equals("BeforeCardStateChange", StringComparison.OrdinalIgnoreCase));
+        bool isRoundGlobalEvent = ev.HookName.Equals("OnFightStart", StringComparison.OrdinalIgnoreCase)
+            || ev.HookName.Equals("PostCombatCommit", StringComparison.OrdinalIgnoreCase);
+
+        // D3-P1-03：精确单边 Scope 语义（未知 Scope 返回 false，绝不再默认放行）
         bool scopeMatched = scope.ToLowerInvariant() switch
         {
-            "selfcard" => ev.HookName is "OnFightStart" or "PostCombatCommit"
-                || ev.SourceCard == binding.Card
-                || ev.TargetCard == binding.Card
-                || (ev.HookName == "BeforeDamage" && ev.TargetPlayer == binding.OwnerPlayer)
-                || (ev.HookName == "BeforeStatusApply" && (ev.TargetCard == binding.Card || ev.TargetPlayer == binding.OwnerPlayer)),
-            "ownerplayer" => ev.TargetPlayer == binding.OwnerPlayer || ev.SourcePlayer == binding.OwnerPlayer,
-            "enemyplayer" => ev.TargetPlayer == binding.OpponentPlayer || ev.SourcePlayer == binding.OpponentPlayer,
-            "ownerboard" => ev.SourcePlayer == binding.OwnerPlayer || ev.TargetPlayer == binding.OwnerPlayer,
-            "enemyboard" => ev.SourcePlayer == binding.OpponentPlayer || ev.TargetPlayer == binding.OpponentPlayer,
-            "any" => true,
-            _ => true
+            "selfcard" => isRoundGlobalEvent
+                || (isCardTargetEvent
+                    ? ReferenceEquals(ev.TargetCard, binding.Card)
+                    : ev.HookName.Equals("BeforeStatusApply", StringComparison.OrdinalIgnoreCase)
+                        ? (ev.TargetCard == null && ReferenceEquals(ev.TargetPlayer, binding.OwnerPlayer))
+                        : ev.HookName.Equals("BeforeDamage", StringComparison.OrdinalIgnoreCase)
+                            ? (ReferenceEquals(ev.SourceCard, binding.Card) || (ev.TargetCard == null && ReferenceEquals(ev.TargetPlayer, binding.OwnerPlayer)))
+                            : (ReferenceEquals(ev.SourceCard, binding.Card) || ReferenceEquals(ev.TargetCard, binding.Card))),
+            "ownerplayer" => isRoundGlobalEvent
+                ? (ev.SourcePlayer == null || ReferenceEquals(ev.SourcePlayer, binding.OwnerPlayer) || ReferenceEquals(ev.TargetPlayer, binding.OwnerPlayer))
+                : ReferenceEquals(ev.TargetPlayer, binding.OwnerPlayer),
+            "enemyplayer" => isRoundGlobalEvent
+                ? (ev.SourcePlayer == null || ReferenceEquals(ev.SourcePlayer, binding.OpponentPlayer) || ReferenceEquals(ev.TargetPlayer, binding.OpponentPlayer))
+                : ReferenceEquals(ev.TargetPlayer, binding.OpponentPlayer),
+            "ownerboard" => isRoundGlobalEvent
+                || (isCardTargetEvent
+                    ? ReferenceEquals(ev.TargetPlayer, binding.OwnerPlayer)
+                    : ReferenceEquals(ev.SourcePlayer, binding.OwnerPlayer)),
+            "enemyboard" => isRoundGlobalEvent
+                || (isCardTargetEvent
+                    ? ReferenceEquals(ev.TargetPlayer, binding.OpponentPlayer)
+                    : ReferenceEquals(ev.SourcePlayer, binding.OpponentPlayer)),
+            "global" or "any" => true,
+            _ => false
         };
         if (!scopeMatched) return false;
 
@@ -595,44 +705,7 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
     }
 
     private static void ClampPlayerInvariants(PlayerState p)
-    {
-        if (p.Shield < 0) p.Shield = 0;
-        if (p.Burn < 0) p.Burn = 0;
-        if (p.Poison < 0) p.Poison = 0;
-        if (p.Attributes.TryGetValue("HealthRegen", out double reg) && reg < 0) p.Attributes["HealthRegen"] = 0;
-        if (p.HealthMax < 1) p.Attributes["HealthMax"] = 1;
-
-        foreach (var c in p.EnumerateHandAndSkills())
-        {
-            if (c.HasteMs < 0) c.HasteMs = 0;
-            if (c.SlowMs < 0) c.SlowMs = 0;
-            if (c.FreezeMs < 0) c.FreezeMs = 0;
-            if (c.CooldownProgressMs < 0) c.CooldownProgressMs = 0;
-            // 保护 CooldownMax 与 PercentCooldownReduction 不被自定义机制改出 0 秒死循环或 NaN
-            SanitizeDict(c.CombatAdd);
-            SanitizeDict(c.CombatMult);
-            if (c.CombatAdd.TryGetValue("PercentCooldownReduction", out double pcr) && pcr > 90)
-                c.CombatAdd["PercentCooldownReduction"] = 90;
-        }
-    }
-
-    private static void SanitizeDict(Dictionary<string, double> dict)
-    {
-        if (dict.Count == 0) return;
-        List<string>? bad = null;
-        foreach (var (k, v) in dict)
-        {
-            if (double.IsNaN(v) || double.IsInfinity(v))
-            {
-                bad ??= new List<string>();
-                bad.Add(k);
-            }
-        }
-        if (bad != null)
-        {
-            foreach (var k in bad) dict[k] = 0;
-        }
-    }
+        => MechanicSafeAttributeWriter.ClampPlayerInvariants(p);
 
     // ── Shield #1：受控变更门面 ICombatMutationApi 实现 ──────────────────────────
     private static double SanitizeNumber(double v, double min = -MaxSafeScalar, double max = MaxSafeScalar)
@@ -671,131 +744,55 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
     }
 
     public static bool IsOutputActionAttribute(string attribute)
-    {
-        return attribute.Equals("DamageAmount", StringComparison.OrdinalIgnoreCase)
-            || attribute.Equals("ShieldApplyAmount", StringComparison.OrdinalIgnoreCase)
-            || attribute.Equals("HealAmount", StringComparison.OrdinalIgnoreCase)
-            || attribute.Equals("BurnApplyAmount", StringComparison.OrdinalIgnoreCase)
-            || attribute.Equals("PoisonApplyAmount", StringComparison.OrdinalIgnoreCase)
-            || attribute.Equals("RegenApplyAmount", StringComparison.OrdinalIgnoreCase)
-            || attribute.Equals("JoyApplyAmount", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool ActionTreeHasActionType(RuleNode? node, string targetActionType, int depth = 0)
-    {
-        if (node == null || depth > 16) return false;
-        if (string.Equals(node.Type, targetActionType, StringComparison.OrdinalIgnoreCase))
-            return true;
-        if (node.Actions != null)
-        {
-            for (int i = 0; i < node.Actions.Count; i++)
-            {
-                if (ActionTreeHasActionType(node.Actions[i], targetActionType, depth + 1))
-                    return true;
-            }
-        }
-        return false;
-    }
+        => !string.IsNullOrWhiteSpace(attribute)
+           && MechanicSafeAttributeWriter.ProtectedOutputAttributes.Contains(attribute.Trim());
 
     public static bool CardSupportsOutputAttribute(CardInstance card, string attribute)
-    {
-        if (card == null || string.IsNullOrWhiteSpace(attribute))
-            return false;
-        // 模板当前品阶显式声明该属性（含 0 初始成长型武器/护盾卡）或当前动态值 > 0 即视为具备该输出能力；
-        // 非输出物品（如 Fishing Rod / Catfish / Sea Shell）不包含 DamageAmount 键，严禁凭空写入。
-        if (card.BaseAttributes.ContainsKey(attribute))
-            return true;
-        if (card.GetAttribute(attribute) > 0)
-            return true;
-
-        string? requiredAction = attribute.ToLowerInvariant() switch
-        {
-            "damageamount" => "TActionPlayerDamage",
-            "shieldapplyamount" => "TActionPlayerShieldApply",
-            "healamount" => "TActionPlayerHeal",
-            "burnapplyamount" => "TActionPlayerBurnApply",
-            "poisonapplyamount" => "TActionPlayerPoisonApply",
-            "regenapplyamount" => "TActionPlayerRegenApply",
-            "joyapplyamount" => "TActionPlayerJoyApply",
-            _ => null,
-        };
-        if (requiredAction == null) return true;
-
-        for (int i = 0; i < card.ActiveAbilities.Count; i++)
-        {
-            if (ActionTreeHasActionType(card.ActiveAbilities[i].Action, requiredAction))
-                return true;
-        }
-        return false;
-    }
+        => MechanicSafeAttributeWriter.HasInherentProtectedAttribute(card, attribute);
 
     public void ModifyCardAttribute(CardInstance targetCard, string attribute, string operation, double value, bool permanent = false, bool grantIfMissing = false)
     {
         if (targetCard == null || string.IsNullOrWhiteSpace(attribute)) return;
-        double safeVal = SanitizeNumber(value);
-        string op = string.IsNullOrWhiteSpace(operation) ? "Add" : operation;
-
-        // 官方一致性铁律：群体/单体增益伤害、护盾、治疗、灼烧、剧毒、再生、喜悦等产出属性时，
-        // 默认严禁给原本不具备该产出能力的物品凭空写入属性（否则客户端会常显一颗无效伤害/护盾宝石），除非 Mod 显式声明 grantIfMissing=true
-        if (!grantIfMissing && IsOutputActionAttribute(attribute) && !CardSupportsOutputAttribute(targetCard, attribute))
-        {
-            return;
-        }
-
-        // 冷却属性强钳制：确保有效冷却绝不跌破 1000ms（杜绝 0 秒无限开火）
-        if (attribute.Equals("CooldownMax", StringComparison.OrdinalIgnoreCase))
-        {
-            double curCd = targetCard.GetAttribute("CooldownMax");
-            double nextCd = ApplyMathOp(curCd, op, safeVal);
-            nextCd = Math.Clamp(nextCd, MinCooldownMs, MaxCooldownMs);
-            double delta = nextCd - curCd;
-            targetCard.ModifyAttribute("CooldownMax", "Add", delta, permanent ? Engine.DurationTarget.Permanent : Engine.DurationTarget.Combat);
-        }
-        else if (attribute.Equals("PercentCooldownReduction", StringComparison.OrdinalIgnoreCase))
-        {
-            double curPcr = targetCard.GetAttribute("PercentCooldownReduction");
-            double nextPcr = Math.Clamp(ApplyMathOp(curPcr, op, safeVal), -200, 90);
-            double delta = nextPcr - curPcr;
-            targetCard.ModifyAttribute("PercentCooldownReduction", "Add", delta, permanent ? Engine.DurationTarget.Permanent : Engine.DurationTarget.Combat);
-        }
-        else if (attribute.Equals("Multicast", StringComparison.OrdinalIgnoreCase))
-        {
-            double curMc = targetCard.GetAttribute("Multicast");
-            double nextMc = Math.Clamp(ApplyMathOp(curMc, op, safeVal), 1, 10);
-            double delta = nextMc - curMc;
-            targetCard.ModifyAttribute("Multicast", "Add", delta, permanent ? Engine.DurationTarget.Permanent : Engine.DurationTarget.Combat);
-        }
-        else
-        {
-            if (op.Equals("Set", StringComparison.OrdinalIgnoreCase))
-            {
-                double cur = targetCard.GetAttribute(attribute);
-                targetCard.ModifyAttribute(attribute, "Add", safeVal - cur, permanent ? Engine.DurationTarget.Permanent : Engine.DurationTarget.Combat);
-            }
-            else
-            {
-                targetCard.ModifyAttribute(attribute, op, safeVal, permanent ? Engine.DurationTarget.Permanent : Engine.DurationTarget.Combat);
-            }
-        }
-        _host.RecalculateAuras();
+        var res = MechanicSafeAttributeWriter.ApplyCardAttribute(
+            targetCard,
+            attribute,
+            operation,
+            value,
+            permanent ? Engine.DurationTarget.Permanent : Engine.DurationTarget.Combat,
+            grantIfMissing,
+            _definitions);
+        if (res.Applied)
+            _host.RecalculateAuras();
     }
 
     public void ModifyPlayerAttribute(PlayerState targetPlayer, string attribute, string operation, double value)
     {
         if (targetPlayer == null || string.IsNullOrWhiteSpace(attribute)) return;
-        double cur = targetPlayer.GetAttribute(attribute);
-        double next = ApplyMathOp(cur, operation, value);
-        if (attribute.Equals("HealthMax", StringComparison.OrdinalIgnoreCase))
-            next = Math.Clamp(next, 1, MaxSafeScalar);
-        else if (attribute.Equals("Shield", StringComparison.OrdinalIgnoreCase)
-                 || attribute.Equals("Burn", StringComparison.OrdinalIgnoreCase)
-                 || attribute.Equals("Poison", StringComparison.OrdinalIgnoreCase)
-                 || attribute.Equals("Regen", StringComparison.OrdinalIgnoreCase))
-            next = Math.Clamp(next, 0, MaxSafeScalar);
-        else if (attribute.Equals("PercentDamageReduction", StringComparison.OrdinalIgnoreCase))
-            next = Math.Clamp(next, 0, 100);
+        string trimmed = attribute.Trim();
+        if (!MechanicDefinition.AllowedPlayerAttributes.Contains(trimmed)) return;
+        if (!double.IsFinite(value)) return;
 
-        targetPlayer.Attributes[attribute] = next;
+        string normalizedAttr = PlayerState.NormalizeAttributeName(trimmed);
+        string op = string.IsNullOrWhiteSpace(operation) ? "Add" : operation.Trim();
+
+        double safeVal = op.Equals("Multiply", StringComparison.OrdinalIgnoreCase)
+            ? Math.Clamp(value, MechanicSafeAttributeWriter.MinMultiplyStep, MechanicSafeAttributeWriter.MaxMultiplyStep)
+            : SanitizeNumber(value);
+
+        // PercentDamageReduction 钳制最终值在 [0, 100]
+        if (normalizedAttr.Equals("PercentDamageReduction", StringComparison.OrdinalIgnoreCase))
+        {
+            double cur = targetPlayer.GetAttribute("PercentDamageReduction");
+            double next = Math.Clamp(ApplyMathOp(cur, op, safeVal), 0, 100);
+            targetPlayer.ModifyAttribute("PercentDamageReduction", "Set", next, Engine.DurationTarget.Combat);
+        }
+        else
+        {
+            targetPlayer.ModifyAttribute(normalizedAttr, op, safeVal, Engine.DurationTarget.Combat);
+        }
+
+        MechanicSafeAttributeWriter.ClampPlayerInvariants(targetPlayer);
+        _host.RecalculateAuras();
     }
 
     public void ChangeCardState(CardInstance targetCard, CardInstance? sourceCard, string changeKind, string? reason = null, bool suppressNormalDestroyTriggers = false, string? vfxKey = null)
@@ -830,6 +827,53 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
     public bool ScheduleDelayed(int delayMs, string mechanicId, CardInstance? ownerCard, Action<ICombatMutationApi> callback)
     {
         if (callback == null) return false;
+        // D3-P2-02：延迟回调按单卡(32) / 单阵营(64) / 全局(128)三级分账，避免一方耗尽配额波及对手
+        if (ownerCard != null && _delayedScheduledByCard.GetValueOrDefault(ownerCard, 0) >= MaxDelayedCallbacksPerCard)
+        {
+            BudgetViolationsCount++;
+            RecordFault(
+                mechanicId,
+                ownerCard,
+                "ScheduleDelayed",
+                "DELAYED_CARD_QUOTA_EXCEEDED",
+                $"机制 '{mechanicId}' 单卡延迟回调注册次数超过上限 {MaxDelayedCallbacksPerCard}，已拒绝继续排程。",
+                tripImmediately: false);
+            return false;
+        }
+
+        int side = 0; // 1 = P1, 2 = P2, 0 = neutral
+        if (ownerCard != null)
+        {
+            if (_p1.Hand.Cards.Contains(ownerCard) || _p1.Skills.Contains(ownerCard) || _p1.Stash.Cards.Contains(ownerCard) || _p1.SocketEffects.Contains(ownerCard))
+                side = 1;
+            else if (_p2.Hand.Cards.Contains(ownerCard) || _p2.Skills.Contains(ownerCard) || _p2.Stash.Cards.Contains(ownerCard) || _p2.SocketEffects.Contains(ownerCard))
+                side = 2;
+        }
+        if (side == 1 && _delayedScheduledP1 >= MaxDelayedCallbacksPerSide)
+        {
+            BudgetViolationsCount++;
+            RecordFault(
+                mechanicId,
+                ownerCard,
+                "ScheduleDelayed",
+                "DELAYED_SIDE_QUOTA_EXCEEDED",
+                $"机制 '{mechanicId}' P1 阵营延迟回调注册次数超过上限 {MaxDelayedCallbacksPerSide}，已拒绝继续排程。",
+                tripImmediately: false);
+            return false;
+        }
+        if (side == 2 && _delayedScheduledP2 >= MaxDelayedCallbacksPerSide)
+        {
+            BudgetViolationsCount++;
+            RecordFault(
+                mechanicId,
+                ownerCard,
+                "ScheduleDelayed",
+                "DELAYED_SIDE_QUOTA_EXCEEDED",
+                $"机制 '{mechanicId}' P2 阵营延迟回调注册次数超过上限 {MaxDelayedCallbacksPerSide}，已拒绝继续排程。",
+                tripImmediately: false);
+            return false;
+        }
+
         if (_delayedScheduledTotal >= MaxDelayedCallbacksPerCombat)
         {
             BudgetViolationsCount++;
@@ -844,6 +888,10 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
         }
         int safeDelay = Math.Clamp(delayMs, 20, 60000);
         _delayedScheduledTotal++;
+        if (side == 1) _delayedScheduledP1++;
+        else if (side == 2) _delayedScheduledP2++;
+        if (ownerCard != null)
+            _delayedScheduledByCard[ownerCard] = _delayedScheduledByCard.GetValueOrDefault(ownerCard, 0) + 1;
         _delayedQueue.Add(new ScheduledMechanicCallback
         {
             ExecuteAtMs = TimeMs + safeDelay,
@@ -918,10 +966,21 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
     public double GetCombatCounter(string key)
         => !string.IsNullOrWhiteSpace(key) ? _combatCounters.GetValueOrDefault(key.Trim(), 0) : 0;
 
+    private bool IsCardOwnedByPlayer1(CardInstance card)
+    {
+        if (_p1.Hand.Cards.Contains(card) || _p1.Stash.Cards.Contains(card)
+            || _p1.Skills.Contains(card) || _p1.SocketEffects.Contains(card))
+            return true;
+        if (_p1.CombatSourceCardMap != null && _p1.CombatSourceCardMap.ContainsKey(card.InstanceId))
+            return true;
+        return false;
+    }
+
     public void QueuePostCombatRemoveCard(CardInstance card, string? reason, string mechanicId)
     {
         if (card == null) return;
-        // 仅允许操作玩家1侧（真实玩家）的持久化卡牌，禁止重复入队
+        // D3-P1-05：严格校验归属 _p1（真实玩家），杜绝敌方 P2 幽灵/野怪机制反向污染玩家局外存档
+        if (!IsCardOwnedByPlayer1(card)) return;
         if (PostCombatOps.Any(o => o.OpKind == "RemoveCard" && string.Equals(o.CardInstanceId, card.InstanceId, StringComparison.Ordinal)))
             return;
         PostCombatOps.Add(new PostCombatMutationOp
@@ -936,6 +995,9 @@ public sealed class CombatMechanicRuntime : ICombatMutationApi
     public void QueuePostCombatModifyAttr(CardInstance card, string attribute, string operation, double value, string mechanicId, bool grantIfMissing = false)
     {
         if (card == null || string.IsNullOrWhiteSpace(attribute)) return;
+        // D3-P1-05：严格校验归属 _p1，且按统一写手防 NaN
+        if (!IsCardOwnedByPlayer1(card)) return;
+        if (!double.IsFinite(value)) return;
         PostCombatOps.Add(new PostCombatMutationOp
         {
             OpKind = "ModifyCardPermanentAttribute",

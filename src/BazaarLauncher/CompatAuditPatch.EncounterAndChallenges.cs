@@ -1074,6 +1074,11 @@ internal static partial class CompatAuditPatch
             if (cardType == ECardType.PvpEncounter || cardType == ECardType.CombatEncounter)
                 return;
 
+            // P0-24：若该遭遇卡已命中自定义 Mod 视觉绑定（EncounterPortrait / EncounterBackground），
+            // 跳过原版父图兜底覆写，避免覆盖 CustomContentVisualModule 刚替换好的自定义奇遇立绘
+            if (BazaarLauncher.Modules.CustomContentVisualModule.HasActiveEncounterVisualOverride(cardData))
+                return;
+
             // 2. 若原生 Setup 因 EncounterStep 跳过加载或子事件无 ArtKey 导致未加载立绘，则自动补全父级 EncounterAssetDataSO
             var currentAsset = _encCurrentEncounterDataObjectProp?.GetValue(controller);
             if (IsUnityObjectAlive(currentAsset))

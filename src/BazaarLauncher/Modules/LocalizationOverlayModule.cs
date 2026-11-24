@@ -154,6 +154,17 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
     private static readonly Regex AttrPlaceholderRegex = new(@"\{attr\.([A-Za-z0-9_]+)\}", RegexOptions.Compiled);
     private static int _l10nHookErrorCount;
 
+    // D4-P1-9：原生 LocalizationService.LocaleChanged 订阅句柄
+    private object _nativeLocaleSvcObj;
+    private EventInfo _nativeLocaleChangedEvent;
+    private Delegate _nativeLocaleChangedDelegate;
+
+    // D3-P1-11：TagRenderer 额外标签渲染反射缓存
+    private static FieldInfo _tagRendererCtrlField;
+    private static MethodInfo _tooltipTagInitMethod;
+    private static MethodInfo _tooltipColorTagMethod;
+    private static PropertyInfo _dataTooltipTypographyProp;
+
     [ThreadStatic] private static MD5 _tsMd5;
     [ThreadStatic] private static byte[] _tsUtf8Buf;
     private static readonly char[] HexDigits = "0123456789abcdef".ToCharArray();
@@ -173,12 +184,14 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         Patcher = new SafeHarmonyPatcher(Manifest.Id);
         InstallLocalizationPatches(Patcher);
         TournamentLocalizationPatch.Apply(Patcher);
+        SubscribeNativeLocaleChanged();
         BazaarLauncherPlugin.Log?.LogInfo(
             $"[LocalizationOverlay] 四层中文词典引擎已激活 (Locale={CurrentLocale}, 条目={_overlayTotalEntries}, 补丁={Patcher.SucceededCount}/{Patcher.AttemptedCount})");
     }
 
     public void OnDisable()
     {
+        UnsubscribeNativeLocaleChanged();
         TournamentLocalizationPatch.ResetAppliedFlag();
         Patcher?.UnpatchAll();
     }
@@ -508,7 +521,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                             return true;
                         }
                     }
-                    catch { }
+                    catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L524", diagEx); }
                 }
             }
 
@@ -524,7 +537,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                         return true;
                     }
                 }
-                catch { }
+                catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L540", diagEx); }
             }
         }
 
@@ -572,7 +585,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         return hasCjk;
     }
 
-    /// <summary>按卡实例/自定义ID/模板ID查询结构化元数据（TierAttributes/EnchantmentPreviewOps/CounterDisplays），不受界面中英文语言限制。</summary>
+    /// <summary>按卡实例/自定义ID/模板ID查询字段级合并后的结构化元数据，不受界面中英文语言限制。</summary>
     internal bool TryResolveCardMetadata(
         string instanceId,
         string customCardId,
@@ -584,17 +597,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         if (snapshots == null || snapshots.Count == 0) return false;
 
         string loc = NormalizeLocale(CurrentLocale);
-        if (snapshots.TryGetValue(loc, out var curSnap) && TryMatchCardOverrideFromSnapshot(curSnap, instanceId, customCardId, templateId, out cardOverride))
-        {
-            return true;
-        }
-        if (!string.Equals(loc, "zh-CN", StringComparison.OrdinalIgnoreCase)
-            && snapshots.TryGetValue("zh-CN", out var zhSnap)
-            && TryMatchCardOverrideFromSnapshot(zhSnap, instanceId, customCardId, templateId, out cardOverride))
-        {
-            return true;
-        }
-        return false;
+        return TryMergeCardOverrideAcrossLocales(snapshots, loc, instanceId, customCardId, templateId, out cardOverride);
     }
 
     public bool TryResolveCardText(
@@ -605,33 +608,138 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         out CardTextOverride cardOverride)
     {
         cardOverride = null;
-        string loc = NormalizeLocale(locale);
-        if (!IsChineseLocale(loc)) return false;
-
         var snapshots = _snapshots;
-        if (!snapshots.TryGetValue(loc, out var snap) || snap.CardOverrides.Length == 0)
+        if (snapshots == null || snapshots.Count == 0) return false;
+
+        string loc = NormalizeLocale(locale);
+        return TryMergeCardOverrideAcrossLocales(snapshots, loc, instanceId, customCardId, templateId, out cardOverride);
+    }
+
+    /// <summary>P0-18：纯逻辑字段级合并入口（供单元测试与运行时共用）。</summary>
+    internal static CardTextOverride MergeCardOverridesForTest(
+        CardTextOverride[] candidates,
+        string instanceId,
+        string customCardId,
+        string templateId)
+    {
+        return MergeCardOverrides(candidates, instanceId, customCardId, templateId);
+    }
+
+    /// <summary>P0-27：按当前语言与借壳标识选择单条显示文本；英文态全新借壳卡缺英文时回退中文，绝不跌落原版底座。</summary>
+    internal static string PickLocalizedString(bool isZh, string zh, string en, bool isBorrowShell)
+    {
+        if (isZh)
+        {
+            if (!string.IsNullOrWhiteSpace(zh)) return zh;
+            if (!string.IsNullOrWhiteSpace(en)) return en;
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(en)) return en;
+        if (isBorrowShell && !string.IsNullOrWhiteSpace(zh)) return zh;
+        return null;
+    }
+
+    internal static string[] PickLocalizedLines(bool isZh, string[] zh, string[] en, bool isBorrowShell)
+    {
+        if (isZh)
+        {
+            if (zh != null && zh.Length > 0) return zh;
+            if (en != null && en.Length > 0) return en;
+            return null;
+        }
+
+        if (en != null && en.Length > 0) return en;
+        if (isBorrowShell && zh != null && zh.Length > 0) return zh;
+        return null;
+    }
+
+    internal static Dictionary<string, string[]> PickLocalizedEnchantTooltips(
+        bool isZh,
+        Dictionary<string, string[]> zh,
+        Dictionary<string, string[]> en,
+        bool isBorrowShell)
+    {
+        if (isZh)
+        {
+            if (zh != null && zh.Count > 0) return zh;
+            if (en != null && en.Count > 0) return en;
+            return null;
+        }
+
+        if (en != null && en.Count > 0) return en;
+        if (isBorrowShell && zh != null && zh.Count > 0) return zh;
+        return null;
+    }
+
+    /// <summary>P0-27：全新借壳自定义卡未配置 PassiveTooltips 时，必须彻底清空原版借壳底座被动词条防止泄漏。</summary>
+    internal static bool ShouldSuppressVanillaPassives(bool isCustomBorrowShell, string[] resolvedPassives)
+    {
+        return isCustomBorrowShell && (resolvedPassives == null || resolvedPassives.Length == 0);
+    }
+
+    /// <summary>D3-P1-02：按附魔预览乘数与加偏移公式计算派生属性值。</summary>
+    internal static int EvaluatePreviewAttrDerivedValue(int sourceVal, double? sourceMultiplier, double? sourceAddOffset)
+    {
+        double mult = sourceMultiplier ?? 1.0;
+        double offset = sourceAddOffset ?? 0.0;
+        return (int)Math.Round(sourceVal * mult + offset);
+    }
+
+    private static bool TryMergeCardOverrideAcrossLocales(
+        Dictionary<string, LocaleSnapshot> snapshots,
+        string primaryLocale,
+        string instanceId,
+        string customCardId,
+        string templateId,
+        out CardTextOverride merged)
+    {
+        merged = null;
+        snapshots.TryGetValue(primaryLocale, out var primarySnap);
+        LocaleSnapshot zhSnap = null;
+        if (!string.Equals(primaryLocale, "zh-CN", StringComparison.OrdinalIgnoreCase))
+        {
+            snapshots.TryGetValue("zh-CN", out zhSnap);
+        }
+
+        if ((primarySnap == null || primarySnap.CardOverrides.Length == 0)
+            && (zhSnap == null || zhSnap.CardOverrides.Length == 0))
         {
             return false;
         }
 
-        return TryMatchCardOverrideFromSnapshot(snap, instanceId, customCardId, templateId, out cardOverride);
+        if (zhSnap == null || zhSnap.CardOverrides.Length == 0)
+        {
+            merged = MergeCardOverrides(primarySnap.CardOverrides, instanceId, customCardId, templateId);
+            return merged != null;
+        }
+        if (primarySnap == null || primarySnap.CardOverrides.Length == 0)
+        {
+            merged = MergeCardOverrides(zhSnap.CardOverrides, instanceId, customCardId, templateId);
+            return merged != null;
+        }
+
+        var combined = new CardTextOverride[primarySnap.CardOverrides.Length + zhSnap.CardOverrides.Length];
+        Array.Copy(primarySnap.CardOverrides, 0, combined, 0, primarySnap.CardOverrides.Length);
+        Array.Copy(zhSnap.CardOverrides, 0, combined, primarySnap.CardOverrides.Length, zhSnap.CardOverrides.Length);
+        merged = MergeCardOverrides(combined, instanceId, customCardId, templateId);
+        return merged != null;
     }
 
-    private static bool TryMatchCardOverrideFromSnapshot(
-        LocaleSnapshot snap,
+    private static CardTextOverride MergeCardOverrides(
+        CardTextOverride[] arr,
         string instanceId,
         string customCardId,
-        string templateId,
-        out CardTextOverride cardOverride)
+        string templateId)
     {
-        cardOverride = null;
-        if (snap == null || snap.CardOverrides.Length == 0) return false;
+        if (arr == null || arr.Length == 0) return null;
 
-        int bestScore = -1;
-        var arr = snap.CardOverrides;
+        List<(int Score, int Order, CardTextOverride Item)> matched = null;
         for (int i = 0; i < arr.Length; i++)
         {
             var c = arr[i];
+            if (c == null) continue;
+
             int score = -1;
             if (!string.IsNullOrEmpty(instanceId) && !string.IsNullOrEmpty(c.InstanceId)
                 && string.Equals(instanceId, c.InstanceId, StringComparison.OrdinalIgnoreCase))
@@ -646,17 +754,120 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             else if (!string.IsNullOrEmpty(templateId) && !string.IsNullOrEmpty(c.TemplateId)
                 && string.Equals(templateId, c.TemplateId, StringComparison.OrdinalIgnoreCase))
             {
+                // 防借壳污染：当候选明确标注为借壳自定义卡（非原位 Patch 且 CustomCardId != TemplateId）时，
+                // 仅允许通过 InstanceId 或 CustomCardId 命中，绝不通过借壳 TemplateId 误命中原版卡
+                if (c.IsCustomBorrowShell
+                    && !c.IsPatchOverride
+                    && !string.IsNullOrEmpty(c.CustomCardId)
+                    && !string.Equals(c.CustomCardId, c.TemplateId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
                 score = 10000 + c.Priority;
             }
 
-            if (score > bestScore)
+            if (score >= 0)
             {
-                bestScore = score;
-                cardOverride = c;
+                matched ??= new List<(int, int, CardTextOverride)>(4);
+                matched.Add((score, i, c));
             }
         }
 
-        return cardOverride != null;
+        if (matched == null || matched.Count == 0) return null;
+        if (matched.Count == 1) return matched[0].Item;
+
+        matched.Sort((a, b) =>
+        {
+            int cmp = b.Score.CompareTo(a.Score);
+            return cmp != 0 ? cmp : a.Order.CompareTo(b.Order);
+        });
+
+        var top = matched[0];
+        bool topIsBorrowShellNewCard = top.Score >= 20000
+            && !top.Item.IsPatchOverride
+            && (top.Item.IsCustomBorrowShell
+                || (!string.IsNullOrEmpty(top.Item.CustomCardId)
+                    && !string.Equals(top.Item.CustomCardId, templateId, StringComparison.OrdinalIgnoreCase)));
+        string topCustomCardId = top.Item.CustomCardId ?? string.Empty;
+
+        var result = new CardTextOverride
+        {
+            Priority = top.Item.Priority,
+        };
+
+        bool identityResolved = false;
+        for (int i = 0; i < matched.Count; i++)
+        {
+            var entry = matched[i];
+            var c = entry.Item;
+
+            // P0-18/P0-27 跨 Mod 借壳隔离：当最高分项为借壳新卡时，严禁混入仅按原版底座 TemplateId 命中的
+            // 原位 Patch（Score < 20000）、显式原位 Patch（IsPatchOverride=true）或其他 CustomCardId 条目，
+            // 彻底防止原位 Patch 的文案/被动词条/徽章/数值反灌进借壳新卡并击穿 ShouldSuppressVanillaPassives。
+            if (topIsBorrowShellNewCard)
+            {
+                if (entry.Score < 20000 || c.IsPatchOverride)
+                    continue;
+
+                if (!string.IsNullOrEmpty(topCustomCardId))
+                {
+                    bool sameCustomId = string.Equals(c.CustomCardId ?? string.Empty, topCustomCardId, StringComparison.OrdinalIgnoreCase)
+                        || (entry.Score >= 30000 && string.IsNullOrEmpty(c.CustomCardId));
+                    if (!sameCustomId)
+                        continue;
+                }
+            }
+
+            if (string.IsNullOrEmpty(result.ModId) && !string.IsNullOrEmpty(c.ModId)) result.ModId = c.ModId;
+            if (string.IsNullOrEmpty(result.Locale) && !string.IsNullOrEmpty(c.Locale)) result.Locale = c.Locale;
+            if (string.IsNullOrEmpty(result.InstanceId) && !string.IsNullOrEmpty(c.InstanceId)) result.InstanceId = c.InstanceId;
+            if (string.IsNullOrEmpty(result.CustomCardId) && !string.IsNullOrEmpty(c.CustomCardId)) result.CustomCardId = c.CustomCardId;
+            if (string.IsNullOrEmpty(result.TemplateId) && !string.IsNullOrEmpty(c.TemplateId)) result.TemplateId = c.TemplateId;
+
+            if (!identityResolved && (c.IsCustomBorrowShell || c.IsPatchOverride))
+            {
+                result.IsPatchOverride = c.IsPatchOverride;
+                result.IsCustomBorrowShell = c.IsCustomBorrowShell;
+                identityResolved = true;
+            }
+
+            if (string.IsNullOrWhiteSpace(result.Title) && !string.IsNullOrWhiteSpace(c.Title)) result.Title = c.Title;
+            if (string.IsNullOrWhiteSpace(result.TitleEn) && !string.IsNullOrWhiteSpace(c.TitleEn)) result.TitleEn = c.TitleEn;
+            if (string.IsNullOrWhiteSpace(result.Description) && !string.IsNullOrWhiteSpace(c.Description)) result.Description = c.Description;
+            if (string.IsNullOrWhiteSpace(result.DescriptionEn) && !string.IsNullOrWhiteSpace(c.DescriptionEn)) result.DescriptionEn = c.DescriptionEn;
+
+            if ((result.ActiveTooltips == null || result.ActiveTooltips.Length == 0) && c.ActiveTooltips != null && c.ActiveTooltips.Length > 0)
+                result.ActiveTooltips = c.ActiveTooltips;
+            if ((result.ActiveTooltipsEn == null || result.ActiveTooltipsEn.Length == 0) && c.ActiveTooltipsEn != null && c.ActiveTooltipsEn.Length > 0)
+                result.ActiveTooltipsEn = c.ActiveTooltipsEn;
+            if ((result.PassiveTooltips == null || result.PassiveTooltips.Length == 0) && c.PassiveTooltips != null && c.PassiveTooltips.Length > 0)
+                result.PassiveTooltips = c.PassiveTooltips;
+            if ((result.PassiveTooltipsEn == null || result.PassiveTooltipsEn.Length == 0) && c.PassiveTooltipsEn != null && c.PassiveTooltipsEn.Length > 0)
+                result.PassiveTooltipsEn = c.PassiveTooltipsEn;
+
+            if ((result.TierAttributes == null || result.TierAttributes.Count == 0) && c.TierAttributes != null && c.TierAttributes.Count > 0)
+                result.TierAttributes = c.TierAttributes;
+            if ((result.EnchantmentPreviewOps == null || result.EnchantmentPreviewOps.Count == 0) && c.EnchantmentPreviewOps != null && c.EnchantmentPreviewOps.Count > 0)
+                result.EnchantmentPreviewOps = c.EnchantmentPreviewOps;
+            if ((result.EnchantmentTooltips == null || result.EnchantmentTooltips.Count == 0) && c.EnchantmentTooltips != null && c.EnchantmentTooltips.Count > 0)
+                result.EnchantmentTooltips = c.EnchantmentTooltips;
+            if ((result.EnchantmentTooltipsEn == null || result.EnchantmentTooltipsEn.Count == 0) && c.EnchantmentTooltipsEn != null && c.EnchantmentTooltipsEn.Count > 0)
+                result.EnchantmentTooltipsEn = c.EnchantmentTooltipsEn;
+            if ((result.CounterDisplays == null || result.CounterDisplays.Length == 0) && c.CounterDisplays != null && c.CounterDisplays.Length > 0)
+                result.CounterDisplays = c.CounterDisplays;
+            if ((result.ExtraDisplayTags == null || result.ExtraDisplayTags.Length == 0) && c.ExtraDisplayTags != null && c.ExtraDisplayTags.Length > 0)
+                result.ExtraDisplayTags = c.ExtraDisplayTags;
+            if (result.MonsterPreview == null && c.MonsterPreview != null)
+                result.MonsterPreview = c.MonsterPreview;
+        }
+
+        if (topIsBorrowShellNewCard)
+        {
+            result.IsCustomBorrowShell = true;
+            result.IsPatchOverride = false;
+        }
+        if (string.IsNullOrEmpty(result.Locale)) result.Locale = "zh-CN";
+        return result;
     }
 
     public void NotifyLocaleReloaded(string overlayRevision = "")
@@ -886,20 +1097,20 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         try
         {
             string cached = ModContentSyncClient.Instance.OverlayCachePath;
-            if (File.Exists(cached))
-            {
-                LoadOverlayJson(File.ReadAllText(cached, Encoding.UTF8), "local-cache");
-                return;
-            }
-
             string cfgDir = BepInEx.Paths.ConfigPath ?? string.Empty;
             string alt = Path.Combine(cfgDir, "custom_zh_overlay.json");
-            if (File.Exists(alt))
+
+            // D7-P1-02：比较本地缓存与 BepInEx/config 离线词典的 revision / 最后写入时间，择最新加载
+            string picked = OverlayCandidateSelector.PickLatestPath(new[] { cached, alt });
+            if (!string.IsNullOrEmpty(picked) && File.Exists(picked))
             {
-                LoadOverlayJson(File.ReadAllText(alt, Encoding.UTF8), "config-overlay");
+                string tag = string.Equals(picked, cached, StringComparison.OrdinalIgnoreCase)
+                    ? "local-cache"
+                    : "config-overlay";
+                LoadOverlayJson(File.ReadAllText(picked, Encoding.UTF8), tag);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L1113", diagEx); }
     }
 
     // ── Harmony 钩子安装 ─────────────────────────────────────────────────────
@@ -1070,6 +1281,32 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                     }
                 }
             }
+
+            // D3-P1-11：挂钩 TagRenderer.Render 注入自定义 ExtraDisplayTags（兼容原生 ECardTag 与自定义字符串标签）
+            var tagRendererType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.TagRenderer");
+            if (tagRendererType != null)
+            {
+                _tagRendererCtrlField = AccessTools.Field(tagRendererType, "_controller");
+                MethodInfo renderMethod = null;
+                foreach (var m in tagRendererType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                {
+                    if (m.Name != "Render") continue;
+                    var ps = m.GetParameters();
+                    if (ps.Length == 4 && ps[2].ParameterType == typeof(ECardType))
+                    {
+                        renderMethod = m;
+                        break;
+                    }
+                }
+                if (renderMethod != null)
+                {
+                    patcher.TryPatchMethod(
+                        renderMethod,
+                        prefix: AccessTools.Method(typeof(LocalizationOverlayModule), nameof(TagRendererRenderPrefix)),
+                        optional: true,
+                        label: "L10n.TagRenderer.Render");
+                }
+            }
         }
     }
 
@@ -1137,10 +1374,11 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             var inst = Instance;
             if (inst == null || __instance == null) return;
             string locale = inst.CurrentLocale;
-            if (!IsChineseLocale(locale)) return;
+            bool isZh = IsChineseLocale(locale);
 
-            if (!TryExtractCardOverride(__instance, locale, out var ov, out _)) return;
-            if (string.IsNullOrWhiteSpace(ov.Title)) return;
+            if (!TryExtractCardMetadata(__instance, out var ov, out _)) return;
+            string title = PickLocalizedString(isZh, ov.Title, ov.TitleEn, ov.IsCustomBorrowShell);
+            if (string.IsNullOrWhiteSpace(title)) return;
 
             // 保留原版生成的 <style=Tiny> 或附魔富文本前缀（如 "剧毒\n"），仅替换标题正文段
             if (!string.IsNullOrEmpty(__result))
@@ -1148,13 +1386,13 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 int nl = __result.LastIndexOf('\n');
                 if (nl >= 0 && nl < __result.Length - 1)
                 {
-                    __result = __result.Substring(0, nl + 1) + ov.Title;
+                    __result = __result.Substring(0, nl + 1) + title;
                     return;
                 }
             }
-            __result = ov.Title;
+            __result = title;
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L1395", diagEx); }
     }
 
     private static bool TryResolveCardDescriptionOverride(object tooltipData, out string renderedDescription)
@@ -1163,12 +1401,15 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         var inst = Instance;
         if (inst == null || tooltipData == null) return false;
         string locale = inst.CurrentLocale;
-        if (!IsChineseLocale(locale)) return false;
+        bool isZh = IsChineseLocale(locale);
 
-        if (!TryExtractCardOverride(tooltipData, locale, out var ov, out var cardInst)) return false;
-        if (string.IsNullOrWhiteSpace(ov.Description)) return false;
+        if (!TryExtractCardMetadata(tooltipData, out var ov, out var cardInst)) return false;
+        string desc = PickLocalizedString(isZh, ov.Description, ov.DescriptionEn, ov.IsCustomBorrowShell);
+        if (string.IsNullOrWhiteSpace(desc)) return false;
 
-        renderedDescription = RenderDynamicAttributePlaceholders(ov.Description, cardInst);
+        // D3-P1-11：描述渲染同样透传 ov 与 isUpgradePreview，使描述中的 {attr.*} 支持非枚举回退与升阶对比箭头
+        bool isUpgradePreview = SafeGetPropertyValue(_tooltipCanFuseProp, tooltipData) is bool cf && cf;
+        renderedDescription = RenderDynamicAttributePlaceholders(desc, cardInst, ov, isUpgradePreview);
         return true;
     }
 
@@ -1181,7 +1422,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 __result = desc;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L1425", diagEx); }
     }
 
     private static void CardTooltipGetDescriptionTuplePostfix<TSecond>(object __instance, ref ValueTuple<string, TSecond> __result)
@@ -1193,7 +1434,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 __result = (desc, __result.Item2);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L1437", diagEx); }
     }
 
     private static void CardTooltipGetTooltipsOfTypePostfix(object __instance, object __0, ref IList __result)
@@ -1203,33 +1444,37 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             var inst = Instance;
             if (inst == null || __instance == null || __0 == null) return;
             string locale = inst.CurrentLocale;
-            if (!IsChineseLocale(locale)) return;
+            bool isZh = IsChineseLocale(locale);
 
-            if (!TryExtractCardOverride(__instance, locale, out var ov, out var cardInst)) return;
+            if (!TryExtractCardMetadata(__instance, out var ov, out var cardInst)) return;
 
             string tipKind = __0.ToString();
+            bool isPassive = string.Equals(tipKind, "Passive", StringComparison.OrdinalIgnoreCase);
             string[] lines = null;
             if (string.Equals(tipKind, "Active", StringComparison.OrdinalIgnoreCase))
             {
-                lines = ov.ActiveTooltips;
+                lines = PickLocalizedLines(isZh, ov.ActiveTooltips, ov.ActiveTooltipsEn, ov.IsCustomBorrowShell);
             }
-            else if (string.Equals(tipKind, "Passive", StringComparison.OrdinalIgnoreCase))
+            else if (isPassive)
             {
-                lines = ov.PassiveTooltips;
+                lines = PickLocalizedLines(isZh, ov.PassiveTooltips, ov.PassiveTooltipsEn, ov.IsCustomBorrowShell);
             }
 
             string[] enchLinesToAppend = null;
-            if (ov.EnchantmentTooltips != null && cardInst != null && string.Equals(tipKind, "Passive", StringComparison.OrdinalIgnoreCase))
+            var enchMap = PickLocalizedEnchantTooltips(isZh, ov.EnchantmentTooltips, ov.EnchantmentTooltipsEn, ov.IsCustomBorrowShell);
+            if (enchMap != null && cardInst != null && isPassive)
             {
                 var cardMembers = GetCardMemberCache(cardInst.GetType());
                 string ench = SafeGetPropertyValue(cardMembers.Enchantment, cardInst)?.ToString();
-                if (!string.IsNullOrEmpty(ench) && ov.EnchantmentTooltips.TryGetValue(ench, out var foundEnchLines) && foundEnchLines != null && foundEnchLines.Length > 0)
+                if (!string.IsNullOrEmpty(ench) && enchMap.TryGetValue(ench, out var foundEnchLines) && foundEnchLines != null && foundEnchLines.Length > 0)
                     enchLinesToAppend = foundEnchLines;
             }
 
             bool hasBaseLines = lines != null && lines.Length > 0;
             bool hasEnchLines = enchLinesToAppend != null && enchLinesToAppend.Length > 0;
-            if (!hasBaseLines && !hasEnchLines) return;
+            bool suppressVanillaPassives = isPassive && ShouldSuppressVanillaPassives(ov.IsCustomBorrowShell, lines);
+
+            if (!hasBaseLines && !hasEnchLines && !suppressVanillaPassives) return;
 
             EnsureTLocalizableTextMeta();
             if (_tLocalizableTextType == null) return;
@@ -1248,9 +1493,10 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                     if (locObj != null) customList.Add(locObj);
                 }
             }
-            else if (__result != null)
+            else if (!suppressVanillaPassives && __result != null)
             {
-                // 若未覆写基础被动词条但命了附魔词条，保留原列表并追加自定义附魔词条
+                // 仅对非借壳卡（或原位 Patch 卡）保留原列表并追加自定义附魔词条；
+                // 全新借壳自定义卡未配 PassiveTooltips 时严禁把借壳底座被动带入 customList
                 foreach (var existing in __result) customList.Add(existing);
             }
 
@@ -1263,12 +1509,134 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 }
             }
 
-            if (customList.Count > 0)
+            if (customList.Count > 0 || suppressVanillaPassives)
             {
                 __result = customList;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L1517", diagEx); }
+    }
+
+    private static bool TagRendererRenderPrefix(object __instance, object __0, ref HashSet<ECardTag> __1, ECardType __2, object __3)
+    {
+        try
+        {
+            if (__instance == null || __0 == null) return true;
+            if (!TryResolveOverrideForCardObject(__0, null, out var ov)
+                || ov?.ExtraDisplayTags == null || ov.ExtraDisplayTags.Length == 0)
+            {
+                return true;
+            }
+
+            var extraEnums = new List<ECardTag>();
+            var customFreeformTags = new List<string>();
+            for (int i = 0; i < ov.ExtraDisplayTags.Length; i++)
+            {
+                string rawTag = ov.ExtraDisplayTags[i];
+                if (string.IsNullOrWhiteSpace(rawTag)) continue;
+                string trimmed = rawTag.Trim();
+                if (Enum.TryParse<ECardTag>(trimmed, ignoreCase: true, out var parsedTag))
+                {
+                    extraEnums.Add(parsedTag);
+                }
+                else
+                {
+                    customFreeformTags.Add(trimmed);
+                }
+            }
+
+            if (extraEnums.Count == 0 && customFreeformTags.Count == 0)
+                return true;
+
+            var mergedSet = __1 != null ? new HashSet<ECardTag>(__1) : new HashSet<ECardTag>();
+            for (int i = 0; i < extraEnums.Count; i++) mergedSet.Add(extraEnums[i]);
+
+            // 若全部额外标签皆为原生 ECardTag 枚举，直接并入 HashSet 交由原版管线原生着色渲染
+            if (customFreeformTags.Count == 0)
+            {
+                __1 = mergedSet;
+                return true;
+            }
+
+            // 存在自定义自由文本标签：尝试直接构造最终字符串列表调用 _controller.InitTooltipTag
+            object ctrl = _tagRendererCtrlField?.GetValue(__instance);
+            if (ctrl != null)
+            {
+                _tooltipTagInitMethod ??= AccessTools.Method(ctrl.GetType(), "InitTooltipTag");
+                if (_tooltipTagInitMethod != null)
+                {
+                    var cardSizeProp = __0.GetType().GetProperty("Size", BindingFlags.Public | BindingFlags.Instance);
+                    string sizeStr = cardSizeProp?.GetValue(__0)?.ToString() ?? "Medium";
+
+                    var formattedList = new List<string>();
+                    foreach (var t in mergedSet)
+                    {
+                        string colored = TryColorTagWithNativeTypography(t);
+                        if (!string.IsNullOrWhiteSpace(colored)) formattedList.Add(colored);
+                    }
+
+                    string locale = Instance?.CurrentLocale ?? "zh-CN";
+                    for (int i = 0; i < customFreeformTags.Count; i++)
+                    {
+                        string raw = customFreeformTags[i];
+                        string disp = Instance != null && IsChineseLocale(locale)
+                            && Instance.TryResolveText(locale, null, raw, "CardTag", out string zh)
+                            ? zh
+                            : raw;
+                        if (!formattedList.Contains(disp))
+                        {
+                            formattedList.Add(disp);
+                        }
+                    }
+
+                    _tooltipTagInitMethod.Invoke(ctrl, new object[] { sizeStr, __2, formattedList, __3 });
+                    return false;
+                }
+            }
+
+            // 反射回退：至少把可解析的枚举标签并入原版集合
+            __1 = mergedSet;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LogL10nHookErrorThrottled(nameof(TagRendererRenderPrefix), ex);
+            return true;
+        }
+    }
+
+    private static string TryColorTagWithNativeTypography(ECardTag tag)
+    {
+        try
+        {
+            if (_dataTooltipTypographyProp == null)
+            {
+                var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
+                _dataTooltipTypographyProp = dataType?.GetProperty("TooltipTypography", BindingFlags.Public | BindingFlags.Static);
+            }
+            object typo = _dataTooltipTypographyProp?.GetValue(null);
+            if (typo != null)
+            {
+                _tooltipColorTagMethod ??= AccessTools.Method(typo.GetType(), "ColorTag", new[] { typeof(ECardTag) })
+                    ?? AccessTools.Method(typo.GetType(), "ColorTag", new[] { typeof(string) });
+                if (_tooltipColorTagMethod != null)
+                {
+                    var ps = _tooltipColorTagMethod.GetParameters();
+                    object arg = ps.Length == 1 && ps[0].ParameterType == typeof(ECardTag)
+                        ? (object)tag
+                        : tag.ToString();
+                    if (_tooltipColorTagMethod.Invoke(typo, new[] { arg }) is string s && !string.IsNullOrWhiteSpace(s))
+                        return s;
+                }
+            }
+        }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L1633", diagEx); }
+
+        string raw = tag.ToString();
+        string locale = Instance?.CurrentLocale ?? "zh-CN";
+        if (Instance != null && IsChineseLocale(locale) && Instance.TryResolveText(locale, null, raw, null, out string zh))
+            return zh;
+        return raw;
     }
 
     private static void CardTooltipNextTierHasAttrPostfix(object __instance, object __0, ref bool __result)
@@ -1293,7 +1661,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                        && nextMap != null
                        && nextMap.ContainsKey(attrName);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L1664", diagEx); }
     }
 
     private static void CardTooltipGetBaseValuePostfix(object __instance, object __0, object __1, float __2, object __3, ref float? __result)
@@ -1302,14 +1670,40 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         {
             var inst = Instance;
             if (inst == null || __instance == null || __0 == null || __1 == null || __3 == null) return;
-            if (!TryExtractCardMetadata(__instance, out var ov, out _)) return;
+            if (!TryExtractCardMetadata(__instance, out var ov, out var cardInst)) return;
             if (ov?.TierAttributes == null || ov.TierAttributes.Count == 0) return;
 
             string attrName = __0.ToString();
             string nextTier = __1.ToString();
             string curTier = __3.ToString();
             if (!ov.TierAttributes.TryGetValue(nextTier, out var nextMap) || nextMap == null || !nextMap.TryGetValue(attrName, out double nextRaw))
+            {
+                // P0-27：全新借壳自定义卡在 TierAttributes 中未声明该属性时，绝不泄露原版借壳底座基值
+                if (ov.IsCustomBorrowShell)
+                {
+                    bool presentOnInstance = false;
+                    if (cardInst != null)
+                    {
+                        var members = GetCardMemberCache(cardInst.GetType());
+                        if (SafeGetPropertyValue(members.Attributes, cardInst) is IDictionary curAttrs)
+                        {
+                            foreach (DictionaryEntry kv in curAttrs)
+                            {
+                                if (string.Equals(kv.Key?.ToString(), attrName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    presentOnInstance = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!presentOnInstance)
+                    {
+                        __result = null;
+                    }
+                }
                 return;
+            }
 
             bool isDur = DurationAttrNames.Contains(attrName);
             double nextDisp = isDur ? nextRaw / 1000.0 : nextRaw;
@@ -1324,7 +1718,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 __result = (float)nextDisp;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L1721", diagEx); }
     }
 
     // ── 通用自定义卡/补丁卡 详情与品阶/附魔预览全链路拦截 ─────────────────────
@@ -1338,6 +1732,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         if (inst == null) return false;
 
         string iid = null;
+        string customId = CustomContentVisualModule.TryGetPreviewCustomCardId(cardObj);
         string tplId = null;
         if (cardObj != null)
         {
@@ -1350,7 +1745,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             var tplMembers = GetCardMemberCache(cardTemplateObj.GetType());
             tplId = SafeGetPropertyValue(tplMembers.Id, cardTemplateObj)?.ToString();
         }
-        return inst.TryResolveCardMetadata(iid, null, tplId, out ov) && ov != null;
+        return inst.TryResolveCardMetadata(iid, customId, tplId, out ov) && ov != null;
     }
 
     private static Dictionary<string, double> SelectBestTierAttrMap(
@@ -1517,7 +1912,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                         && Enum.TryParse<ECardAttributeType>(op.SourceAttribute, ignoreCase: true, out var srcEnum)
                         && previewAttributes.TryGetValue(srcEnum, out int srcInt))
                     {
-                        operand = srcInt;
+                        operand = EvaluatePreviewAttrDerivedValue(srcInt, op.SourceMultiplier, op.SourceAddOffset);
                     }
 
                     double cur = previewAttributes.TryGetValue(attrEnum, out int existing)
@@ -1689,11 +2084,12 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         }
     }
 
-    private static bool TryExtractCardMetadata(object tooltipData, out CardTextOverride ov, out object cardInst)
+    internal static bool TryExtractCardMetadata(object tooltipData, out CardTextOverride ov, out object cardInst)
     {
         ov = null;
         cardInst = SafeGetPropertyValue(_tooltipCardInstanceProp, tooltipData);
         string iid = null;
+        string customId = CustomContentVisualModule.TryGetPreviewCustomCardId(cardInst);
         string tplId = null;
 
         if (cardInst != null)
@@ -1713,7 +2109,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             }
         }
 
-        return Instance != null && Instance.TryResolveCardMetadata(iid, null, tplId, out ov) && ov != null;
+        return Instance != null && Instance.TryResolveCardMetadata(iid, customId, tplId, out ov) && ov != null;
     }
 
     private static bool TryExtractCardOverride(object tooltipData, string locale, out CardTextOverride ov, out object cardInst)
@@ -1721,6 +2117,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         ov = null;
         cardInst = SafeGetPropertyValue(_tooltipCardInstanceProp, tooltipData);
         string iid = null;
+        string customId = CustomContentVisualModule.TryGetPreviewCustomCardId(cardInst);
         string tplId = null;
 
         if (cardInst != null)
@@ -1740,7 +2137,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             }
         }
 
-        return Instance != null && Instance.TryResolveCardText(locale, iid, null, tplId, out ov) && ov != null;
+        return Instance != null && Instance.TryResolveCardText(locale, iid, customId, tplId, out ov) && ov != null;
     }
 
     private static string FormatAttrNumber(string attrName, double rawVal)
@@ -1896,7 +2293,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             mapObj?.GetType().GetMethod("Clear", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null)?.Invoke(mapObj, null);
             listObj?.GetType().GetMethod("Clear", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null)?.Invoke(listObj, null);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L2296", diagEx); }
     }
 
     internal static string DetectCurrentGameLocale()
@@ -1916,7 +2313,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
                 if (!string.IsNullOrWhiteSpace(code)) return NormalizeLocale(code);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L2316", diagEx); }
         return "zh-CN";
     }
 
@@ -2048,6 +2445,104 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         return new string(hex);
     }
 
+    private void SubscribeNativeLocaleChanged()
+    {
+        try
+        {
+            UnsubscribeNativeLocaleChanged();
+            var svcType = AccessTools.TypeByName("TheBazaar.Localization.LocalizationService");
+            if (svcType == null) return;
+
+            var servicesType = AccessTools.TypeByName("TheBazaar.AppFramework.Services");
+            var getGeneric = servicesType?.GetMethod("Get", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+            object locSvc = null;
+            if (getGeneric != null && getGeneric.IsGenericMethodDefinition)
+            {
+                locSvc = getGeneric.MakeGenericMethod(svcType).Invoke(null, null);
+            }
+            if (locSvc == null) return;
+
+            var ev = svcType.GetEvent("LocaleChanged", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (ev == null || ev.EventHandlerType == null) return;
+
+            var invokeM = ev.EventHandlerType.GetMethod("Invoke");
+            var ps = invokeM?.GetParameters() ?? Array.Empty<ParameterInfo>();
+            Delegate del = null;
+            if (ps.Length == 0)
+            {
+                var target = typeof(LocalizationOverlayModule).GetMethod(nameof(OnNativeLocaleChanged0), BindingFlags.NonPublic | BindingFlags.Static);
+                if (target != null) del = Delegate.CreateDelegate(ev.EventHandlerType, target, throwOnBindFailure: false);
+            }
+            else if (ps.Length == 1)
+            {
+                var open = typeof(LocalizationOverlayModule).GetMethod(nameof(OnNativeLocaleChanged1), BindingFlags.NonPublic | BindingFlags.Static);
+                if (open != null)
+                {
+                    var closed = open.MakeGenericMethod(ps[0].ParameterType);
+                    del = Delegate.CreateDelegate(ev.EventHandlerType, closed, throwOnBindFailure: false);
+                }
+            }
+            else if (ps.Length == 2)
+            {
+                var open = typeof(LocalizationOverlayModule).GetMethod(nameof(OnNativeLocaleChanged2), BindingFlags.NonPublic | BindingFlags.Static);
+                if (open != null)
+                {
+                    var closed = open.MakeGenericMethod(ps[0].ParameterType, ps[1].ParameterType);
+                    del = Delegate.CreateDelegate(ev.EventHandlerType, closed, throwOnBindFailure: false);
+                }
+            }
+
+            if (del != null)
+            {
+                ev.AddEventHandler(locSvc, del);
+                _nativeLocaleSvcObj = locSvc;
+                _nativeLocaleChangedEvent = ev;
+                _nativeLocaleChangedDelegate = del;
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"[LocalizationOverlay] 订阅 LocalizationService.LocaleChanged 失败: {ex.Message}");
+        }
+    }
+
+    private void UnsubscribeNativeLocaleChanged()
+    {
+        try
+        {
+            if (_nativeLocaleChangedEvent != null && _nativeLocaleSvcObj != null && _nativeLocaleChangedDelegate != null)
+            {
+                _nativeLocaleChangedEvent.RemoveEventHandler(_nativeLocaleSvcObj, _nativeLocaleChangedDelegate);
+            }
+        }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L2518", diagEx); }
+        finally
+        {
+            _nativeLocaleSvcObj = null;
+            _nativeLocaleChangedEvent = null;
+            _nativeLocaleChangedDelegate = null;
+        }
+    }
+
+    private static void OnNativeLocaleChanged0() => HandleNativeLocaleChanged();
+    private static void OnNativeLocaleChanged1<T1>(T1 _) => HandleNativeLocaleChanged();
+    private static void OnNativeLocaleChanged2<T1, T2>(T1 _, T2 __) => HandleNativeLocaleChanged();
+
+    private static void HandleNativeLocaleChanged()
+    {
+        var inst = Instance;
+        if (inst == null) return;
+        inst._resolveMemo.Clear();
+        MainThreadDispatcher.Enqueue(() =>
+        {
+            string newLocale = DetectCurrentGameLocale();
+            FlushNativeLocalizationServiceCache();
+            TournamentLocalizationPatch.RefreshOnLocaleChanged(newLocale);
+            BazaarLauncherPlugin.Host?.EventBus.Publish(new LocaleSwitchedModEvent(newLocale, inst._overlayRevision));
+            CustomContentVisualModule.Instance?.ReapplyActiveVisualsOnMainThread();
+        });
+    }
+
     private sealed class CallbackDisposable : IDisposable
     {
         private Action _act;
@@ -2059,5 +2554,134 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
     {
         public static readonly EmptyDisposable Instance = new();
         public void Dispose() { }
+    }
+}
+
+/// <summary>
+/// D7-P1-02：离线词典候选选择器——优先按 JSON 内 revision/version 自然序择高，版本相等或缺失时按最后写入时间择新。
+/// </summary>
+internal static class OverlayCandidateSelector
+{
+    private static readonly Regex RevisionFieldRegex = new(
+        "\"(?:revision|version)\"\\s*:\\s*\"([^\"]*)\"",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    internal static string PickLatestPath(IEnumerable<string> candidatePaths)
+    {
+        if (candidatePaths == null) return null;
+
+        string bestPath = null;
+        string bestRev = null;
+        DateTime bestUtc = DateTime.MinValue;
+
+        foreach (string path in candidatePaths)
+        {
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) continue;
+
+            string rev = TryReadRevision(path);
+            DateTime utc;
+            try { utc = File.GetLastWriteTimeUtc(path); }
+            catch { utc = DateTime.MinValue; }
+
+            if (bestPath == null || IsCandidateNewer(rev, utc, bestRev, bestUtc))
+            {
+                bestPath = path;
+                bestRev = rev;
+                bestUtc = utc;
+            }
+        }
+
+        return bestPath;
+    }
+
+    private static bool IsCandidateNewer(string candRev, DateTime candUtc, string bestRev, DateTime bestUtc)
+    {
+        bool candHas = HasMeaningfulRevision(candRev);
+        bool bestHas = HasMeaningfulRevision(bestRev);
+
+        if (candHas && bestHas)
+        {
+            int cmp = CompareNaturalRevision(candRev, bestRev);
+            if (cmp != 0) return cmp > 0;
+            return candUtc > bestUtc;
+        }
+        if (candHas != bestHas)
+        {
+            return candHas;
+        }
+        return candUtc > bestUtc;
+    }
+
+    private static bool HasMeaningfulRevision(string rev)
+    {
+        if (string.IsNullOrWhiteSpace(rev)) return false;
+        string t = rev.Trim();
+        return !string.Equals(t, "builtin", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(t, "synced", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string TryReadRevision(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            int readLen = (int)Math.Min(fs.Length, 4096);
+            if (readLen <= 0) return null;
+            byte[] buf = new byte[readLen];
+            int actual = fs.Read(buf, 0, readLen);
+            string head = Encoding.UTF8.GetString(buf, 0, actual);
+            var m = RevisionFieldRegex.Match(head);
+            if (m.Success)
+            {
+                return m.Groups[1].Value?.Trim();
+            }
+
+            if (fs.Length <= 4 * 1024 * 1024)
+            {
+                fs.Position = 0;
+                using var sr = new StreamReader(fs, Encoding.UTF8);
+                var obj = JObject.Parse(sr.ReadToEnd());
+                return ((string)(obj["revision"] ?? obj["version"]))?.Trim();
+            }
+        }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L2647", diagEx); }
+        return null;
+    }
+
+    private static int CompareNaturalRevision(string a, string b)
+    {
+        a ??= string.Empty;
+        b ??= string.Empty;
+        int ia = 0, ib = 0;
+        while (ia < a.Length && ib < b.Length)
+        {
+            bool da = char.IsDigit(a[ia]);
+            bool db = char.IsDigit(b[ib]);
+            if (da && db)
+            {
+                long na = 0;
+                while (ia < a.Length && char.IsDigit(a[ia]))
+                {
+                    na = na * 10 + (a[ia] - '0');
+                    ia++;
+                }
+                long nb = 0;
+                while (ib < b.Length && char.IsDigit(b[ib]))
+                {
+                    nb = nb * 10 + (b[ib] - '0');
+                    ib++;
+                }
+                int cmp = na.CompareTo(nb);
+                if (cmp != 0) return cmp;
+            }
+            else
+            {
+                int cmp = char.ToUpperInvariant(a[ia]).CompareTo(char.ToUpperInvariant(b[ib]));
+                if (cmp != 0) return cmp;
+                ia++;
+                ib++;
+            }
+        }
+        return (a.Length - ia).CompareTo(b.Length - ib);
     }
 }

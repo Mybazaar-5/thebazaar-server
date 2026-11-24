@@ -27,42 +27,19 @@ namespace BazaarCore.Tests;
 /// 5. 全链路验证：ModLoader 扫描 mechanics/*.json → Gate #4 静态校验 → ModRegistry 热重载与 RollbackToBase 零残留；
 /// 6. 工坊 API & 全量词缀自由拼装验证：TTriggerOr + TActionAnd 多动作链真战斗执行，及 /api/workshop/mechanics 与 /api/workshop/mechanics/stress-test 端到端通过。
 /// </summary>
+[Xunit.Collection("GlobalStaticState")]
 public sealed class V14_OpenMechanicSandboxTests
 {
     private const string SmallItemCarrierId = "03b1fd16-6b0d-4847-a76f-6c586f7c5958";
 
     private static readonly Lazy<SharedData> Shared = new(LoadShared);
 
-    private sealed record SharedData(string RepoRoot, GameDataRepository Repo, HashSet<string> Whitelist);
+    private sealed record SharedData(string RepoRoot, string DataDir, GameDataRepository Repo, HashSet<string> Whitelist);
 
     private static SharedData LoadShared()
     {
-        var cur = new DirectoryInfo(AppContext.BaseDirectory);
-        string? repoRoot = null;
-        while (cur != null)
-        {
-            if (File.Exists(Path.Combine(cur.FullName, "Bazaar.sln")))
-            {
-                repoRoot = cur.FullName;
-                break;
-            }
-            cur = cur.Parent;
-        }
-        Assert.False(string.IsNullOrWhiteSpace(repoRoot), "未定位到 Bazaar.sln 根目录");
-        string dataRoot = Path.Combine(repoRoot!, "dist", "data");
-        string? dbPath = SteamPathResolver.ResolveGameDataSourcePath(dataRoot);
-        Assert.False(string.IsNullOrWhiteSpace(dbPath));
-        string? zhPath = SteamPathResolver.ResolveZhCnTranslationPath(dataRoot);
-        var repo = GameDatabaseLoader.Load(dbPath!, zhPath);
-        var wl = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        using (var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(dataRoot, "valid_card_ids.json"), Encoding.UTF8)))
-        {
-            var arr = doc.RootElement.ValueKind == JsonValueKind.Array ? doc.RootElement : doc.RootElement.GetProperty("valid_ids");
-            foreach (var it in arr.EnumerateArray())
-                if (it.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(it.GetString()))
-                    wl.Add(it.GetString()!);
-        }
-        return new SharedData(repoRoot!, repo, wl);
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
+        return new SharedData(shared.RepoRoot, shared.DataDir, shared.Repo, shared.CreateValidCardIdsCopy());
     }
 
     private static JsonElement J(object v) => JsonSerializer.SerializeToElement(v);
@@ -737,7 +714,7 @@ public sealed class V14_OpenMechanicSandboxTests
 
         var modHost = new ServerModHost(
             data.Repo,
-            Path.Combine(data.RepoRoot, "dist", "data"),
+            data.DataDir,
             tempState,
             data.Whitelist,
             modsRootOverride: tempMods);

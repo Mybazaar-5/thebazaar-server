@@ -7,6 +7,7 @@ using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -105,27 +106,33 @@ internal static class SmartStrategy
         index.SelfDisableNeighborIds.Add("1654faeb-e324-46d6-a1e8-d4b838f951a6"); // Void Disruptor
         index.SelfDisableNeighborNames.Add("Void Disruptor");
 
+        // D8-P2-07：改为只读检索权威 SQLite GameData.db 的 cards 表，彻底移除已废弃的 cards.json 依赖
         try
         {
-            string cardsPath = ResolveCardsJsonPath();
-            if (!string.IsNullOrEmpty(cardsPath) && File.Exists(cardsPath))
+            string dbPath = ResolveGameDataDbPath();
+            if (!string.IsNullOrEmpty(dbPath) && File.Exists(dbPath))
             {
-                using var sr = new StreamReader(cardsPath);
-                using var reader = new JsonTextReader(sr);
+                string connStr = new SqliteConnectionStringBuilder
+                {
+                    DataSource = dbPath,
+                    Mode = SqliteOpenMode.ReadOnly,
+                }.ToString();
+                using var conn = new SqliteConnection(connStr);
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT Data FROM cards";
+                using var reader = cmd.ExecuteReader();
                 while (reader.Read())
                 {
-                    if (reader.TokenType == JsonToken.StartArray)
+                    if (reader.IsDBNull(0)) continue;
+                    string rawJson = reader.GetString(0);
+                    if (string.IsNullOrWhiteSpace(rawJson)) continue;
+                    try
                     {
-                        while (reader.Read() && reader.TokenType != JsonToken.EndArray)
-                        {
-                            if (reader.TokenType == JsonToken.StartObject)
-                            {
-                                var card = JObject.Load(reader);
-                                ClassifyCardHazards(card, index);
-                            }
-                        }
-                        break;
+                        var card = JObject.Parse(rawJson);
+                        ClassifyCardHazards(card, index);
                     }
+                    catch { }
                 }
             }
         }
@@ -134,28 +141,34 @@ internal static class SmartStrategy
         return index;
     }
 
-    private static string ResolveCardsJsonPath()
+    private static string ResolveGameDataDbPath()
     {
-        string env = Environment.GetEnvironmentVariable("BAZAAR_CARDS_JSON");
-        if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return env;
+        string envDb = Environment.GetEnvironmentVariable("BAZAAR_GAMEDATA_DB");
+        if (!string.IsNullOrWhiteSpace(envDb) && File.Exists(envDb)) return envDb;
+
+        string envData = Environment.GetEnvironmentVariable("BAZAAR_DATA");
+        if (!string.IsNullOrWhiteSpace(envData))
+        {
+            string fromData = Path.Combine(envData, "GameData.db");
+            if (File.Exists(fromData)) return fromData;
+        }
 
         foreach (string start in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
         {
             string dir = start;
             for (int i = 0; i < 10 && !string.IsNullOrEmpty(dir); i++)
             {
-                string c1 = Path.Combine(dir, "dist", "data", "cards.json");
+                string c1 = Path.Combine(dir, "dist", "data", "GameData.db");
                 if (File.Exists(c1)) return c1;
-                string c2 = Path.Combine(dir, "data", "cards.json");
+                string c2 = Path.Combine(dir, "data", "GameData.db");
                 if (File.Exists(c2)) return c2;
-                string c3 = Path.Combine(dir, "cards.json");
+                string c3 = Path.Combine(dir, "GameData.db");
                 if (File.Exists(c3)) return c3;
                 dir = Path.GetDirectoryName(dir);
             }
         }
 
-        const string fallback = @"e:\thebazaar\dist\data\cards.json";
-        return File.Exists(fallback) ? fallback : null;
+        return null;
     }
 
     private static void ClassifyCardHazards(JObject card, PositionalHazardIndex index)

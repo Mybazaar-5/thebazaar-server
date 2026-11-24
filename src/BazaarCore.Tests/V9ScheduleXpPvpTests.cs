@@ -28,6 +28,7 @@ namespace BazaarCore.Tests;
 /// 每小时 3 槽布局 Merchant&lt;=1 与废卡屏蔽（#11/#17）、货架 &lt;=10 格/三战利品足额/0 元过滤/Unsellable/WillAutoSellOnExit（#4/#7/#18/#19b/#32a）、
 /// 分天野怪与 Day 1 福利局（#5/#17/#30）、以及 Hour 6 PvP 一致化绑定与镜像清洗（#8/#9/#20/#25/#35）。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V9ScheduleXpPvpTests
 {
     private const string PolShopId = "065f6793-8607-4f02-abfe-db6afb221ab2";
@@ -57,30 +58,17 @@ public sealed class V9ScheduleXpPvpTests
 
     private static readonly Lazy<Fx> RealFixture = new(() =>
     {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 10 && !string.IsNullOrEmpty(dir); i++, dir = Directory.GetParent(dir)?.FullName)
-        {
-            string candidate = Path.Combine(dir, "dist", "data");
-            if (File.Exists(Path.Combine(candidate, "GameData.db")))
-            {
-                dir = candidate;
-                break;
-            }
-        }
-        if (string.IsNullOrEmpty(dir) || !File.Exists(Path.Combine(dir, "GameData.db")))
-            dir = @"e:\thebazaar\dist\data";
-
-        string dbPath = Path.Combine(dir, "GameData.db");
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new Fx
         {
-            DataDir = dir,
-            DbPath = dbPath,
-            Pool = CardPool.Load(dbPath),
-            Monsters = MonsterPool.Load(dbPath),
-            LevelUps = LevelUpTable.Load(dbPath),
-            Mode = GameModeConfig.Load(dbPath),
-            Repo = GameDatabaseLoader.Load(dbPath, null),
-            Ghosts = PvpGhostPool.Load(dir),
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
         };
     });
 
@@ -490,15 +478,12 @@ public sealed class V9ScheduleXpPvpTests
     public void Test04_HourlyEncounters_AtMostOneMerchant_And_ExcludesAllDevStoryTemplates()
     {
         var fx = RealFixture.Value;
+        // D2-P1-11（#84 授权适配）：保留真实废卡黑名单，解除 3 张官方活跃卡与 1 只野怪的误封
         string[] bannedIds =
         [
             "1400ea5b-6492-4c41-9bf9-c7016973ee0a", // Greenheart Help Jules Ambush Giant Mosquito
             "c20ccde2-99be-462c-9b32-8a340ee8b017", // Greenheart Help Merchant Help Kyver Drone
             "85a40ccc-9683-4794-8641-65940237da3a", // [Jungle Expedition] Greenheart Guardian Exit
-            "fd862d85-66cd-431f-a85a-07742cbc2e1b", // Test Subject Alpha (Monster)
-            "071cf90c-57a4-40f2-8d79-4c87f0d100d4", // Test Subject Alpha
-            "41cdf4ee-7790-4da1-96f8-a46d3391a0d9", // The Tester
-            "47704642-ae7a-4775-a26a-e5e5a8cff7bf", // Eating Contest
             "62d59e46-31cc-411d-af27-0f3bf82ca57b", // Big Bad Wolf
         ];
 
@@ -508,6 +493,11 @@ public sealed class V9ScheduleXpPvpTests
             Assert.False(fx.Pool.IsPlayerSpawnableId(badId, allowGuidOnly: true), $"废卡 {badId} 不得通过 IsPlayerSpawnable");
             Assert.False(fx.Pool.IsPlayerSpawnableId(badId, allowGuidOnly: false));
         }
+
+        // D2-P1-11 正面断言：官方活跃卡必须可生成
+        Assert.True(fx.Pool.IsPlayerSpawnableId("071cf90c-57a4-40f2-8d79-4c87f0d100d4", allowGuidOnly: false)); // Test Subject Alpha
+        Assert.True(fx.Pool.IsPlayerSpawnableId("41cdf4ee-7790-4da1-96f8-a46d3391a0d9", allowGuidOnly: false)); // The Tester
+        Assert.True(fx.Pool.IsPlayerSpawnableId("47704642-ae7a-4775-a26a-e5e5a8cff7bf", allowGuidOnly: false)); // Eating Contest
 
         foreach (var hero in new[] { EHero.Vanessa, EHero.Pygmalien, EHero.Dooley, EHero.Mak })
         {
@@ -552,8 +542,6 @@ public sealed class V9ScheduleXpPvpTests
                         Assert.DoesNotContain("Tutorial", name, StringComparison.OrdinalIgnoreCase);
                         Assert.DoesNotContain("[DEBUG]", name, StringComparison.OrdinalIgnoreCase);
                         Assert.DoesNotContain("Greenheart", name, StringComparison.OrdinalIgnoreCase);
-                        Assert.DoesNotContain("Eating Contest", name, StringComparison.OrdinalIgnoreCase);
-                        Assert.DoesNotContain("The Tester", name, StringComparison.OrdinalIgnoreCase);
 
                         if (CardArchetypeIndex.IsMerchantEncounterTemplate(tplId, name, tpl, core))
                             merchantCount++;
@@ -1249,69 +1237,19 @@ public sealed class V9ScheduleXpPvpTests
 
     private sealed class OverlayContext : IDisposable
     {
-        private readonly string _dir;
-        public CardPool Pool { get; }
-        public List<BazaarServer.Data.MonsterTemplate> Monsters { get; }
-        public LevelUpTable LevelUps { get; }
-        public GameModeConfig Mode { get; }
-        public GameDataRepository Repo { get; }
-        public PvpGhostPool Ghosts { get; }
+        private readonly TestInfrastructure.SharedTestOverlay _inner;
+        public CardPool Pool => _inner.Pool;
+        public List<BazaarServer.Data.MonsterTemplate> Monsters => _inner.Monsters;
+        public LevelUpTable LevelUps => _inner.LevelUps;
+        public GameModeConfig Mode => _inner.Mode;
+        public GameDataRepository Repo => _inner.Repo;
+        public PvpGhostPool Ghosts => _inner.Ghosts;
 
         public OverlayContext(IEnumerable<(string Id, string Json)> customCards)
         {
-            var fx = RealFixture.Value;
-            _dir = Path.Combine(Path.GetTempPath(), "bazaar_v9_b2_" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(_dir);
-            string dbPath = Path.Combine(_dir, "GameData.db");
-            File.Copy(fx.DbPath, dbPath, overwrite: true);
-
-            var wl = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            string srcWlPath = Path.Combine(fx.DataDir, "valid_card_ids.json");
-            if (File.Exists(srcWlPath))
-            {
-                using var doc = JsonDocument.Parse(File.ReadAllText(srcWlPath));
-                var arr = doc.RootElement.ValueKind == JsonValueKind.Array
-                    ? doc.RootElement
-                    : doc.RootElement.GetProperty("valid_ids");
-                foreach (var el in arr.EnumerateArray())
-                    if (el.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(el.GetString()))
-                        wl.Add(el.GetString()!);
-            }
-
-            using (var conn = new SqliteConnection($"Data Source={dbPath}"))
-            {
-                conn.Open();
-                foreach (var (id, json) in customCards)
-                {
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "INSERT OR REPLACE INTO cards (Id, Data) VALUES ($id, $data)";
-                    cmd.Parameters.AddWithValue("$id", id);
-                    cmd.Parameters.AddWithValue("$data", System.Text.Encoding.UTF8.GetBytes(json));
-                    cmd.ExecuteNonQuery();
-                    wl.Add(id);
-                }
-            }
-
-            if (wl.Count > 0)
-                File.WriteAllText(Path.Combine(_dir, "valid_card_ids.json"), JsonSerializer.Serialize(wl.ToList()));
-
-            Pool = CardPool.Load(dbPath);
-            Monsters = MonsterPool.Load(dbPath);
-            LevelUps = LevelUpTable.Load(dbPath);
-            Mode = GameModeConfig.Load(dbPath);
-            Repo = GameDatabaseLoader.Load(dbPath, null);
-            Ghosts = fx.Ghosts;
+            _inner = TestInfrastructure.SharedGameDataFixture.Shared.CreateMemoryOverlay(customCards: customCards);
         }
 
-        public void Dispose()
-        {
-            SqliteConnection.ClearAllPools();
-            try
-            {
-                if (Directory.Exists(_dir))
-                    Directory.Delete(_dir, recursive: true);
-            }
-            catch { }
-        }
+        public void Dispose() => _inner.Dispose();
     }
 }

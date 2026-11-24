@@ -6,6 +6,60 @@ using HarmonyLib;
 
 namespace BazaarLauncher.Core;
 
+/// <summary>D4-P2-1：补丁重要度分级。</summary>
+public enum PatchSeverity
+{
+    Critical = 0,
+    Optional = 1,
+}
+
+/// <summary>
+/// D4-P2-1：零 Unity 依赖的确定性方法重载选择器纯 .NET 内核。
+/// 当未指定 parameterTypes 命中多个重载时，按 (参数数, 参数类型全名序列, 返回类型全名) 稳定字典序选取唯一确定性重载，彻底消除反射枚举顺序漂移。
+/// </summary>
+public static class HarmonyOverloadSelector
+{
+    public static MethodInfo SelectDeterministic(IEnumerable<MethodInfo> candidates)
+    {
+        if (candidates == null) return null;
+        MethodInfo best = null;
+        string bestKey = null;
+        int bestParamCount = int.MaxValue;
+
+        foreach (MethodInfo m in candidates)
+        {
+            if (m == null) continue;
+            var ps = m.GetParameters();
+            int pc = ps.Length;
+            string key = BuildSignatureKey(m, ps);
+            if (best == null || pc < bestParamCount || (pc == bestParamCount && string.CompareOrdinal(key, bestKey) < 0))
+            {
+                best = m;
+                bestParamCount = pc;
+                bestKey = key;
+            }
+        }
+        return best;
+    }
+
+    private static string BuildSignatureKey(MethodInfo m, ParameterInfo[] ps)
+    {
+        var sb = new System.Text.StringBuilder(64);
+        sb.Append(m.DeclaringType?.FullName ?? string.Empty);
+        sb.Append('.');
+        sb.Append(m.Name);
+        sb.Append('(');
+        for (int i = 0; i < ps.Length; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(ps[i].ParameterType?.FullName ?? ps[i].ParameterType?.Name ?? string.Empty);
+        }
+        sb.Append(")->");
+        sb.Append(m.ReturnType?.FullName ?? string.Empty);
+        return sb.ToString();
+    }
+}
+
 /// <summary>
 /// Harmony 签名预检、重载精确锁定与单点自降级补丁器。
 /// 任何一条补丁在官方小版本更新后发生签名变更或抛出 HarmonyException 时，
@@ -139,8 +193,21 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         int postfixPriority = Priority.Normal,
         bool optional = false,
         string label = null)
+        => TryPatchMethodCore(target, prefix, postfix, finalizer, prefixPriority, postfixPriority, optional, label, countAttempt: true);
+
+    private bool TryPatchMethodCore(
+        MethodBase target,
+        MethodInfo prefix,
+        MethodInfo postfix,
+        MethodInfo finalizer,
+        int prefixPriority,
+        int postfixPriority,
+        bool optional,
+        string label,
+        bool countAttempt)
     {
-        Interlocked.Increment(ref _attempted);
+        if (countAttempt)
+            Interlocked.Increment(ref _attempted);
         string tag = label ?? (target == null ? "<null>" : $"{target.DeclaringType?.FullName}.{target.Name}");
 
         if (_disposed)
@@ -188,7 +255,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
     }
 
     /// <summary>
-    /// 安全安装属性 Getter/Setter 补丁。
+    /// 安全安装属性 Getter/Setter 补丁（D4-P2-1：入口即计入 _attempted，确保缺失类型/Getter 时统计准确）。
     /// </summary>
     internal bool TryPatchPropertyGetter(
         string typeName,
@@ -197,6 +264,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         MethodInfo postfix = null,
         bool optional = false)
     {
+        Interlocked.Increment(ref _attempted);
         Type t = GameInspector.FindTypeSafe(typeName);
         if (t == null)
         {
@@ -212,7 +280,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
             return false;
         }
 
-        return TryPatchMethod(getter, prefix: prefix, postfix: postfix, optional: optional, label: $"{typeName}.get_{propertyName}");
+        return TryPatchMethodCore(getter, prefix: prefix, postfix: postfix, finalizer: null, prefixPriority: Priority.Normal, postfixPriority: Priority.Normal, optional: optional, label: $"{typeName}.get_{propertyName}", countAttempt: false);
     }
 
     /// <summary>
@@ -260,14 +328,25 @@ internal sealed class SafeHarmonyPatcher : IDisposable
 
         if (matched.Count > 1)
         {
-            // 若存在多重载，优先取参数最少的重载并记录明确诊断日志，便于定位是否需要补充 parameterTypes
-            matched.Sort((a, b) => a.GetParameters().Length.CompareTo(b.GetParameters().Length));
-            var chosen = matched[0];
+            // D4-P2-1：通过确定性选择器稳定选取唯一重载，消除反射枚举序漂移
+            var chosen = HarmonyOverloadSelector.SelectDeterministic(matched);
             BazaarLauncherPlugin.Log?.LogDebug(
-                $"[SafeHarmonyPatcher] {targetType.FullName}.{methodName} 匹配到 {matched.Count} 个重载，未指定 parameterTypes，自动选择最短签名 ({chosen.GetParameters().Length} 参)。");
+                $"[SafeHarmonyPatcher] {targetType.FullName}.{methodName} 匹配到 {matched.Count} 个重载，未指定 parameterTypes，确定性选择 ({chosen.GetParameters().Length} 参)。");
+            if (chosen != null && chosen.DeclaringType != targetType)
+            {
+                BazaarLauncherPlugin.Log?.LogWarning(
+                    $"[SafeHarmonyPatcher] 基类方法漂移提醒：{targetType.FullName}.{methodName} 解析到基类 {chosen.DeclaringType?.FullName}.{chosen.Name}。");
+            }
+            return chosen;
         }
 
-        return matched[0];
+        var single = matched[0];
+        if (single.DeclaringType != targetType)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning(
+                $"[SafeHarmonyPatcher] 基类方法漂移提醒：{targetType.FullName}.{methodName} 解析到基类 {single.DeclaringType?.FullName}.{single.Name}。");
+        }
+        return single;
     }
 
     private static bool ValidateHookMethod(MethodBase target, MethodInfo hook, string role, out string error)

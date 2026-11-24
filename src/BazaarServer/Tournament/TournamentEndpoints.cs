@@ -2,7 +2,9 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using BazaarCore.Models;
+using BazaarCore.Runtime;
 using BazaarGameShared.Domain.Core.Types;
 using BazaarGameShared.Domain.Runs;
 using BazaarServer.Accounts;
@@ -70,6 +72,7 @@ public sealed class LobbyStore
     private List<TaskCompletionSource<bool>> _globalWaiters = new();
     private long _changeVersion;
     private Func<DateTime> _utcNowProvider = static () => DateTime.UtcNow;
+    private Func<long> _monotonicMsProvider = static () => Environment.TickCount64;
 
     private SseEventHub? _sseHub;
     private ISocialAndReplaySink? _socialSink;
@@ -93,9 +96,22 @@ public sealed class LobbyStore
     public SseEventHub? SseHub => _sseHub;
     public long ChangeVersion => Volatile.Read(ref _changeVersion);
     internal DateTime UtcNow => _utcNowProvider();
+    /// <summary>D6-P2-04：单调时钟毫秒计数（默认 Environment.TickCount64，免疫系统墙钟 NTP 回拨；测试注入时钟时自动同步映射）。</summary>
+    internal long MonotonicNowMs => _monotonicMsProvider();
 
     public void SetClockForTesting(Func<DateTime>? utcNowProvider)
-        => _utcNowProvider = utcNowProvider ?? (static () => DateTime.UtcNow);
+    {
+        if (utcNowProvider == null)
+        {
+            _utcNowProvider = static () => DateTime.UtcNow;
+            _monotonicMsProvider = static () => Environment.TickCount64;
+        }
+        else
+        {
+            _utcNowProvider = utcNowProvider;
+            _monotonicMsProvider = () => (long)(utcNowProvider().ToUniversalTime() - DateTime.UnixEpoch).TotalMilliseconds;
+        }
+    }
 
     public sealed record RemovalNotice(string LobbyId, string Code, string Reason);
 
@@ -108,7 +124,15 @@ public sealed class LobbyStore
         public uint Day { get; init; }
         public DateTime? FirstReadyAtUtc { get; set; }
         public DateTime? DeadlineAtUtc { get; set; }
+        /// <summary>D6-P2-04：单调时钟就绪基准（毫秒），用于不受墙钟回拨影响的超时与宽限期判定。</summary>
+        [JsonIgnore]
+        public long? FirstReadyMonotonicMs { get; set; }
+        /// <summary>D6-P2-04：单调时钟截止点（毫秒），从持久化恢复时按 remainingMs 钳制初始化。</summary>
+        [JsonIgnore]
+        public long? DeadlineMonotonicMs { get; set; }
         public bool IsAccelerated { get; set; }
+        /// <summary>D6-P1-07：全员按时到达 Hour 6 正常解锁标记（与真实超时解锁 TimedOutUnlocked 严格分离）。</summary>
+        public bool AllReadyUnlocked { get; set; }
         public bool TimedOutUnlocked { get; set; }
     }
 
@@ -179,6 +203,8 @@ public sealed class LobbyStore
         public uint CurrentDay { get; set; } = 1;
         public uint CurrentHour { get; set; } = 1;
         public bool IsReadyAtHour6Pvp { get; set; }
+        /// <summary>P0-42 / P0-16：语义纯粹的已完成 PvP（真实对阵或托管代打）最高天数，绝不被 run.Day 或 FinalDay 覆写。</summary>
+        public uint LastCompletedPvpDay { get; set; }
 
         // 终局与 AI 真实战绩状态
         public bool HasFinishedRun { get; set; }
@@ -347,6 +373,7 @@ public sealed class LobbyStore
                     PasswordHash = row.PasswordHash,
                     IsInviteOnly = row.IsInviteOnly,
                     InviteTokenHash = row.InviteTokenHash,
+                    InviteTokenExpiresAtUtc = row.InviteTokenExpiresAtUtc,
                     ExcludeHostFromGameplay = row.ExcludeHostFromGameplay,
                     HasStarted = row.State is "started" or "finished",
                     CountdownStarted = row.State is "countdown" or "started" or "finished",
@@ -363,14 +390,29 @@ public sealed class LobbyStore
                     Matchmaker = matchmaker,
                 };
 
-                // 恢复 RoundBarriers
+                // 恢复 RoundBarriers（D6-P2-04：同步按剩余时间初始化单调时钟截止点，<= 0 钳制为 MonotonicNowMs 立即到期）
                 try
                 {
                     var barriers = JsonSerializer.Deserialize<Dictionary<uint, RoundBarrierState>>(row.RoundBarriersJson, StorageJsonOpts);
                     if (barriers != null)
                     {
+                        DateTime restoreNowUtc = UtcNow;
+                        long restoreMonoMs = MonotonicNowMs;
                         foreach (var kv in barriers)
-                            lobby.RoundBarriers[kv.Key] = kv.Value;
+                        {
+                            var br = kv.Value;
+                            if (br.FirstReadyAtUtc.HasValue)
+                            {
+                                long elapsedMs = Math.Max(0L, (long)(restoreNowUtc - br.FirstReadyAtUtc.Value).TotalMilliseconds);
+                                br.FirstReadyMonotonicMs = restoreMonoMs - elapsedMs;
+                            }
+                            if (br.DeadlineAtUtc.HasValue)
+                            {
+                                long remMs = Math.Max(0L, (long)(br.DeadlineAtUtc.Value - restoreNowUtc).TotalMilliseconds);
+                                br.DeadlineMonotonicMs = restoreMonoMs + remMs;
+                            }
+                            lobby.RoundBarriers[kv.Key] = br;
+                        }
                     }
                 }
                 catch { }
@@ -507,7 +549,8 @@ public sealed class LobbyStore
                     StartedAt: lobby.StartedAt,
                     ExpiresAt: lobby.ExpiresAt,
                     EndedAt: lobby.EndedAt,
-                    UpdatedAt: now);
+                    UpdatedAt: now,
+                    InviteTokenExpiresAtUtc: lobby.InviteTokenExpiresAtUtc);
 
                 memberRows = lobby.Members.Select(m => new Persistence.TournamentLobbyMemberRow(
                     LobbyId: lobby.LobbyId,
@@ -884,15 +927,23 @@ public sealed class LobbyStore
 
         DateTime now = UtcNow;
         bool alreadyMember;
+        bool needPasswordCheck = false;
+        string expectedPasswordHash = string.Empty;
         lock (lobby.Members)
         {
+            if (lobby.IsCancelled)
+                return new JoinLobbyResult(false, "LOBBY_NOT_FOUND", "房间不存在或已解散。", null);
+
             alreadyMember = lobby.Members.Exists(m => m.AccountId.Equals(aid, StringComparison.OrdinalIgnoreCase));
             if (alreadyMember)
             {
                 var self = lobby.Members.Find(m => m.AccountId.Equals(aid, StringComparison.OrdinalIgnoreCase))!;
                 self.LastSeenAt = now;
-                self.ConnectionState = "online";
-                self.AiTakeoverSinceUtc = null;
+                if (!self.HasFinishedRun && !string.Equals(self.ConnectionState, "left", StringComparison.OrdinalIgnoreCase))
+                {
+                    self.ConnectionState = "online";
+                    self.AiTakeoverSinceUtc = null;
+                }
             }
             else
             {
@@ -916,25 +967,19 @@ public sealed class LobbyStore
                 {
                     if (string.IsNullOrWhiteSpace(password))
                         return new JoinLobbyResult(false, "PASSWORD_REQUIRED", "该房间已设置密码，请输入房间密码后再加入。", null);
-                    if (!AccountStore.VerifySecretHash(password.Trim(), lobby.PasswordHash))
-                        return new JoinLobbyResult(false, "INVALID_PASSWORD", "房间密码不正确，请核对后重试。", null);
+                    // 将高开销 PBKDF2 密码验算移至 lock (lobby.Members) 之外，防止暴力猜密阻塞全房操作
+                    needPasswordCheck = true;
+                    expectedPasswordHash = lobby.PasswordHash;
                 }
 
-                // 满员检查：开赛前若存在 AI 占位，自动移除最后 1 名 AI 为真人腾位；全真人满房则严拒
-                if (lobby.Members.Count >= lobby.PlayerCap)
-                {
-                    int lastAi = lobby.Members.FindLastIndex(m => m.IsAi);
-                    if (lastAi >= 0)
-                    {
-                        lobby.Members.RemoveAt(lastAi);
-                    }
-                    else
-                    {
-                        return new JoinLobbyResult(false, "LOBBY_FULL", "房间人数已满，无法加入。", null);
-                    }
-                }
+                // 预检满房（此处不提前移除 AI，待锁外密码核验通过后再原子腾位）
+                if (lobby.Members.Count >= lobby.PlayerCap && !lobby.Members.Exists(m => m.IsAi))
+                    return new JoinLobbyResult(false, "LOBBY_FULL", "房间人数已满，无法加入。", null);
             }
         }
+
+        if (needPasswordCheck && !AccountStore.VerifySecretHash(password!.Trim(), expectedPasswordHash))
+            return new JoinLobbyResult(false, "INVALID_PASSWORD", "房间密码不正确，请核对后重试。", null);
 
         var prev = GetByMember(aid);
         if (prev != null && !prev.LobbyId.Equals(lobby.LobbyId, StringComparison.OrdinalIgnoreCase))
@@ -946,6 +991,8 @@ public sealed class LobbyStore
         {
             lock (lobby.Members)
             {
+                if (lobby.IsCancelled)
+                    return new JoinLobbyResult(false, "LOBBY_NOT_FOUND", "房间不存在或已解散。", null);
                 if (lobby.HasStarted || lobby.CountdownStarted)
                     return new JoinLobbyResult(false, "LOBBY_ALREADY_STARTED", "该房间已经开赛，无法加入。", null);
 
@@ -990,33 +1037,77 @@ public sealed class LobbyStore
         string? removedName = null;
         string? newHostName = null;
         bool wasPublic = lobby.IsPublic;
+        bool lobbyCancelled = false;
         lock (lobby.Members)
         {
             var removed = lobby.Members.Find(m => m.AccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase));
             removedName = removed?.Username;
-            lobby.Members.RemoveAll(m => m.AccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase));
 
-            int humanLeft = lobby.Members.Count(m => !m.IsAi);
-            if (humanLeft == 0)
+            if (!lobby.HasStarted)
             {
-                lobby.IsCancelled = true;
-                lobby.EndedAt = UtcNow;
-                _byId.TryRemove(lobby.LobbyId, out _);
-                _codeToId.TryRemove(lobby.Code, out _);
-            }
-            else if (lobby.HostAccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase))
-            {
-                // 修复 MP-P1-06：房主离开后自动顺延移交给最早加入的在线真人成员，避免无主僵尸房
-                var successor = lobby.Members
-                    .Where(m => !m.IsAi)
-                    .OrderBy(m => m.ConnectionState == "online" ? 0 : 1)
-                    .ThenBy(m => m.JoinedAt)
-                    .FirstOrDefault();
-                if (successor != null)
+                // 开赛前允许物理移除成员
+                lobby.Members.RemoveAll(m => m.AccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase));
+
+                int humanLeft = lobby.Members.Count(m => !m.IsAi);
+                if (humanLeft == 0)
                 {
-                    lobby.HostAccountId = successor.AccountId;
-                    lobby.HostUsername = successor.Username;
-                    newHostName = successor.Username;
+                    lobby.IsCancelled = true;
+                    lobby.EndedAt = UtcNow;
+                    lobbyCancelled = true;
+                    _byId.TryRemove(lobby.LobbyId, out _);
+                    _codeToId.TryRemove(lobby.Code, out _);
+                }
+                else if (lobby.HostAccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase))
+                {
+                    var successor = lobby.Members
+                        .Where(m => !m.IsAi)
+                        .OrderBy(m => m.ConnectionState == "online" ? 0 : 1)
+                        .ThenBy(m => m.JoinedAt)
+                        .FirstOrDefault();
+                    if (successor != null)
+                    {
+                        lobby.HostAccountId = successor.AccountId;
+                        lobby.HostUsername = successor.Username;
+                        newHostName = successor.Username;
+                    }
+                }
+            }
+            else
+            {
+                // D6-P1-07：开赛后严禁物理删除成员，改为软退赛保留席位与完整对阵/排名历史
+                if (removed != null)
+                {
+                    removed.ConnectionState = "left";
+                    removed.AiTakeoverSinceUtc = null;
+                    if (!removed.HasFinishedRun)
+                    {
+                        removed.HasFinishedRun = true;
+                        removed.FinalIsConceded = true;
+                        removed.FinalIsEliminated = true;
+                        removed.FinalPrestige = 0;
+                    }
+                    removed.RemovalReason = string.IsNullOrWhiteSpace(reason) ? "left" : reason.Trim();
+                }
+
+                int remainingHumans = lobby.Members.Count(m =>
+                    !m.IsAi && !string.Equals(m.ConnectionState, "left", StringComparison.OrdinalIgnoreCase));
+                if (remainingHumans == 0)
+                {
+                    lobby.EndedAt ??= UtcNow;
+                }
+                else if (lobby.HostAccountId.Equals(normAid, StringComparison.OrdinalIgnoreCase))
+                {
+                    var successor = lobby.Members
+                        .Where(m => !m.IsAi && !string.Equals(m.ConnectionState, "left", StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(m => m.ConnectionState == "online" ? 0 : 1)
+                        .ThenBy(m => m.JoinedAt)
+                        .FirstOrDefault();
+                    if (successor != null)
+                    {
+                        lobby.HostAccountId = successor.AccountId;
+                        lobby.HostUsername = successor.Username;
+                        newHostName = successor.Username;
+                    }
                 }
             }
         }
@@ -1028,7 +1119,7 @@ public sealed class LobbyStore
         }
 
         PersistLobby(lobby);
-        if (!string.IsNullOrWhiteSpace(removedName) && !lobby.IsCancelled)
+        if (!string.IsNullOrWhiteSpace(removedName) && !lobbyCancelled)
         {
             string msg = reason == "kicked" ? $"🚪 {removedName} 已被房主移出房间。" : $"👋 {removedName} 离开了房间。";
             _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_leave", msg, new { lobbyId = lobby.LobbyId, username = removedName, reason = reason ?? "left" });
@@ -1040,7 +1131,7 @@ public sealed class LobbyStore
         NotifyLobbyChanged(lobby.LobbyId, publicListChanged: wasPublic);
     }
 
-    /// <summary>带权限校验的踢人操作（修复 MP-P0-01 + MP-P1-11）。</summary>
+    /// <summary>带权限校验的踢人操作（修复 MP-P0-01 + MP-P1-11 + D6-P1-07 开赛后禁物理删成员）。</summary>
     public OperationResult KickMember(Lobby lobby, string callerAccountId, string targetAccountId)
     {
         string normCaller = NormalizeAccountKey(callerAccountId);
@@ -1061,13 +1152,19 @@ public sealed class LobbyStore
             if (target == null)
                 return new OperationResult(false, 404, "MEMBER_NOT_FOUND", "该成员不在当前房间中。");
 
-            if (lobby.HasStarted && !target.IsAi && target.ConnectionState == "online" && !target.HasFinishedRun)
-                return new OperationResult(false, 409, "CANNOT_KICK_ACTIVE_PLAYER", "对局进行中，无法踢出在线参赛玩家。");
+            if (lobby.HasStarted)
+            {
+                // D6-P1-07：开赛后禁止物理移除 AI 或已完赛成员；仅允许对掉线/托管中的未完赛真人做软退赛淘汰
+                if (target.IsAi || target.HasFinishedRun)
+                    return new OperationResult(false, 409, "CANNOT_KICK_AFTER_START", "对局已经开始，无法删除 AI 或已完赛成员以保护完整对阵历史。");
+                if (target.ConnectionState == "online")
+                    return new OperationResult(false, 409, "CANNOT_KICK_ACTIVE_PLAYER", "对局进行中，无法踢出在线参赛玩家。");
+            }
 
             targetIsAi = target.IsAi;
             targetName = target.Username;
 
-            if (targetIsAi)
+            if (targetIsAi && !lobby.HasStarted)
             {
                 lobby.Members.Remove(target);
             }
@@ -1099,7 +1196,9 @@ public sealed class LobbyStore
             if (m != null)
             {
                 m.LastSeenAt = UtcNow;
-                if (m.ConnectionState != "online")
+                if (!m.HasFinishedRun &&
+                    !string.Equals(m.ConnectionState, "left", StringComparison.OrdinalIgnoreCase) &&
+                    m.ConnectionState != "online")
                 {
                     restoredFromTakeover = m.ConnectionState == "ai_takeover";
                     m.ConnectionState = "online";
@@ -1296,11 +1395,11 @@ public sealed class LobbyStore
             if (sessions != null)
             {
                 var mem = sessions.GetByAccount(m.AccountId);
-                var run = mem != null ? SessionRegistry.Get(mem.Sid)?.Run : null;
-                if (run != null && (!lobby.TournamentSessionId.HasValue || mem!.TournamentSessionId == lobby.TournamentSessionId))
+                var snap = mem != null ? SessionRegistry.Get(mem.Sid)?.Run.PublicSummary : null;
+                if (snap != null && (!lobby.TournamentSessionId.HasValue || mem!.TournamentSessionId == lobby.TournamentSessionId))
                 {
-                    if (Persistence.IsTerminalState(run.State)) continue;
-                    mDay = Math.Max(mDay, run.Day);
+                    if (snap.IsTerminal) continue;
+                    mDay = Math.Max(mDay, snap.Day);
                 }
             }
 
@@ -1342,11 +1441,11 @@ public sealed class LobbyStore
                 if (!m.IsAi && !elim && sessions != null)
                 {
                     var mem = sessions.GetByAccount(m.AccountId);
-                    var run = mem != null ? SessionRegistry.Get(mem.Sid)?.Run : null;
-                    if (run != null &&
+                    var snap = mem != null ? SessionRegistry.Get(mem.Sid)?.Run.PublicSummary : null;
+                    if (snap != null &&
                         (!lobby.TournamentSessionId.HasValue || mem!.TournamentSessionId == lobby.TournamentSessionId))
                     {
-                        elim = run.State is ERunState.EndRunDefeat or ERunState.Shutdown;
+                        elim = snap.State is ERunState.EndRunDefeat or ERunState.Shutdown;
                     }
                 }
                 participants.Add(new MatchupParticipant(m.AccountId, m.Username, m.IsAi, elim));
@@ -1392,10 +1491,10 @@ public sealed class LobbyStore
                 else if (!eliminated && sessions != null)
                 {
                     var mem = sessions.GetByAccount(m.AccountId);
-                    var r = mem != null ? SessionRegistry.Get(mem.Sid)?.Run : null;
-                    if (r != null &&
+                    var snap = mem != null ? SessionRegistry.Get(mem.Sid)?.Run.PublicSummary : null;
+                    if (snap != null &&
                         (!lobby.TournamentSessionId.HasValue || mem!.TournamentSessionId == lobby.TournamentSessionId) &&
-                        r.State is ERunState.EndRunDefeat or ERunState.Shutdown)
+                        snap.State is ERunState.EndRunDefeat or ERunState.Shutdown)
                     {
                         eliminated = true;
                     }
@@ -1409,9 +1508,62 @@ public sealed class LobbyStore
         return (totalHumans, survivingHumans);
     }
 
+    /// <summary>P0-42 / P0-15：短持 L5a 采集的成员只读权威快照，供 /sessions 重连对齐与终局阻断安全消费（严守 L1 -> L5a 锁序）。</summary>
+    public sealed record MemberAuthoritySnapshot(
+        string AccountId,
+        uint CurrentDay,
+        uint CurrentHour,
+        uint LastCompletedPvpDay,
+        int FinalVictories,
+        int FinalDefeats,
+        int FinalPrestige,
+        bool HasFinishedRun,
+        bool FinalIsChampion,
+        bool FinalIsEliminated,
+        bool FinalIsConceded,
+        string RemovalReason);
+
+    public MemberAuthoritySnapshot? TryGetMemberSnapshot(Lobby? lobby, string? accountId)
+    {
+        if (lobby == null || string.IsNullOrWhiteSpace(accountId))
+            return null;
+        string normalized = NormalizeAccountKey(accountId);
+        lock (lobby.Members)
+        {
+            var m = lobby.Members.Find(x =>
+                x.AccountId.Equals(accountId, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(normalized) && x.AccountId.Equals(normalized, StringComparison.OrdinalIgnoreCase)));
+            if (m == null) return null;
+            return new MemberAuthoritySnapshot(
+                m.AccountId,
+                m.CurrentDay,
+                m.CurrentHour,
+                m.LastCompletedPvpDay,
+                m.FinalVictories,
+                m.FinalDefeats,
+                m.FinalPrestige,
+                m.HasFinishedRun,
+                m.FinalIsChampion,
+                m.FinalIsEliminated,
+                m.FinalIsConceded,
+                m.RemovalReason ?? "");
+        }
+    }
+
     public void RecordRunProgress(Lobby lobby, string accountId, RunState run)
     {
         if (lobby == null || run == null || string.IsNullOrWhiteSpace(accountId))
+            return;
+
+        // 持 Gate 写侧或单测路径先刷新一次不可变公开摘要，再走统一的不可变快照更新逻辑
+        var snap = run.PublishPublicSummary();
+        RecordRunProgressSnapshot(lobby, accountId, snap);
+    }
+
+    /// <summary>D8-P1-02：基于不可变 RunPublicSummarySnapshot 同步成员对局进度，彻底消除无锁跨线程读可变 RunState。</summary>
+    public void RecordRunProgressSnapshot(Lobby lobby, string accountId, RunPublicSummarySnapshot snap)
+    {
+        if (lobby == null || snap == null || string.IsNullOrWhiteSpace(accountId))
             return;
 
         string normalized = NormalizeAccountKey(accountId);
@@ -1430,49 +1582,79 @@ public sealed class LobbyStore
             if (m != null)
             {
                 DateTime now = UtcNow;
-                bool isTerminal = Persistence.IsTerminalState(run.State);
-                bool readyH6 = !isTerminal && ComputeIsAtOrPastHour6Pvp(run);
-                int prestige = run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 0);
-                string heroName = (run.Hero == EHero.Common ? EHero.Vanessa : run.Hero).ToString();
+                bool isTerminal = snap.IsTerminal;
 
-                if (m.CurrentDay != run.Day ||
-                    m.CurrentHour != run.Hour ||
-                    m.IsReadyAtHour6Pvp != readyH6 ||
-                    m.FinalVictories != (int)run.Victories ||
-                    m.FinalDefeats != (int)run.Defeats ||
-                    m.FinalPrestige != prestige ||
-                    m.FinalDay != run.Day ||
-                    m.Hero != heroName ||
-                    m.ConnectionState != "online" ||
-                    (isTerminal && !m.HasFinishedRun))
+                // P0-42 守卫 1（终态不可逆）：已完赛/已 AFK 淘汰成员绝不允许被陈旧非终态 RunState 覆写复活
+                if (m.HasFinishedRun)
+                    return;
+
+                // P0-42 守卫 2（语义纯粹的单调不倒流）：仅拦截 snap.Day < m.CurrentDay 或同天未包含已结算托管 PvP 的旧快照；
+                // 严禁用混义 m.FinalDay 对比 LastCompletedPvpDay，确保曾托管 1 天的玩家重连正常玩 Day 2 Hour 1..6 100% 放行！
+                bool isStaleDay = snap.Day < m.CurrentDay;
+                bool isStaleSameDayPvp = snap.Day == m.CurrentDay
+                    && !isTerminal
+                    && m.LastCompletedPvpDay > 0
+                    && snap.LastCompletedPvpDay < m.LastCompletedPvpDay;
+
+                if (isStaleDay || isStaleSameDayPvp)
                 {
-                    changed = true;
+                    if (m.ConnectionState == "ai_takeover")
+                        restoredFromTakeover = true;
+                    if (m.ConnectionState != "online")
+                        changed = true;
+                    m.LastSeenAt = now;
+                    m.ConnectionState = "online";
+                    m.AiTakeoverSinceUtc = null;
+                    memberName = m.Username;
                 }
-
-                if (m.ConnectionState == "ai_takeover")
-                    restoredFromTakeover = true;
-
-                m.LastSeenAt = now;
-                m.ConnectionState = "online";
-                m.AiTakeoverSinceUtc = null;
-                m.Hero = heroName;
-                m.CurrentDay = run.Day;
-                m.CurrentHour = run.Hour;
-                m.IsReadyAtHour6Pvp = readyH6;
-                m.FinalVictories = (int)run.Victories;
-                m.FinalDefeats = (int)run.Defeats;
-                m.FinalPrestige = prestige;
-                m.FinalDay = run.Day;
-                memberName = m.Username;
-                finalWins = (int)run.Victories;
-
-                if (isTerminal && !m.HasFinishedRun)
+                else
                 {
-                    m.HasFinishedRun = true;
-                    m.FinalIsChampion = run.State == ERunState.EndRunVictory;
-                    m.FinalIsEliminated = run.State is ERunState.EndRunDefeat or ERunState.Shutdown;
-                    newlyChampion = m.FinalIsChampion;
-                    newlyEliminated = m.FinalIsEliminated;
+                    bool readyH6 = !isTerminal && snap.IsReadyAtHour6Pvp;
+                    int prestige = snap.Prestige;
+                    string heroName = (snap.Hero == EHero.Common ? EHero.Vanessa : snap.Hero).ToString();
+                    uint nextLastCompletedPvpDay = Math.Max(m.LastCompletedPvpDay, snap.LastCompletedPvpDay);
+
+                    if (m.CurrentDay != snap.Day ||
+                        m.CurrentHour != snap.Hour ||
+                        m.IsReadyAtHour6Pvp != readyH6 ||
+                        m.LastCompletedPvpDay != nextLastCompletedPvpDay ||
+                        m.FinalVictories != (int)snap.Victories ||
+                        m.FinalDefeats != (int)snap.Defeats ||
+                        m.FinalPrestige != prestige ||
+                        m.FinalDay != snap.Day ||
+                        m.Hero != heroName ||
+                        m.ConnectionState != "online" ||
+                        (isTerminal && !m.HasFinishedRun))
+                    {
+                        changed = true;
+                    }
+
+                    if (m.ConnectionState == "ai_takeover")
+                        restoredFromTakeover = true;
+
+                    m.LastSeenAt = now;
+                    m.ConnectionState = "online";
+                    m.AiTakeoverSinceUtc = null;
+                    m.Hero = heroName;
+                    m.CurrentDay = snap.Day;
+                    m.CurrentHour = snap.Hour;
+                    m.IsReadyAtHour6Pvp = readyH6;
+                    m.LastCompletedPvpDay = nextLastCompletedPvpDay;
+                    m.FinalVictories = (int)snap.Victories;
+                    m.FinalDefeats = (int)snap.Defeats;
+                    m.FinalPrestige = prestige;
+                    m.FinalDay = snap.Day;
+                    memberName = m.Username;
+                    finalWins = (int)snap.Victories;
+
+                    if (isTerminal && !m.HasFinishedRun)
+                    {
+                        m.HasFinishedRun = true;
+                        m.FinalIsChampion = snap.State == ERunState.EndRunVictory;
+                        m.FinalIsEliminated = snap.State is ERunState.EndRunDefeat or ERunState.Shutdown;
+                        newlyChampion = m.FinalIsChampion;
+                        newlyEliminated = m.FinalIsEliminated;
+                    }
                 }
             }
         }
@@ -1487,14 +1669,28 @@ public sealed class LobbyStore
             }
             if (newlyChampion)
             {
-                _socialSink?.PublishSystemBroadcast(null, "system_champion", $"🏆 {memberName} 在【{lobby.Name}】中以 {finalWins} 胜夺得最终冠军！", new { lobbyId = lobby.LobbyId, watchCode = lobby.Code, username = memberName, wins = finalWins, day = run.Day });
+                _socialSink?.PublishSystemBroadcast(null, "system_champion", $"🏆 {memberName} 在【{lobby.Name}】中以 {finalWins} 胜夺得最终冠军！", new { lobbyId = lobby.LobbyId, watchCode = lobby.Code, username = memberName, wins = finalWins, day = snap.Day });
             }
             else if (newlyEliminated)
             {
-                _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_eliminated", $"💀 {memberName} 在第 {run.Day} 天被淘汰出局。", new { lobbyId = lobby.LobbyId, username = memberName, day = run.Day });
+                _socialSink?.PublishSystemBroadcast(lobby.LobbyId, "system_eliminated", $"💀 {memberName} 在第 {snap.Day} 天被淘汰出局。", new { lobbyId = lobby.LobbyId, username = memberName, day = snap.Day });
             }
             NotifyLobbyChanged(lobby.LobbyId);
         }
+    }
+
+    /// <summary>P0-16：权威判定该局当日 PvP 是否已完成（兼容历史未填 LastCompletedPvpDay 的单测/旧快照，根治 BossRush/同步平局误判）。</summary>
+    public static bool HasCompletedPvpForDay(RunState run)
+    {
+        if (run == null) return false;
+        if (run.LastCompletedPvpDay >= run.Day) return true;
+        if (run.LastCompletedPvpDay == 0 &&
+            (run.CustomRules?.SpecialModeId ?? ESpecialModeId.Standard) != ESpecialModeId.BossRush &&
+            (run.Victories + run.Defeats) >= run.Day)
+        {
+            return true;
+        }
+        return false;
     }
 
     public static bool ComputeIsAtOrPastHour6Pvp(RunState run)
@@ -1504,7 +1700,7 @@ public sealed class LobbyStore
         return run.State == ERunState.TournamentPvpChoice
             || run.State == ERunState.TournamentWaitingRoom
             || run.State == ERunState.PVPCombat
-            || (run.Hour >= 6 && (run.Victories + run.Defeats) >= run.Day)
+            || (run.Hour >= 6 && HasCompletedPvpForDay(run))
             || (run.State == ERunState.Choice && run.Hour >= 6);
     }
 
@@ -1556,38 +1752,44 @@ public sealed class LobbyStore
                               (m.AccountId.Equals(selfAccountId, StringComparison.OrdinalIgnoreCase) ||
                                (!string.IsNullOrEmpty(normalizedSelf) && m.AccountId.Equals(normalizedSelf, StringComparison.OrdinalIgnoreCase)));
 
-                RunState? liveRun = isSelf ? selfRun : null;
-                if (liveRun == null && sessions != null)
+                // D8-P1-02：他人状态严格读取不可变 volatile RunPublicSummarySnapshot，彻底消灭无锁跨线程读可变 RunState 与 (Day, Hour) 撕裂态
+                RunPublicSummarySnapshot? liveSnap = null;
+                if (isSelf && selfRun != null)
+                {
+                    selfRun.PublishPublicSummary();
+                    liveSnap = selfRun.PublicSummary;
+                }
+                else if (sessions != null)
                 {
                     var mem = sessions.GetByAccount(m.AccountId);
-                    var candidate = mem != null ? SessionRegistry.Get(mem.Sid)?.Run : null;
-                    if (candidate != null &&
+                    var candidateSnap = mem != null ? SessionRegistry.Get(mem.Sid)?.Run.PublicSummary : null;
+                    if (candidateSnap != null &&
                         (!lobby.TournamentSessionId.HasValue || mem!.TournamentSessionId == lobby.TournamentSessionId))
                     {
-                        liveRun = candidate;
+                        liveSnap = candidateSnap;
                     }
                 }
 
-                if (liveRun != null)
+                if (liveSnap != null)
                 {
-                    bool term = Persistence.IsTerminalState(liveRun.State);
-                    bool h6Ready = !term && ComputeIsAtOrPastHour6Pvp(liveRun);
-                    if (m.CurrentDay != liveRun.Day || m.CurrentHour != liveRun.Hour || m.IsReadyAtHour6Pvp != h6Ready)
+                    bool term = liveSnap.IsTerminal;
+                    bool h6Ready = !term && liveSnap.IsReadyAtHour6Pvp;
+                    if (m.CurrentDay != liveSnap.Day || m.CurrentHour != liveSnap.Hour || m.IsReadyAtHour6Pvp != h6Ready)
                     {
-                        m.CurrentDay = liveRun.Day;
-                        m.CurrentHour = liveRun.Hour;
+                        m.CurrentDay = liveSnap.Day;
+                        m.CurrentHour = liveSnap.Hour;
                         m.IsReadyAtHour6Pvp = h6Ready;
                     }
                     if (term && !m.HasFinishedRun)
                     {
                         m.HasFinishedRun = true;
-                        m.FinalIsChampion = liveRun.State == ERunState.EndRunVictory;
-                        m.FinalIsEliminated = liveRun.State is ERunState.EndRunDefeat or ERunState.Shutdown;
+                        m.FinalIsChampion = liveSnap.State == ERunState.EndRunVictory;
+                        m.FinalIsEliminated = liveSnap.State is ERunState.EndRunDefeat or ERunState.Shutdown;
                     }
                 }
 
                 bool elimOrDone = m.HasFinishedRun || m.FinalIsEliminated || m.FinalIsChampion
-                                  || (liveRun != null && Persistence.IsTerminalState(liveRun.State));
+                                  || (liveSnap != null && liveSnap.IsTerminal);
                 if (elimOrDone)
                     continue;
 
@@ -1614,9 +1816,10 @@ public sealed class LobbyStore
             }
             else if (notReadyHumans == 0)
             {
-                if (lobby.RoundBarriers.TryGetValue(day, out var doneBarrier) && !doneBarrier.TimedOutUnlocked)
+                // D6-P1-07：全员按时就位仅置 AllReadyUnlocked = true，绝不误置 TimedOutUnlocked = true（避免客户端误发 ForcedTransition）
+                if (lobby.RoundBarriers.TryGetValue(day, out var doneBarrier) && !doneBarrier.AllReadyUnlocked)
                 {
-                    doneBarrier.TimedOutUnlocked = true;
+                    doneBarrier.AllReadyUnlocked = true;
                     shouldNotify = true;
                     shouldPersist = true;
                 }
@@ -1626,13 +1829,15 @@ public sealed class LobbyStore
             {
                 lobby.RoundBarriers.TryGetValue(day, out var barrier);
                 DateTime now = UtcNow;
+                long monoNow = MonotonicNowMs;
 
-                if (barrier is { TimedOutUnlocked: true })
+                if (barrier is { AllReadyUnlocked: true } or { TimedOutUnlocked: true })
                 {
+                    bool isTimedOut = barrier.TimedOutUnlocked;
                     decision = new PvpBarrierDecision(
                         true, false, barrier.DeadlineAtUtc,
                         survivingHumans, readyHumans, notReadyHumans,
-                        barrier.IsAccelerated, true, 0, null);
+                        barrier.IsAccelerated, isTimedOut, 0, null);
                 }
                 else if (readyHumans == 0)
                 {
@@ -1653,21 +1858,37 @@ public sealed class LobbyStore
                         }
                         if (!barrier.FirstReadyAtUtc.HasValue)
                         {
+                            int cdSec = Math.Max(0, lobby.RoundCountdownSeconds);
                             barrier.FirstReadyAtUtc = now;
-                            barrier.DeadlineAtUtc = now.AddSeconds(Math.Max(0, lobby.RoundCountdownSeconds));
+                            barrier.FirstReadyMonotonicMs = monoNow;
+                            barrier.DeadlineAtUtc = now.AddSeconds(cdSec);
+                            barrier.DeadlineMonotonicMs = monoNow + cdSec * 1000L;
                             shouldNotify = true;
                             shouldPersist = true;
+                        }
+                        else if (!barrier.DeadlineMonotonicMs.HasValue && barrier.DeadlineAtUtc.HasValue)
+                        {
+                            long remMs = Math.Max(0L, (long)(barrier.DeadlineAtUtc.Value - now).TotalMilliseconds);
+                            barrier.DeadlineMonotonicMs = monoNow + remMs;
+                            barrier.FirstReadyMonotonicMs ??= monoNow - Math.Max(0L, (long)(now - barrier.FirstReadyAtUtc.Value).TotalMilliseconds);
                         }
                         if (notReadyHumans == 1 && !barrier.IsAccelerated)
                         {
                             barrier.IsAccelerated = true;
-                            DateTime accelDeadline = now.AddSeconds(Math.Max(0, lobby.AcceleratedRoundCountdownSeconds));
-                            if (!barrier.DeadlineAtUtc.HasValue || accelDeadline < barrier.DeadlineAtUtc.Value)
+                            int accelSec = Math.Max(0, lobby.AcceleratedRoundCountdownSeconds);
+                            long accelMono = monoNow + accelSec * 1000L;
+                            DateTime accelDeadline = now.AddSeconds(accelSec);
+                            if (!barrier.DeadlineMonotonicMs.HasValue || accelMono < barrier.DeadlineMonotonicMs.Value)
+                            {
+                                barrier.DeadlineMonotonicMs = accelMono;
                                 barrier.DeadlineAtUtc = accelDeadline;
+                            }
                             shouldNotify = true;
                             shouldPersist = true;
                         }
-                        if (barrier.DeadlineAtUtc.HasValue && now >= barrier.DeadlineAtUtc.Value)
+                        if (barrier.DeadlineMonotonicMs.HasValue
+                            ? monoNow >= barrier.DeadlineMonotonicMs.Value
+                            : (barrier.DeadlineAtUtc.HasValue && now >= barrier.DeadlineAtUtc.Value))
                         {
                             barrier.TimedOutUnlocked = true;
                             shouldNotify = true;
@@ -1685,9 +1906,20 @@ public sealed class LobbyStore
                     else
                     {
                         DateTime? dl = barrier?.DeadlineAtUtc;
-                        int remSec = dl.HasValue
-                            ? Math.Max(1, (int)Math.Ceiling((dl.Value - now).TotalSeconds))
-                            : Math.Max(1, notReadyHumans == 1 ? lobby.AcceleratedRoundCountdownSeconds : lobby.RoundCountdownSeconds);
+                        int remSec;
+                        if (barrier?.DeadlineMonotonicMs.HasValue == true)
+                        {
+                            double remS = (barrier.DeadlineMonotonicMs.Value - monoNow) / 1000.0;
+                            remSec = Math.Max(1, (int)Math.Ceiling(remS));
+                        }
+                        else if (dl.HasValue)
+                        {
+                            remSec = Math.Max(1, (int)Math.Ceiling((dl.Value - now).TotalSeconds));
+                        }
+                        else
+                        {
+                            remSec = Math.Max(1, notReadyHumans == 1 ? lobby.AcceleratedRoundCountdownSeconds : lobby.RoundCountdownSeconds);
+                        }
                         decision = new PvpBarrierDecision(
                             false, true, dl,
                             survivingHumans, readyHumans, notReadyHumans,
@@ -1711,15 +1943,49 @@ public sealed class LobbyStore
 
     // ── 后台看门狗（1s 屏障主动唤醒 + 掉线 AI 托管接管 + 过期房归档）──────────
 
+    private sealed record HumanWatchdogSnapshot(
+        string AccountId,
+        uint CurrentDay,
+        bool IsReadyAtHour6Pvp,
+        string ConnectionState,
+        bool HasFinishedRun,
+        bool FinalIsEliminated);
+
+    private sealed record TakeoverStepPlan(
+        string AccountId,
+        string Username,
+        uint SimDay,
+        int NextMissedPvpDays,
+        Guid? TournamentSessionId,
+        bool BarrierTimedOut);
+
+    private sealed record TakeoverStepResult(
+        string AccountId,
+        uint SimDay,
+        bool WonByTakeover,
+        bool IsDraw,
+        bool Deferred);
+
+    private sealed record TakeoverRunSyncAction(
+        string AccountId,
+        Guid TournamentSessionId,
+        uint SimDay,
+        int FinalVictories,
+        int FinalDefeats,
+        int FinalPrestige,
+        bool IsEliminated,
+        string RemovalReason);
+
     /// <summary>
     /// 1 秒级后台看门狗单次扫描（支持测试中手工触发）：
     /// 1. 驱动掉线状态机 online -> disconnected (45s) -> ai_takeover (阻塞屏障30s或累计90s)；
-    /// 2. 为被托管玩家自动按末次快照代打推进滞后天数，连缺 3 天自动 AFK 淘汰；
+    /// 2. 采用四阶段无跨锁拆分（阶段1收集单日计划 -> 阶段2无锁协调 PvP 裁决与在线真人防截胡门控 -> 阶段3原子复核应用 -> 阶段4彻底释放 L5a 后按 L1->L2->L6/L7 同步推进/终结掉线 RunState 与 SQLite），严格服从 11 锁全局 DAG；
     /// 3. 主动扫描并解锁已达 DeadlineAtUtc 的所有 RoundBarriers，推送房间级 SSE 唤醒等待客户端。
     /// </summary>
     public void RunWatchdogTick(SessionStore? sessions = null, ITournamentPvpCoordinator? pvpCoordinator = null)
     {
         DateTime now = UtcNow;
+        long monoNow = MonotonicNowMs;
         foreach (var lobby in _byId.Values)
         {
             if (lobby.IsCancelled || !lobby.HasStarted)
@@ -1729,7 +1995,9 @@ public sealed class LobbyStore
             var takeoverEvents = new List<(string AccountId, string Username, string State, string Reason)>();
             var afkEliminations = new List<(string AccountId, string Username, uint Day)>();
             var daysToCheckBarrier = new HashSet<uint>();
+            var runSyncActions = new List<TakeoverRunSyncAction>();
 
+            // 阶段 0：短持 lobby.Members，仅推进掉线状态机与收集待检查屏障
             lock (lobby.Members)
             {
                 uint maxOnlineDay = 1;
@@ -1741,10 +2009,10 @@ public sealed class LobbyStore
                     }
                 }
 
-                // 收集当前尚未解锁的屏障天
+                // 收集当前尚未解锁的屏障天（全员就位 AllReadyUnlocked 或超时 TimedOutUnlocked 均视为已解锁）
                 foreach (var kv in lobby.RoundBarriers)
                 {
-                    if (!kv.Value.TimedOutUnlocked)
+                    if (!kv.Value.AllReadyUnlocked && !kv.Value.TimedOutUnlocked)
                         daysToCheckBarrier.Add(kv.Key);
                 }
                 if (maxOnlineDay >= 1) daysToCheckBarrier.Add(maxOnlineDay);
@@ -1773,9 +2041,11 @@ public sealed class LobbyStore
                     if (m.ConnectionState == "disconnected")
                     {
                         bool blockingActiveBarrier = lobby.RoundBarriers.Values.Any(b =>
+                            !b.AllReadyUnlocked &&
                             !b.TimedOutUnlocked &&
-                            b.FirstReadyAtUtc.HasValue &&
-                            (now - b.FirstReadyAtUtc.Value).TotalSeconds >= TakeoverBarrierGraceSeconds &&
+                            (b.FirstReadyMonotonicMs.HasValue
+                                ? (monoNow - b.FirstReadyMonotonicMs.Value) >= TakeoverBarrierGraceSeconds * 1000L
+                                : (b.FirstReadyAtUtc.HasValue && (now - b.FirstReadyAtUtc.Value).TotalSeconds >= TakeoverBarrierGraceSeconds)) &&
                             (m.CurrentDay < b.Day || (m.CurrentDay == b.Day && !m.IsReadyAtHour6Pvp)));
 
                         if (blockingActiveBarrier || offlineSec >= TakeoverTotalDisconnectSeconds)
@@ -1786,78 +2056,197 @@ public sealed class LobbyStore
                             takeoverEvents.Add((m.AccountId, m.Username, "ai_takeover", blockingActiveBarrier ? "barrier_timeout" : "disconnect_timeout"));
                         }
                     }
+                }
+            }
 
-                    // 若处于 AI 托管状态且落后于全房在线进度，自动为其按末次快照代打推进滞后天数
-                    if (m.ConnectionState == "ai_takeover" && m.CurrentDay < maxOnlineDay)
+            // 阶段 1 -> 2 -> 3：逐日无跨锁推进托管滞后天数（每次仅采集 1 天，避免第 1 天已淘汰却提前替第 2 天向 pvpCoordinator 写入负场）
+            int maxAdvanceSteps = MaxMissedTakeoverDays + 1;
+            for (int step = 0; step < maxAdvanceSteps; step++)
+            {
+                var takeoverPlans = new List<TakeoverStepPlan>();
+                var humanSnaps = new Dictionary<string, HumanWatchdogSnapshot>(StringComparer.OrdinalIgnoreCase);
+                lock (lobby.Members)
+                {
+                    if (lobby.IsCancelled)
+                        break;
+
+                    uint maxOnlineDay = 1;
+                    foreach (var m in lobby.Members)
                     {
-                        while (m.CurrentDay < maxOnlineDay && !m.FinalIsEliminated && !m.HasFinishedRun)
+                        if (!m.IsAi)
                         {
-                            uint simDay = m.CurrentDay;
-                            m.MissedPvpDays++;
+                            humanSnaps[m.AccountId] = new HumanWatchdogSnapshot(
+                                m.AccountId,
+                                m.CurrentDay,
+                                m.IsReadyAtHour6Pvp,
+                                m.ConnectionState,
+                                m.HasFinishedRun,
+                                m.FinalIsEliminated);
+                        }
+                        if (!m.IsAi && !m.HasFinishedRun && !m.FinalIsEliminated && m.ConnectionState == "online")
+                        {
+                            if (m.CurrentDay > maxOnlineDay) maxOnlineDay = m.CurrentDay;
+                        }
+                    }
 
-                            // 对称裁决保护：若当日已有真人对手结果则服从，否则托管代打按保守战果结算（不作弊强化）
-                            bool wonByTakeover = false;
-                            if (lobby.TournamentSessionId.HasValue && pvpCoordinator != null)
-                            {
-                                var assign = lobby.Matchmaker.GetAssignment(m.AccountId, simDay);
-                                if (assign != null && !assign.OpponentIsBot)
-                                {
-                                    var resolved = pvpCoordinator.TryGetResolvedMatch(lobby.TournamentSessionId.Value, simDay, m.AccountId, assign.OpponentAccountId);
-                                    if (resolved != null)
-                                    {
-                                        wonByTakeover = string.Equals(resolved.WinnerAccountId, m.AccountId, StringComparison.OrdinalIgnoreCase);
-                                    }
-                                    else
-                                    {
-                                        // 无人先结算时记录保守判负（避免掉线托管白嫖胜利）
-                                        pvpCoordinator.RecordOrGetResolvedMatch(
-                                            lobby.TournamentSessionId.Value,
-                                            simDay,
-                                            m.AccountId,
-                                            assign.OpponentAccountId,
-                                            new SymmetricHumanPvpOutcome(
-                                                WinnerAccountId: assign.OpponentAccountId,
-                                                LoserAccountId: m.AccountId,
-                                                BattleSeed: assign.BattleSeed,
-                                                LoserPrestigeDamage: Math.Max(1, (int)simDay),
-                                                ReplayId: "",
-                                                CachedCombatSimForP1: null,
-                                                CachedCombatSimForP2: null));
-                                    }
-                                }
-                                else
-                                {
-                                    // 对阵 AI 托管采用确定性中等胜率
-                                    wonByTakeover = ((simDay + m.MissedPvpDays) % 2) == 0;
-                                }
-                            }
-
-                            if (wonByTakeover)
-                            {
-                                m.FinalVictories++;
-                            }
-                            else
-                            {
-                                m.FinalDefeats++;
-                                m.FinalPrestige = Math.Max(0, m.FinalPrestige - Math.Max(1, (int)simDay));
-                            }
-
-                            m.CurrentDay = simDay + 1;
-                            m.CurrentHour = 1;
-                            m.IsReadyAtHour6Pvp = false;
-                            m.FinalDay = simDay;
-                            lobbyDirty = true;
-
-                            if (m.FinalPrestige <= 0 || m.MissedPvpDays >= MaxMissedTakeoverDays)
-                            {
-                                m.FinalIsEliminated = true;
-                                m.HasFinishedRun = true;
-                                m.RemovalReason = "afk";
-                                afkEliminations.Add((m.AccountId, m.Username, simDay));
-                            }
+                    foreach (var m in lobby.Members)
+                    {
+                        if (m.IsAi || m.HasFinishedRun || m.FinalIsEliminated || m.FinalIsChampion)
+                            continue;
+                        if (m.ConnectionState == "ai_takeover" && m.CurrentDay < maxOnlineDay)
+                        {
+                            bool barrierTimedOut = lobby.RoundBarriers.TryGetValue(m.CurrentDay, out var br) && br.TimedOutUnlocked;
+                            takeoverPlans.Add(new TakeoverStepPlan(
+                                AccountId: m.AccountId,
+                                Username: m.Username,
+                                SimDay: m.CurrentDay,
+                                NextMissedPvpDays: m.MissedPvpDays + 1,
+                                TournamentSessionId: lobby.TournamentSessionId,
+                                BarrierTimedOut: barrierTimedOut));
                         }
                     }
                 }
+
+                if (takeoverPlans.Count == 0)
+                    break;
+
+                // 阶段 2（完全无锁）：对称裁决查询/落盘，绝不持有 lobby.Members，且严格保护在线游玩真人不被第三方领跑提前判负截胡（P0-42）
+                var takeoverResults = new List<TakeoverStepResult>(takeoverPlans.Count);
+                foreach (var plan in takeoverPlans)
+                {
+                    bool wonByTakeover = false;
+                    bool isDraw = false;
+                    bool deferred = false;
+                    if (plan.TournamentSessionId.HasValue && pvpCoordinator != null)
+                    {
+                        var assign = lobby.Matchmaker.GetAssignment(plan.AccountId, plan.SimDay);
+                        if (assign != null && !assign.OpponentIsBot)
+                        {
+                            var resolved = pvpCoordinator.TryGetResolvedMatch(plan.TournamentSessionId.Value, plan.SimDay, plan.AccountId, assign.OpponentAccountId);
+                            if (resolved != null)
+                            {
+                                isDraw = string.Equals(resolved.WinnerAccountId, "__draw__", StringComparison.OrdinalIgnoreCase);
+                                wonByTakeover = !isDraw && string.Equals(resolved.WinnerAccountId, plan.AccountId, StringComparison.OrdinalIgnoreCase);
+                            }
+                            else
+                            {
+                                // P0-42：仅当真人对手已就位/越天/已锁板、对手自身也托管或终局、或本轮屏障已正式超时解锁时才允许落盘缺席判负
+                                bool oppReadyOrPast = false;
+                                bool oppOfflineOrFinished = false;
+                                if (humanSnaps.TryGetValue(assign.OpponentAccountId, out var oppSnap))
+                                {
+                                    oppReadyOrPast = oppSnap.CurrentDay > plan.SimDay
+                                        || (oppSnap.CurrentDay == plan.SimDay && oppSnap.IsReadyAtHour6Pvp);
+                                    oppOfflineOrFinished = oppSnap.ConnectionState == "ai_takeover"
+                                        || oppSnap.HasFinishedRun
+                                        || oppSnap.FinalIsEliminated;
+                                }
+                                bool oppHasLockedBoard = pvpCoordinator.TryGetLockedBoard(
+                                    plan.TournamentSessionId.Value, plan.SimDay, assign.OpponentAccountId) != null;
+
+                                if (oppReadyOrPast || oppHasLockedBoard || oppOfflineOrFinished || plan.BarrierTimedOut)
+                                {
+                                    // 无人先结算时记录保守判负（避免掉线托管白嫖胜利）；若对手并发抢先提交则服从权威结果
+                                    var committed = pvpCoordinator.RecordOrGetResolvedMatch(
+                                        plan.TournamentSessionId.Value,
+                                        plan.SimDay,
+                                        plan.AccountId,
+                                        assign.OpponentAccountId,
+                                        new SymmetricHumanPvpOutcome(
+                                            WinnerAccountId: assign.OpponentAccountId,
+                                            LoserAccountId: plan.AccountId,
+                                            BattleSeed: assign.BattleSeed,
+                                            LoserPrestigeDamage: Math.Max(1, (int)plan.SimDay),
+                                            ReplayId: "",
+                                            CachedCombatSimForP1: null,
+                                            CachedCombatSimForP2: null));
+                                    isDraw = string.Equals(committed.WinnerAccountId, "__draw__", StringComparison.OrdinalIgnoreCase);
+                                    wonByTakeover = !isDraw && string.Equals(committed.WinnerAccountId, plan.AccountId, StringComparison.OrdinalIgnoreCase);
+                                }
+                                else
+                                {
+                                    // 真人对手仍在当日 Hour 1..5 正常在线游玩：暂缓托管结算，绝不提前截胡！
+                                    deferred = true;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // 对阵 AI 托管采用确定性中等胜率
+                            wonByTakeover = ((plan.SimDay + plan.NextMissedPvpDays) % 2) == 0;
+                        }
+                    }
+                    takeoverResults.Add(new TakeoverStepResult(plan.AccountId, plan.SimDay, wonByTakeover, isDraw, deferred));
+                }
+
+                // 阶段 3（短持 lobby.Members）：原子复核成员仍处于 ai_takeover 且当前天数未变更后应用进度，并收集阶段 4 RunState 同步动作
+                bool anyApplied = false;
+                lock (lobby.Members)
+                {
+                    if (lobby.IsCancelled)
+                        break;
+
+                    foreach (var res in takeoverResults)
+                    {
+                        if (res.Deferred)
+                            continue;
+
+                        var m = lobby.Members.Find(x => x.AccountId.Equals(res.AccountId, StringComparison.OrdinalIgnoreCase));
+                        if (m == null || m.IsAi || m.HasFinishedRun || m.FinalIsEliminated || m.FinalIsChampion)
+                            continue;
+                        if (m.ConnectionState != "ai_takeover" || m.CurrentDay != res.SimDay)
+                            continue;
+
+                        m.MissedPvpDays++;
+                        if (res.IsDraw)
+                        {
+                            // 平局不增胜负不扣声望
+                        }
+                        else if (res.WonByTakeover)
+                        {
+                            m.FinalVictories++;
+                        }
+                        else
+                        {
+                            m.FinalDefeats++;
+                            m.FinalPrestige = Math.Max(0, m.FinalPrestige - Math.Max(1, (int)res.SimDay));
+                        }
+
+                        m.LastCompletedPvpDay = Math.Max(m.LastCompletedPvpDay, res.SimDay);
+                        m.CurrentDay = res.SimDay + 1;
+                        m.CurrentHour = 1;
+                        m.IsReadyAtHour6Pvp = false;
+                        m.FinalDay = res.SimDay;
+                        lobbyDirty = true;
+                        anyApplied = true;
+
+                        bool newlyEliminated = false;
+                        if (m.FinalPrestige <= 0 || m.MissedPvpDays >= MaxMissedTakeoverDays)
+                        {
+                            m.FinalIsEliminated = true;
+                            m.HasFinishedRun = true;
+                            m.RemovalReason = "afk";
+                            newlyEliminated = true;
+                            afkEliminations.Add((m.AccountId, m.Username, res.SimDay));
+                        }
+
+                        if (lobby.TournamentSessionId.HasValue)
+                        {
+                            runSyncActions.Add(new TakeoverRunSyncAction(
+                                AccountId: m.AccountId,
+                                TournamentSessionId: lobby.TournamentSessionId.Value,
+                                SimDay: res.SimDay,
+                                FinalVictories: m.FinalVictories,
+                                FinalDefeats: m.FinalDefeats,
+                                FinalPrestige: m.FinalPrestige,
+                                IsEliminated: newlyEliminated || m.FinalIsEliminated,
+                                RemovalReason: newlyEliminated ? "afk_eliminated" : (m.RemovalReason ?? "")));
+                        }
+                    }
+                }
+
+                if (!anyApplied)
+                    break;
             }
 
             if (lobbyDirty)
@@ -1878,10 +2267,151 @@ public sealed class LobbyStore
                 NotifyLobbyChanged(lobby.LobbyId);
             }
 
+            // 阶段 4（完全在 L5a 锁外执行！）：按严格全局正序 L1 (AccountLock) -> L2 (Session.Gate) -> L6/L7 (Persistence)
+            // 同步推进或终结掉线玩家的 RunState 与 SQLite，并清理僵尸内存会话（P0-42）
+            if (runSyncActions.Count > 0)
+            {
+                // 同账号多次步进合并为最新终态动作，避免冗余重复落盘
+                var latestByAccount = new Dictionary<string, TakeoverRunSyncAction>(StringComparer.OrdinalIgnoreCase);
+                foreach (var act in runSyncActions)
+                {
+                    if (!latestByAccount.TryGetValue(act.AccountId, out var prev) ||
+                        act.IsEliminated ||
+                        act.SimDay >= prev.SimDay)
+                    {
+                        latestByAccount[act.AccountId] = act;
+                    }
+                }
+                foreach (var action in latestByAccount.Values)
+                {
+                    ApplyTakeoverRunSyncOutOfLobbyLock(action, sessions);
+                }
+            }
+
             foreach (uint d in daysToCheckBarrier)
             {
                 EvaluateRoundBarrier(lobby, d, null, null, sessions, startOrAdvanceCountdown: true);
             }
+        }
+    }
+
+    /// <summary>
+    /// P0-42 阶段 4：彻底在 L5a 锁外按严格正序 L1 (AccountSessionLock, 200ms TryWait) -> L2 (Session.Gate, 200ms TryWait) -> L6/L7 (Persistence)
+    /// 同步推进或终结掉线玩家内存 RunState 与 SQLite 快照，并分离僵尸会话防止空 SelectionSet 内存态残留。
+    /// </summary>
+    private void ApplyTakeoverRunSyncOutOfLobbyLock(TakeoverRunSyncAction action, SessionStore? sessions)
+    {
+        var accountLock = GameServerEndpoints.GetAccountSessionLock(action.AccountId);
+        if (!accountLock.Wait(TimeSpan.FromMilliseconds(200)))
+            return;
+        try
+        {
+            bool handledInMemory = false;
+            var mem = sessions?.GetByAccount(action.AccountId);
+            if (mem != null && mem.TournamentSessionId == action.TournamentSessionId)
+            {
+                if (mem.Gate.Wait(TimeSpan.FromMilliseconds(200)))
+                {
+                    try
+                    {
+                        var handle = SessionRegistry.Get(mem.Sid);
+                        if (handle != null && handle.Run.TournamentSessionId == action.TournamentSessionId)
+                        {
+                            var run = handle.Run;
+                            // 首行强制 TOCTOU 二次复核：若玩家已在间隙主动投降/阵亡/夺冠，绝不覆写已终局态！
+                            if (Persistence.IsTerminalState(run.State))
+                            {
+                                handledInMemory = true;
+                            }
+                            else if (action.IsEliminated)
+                            {
+                                run.State = ERunState.EndRunDefeat;
+                                run.Day = Math.Max(run.Day, action.SimDay);
+                                run.Victories = Math.Max(run.Victories, (uint)Math.Max(0, action.FinalVictories));
+                                run.Defeats = Math.Max(run.Defeats, (uint)Math.Max(0, action.FinalDefeats));
+                                run.LastCompletedPvpDay = Math.Max(run.LastCompletedPvpDay, action.SimDay);
+                                run.PlayerAttributes[EPlayerAttributeType.Prestige] = 0;
+                                run.PublishPublicSummary();
+
+                                // 严格落盘序（兼顾 W1-A SQL 终态守卫）：先写含 EndRunDefeat 的完整终局快照，再 MarkRunEnded
+                                if (_db != null)
+                                {
+                                    try
+                                    {
+                                        string snapJson = RunSnapshotSerializer.Serialize(run, startSelectionDone: run.StartSelectionDone);
+                                        _db.SaveRunSnapshot(run, action.AccountId, snapJson, isCustomRule: run.IsCustomRuleRun);
+                                        _db.MarkRunEnded(run.RunId, ERunState.EndRunDefeat, "afk_eliminated");
+                                    }
+                                    catch { }
+                                }
+                                SessionRegistry.Detach(mem.Sid);
+                                GameServerEndpoints.DetachRidCache(mem.Sid);
+                                sessions!.Remove(mem.Sid);
+                                handledInMemory = true;
+                            }
+                            else if (run.Day <= action.SimDay)
+                            {
+                                // 仅当内存会话仍停留在 <= action.SimDay 时推进（防止 TOCTOU 清空已抢先进入 Day+1 的在线玩家盘面！）
+                                run.Day = action.SimDay + 1;
+                                run.Hour = 1;
+                                run.State = ERunState.Choice;
+                                run.CurrentEncounterId = null;
+                                run.ActiveEncounterCardInstanceId = null;
+                                run.SelectionSet.Clear();
+                                run.SuspendedStates.Clear();
+                                run.Victories = Math.Max(run.Victories, (uint)Math.Max(0, action.FinalVictories));
+                                run.Defeats = Math.Max(run.Defeats, (uint)Math.Max(0, action.FinalDefeats));
+                                run.LastCompletedPvpDay = Math.Max(run.LastCompletedPvpDay, action.SimDay);
+                                int curPrestige = run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, action.FinalPrestige);
+                                run.PlayerAttributes[EPlayerAttributeType.Prestige] = Math.Max(0, Math.Min(curPrestige, action.FinalPrestige));
+                                run.PublishPublicSummary();
+
+                                if (_db != null)
+                                {
+                                    try
+                                    {
+                                        string snapJson = RunSnapshotSerializer.Serialize(run, startSelectionDone: run.StartSelectionDone);
+                                        _db.SaveRunSnapshot(run, action.AccountId, snapJson, isCustomRule: run.IsCustomRuleRun);
+                                    }
+                                    catch { }
+                                }
+                                // 分离旧内存会话，令重连走 /sessions 自愈补发 Day N Hour 1 完整候选，绝不留空 SelectionSet 僵尸会话
+                                SessionRegistry.Detach(mem.Sid);
+                                GameServerEndpoints.DetachRidCache(mem.Sid);
+                                sessions!.Remove(mem.Sid);
+                                handledInMemory = true;
+                            }
+                            else
+                            {
+                                // 玩家已在线推进至 >= SimDay + 1，尊重在线状态不干扰
+                                handledInMemory = true;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        mem.Gate.Release();
+                    }
+                }
+            }
+
+            // 内存无活跃会话（如服务曾重启或先前已分离）：针对淘汰动作仍在持 L1 内兜底更新 SQLite 终局标志
+            if (!handledInMemory && action.IsEliminated && _db != null && Guid.TryParse(action.AccountId, out var accGuid))
+            {
+                try
+                {
+                    var row = _db.LoadLatestTournamentRun(accGuid, action.TournamentSessionId);
+                    if (row != null && !row.IsEnded)
+                    {
+                        _db.MarkRunEnded(row.RunId, ERunState.EndRunDefeat, "afk_eliminated");
+                    }
+                }
+                catch { }
+            }
+        }
+        finally
+        {
+            accountLock.Release();
         }
     }
 
@@ -3045,7 +3575,8 @@ public static class TournamentEndpoints
         };
     }
 
-    private static RunState? FindAccountActiveOrRecentRun(
+    /// <summary>D8-P1-02：跨线程零锁读取指定账号锦标赛对局的不可变公开摘要快照，严禁无锁直接读取他人 RunState。</summary>
+    private static RunPublicSummarySnapshot? FindAccountPublicSummary(
         string accountIdHex,
         SessionStore sessions,
         Guid? expectedTournamentSessionId = null)
@@ -3063,20 +3594,20 @@ public static class TournamentEndpoints
             return null;
         }
 
-        return SessionRegistry.Get(mem.Sid)?.Run;
+        return SessionRegistry.Get(mem.Sid)?.Run.PublicSummary;
     }
 
-    private static object StatusFor(AccountStore.Account acc, LobbyStore lobbies, SessionStore sessions)
+    public static object StatusFor(AccountStore.Account acc, LobbyStore lobbies, SessionStore sessions)
     {
         string aid = acc.AccountId.ToString("N");
         var lobby = lobbies.GetByMember(aid);
         Guid? expectedTid = lobby?.TournamentSessionId;
-        var run = (lobby != null && (!lobby.HasStarted || !expectedTid.HasValue))
+        var runSnap = (lobby != null && (!lobby.HasStarted || !expectedTid.HasValue))
             ? null
-            : FindAccountActiveOrRecentRun(aid, sessions, expectedTid);
+            : FindAccountPublicSummary(aid, sessions, expectedTid);
         var selfMember = lobby != null ? lobbies.FindMember(lobby, aid) : null;
 
-        bool started = lobby?.HasStarted ?? (run != null);
+        bool started = lobby?.HasStarted ?? (runSnap != null);
         var activeMem = sessions.GetByAccount(aid);
         Guid sessionId = lobby?.TournamentSessionId
                          ?? (activeMem != null && (activeMem.PlayMode == EPlayMode.Tournament || activeMem.TournamentSessionId.HasValue)
@@ -3084,42 +3615,49 @@ public static class TournamentEndpoints
                              : null)
                          ?? Guid.Empty;
 
-        uint currentDay = run?.Day ?? selfMember?.FinalDay ?? 1u;
+        uint currentDay = runSnap?.Day ?? selfMember?.FinalDay ?? 1u;
         bool isChampion = false;
         bool isEliminated = false;
         bool isConceded = false;
         bool isRunEnded = false;
 
-        if (run != null)
-        {
-            isChampion = run.State == ERunState.EndRunVictory;
-            isEliminated = run.State == ERunState.EndRunDefeat;
-            isRunEnded = Persistence.IsTerminalState(run.State);
-            if (isRunEnded && selfMember != null && !selfMember.HasFinishedRun && lobby != null)
-            {
-                lobbies.RecordRunProgress(lobby, aid, run);
-            }
-        }
-        else if (selfMember != null && selfMember.HasFinishedRun)
+        // P0-42：当 selfMember 已标记权威终局（含 AFK 淘汰），一律终态优先，绝不因残留内存 run 误报未淘汰
+        if (selfMember != null && selfMember.HasFinishedRun)
         {
             isChampion = selfMember.FinalIsChampion;
             isEliminated = selfMember.FinalIsEliminated;
             isConceded = selfMember.FinalIsConceded;
             isRunEnded = true;
         }
-
-        bool isPvpReady = !isRunEnded && run != null &&
-            (run.State == ERunState.TournamentPvpChoice ||
-             run.State == ERunState.TournamentWaitingRoom ||
-             (run.State == ERunState.Choice && run.Hour >= 6 && (run.Victories + run.Defeats) < run.Day));
-
-        if (lobby != null && run != null)
+        else if (runSnap != null)
         {
-            lobbies.RecordRunProgress(lobby, aid, run);
+            isChampion = runSnap.State == ERunState.EndRunVictory;
+            isEliminated = runSnap.State == ERunState.EndRunDefeat;
+            isRunEnded = runSnap.IsTerminal;
+            if (isRunEnded && selfMember != null && !selfMember.HasFinishedRun && lobby != null)
+            {
+                lobbies.RecordRunProgressSnapshot(lobby, aid, runSnap);
+            }
         }
 
+        bool snapHasCompletedPvpForDay = runSnap != null && (
+            runSnap.LastCompletedPvpDay >= runSnap.Day ||
+            (runSnap.LastCompletedPvpDay == 0 &&
+             runSnap.RulesSnapshot.SpecialModeId != ESpecialModeId.BossRush &&
+             (runSnap.Victories + runSnap.Defeats) >= runSnap.Day));
+        bool isPvpReady = !isRunEnded && runSnap != null &&
+            (runSnap.State == ERunState.TournamentPvpChoice ||
+             runSnap.State == ERunState.TournamentWaitingRoom ||
+             (runSnap.State == ERunState.Choice && runSnap.Hour >= 6 && !snapHasCompletedPvpForDay));
+
+        if (lobby != null && runSnap != null)
+        {
+            lobbies.RecordRunProgressSnapshot(lobby, aid, runSnap);
+        }
+
+        // D8-P1-02：StatusFor 处于无 Session.Gate 的只读 HTTP 路径，传 selfRun: null 令屏障评估同样经 sessions 读取不可变 PublicSummary
         var barrierDecision = (lobby != null && started && !isRunEnded)
-            ? lobbies.EvaluateRoundBarrier(lobby, currentDay, aid, run, sessions, startOrAdvanceCountdown: true)
+            ? lobbies.EvaluateRoundBarrier(lobby, currentDay, aid, selfRun: null, sessions, startOrAdvanceCountdown: true)
             : new LobbyStore.PvpBarrierDecision(true, false, null, 1, isPvpReady ? 1 : 0, 0, false, false, 0, null);
 
         bool canStartPvp = isPvpReady && barrierDecision.CanStartPvp;
@@ -3133,12 +3671,12 @@ public static class TournamentEndpoints
             phase = "RunEnded";
         else if (isPvpReady)
             phase = "PvpReady";
-        else if (run == null)
+        else if (runSnap == null)
             phase = "RunStarting";
         else
             phase = "DayFlow";
 
-        var players = BuildPlayersSnapshot(lobby, acc, run, currentDay, sessions, lobbies);
+        var players = BuildPlayersSnapshot(lobby, acc, runSnap, currentDay, sessions, lobbies);
         var selfSnapshot = players.FirstOrDefault(p => p.AccountId.Equals(aid, StringComparison.OrdinalIgnoreCase));
 
         string assignedOppId = selfSnapshot?.AssignedOpponentAccountId ?? "";
@@ -3181,7 +3719,7 @@ public static class TournamentEndpoints
             DeadlineAt = deadlineAt,
             PlayerReadyForPvp = isPvpReady,
             ForcedTransition = barrierDecision.TimedOutUnlocked,
-            CombatSubmitted = run != null && run.State == ERunState.PVPCombat,
+            CombatSubmitted = runSnap != null && runSnap.State == ERunState.PVPCombat,
             CanStartPvp = canStartPvp,
             WaitingForOtherPlayers = waitingForOthers,
             IsEliminated = isEliminated,
@@ -3205,7 +3743,7 @@ public static class TournamentEndpoints
         public string Hero { get; set; } = "Vanessa";
         public uint CurrentDay { get; set; } = 1;
         public uint CurrentHour { get; set; } = 1;
-        public int Prestige { get; set; } = 20;
+        public int Prestige { get; set; } = GameDefaults.StartingPrestige;
         public bool HasVisitedFates { get; set; }
         public int Wins { get; set; }
         public int Losses { get; set; }
@@ -3228,7 +3766,7 @@ public static class TournamentEndpoints
     private static ObservedPlayerRow[] BuildPlayersSnapshot(
         LobbyStore.Lobby? lobby,
         AccountStore.Account? selfAcc,
-        RunState? selfRun,
+        RunPublicSummarySnapshot? selfSnap,
         uint currentDay,
         SessionStore sessions,
         LobbyStore? store = null)
@@ -3240,7 +3778,7 @@ public static class TournamentEndpoints
         {
             if (selfAcc != null)
             {
-                list.Add(BuildHumanRow(selfAcc.AccountId.ToString("N"), selfAcc.Username, selfRun, null, currentDay));
+                list.Add(BuildHumanRow(selfAcc.AccountId.ToString("N"), selfAcc.Username, selfSnap, null, currentDay));
             }
             return list.ToArray();
         }
@@ -3263,12 +3801,12 @@ public static class TournamentEndpoints
             isAiById[m.AccountId] = m.IsAi;
             if (!m.IsAi)
             {
-                var r = (selfAid != null && m.AccountId.Equals(selfAid, StringComparison.OrdinalIgnoreCase))
-                    ? selfRun
+                var snap = (selfAid != null && m.AccountId.Equals(selfAid, StringComparison.OrdinalIgnoreCase))
+                    ? selfSnap
                     : ((lobby.HasStarted && lobby.TournamentSessionId.HasValue)
-                        ? FindAccountActiveOrRecentRun(m.AccountId, sessions, lobby.TournamentSessionId)
+                        ? FindAccountPublicSummary(m.AccountId, sessions, lobby.TournamentSessionId)
                         : null);
-                list.Add(BuildHumanRow(m.AccountId, m.Username, r, m, currentDay));
+                list.Add(BuildHumanRow(m.AccountId, m.Username, snap, m, currentDay));
             }
             else
             {
@@ -3318,32 +3856,54 @@ public static class TournamentEndpoints
     private static ObservedPlayerRow BuildHumanRow(
         string accountId,
         string username,
-        RunState? r,
+        RunPublicSummarySnapshot? snap,
         LobbyStore.Member? m,
         uint fallbackDay)
     {
-        if (r != null)
+        if (m != null && m.HasFinishedRun)
         {
-            bool champ = r.State == ERunState.EndRunVictory;
-            bool elim = r.State == ERunState.EndRunDefeat;
-            bool terminal = Persistence.IsTerminalState(r.State);
-            bool readyPvp = !terminal && LobbyStore.ComputeIsAtOrPastHour6Pvp(r);
             return new ObservedPlayerRow
             {
                 AccountId = accountId,
                 Username = username,
-                Hero = (r.Hero == EHero.Common ? EHero.Vanessa : r.Hero).ToString(),
-                CurrentDay = r.Day,
-                CurrentHour = r.Hour,
-                Prestige = r.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 20),
-                HasVisitedFates = r.HasVisitedFates,
-                Wins = (int)r.Victories,
-                Losses = (int)r.Defeats,
+                Hero = m.Hero,
+                CurrentDay = m.FinalDay,
+                CurrentHour = m.CurrentHour,
+                Prestige = m.FinalPrestige,
+                Wins = m.FinalVictories,
+                Losses = m.FinalDefeats,
+                Phase = "RunEnded",
+                IsChampion = m.FinalIsChampion,
+                IsEliminated = m.FinalIsEliminated,
+                IsConceded = m.FinalIsConceded,
+                CanObserve = false,
+                ConnectionState = m.ConnectionState,
+                AiTakeoverRounds = m.MissedPvpDays,
+            };
+        }
+        if (snap != null)
+        {
+            bool champ = snap.State == ERunState.EndRunVictory;
+            bool elim = snap.State == ERunState.EndRunDefeat;
+            bool terminal = snap.IsTerminal;
+            bool readyPvp = !terminal && snap.IsReadyAtHour6Pvp;
+            return new ObservedPlayerRow
+            {
+                AccountId = accountId,
+                Username = username,
+                Hero = (snap.Hero == EHero.Common ? EHero.Vanessa : snap.Hero).ToString(),
+                CurrentDay = snap.Day,
+                CurrentHour = snap.Hour,
+                Prestige = snap.Prestige,
+                HasVisitedFates = snap.HasVisitedFates,
+                Wins = (int)snap.Victories,
+                Losses = (int)snap.Defeats,
                 Phase = terminal ? "RunEnded" : (readyPvp ? "PvpReady" : "DayFlow"),
                 ReadyForPvp = readyPvp,
-                CombatSubmitted = r.State == ERunState.PVPCombat,
+                CombatSubmitted = snap.State == ERunState.PVPCombat,
                 IsChampion = champ,
                 IsEliminated = elim,
+                IsConceded = m?.FinalIsConceded ?? false,
                 CanObserve = !terminal,
                 ConnectionState = m?.ConnectionState ?? "online",
                 AiTakeoverRounds = m?.MissedPvpDays ?? 0,
@@ -3356,7 +3916,7 @@ public static class TournamentEndpoints
             Hero = m?.Hero ?? "Vanessa",
             CurrentDay = m?.FinalDay ?? fallbackDay,
             CurrentHour = m?.CurrentHour ?? 1,
-            Prestige = m?.FinalPrestige ?? 20,
+            Prestige = m?.FinalPrestige ?? GameDefaults.StartingPrestige,
             Wins = m?.FinalVictories ?? 0,
             Losses = m?.FinalDefeats ?? 0,
             Phase = m?.HasFinishedRun == true ? "RunEnded" : "DayFlow",

@@ -8,6 +8,7 @@
 
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>
@@ -31,6 +32,7 @@
     <ProjectReference Include="..\BazaarCore\BazaarCore.csproj" />
     <ProjectReference Include="..\BazaarCli\BazaarCli.csproj" />
     <ProjectReference Include="..\BazaarDatasetGen\BazaarDatasetGen.csproj" />
+    <ProjectReference Include="..\BazaarModSdk\BazaarModSdk.csproj" />
     <ProjectReference Include="..\BazaarServer\BazaarServer.csproj" />
     <Reference Include="BazaarGameShared"><HintPath>..\..\ext\Managed\BazaarGameShared.dll</HintPath><Private>true</Private></Reference>
     <Reference Include="BazaarBattleService"><HintPath>..\..\ext\Managed\BazaarBattleService.dll</HintPath><Private>true</Private></Reference>
@@ -38,7 +40,6 @@
     <Reference Include="BazaarUnityTools"><HintPath>..\..\ext\Managed\BazaarUnityTools.dll</HintPath><Private>true</Private></Reference>
     <Reference Include="MessagePack"><HintPath>..\..\ext\Managed\MessagePack.dll</HintPath><Private>true</Private></Reference>
     <Reference Include="MessagePack.Annotations"><HintPath>..\..\ext\Managed\MessagePack.Annotations.dll</HintPath><Private>true</Private></Reference>
-    <Reference Include="Newtonsoft.Json"><HintPath>..\..\ext\Managed\Newtonsoft.Json.dll</HintPath><Private>true</Private></Reference>
     <Reference Include="Nanoid"><HintPath>..\..\ext\Managed\Nanoid.dll</HintPath><Private>true</Private></Reference>
     <Reference Include="Gilzoide.SqliteNet"><HintPath>..\..\ext\Managed\Gilzoide.SqliteNet.dll</HintPath><Private>true</Private></Reference>
   </ItemGroup>

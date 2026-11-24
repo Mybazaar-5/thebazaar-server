@@ -27,6 +27,7 @@ namespace BazaarCore.Tests;
 /// 出售附魔收益、Curio/商户防双折、2 级跨职业技能池隔离、技能去重与野怪同/高阶技能升级、
 /// UntilEndOfDay 清理事件同步、随机附魔排除当前、Jules 开局/Brolin 非相邻/双跨冰火插座、以及长袍怪商 30g 宝箱与 Waystones。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V12BiliServerHeroParityTests
 {
     private const string WhereAmIId = "875caea4-93c5-440b-a9fd-2886eeaa0fc5";
@@ -71,120 +72,43 @@ public sealed class V12BiliServerHeroParityTests
 
     private static readonly Lazy<Fx> RealFixture = new(() =>
     {
-        string? dataDir = Environment.GetEnvironmentVariable("BAZAAR_DATA_DIR");
-        if (string.IsNullOrWhiteSpace(dataDir) || !File.Exists(Path.Combine(dataDir, "GameData.db")))
-        {
-            string? probe = AppContext.BaseDirectory;
-            for (int i = 0; i < 10 && !string.IsNullOrEmpty(probe); i++, probe = Directory.GetParent(probe)?.FullName)
-            {
-                string candidate = Path.Combine(probe, "dist", "data");
-                if (File.Exists(Path.Combine(candidate, "GameData.db")))
-                {
-                    dataDir = candidate;
-                    break;
-                }
-            }
-        }
-        if (string.IsNullOrWhiteSpace(dataDir) || !File.Exists(Path.Combine(dataDir, "GameData.db")))
-            dataDir = @"e:\thebazaar\dist\data";
-
-        string dbPath = Path.Combine(dataDir, "GameData.db");
-        var validIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        string wlPath = Path.Combine(dataDir, "valid_card_ids.json");
-        if (File.Exists(wlPath))
-        {
-            using var doc = JsonDocument.Parse(File.ReadAllText(wlPath));
-            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                doc.RootElement.TryGetProperty("valid_ids", out var arr) &&
-                arr.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var el in arr.EnumerateArray())
-                {
-                    string? id = el.GetString();
-                    if (!string.IsNullOrWhiteSpace(id)) validIds.Add(id);
-                }
-            }
-        }
-
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new Fx
         {
-            DataDir = dataDir,
-            DbPath = dbPath,
-            Pool = CardPool.Load(dbPath),
-            Monsters = MonsterPool.Load(dbPath),
-            LevelUps = LevelUpTable.Load(dbPath),
-            Mode = GameModeConfig.Load(dbPath),
-            Repo = GameDatabaseLoader.Load(dbPath, null),
-            Ghosts = PvpGhostPool.Load(dataDir),
-            ValidCardIds = validIds,
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
+            ValidCardIds = shared.CreateValidCardIdsCopy(),
         };
     });
 
     private sealed class OverlayFixture : IDisposable
     {
-        public string TempDir { get; }
-        public string DbPath { get; }
-        public CardPool Pool { get; }
-        public List<BazaarServer.Data.MonsterTemplate> Monsters { get; }
-        public LevelUpTable LevelUps { get; }
-        public GameModeConfig Mode { get; }
-        public GameDataRepository Repo { get; }
-        public PvpGhostPool Ghosts { get; }
+        private readonly TestInfrastructure.SharedTestOverlay _inner;
+        public string TempDir => _inner.TempDir;
+        public string DbPath => TestInfrastructure.SharedGameDataFixture.Shared.DbPath;
+        public CardPool Pool => _inner.Pool;
+        public List<BazaarServer.Data.MonsterTemplate> Monsters => _inner.Monsters;
+        public LevelUpTable LevelUps => _inner.LevelUps;
+        public GameModeConfig Mode => _inner.Mode;
+        public GameDataRepository Repo => _inner.Repo;
+        public PvpGhostPool Ghosts => _inner.Ghosts;
 
         public OverlayFixture(
             (string Id, string Json)[] customCards,
             params (int Level, string Json)[] customLevelUps)
         {
-            var real = RealFixture.Value;
-            TempDir = Path.Combine(Path.GetTempPath(), "bazaar_v12_bili_" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(TempDir);
-            DbPath = Path.Combine(TempDir, "GameData.db");
-            File.Copy(real.DbPath, DbPath, overwrite: true);
-
-            var wl = new HashSet<string>(real.ValidCardIds, StringComparer.OrdinalIgnoreCase);
-            using (var conn = new SqliteConnection($"Data Source={DbPath}"))
-            {
-                conn.Open();
-                foreach (var (id, json) in customCards)
-                {
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "INSERT OR REPLACE INTO cards (Id, Data) VALUES ($id, $data)";
-                    cmd.Parameters.AddWithValue("$id", id);
-                    cmd.Parameters.AddWithValue("$data", Encoding.UTF8.GetBytes(json));
-                    cmd.ExecuteNonQuery();
-                    wl.Add(id);
-                }
-
-                foreach (var (lvl, json) in customLevelUps)
-                {
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "INSERT OR REPLACE INTO level_ups (Id, Data) VALUES ($id, $data)";
-                    cmd.Parameters.AddWithValue("$id", lvl);
-                    cmd.Parameters.AddWithValue("$data", Encoding.UTF8.GetBytes(json));
-                    cmd.ExecuteNonQuery();
-                }
-            }
-
-            File.WriteAllText(
-                Path.Combine(TempDir, "valid_card_ids.json"),
-                JsonSerializer.Serialize(new { valid_ids = wl.ToArray() }));
-
-            Pool = CardPool.Load(DbPath);
-            Monsters = real.Monsters;
-            LevelUps = LevelUpTable.Load(DbPath);
-            Mode = real.Mode;
-            Repo = GameDatabaseLoader.Load(DbPath, null);
-            Ghosts = real.Ghosts;
+            _inner = TestInfrastructure.SharedGameDataFixture.Shared.CreateMemoryOverlay(
+                customCards: customCards,
+                customLevelUps: customLevelUps);
         }
 
-        public void Dispose()
-        {
-            SqliteConnection.ClearAllPools();
-            if (Directory.Exists(TempDir))
-            {
-                try { Directory.Delete(TempDir, recursive: true); } catch { }
-            }
-        }
+        public void Dispose() => _inner.Dispose();
     }
 
     private static (RunState Run, RunEngine Engine) CreateStartedEngine(
@@ -657,7 +581,7 @@ public sealed class V12BiliServerHeroParityTests
         int baseDmg = cutlass.Attributes[ECardAttributeType.DamageAmount];
 
         cutlass.CoreCard!.DayAdd["DamageAmount"] = 30;
-        cutlass.CoreCard.ApplyEnchantment("Fiery", preventOverride: false, DurationTarget.Day);
+        cutlass.CoreCard.ApplyEnchantment("Fiery", DurationTarget.Day, preventOverride: false);
         run.SyncAllEntriesFromCoreCardsAndDiff(fx.Repo.GameMode.StandardPrices, [cutlass]);
         Assert.Equal(EEnchantmentType.Fiery, cutlass.Enchantment);
         Assert.Equal(baseDmg + 30, cutlass.Attributes[ECardAttributeType.DamageAmount]);

@@ -1,4 +1,7 @@
 using System.Numerics;
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace BazaarCore.Models;
@@ -371,7 +374,30 @@ public sealed record MutatorMetadata(
     double ScoreMultiplierDelta,
     bool IsPositive,
     string TargetHook = "CombatSimulator",
-    IReadOnlyDictionary<string, double>? Parameters = null);
+    IReadOnlyDictionary<string, double>? Parameters = null,
+    string? SourceModId = null,
+    string? NameEn = null,
+    string? Category = null,
+    double DifficultyDelta = 0.0,
+    bool EnabledByDefault = false,
+    IReadOnlyDictionary<string, object?>? Rules = null);
+
+/// <summary>
+/// P0-22：自定义突变词条的局外与商店规则聚合结果（供 RunEngine / ShopEngine 通用数据驱动消费，零硬编码单词条 ID）。
+/// </summary>
+public sealed class CustomMutatorRuleSummary
+{
+    public int StartingGoldDelta { get; init; }
+    public int StartingIncomeDelta { get; init; }
+    public bool FreeFirstShopReroll { get; init; }
+    public double MonsterHealthMultiplier { get; init; } = 1.0;
+    public double BoostModCardWeight { get; init; } = 1.0;
+    public double ShopPriceMultiplier { get; init; } = 1.0;
+    public int ExtraShopSlots { get; init; }
+    public IReadOnlyDictionary<string, object?> RawMergedRules { get; init; } = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+    public static CustomMutatorRuleSummary Empty { get; } = new();
+}
 
 /// <summary>
 /// 全局 14 条肉鸽突变词条权威目录与冲突消解工具。
@@ -440,14 +466,83 @@ public static class MutatorCatalog
             Parameters: new Dictionary<string, double> { ["minExtraCrossHeroItems"] = 1, ["maxExtraCrossHeroItems"] = 2 })
     ];
 
-    /// <summary>按词条 ID 索引（大小写不敏感）。</summary>
+    /// <summary>按词条 ID 索引（大小写不敏感，仅含内置 14 条）。</summary>
     public static IReadOnlyDictionary<string, MutatorMetadata> ById { get; } =
         All.ToDictionary(x => x.Id, StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>P0-22：进程全局运行时扩展 Mod 突变词条注册表（隔离单局请优先通过 extraMutators 传参，避免污染全局）。</summary>
+    private static readonly ConcurrentDictionary<string, MutatorMetadata> _runtimeModMutators =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>注册全局运行时 Mod 自定义突变词条（仅允许由全局宿主热重载/初始化调用，跳过与内置 ID 冲突的条目）。</summary>
+    public static void RegisterModMutators(IEnumerable<MutatorMetadata>? mutators)
+    {
+        if (mutators == null) return;
+        foreach (var m in mutators)
+        {
+            if (m == null || string.IsNullOrWhiteSpace(m.Id)) continue;
+            string id = m.Id.Trim();
+            if (ById.ContainsKey(id)) continue;
+            _runtimeModMutators[id] = m;
+        }
+    }
+
+    /// <summary>清空全局运行时扩展 Mod 突变词条（热重载前调用）。</summary>
+    public static void ClearModMutators() => _runtimeModMutators.Clear();
+
+    /// <summary>按 ID 解析词条元数据：优先级 extraMutators（隔离单局）> 内置目录 > 全局运行时扩展表。</summary>
+    public static MutatorMetadata? TryGet(string? id, IReadOnlyDictionary<string, MutatorMetadata>? extraMutators = null)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return null;
+        string trimmed = id.Trim();
+        if (extraMutators != null && extraMutators.TryGetValue(trimmed, out var ext))
+            return ext;
+        if (ById.TryGetValue(trimmed, out var builtIn))
+            return builtIn;
+        if (extraMutators == null && _runtimeModMutators.TryGetValue(trimmed, out var rt))
+            return rt;
+        return null;
+    }
+
+    /// <summary>返回完整可用突变词条列表（内置 + 单局 extraMutators 或全局扩展表）。</summary>
+    public static IReadOnlyList<MutatorMetadata> GetAll(IReadOnlyDictionary<string, MutatorMetadata>? extraMutators = null)
+    {
+        var list = new List<MutatorMetadata>(All.Count + (extraMutators?.Count ?? _runtimeModMutators.Count));
+        list.AddRange(All);
+        IEnumerable<MutatorMetadata> extras = extraMutators != null ? extraMutators.Values : _runtimeModMutators.Values;
+        var seen = new HashSet<string>(ById.Keys, StringComparer.OrdinalIgnoreCase);
+        foreach (var m in extras)
+        {
+            if (m != null && !string.IsNullOrWhiteSpace(m.Id) && seen.Add(m.Id.Trim()))
+                list.Add(m);
+        }
+        return list;
+    }
+
     /// <summary>
-    /// 清洗、去重、过滤非法词条并按互斥组（ConflictGroup）消解冲突，最多保留 <paramref name="maxCount"/> 条。
+    /// 清洗、去重、过滤非法词条并按互斥组（ConflictGroup）消解冲突，最多保留 <paramref name="maxCount"/> 条（默认 4 条）。
     /// </summary>
     public static List<string> NormalizeAndResolveConflicts(IEnumerable<string>? ids, int maxCount = 4)
+        => NormalizeAndResolveConflicts(ids, maxCount, extraMutators: null);
+
+    /// <summary>
+    /// 支持传入单局隔离 <paramref name="extraMutators"/> 的词条清洗与冲突消解重载。
+    /// </summary>
+    public static List<string> NormalizeAndResolveConflicts(
+        IEnumerable<string>? ids,
+        int maxCount,
+        IReadOnlyDictionary<string, MutatorMetadata>? extraMutators)
+        => NormalizeAndResolveConflicts(ids, maxCount, extraMutators, preserveUnregistered: false);
+
+    /// <summary>
+    /// 支持单局隔离 <paramref name="extraMutators"/> 与无上下文保活模式（<paramref name="preserveUnregistered"/>）的词条清洗重载：
+    /// 已知词条仍严格按互斥组消解冲突；当 <paramref name="preserveUnregistered"/> 为 true 时，保留当前无上下文暂未注册的隔离 Mod 词条 ID 避免在序列化/分区时静默丢弃。
+    /// </summary>
+    public static List<string> NormalizeAndResolveConflicts(
+        IEnumerable<string>? ids,
+        int maxCount,
+        IReadOnlyDictionary<string, MutatorMetadata>? extraMutators,
+        bool preserveUnregistered)
     {
         var result = new List<string>();
         if (ids == null || maxCount <= 0)
@@ -462,8 +557,18 @@ public static class MutatorCatalog
                 continue;
 
             var trimmed = raw.Trim();
-            if (!ById.TryGetValue(trimmed, out var meta))
+            var meta = TryGet(trimmed, extraMutators);
+            if (meta == null)
+            {
+                if (!preserveUnregistered)
+                    continue;
+                if (!seenIds.Add(trimmed))
+                    continue;
+                result.Add(trimmed);
+                if (result.Count >= maxCount)
+                    break;
                 continue;
+            }
             if (!seenIds.Add(meta.Id))
                 continue;
             if (!string.IsNullOrEmpty(meta.ConflictGroup) && !usedGroups.Add(meta.ConflictGroup))
@@ -481,17 +586,170 @@ public static class MutatorCatalog
     /// 计算给定预设档位与激活突变词条列表叠加后的最终积分结算倍率（最低钳底 0.25x）。
     /// </summary>
     public static double CalculateTotalScoreMultiplier(EGameModePreset preset, IEnumerable<string>? mutatorIds)
+        => CalculateTotalScoreMultiplier(preset, mutatorIds, extraMutators: null);
+
+    /// <summary>
+    /// 支持单局隔离 <paramref name="extraMutators"/> 的最终积分倍率计算重载。
+    /// </summary>
+    public static double CalculateTotalScoreMultiplier(
+        EGameModePreset preset,
+        IEnumerable<string>? mutatorIds,
+        IReadOnlyDictionary<string, MutatorMetadata>? extraMutators)
     {
         double baseMult = PresetCatalog.ById.TryGetValue(preset, out var p) ? p.ScoreMultiplier : 1.0;
         if (mutatorIds != null)
         {
-            foreach (var id in NormalizeAndResolveConflicts(mutatorIds, maxCount: 14))
+            foreach (var id in NormalizeAndResolveConflicts(mutatorIds, maxCount: 14, extraMutators))
             {
-                if (ById.TryGetValue(id, out var m))
+                var m = TryGet(id, extraMutators);
+                if (m != null)
                     baseMult += m.ScoreMultiplierDelta;
             }
         }
         return Math.Max(0.25, Math.Round(baseMult, 2));
+    }
+
+    /// <summary>
+    /// P0-22：从激活的自定义突变词条 Rules/Parameters 通用聚合局外开局与商店规则参数。
+    /// </summary>
+    public static CustomMutatorRuleSummary ResolveRuleSummary(
+        IEnumerable<string>? activeMutatorIds,
+        IReadOnlyDictionary<string, MutatorMetadata>? extraMutators = null)
+    {
+        if (activeMutatorIds == null) return CustomMutatorRuleSummary.Empty;
+
+        int goldDelta = 0;
+        int incomeDelta = 0;
+        bool freeFirstReroll = false;
+        double monsterHpMult = 1.0;
+        double boostModCardWeight = 1.0;
+        double shopPriceMult = 1.0;
+        int extraShopSlots = 0;
+        var merged = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var id in NormalizeAndResolveConflicts(activeMutatorIds, maxCount: 14, extraMutators))
+        {
+            var m = TryGet(id, extraMutators);
+            if (m == null) continue;
+            // 仅汇聚自定义/扩展规则词条（内置词条仍由既有开关逻辑处理，避免重复叠加）
+            if (m.Rules == null && string.IsNullOrWhiteSpace(m.SourceModId)) continue;
+
+            if (m.Rules != null)
+            {
+                foreach (var (k, v) in m.Rules)
+                    merged[k] = v;
+            }
+            if (m.Parameters != null)
+            {
+                foreach (var (k, v) in m.Parameters)
+                    merged.TryAdd(k, v);
+            }
+
+            if (TryReadRuleDouble(m, "startingGoldDelta", out double gd))
+                goldDelta += (int)Math.Round(Math.Clamp(gd, -200, 500));
+            if (TryReadRuleDouble(m, "startingIncomeDelta", out double inc))
+                incomeDelta += (int)Math.Round(Math.Clamp(inc, -50, 100));
+            if (TryReadRuleBool(m, "freeFirstShopReroll", out bool fr) && fr)
+                freeFirstReroll = true;
+            if (TryReadRuleDouble(m, "monsterHealthMultiplier", out double mhm) && mhm > 0)
+                monsterHpMult *= Math.Clamp(mhm, 0.25, 5.0);
+            if (TryReadRuleDouble(m, "boostModCardWeight", out double bmw) && bmw > 0)
+                boostModCardWeight *= Math.Clamp(bmw, 0.1, 10.0);
+            if (TryReadRuleDouble(m, "shopPriceMultiplier", out double spm) && spm > 0)
+                shopPriceMult *= Math.Clamp(spm, 0.2, 5.0);
+            if (TryReadRuleDouble(m, "extraShopSlots", out double ess))
+                extraShopSlots += (int)Math.Round(Math.Clamp(ess, -2, 4));
+        }
+
+        return new CustomMutatorRuleSummary
+        {
+            StartingGoldDelta = Math.Clamp(goldDelta, -200, 500),
+            StartingIncomeDelta = Math.Clamp(incomeDelta, -50, 100),
+            FreeFirstShopReroll = freeFirstReroll,
+            MonsterHealthMultiplier = Math.Clamp(monsterHpMult, 0.25, 5.0),
+            BoostModCardWeight = Math.Clamp(boostModCardWeight, 0.1, 10.0),
+            ShopPriceMultiplier = Math.Clamp(shopPriceMult, 0.2, 5.0),
+            ExtraShopSlots = Math.Clamp(extraShopSlots, -2, 4),
+            RawMergedRules = merged
+        };
+    }
+
+    public static bool TryReadRuleDouble(MutatorMetadata meta, string key, out double value)
+    {
+        value = 0;
+        if (meta.Rules != null && meta.Rules.TryGetValue(key, out var raw) && TryConvertToDouble(raw, out value))
+            return true;
+        if (meta.Parameters != null && meta.Parameters.TryGetValue(key, out double pVal) && double.IsFinite(pVal))
+        {
+            value = pVal;
+            return true;
+        }
+        return false;
+    }
+
+    public static bool TryReadRuleBool(MutatorMetadata meta, string key, out bool value)
+    {
+        value = false;
+        if (meta.Rules != null && meta.Rules.TryGetValue(key, out var raw))
+        {
+            switch (raw)
+            {
+                case bool b:
+                    value = b;
+                    return true;
+                case JsonElement el when el.ValueKind == JsonValueKind.True:
+                    value = true;
+                    return true;
+                case JsonElement el when el.ValueKind == JsonValueKind.False:
+                    value = false;
+                    return true;
+                case JsonElement el when el.ValueKind == JsonValueKind.Number && el.TryGetDouble(out double d):
+                    value = Math.Abs(d) > 1e-9;
+                    return true;
+                case string s when bool.TryParse(s, out bool parsed):
+                    value = parsed;
+                    return true;
+            }
+        }
+        if (meta.Parameters != null && meta.Parameters.TryGetValue(key, out double pVal) && double.IsFinite(pVal))
+        {
+            value = Math.Abs(pVal) > 1e-9;
+            return true;
+        }
+        return false;
+    }
+
+    private static bool TryConvertToDouble(object? raw, out double result)
+    {
+        result = 0;
+        switch (raw)
+        {
+            case null:
+                return false;
+            case double d when double.IsFinite(d):
+                result = d;
+                return true;
+            case float f when float.IsFinite(f):
+                result = f;
+                return true;
+            case int i:
+                result = i;
+                return true;
+            case long l:
+                result = l;
+                return true;
+            case decimal dec:
+                result = (double)dec;
+                return true;
+            case JsonElement el when el.ValueKind == JsonValueKind.Number && el.TryGetDouble(out double jd) && double.IsFinite(jd):
+                result = jd;
+                return true;
+            case string s when double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out double sd) && double.IsFinite(sd):
+                result = sd;
+                return true;
+            default:
+                return false;
+        }
     }
 }
 
@@ -584,6 +842,10 @@ public sealed class CustomRunRuleSet
     [JsonPropertyName("specialModeId")]
     public ESpecialModeId SpecialModeId { get; set; } = ESpecialModeId.Standard;
 
+    /// <summary>P0-22：可选 Mod 自定义游戏模式 ID（命中 ModRuntimeContext.ModeHooks / DeclarativeGameModeHook）。</summary>
+    [JsonPropertyName("customModeId")]
+    public string? CustomModeId { get; set; }
+
     [JsonPropertyName("mutatorIds")]
     public List<string> MutatorIds { get; set; } = new();
 
@@ -642,6 +904,7 @@ public sealed class CustomRunRuleSet
     [JsonIgnore]
     public bool IsNonStandardRun =>
         SpecialModeId != ESpecialModeId.Standard
+        || !string.IsNullOrWhiteSpace(CustomModeId)
         || PresetId != EGameModePreset.PureOfficial
         || (MutatorIds != null && MutatorIds.Count > 0)
         || IsCustomPowerModified();
@@ -682,6 +945,7 @@ public sealed class CustomRunRuleSet
     {
         bool isStandardMode =
             SpecialModeId == ESpecialModeId.Standard &&
+            string.IsNullOrWhiteSpace(CustomModeId) &&
             PresetId == EGameModePreset.PureOfficial &&
             (MutatorIds == null || MutatorIds.Count == 0);
 
@@ -699,6 +963,8 @@ public sealed class CustomRunRuleSet
             MonsterLootBonusChoices == 0 &&
             MonsterLootTierBonus == 0 &&
             Math.Abs(EnemyStatMultiplier - 1.0) < 1e-6 &&
+            Math.Abs(ArchetypeWeightMultiplier - 2.0) < 1e-6 &&
+            Math.Abs(ArchetypeMultiMatchCap - 3.0) < 1e-6 &&
             !DisableFatesRevive;
 
         bool noPresetCards =
@@ -750,7 +1016,31 @@ public sealed class CustomRunRuleSet
     /// 返回经边界钳制与深拷贝归一化后的规则副本。
     /// </summary>
     public CustomRunRuleSet CloneNormalized()
+        => CloneNormalized(extraMutators: null, preserveUnregisteredMutators: false);
+
+    /// <summary>
+    /// 支持单局隔离自定义突变词条字典的归一化克隆重载（P0-22）。
+    /// </summary>
+    public CustomRunRuleSet CloneNormalized(IReadOnlyDictionary<string, MutatorMetadata>? extraMutators)
+        => CloneNormalized(extraMutators, preserveUnregisteredMutators: false);
+
+    /// <summary>
+    /// 支持单局隔离自定义突变词条字典与无上下文保活模式（<paramref name="preserveUnregisteredMutators"/>）的归一化克隆重载（P0-22）。
+    /// </summary>
+    public CustomRunRuleSet CloneNormalized(
+        IReadOnlyDictionary<string, MutatorMetadata>? extraMutators,
+        bool preserveUnregisteredMutators)
     {
+        var specialMode = Enum.IsDefined(SpecialModeId) ? SpecialModeId : ESpecialModeId.Standard;
+        string? rawDailyDate = string.IsNullOrWhiteSpace(DailyChallengeDate) ? null : DailyChallengeDate.Trim();
+        // D6-P2-06：非每日挑战模式必须清零残留 DailyChallengeDate，并同时清除原由每日挑战带入的残留 FixedRunSeed（沙盒模式亦不保留固定种子）
+        string? effectiveDailyDate = specialMode == ESpecialModeId.DailyChallenge ? rawDailyDate : null;
+        int? effectiveFixedSeed = specialMode == ESpecialModeId.SandboxLab
+            ? null
+            : (specialMode != ESpecialModeId.DailyChallenge && !string.IsNullOrEmpty(rawDailyDate)
+                ? null
+                : FixedRunSeed);
+
         var normalized = new CustomRunRuleSet
         {
             SelectedArchetypeMask = CardArchetypeCatalog.ClampMaxBits(
@@ -775,10 +1065,11 @@ public sealed class CustomRunRuleSet
             HumanMatchEvery4Rounds = HumanMatchEvery4Rounds,
             LastHumanStandingMode = LastHumanStandingMode,
             PresetId = Enum.IsDefined(PresetId) ? PresetId : EGameModePreset.PureOfficial,
-            SpecialModeId = Enum.IsDefined(SpecialModeId) ? SpecialModeId : ESpecialModeId.Standard,
-            MutatorIds = MutatorCatalog.NormalizeAndResolveConflicts(MutatorIds, maxCount: 4),
-            DailyChallengeDate = string.IsNullOrWhiteSpace(DailyChallengeDate) ? null : DailyChallengeDate.Trim(),
-            FixedRunSeed = FixedRunSeed,
+            SpecialModeId = specialMode,
+            CustomModeId = string.IsNullOrWhiteSpace(CustomModeId) ? null : CustomModeId.Trim(),
+            MutatorIds = MutatorCatalog.NormalizeAndResolveConflicts(MutatorIds, maxCount: 4, extraMutators, preserveUnregisteredMutators),
+            DailyChallengeDate = effectiveDailyDate,
+            FixedRunSeed = effectiveFixedSeed,
             EndlessMaxDay = Math.Clamp(EndlessMaxDay, 11, 99),
             CrossHeroOwnHeroBias = ClampFinite(CrossHeroOwnHeroBias, 0.0, 1.0, 0.40),
             BossRushTotalWaves = Math.Clamp(BossRushTotalWaves, 1, 30),

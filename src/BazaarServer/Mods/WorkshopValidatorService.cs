@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
@@ -90,10 +91,14 @@ public sealed class WorkshopValidatorService
 
     private readonly ServerModHost _modHost;
     private readonly SemaphoreSlim _validationThrottle = new(2, 2);
+    // 按 modId 分片的磁盘目录写/切/读互斥锁；锁序 DAG 硬承诺：所有 _modHost.*Reload() 必须在释放本锁后执行
+    private readonly ConcurrentDictionary<string, object> _modDirLocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly Lazy<List<BaseCardIndexEntry>> _baseCardIndex;
     private readonly Lazy<List<string>> _knownVfxKeys;
     private readonly Lazy<string> _cachedRuleCatalogJson;
     private readonly Lazy<string> _cachedRuleCatalogEtag;
+
+    private object GetModDirLock(string modId) => _modDirLocks.GetOrAdd(modId.Trim(), static _ => new object());
 
     public WorkshopValidatorService(ServerModHost modHost)
     {
@@ -103,7 +108,7 @@ public sealed class WorkshopValidatorService
         _cachedRuleCatalogJson = new Lazy<string>(() =>
         {
             var baseDto = ModRuleCatalog.BuildCatalogDto();
-            // 叠加全库 GameData.db 提取出的 131 种官方白名单 VFX 键，供工坊积木与自定义机制下拉选取
+            // 叠加全库 GameData.db 提取出的全部 133 种官方白名单 VFX 键（含 Abilities/Auras/Enchantments），供工坊积木与自定义机制下拉选取
             using var doc = JsonDocument.Parse(JsonSerializer.Serialize(baseDto, JsonOpts));
             var merged = new Dictionary<string, object?>(StringComparer.Ordinal);
             foreach (var prop in doc.RootElement.EnumerateObject())
@@ -130,12 +135,20 @@ public sealed class WorkshopValidatorService
             foreach (var ab in card.Abilities.Values)
                 if (!string.IsNullOrWhiteSpace(ab.VFXConfig?.VFXOverrideKey))
                     set.Add(ab.VFXConfig!.VFXOverrideKey!.Trim());
+            foreach (var aura in card.Auras.Values)
+                if (!string.IsNullOrWhiteSpace(aura.VFXConfig?.VFXOverrideKey))
+                    set.Add(aura.VFXConfig!.VFXOverrideKey!.Trim());
             if (card.Enchantments != null)
             {
                 foreach (var ed in card.Enchantments.Values)
+                {
                     foreach (var ab in ed.Abilities.Values)
                         if (!string.IsNullOrWhiteSpace(ab.VFXConfig?.VFXOverrideKey))
                             set.Add(ab.VFXConfig!.VFXOverrideKey!.Trim());
+                    foreach (var aura in ed.Auras.Values)
+                        if (!string.IsNullOrWhiteSpace(aura.VFXConfig?.VFXOverrideKey))
+                            set.Add(aura.VFXConfig!.VFXOverrideKey!.Trim());
+                }
             }
         }
         return set.OrderBy(k => k, StringComparer.OrdinalIgnoreCase).ToList();
@@ -185,6 +198,8 @@ public sealed class WorkshopValidatorService
 
         var staticIssues = new List<ModValidationIssue>();
         MechanicSandboxInterpreter.ValidateStatic(mechanic, "mechanic-lab", staticIssues);
+        // 统一归一化静态规则审计闸门编号为 Gate #4（避免旧版 11 等离散编号破坏前端定位）
+        staticIssues = staticIssues.Select(i => i.GateId == 4 ? i : i with { GateId = 4 }).ToList();
         if (staticIssues.Any(i => i.Severity == ModValidationSeverity.Error))
         {
             return new
@@ -544,150 +559,176 @@ public sealed class WorkshopValidatorService
         string modsRoot = _modHost.ModsRootDirectory;
         Directory.CreateDirectory(modsRoot);
         string targetDir = ResolveSafeModDir(modId);
-        bool isNewMod = !Directory.Exists(targetDir) || !File.Exists(Path.Combine(targetDir, "mod.json"));
-        if (isNewMod)
-            workspace.Manifest.EnabledByDefault = false;
 
-        string stageDir = Path.Combine(modsRoot, $".tmp_{modId}_{Guid.NewGuid():N}");
-        try
+        lock (GetModDirLock(modId))
         {
-            Directory.CreateDirectory(stageDir);
+            bool isNewMod = !Directory.Exists(targetDir) || !File.Exists(Path.Combine(targetDir, "mod.json"));
+            if (isNewMod)
+                workspace.Manifest.EnabledByDefault = false;
 
-            // 保留已有贴图资产，避免保存草稿丢失已上传 PNG
-            string existingAssets = Path.Combine(targetDir, "assets");
-            string stagedAssets = Path.Combine(stageDir, "assets");
-            Directory.CreateDirectory(stagedAssets);
-            if (Directory.Exists(existingAssets))
+            string stageDir = Path.Combine(modsRoot, $".tmp_{modId}_{Guid.NewGuid():N}");
+            try
             {
-                foreach (var f in Directory.GetFiles(existingAssets, "*.*", SearchOption.AllDirectories))
+                Directory.CreateDirectory(stageDir);
+
+                // 保留已有贴图资产与非受控附加文件（如 README.md、docs/），避免保存草稿丢失资产与文档
+                string existingAssets = Path.Combine(targetDir, "assets");
+                string stagedAssets = Path.Combine(stageDir, "assets");
+                Directory.CreateDirectory(stagedAssets);
+                if (Directory.Exists(existingAssets))
                 {
-                    string rel = Path.GetRelativePath(existingAssets, f);
-                    string dest = Path.Combine(stagedAssets, rel);
-                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                    File.Copy(f, dest, overwrite: true);
+                    foreach (var f in Directory.GetFiles(existingAssets, "*.*", SearchOption.AllDirectories))
+                    {
+                        string rel = Path.GetRelativePath(existingAssets, f);
+                        string dest = Path.Combine(stagedAssets, rel);
+                        Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                        File.Copy(f, dest, overwrite: true);
+                    }
                 }
-            }
 
-            // 规范 contentRoots 默认路径
-            workspace.Manifest.ContentRoots.Cards = "cards/custom_cards.json";
-            workspace.Manifest.ContentRoots.Patches = "patches/vanilla_patches.json";
-            workspace.Manifest.ContentRoots.Events = "events/custom_events.json";
-            workspace.Manifest.ContentRoots.Modes = "modes/*.json";
-            workspace.Manifest.ContentRoots.Mechanics = "mechanics/custom_mechanics.json";
-            workspace.Manifest.ContentRoots.Localization = "localization/zh-CN.json";
-            workspace.Manifest.ContentRoots.Assets = "assets/*.png";
-            workspace.Manifest.ContentRoots.ArtManifest = "assets/art_manifest.json";
-
-            WriteJson(Path.Combine(stageDir, "mod.json"), workspace.Manifest);
-
-            if (workspace.Cards.Count > 0)
-            {
-                WriteJson(Path.Combine(stageDir, "cards", "custom_cards.json"), new
+                var managedTopDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                 {
-                    schemaVersion = 1,
-                    modId,
-                    cards = workspace.Cards
-                });
-            }
-
-            if (workspace.Patches.Count > 0)
-            {
-                WriteJson(Path.Combine(stageDir, "patches", "vanilla_patches.json"), new
+                    "cards", "patches", "events", "monsters", "modes", "mechanics", "localization", "assets"
+                };
+                if (Directory.Exists(targetDir))
                 {
-                    schemaVersion = 1,
-                    modId,
-                    patches = workspace.Patches
-                });
-            }
+                    foreach (var f in Directory.GetFiles(targetDir, "*.*", SearchOption.TopDirectoryOnly))
+                    {
+                        string name = Path.GetFileName(f);
+                        if (string.Equals(name, "mod.json", StringComparison.OrdinalIgnoreCase) || name.StartsWith('.'))
+                            continue;
+                        File.Copy(f, Path.Combine(stageDir, name), overwrite: true);
+                    }
+                    foreach (var d in Directory.GetDirectories(targetDir, "*", SearchOption.TopDirectoryOnly))
+                    {
+                        string name = Path.GetFileName(d);
+                        if (managedTopDirs.Contains(name) || name.StartsWith('.'))
+                            continue;
+                        CopyDirectoryRecursive(d, Path.Combine(stageDir, name));
+                    }
+                }
 
-            if (workspace.Events.Count > 0)
-            {
-                WriteJson(Path.Combine(stageDir, "events", "custom_events.json"), new
+                // 仅当自定义 contentRoots 不安全或无法覆盖本次写出文件时才回退默认值，绝不硬覆写作者合法配置
+                var writtenCards = workspace.Cards.Count > 0 ? new[] { "cards/custom_cards.json" } : Array.Empty<string>();
+                var writtenPatches = workspace.Patches.Count > 0 ? new[] { "patches/vanilla_patches.json" } : Array.Empty<string>();
+                var writtenEvents = workspace.Events.Count > 0 ? new[] { "events/custom_events.json" } : Array.Empty<string>();
+                var writtenModes = new List<string>();
+                if (workspace.Modes.Count > 0) writtenModes.Add("modes/custom_modes.json");
+                if (workspace.Mutators.Count > 0) writtenModes.Add("modes/custom_mutators.json");
+                var writtenMechanics = workspace.Mechanics.Count > 0 ? new[] { "mechanics/custom_mechanics.json" } : Array.Empty<string>();
+                var writtenLoc = workspace.Localization != null ? new[] { "localization/zh-CN.json" } : Array.Empty<string>();
+
+                var stagedAssetRelPaths = Directory.Exists(stagedAssets)
+                    ? Directory.GetFiles(stagedAssets, "*.*", SearchOption.AllDirectories)
+                        .Where(f => IsSupportedAssetExtension(Path.GetExtension(f)))
+                        .Select(f => ModValidator.NormalizeLogicalPath(Path.GetRelativePath(stageDir, f)))
+                        .ToList()
+                    : new List<string>();
+
+                var cr = workspace.Manifest.ContentRoots;
+                cr.Cards = EnsureSafeMatchingContentRoot(cr.Cards, writtenCards, "cards/custom_cards.json");
+                cr.Patches = EnsureSafeMatchingContentRoot(cr.Patches, writtenPatches, "patches/vanilla_patches.json");
+                cr.Events = EnsureSafeMatchingContentRoot(cr.Events, writtenEvents, "events/custom_events.json");
+                cr.Modes = EnsureSafeMatchingContentRoot(cr.Modes, writtenModes, "modes/*.json");
+                cr.Mechanics = EnsureSafeMatchingContentRoot(cr.Mechanics, writtenMechanics, "mechanics/custom_mechanics.json");
+                cr.Localization = EnsureSafeMatchingContentRoot(cr.Localization, writtenLoc, "localization/zh-CN.json");
+                cr.Assets = EnsureSafeMatchingContentRoot(cr.Assets, stagedAssetRelPaths, "assets/*");
+                cr.ArtManifest = EnsureSafeMatchingContentRoot(cr.ArtManifest, ["assets/art_manifest.json"], "assets/art_manifest.json");
+
+                WriteJson(Path.Combine(stageDir, "mod.json"), workspace.Manifest);
+
+                if (workspace.Cards.Count > 0)
                 {
-                    schemaVersion = 1,
-                    modId,
-                    events = workspace.Events
-                });
-            }
+                    WriteJson(Path.Combine(stageDir, "cards", "custom_cards.json"), new
+                    {
+                        schemaVersion = 1,
+                        modId,
+                        cards = workspace.Cards
+                    });
+                }
 
-            if (workspace.Monsters.Count > 0)
-            {
-                WriteJson(Path.Combine(stageDir, "monsters", "custom_monsters.json"), new
+                if (workspace.Patches.Count > 0)
                 {
-                    schemaVersion = 1,
-                    modId,
-                    monsters = workspace.Monsters
-                });
-            }
+                    WriteJson(Path.Combine(stageDir, "patches", "vanilla_patches.json"), new
+                    {
+                        schemaVersion = 1,
+                        modId,
+                        patches = workspace.Patches
+                    });
+                }
 
-            if (workspace.Modes.Count > 0)
-            {
-                WriteJson(Path.Combine(stageDir, "modes", "custom_modes.json"), new
+                if (workspace.Events.Count > 0)
                 {
-                    schemaVersion = 1,
-                    modId,
-                    modes = workspace.Modes
-                });
-            }
+                    WriteJson(Path.Combine(stageDir, "events", "custom_events.json"), new
+                    {
+                        schemaVersion = 1,
+                        modId,
+                        events = workspace.Events
+                    });
+                }
 
-            if (workspace.Mechanics.Count > 0)
-            {
-                WriteJson(Path.Combine(stageDir, "mechanics", "custom_mechanics.json"), new
+                if (workspace.Monsters.Count > 0)
                 {
-                    schemaVersion = 1,
-                    modId,
-                    mechanics = workspace.Mechanics
-                });
-            }
+                    WriteJson(Path.Combine(stageDir, "monsters", "custom_monsters.json"), new
+                    {
+                        schemaVersion = 1,
+                        modId,
+                        monsters = workspace.Monsters
+                    });
+                }
 
-            if (workspace.Mutators.Count > 0)
-            {
-                WriteJson(Path.Combine(stageDir, "modes", "custom_mutators.json"), new
+                if (workspace.Modes.Count > 0)
                 {
-                    schemaVersion = 1,
-                    modId,
-                    mutators = workspace.Mutators
-                });
-            }
+                    WriteJson(Path.Combine(stageDir, "modes", "custom_modes.json"), new
+                    {
+                        schemaVersion = 1,
+                        modId,
+                        modes = workspace.Modes
+                    });
+                }
 
-            if (workspace.Localization != null)
+                if (workspace.Mechanics.Count > 0)
+                {
+                    WriteJson(Path.Combine(stageDir, "mechanics", "custom_mechanics.json"), new
+                    {
+                        schemaVersion = 1,
+                        modId,
+                        mechanics = workspace.Mechanics
+                    });
+                }
+
+                if (workspace.Mutators.Count > 0)
+                {
+                    WriteJson(Path.Combine(stageDir, "modes", "custom_mutators.json"), new
+                    {
+                        schemaVersion = 1,
+                        modId,
+                        mutators = workspace.Mutators
+                    });
+                }
+
+                if (workspace.Localization != null)
+                {
+                    WriteJson(Path.Combine(stageDir, "localization", "zh-CN.json"), workspace.Localization);
+                }
+
+                RebuildArtManifest(stageDir, modId);
+
+                // 同卷隐藏目录原子切换事务（.tmp_ -> targetDir，旧目录临时移入 .bak_ 失败自动回滚）
+                AtomicSwapDirectory(stageDir, targetDir, modsRoot, modId);
+
+                var issues = new List<ModValidationIssue>();
+                var loaded = ModLoader.LoadSinglePackage(targetDir, modId, issues);
+                return (true, null, modId, loaded?.PackageHash ?? string.Empty);
+            }
+            finally
             {
-                WriteJson(Path.Combine(stageDir, "localization", "zh-CN.json"), workspace.Localization);
+                TryDeleteDirQuietly(stageDir);
             }
-
-            RebuildArtManifest(stageDir, modId);
-
-            // 原子同步落盘：移除旧 JSON 目录内容并用新 staged 目录覆盖（保留 assets）
-            Directory.CreateDirectory(targetDir);
-            string[] managedSubdirs = ["cards", "patches", "events", "monsters", "modes", "mechanics", "localization"];
-            foreach (var sub in managedSubdirs)
-            {
-                string oldSub = Path.Combine(targetDir, sub);
-                if (Directory.Exists(oldSub))
-                    Directory.Delete(oldSub, recursive: true);
-                string newSub = Path.Combine(stageDir, sub);
-                if (Directory.Exists(newSub))
-                    CopyDirectoryRecursive(newSub, oldSub);
-            }
-            File.Copy(Path.Combine(stageDir, "mod.json"), Path.Combine(targetDir, "mod.json"), overwrite: true);
-            string stagedArtManifest = Path.Combine(stageDir, "assets", "art_manifest.json");
-            if (File.Exists(stagedArtManifest))
-            {
-                Directory.CreateDirectory(Path.Combine(targetDir, "assets"));
-                File.Copy(stagedArtManifest, Path.Combine(targetDir, "assets", "art_manifest.json"), overwrite: true);
-            }
-
-            var issues = new List<ModValidationIssue>();
-            var loaded = ModLoader.LoadSinglePackage(targetDir, modId, issues);
-            return (true, null, modId, loaded?.PackageHash ?? string.Empty);
-        }
-        finally
-        {
-            TryDeleteDirQuietly(stageDir);
         }
     }
 
-    // ── 3. PNG 资产上传校验与 SHA-256 登记 ────────────────────────────────────
+    // ── 3. PNG/JPEG 资产上传校验与 SHA-256 登记（方案 A：支持 PNG & JPEG，严拒 WebP）──
 
     public (bool Ok, string? Error, object? AssetInfo) SavePngAsset(string modId, string logicalFileName, byte[] rawBytes)
     {
@@ -699,33 +740,43 @@ public sealed class WorkshopValidatorService
             return (false, $"上传图片体积 {rawBytes.Length} 字节超出上限 8 MB。", null);
 
         if (!ModValidator.TryValidateImageHeader(rawBytes, out int width, out int height, out string contentType))
-            return (false, "仅支持合法的标准 PNG 图片（PNG 8 字节魔数头校验失败；如为 JPG/WebP 请先在网页工坊裁切器转换为 PNG）。", null);
+            return (false, "仅支持合法的标准 PNG 或 JPEG 图片（图片魔数头校验失败；如为 WebP 请先在网页工坊裁切器转换为 PNG）。", null);
 
-        if (!string.Equals(contentType, "image/png", StringComparison.OrdinalIgnoreCase))
-            return (false, "原版 Unity 客户端不支持 WebP 解码，请上传标准 PNG 图片（网页工坊裁切器会自动转 PNG）。", null);
+        if (!string.Equals(contentType, "image/png", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(contentType, "image/jpeg", StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, "原版 Unity 客户端不支持 WebP 解码，请上传标准 PNG 或 JPEG 图片（网页工坊裁切器会自动转 PNG）。", null);
+        }
 
         if (rawBytes.Length > ModValidator.MaxAssetBytes)
-            return (false, $"PNG 体积 {rawBytes.Length} 字节超出单图上限 2 MB，请适当缩小分辨率或压缩。", null);
+            return (false, $"图片体积 {rawBytes.Length} 字节超出单图上限 2 MB，请适当缩小分辨率或压缩。", null);
 
         if (width < ModValidator.MinAssetDimension || height < ModValidator.MinAssetDimension
             || width > ModValidator.MaxAssetWidth || height > ModValidator.MaxAssetHeight)
         {
-            return (false, $"PNG 分辨率 {width}×{height} 超出安全范围 [{ModValidator.MinAssetDimension}, {ModValidator.MaxAssetWidth}]。", null);
+            return (false, $"图片分辨率 {width}×{height} 超出安全范围 [{ModValidator.MinAssetDimension}, {ModValidator.MaxAssetWidth}]。", null);
         }
 
-        string safeName = SanitizePngFileName(logicalFileName);
+        string normalizedContentType = string.Equals(contentType, "image/jpeg", StringComparison.OrdinalIgnoreCase)
+            ? "image/jpeg"
+            : "image/png";
+        string safeName = SanitizeImageFileName(logicalFileName, normalizedContentType);
         string modDir = ResolveSafeModDir(modId);
-        string assetsDir = Path.Combine(modDir, "assets");
-        Directory.CreateDirectory(assetsDir);
-
-        string destPath = Path.Combine(assetsDir, safeName);
-        string tmpPath = destPath + $".{Guid.NewGuid():N}.tmp";
-        File.WriteAllBytes(tmpPath, rawBytes);
-        File.Move(tmpPath, destPath, overwrite: true);
-
         string sha = Convert.ToHexString(SHA256.HashData(rawBytes)).ToLowerInvariant();
         string logicalPath = $"assets/{safeName}";
-        RebuildArtManifest(modDir, modId);
+
+        lock (GetModDirLock(modId))
+        {
+            string assetsDir = Path.Combine(modDir, "assets");
+            Directory.CreateDirectory(assetsDir);
+
+            string destPath = Path.Combine(assetsDir, safeName);
+            string tmpPath = destPath + $".{Guid.NewGuid():N}.tmp";
+            File.WriteAllBytes(tmpPath, rawBytes);
+            File.Move(tmpPath, destPath, overwrite: true);
+
+            RebuildArtManifest(modDir, modId);
+        }
 
         return (true, null, new
         {
@@ -736,7 +787,7 @@ public sealed class WorkshopValidatorService
             width,
             height,
             bytes = rawBytes.LongLength,
-            contentType = "image/png",
+            contentType = normalizedContentType,
             previewUrl = $"/api/workshop/mods/{modId}/assets/{logicalPath}"
         });
     }
@@ -747,18 +798,46 @@ public sealed class WorkshopValidatorService
         contentType = "image/png";
         if (!ModValidator.IsValidModId(modId)) return false;
         string normalized = ModValidator.NormalizeLogicalPath(logicalPath);
-        if (!ModValidator.IsSafeRelativePath(normalized)) return false;
+        if (!SafePathGuard.IsSafeRelativePath(normalized)) return false;
+        if (!normalized.StartsWith("assets/", StringComparison.OrdinalIgnoreCase)) return false;
+
+        string ext = Path.GetExtension(normalized);
+        if (!IsSupportedAssetExtension(ext))
+            return false;
 
         string modDir = ResolveSafeModDir(modId);
-        string candidate = Path.GetFullPath(Path.Combine(modDir, normalized.Replace('/', Path.DirectorySeparatorChar)));
-        string fullRoot = Path.GetFullPath(modDir) + Path.DirectorySeparatorChar;
-        if (!candidate.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase) || !File.Exists(candidate))
+        if (!SafePathGuard.TryResolveUnderRoot(modDir, normalized, out string candidate) || !File.Exists(candidate))
+            return false;
+
+        // 核验前 12 字节真实魔数，严防伪造扩展名（如文本/JSON/WebP 改名 .png/.jpg）绕过读取
+        byte[] header = new byte[12];
+        int read;
+        try
+        {
+            using var fs = File.OpenRead(candidate);
+            read = fs.Read(header, 0, header.Length);
+        }
+        catch
+        {
+            return false;
+        }
+
+        if (read < 3)
+            return false;
+
+        bool isPng = read >= 4
+            && header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47
+            && (read < 8 || (header[4] == 0x0D && header[5] == 0x0A && header[6] == 0x1A && header[7] == 0x0A));
+        bool isJpeg = header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF;
+        if (!isPng && !isJpeg)
+            return false;
+        if (isPng && !ext.Equals(".png", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (isJpeg && !ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) && !ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
             return false;
 
         fullPath = candidate;
-        contentType = candidate.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
-            ? "image/png"
-            : "application/octet-stream";
+        contentType = isPng ? "image/png" : "image/jpeg";
         return true;
     }
 
@@ -806,7 +885,7 @@ public sealed class WorkshopValidatorService
         if (draft != null)
         {
             string effectiveId = !string.IsNullOrWhiteSpace(draft.Manifest?.Id) ? draft.Manifest.Id.Trim() : modId.Trim();
-            targetPkg = BuildInMemoryPackageFromWorkspace(draft, effectiveId);
+            targetPkg = BuildInMemoryPackageFromWorkspace(draft, effectiveId, scanIssues);
         }
         else
         {
@@ -871,7 +950,10 @@ public sealed class WorkshopValidatorService
         return report;
     }
 
-    private ModPackage BuildInMemoryPackageFromWorkspace(WorkshopModWorkspace draft, string modId)
+    private ModPackage BuildInMemoryPackageFromWorkspace(
+        WorkshopModWorkspace draft,
+        string modId,
+        List<ModValidationIssue> scanIssues)
     {
         string modDir = ModValidator.IsValidModId(modId) ? ResolveSafeModDir(modId) : Path.Combine(_modHost.ModsRootDirectory, "_memory");
         var pkg = new ModPackage
@@ -887,6 +969,43 @@ public sealed class WorkshopValidatorService
         pkg.Modes.AddRange(draft.Modes ?? []);
         pkg.Mechanics.AddRange(draft.Mechanics ?? []);
         pkg.LocalizationOverlay = draft.Localization;
+
+        // 将工作区 draft.Mutators 安全转换为 CustomMutators（捕获格式错误转为 Gate #1 Error，绝不 500）
+        if (draft.Mutators is { Count: > 0 })
+        {
+            for (int i = 0; i < draft.Mutators.Count; i++)
+            {
+                var el = draft.Mutators[i];
+                try
+                {
+                    var def = JsonSerializer.Deserialize<CustomMutatorDefinition>(el.GetRawText(), JsonOpts);
+                    if (def == null || string.IsNullOrWhiteSpace(def.Id))
+                    {
+                        scanIssues.Add(new ModValidationIssue(
+                            ModValidationSeverity.Error,
+                            modId,
+                            "MUTATOR_JSON_INVALID",
+                            $"草稿突变词条 #{i + 1} 缺少必填 id 字段。",
+                            TargetId: $"mutators[{i}]",
+                            GateId: 1,
+                            FixHintZh: "请为每条自定义突变词条填写非空唯一 id（如 my-mod:fast_storm）。"));
+                        continue;
+                    }
+                    pkg.CustomMutators.Add(def.ToMetadata(modId));
+                }
+                catch (JsonException ex)
+                {
+                    scanIssues.Add(new ModValidationIssue(
+                        ModValidationSeverity.Error,
+                        modId,
+                        "MUTATOR_JSON_INVALID",
+                        $"草稿突变词条 #{i + 1} JSON 字段类型非法：{ex.Message}",
+                        TargetId: $"mutators[{i}]",
+                        GateId: 1,
+                        FixHintZh: "请核对 mutator 字段类型（difficultyDelta/scoreMultiplierDelta 为数字，isPositive/enabledByDefault 为布尔值，rules 为字符串键值表）。"));
+                }
+            }
+        }
 
         // 继承磁盘该 Mod 目录下已上传的资产，以便草稿态直接过 Gate #8
         if (Directory.Exists(modDir))
@@ -907,61 +1026,86 @@ public sealed class WorkshopValidatorService
 
     // ── 5. .bazaarmod.zip 导出与严苛检疫导入 ──────────────────────────────────
 
+    /// <summary>向后兼容的 4 元组导出包装（默认阻断含 Error 病包，需显式 allowDraft 才允许导出草稿备份）。</summary>
     public async Task<(bool Ok, string? Error, byte[]? ZipBytes, string? FileName)> ExportZipAsync(string modId, CancellationToken ct = default)
     {
+        var (ok, _, err, bytes, fileName, _) = await ExportZipWithReportAsync(modId, allowDraft: false, ct).ConfigureAwait(false);
+        return (ok, err, bytes, fileName);
+    }
+
+    public async Task<(bool Ok, int StatusCode, string? Error, byte[]? ZipBytes, string? FileName, ModTenGateValidationReport? Validation)> ExportZipWithReportAsync(
+        string modId,
+        bool allowDraft = false,
+        CancellationToken ct = default)
+    {
         if (!ModValidator.IsValidModId(modId))
-            return (false, $"非法 Mod ID：{modId}", null, null);
+            return (false, 400, $"非法 Mod ID：{modId}", null, null, null);
 
         string modDir = ResolveSafeModDir(modId);
         if (!Directory.Exists(modDir) || !File.Exists(Path.Combine(modDir, "mod.json")))
-            return (false, $"未找到 Mod '{modId}'。", null, null);
+            return (false, 404, $"未找到 Mod '{modId}'。", null, null, null);
 
         var validation = await ValidateAsync(modId, null, matches: 20, seed: 2026131, ct: ct).ConfigureAwait(false);
+        if (!validation.Passed && !allowDraft)
+        {
+            return (false, 422, $"导出已拦截：存在 {validation.ErrorCount} 个错误未修复（如需导出未完成草稿请显式传 ?allowDraft=true）。", null, null, validation);
+        }
+
         string version = "1.0.0";
-        try
+        byte[] zipBytes;
+        lock (GetModDirLock(modId))
         {
-            var m = JsonSerializer.Deserialize<ModManifest>(File.ReadAllText(Path.Combine(modDir, "mod.json"), Encoding.UTF8), JsonOpts);
-            if (!string.IsNullOrWhiteSpace(m?.Version)) version = m!.Version.Trim();
-        }
-        catch { }
+            if (!Directory.Exists(modDir) || !File.Exists(Path.Combine(modDir, "mod.json")))
+                return (false, 404, $"未找到 Mod '{modId}'。", null, null, validation);
 
-        using var ms = new MemoryStream();
-        using (var archive = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true))
-        {
-            var files = Directory.GetFiles(modDir, "*.*", SearchOption.AllDirectories);
-            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
-            foreach (var f in files)
+            try
             {
-                string rel = ModValidator.NormalizeLogicalPath(Path.GetRelativePath(modDir, f));
-                if (rel.StartsWith('.') || rel.Contains("/.") || rel.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                string ext = Path.GetExtension(f);
-                if (ForbiddenZipExtensions.Contains(ext))
-                    continue;
-
-                var entry = archive.CreateEntry(rel, CompressionLevel.Optimal);
-                using var es = entry.Open();
-                using var fs = File.OpenRead(f);
-                fs.CopyTo(es);
+                var m = JsonSerializer.Deserialize<ModManifest>(File.ReadAllText(Path.Combine(modDir, "mod.json"), Encoding.UTF8), JsonOpts);
+                if (!string.IsNullOrWhiteSpace(m?.Version)) version = m!.Version.Trim();
             }
+            catch { }
 
-            var stampEntry = archive.CreateEntry("validation_stamp.json", CompressionLevel.Optimal);
-            using (var sw = new StreamWriter(stampEntry.Open(), new UTF8Encoding(false)))
+            using var ms = new MemoryStream();
+            using (var archive = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true))
             {
-                sw.Write(JsonSerializer.Serialize(new
+                var files = Directory.GetFiles(modDir, "*.*", SearchOption.AllDirectories);
+                Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+                foreach (var f in files)
                 {
-                    modId,
-                    version,
-                    exportedAtUtc = DateTimeOffset.UtcNow,
-                    validationPassed = validation.Passed,
-                    errorCount = validation.ErrorCount,
-                    warningCount = validation.WarningCount,
-                    summaryZh = validation.SummaryZh
-                }, JsonOpts));
+                    string rel = ModValidator.NormalizeLogicalPath(Path.GetRelativePath(modDir, f));
+                    if (rel.StartsWith('.') || rel.Contains("/.") || rel.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    string ext = Path.GetExtension(f);
+                    if (ForbiddenZipExtensions.Contains(ext))
+                        continue;
+
+                    var entry = archive.CreateEntry(rel, CompressionLevel.Optimal);
+                    using var es = entry.Open();
+                    using var fs = File.OpenRead(f);
+                    fs.CopyTo(es);
+                }
+
+                var stampEntry = archive.CreateEntry("validation_stamp.json", CompressionLevel.Optimal);
+                using (var sw = new StreamWriter(stampEntry.Open(), new UTF8Encoding(false)))
+                {
+                    sw.Write(JsonSerializer.Serialize(new
+                    {
+                        modId,
+                        version,
+                        exportedAtUtc = DateTimeOffset.UtcNow,
+                        validationPassed = validation.Passed,
+                        isDraftExport = !validation.Passed,
+                        errorCount = validation.ErrorCount,
+                        warningCount = validation.WarningCount,
+                        summaryZh = validation.SummaryZh
+                    }, JsonOpts));
+                }
             }
+            zipBytes = ms.ToArray();
         }
 
-        return (true, null, ms.ToArray(), $"{modId}-{version}.bazaarmod.zip");
+        string safeVersion = SanitizeFileSegment(version, "1.0.0");
+        return (true, 200, null, zipBytes, $"{modId}-{safeVersion}.bazaarmod.zip", validation);
     }
 
     public async Task<(bool Ok, int StatusCode, string? Error, string? ModId, ModTenGateValidationReport? Report)> ImportZipAsync(
@@ -974,56 +1118,24 @@ public sealed class WorkshopValidatorService
         if (zipBytes.Length > MaxZipBytes)
             return (false, 400, $"压缩包体积 {zipBytes.Length} 字节超出上限 25 MB。", null, null);
 
-        string tempExtract = Path.Combine(_modHost.ModsRootDirectory, $".import_{Guid.NewGuid():N}");
+        string modsRoot = _modHost.ModsRootDirectory;
+        Directory.CreateDirectory(modsRoot);
+        string tempExtract = Path.Combine(modsRoot, $".import_{Guid.NewGuid():N}");
+        string? sameVolStage = null;
         try
         {
             Directory.CreateDirectory(tempExtract);
-            using (var ms = new MemoryStream(zipBytes))
-            using (var archive = new ZipArchive(ms, ZipArchiveMode.Read))
-            {
-                if (archive.Entries.Count == 0)
-                    return (false, 400, "压缩包为空，未包含 mod.json。", null, null);
-                if (archive.Entries.Count > MaxZipEntries)
-                    return (false, 400, $"压缩包条目数 {archive.Entries.Count} 超过安全上限 {MaxZipEntries}。", null, null);
-
-                long totalUncompressed = 0;
-                foreach (var entry in archive.Entries)
-                {
-                    if (string.IsNullOrEmpty(entry.Name) && entry.FullName.EndsWith('/'))
-                        continue;
-
-                    string rel = ModValidator.NormalizeLogicalPath(entry.FullName);
-                    if (!ModValidator.IsSafeRelativePath(rel))
-                        return (false, 400, $"安全拦截：压缩包包含非法路径穿越条目 '{entry.FullName}'（Zip Slip 防护）。", null, null);
-
-                    string ext = Path.GetExtension(rel);
-                    if (ForbiddenZipExtensions.Contains(ext))
-                        return (false, 400, $"安全拦截：严禁导入包含可执行/脚本后缀的文件 '{rel}'。", null, null);
-
-                    totalUncompressed += entry.Length;
-                    if (totalUncompressed > MaxZipUncompressedBytes)
-                        return (false, 400, "安全拦截：解压总体积超出 64 MB 限制（Zip Bomb 防护）。", null, null);
-
-                    string destFile = Path.GetFullPath(Path.Combine(tempExtract, rel.Replace('/', Path.DirectorySeparatorChar)));
-                    string rootGuard = Path.GetFullPath(tempExtract) + Path.DirectorySeparatorChar;
-                    if (!destFile.StartsWith(rootGuard, StringComparison.OrdinalIgnoreCase))
-                        return (false, 400, $"安全拦截：目标路径越界 '{entry.FullName}'。", null, null);
-
-                    Directory.CreateDirectory(Path.GetDirectoryName(destFile)!);
-                    using var src = entry.Open();
-                    using var dst = File.Create(destFile);
-                    long copied = 0;
-                    var buf = new byte[16384];
-                    int read;
-                    while ((read = src.Read(buf, 0, buf.Length)) > 0)
-                    {
-                        copied += read;
-                        if (copied > MaxZipUncompressedBytes)
-                            return (false, 400, "安全拦截：单文件解压流超出 64 MB 上限（Zip Bomb 防护）。", null, null);
-                        dst.Write(buf, 0, read);
-                    }
-                }
-            }
+            var extractResult = SafeZipExtractor.ExtractToDirectory(
+                zipBytes,
+                tempExtract,
+                new SafeZipExtractOptions(
+                    MaxEntries: MaxZipEntries,
+                    MaxTotalUncompressedBytes: MaxZipUncompressedBytes,
+                    MaxSingleFileBytes: MaxZipUncompressedBytes,
+                    ForbiddenExtensions: ForbiddenZipExtensions,
+                    RejectSymlinks: true));
+            if (!extractResult.Ok)
+                return (false, 400, extractResult.ErrorZh ?? "压缩包安全解压失败。", null, null);
 
             // 兼容顶层嵌套了一层 <mod-id>/ 目录的压缩包结构
             string actualModDir = tempExtract;
@@ -1043,34 +1155,59 @@ public sealed class WorkshopValidatorService
 
             string modId = pkg.Manifest.Id.Trim();
 
-            // 隔离跑 10 道防 Bug 铁闸（导入时跑 50 场真实战斗压测）
-            var report = await Task.Run(() =>
-                ModValidator.RunTenGateValidation(
-                    pkg,
-                    _modHost.DiscoveredPackages,
-                    _modHost.BaseRepository,
-                    _modHost.ValidVisualWhitelist,
-                    combatMatches: 50,
-                    combatSeed: 2026131,
-                    runDynamicGates: true), ct).ConfigureAwait(false);
+            // 纳入并发压测限流，隔离跑 10 道防 Bug 铁闸（导入时跑 50 场真实战斗压测）
+            bool acquired = await _validationThrottle.WaitAsync(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
+            if (!acquired)
+                return (false, 429, "服务端校验沙盒繁忙（并发压测已达上限），请稍候再试。", modId, null);
 
-            if (!report.Passed && !allowDraftWithWarnings)
+            ModTenGateValidationReport report;
+            try
             {
-                return (false, 422, $"导入体检未通过（{report.ErrorCount} 个错误），已拦截落盘防带病污染服务器。", modId, report);
+                report = await Task.Run(() =>
+                    ModValidator.RunTenGateValidation(
+                        pkg,
+                        _modHost.DiscoveredPackages,
+                        _modHost.BaseRepository,
+                        _modHost.ValidVisualWhitelist,
+                        combatMatches: 50,
+                        combatSeed: 2026131,
+                        runDynamicGates: true), ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _validationThrottle.Release();
             }
 
-            // 安全落盘到 mods/<mod-id>/（导入默认禁用草稿态，由用户确认发布热重载）
-            string targetDir = ResolveSafeModDir(modId);
-            if (Directory.Exists(targetDir))
-                Directory.Delete(targetDir, recursive: true);
-            CopyDirectoryRecursive(actualModDir, targetDir);
+            if (scanIssues.Count > 0 && report.Gates.Count > 0)
+            {
+                report.Gates[0].Issues.InsertRange(0, scanIssues);
+                if (scanIssues.Any(i => i.Severity == ModValidationSeverity.Error))
+                {
+                    report.Gates[0].Status = "FAIL";
+                    report.Passed = false;
+                    report.ErrorCount = report.Gates.Sum(g => g.Issues.Count(i => i.Severity == ModValidationSeverity.Error));
+                }
+            }
 
-            // 保证新导入的 Mod 若未通过全绿则强制设为禁用草稿
+            // 严禁任何 Error 病包入库（allowDraftWithWarnings 仅语义允许 0 Error + 存在 Warning 的草稿透传）
+            _ = allowDraftWithWarnings;
             if (!report.Passed)
-                _modHost.SetModEnabledAndReload(modId, enabled: false);
-            else
-                _modHost.Reload();
+            {
+                return (false, 422, $"导入体检未通过（{report.ErrorCount} 个错误），已严格拦截落盘防带病污染服务器。", modId, report);
+            }
 
+            // 同卷暂存 + 按 modId 加锁原子切换目录（绝不在锁内调用 _modHost.Reload）
+            string targetDir = ResolveSafeModDir(modId);
+            sameVolStage = Path.Combine(modsRoot, $".tmp_{modId}_{Guid.NewGuid():N}");
+            CopyDirectoryRecursive(actualModDir, sameVolStage);
+
+            lock (GetModDirLock(modId))
+            {
+                AtomicSwapDirectory(sameVolStage, targetDir, modsRoot, modId);
+            }
+
+            // 释放目录锁后再通知 ServerModHost 重新扫描发现列表
+            _modHost.Reload();
             return (true, 200, null, modId, report);
         }
         catch (InvalidDataException)
@@ -1080,6 +1217,8 @@ public sealed class WorkshopValidatorService
         finally
         {
             TryDeleteDirQuietly(tempExtract);
+            if (!string.IsNullOrEmpty(sameVolStage))
+                TryDeleteDirQuietly(sameVolStage);
         }
     }
 
@@ -1093,10 +1232,15 @@ public sealed class WorkshopValidatorService
             return (false, 403, "系统官方示例包 bazaar-chronicles-sample 受保护禁止直接删除（可先禁用或克隆为新 Mod）。");
 
         string modDir = ResolveSafeModDir(clean);
-        if (!Directory.Exists(modDir))
-            return (false, 404, $"未找到 Mod 目录：{clean}");
+        lock (GetModDirLock(clean))
+        {
+            if (!Directory.Exists(modDir))
+                return (false, 404, $"未找到 Mod 目录：{clean}");
 
-        Directory.Delete(modDir, recursive: true);
+            Directory.Delete(modDir, recursive: true);
+        }
+
+        // 释放目录锁后再通知 ServerModHost 移除状态并重载
         _modHost.RemoveModStateAndReload(clean);
         return (true, 200, null);
     }
@@ -1171,10 +1315,7 @@ public sealed class WorkshopValidatorService
 
     private string ResolveSafeModDir(string modId)
     {
-        string fullRoot = Path.GetFullPath(_modHost.ModsRootDirectory);
-        string candidate = Path.GetFullPath(Path.Combine(fullRoot, modId.Trim()));
-        string guard = fullRoot.EndsWith(Path.DirectorySeparatorChar) ? fullRoot : fullRoot + Path.DirectorySeparatorChar;
-        if (!candidate.StartsWith(guard, StringComparison.OrdinalIgnoreCase))
+        if (!SafePathGuard.TryResolveUnderRoot(_modHost.ModsRootDirectory, modId.Trim(), out string candidate))
             throw new InvalidOperationException($"越界 Mod 目录路径：{modId}");
         return candidate;
     }
@@ -1192,19 +1333,25 @@ public sealed class WorkshopValidatorService
         if (!Directory.Exists(assetsDir)) return;
 
         var entries = new List<object>();
-        var files = Directory.GetFiles(assetsDir, "*.png", SearchOption.AllDirectories);
-        Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+        var files = Directory.GetFiles(assetsDir, "*.*", SearchOption.AllDirectories)
+            .Where(f => IsSupportedAssetExtension(Path.GetExtension(f)))
+            .OrderBy(f => ModValidator.NormalizeLogicalPath(Path.GetRelativePath(modDir, f)), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
         foreach (var f in files)
         {
             byte[] bytes = File.ReadAllBytes(f);
             string sha = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
-            ModValidator.TryValidateImageHeader(bytes, out int w, out int h, out _);
+            bool valid = ModValidator.TryValidateImageHeader(bytes, out int w, out int h, out string ct);
+            string contentType = valid && !string.IsNullOrWhiteSpace(ct)
+                ? ct
+                : (string.Equals(Path.GetExtension(f), ".png", StringComparison.OrdinalIgnoreCase) ? "image/png" : "image/jpeg");
             string rel = ModValidator.NormalizeLogicalPath(Path.GetRelativePath(modDir, f));
             entries.Add(new
             {
                 filename = Path.GetFileName(f),
                 logicalPath = rel,
+                contentType,
                 width = w,
                 height = h,
                 bytes = bytes.LongLength,
@@ -1222,7 +1369,12 @@ public sealed class WorkshopValidatorService
         });
     }
 
-    private static string SanitizePngFileName(string rawName)
+    private static bool IsSupportedAssetExtension(string? ext) =>
+        string.Equals(ext, ".png", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(ext, ".jpg", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(ext, ".jpeg", StringComparison.OrdinalIgnoreCase);
+
+    private static string SanitizeImageFileName(string rawName, string contentType)
     {
         string name = Path.GetFileNameWithoutExtension(rawName ?? string.Empty).Trim().ToLowerInvariant();
         var sb = new StringBuilder(name.Length);
@@ -1237,7 +1389,91 @@ public sealed class WorkshopValidatorService
         if (string.IsNullOrEmpty(clean))
             clean = $"art_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}";
         if (clean.Length > 48) clean = clean[..48];
-        return clean + ".png";
+        string ext = string.Equals(contentType, "image/jpeg", StringComparison.OrdinalIgnoreCase) ? ".jpg" : ".png";
+        return clean + ext;
+    }
+
+    private static string SanitizeFileSegment(string raw, string fallback)
+    {
+        var sb = new StringBuilder(raw.Length);
+        foreach (char ch in raw)
+        {
+            if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch is '.' or '_' or '-')
+                sb.Append(ch);
+        }
+        string cleaned = sb.ToString().Trim('.', '-', '_');
+        if (cleaned.Length > 40) cleaned = cleaned[..40];
+        return string.IsNullOrEmpty(cleaned) ? fallback : cleaned;
+    }
+
+    private static string EnsureSafeMatchingContentRoot(
+        string? existing,
+        IReadOnlyList<string> writtenRelPaths,
+        string defaultValue)
+    {
+        if (string.IsNullOrWhiteSpace(existing))
+            return defaultValue;
+
+        string normalized = ModValidator.NormalizeLogicalPath(existing.Trim());
+        string probe = normalized.Replace("*", "x", StringComparison.Ordinal);
+        if (!SafePathGuard.IsSafeRelativePath(probe))
+            return defaultValue;
+
+        if (writtenRelPaths.Count == 0)
+            return normalized;
+
+        foreach (var rawTarget in writtenRelPaths)
+        {
+            string target = ModValidator.NormalizeLogicalPath(rawTarget);
+            if (!ContentRootMatches(normalized, target))
+                return defaultValue;
+        }
+        return normalized;
+    }
+
+    private static bool ContentRootMatches(string pattern, string targetRelPath)
+    {
+        if (string.Equals(pattern, targetRelPath, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        int starIdx = pattern.IndexOf('*');
+        if (starIdx < 0)
+            return false;
+
+        string dirPrefix = pattern[..starIdx];
+        string suffix = pattern[(starIdx + 1)..];
+        if (!targetRelPath.StartsWith(dirPrefix, StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (!string.IsNullOrEmpty(suffix) && !targetRelPath.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            return false;
+        return targetRelPath.Length >= dirPrefix.Length + suffix.Length;
+    }
+
+    private static void AtomicSwapDirectory(string sameVolStageDir, string targetDir, string modsRoot, string modId)
+    {
+        if (!Directory.Exists(targetDir))
+        {
+            Directory.Move(sameVolStageDir, targetDir);
+            return;
+        }
+
+        string backupDir = Path.Combine(modsRoot, $".bak_{modId}_{Guid.NewGuid():N}");
+        Directory.Move(targetDir, backupDir);
+        try
+        {
+            Directory.Move(sameVolStageDir, targetDir);
+        }
+        catch
+        {
+            try
+            {
+                if (!Directory.Exists(targetDir) && Directory.Exists(backupDir))
+                    Directory.Move(backupDir, targetDir);
+            }
+            catch { }
+            throw;
+        }
+        TryDeleteDirQuietly(backupDir);
     }
 
     private static string MakeSlug(string? input)

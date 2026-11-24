@@ -32,11 +32,41 @@ public sealed class SuspendedStateSnapshot
     public int? CurrentMaxSelections { get; set; }
     /// <summary>P1-32：挂起时刻当前货架绿标/光环折扣缓存（InstanceId → 折扣后买价），弹栈时无损还原。</summary>
     public Dictionary<string, int> ActiveShelfDiscounts { get; } = new(StringComparer.Ordinal);
+    /// <summary>D2-P1-14：挂起时刻当前货架商品的显式折扣前原价缓存（InstanceId → 原价），弹栈时无损还原。</summary>
+    public Dictionary<string, int> ActiveShelfOriginalPrices { get; } = new(StringComparer.Ordinal);
+    /// <summary>D2-P1-04：挂起时刻激活的切板场景覆盖 ID（BoardOverride），压栈/序列化/弹栈无损保留。</summary>
+    public string? CurrentBoardId { get; set; }
+    /// <summary>D2-P1-14：挂起时刻的分页怪物战利品页列表（如 Loot 中升级压栈后弹栈恢复）。</summary>
+    public List<List<RunState.MonsterLootPageItemState>> MonsterLootPages { get; } = new();
+    /// <summary>D2-P1-14：挂起时刻的分页怪物战利品当前页索引。</summary>
+    public int MonsterLootPageIndex { get; set; }
     /// <summary>P1-32：挂起时刻母遭遇暂存的退出奖励经验，弹栈时无损还原。</summary>
     public int PendingEncounterExitXp { get; set; }
     /// <summary>挂起时刻留在货架上的候选卡牌条目（供内存恢复重放时无损放回 RunState.Cards 并重发 CardDealt）。</summary>
     public List<RunState.CardEntry> SuspendedCards { get; } = new();
 }
+
+/// <summary>
+/// D6-P1-07 / D8-P1-02：不可变对局公开只读摘要快照，供锦标赛/TempoNet/活跃摘要端点零锁跨线程读取，
+/// 彻底消灭无锁直读他人可变 RunState 引发的字典并发异常与跨天 (Day, Hour) 撕裂态。
+/// </summary>
+public sealed record RunPublicSummarySnapshot(
+    string RunId,
+    EPlayMode PlayMode,
+    Guid? TournamentSessionId,
+    EHero Hero,
+    ERunState State,
+    uint Day,
+    uint Hour,
+    uint Victories,
+    uint Defeats,
+    uint LastCompletedPvpDay,
+    int Prestige,
+    bool HasVisitedFates,
+    bool IsTerminal,
+    bool IsReadyAtHour6Pvp,
+    string SpecialModeIdName,
+    CustomRunRuleSet RulesSnapshot);
 
 /// <summary>
 /// 一个 Run 的服务端权威状态。
@@ -52,8 +82,15 @@ public sealed class RunState
     public string Username { get; set; } = string.Empty;
     public Guid? TournamentSessionId { get; set; }
 
-    /// <summary>本局应用的自定义规则集（默认 MonsterLootChooseOne = true）。</summary>
-    public CustomRunRuleSet CustomRules { get; set; } = new();
+    private CustomRunRuleSet _customRules = new();
+
+    /// <summary>本局应用的自定义规则集（默认 MonsterLootChooseOne = true；赋值 null 时自动回退为默认规则集）。</summary>
+    [System.Diagnostics.CodeAnalysis.AllowNull]
+    public CustomRunRuleSet CustomRules
+    {
+        get => _customRules;
+        set => _customRules = value ?? new CustomRunRuleSet();
+    }
 
     /// <summary>本局流派倾向是否已锁定（全模式统一：Day 1 Hour 1 开场确认锁定一次，或推进离开开场后自动焊死，严禁途中篡改）。</summary>
     public bool TendencyLocked { get; set; }
@@ -103,6 +140,8 @@ public sealed class RunState
     public uint Hour { get; set; } = 1;
     public uint Victories { get; set; }
     public uint Defeats { get; set; }
+    /// <summary>P0-16：本局已完成 PvP 结算的最高天数（覆盖胜/负/平局与托管结算，根治 BossRush/同步平局跨天循环）。</summary>
+    public uint LastCompletedPvpDay { get; set; }
 
     /// <summary>是否已触发过 Fates 濒死救援遭遇（Futura）。</summary>
     public bool FatesUsed { get; set; }
@@ -118,7 +157,7 @@ public sealed class RunState
     public string DataVersion { get; set; } = "5.0.0";
 
     public ERunState State { get; set; } = ERunState.Choice;
-    public string CurrentEncounterId { get; set; }
+    public string? CurrentEncounterId { get; set; }
     public uint RerollCost { get; set; } = 2;
     /// <summary>P1-18：未叠加玩家 RerollCostModifier（如 Arbitrage / Cloche Hat）前的原始刷新基价，供光环增减与连续刷新精确重算。</summary>
     public uint? BaseRerollCost { get; set; }
@@ -148,8 +187,80 @@ public sealed class RunState
     /// <summary>当前选择上下文的显式最大可选次数（持久化以防止断点续玩/翻页丢失多选上限）。</summary>
     public int? CurrentMaxSelections { get; set; }
 
-    /// <summary>P1-33：当前货架商品的折扣价映射（InstanceId → 折后买价，迁移自 ShopEngine 内存字段以支持断点续玩与挂起恢复）。</summary>
+    /// <summary>P1-33：当前货架商品的折扣价映射（InstanceId → 折后买价，保留既有公开字典签名零破损兼容）。</summary>
     public Dictionary<string, int> ActiveShelfDiscounts { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>D2-P1-14：当前货架打折商品的显式折扣前原价平行映射（InstanceId → 折扣前原价），消除恢复反推失真。</summary>
+    public Dictionary<string, int> ActiveShelfOriginalPrices { get; } = new(StringComparer.Ordinal);
+
+    private volatile RunPublicSummarySnapshot? _publicSummary;
+    private CustomRunRuleSet? _cachedImmutableRulesSnapshot;
+    private IReadOnlyDictionary<string, MutatorMetadata>? _lastEffectiveCustomMutators;
+
+    /// <summary>D6-P1-07 / D8-P1-02：跨线程零锁只读摘要快照（首次访问惰性发布，状态推进后经 PublishPublicSummary 原子刷新）。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public RunPublicSummarySnapshot PublicSummary => _publicSummary ?? PublishPublicSummary();
+
+    /// <summary>刷新不可变规则快照缓存（仅在 StartRun / DeserializeFromDto / 修改 CustomRules 时调用，避免热路径高频克隆；支持透传隔离 Mod 自定义词条字典）。</summary>
+    public void RefreshImmutableRulesSnapshot(IReadOnlyDictionary<string, MutatorMetadata>? extraMutators = null)
+    {
+        if (extraMutators != null)
+            _lastEffectiveCustomMutators = extraMutators;
+        var effMutators = extraMutators ?? _lastEffectiveCustomMutators;
+        _cachedImmutableRulesSnapshot = (CustomRules ?? new CustomRunRuleSet()).CloneNormalized(
+            effMutators,
+            preserveUnregisteredMutators: effMutators == null);
+    }
+
+    /// <summary>原子发布最新不可变公开摘要快照（零锁，供锦标赛/TempoNet/活跃摘要跨线程安全消费）。</summary>
+    public RunPublicSummarySnapshot PublishPublicSummary()
+    {
+        var rulesSnap = _cachedImmutableRulesSnapshot;
+        if (rulesSnap == null)
+        {
+            var effMutators = _lastEffectiveCustomMutators;
+            rulesSnap = (CustomRules ?? new CustomRunRuleSet()).CloneNormalized(
+                effMutators,
+                preserveUnregisteredMutators: effMutators == null);
+            _cachedImmutableRulesSnapshot = rulesSnap;
+        }
+
+        var state = State;
+        uint day = Day;
+        uint hour = Hour;
+        bool isTerminal = state is ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown;
+        bool hasCompletedPvpForDay = LastCompletedPvpDay >= day
+            || (LastCompletedPvpDay == 0
+                && rulesSnap.SpecialModeId != ESpecialModeId.BossRush
+                && (Victories + Defeats) >= day);
+        bool isReadyAtHour6Pvp = !isTerminal && (
+            state == ERunState.TournamentPvpChoice
+            || state == ERunState.TournamentWaitingRoom
+            || state == ERunState.PVPCombat
+            || (hour >= 6 && hasCompletedPvpForDay)
+            || (state == ERunState.Choice && hour >= 6));
+        int prestige = PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, GameDefaults.StartingPrestige);
+
+        var snap = new RunPublicSummarySnapshot(
+            RunId: RunId ?? string.Empty,
+            PlayMode: PlayMode,
+            TournamentSessionId: TournamentSessionId,
+            Hero: Hero,
+            State: state,
+            Day: day,
+            Hour: hour,
+            Victories: Victories,
+            Defeats: Defeats,
+            LastCompletedPvpDay: LastCompletedPvpDay,
+            Prestige: prestige,
+            HasVisitedFates: FatesUsed,
+            IsTerminal: isTerminal,
+            IsReadyAtHour6Pvp: isReadyAtHour6Pvp,
+            SpecialModeIdName: rulesSnap.SpecialModeId.ToString(),
+            RulesSnapshot: rulesSnap);
+        _publicSummary = snap;
+        return snap;
+    }
 
     /// <summary>P2-26：IsTakeover 遭遇的局内 SpawningChanceIncrement 累积概率表（TemplateId → 已累加增量）。</summary>
     public Dictionary<string, double> TakeoverChanceBonuses { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -249,22 +360,383 @@ public sealed class RunState
     }
 
     /// <summary>手牌 10 格与背包 10 格的权威占位网格。</summary>
-    public BoardGrid HandGrid { get; } = new(0b00_0111_1000);
+    public BoardGrid HandGrid { get; } = new(GameDefaults.InitialUnlockedSlotsMask);
     public BoardGrid StashGrid { get; } = new(1023);
 
-    /// <summary>玩家权威属性字典（必含 Health/HealthMax/Shield/Joy 等客户端 UI 强依赖键）。</summary>
+    /// <summary>玩家权威属性展示字典（必含 Health/HealthMax/Shield/Joy 等客户端 UI 强依赖键）。</summary>
     public Dictionary<EPlayerAttributeType, int> PlayerAttributes { get; } =
-        CreateDefaultCombatantAttributes(hp: 300, hpMax: 300, prestige: 20, level: 1, gold: 15, income: 5);
+        CreateDefaultCombatantAttributes(
+            hp: GameDefaults.StartingHealth,
+            hpMax: GameDefaults.StartingHealth,
+            prestige: GameDefaults.StartingPrestige,
+            level: 1,
+            gold: GameDefaults.StartingGold,
+            income: GameDefaults.StartingIncome);
 
-    /// <summary>玩家局外限时属性层（UntilEndOfHour / UntilEndOfDay），挂于 RunState 便于无损序列化持久化。</summary>
+    /// <summary>D2-P1-08：玩家永久基础属性独立真源（彻底消灭 mult==0 反除摧毁基础值）。</summary>
+    public Dictionary<string, double> BasePlayerAttributes { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>D2-P1-08：上次由分层公式推导出的玩家展示属性值，用于感知外部/单测直写 PlayerAttributes 的增量变化。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public Dictionary<EPlayerAttributeType, int> LastDerivedPlayerAttributes { get; } = new();
+
+    /// <summary>玩家局外限时属性层（UntilEndOfHour / UntilEndOfDay），Mult 严格存储纯净 PureMult，AdditiveMult 独立存储。</summary>
     public Dictionary<string, double> PlayerHourAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> PlayerHourMult { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> PlayerHourAdditiveMult { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> PlayerDayAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> PlayerDayMult { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> PlayerDayAdditiveMult { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>局外玩家属性光环上一轮生效值追踪（每次光环重算前需从 PlayerAttributes 剥离，防止无限叠加）。</summary>
+    /// <summary>局外玩家属性光环修饰层（Mult 严格存储纯净 PureMult，AdditiveMult 独立存储）。</summary>
     public Dictionary<string, double> PlayerAuraAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> PlayerAuraMult { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> PlayerAuraAdditiveMult { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>D2-P1-08：装配入核时的永久基础值与有效展示值双快照，供局外批次精确分离真实引擎修饰层变化与外部手工合成批次。</summary>
+    public sealed record CoreBuildAttributeSnapshot(
+        Dictionary<string, double> BaseAttributes,
+        Dictionary<string, double> EffectiveAttributes);
+
+    /// <summary>D2-P1-08：按 PlayerState 实例弱引用记录装配入核时的双快照（支持递归嵌套且零泄漏）。</summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<PlayerState, CoreBuildAttributeSnapshot> CoreBuildBaseSnapshots = new();
+
+    /// <summary>获取指定 PlayerState 在 ApplyLayeredPlayerStateTo 时刻记录的基础与有效值双快照。</summary>
+    public static bool TryGetCoreBuildBaseSnapshot(PlayerState ps, out CoreBuildAttributeSnapshot? snapshot)
+        => CoreBuildBaseSnapshots.TryGetValue(ps, out snapshot);
+
+    /// <summary>
+    /// D2-P1-08 单一权威正向装配器：将本 RunState 的基础属性与 9 张修饰层（Hour/Day/Aura × Add/PureMult/AdditiveMult）
+    /// 无损装载入 <paramref name="ps"/>，全程 0 反除毁档、0 双重乘算，同时兼容外部/单测直写 PlayerAttributes。
+    /// </summary>
+    public void ApplyLayeredPlayerStateTo(PlayerState ps)
+    {
+        ArgumentNullException.ThrowIfNull(ps);
+
+        var allKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var k in BasePlayerAttributes.Keys) allKeys.Add(k);
+        foreach (var ak in PlayerAttributes.Keys) allKeys.Add(ak.ToString());
+        foreach (var k in PlayerHourAdd.Keys) allKeys.Add(k);
+        foreach (var k in PlayerHourMult.Keys) allKeys.Add(k);
+        foreach (var k in PlayerHourAdditiveMult.Keys) allKeys.Add(k);
+        foreach (var k in PlayerDayAdd.Keys) allKeys.Add(k);
+        foreach (var k in PlayerDayMult.Keys) allKeys.Add(k);
+        foreach (var k in PlayerDayAdditiveMult.Keys) allKeys.Add(k);
+        foreach (var k in PlayerAuraAdd.Keys) allKeys.Add(k);
+        foreach (var k in PlayerAuraMult.Keys) allKeys.Add(k);
+        foreach (var k in PlayerAuraAdditiveMult.Keys) allKeys.Add(k);
+
+        foreach (string key in allKeys)
+        {
+            if (string.IsNullOrWhiteSpace(key)) continue;
+
+            double totalAdd = PlayerHourAdd.GetValueOrDefault(key, 0.0)
+                            + PlayerDayAdd.GetValueOrDefault(key, 0.0)
+                            + PlayerAuraAdd.GetValueOrDefault(key, 0.0);
+            double totalAdditiveMult = PlayerHourAdditiveMult.GetValueOrDefault(key, 0.0)
+                                     + PlayerDayAdditiveMult.GetValueOrDefault(key, 0.0)
+                                     + PlayerAuraAdditiveMult.GetValueOrDefault(key, 0.0);
+            double totalPureMult = PlayerHourMult.GetValueOrDefault(key, 1.0)
+                                 * PlayerDayMult.GetValueOrDefault(key, 1.0)
+                                 * PlayerAuraMult.GetValueOrDefault(key, 1.0);
+            double effectiveMult = (1.0 + totalAdditiveMult) * totalPureMult;
+
+            bool hasAnyModifier = Math.Abs(totalAdd) > 1e-9
+                               || Math.Abs(totalAdditiveMult) > 1e-9
+                               || Math.Abs(totalPureMult - 1.0) > 1e-9;
+
+            bool hasEnum = Enum.TryParse<EPlayerAttributeType>(key, true, out var ak);
+            int shownVal = 0;
+            bool hasShown = hasEnum && PlayerAttributes.TryGetValue(ak, out shownVal);
+
+            double resolvedBase;
+            if (!BasePlayerAttributes.TryGetValue(key, out double storedBase) || !double.IsFinite(storedBase))
+            {
+                if (!hasAnyModifier)
+                {
+                    resolvedBase = hasShown ? shownVal : ps.Attributes.GetValueOrDefault(key, 0.0);
+                }
+                else if (Math.Abs(effectiveMult) > 1e-6)
+                {
+                    // 历史旧快照首次载入的一次性安全迁移
+                    resolvedBase = (shownVal / effectiveMult) - totalAdd;
+                }
+                else
+                {
+                    // effectiveMult == 0 时绝不反除归零，退回合理默认基线
+                    resolvedBase = ResolveFallbackBaseAttribute(key);
+                }
+                BasePlayerAttributes[key] = resolvedBase;
+            }
+            else if (hasShown && hasEnum)
+            {
+                if (LastDerivedPlayerAttributes.TryGetValue(ak, out int lastDerived))
+                {
+                    if (shownVal == lastDerived)
+                    {
+                        resolvedBase = storedBase;
+                    }
+                    else if (!hasAnyModifier)
+                    {
+                        resolvedBase = shownVal;
+                        BasePlayerAttributes[key] = resolvedBase;
+                    }
+                    else if (Math.Abs(effectiveMult) <= 1e-6)
+                    {
+                        // mult == 0 场景外部直接增量改写展示值时按纯加法增量回写，绝不除以 0 毁档
+                        resolvedBase = storedBase + (shownVal - lastDerived);
+                        BasePlayerAttributes[key] = resolvedBase;
+                    }
+                    else
+                    {
+                        resolvedBase = storedBase + ((shownVal - lastDerived) / effectiveMult);
+                        BasePlayerAttributes[key] = resolvedBase;
+                    }
+                }
+                else if (!hasAnyModifier)
+                {
+                    resolvedBase = shownVal;
+                    BasePlayerAttributes[key] = resolvedBase;
+                }
+                else
+                {
+                    resolvedBase = storedBase;
+                }
+            }
+            else
+            {
+                resolvedBase = storedBase;
+            }
+
+            ps.Attributes[key] = resolvedBase;
+        }
+
+        // 通过同程序集 PlayerLayerModifierBridge 精确同步 9 张修饰层字典（先清旧层，且 pure==0.0 精确落盘，0 双重乘算）
+        PlayerLayerModifierBridge.ApplyHourLayer(ps, PlayerHourAdd, PlayerHourMult, PlayerHourAdditiveMult);
+        PlayerLayerModifierBridge.ApplyDayLayer(ps, PlayerDayAdd, PlayerDayMult, PlayerDayAdditiveMult);
+        PlayerLayerModifierBridge.ApplyAuraLayer(ps, PlayerAuraAdd, PlayerAuraMult, PlayerAuraAdditiveMult);
+
+        // 刷新展示推导缓存，保证下一轮无外部篡改时严格 0 反除
+        foreach (EPlayerAttributeType ak in PlayerAttributes.Keys.ToList())
+        {
+            if (ak == EPlayerAttributeType.Health)
+            {
+                LastDerivedPlayerAttributes[ak] = PlayerAttributes[ak];
+                continue;
+            }
+            LastDerivedPlayerAttributes[ak] = (int)Math.Round(ps.GetAttribute(ak.ToString()));
+        }
+
+        int hp = PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, ps.HealthMax);
+        ps.CurrentHealth = Math.Clamp(hp, 0, Math.Max(1, ps.HealthMax));
+        var effSnap = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        foreach (var k in ps.Attributes.Keys)
+            effSnap[k] = ps.GetAttribute(k);
+        CoreBuildBaseSnapshots.AddOrUpdate(ps, new CoreBuildAttributeSnapshot(
+            new Dictionary<string, double>(ps.Attributes, StringComparer.OrdinalIgnoreCase),
+            effSnap));
+    }
+
+    /// <summary>
+    /// D2-P1-08 单一权威正向回写器：从 <paramref name="ps"/> 精确提取 9 张修饰层与永久基础值，
+    /// 再正向推导更新展示值 PlayerAttributes 与 LastDerivedPlayerAttributes。
+    /// </summary>
+    public void CaptureLayeredPlayerStateFrom(
+        PlayerState ps,
+        bool captureBaseValues = true,
+        bool includeAllExistingAttrs = true)
+    {
+        ArgumentNullException.ThrowIfNull(ps);
+
+        CopyCleanLayerDict(ps.HourAdd, PlayerHourAdd, zeroDefault: 0.0);
+        PlayerLayerModifierBridge.CopyHourPureMults(ps, PlayerHourMult);
+        CopyCleanLayerDict(ps.HourAdditiveMult, PlayerHourAdditiveMult, zeroDefault: 0.0);
+
+        CopyCleanLayerDict(ps.DayAdd, PlayerDayAdd, zeroDefault: 0.0);
+        PlayerLayerModifierBridge.CopyDayPureMults(ps, PlayerDayMult);
+        CopyCleanLayerDict(ps.DayAdditiveMult, PlayerDayAdditiveMult, zeroDefault: 0.0);
+
+        CopyCleanLayerDict(ps.AuraAdd, PlayerAuraAdd, zeroDefault: 0.0);
+        PlayerLayerModifierBridge.CopyAuraPureMults(ps, PlayerAuraMult);
+        CopyCleanLayerDict(ps.AuraAdditiveMult, PlayerAuraAdditiveMult, zeroDefault: 0.0);
+
+        if (captureBaseValues)
+        {
+            foreach (var (k, v) in ps.Attributes)
+            {
+                if (!string.IsNullOrWhiteSpace(k) && double.IsFinite(v))
+                    BasePlayerAttributes[k] = v;
+            }
+        }
+
+        var keysToDerive = new HashSet<EPlayerAttributeType>();
+        if (includeAllExistingAttrs)
+        {
+            foreach (var ak in PlayerAttributes.Keys) keysToDerive.Add(ak);
+        }
+        foreach (var k in ps.Attributes.Keys)
+            if (Enum.TryParse<EPlayerAttributeType>(k, true, out var ak)) keysToDerive.Add(ak);
+        foreach (var k in PlayerHourAdd.Keys.Concat(PlayerHourMult.Keys).Concat(PlayerHourAdditiveMult.Keys)
+                     .Concat(PlayerDayAdd.Keys).Concat(PlayerDayMult.Keys).Concat(PlayerDayAdditiveMult.Keys)
+                     .Concat(PlayerAuraAdd.Keys).Concat(PlayerAuraMult.Keys).Concat(PlayerAuraAdditiveMult.Keys))
+        {
+            if (Enum.TryParse<EPlayerAttributeType>(k, true, out var ak)) keysToDerive.Add(ak);
+        }
+
+        foreach (var ak in keysToDerive)
+        {
+            if (ak == EPlayerAttributeType.Health) continue;
+            int eff = (int)Math.Round(ps.GetAttribute(ak.ToString()));
+            if (ak == EPlayerAttributeType.HealthMax)
+                eff = Math.Max(1, eff);
+            else if (ak is EPlayerAttributeType.Gold or EPlayerAttributeType.Prestige or EPlayerAttributeType.Experience)
+                eff = Math.Max(0, eff);
+            PlayerAttributes[ak] = eff;
+            LastDerivedPlayerAttributes[ak] = eff;
+        }
+    }
+
+    /// <summary>同步设置某玩家属性的永久基础值并立即正向重算其展示值（供开局/升级/直接增减基础资源调用）。</summary>
+    public void SetBasePlayerAttribute(EPlayerAttributeType attr, double baseValue)
+    {
+        if (!double.IsFinite(baseValue)) return;
+        string key = attr.ToString();
+        BasePlayerAttributes[key] = baseValue;
+        int eff = ComputeDerivedPlayerAttribute(attr, baseValue);
+        PlayerAttributes[attr] = eff;
+        LastDerivedPlayerAttributes[attr] = eff;
+    }
+
+    /// <summary>检测并吸收外部/单测直接改写 PlayerAttributes[attr] 所带来的基础值增量（零反除归零）。</summary>
+    private void SyncExternalPlayerAttributeMutationIfNeeded(EPlayerAttributeType attr)
+    {
+        if (attr == EPlayerAttributeType.Health) return;
+        string key = attr.ToString();
+        if (!PlayerAttributes.TryGetValue(attr, out int shownVal))
+            return;
+
+        double totalAdd = PlayerHourAdd.GetValueOrDefault(key, 0.0)
+                        + PlayerDayAdd.GetValueOrDefault(key, 0.0)
+                        + PlayerAuraAdd.GetValueOrDefault(key, 0.0);
+        double totalAdditiveMult = PlayerHourAdditiveMult.GetValueOrDefault(key, 0.0)
+                                 + PlayerDayAdditiveMult.GetValueOrDefault(key, 0.0)
+                                 + PlayerAuraAdditiveMult.GetValueOrDefault(key, 0.0);
+        double totalPureMult = PlayerHourMult.GetValueOrDefault(key, 1.0)
+                             * PlayerDayMult.GetValueOrDefault(key, 1.0)
+                             * PlayerAuraMult.GetValueOrDefault(key, 1.0);
+        double effectiveMult = (1.0 + totalAdditiveMult) * totalPureMult;
+        bool hasAnyModifier = Math.Abs(totalAdd) > 1e-9
+                           || Math.Abs(totalAdditiveMult) > 1e-9
+                           || Math.Abs(totalPureMult - 1.0) > 1e-9;
+
+        if (!BasePlayerAttributes.TryGetValue(key, out double storedBase) || !double.IsFinite(storedBase))
+        {
+            if (!hasAnyModifier)
+                BasePlayerAttributes[key] = shownVal;
+            else if (Math.Abs(effectiveMult) > 1e-6)
+                BasePlayerAttributes[key] = (shownVal / effectiveMult) - totalAdd;
+            else
+                BasePlayerAttributes[key] = ResolveFallbackBaseAttribute(key);
+            return;
+        }
+
+        if (LastDerivedPlayerAttributes.TryGetValue(attr, out int lastDerived))
+        {
+            if (shownVal == lastDerived)
+                return;
+            if (!hasAnyModifier)
+                BasePlayerAttributes[key] = shownVal;
+            else if (Math.Abs(effectiveMult) <= 1e-6)
+                BasePlayerAttributes[key] = storedBase + (shownVal - lastDerived);
+            else
+                BasePlayerAttributes[key] = storedBase + ((shownVal - lastDerived) / effectiveMult);
+        }
+        else if (!hasAnyModifier)
+        {
+            BasePlayerAttributes[key] = shownVal;
+        }
+    }
+
+    /// <summary>对某玩家属性永久基础值做增量调整，并正向重算其展示值（绝不走反除）。</summary>
+    public int AdjustBasePlayerAttribute(EPlayerAttributeType attr, int delta, int? minBase = null)
+        => AdjustBasePlayerAttributeDouble(attr, delta, minBase);
+
+    /// <summary>对某玩家属性永久基础值做浮点增量调整，并正向重算其展示值（先同步外部直写增量，零反除归零）。</summary>
+    public int AdjustBasePlayerAttributeDouble(EPlayerAttributeType attr, double delta, int? minBase = null)
+    {
+        SyncExternalPlayerAttributeMutationIfNeeded(attr);
+        string key = attr.ToString();
+        double curBase = BasePlayerAttributes.TryGetValue(key, out double b) && double.IsFinite(b)
+            ? b
+            : PlayerAttributes.GetValueOrDefault(attr, 0);
+        double nextBase = curBase + delta;
+        if (minBase.HasValue && nextBase < minBase.Value)
+            nextBase = minBase.Value;
+        BasePlayerAttributes[key] = nextBase;
+        int eff = ComputeDerivedPlayerAttribute(attr, nextBase);
+        PlayerAttributes[attr] = eff;
+        LastDerivedPlayerAttributes[attr] = eff;
+        return eff;
+    }
+
+    /// <summary>按当前已落盘的永久基础值与 9 张修饰层正向重算指定玩家属性的展示值（不动 BasePlayerAttributes）。</summary>
+    public int RecomputeDerivedPlayerAttribute(EPlayerAttributeType attr)
+    {
+        SyncExternalPlayerAttributeMutationIfNeeded(attr);
+        string key = attr.ToString();
+        double curBase = BasePlayerAttributes.TryGetValue(key, out double b) && double.IsFinite(b)
+            ? b
+            : PlayerAttributes.GetValueOrDefault(attr, 0);
+        int eff = ComputeDerivedPlayerAttribute(attr, curBase);
+        PlayerAttributes[attr] = eff;
+        LastDerivedPlayerAttributes[attr] = eff;
+        return eff;
+    }
+
+    private int ComputeDerivedPlayerAttribute(EPlayerAttributeType attr, double baseValue)
+    {
+        if (attr == EPlayerAttributeType.Health)
+        {
+            int maxHp = Math.Max(1, PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, GameDefaults.StartingHealth));
+            return Math.Clamp((int)Math.Round(baseValue), 0, maxHp);
+        }
+        string key = attr.ToString();
+        double totalAdd = PlayerHourAdd.GetValueOrDefault(key, 0.0)
+                        + PlayerDayAdd.GetValueOrDefault(key, 0.0)
+                        + PlayerAuraAdd.GetValueOrDefault(key, 0.0);
+        double totalAdditiveMult = PlayerHourAdditiveMult.GetValueOrDefault(key, 0.0)
+                                 + PlayerDayAdditiveMult.GetValueOrDefault(key, 0.0)
+                                 + PlayerAuraAdditiveMult.GetValueOrDefault(key, 0.0);
+        double totalPureMult = PlayerHourMult.GetValueOrDefault(key, 1.0)
+                             * PlayerDayMult.GetValueOrDefault(key, 1.0)
+                             * PlayerAuraMult.GetValueOrDefault(key, 1.0);
+        double derived = (baseValue + totalAdd) * (1.0 + totalAdditiveMult) * totalPureMult;
+        int eff = double.IsFinite(derived) ? (int)Math.Round(derived) : 0;
+        if (attr == EPlayerAttributeType.HealthMax)
+            return Math.Max(1, eff);
+        if (attr is EPlayerAttributeType.Gold or EPlayerAttributeType.Prestige or EPlayerAttributeType.Experience)
+            return Math.Max(0, eff);
+        return eff;
+    }
+
+    private static double ResolveFallbackBaseAttribute(string key) => key.ToLowerInvariant() switch
+    {
+        "healthmax" or "health" => GameDefaults.StartingHealth,
+        "prestige" => GameDefaults.StartingPrestige,
+        "income" => GameDefaults.StartingIncome,
+        "level" => 1,
+        _ => 0.0,
+    };
+
+    private static void CopyCleanLayerDict(Dictionary<string, double> src, Dictionary<string, double> dst, double zeroDefault)
+    {
+        dst.Clear();
+        foreach (var (k, v) in src)
+        {
+            if (!string.IsNullOrWhiteSpace(k) && double.IsFinite(v) && Math.Abs(v - zeroDefault) >= 1e-9)
+                dst[k] = v;
+        }
+    }
 
     /// <summary>本局已生成/触发过的 IsSingleSpawn 奇遇模板 ID，避免重复出现。</summary>
     public HashSet<string> VisitedSingleSpawnEncounterIds { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -368,22 +840,22 @@ public sealed class RunState
         [System.Text.Json.Serialization.JsonIgnore]
         public bool IsFreeCandidate { get; set; }
         /// <summary>对应的 BazaarCore 运行时实例（用于手牌网格占位及确定性战斗结算）。</summary>
-        public CardInstance CoreCard { get; set; }
+        [System.Diagnostics.CodeAnalysis.AllowNull]
+        public CardInstance CoreCard { get; set; } = default!;
     }
 
-    /// <summary>累加指定玩家整型属性（用于追踪 Custom_3..Custom_11 等官方全局计数）。</summary>
+    /// <summary>累加指定玩家整型属性（用于追踪 Custom_3..Custom_11 等官方全局计数，同步维护 BasePlayerAttributes）。</summary>
     public void IncrementPlayerAttribute(EPlayerAttributeType attr, int delta)
     {
         if (delta == 0) return;
-        PlayerAttributes[attr] = PlayerAttributes.GetValueOrDefault(attr, 0) + delta;
+        AdjustBasePlayerAttribute(attr, delta);
     }
 
-    /// <summary>增减玩家金币，并在实际正向增加时自动累加官方 Custom_3 (Gold Gained)。</summary>
+    /// <summary>增减玩家金币，并在实际正向增加时自动累加官方 Custom_3 (Gold Gained)，同步维护 BasePlayerAttributes。</summary>
     public void AddPlayerGold(int delta)
     {
         int curGold = PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0);
-        int nextGold = Math.Max(0, curGold + delta);
-        PlayerAttributes[EPlayerAttributeType.Gold] = nextGold;
+        int nextGold = AdjustBasePlayerAttribute(EPlayerAttributeType.Gold, delta, minBase: 0);
         int actualGain = nextGold - curGold;
         if (actualGain > 0)
             IncrementPlayerAttribute(EPlayerAttributeType.Custom_3, actualGain);
@@ -413,7 +885,7 @@ public sealed class RunState
     }
 
     public static Dictionary<EPlayerAttributeType, int> CreateDefaultCombatantAttributes(
-        int hp, int hpMax, int prestige = 20, int level = 1, int gold = 0, int income = 0, int experience = 0)
+        int hp, int hpMax, int prestige = GameDefaults.StartingPrestige, int level = 1, int gold = 0, int income = 0, int experience = 0)
     {
         return new Dictionary<EPlayerAttributeType, int>
         {
@@ -789,47 +1261,8 @@ public sealed class RunState
         if (events != null)
         {
             foreach (var ev in events)
-            {
                 sim.Events.Add(ev);
-                switch (ev)
-                {
-                    case GameSimEventCardMoved mv when !string.IsNullOrEmpty(mv.InstanceId):
-                        targetIds.Add(mv.InstanceId);
-                        break;
-                    case GameSimEventCardUpgraded upg when !string.IsNullOrEmpty(upg.InstanceId):
-                        targetIds.Add(upg.InstanceId);
-                        break;
-                    case GameSimEventCardEnchanted enc when !string.IsNullOrEmpty(enc.InstanceId):
-                        targetIds.Add(enc.InstanceId);
-                        break;
-                    case GameSimEventEffectAuraExecuted aura:
-                        if (aura.Source.HasValue && !string.IsNullOrEmpty(aura.Source.Value.Value))
-                            targetIds.Add(aura.Source.Value.Value);
-                        if (aura.AppliedTo != null)
-                        {
-                            foreach (var t in aura.AppliedTo)
-                            {
-                                if (t is EffectTargetCard tc && !string.IsNullOrEmpty(tc.Target.Value))
-                                    targetIds.Add(tc.Target.Value);
-                            }
-                        }
-                        if (aura.RemovedFrom != null)
-                        {
-                            foreach (var t in aura.RemovedFrom)
-                            {
-                                if (t is EffectTargetCard tc && !string.IsNullOrEmpty(tc.Target.Value))
-                                    targetIds.Add(tc.Target.Value);
-                            }
-                        }
-                        break;
-                    case GameSimEventCardSpawned sp when !string.IsNullOrEmpty(sp.InstanceId):
-                        targetIds.Add(sp.InstanceId);
-                        break;
-                    case GameSimEventCardDealt dl when !string.IsNullOrEmpty(dl.InstanceId):
-                        targetIds.Add(dl.InstanceId);
-                        break;
-                }
-            }
+            CollectEventReferencedCardIds(events, targetIds);
         }
 
         var movedExistingIds = CollectMovedExistingCardIds(sim.Events);
@@ -854,6 +1287,97 @@ public sealed class RunState
         }
 
         return sim;
+    }
+
+    /// <summary>
+    /// P0-13：统一扫描事件列表中引用的全部卡牌实体 ID（含 Transformed / TransformReverted / EffectExecuted / EffectAuraExecuted / Fused / Quest 等），
+    /// 供 BuildDeltaGameSim 与 MoveOwnedCard 共享，彻底防止客户端 simUpdates[id] 查表抛 KeyNotFoundException。
+    /// </summary>
+    public static void CollectEventReferencedCardIds(IEnumerable<IGameSimEvent>? events, HashSet<string> targetIds)
+    {
+        if (events == null || targetIds == null) return;
+
+        static void AddIfValid(HashSet<string> set, string? id)
+        {
+            if (!string.IsNullOrEmpty(id))
+                set.Add(id);
+        }
+
+        static void AddEffectTarget(HashSet<string> set, IEffectTarget? target)
+        {
+            if (target is EffectTargetCard tc)
+                AddIfValid(set, tc.Target.Value);
+        }
+
+        foreach (var ev in events)
+        {
+            switch (ev)
+            {
+                case GameSimEventCardMoved mv:
+                    AddIfValid(targetIds, mv.InstanceId);
+                    break;
+                case GameSimEventCardUpgraded upg:
+                    AddIfValid(targetIds, upg.InstanceId);
+                    break;
+                case GameSimEventCardEnchanted enc:
+                    AddIfValid(targetIds, enc.InstanceId);
+                    break;
+                case GameSimEventCardSpawned sp:
+                    AddIfValid(targetIds, sp.InstanceId);
+                    break;
+                case GameSimEventCardDealt dl:
+                    AddIfValid(targetIds, dl.InstanceId);
+                    break;
+                case GameSimEventCardPurchased pur:
+                    AddIfValid(targetIds, pur.InstanceId);
+                    break;
+                case GameSimEventPlayerSkillEquipped sk:
+                    AddIfValid(targetIds, sk.InstanceId);
+                    break;
+                case GameSimEventCardQuestUpdated qu:
+                    AddIfValid(targetIds, qu.InstanceId);
+                    break;
+                case GameSimEventCardQuestCompleted qc:
+                    AddIfValid(targetIds, qc.InstanceId);
+                    break;
+                case GameSimEventCardFused fz:
+                    AddIfValid(targetIds, fz.SelectedInstanceId);
+                    AddIfValid(targetIds, fz.FusedInstanceId);
+                    break;
+                case GameSimEventCardTransformed tr:
+                    AddIfValid(targetIds, tr.OriginalInstanceId);
+                    if (tr.TransformedCards != null)
+                    {
+                        foreach (var tc in tr.TransformedCards)
+                            AddIfValid(targetIds, tc?.InstanceId);
+                    }
+                    break;
+                case GameSimEventCardTransformReverted rev:
+                    AddIfValid(targetIds, rev.OriginalCard?.InstanceId);
+                    if (rev.TransformedCardInstanceIds != null)
+                    {
+                        foreach (var id in rev.TransformedCardInstanceIds)
+                            AddIfValid(targetIds, id);
+                    }
+                    break;
+                case GameSimEventEffectAuraExecuted aura:
+                    if (aura.Source.HasValue) AddIfValid(targetIds, aura.Source.Value.Value);
+                    if (aura.AppliedTo != null)
+                    {
+                        foreach (var t in aura.AppliedTo) AddEffectTarget(targetIds, t);
+                    }
+                    if (aura.RemovedFrom != null)
+                    {
+                        foreach (var t in aura.RemovedFrom) AddEffectTarget(targetIds, t);
+                    }
+                    break;
+                case GameSimEventEffectExecuted eff:
+                    if (eff.Source.HasValue) AddIfValid(targetIds, eff.Source.Value.Value);
+                    if (eff.TriggerSource.HasValue) AddIfValid(targetIds, eff.TriggerSource.Value.Value);
+                    AddEffectTarget(targetIds, eff.Target);
+                    break;
+            }
+        }
     }
 
     public static TSelectionContextRules CloneRules(TSelectionContextRules? src)
@@ -884,6 +1408,23 @@ public sealed class RunState
             .ToFrozenDictionary(v => v.ToString(), v => v, StringComparer.OrdinalIgnoreCase);
 
     /// <summary>获取卡牌在核心引擎中的真实模板 ID（Mod 自定义卡返回 CustomCardId，原版卡返回 TemplateId）。</summary>
+    /// <summary>
+    /// D2-P1-02 单一权威 CustomCardId 判定：仅真正的 Mod 自定义卡返回逻辑 ID，
+    /// 纯原版卡与原位 Patch 卡（IsPatchOverride=true）一律返回 null，杜绝幽灵隔离误判与修订号噪增。
+    /// </summary>
+    public static string? ResolveCustomCardId(
+        string? coreTemplateId,
+        Guid wireTemplateId,
+        CardPool.CardTemplate? poolTpl = null)
+    {
+        if (string.IsNullOrWhiteSpace(coreTemplateId)) return null;
+        if (poolTpl != null && poolTpl.IsPatchOverride) return null;
+        if (poolTpl != null && poolTpl.IsCustomModCard) return coreTemplateId;
+        return !string.Equals(coreTemplateId, wireTemplateId.ToString(), StringComparison.OrdinalIgnoreCase)
+            ? coreTemplateId
+            : null;
+    }
+
     public static string ResolveCoreTemplateId(CardEntry entry)
         => !string.IsNullOrWhiteSpace(entry.CustomCardId) ? entry.CustomCardId! : entry.TemplateId.ToString();
 
@@ -1254,29 +1795,18 @@ public sealed class RunState
             }
         }
 
-        // 3. 标签（Template.Tags + ExtraTags + CombatTags + AuraTags + Enchantment.Tags）差分
+        // 3. 标签（Template.Tags + ExtraTags + CombatTags + AuraTags + Enchantment.Tags）全量统一差分（D1-P1-14：移除 Tags.Count > 0 特判，彻底清除零基础标签物品的幽灵残留标签）
         var expectedTags = new HashSet<ECardTag>();
         foreach (string rawTag in core.GetAllTags())
         {
             if (Enum.TryParse<ECardTag>(rawTag, true, out var parsedTag))
                 expectedTags.Add(parsedTag);
         }
-        if (core.Template.Tags.Count > 0)
+        if (!entry.Tags.SetEquals(expectedTags))
         {
-            if (!entry.Tags.SetEquals(expectedTags))
-            {
-                entry.Tags.Clear();
-                foreach (var t in expectedTags) entry.Tags.Add(t);
-                needsUiCardRefresh = true;
-            }
-        }
-        else
-        {
-            foreach (var t in expectedTags)
-            {
-                if (entry.Tags.Add(t))
-                    needsUiCardRefresh = true;
-            }
+            entry.Tags.Clear();
+            foreach (var t in expectedTags) entry.Tags.Add(t);
+            needsUiCardRefresh = true;
         }
 
         // 3b. 隐藏标签（Template.HiddenTags + Enchantment.HiddenTags + Tiny + 动态能力 HiddenTags）精确同步，区分 Burn 与 BurnReference

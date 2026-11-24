@@ -32,42 +32,10 @@ public sealed class V11OfficialDllDiffTests
 
     private static readonly Lazy<(string DbPath, GameDataRepository Repo)> SharedData = new(() =>
     {
-        var dbPath = ResolveGameDataDbPath();
-        var repo = GameDatabaseLoader.Load(dbPath);
-        OfficialSharedOracle.EnsureDbTemplatesLoaded(dbPath);
-        return (dbPath, repo);
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
+        OfficialSharedOracle.EnsureDbTemplatesLoaded(shared.DbPath);
+        return (shared.DbPath, shared.Repo);
     });
-
-    private static string ResolveGameDataDbPath()
-    {
-        var explicitDb = Environment.GetEnvironmentVariable("BAZAAR_GAME_DATA_DB");
-        if (!string.IsNullOrWhiteSpace(explicitDb) && File.Exists(explicitDb))
-            return Path.GetFullPath(explicitDb);
-
-        var dataDir = Environment.GetEnvironmentVariable("BAZAAR_DATA_DIR");
-        if (!string.IsNullOrWhiteSpace(dataDir))
-        {
-            var candidate = Path.Combine(dataDir, "GameData.db");
-            if (File.Exists(candidate))
-                return Path.GetFullPath(candidate);
-        }
-
-        // 从测试工作目录 / 程序集目录向上回溯查找 dist/data/GameData.db
-        foreach (var root in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
-        {
-            var dir = new DirectoryInfo(root);
-            while (dir != null)
-            {
-                var candidate = Path.Combine(dir.FullName, "dist", "data", "GameData.db");
-                if (File.Exists(candidate))
-                    return candidate;
-                dir = dir.Parent;
-            }
-        }
-
-        return SteamPathResolver.ResolveGameDataSourcePath()
-               ?? throw new FileNotFoundException("未找到只读 GameData.db，请设置 BAZAAR_DATA_DIR。");
-    }
 
     [Fact]
     public void Audit_GameDataDb_SchemaAndRuleTypeRegistry_Covers100Percent()

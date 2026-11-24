@@ -54,6 +54,7 @@ public sealed class SseEventHub
         }
     }
 
+    private readonly object _topicSync = new();
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<Guid, Channel<SseFrame>>> _topics =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _ownerConnCounts = new(StringComparer.OrdinalIgnoreCase);
@@ -61,6 +62,17 @@ public sealed class SseEventHub
     private int _totalConnections;
 
     public int TotalConnections => Volatile.Read(ref _totalConnections);
+
+    /// <summary>O(1) 线程安全检测指定主题是否存在活跃订阅者。</summary>
+    public bool HasTopicSubscribers(string topicKey)
+        => !string.IsNullOrWhiteSpace(topicKey)
+           && _topics.TryGetValue(topicKey, out var bucket)
+           && !bucket.IsEmpty;
+
+    /// <summary>O(1) 线程安全检测目标玩家棋盘观战频道是否存在活跃 SSE 订阅者。</summary>
+    public bool HasBoardSubscribers(string targetAccountId)
+        => !string.IsNullOrWhiteSpace(targetAccountId)
+           && HasTopicSubscribers(BoardTopic(targetAccountId));
 
     public static string LobbyTopic(string lobbyId) => $"lobby:{lobbyId.Trim().ToLowerInvariant()}";
     public static string PublicLobbiesTopic => "lobby:__public__";
@@ -85,14 +97,6 @@ public sealed class SseEventHub
         string effectiveOwner = string.IsNullOrWhiteSpace(ownerKey) ? "anon" : ownerKey.Trim().ToLowerInvariant();
         int effectiveLimit = effectiveOwner.StartsWith("anon", StringComparison.Ordinal) ? Math.Max(8, maxPerOwner * 2) : Math.Max(1, maxPerOwner);
 
-        int ownerCount = _ownerConnCounts.AddOrUpdate(effectiveOwner, 1, (_, old) => old + 1);
-        if (ownerCount > effectiveLimit)
-        {
-            _ownerConnCounts.AddOrUpdate(effectiveOwner, 0, (_, old) => Math.Max(0, old - 1));
-            Interlocked.Decrement(ref _totalConnections);
-            return null;
-        }
-
         var channel = Channel.CreateBounded<SseFrame>(new BoundedChannelOptions(ChannelCapacity)
         {
             SingleReader = true,
@@ -101,12 +105,25 @@ public sealed class SseEventHub
         });
 
         Guid subId = Guid.NewGuid();
-        var bucket = _topics.GetOrAdd(topicKey, _ => new ConcurrentDictionary<Guid, Channel<SseFrame>>());
-        bucket[subId] = channel;
-
-        if (!string.IsNullOrWhiteSpace(spectateLobbyId))
+        lock (_topicSync)
         {
-            _spectatorCounts.AddOrUpdate(spectateLobbyId.Trim().ToLowerInvariant(), 1, (_, old) => old + 1);
+            int ownerCount = _ownerConnCounts.AddOrUpdate(effectiveOwner, 1, (_, old) => old + 1);
+            if (ownerCount > effectiveLimit)
+            {
+                int rolledBack = _ownerConnCounts.AddOrUpdate(effectiveOwner, 0, (_, old) => Math.Max(0, old - 1));
+                if (rolledBack <= 0)
+                    _ownerConnCounts.TryRemove(effectiveOwner, out _);
+                Interlocked.Decrement(ref _totalConnections);
+                return null;
+            }
+
+            var bucket = _topics.GetOrAdd(topicKey, _ => new ConcurrentDictionary<Guid, Channel<SseFrame>>());
+            bucket[subId] = channel;
+
+            if (!string.IsNullOrWhiteSpace(spectateLobbyId))
+            {
+                _spectatorCounts.AddOrUpdate(spectateLobbyId.Trim().ToLowerInvariant(), 1, (_, old) => old + 1);
+            }
         }
 
         return new Subscription(this, topicKey, effectiveOwner, spectateLobbyId, subId, channel);
@@ -114,22 +131,30 @@ public sealed class SseEventHub
 
     private void Unsubscribe(string topicKey, string ownerKey, string? spectateLobbyId, Guid subId, Channel<SseFrame> channel)
     {
-        if (_topics.TryGetValue(topicKey, out var bucket))
+        lock (_topicSync)
         {
-            bucket.TryRemove(subId, out _);
-            if (bucket.IsEmpty)
-                _topics.TryRemove(topicKey, out _);
+            if (_topics.TryGetValue(topicKey, out var bucket))
+            {
+                bucket.TryRemove(subId, out _);
+                if (bucket.IsEmpty)
+                    _topics.TryRemove(topicKey, out _);
+            }
+
+            int nextOwner = _ownerConnCounts.AddOrUpdate(ownerKey, 0, (_, old) => Math.Max(0, old - 1));
+            if (nextOwner <= 0)
+                _ownerConnCounts.TryRemove(ownerKey, out _);
+
+            if (!string.IsNullOrWhiteSpace(spectateLobbyId))
+            {
+                string lk = spectateLobbyId.Trim().ToLowerInvariant();
+                int nextSpec = _spectatorCounts.AddOrUpdate(lk, 0, (_, old) => Math.Max(0, old - 1));
+                if (nextSpec <= 0)
+                    _spectatorCounts.TryRemove(lk, out _);
+            }
         }
 
         channel.Writer.TryComplete();
-        _ownerConnCounts.AddOrUpdate(ownerKey, 0, (_, old) => Math.Max(0, old - 1));
         Interlocked.Decrement(ref _totalConnections);
-
-        if (!string.IsNullOrWhiteSpace(spectateLobbyId))
-        {
-            string lk = spectateLobbyId.Trim().ToLowerInvariant();
-            _spectatorCounts.AddOrUpdate(lk, 0, (_, old) => Math.Max(0, old - 1));
-        }
     }
 
     public int GetSpectatorCount(string? lobbyId)

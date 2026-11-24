@@ -2,25 +2,26 @@ using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using BazaarGameShared.Domain.Core.Types;
 using BazaarLauncher.Core;
 using BazaarModSdk;
 using HarmonyLib;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
 namespace BazaarLauncher.Modules;
 
 /// <summary>
-/// 自定义 PNG 卡图 4 大渲染通路热替换引擎（实现 ICardVisualOverrideRegistry）：
-///   通路 1：3D 棋盘物品与战报回放（ItemVisualsController.Setup / SetCardFrameMaterial / OnDestroy）
-///   通路 2：3D 技能圆牌与技能代理（SkillController.Setup / UpdateCard、SkillProxyRenderer.Initialize -> SkillIconUpdater）
-///   通路 3：2D UI 预览/图鉴/商店（CardPreviewItem.UpdateCardImageMaterial、CardPreviewSkill.LoadArt、CardPreviewEncounter.LoadArt）
-///   通路 4：遭遇卡背景与战斗立绘（EncounterController.Setup、PortraitApplyHelper）
-/// 所有异步加载均受 CardVisualOverrideAgent.Epoch 版本号保护（铁律四），失败瞬间回退合法原版底座（0 白块 0 粉块 0 NRE）。
+/// 自定义 PNG/JPEG 卡图 4 大渲染通路热替换引擎 + 逻辑融合隔离 + 野怪自定义悬停预览 + 全生命周期回收（实现 ICardVisualOverrideRegistry）：
+///   通路 1：3D 棋盘物品与战报回放（ItemVisualsController / CardController.ClearVisualProxy / BoardManager.HideRecapView）
+///   通路 2：3D 技能圆牌与技能代理（SkillIconUpdater.UpdateSkillIconMaterial 落盘拦截 / SkillController.Cleanup Prefix）
+///   通路 3：2D UI 预览/图鉴/商店/野怪悬停（CardPreviewBase 4 参 SetUp 上下文穿透 / MonsterBoardTooltip.HandlePooling Prefix）
+///   通路 4：遭遇卡背景与战斗立绘（EncounterController.Setup / SetupEncounterController / Cleanup Prefix + MPB 零泄漏背景）
 /// </summary>
 internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisualOverrideRegistry
 {
@@ -30,9 +31,9 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     {
         Id = "bazaar.visual.custom_content",
         Name = "自定义 PNG 卡图渲染拦截引擎",
-        Version = "2.1.0",
+        Version = "2.2.0",
         Author = "BazaarModKit",
-        Description = "通过 4 大原生渲染通路无缝热替换自定义物品/技能/遭遇 PNG 卡图，严格执行 6 道防白块与显存防泄漏铁律。",
+        Description = "通过 4 大原生渲染通路无缝热替换自定义物品/技能/遭遇 PNG/JPEG 卡图，完整闭环逻辑融合隔离、野怪悬停、2D 穿透与 4 管线快照回收。",
         IsBuiltIn = true,
         DefaultEnabled = true,
         Category = "Visual",
@@ -41,9 +42,30 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
 
     public SafeHarmonyPatcher Patcher { get; private set; }
 
+    internal sealed class PreviewCardContext
+    {
+        public string CustomCardId { get; }
+        public string TemplateId { get; }
+        public string ModId { get; }
+
+        public PreviewCardContext(string customCardId, string templateId, string modId)
+        {
+            CustomCardId = customCardId ?? string.Empty;
+            TemplateId = templateId ?? string.Empty;
+            ModId = modId ?? string.Empty;
+        }
+    }
+
     private readonly object _sync = new();
     private readonly List<CardVisualBinding> _bindings = new();
     private readonly List<(int Priority, Func<CardVisualQuery, CardVisualBinding> Resolver)> _dynamicResolvers = new();
+    private IDisposable _sceneEventSub;
+    private IDisposable _combatEventSub;
+
+    // P0-26：2D 预览与野怪棋盘 CustomCardId 上下文映射（弱引用零泄漏）
+    private static readonly ConditionalWeakTable<object, PreviewCardContext> PreviewContextMap = new();
+    [ThreadStatic] private static PreviewCardContext _activePreviewSetupContext;
+    [ThreadStatic] private static bool _inModSkillIconApply;
 
     // 反射缓存（零热路径反射查找）
     private static FieldInfo _itemMatInstanceField;
@@ -52,10 +74,15 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     private static FieldInfo _itemControllerField;
     private static FieldInfo _itemBackVisibleField;
     private static Type _itemVisualsControllerType;
+    private static Type _cardControllerType;
+    private static Type _recapItemVisualControllerType;
+    private static Type _previewBaseType;
     private static Type _previewItemType;
     private static Type _previewSkillType;
     private static Type _previewEncounterType;
     private static Type _encounterControllerType;
+    private static Type _skillControllerType;
+    private static Type _skillProxyRendererType;
     private static MethodInfo _skillUpdateIconMethod;
     private static FieldInfo _previewItemMaterialField;
     private static FieldInfo _previewCardDataField;
@@ -66,10 +93,22 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     private static FieldInfo _encounterAnimatedPortraitField;
     private static FieldInfo _encounterBackgroundRendererField;
     private static FieldInfo _encounterInstancedBgMatField;
+    private static PropertyInfo _encounterCardDataProp;
     private static MethodInfo _cardFrameUpdateBgMethod;
     private static Type _skillIconUpdaterType;
+    private static FieldInfo _monsterRewardViewField;
+    private static FieldInfo _monsterBoardViewField;
+    private static FieldInfo _monsterBoardActiveCardsField;
+    private static FieldInfo _monsterBoardActiveSkillsField;
+    private static PropertyInfo _dataRunProp;
+    private static PropertyInfo _dataEntitiesProp;
+    private static MethodInfo _dataGetStaticMethod;
+    private static FieldInfo _boardManagerIsRecapOpenField;
+    private static PropertyInfo _boardManagerIsRecapOpenProp;
 
-    // 按运行时真实类型隔离缓存卡牌反射属性（彻底杜绝 ItemCard.Enchantment 复用到 SkillCard/Card 抛出 InvalidCastException）
+    private static readonly int BaseMapPropId = Shader.PropertyToID("_BaseMap");
+    private static readonly int MainTexPropId = Shader.PropertyToID("_MainTex");
+
     private sealed class CardPropBag
     {
         public PropertyInfo InstanceId;
@@ -77,6 +116,8 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         public PropertyInfo Tier;
         public PropertyInfo Enchantment;
         public PropertyInfo Id;
+        public PropertyInfo Owner;
+        public PropertyInfo Size;
     }
 
     private static readonly ConcurrentDictionary<Type, CardPropBag> _cardPropsByType = new();
@@ -93,12 +134,15 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     {
         Patcher = new SafeHarmonyPatcher(Manifest.Id);
         InstallFourRenderPipelinePatches(Patcher);
+        InstallFusionAndMonsterPreviewPatches(Patcher);
+        SubscribeLifecycleEvents();
         BazaarLauncherPlugin.Log?.LogInfo(
-            $"[CustomVisual] 4 大 PNG 渲染通路拦截已就绪 (成功={Patcher.SucceededCount}/{Patcher.AttemptedCount})");
+            $"[CustomVisual] 4 大 PNG 渲染通路 + 融合隔离 + 野怪预览拦截已就绪 (成功={Patcher.SucceededCount}/{Patcher.AttemptedCount})");
     }
 
     public void OnDisable()
     {
+        UnsubscribeLifecycleEvents();
         Patcher?.UnpatchAll();
     }
 
@@ -107,6 +151,155 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         OnDisable();
         CardTextureCache.Instance.DisposeAllOnMain();
         if (Instance == this) Instance = null;
+    }
+
+    private void SubscribeLifecycleEvents()
+    {
+        UnsubscribeLifecycleEvents();
+        try
+        {
+            var bus = BazaarLauncherPlugin.Host?.EventBus;
+            if (bus != null)
+            {
+                _sceneEventSub = bus.Subscribe<SceneChangedModEvent>(OnSceneChangedModEvent);
+                _combatEventSub = bus.Subscribe<CombatLifecycleModEvent>(OnCombatLifecycleModEvent);
+            }
+            SceneManager.activeSceneChanged += OnUnityActiveSceneChanged;
+        }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L169", diagEx); }
+    }
+
+    private void UnsubscribeLifecycleEvents()
+    {
+        try { _sceneEventSub?.Dispose(); } catch { }
+        _sceneEventSub = null;
+        try { _combatEventSub?.Dispose(); } catch { }
+        _combatEventSub = null;
+        try { SceneManager.activeSceneChanged -= OnUnityActiveSceneChanged; } catch { }
+    }
+
+    private static void OnSceneChangedModEvent(SceneChangedModEvent ev)
+    {
+        if (ev.IsMainMenu || IsMainMenuSceneName(ev.SceneName))
+        {
+            ModContentSyncClient.Instance?.OnReturnedToMainMenu();
+        }
+    }
+
+    private static void OnUnityActiveSceneChanged(Scene _, Scene next)
+    {
+        if (IsMainMenuSceneName(next.name))
+        {
+            ModContentSyncClient.Instance?.OnReturnedToMainMenu();
+        }
+    }
+
+    private static void OnCombatLifecycleModEvent(CombatLifecycleModEvent ev)
+    {
+        if (ev.Started)
+        {
+            _ = ModContentSyncClient.Instance?.SyncActiveBindingsAsync();
+        }
+    }
+
+    private static bool IsMainMenuSceneName(string sceneName)
+    {
+        if (string.IsNullOrWhiteSpace(sceneName)) return false;
+        return sceneName.IndexOf("MainMenu", StringComparison.OrdinalIgnoreCase) >= 0
+            || sceneName.IndexOf("Title", StringComparison.OrdinalIgnoreCase) >= 0
+            || sceneName.IndexOf("Home", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    // ── 对外协作查询接口（供 CardIdentityResolver / LocalizationOverlay / CompatAuditPatch 调用）──
+
+    internal static string TryGetPreviewCustomCardId(object cardOrComp)
+    {
+        if (cardOrComp != null && PreviewContextMap.TryGetValue(cardOrComp, out var ctx)
+            && !string.IsNullOrEmpty(ctx.CustomCardId))
+        {
+            return ctx.CustomCardId;
+        }
+        var active = _activePreviewSetupContext;
+        if (active != null && !string.IsNullOrEmpty(active.CustomCardId))
+        {
+            return active.CustomCardId;
+        }
+        return null;
+    }
+
+    internal bool TryLookupCustomIdentity(string instanceId, string templateId, out string customId, out bool isPatch)
+    {
+        customId = null;
+        isPatch = false;
+        lock (_sync)
+        {
+            if (!string.IsNullOrEmpty(instanceId))
+            {
+                for (int i = 0; i < _bindings.Count; i++)
+                {
+                    var b = _bindings[i];
+                    if (b == null) continue;
+                    if (!string.IsNullOrEmpty(b.InstanceId)
+                        && string.Equals(b.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        customId = b.CustomCardId;
+                        isPatch = b.IsPatchOverride
+                            || (!string.IsNullOrEmpty(b.TemplateId) && string.Equals(b.CustomCardId, b.TemplateId, StringComparison.OrdinalIgnoreCase));
+                        return !string.IsNullOrEmpty(customId);
+                    }
+                }
+            }
+
+            if (!string.IsNullOrEmpty(templateId))
+            {
+                for (int i = 0; i < _bindings.Count; i++)
+                {
+                    var b = _bindings[i];
+                    if (b == null) continue;
+                    if (!string.IsNullOrEmpty(b.TemplateId)
+                        && string.Equals(b.TemplateId, templateId, StringComparison.OrdinalIgnoreCase)
+                        && (b.IsPatchOverride || string.Equals(b.CustomCardId, b.TemplateId, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        customId = b.CustomCardId;
+                        isPatch = true;
+                        return !string.IsNullOrEmpty(customId);
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>P0-24：供 CompatAuditPatch.WrapEncounterSetupTask 查询当前遭遇卡是否已有自定义视觉绑定。</summary>
+    internal static bool HasActiveEncounterVisualOverride(object card)
+    {
+        var inst = Instance;
+        if (inst == null || card == null) return false;
+        var pq = BuildQueryFromCard(card, CardVisualTarget.EncounterPortrait);
+        if (inst.TryResolveVisual(in pq, out _)) return true;
+        var bq = BuildQueryFromCard(card, CardVisualTarget.EncounterBackground);
+        return inst.TryResolveVisual(in bq, out _);
+    }
+
+    internal bool TryResolveWireTemplateIdForCustomCard(string customCardId, out string templateId)
+    {
+        templateId = null;
+        if (string.IsNullOrWhiteSpace(customCardId)) return false;
+        lock (_sync)
+        {
+            for (int i = 0; i < _bindings.Count; i++)
+            {
+                var b = _bindings[i];
+                if (b != null
+                    && string.Equals(b.CustomCardId, customCardId, StringComparison.OrdinalIgnoreCase)
+                    && !string.IsNullOrWhiteSpace(b.TemplateId))
+                {
+                    templateId = b.TemplateId;
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // ── ICardVisualOverrideRegistry 实现 ─────────────────────────────────────
@@ -157,7 +350,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                         return true;
                     }
                 }
-                catch { }
+                catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L353", diagEx); }
             }
 
             for (int i = 0; i < _bindings.Count; i++)
@@ -180,10 +373,9 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 else if (!string.IsNullOrEmpty(query.TemplateId) && !string.IsNullOrEmpty(b.TemplateId)
                     && string.Equals(query.TemplateId, b.TemplateId, StringComparison.OrdinalIgnoreCase))
                 {
-                    // 铁律防串图：若某绑定带独立 CustomCardId 且 CustomCardId != TemplateId，说明是借壳自定义卡，
-                    // 严禁按原版借壳 TemplateId 兜底匹配，否则会把原版物品的贴图错误替换成自定义卡贴图！
-                    if (!string.IsNullOrEmpty(b.CustomCardId)
-                        && !string.Equals(b.CustomCardId, b.TemplateId, StringComparison.OrdinalIgnoreCase))
+                    if ((b.IsCustomBorrowShell && !b.IsPatchOverride)
+                        || (!string.IsNullOrEmpty(b.CustomCardId)
+                            && !string.Equals(b.CustomCardId, b.TemplateId, StringComparison.OrdinalIgnoreCase)))
                     {
                         continue;
                     }
@@ -211,13 +403,15 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         lock (_sync) return _bindings.Count;
     }
 
-    /// <summary>当 /api/mods/active-bindings 同步返回新实例绑定（或切换/禁用 Mod）后，在主线程对已在场的 3D 物品卡立即补刷或还原贴图。</summary>
+    /// <summary>D3-P1-13：在主线程重绘所有在场与隐藏仓库卡（FindObjectsInactive.Include）的视觉贴图与徽章。</summary>
     internal void ReapplyActiveVisualsOnMainThread()
     {
         try
         {
             var visited = new HashSet<int>();
-            var agents = UnityEngine.Object.FindObjectsByType<CardVisualOverrideAgent>(FindObjectsSortMode.None);
+            var agents = UnityEngine.Object.FindObjectsByType<CardVisualOverrideAgent>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None);
             if (agents != null)
             {
                 for (int i = 0; i < agents.Length; i++)
@@ -226,7 +420,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     if (ag == null || ag.HostController == null) continue;
                     visited.Add(ag.HostController.GetInstanceID());
 
-                    // 若因极端路径导致 agent 丢失上下文但所属 ItemController 仍有活体 Card，自动重建上下文
                     if (!ag.HasContext && _itemVisualsControllerType != null && _itemVisualsControllerType.IsInstanceOfType(ag.HostController))
                     {
                         object liveCard = ResolveLiveCardFromVisuals(ag.HostController);
@@ -238,6 +431,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     }
 
                     if (!ag.HasContext) continue;
+                    ag.MarkBadgeDirty();
                     var host = ag.HostController;
                     if (_previewItemType != null && _previewItemType.IsInstanceOfType(host))
                     {
@@ -266,10 +460,12 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 }
             }
 
-            // 兜底补扫：若场上有在钩子前已生成或尚无 Agent 的 ItemVisualsController 且其实体已命中绑定，立即挂接并补刷
             if (_itemVisualsControllerType != null)
             {
-                var visualsArr = UnityEngine.Object.FindObjectsByType(_itemVisualsControllerType, FindObjectsSortMode.None);
+                var visualsArr = UnityEngine.Object.FindObjectsByType(
+                    _itemVisualsControllerType,
+                    FindObjectsInactive.Include,
+                    FindObjectsSortMode.None);
                 if (visualsArr != null)
                 {
                     for (int i = 0; i < visualsArr.Length; i++)
@@ -308,12 +504,15 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
-    // ── 安装 4 大渲染通路 Harmony 钩子 ───────────────────────────────────────
+    // ── 安装 4 大渲染通路 + 回收钩子 ─────────────────────────────────────────
 
     private static void InstallFourRenderPipelinePatches(SafeHarmonyPatcher patcher)
     {
-        // 通路 1：3D 物品与战报回放 (ItemVisualsController)
+        // 通路 1：3D 物品与战报回放 (ItemVisualsController / CardController / BoardManager)
         var itemVisType = GameInspector.FindTypeSafe("TheBazaar.Game.CardFrames.ItemVisualsController");
+        _recapItemVisualControllerType = GameInspector.FindTypeSafe("TheBazaar.RecapItemVisualController", "RecapItemVisualController");
+        _cardControllerType = GameInspector.FindTypeSafe("CardController", "TheBazaar.CardController");
+
         if (itemVisType != null)
         {
             _itemVisualsControllerType = itemVisType;
@@ -324,14 +523,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _itemBackVisibleField = AccessTools.Field(itemVisType, "_backVisible");
 
             var cardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.Card");
-            // 修正命名空间：真实类型为 BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout，消除启动告警 #5
             var loadoutType = GameInspector.FindTypeSafe(
                 "BazaarGameShared.TempoNet.Models.BazaarCollectionLoadout",
                 "TheBazaar.BazaarCollectionLoadout");
             if (cardType != null && loadoutType != null)
             {
-                // 必须在 Prefix 中先切换上下文并递增值班 Epoch，杜绝 AssetLoader 同步命中已缓存原版材质时
-                // SetCardFrameMaterial 先于 Postfix 执行并把上一张池化自定义卡 PNG 误刷到食人鱼/刺刀等原版卡上
                 patcher.TryPatch(
                     itemVisType,
                     "Setup",
@@ -385,8 +581,34 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 label: "Visual.P1.ItemVisualsController.SetCardFrameMaterial");
         }
 
-        // 通路 2：3D 技能圆牌与技能代理 (SkillController / SkillProxyRenderer)
+        // P0-29：管线 1 补齐 CardController.ClearVisualProxy Prefix + BoardManager.HideRecapView Postfix（严禁挂 HideRecapDeck）
+        if (_cardControllerType != null)
+        {
+            patcher.TryPatch(
+                _cardControllerType,
+                "ClearVisualProxy",
+                prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(CardControllerClearVisualProxyPrefix)),
+                optional: true,
+                label: "Visual.P1.CardController.ClearVisualProxy");
+        }
+
+        var boardMgrType = GameInspector.FindTypeSafe("BoardManager", "TheBazaar.BoardManager");
+        if (boardMgrType != null)
+        {
+            _boardManagerIsRecapOpenProp = AccessTools.Property(boardMgrType, "IsRecapViewOpen");
+            _boardManagerIsRecapOpenField = AccessTools.Field(boardMgrType, "_isRecapViewOpen");
+            patcher.TryPatch(
+                boardMgrType,
+                "HideRecapView",
+                prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(BoardManagerHideRecapViewPrefix)),
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(BoardManagerHideRecapViewPostfix)),
+                optional: true,
+                label: "Visual.P1.BoardManager.HideRecapView");
+        }
+
+        // 通路 2：3D 技能圆牌与技能代理 (SkillController / SkillProxyRenderer / SkillIconUpdater)
         var skillCtrlType = GameInspector.FindTypeSafe("SkillController", "TheBazaar.SkillController");
+        _skillControllerType = skillCtrlType;
         if (skillCtrlType != null)
         {
             _skillUpdateIconMethod = AccessTools.Method(skillCtrlType, "UpdateSkillIcon", new[] { typeof(Texture) });
@@ -402,11 +624,37 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillControllerUpdateCardPostfix)),
                 optional: true,
                 label: "Visual.P2.SkillController.UpdateCard");
+            patcher.TryPatch(
+                skillCtrlType,
+                "UpdateSkillIcon",
+                new[] { typeof(Texture) },
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillUpdateIconPostfix)),
+                optional: true,
+                label: "Visual.P2.SkillController.UpdateSkillIcon");
+            // P0-29：SkillController.Cleanup Prefix 先还原快照与释放租约，再由原版 PoolObject
+            patcher.TryPatch(
+                skillCtrlType,
+                "Cleanup",
+                prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillControllerCleanupPrefix)),
+                optional: true,
+                label: "Visual.P2.SkillController.Cleanup");
         }
 
         _skillIconUpdaterType = GameInspector.FindTypeSafe("SkillIconUpdater", "TheBazaar.SkillIconUpdater");
+        if (_skillIconUpdaterType != null)
+        {
+            // P0-23：直接挂钩 SkillIconUpdater.UpdateSkillIconMaterial(Texture) 落盘瞬间替换自定义图并留原版快照
+            patcher.TryPatch(
+                _skillIconUpdaterType,
+                "UpdateSkillIconMaterial",
+                new[] { typeof(Texture) },
+                prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillIconUpdaterMaterialPrefix)),
+                optional: true,
+                label: "Visual.P2.SkillIconUpdater.UpdateSkillIconMaterial");
+        }
 
         var skillProxyType = GameInspector.FindTypeSafe("SkillProxyRenderer", "TheBazaar.SkillProxyRenderer");
+        _skillProxyRendererType = skillProxyType;
         if (skillProxyType != null)
         {
             patcher.TryPatch(
@@ -415,15 +663,38 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillProxyInitializePostfix)),
                 optional: true,
                 label: "Visual.P2.SkillProxyRenderer.Initialize");
+            patcher.TryPatch(
+                skillProxyType,
+                "UpdateSkillIcon",
+                new[] { typeof(Texture) },
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillUpdateIconPostfix)),
+                optional: true,
+                label: "Visual.P2.SkillProxyRenderer.UpdateSkillIcon");
         }
 
-        // 通路 3：2D UI 预览 (CardPreviewItem / CardPreviewSkill / CardPreviewEncounter)
+        // 通路 3：2D UI 预览 (CardPreviewBase 4 参 SetUp / CardPreviewItem / CardPreviewSkill / CardPreviewEncounter)
         var previewBase = GameInspector.FindTypeSafe("TheBazaar.UI.CardPreviewBase");
+        _previewBaseType = previewBase;
         if (previewBase != null)
         {
             _previewCardDataField = AccessTools.Field(previewBase, "_cardData");
             _previewClientCardField = AccessTools.Field(previewBase, "_clientCard");
             _previewCardImageField = AccessTools.Field(previewBase, "_cardImage");
+
+            // P0-26：必须显式指定 4 参类型数组防止 CardPreviewBase.SetUp 双重载引发 AmbiguousMatchException
+            var tCardBaseType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Cards.TCardBase");
+            var tCardInstType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Cards.TCardInstance");
+            if (tCardBaseType != null && tCardInstType != null)
+            {
+                patcher.TryPatch(
+                    previewBase,
+                    "SetUp",
+                    new[] { tCardBaseType, typeof(bool), tCardInstType, typeof(CancellationToken) },
+                    prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(CardPreviewBaseSetUpPrefix)),
+                    postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(CardPreviewBaseSetUpPostfix)),
+                    optional: true,
+                    label: "Visual.P3.CardPreviewBase.SetUp(4)");
+            }
         }
 
         var previewItem = GameInspector.FindTypeSafe("TheBazaar.UI.CardPreviewItem");
@@ -476,6 +747,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _encounterAnimatedPortraitField = AccessTools.Field(encCtrl, "_currentAnimatedPortraitInstance");
             _encounterBackgroundRendererField = AccessTools.Field(encCtrl, "backgroundRenderer");
             _encounterInstancedBgMatField = AccessTools.Field(encCtrl, "instancedBackgroundMaterial");
+            _encounterCardDataProp = AccessTools.Property(encCtrl, "CardData");
 
             var frameType = GameInspector.FindTypeSafe(
                 "TheBazaar.Game.CardFrames.CardFrameController",
@@ -492,6 +764,495 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(EncounterControllerSetupPostfix)),
                 optional: true,
                 label: "Visual.P4.EncounterController.Setup");
+
+            // P0-24：在 SetupEncounterController 异步装配完成后立即补刷自定义奇遇立绘/背景
+            var encSoType = GameInspector.FindTypeSafe(
+                "EncounterAssetDataSO",
+                "TheBazaar.Assets.Scripts.ScriptableObjectsScripts.EncounterAssetDataSO");
+            var setupEncCtrlMethod = encSoType != null
+                ? AccessTools.Method(encCtrl, "SetupEncounterController", new[] { encSoType })
+                : AccessTools.Method(encCtrl, "SetupEncounterController");
+            if (setupEncCtrlMethod != null)
+            {
+                patcher.TryPatchMethod(
+                    setupEncCtrlMethod,
+                    postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(EncounterControllerSetupEncounterPostfix)),
+                    optional: true,
+                    label: "Visual.P4.EncounterController.SetupEncounterController");
+            }
+
+            // P0-29：EncounterController.Cleanup Prefix 先还原原版立绘/背景 MPB 与租约
+            patcher.TryPatch(
+                encCtrl,
+                "Cleanup",
+                prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(EncounterControllerCleanupPrefix)),
+                optional: true,
+                label: "Visual.P4.EncounterController.Cleanup");
+        }
+    }
+
+    // ── 安装 P0-20 融合隔离 + P0-21 野怪悬停 + P0-29 MonsterBoardTooltip 回收 ──
+
+    private static void InstallFusionAndMonsterPreviewPatches(SafeHarmonyPatcher patcher)
+    {
+        var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
+        if (dataType != null)
+        {
+            _dataRunProp = dataType.GetProperty("Run", BindingFlags.Public | BindingFlags.Static);
+            _dataEntitiesProp = dataType.GetProperty("Entities", BindingFlags.Public | BindingFlags.Static);
+            _dataGetStaticMethod = dataType.GetMethod("GetStatic", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+        }
+
+        // P0-20：融合逻辑身份隔离 3 钩子
+        var itemCardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.ItemCard");
+        if (itemCardType != null)
+        {
+            patcher.TryPatch(
+                itemCardType,
+                "CanFuseWith",
+                new[] { itemCardType },
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(CardCanFuseWithPostfix)),
+                optional: true,
+                label: "Fusion.ItemCard.CanFuseWith");
+        }
+
+        var skillCardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.SkillCard");
+        if (skillCardType != null)
+        {
+            patcher.TryPatch(
+                skillCardType,
+                "CanFuseWith",
+                new[] { skillCardType },
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(CardCanFuseWithPostfix)),
+                optional: true,
+                label: "Fusion.SkillCard.CanFuseWith");
+        }
+
+        var cardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.Card");
+        var cardExtType = GameInspector.FindTypeSafe("TheBazaar.CardExtensions");
+        if (cardExtType != null && cardType != null)
+        {
+            patcher.TryPatch(
+                cardExtType,
+                "CanFuse",
+                new[] { cardType },
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(CardExtensionsCanFusePostfix)),
+                optional: true,
+                label: "Fusion.CardExtensions.CanFuse");
+        }
+
+        // P0-21：野怪悬停自定义预览
+        var tooltipDataType = GameInspector.FindTypeSafe("TheBazaar.Tooltips.CardTooltipData");
+        if (tooltipDataType != null)
+        {
+            patcher.TryPatch(
+                tooltipDataType,
+                "GetPVEEncounterLevel",
+                Type.EmptyTypes,
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(GetPveEncounterLevelPostfix)),
+                optional: true,
+                label: "MonsterPreview.CardTooltipData.GetPVEEncounterLevel");
+        }
+
+        var rewardRendererType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.MonsterRewardRenderer");
+        if (rewardRendererType != null && tooltipDataType != null)
+        {
+            _monsterRewardViewField = AccessTools.Field(rewardRendererType, "_view");
+            patcher.TryPatch(
+                rewardRendererType,
+                "Render",
+                new[] { tooltipDataType },
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(MonsterRewardRendererRenderPostfix)),
+                optional: true,
+                label: "MonsterPreview.MonsterRewardRenderer.Render");
+        }
+
+        var boardRendererType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.MonsterBoardRenderer");
+        var tMonsterType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Monsters.TMonster", "BazaarGameShared.Domain.Cards.Encounter.TMonster");
+        if (boardRendererType != null && tooltipDataType != null)
+        {
+            _monsterBoardViewField = AccessTools.Field(boardRendererType, "_view");
+            MethodInfo buildDisplayM = tMonsterType != null
+                ? AccessTools.Method(boardRendererType, "BuildDisplay", new[] { tMonsterType, tooltipDataType })
+                : AccessTools.Method(boardRendererType, "BuildDisplay");
+            if (buildDisplayM != null)
+            {
+                patcher.TryPatchMethod(
+                    buildDisplayM,
+                    prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(MonsterBoardRendererBuildDisplayPrefix)),
+                    optional: true,
+                    label: "MonsterPreview.MonsterBoardRenderer.BuildDisplay");
+            }
+        }
+
+        // P0-29：MonsterBoardTooltip.HandlePooling Prefix 先还原与释放子项预览租约再交由原版回收
+        var boardTooltipType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.MonsterBoardTooltip");
+        if (boardTooltipType != null)
+        {
+            _monsterBoardActiveCardsField = AccessTools.Field(boardTooltipType, "_activeCards");
+            _monsterBoardActiveSkillsField = AccessTools.Field(boardTooltipType, "_activeSkills");
+            patcher.TryPatch(
+                boardTooltipType,
+                "HandlePooling",
+                Type.EmptyTypes,
+                prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(MonsterBoardTooltipHandlePoolingPrefix)),
+                optional: true,
+                label: "Visual.P4.MonsterBoardTooltip.HandlePooling");
+        }
+    }
+
+    // ── P0-20 融合隔离回调 ───────────────────────────────────────────────────
+
+    private static void CardCanFuseWithPostfix(object __instance, object __0, ref bool __result)
+    {
+        try
+        {
+            if (!__result || __instance == null || __0 == null) return;
+            string idA = CardIdentityResolver.ResolveLogicalCardIdentity(__instance);
+            string idB = CardIdentityResolver.ResolveLogicalCardIdentity(__0);
+            if (!string.Equals(idA, idB, StringComparison.OrdinalIgnoreCase))
+            {
+                __result = false;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(CardCanFuseWithPostfix), ex);
+        }
+    }
+
+    private static void CardExtensionsCanFusePostfix(object __0, ref bool __result)
+    {
+        try
+        {
+            if (!__result || __0 == null) return;
+
+            object run = _dataRunProp?.GetValue(null);
+            object player = run != null ? run.GetType().GetProperty("Player", BindingFlags.Public | BindingFlags.Instance)?.GetValue(run) : null;
+            if (player == null) return;
+
+            var cardBag = GetCardPropBag(__0.GetType());
+            object cardOwner = SafeGetPropertyValue(cardBag.Owner, __0);
+
+            // 仅在 cardToFuse.Owner == player 分支执行全量实体逻辑身份复验；
+            // Owner != player 分支已由补丁后的 ItemCard/SkillCard.CanFuseWith 精确拦截，绝不误伤原版商店卡！
+            if (!ReferenceEquals(cardOwner, player)) return;
+
+            string myId = CardIdentityResolver.ResolveLogicalCardIdentity(__0);
+            object myTier = SafeGetPropertyValue(cardBag.Tier, __0);
+            if (_dataEntitiesProp?.GetValue(null) is not IDictionary entities) return;
+
+            bool foundLogicalMatch = false;
+            foreach (object val in entities.Values)
+            {
+                if (val == null || ReferenceEquals(val, __0)) continue;
+                var otherBag = GetCardPropBag(val.GetType());
+                object otherOwner = SafeGetPropertyValue(otherBag.Owner, val);
+                if (ReferenceEquals(otherOwner, cardOwner)) continue;
+                object otherTier = SafeGetPropertyValue(otherBag.Tier, val);
+                if (!Equals(myTier, otherTier)) continue;
+                string otherId = CardIdentityResolver.ResolveLogicalCardIdentity(val);
+                if (string.Equals(myId, otherId, StringComparison.OrdinalIgnoreCase))
+                {
+                    foundLogicalMatch = true;
+                    break;
+                }
+            }
+
+            if (!foundLogicalMatch)
+            {
+                __result = false;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(CardExtensionsCanFusePostfix), ex);
+        }
+    }
+
+    // ── P0-21 野怪悬停自定义预览回调 ─────────────────────────────────────────
+
+    private static void GetPveEncounterLevelPostfix(object __instance, ref int __result)
+    {
+        try
+        {
+            if (__instance == null) return;
+            if (LocalizationOverlayModule.TryExtractCardMetadata(__instance, out var ov, out _)
+                && ov?.MonsterPreview != null && ov.MonsterPreview.Level > 0)
+            {
+                __result = ov.MonsterPreview.Level;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(GetPveEncounterLevelPostfix), ex);
+        }
+    }
+
+    private static void MonsterRewardRendererRenderPostfix(object __instance, object __0)
+    {
+        try
+        {
+            if (__instance == null || __0 == null) return;
+            if (!LocalizationOverlayModule.TryExtractCardMetadata(__0, out var ov, out _)
+                || ov?.MonsterPreview == null)
+            {
+                return;
+            }
+
+            var mp = ov.MonsterPreview;
+            object view = _monsterRewardViewField?.GetValue(__instance);
+            if (view == null) return;
+
+            int effLevel = mp.Level > 0 ? mp.Level : Math.Max(1, mp.Day);
+            int effDay = mp.Day > 0 ? mp.Day : 1;
+
+            // 反编译对齐：MonsterRewardView.Init(string gold, string xp, string level, string day) + ShowAll(true)
+            var initM = AccessTools.Method(view.GetType(), "Init", new[] { typeof(string), typeof(string), typeof(string), typeof(string) });
+            if (initM != null)
+            {
+                initM.Invoke(view, new object[]
+                {
+                    mp.RewardGold.ToString(),
+                    mp.RewardXp.ToString(),
+                    effLevel.ToString(),
+                    effDay.ToString(),
+                });
+                var showAllM = AccessTools.Method(view.GetType(), "ShowAll", new[] { typeof(bool) });
+                showAllM?.Invoke(view, new object[] { true });
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(MonsterRewardRendererRenderPostfix), ex);
+        }
+    }
+
+    private static bool MonsterBoardRendererBuildDisplayPrefix(object __instance, object __1)
+    {
+        try
+        {
+            if (__instance == null || __1 == null) return true;
+            if (!LocalizationOverlayModule.TryExtractCardMetadata(__1, out var ov, out _)
+                || ov?.MonsterPreview == null)
+            {
+                return true;
+            }
+
+            object view = _monsterBoardViewField?.GetValue(__instance);
+            if (view == null) return true;
+
+            var mp = ov.MonsterPreview;
+            var tItemType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Cards.Item.TCardInstanceItem");
+            var tSkillType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Cards.Skill.TCardInstanceSkill");
+            if (tItemType == null || tSkillType == null) return true;
+
+            // 先回收上次预览卡片，杜绝野怪悬停残留叠加
+            var handlePoolingM = AccessTools.Method(view.GetType(), "HandlePooling", Type.EmptyTypes);
+            handlePoolingM?.Invoke(view, null);
+
+            var itemListType = typeof(List<>).MakeGenericType(tItemType);
+            var skillListType = typeof(List<>).MakeGenericType(tSkillType);
+            if (Activator.CreateInstance(itemListType) is not IList itemsList
+                || Activator.CreateInstance(skillListType) is not IList skillsList)
+            {
+                return true;
+            }
+
+            // 1. 计算居中槽位宽度并构建 List<TCardInstanceItem>（SocketId 严格使用 EContainerSocketId 0..9）
+            var srcItems = mp.Items ?? Array.Empty<CardMonsterLoadoutItemInfo>();
+            var resolvedEntries = new List<(CardMonsterLoadoutItemInfo Entry, Guid WireGuid, int Width)>(srcItems.Length);
+            int totalSlots = 0;
+            for (int i = 0; i < srcItems.Length; i++)
+            {
+                var entry = srcItems[i];
+                if (entry == null) continue;
+                if (!TryResolveLoadoutWireGuid(entry, out Guid wireGuid)) continue;
+                int width = ResolveLoadoutItemWidth(entry, wireGuid);
+                resolvedEntries.Add((entry, wireGuid, width));
+                totalSlots += width;
+            }
+
+            int clampedTotal = Math.Min(10, totalSlots);
+            int cursor = Math.Max(0, (10 - clampedTotal) / 2);
+            var itemTplIdProp = tItemType.GetProperty("TemplateId", BindingFlags.Public | BindingFlags.Instance);
+            var itemTierProp = tItemType.GetProperty("Tier", BindingFlags.Public | BindingFlags.Instance);
+            var itemEnchProp = tItemType.GetProperty("EnchantmentType", BindingFlags.Public | BindingFlags.Instance)
+                ?? tItemType.GetProperty("Enchantment", BindingFlags.Public | BindingFlags.Instance);
+            var itemSocketProp = tItemType.GetProperty("SocketId", BindingFlags.Public | BindingFlags.Instance);
+
+            for (int i = 0; i < resolvedEntries.Count; i++)
+            {
+                var (entry, wireGuid, width) = resolvedEntries[i];
+                object itemInst = Activator.CreateInstance(tItemType);
+                if (itemInst == null) continue;
+
+                SafeSetProp(itemTplIdProp, itemInst, wireGuid);
+                if (!string.IsNullOrWhiteSpace(entry.Tier) && Enum.TryParse<ETier>(entry.Tier.Trim(), true, out var tierVal))
+                {
+                    SafeSetProp(itemTierProp, itemInst, tierVal);
+                }
+                if (!string.IsNullOrWhiteSpace(entry.Enchantment) && Enum.TryParse<EEnchantmentType>(entry.Enchantment.Trim(), true, out var enchVal))
+                {
+                    SafeSetProp(itemEnchProp, itemInst, enchVal);
+                }
+
+                int slotIdx = Math.Min(9, Math.Max(0, cursor));
+                AssignSocketIdProperty(itemSocketProp, itemInst, slotIdx);
+                cursor = Math.Min(10, cursor + width);
+
+                if (!string.IsNullOrWhiteSpace(entry.CardId))
+                {
+                    PreviewContextMap.AddOrUpdate(itemInst, new PreviewCardContext(entry.CardId, wireGuid.ToString(), ov.ModId));
+                }
+                itemsList.Add(itemInst);
+            }
+
+            // 2. 构建 List<TCardInstanceSkill>
+            var srcSkills = mp.Skills ?? Array.Empty<CardMonsterLoadoutItemInfo>();
+            var skillTplIdProp = tSkillType.GetProperty("TemplateId", BindingFlags.Public | BindingFlags.Instance);
+            var skillTierProp = tSkillType.GetProperty("Tier", BindingFlags.Public | BindingFlags.Instance);
+            for (int i = 0; i < srcSkills.Length; i++)
+            {
+                var entry = srcSkills[i];
+                if (entry == null) continue;
+                if (!TryResolveLoadoutWireGuid(entry, out Guid wireGuid)) continue;
+
+                object skillInst = Activator.CreateInstance(tSkillType);
+                if (skillInst == null) continue;
+
+                SafeSetProp(skillTplIdProp, skillInst, wireGuid);
+                if (!string.IsNullOrWhiteSpace(entry.Tier) && Enum.TryParse<ETier>(entry.Tier.Trim(), true, out var tierVal))
+                {
+                    SafeSetProp(skillTierProp, skillInst, tierVal);
+                }
+                if (!string.IsNullOrWhiteSpace(entry.CardId))
+                {
+                    PreviewContextMap.AddOrUpdate(skillInst, new PreviewCardContext(entry.CardId, wireGuid.ToString(), ov.ModId));
+                }
+                skillsList.Add(skillInst);
+            }
+
+            var handleBoardStateM = AccessTools.Method(view.GetType(), "HandleBoardState");
+            if (handleBoardStateM == null) return true;
+
+            handleBoardStateM.Invoke(view, new object[] { itemsList, skillsList, mp.HealthMax });
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(MonsterBoardRendererBuildDisplayPrefix), ex);
+            return true;
+        }
+    }
+
+    private static bool TryResolveLoadoutWireGuid(CardMonsterLoadoutItemInfo entry, out Guid wireGuid)
+    {
+        wireGuid = Guid.Empty;
+        if (entry == null) return false;
+        if (!string.IsNullOrWhiteSpace(entry.WireTemplateId) && Guid.TryParse(entry.WireTemplateId.Trim(), out wireGuid) && wireGuid != Guid.Empty)
+            return true;
+        if (!string.IsNullOrWhiteSpace(entry.CardId) && Guid.TryParse(entry.CardId.Trim(), out wireGuid) && wireGuid != Guid.Empty)
+            return true;
+        if (!string.IsNullOrWhiteSpace(entry.CardId) && Instance != null
+            && Instance.TryResolveWireTemplateIdForCustomCard(entry.CardId.Trim(), out string mapped)
+            && Guid.TryParse(mapped, out wireGuid) && wireGuid != Guid.Empty)
+            return true;
+        return false;
+    }
+
+    private static int ResolveLoadoutItemWidth(CardMonsterLoadoutItemInfo entry, Guid wireGuid)
+    {
+        // 双审备忘 #1：优先读取 monsterPreview.items[].size，缺失时回落静态模板 Size
+        if (!string.IsNullOrWhiteSpace(entry?.Size))
+        {
+            int fromEntry = MapCardSizeNameToSlotWidth(entry.Size);
+            if (fromEntry > 0) return fromEntry;
+        }
+        try
+        {
+            var staticMgr = _dataGetStaticMethod?.Invoke(null, null);
+            var getCardM = staticMgr?.GetType().GetMethod("GetCardById", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(Guid) }, null);
+            object tpl = getCardM?.Invoke(staticMgr, new object[] { wireGuid });
+            if (tpl != null)
+            {
+                var sizeProp = tpl.GetType().GetProperty("Size", BindingFlags.Public | BindingFlags.Instance);
+                string sizeName = sizeProp?.GetValue(tpl)?.ToString();
+                int fromTpl = MapCardSizeNameToSlotWidth(sizeName);
+                if (fromTpl > 0) return fromTpl;
+            }
+        }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L1185", diagEx); }
+        return 1;
+    }
+
+    private static int MapCardSizeNameToSlotWidth(string sizeName)
+    {
+        if (string.IsNullOrWhiteSpace(sizeName)) return 0;
+        string s = sizeName.Trim();
+        if (string.Equals(s, "Large", StringComparison.OrdinalIgnoreCase)) return 3;
+        if (string.Equals(s, "Medium", StringComparison.OrdinalIgnoreCase)) return 2;
+        if (string.Equals(s, "Small", StringComparison.OrdinalIgnoreCase)) return 1;
+        return 0;
+    }
+
+    private static void AssignSocketIdProperty(PropertyInfo prop, object target, int slotIdx)
+    {
+        if (prop == null || !prop.CanWrite || target == null) return;
+        try
+        {
+            Type pType = Nullable.GetUnderlyingType(prop.PropertyType) ?? prop.PropertyType;
+            if (pType == typeof(EContainerSocketId))
+            {
+                prop.SetValue(target, (EContainerSocketId)slotIdx);
+            }
+            else if (pType.IsEnum)
+            {
+                prop.SetValue(target, Enum.ToObject(pType, slotIdx));
+            }
+            else if (pType == typeof(int))
+            {
+                prop.SetValue(target, slotIdx);
+            }
+        }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L1218", diagEx); }
+    }
+
+    private static void SafeSetProp(PropertyInfo prop, object target, object value)
+    {
+        if (prop == null || !prop.CanWrite || target == null) return;
+        try { prop.SetValue(target, value); } catch { }
+    }
+
+    private static void MonsterBoardTooltipHandlePoolingPrefix(object __instance)
+    {
+        try
+        {
+            if (__instance == null) return;
+            CleanupPreviewCollection(_monsterBoardActiveCardsField?.GetValue(__instance) as IEnumerable);
+            CleanupPreviewCollection(_monsterBoardActiveSkillsField?.GetValue(__instance) as IEnumerable);
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(MonsterBoardTooltipHandlePoolingPrefix), ex);
+        }
+    }
+
+    private static void CleanupPreviewCollection(IEnumerable items)
+    {
+        if (items == null) return;
+        foreach (object obj in items)
+        {
+            if (obj is not Component comp || comp == null) continue;
+            var agent = comp.GetComponent<CardVisualOverrideAgent>();
+            if (agent != null)
+            {
+                agent.RestorePreviewVisualIfApplied(comp);
+                agent.ClearContext();
+            }
+            PreviewContextMap.Remove(comp);
+            object clientCard = _previewClientCardField?.GetValue(comp);
+            if (clientCard != null) PreviewContextMap.Remove(clientCard);
         }
     }
 
@@ -618,15 +1379,8 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             if (__instance == null) return;
             var agent = __instance.GetComponent<CardVisualOverrideAgent>();
             if (agent == null) return;
+            if (agent.IsTypedSetupInFlight) return;
 
-            // 核心修复：ItemVisualsController.Setup(Card/ITCard) 是 async Task 方法，会先 await GetCardMaterial/GetEquippedCardBack
-            // 挂起后再异步续体调用本 Setup(Material) 重载。必须以实例级在途 Task 状态识别内部续体，严禁误调 ClearContext 清掉刚建立的自定义卡绑定！
-            if (agent.IsTypedSetupInFlight)
-            {
-                return;
-            }
-
-            // 仅当确实是外部直接调用 Setup(Material)（例如图鉴/卡背展示，或所属 ItemController 活体卡已变更）时才清空上下文
             object liveCard = ResolveLiveCardFromVisuals(__instance);
             if (liveCard != null && agent.HasContext && LiveCardMatchesAgent(__instance, agent))
             {
@@ -646,11 +1400,79 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         {
             if (__instance == null) return;
             var agent = __instance.GetComponent<CardVisualOverrideAgent>();
-            agent?.ClearContext();
+            if (agent != null)
+            {
+                Material mat = _itemMatInstanceField?.GetValue(__instance) as Material;
+                if (mat != null) agent.RestoreOriginalMaterialIfApplied(mat);
+                agent.ClearContext();
+            }
         }
         catch (Exception ex)
         {
             LogHookErrorThrottled(nameof(ItemVisualsCleanupPrefix), ex);
+        }
+    }
+
+    private static void CardControllerClearVisualProxyPrefix(Component __instance)
+    {
+        try
+        {
+            if (__instance == null) return;
+            var agents = __instance.GetComponentsInChildren<CardVisualOverrideAgent>(includeInactive: true);
+            if (agents == null) return;
+            for (int i = 0; i < agents.Length; i++)
+            {
+                var ag = agents[i];
+                if (ag == null) continue;
+                if (ag.HostController != null && _itemVisualsControllerType != null && _itemVisualsControllerType.IsInstanceOfType(ag.HostController))
+                {
+                    Material mat = _itemMatInstanceField?.GetValue(ag.HostController) as Material;
+                    if (mat != null) ag.RestoreOriginalMaterialIfApplied(mat);
+                }
+                ag.ClearContext();
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(CardControllerClearVisualProxyPrefix), ex);
+        }
+    }
+
+    private static void BoardManagerHideRecapViewPrefix(object __instance, out bool __state)
+    {
+        __state = false;
+        try
+        {
+            if (__instance == null) return;
+            if (_boardManagerIsRecapOpenProp?.GetValue(__instance) is bool bp) __state = bp;
+            else if (_boardManagerIsRecapOpenField?.GetValue(__instance) is bool bf) __state = bf;
+        }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L1450", diagEx); }
+    }
+
+    private static void BoardManagerHideRecapViewPostfix(object __instance, bool __state)
+    {
+        try
+        {
+            if (!__state || __instance == null) return;
+            bool nowOpen = false;
+            if (_boardManagerIsRecapOpenProp?.GetValue(__instance) is bool bp) nowOpen = bp;
+            else if (_boardManagerIsRecapOpenField?.GetValue(__instance) is bool bf) nowOpen = bf;
+            if (nowOpen) return;
+
+            var agents = UnityEngine.Object.FindObjectsByType<CardVisualOverrideAgent>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+            if (agents == null) return;
+            for (int i = 0; i < agents.Length; i++)
+            {
+                var ag = agents[i];
+                if (ag == null || !ag.IsRecapPooledHost) continue;
+                ag.RestoreAllKnownSnapshots();
+                ag.ClearContext();
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(BoardManagerHideRecapViewPostfix), ex);
         }
     }
 
@@ -672,9 +1494,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     private static bool LiveCardMatchesAgent(Component visualsComp, CardVisualOverrideAgent agent)
     {
         if (visualsComp == null || agent == null || !agent.HasContext) return false;
-
-        // 第二道铁律防线：对照当前所属 ItemController.CardData（或 BoundCardObj）的实时 InstanceId/TemplateId，
-        // 哪怕对象池在极端路径下绕过 Setup(Card)，也绝不允许把旧自定义卡的 PNG 写入原版卡的新材质！
         object liveCard = ResolveLiveCardFromVisuals(visualsComp) ?? agent.BoundCardObj;
         if (liveCard == null) return true;
 
@@ -720,7 +1539,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             Material mat = _itemMatInstanceField?.GetValue(visualsComp) as Material;
             if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null)
             {
-                // 若当前卡不再命中任何自定义贴图绑定（例如禁用 Mod、切服或复用回原版借壳卡），无损还原该实例材质的原版贴图
                 if (mat != null)
                 {
                     agent.RestoreOriginalMaterialIfApplied(mat);
@@ -733,49 +1551,39 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             int matId = mat.GetInstanceID();
             if (agent.IsAlreadyAppliedTo(matId, binding.LocalImagePath)) return;
 
-            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, incomingLease =>
             {
-                if (entry == null || entry.Texture == null) return;
+                TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
                     if (visualsComp == null || agent == null || !agent.HasContext || agent.Epoch != capturedEpoch
                         || !LiveCardMatchesAgent(visualsComp, agent))
                     {
-                        CardTextureCache.Instance.Release(entry);
                         return;
                     }
 
                     Material currentMat = _itemMatInstanceField?.GetValue(visualsComp) as Material;
-                    if (currentMat == null)
-                    {
-                        CardTextureCache.Instance.Release(entry);
-                        return;
-                    }
+                    if (currentMat == null) return;
 
                     int curMatId = currentMat.GetInstanceID();
-                    if (agent.IsAlreadyAppliedTo(curMatId, binding.LocalImagePath))
-                    {
-                        CardTextureCache.Instance.Release(entry);
-                        return;
-                    }
+                    if (agent.IsAlreadyAppliedTo(curMatId, binding.LocalImagePath)) return;
 
-                    // 首次覆写该实例化材质前抓取原版贴图快照，确保随时可无损还原原版借壳物品贴图
                     agent.EnsureOriginalMaterialSnapshot(currentMat);
 
-                    if (CardTextureCache.Instance.ApplyTextureToUrpMaterial(currentMat, entry.Texture, binding.DisableParallaxPremium))
+                    if (CardTextureCache.Instance.ApplyTextureToUrpMaterial(currentMat, lease.Asset.Texture, binding.DisableParallaxPremium))
                     {
-                        agent.BindTextureEntry(entry);
+                        agent.TakePrimaryLease(ref lease);
                         agent.MarkApplied(curMatId, binding.LocalImagePath);
-                    }
-                    else
-                    {
-                        CardTextureCache.Instance.Release(entry);
                     }
                 }
                 catch (Exception ex)
                 {
-                    CardTextureCache.Instance.Release(entry);
                     LogHookErrorThrottled("TryApplyItemVisual.Callback", ex);
+                }
+                finally
+                {
+                    lease?.Dispose();
                 }
             });
         }
@@ -785,7 +1593,141 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
-    // ── 通路 2 回调：3D 技能圆牌 ────────────────────────────────────────────
+    // ── 通路 2 回调：3D 技能圆牌（P0-23 落盘瞬间拦截 + P0-29 Prefix 还原）─────
+
+    private static void SkillIconUpdaterMaterialPrefix(Component __instance, ref Texture __0)
+    {
+        try
+        {
+            if (__instance == null || Instance == null) return;
+
+            Component host = FindSkillHostForUpdater(__instance);
+            if (host == null) return;
+            var agent = host.GetComponent<CardVisualOverrideAgent>();
+            if (agent == null) return;
+
+            if (!_inModSkillIconApply)
+            {
+                agent.SaveOriginalSkillTexture(__instance, __0);
+            }
+
+            if (_inModSkillIconApply || !agent.HasContext || agent.LastQuery.Target != CardVisualTarget.SkillIcon)
+                return;
+
+            if (!Instance.TryResolveVisual(agent.LastQuery, out var binding) || binding == null)
+                return;
+
+            uint capturedEpoch = agent.Epoch;
+            Texture syncTex = null;
+            bool finishedSync = false;
+
+            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, incomingLease =>
+            {
+                TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
+                try
+                {
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (__instance == null || agent == null || !agent.HasContext || agent.Epoch != capturedEpoch) return;
+
+                    if (!finishedSync)
+                    {
+                        // 缓存已热命中：同步在落盘瞬间零延迟替换 ref Texture __0
+                        syncTex = lease.Asset.Texture;
+                        agent.TakePrimaryLease(ref lease);
+                    }
+                    else
+                    {
+                        // 异步加载完成回主线程：在防重入标记下补调 UpdateSkillIconMaterial
+                        agent.TakePrimaryLease(ref lease);
+                        ApplySkillIconToUpdaterSafe(__instance, lease.Asset.Texture);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogHookErrorThrottled("SkillIconUpdaterMaterialPrefix.Callback", ex);
+                }
+                finally
+                {
+                    lease?.Dispose();
+                }
+            });
+
+            finishedSync = true;
+            if (syncTex != null)
+            {
+                __0 = syncTex;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(SkillIconUpdaterMaterialPrefix), ex);
+        }
+    }
+
+    private static Component FindSkillHostForUpdater(Component updater)
+    {
+        if (updater == null) return null;
+        if (_skillControllerType != null)
+        {
+            var sc = updater.GetComponentInParent(_skillControllerType);
+            if (sc != null) return sc;
+        }
+        if (_skillProxyRendererType != null)
+        {
+            var sp = updater.GetComponentInParent(_skillProxyRendererType);
+            if (sp != null) return sp;
+        }
+        return updater.GetComponentInParent<CardVisualOverrideAgent>()?.HostController;
+    }
+
+    private static void ApplySkillIconToUpdaterSafe(Component updater, Texture tex)
+    {
+        if (updater == null || tex == null) return;
+        var m = _skillUpdaterMethodByType.GetOrAdd(
+            updater.GetType(),
+            static ut => ut.GetMethod("UpdateSkillIconMaterial", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(Texture) }, null));
+        if (m == null) return;
+
+        bool prev = _inModSkillIconApply;
+        _inModSkillIconApply = true;
+        try
+        {
+            m.Invoke(updater, new object[] { tex });
+        }
+        finally
+        {
+            _inModSkillIconApply = prev;
+        }
+    }
+
+    private static void SkillUpdateIconPostfix(Component __instance)
+    {
+        try
+        {
+            if (__instance == null) return;
+            var ag = __instance.GetComponent<CardVisualOverrideAgent>();
+            ag?.MarkBadgeDirty();
+        }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L1711", diagEx); }
+    }
+
+    private static void SkillControllerCleanupPrefix(Component __instance)
+    {
+        try
+        {
+            if (__instance == null) return;
+            var agent = __instance.GetComponent<CardVisualOverrideAgent>();
+            if (agent != null)
+            {
+                agent.RestoreOriginalSkillTextureIfApplied();
+                agent.ClearContext();
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(SkillControllerCleanupPrefix), ex);
+        }
+    }
 
     private static void SkillControllerSetupPostfix(Component __instance, object __1, Task __result)
     {
@@ -853,6 +1795,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             var query = agent.LastQuery;
             if (!Instance.TryResolveVisual(query, out var binding) || binding == null)
             {
+                agent.RestoreOriginalSkillTextureIfApplied();
                 if (triggerSyncIfMissing && !string.IsNullOrEmpty(query.InstanceId))
                 {
                     ModContentSyncClient.Instance?.NotifyUnboundInstanceSeen(query.InstanceId, query.TemplateId);
@@ -860,48 +1803,48 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 return;
             }
 
-            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, incomingLease =>
             {
-                if (entry == null || entry.Texture == null) return;
-                if (skillComp == null || agent == null || agent.Epoch != epoch)
-                {
-                    CardTextureCache.Instance.Release(entry);
-                    return;
-                }
-
+                TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (_skillUpdateIconMethod != null && _skillUpdateIconMethod.DeclaringType.IsInstanceOfType(skillComp))
-                    {
-                        _skillUpdateIconMethod.Invoke(skillComp, new object[] { entry.Texture });
-                        agent.BindTextureEntry(entry);
-                        return;
-                    }
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (skillComp == null || agent == null || agent.Epoch != epoch) return;
 
-                    // SkillProxyRenderer 兼容兜底：查找子组件 SkillIconUpdater
                     if (_skillIconUpdaterType != null)
                     {
                         var updater = skillComp.GetComponentInChildren(_skillIconUpdaterType, true);
                         if (updater != null)
                         {
-                            var m = _skillUpdaterMethodByType.GetOrAdd(
-                                updater.GetType(),
-                                static ut => ut.GetMethod("UpdateSkillIconMaterial", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(Texture) }, null));
-                            if (m != null)
-                            {
-                                m.Invoke(updater, new object[] { entry.Texture });
-                                agent.BindTextureEntry(entry);
-                                return;
-                            }
+                            ApplySkillIconToUpdaterSafe(updater, lease.Asset.Texture);
+                            agent.TakePrimaryLease(ref lease);
+                            return;
                         }
+                    }
+
+                    if (_skillUpdateIconMethod != null && _skillUpdateIconMethod.DeclaringType.IsInstanceOfType(skillComp))
+                    {
+                        bool prev = _inModSkillIconApply;
+                        _inModSkillIconApply = true;
+                        try
+                        {
+                            _skillUpdateIconMethod.Invoke(skillComp, new object[] { lease.Asset.Texture });
+                        }
+                        finally
+                        {
+                            _inModSkillIconApply = prev;
+                        }
+                        agent.TakePrimaryLease(ref lease);
                     }
                 }
                 catch (Exception ex)
                 {
                     LogHookErrorThrottled("TryApplySkillVisual.Callback", ex);
                 }
-
-                CardTextureCache.Instance.Release(entry);
+                finally
+                {
+                    lease?.Dispose();
+                }
             });
         }
         catch (Exception ex)
@@ -910,7 +1853,108 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
-    // ── 通路 3 回调：2D UI 预览 (物品/技能/遭遇) ─────────────────────────────
+    // ── 通路 3 回调：2D UI 预览（P0-26 4 参 SetUp 上下文穿透） ───────────────
+
+    private static void CardPreviewBaseSetUpPrefix(Component __instance, object __0, object __2, out PreviewCardContext __state)
+    {
+        __state = null;
+        try
+        {
+            PreviewCardContext ctx = null;
+            if (__2 != null && PreviewContextMap.TryGetValue(__2, out var fromInst))
+            {
+                ctx = fromInst;
+            }
+            else if (__2 != null)
+            {
+                var bag = GetCardPropBag(__2.GetType());
+                string iid = SafeGetPropertyValue(bag.InstanceId, __2)?.ToString();
+                string tplId = SafeGetPropertyValue(bag.TemplateId, __2)?.ToString() ?? ReadTemplateId(__0);
+                if (!string.IsNullOrEmpty(iid))
+                {
+                    if (LocalizationOverlayModule.Instance != null
+                        && LocalizationOverlayModule.Instance.TryResolveCardMetadata(iid, null, tplId, out var ov)
+                        && !string.IsNullOrWhiteSpace(ov?.CustomCardId))
+                    {
+                        ctx = new PreviewCardContext(ov.CustomCardId, tplId, ov.ModId);
+                    }
+                    else if (Instance != null && Instance.TryLookupCustomIdentity(iid, tplId, out string cid, out _))
+                    {
+                        ctx = new PreviewCardContext(cid, tplId, string.Empty);
+                    }
+                }
+            }
+
+            if (ctx != null)
+            {
+                __state = ctx;
+                _activePreviewSetupContext = ctx;
+                if (__instance != null) PreviewContextMap.AddOrUpdate(__instance, ctx);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(CardPreviewBaseSetUpPrefix), ex);
+        }
+    }
+
+    private static void CardPreviewBaseSetUpPostfix(Component __instance, object __2, PreviewCardContext __state, ref Task __result)
+    {
+        _activePreviewSetupContext = null;
+        try
+        {
+            if (__instance == null || __state == null) return;
+            PreviewContextMap.AddOrUpdate(__instance, __state);
+            object clientCard = _previewClientCardField?.GetValue(__instance);
+            if (clientCard != null)
+            {
+                PreviewContextMap.AddOrUpdate(clientCard, __state);
+            }
+
+            if (__result != null)
+            {
+                __result = ContinueApplyPreviewAfterSetUpAsync(__result, __instance, __state);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(CardPreviewBaseSetUpPostfix), ex);
+        }
+    }
+
+    private static async Task ContinueApplyPreviewAfterSetUpAsync(Task innerTask, Component previewComp, PreviewCardContext ctx)
+    {
+        if (innerTask != null)
+        {
+            await innerTask;
+        }
+        if (previewComp == null || ctx == null) return;
+        MainThreadDispatcher.Enqueue(() =>
+        {
+            if (previewComp == null || Instance == null) return;
+            PreviewContextMap.AddOrUpdate(previewComp, ctx);
+            object clientCard = _previewClientCardField?.GetValue(previewComp);
+            if (clientCard != null) PreviewContextMap.AddOrUpdate(clientCard, ctx);
+
+            var ag = GetOrAddAgent(previewComp);
+            ag.HostController = previewComp;
+            if (_previewItemType != null && _previewItemType.IsInstanceOfType(previewComp))
+            {
+                ag.SetContext(BuildQueryFromPreview(previewComp, CardVisualTarget.ItemArt));
+                TryApplyPreviewItemVisual(previewComp, ag, ag.Epoch, triggerSyncIfMissing: false);
+            }
+            else if (_previewSkillType != null && _previewSkillType.IsInstanceOfType(previewComp))
+            {
+                ag.SetContext(BuildQueryFromPreview(previewComp, CardVisualTarget.SkillIcon));
+                TryApplyPreviewSkillVisual(previewComp, ag, ag.Epoch, triggerSyncIfMissing: false);
+            }
+            else if (_previewEncounterType != null && _previewEncounterType.IsInstanceOfType(previewComp))
+            {
+                ag.SetContext(BuildQueryFromPreview(previewComp, CardVisualTarget.EncounterPortrait));
+                TryApplyPreviewEncounterVisual(previewComp, ag, ag.Epoch, triggerSyncIfMissing: false);
+            }
+        });
+    }
 
     private static void CardPreviewItemPrefix(Component __instance)
     {
@@ -962,6 +2006,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             var query = agent.LastQuery;
             if (!Instance.TryResolveVisual(query, out var binding) || binding == null)
             {
+                agent.RestorePreviewVisualIfApplied(previewComp);
                 if (triggerSyncIfMissing && !string.IsNullOrEmpty(query.InstanceId))
                 {
                     ModContentSyncClient.Instance?.NotifyUnboundInstanceSeen(query.InstanceId, query.TemplateId);
@@ -969,38 +2014,41 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 return;
             }
 
-            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, incomingLease =>
             {
-                if (entry == null || entry.Texture == null) return;
+                TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (previewComp == null || agent == null || agent.Epoch != epoch)
-                    {
-                        CardTextureCache.Instance.Release(entry);
-                        return;
-                    }
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (previewComp == null || agent == null || agent.Epoch != epoch) return;
 
                     Material mat = _previewItemMaterialField?.GetValue(previewComp) as Material;
-                    if (mat != null && CardTextureCache.Instance.ApplyTextureToUrpMaterial(mat, entry.Texture, binding.DisableParallaxPremium))
+                    if (mat != null)
                     {
-                        agent.BindTextureEntry(entry);
-                        return;
+                        agent.EnsureOriginalMaterialSnapshot(mat);
+                        if (CardTextureCache.Instance.ApplyTextureToUrpMaterial(mat, lease.Asset.Texture, binding.DisableParallaxPremium))
+                        {
+                            agent.TakePrimaryLease(ref lease);
+                            return;
+                        }
                     }
 
                     RawImage rawImg = _previewCardImageField?.GetValue(previewComp) as RawImage;
                     if (rawImg != null)
                     {
-                        rawImg.texture = entry.Texture;
-                        agent.BindTextureEntry(entry);
-                        return;
+                        agent.EnsureOriginalPreviewRawImage(rawImg);
+                        rawImg.texture = lease.Asset.Texture;
+                        agent.TakePrimaryLease(ref lease);
                     }
                 }
                 catch (Exception ex)
                 {
                     LogHookErrorThrottled("TryApplyPreviewItemVisual.Callback", ex);
                 }
-
-                CardTextureCache.Instance.Release(entry);
+                finally
+                {
+                    lease?.Dispose();
+                }
             });
         }
         catch (Exception ex)
@@ -1059,6 +2107,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             var query = agent.LastQuery;
             if (!Instance.TryResolveVisual(query, out var binding) || binding == null)
             {
+                agent.RestorePreviewVisualIfApplied(previewComp);
                 if (triggerSyncIfMissing && !string.IsNullOrEmpty(query.InstanceId))
                 {
                     ModContentSyncClient.Instance?.NotifyUnboundInstanceSeen(query.InstanceId, query.TemplateId);
@@ -1066,31 +2115,30 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 return;
             }
 
-            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, incomingLease =>
             {
-                if (entry == null || entry.Texture == null) return;
+                TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (previewComp == null || agent == null || agent.Epoch != epoch)
-                    {
-                        CardTextureCache.Instance.Release(entry);
-                        return;
-                    }
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (previewComp == null || agent == null || agent.Epoch != epoch) return;
 
                     RawImage rawImg = _previewCardImageField?.GetValue(previewComp) as RawImage;
                     if (rawImg != null)
                     {
-                        rawImg.texture = entry.Texture;
-                        agent.BindTextureEntry(entry);
-                        return;
+                        agent.EnsureOriginalPreviewRawImage(rawImg);
+                        rawImg.texture = lease.Asset.Texture;
+                        agent.TakePrimaryLease(ref lease);
                     }
                 }
                 catch (Exception ex)
                 {
                     LogHookErrorThrottled("TryApplyPreviewSkillVisual.Callback", ex);
                 }
-
-                CardTextureCache.Instance.Release(entry);
+                finally
+                {
+                    lease?.Dispose();
+                }
             });
         }
         catch (Exception ex)
@@ -1149,6 +2197,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             var query = agent.LastQuery;
             if (!Instance.TryResolveVisual(query, out var binding) || binding == null)
             {
+                agent.RestorePreviewVisualIfApplied(previewComp);
                 if (triggerSyncIfMissing && !string.IsNullOrEmpty(query.InstanceId))
                 {
                     ModContentSyncClient.Instance?.NotifyUnboundInstanceSeen(query.InstanceId, query.TemplateId);
@@ -1156,33 +2205,32 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 return;
             }
 
-            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, entry =>
+            CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, incomingLease =>
             {
-                if (entry == null || entry.Texture == null) return;
+                TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                 try
                 {
-                    if (previewComp == null || agent == null || agent.Epoch != epoch)
-                    {
-                        CardTextureCache.Instance.Release(entry);
-                        return;
-                    }
+                    if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                    if (previewComp == null || agent == null || agent.Epoch != epoch) return;
 
                     Image portraitImg = _previewEncounterPortraitField?.GetValue(previewComp) as Image;
-                    Sprite sp = CardTextureCache.Instance.GetOrCreateSpriteOnMain(entry);
+                    Sprite sp = CardTextureCache.Instance.GetOrCreateSpriteOnMain(lease);
                     if (portraitImg != null && sp != null)
                     {
+                        agent.EnsureOriginalPreviewImage(portraitImg);
                         portraitImg.sprite = sp;
                         portraitImg.enabled = true;
-                        agent.BindTextureEntry(entry);
-                        return;
+                        agent.TakePrimaryLease(ref lease);
                     }
                 }
                 catch (Exception ex)
                 {
                     LogHookErrorThrottled("TryApplyPreviewEncounterVisual.Callback", ex);
                 }
-
-                CardTextureCache.Instance.Release(entry);
+                finally
+                {
+                    lease?.Dispose();
+                }
             });
         }
         catch (Exception ex)
@@ -1191,30 +2239,72 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
-    // ── 通路 4 回调：遭遇卡与战斗立绘 ────────────────────────────────────────
+    // ── 通路 4 回调：遭遇卡与战斗立绘（P0-24 + D4-P1-8 MPB + P0-29 Prefix）──
 
     private static void EncounterControllerSetupPostfix(Component __instance, object __0, Task __result)
     {
         try
         {
             if (__instance == null || __0 == null || Instance == null) return;
-            var agent = GetOrAddAgent(__instance);
-            agent.HostController = __instance;
-            agent.BoundCardObj = __0;
-            var portraitQuery = BuildQueryFromCard(__0, CardVisualTarget.EncounterPortrait);
-            agent.SetContext(portraitQuery);
-            uint epoch = agent.Epoch;
-
-            void ApplyAction() => TryApplyEncounterVisual(__instance, agent, epoch, triggerSyncIfMissing: true);
-
-            if (__result != null && !__result.IsCompleted)
-                _ = __result.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
-            else
-                ApplyAction();
+            ScheduleEncounterVisual(__instance, __0, __result);
         }
         catch (Exception ex)
         {
             LogHookErrorThrottled(nameof(EncounterControllerSetupPostfix), ex);
+        }
+    }
+
+    private static void EncounterControllerSetupEncounterPostfix(Component __instance, Task __result)
+    {
+        try
+        {
+            if (__instance == null || Instance == null) return;
+            object cardObj = _encounterCardDataProp?.GetValue(__instance)
+                ?? __instance.GetComponent<CardVisualOverrideAgent>()?.BoundCardObj;
+            if (cardObj == null) return;
+            ScheduleEncounterVisual(__instance, cardObj, __result);
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(EncounterControllerSetupEncounterPostfix), ex);
+        }
+    }
+
+    private static void ScheduleEncounterVisual(Component encComp, object cardObj, Task pendingTask)
+    {
+        var agent = GetOrAddAgent(encComp);
+        agent.HostController = encComp;
+        agent.BoundCardObj = cardObj;
+        var portraitQuery = BuildQueryFromCard(cardObj, CardVisualTarget.EncounterPortrait);
+        if (!agent.HasContext || !agent.MatchesQuery(in portraitQuery))
+        {
+            agent.SetContext(portraitQuery);
+        }
+        uint epoch = agent.Epoch;
+
+        void ApplyAction() => TryApplyEncounterVisual(encComp, agent, epoch, triggerSyncIfMissing: true);
+
+        if (pendingTask != null && !pendingTask.IsCompleted)
+            _ = pendingTask.ContinueWith(_ => MainThreadDispatcher.Enqueue(ApplyAction), TaskScheduler.Default);
+        else
+            ApplyAction();
+    }
+
+    private static void EncounterControllerCleanupPrefix(Component __instance)
+    {
+        try
+        {
+            if (__instance == null) return;
+            var agent = __instance.GetComponent<CardVisualOverrideAgent>();
+            if (agent != null)
+            {
+                agent.RestoreOriginalEncounterVisuals(__instance);
+                agent.ClearContext();
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(EncounterControllerCleanupPrefix), ex);
         }
     }
 
@@ -1238,29 +2328,30 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             if (Instance.TryResolveVisual(portraitQuery, out var pBinding) && pBinding != null)
             {
                 matchedAny = true;
-                CardTextureCache.Instance.AcquireTextureAsync(pBinding.LocalImagePath, pBinding.ContentSha256, entry =>
+                CardTextureCache.Instance.AcquireTextureAsync(pBinding.LocalImagePath, pBinding.ContentSha256, incomingLease =>
                 {
-                    if (entry == null || entry.Texture == null) return;
+                    TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                     try
                     {
-                        if (encComp == null || agent == null || agent.Epoch != epoch)
-                        {
-                            CardTextureCache.Instance.Release(entry);
-                            return;
-                        }
+                        if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                        if (encComp == null || agent == null || agent.Epoch != epoch) return;
 
                         SpriteRenderer sr = _encounterPortraitRendererField?.GetValue(encComp) as SpriteRenderer;
-                        Sprite sp = CardTextureCache.Instance.GetOrCreateSpriteOnMain(entry);
+                        Sprite sp = CardTextureCache.Instance.GetOrCreateSpriteOnMain(lease);
                         if (sr != null && sp != null)
                         {
+                            GameObject animGo = _encounterAnimatedPortraitField?.GetValue(encComp) as GameObject;
+                            agent.EnsureOriginalEncounterPortraitSnapshot(sr, animGo);
+
                             sr.sprite = sp;
+                            // P0-24：确保静态立绘节点处于激活态，避免原版 Spine 激活分支曾将 portrait 隐藏导致不可见
+                            if (!sr.gameObject.activeSelf) sr.gameObject.SetActive(true);
                             sr.enabled = true;
-                            // 隐藏可能重叠穿帮的 Spine 动态骨骼立绘
-                            if (_encounterAnimatedPortraitField?.GetValue(encComp) is GameObject animGo && animGo != null)
+                            if (animGo != null)
                             {
                                 animGo.SetActive(false);
                             }
-                            agent.BindTextureEntry(entry);
+                            agent.TakePrimaryLease(ref lease);
                             return;
                         }
                     }
@@ -1268,53 +2359,55 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     {
                         LogHookErrorThrottled("TryApplyEncounterVisual.PortraitCallback", ex);
                     }
-
-                    CardTextureCache.Instance.Release(entry);
+                    finally
+                    {
+                        lease?.Dispose();
+                    }
                 });
             }
 
             if (Instance.TryResolveVisual(bgQuery, out var bgBinding) && bgBinding != null)
             {
                 matchedAny = true;
-                CardTextureCache.Instance.AcquireTextureAsync(bgBinding.LocalImagePath, bgBinding.ContentSha256, entry =>
+                CardTextureCache.Instance.AcquireTextureAsync(bgBinding.LocalImagePath, bgBinding.ContentSha256, incomingLease =>
                 {
-                    if (entry == null || entry.Texture == null) return;
+                    TextureLease<CardTextureCache.CacheEntry> lease = incomingLease;
                     try
                     {
-                        if (encComp == null || agent == null || agent.Epoch != epoch)
+                        if (lease == null || lease.Asset == null || lease.Asset.Texture == null) return;
+                        if (encComp == null || agent == null || agent.Epoch != epoch) return;
+
+                        // D4-P1-8：优先通过 MaterialPropertyBlock 写 backgroundRenderer，严禁访问 bgMr.material 触发隐式材质克隆显存泄漏！
+                        if (_encounterBackgroundRendererField?.GetValue(encComp) is Renderer bgRenderer && bgRenderer != null)
                         {
-                            CardTextureCache.Instance.Release(entry);
+                            var mpb = agent.GetOrCreateEncounterBgMpb();
+                            bgRenderer.GetPropertyBlock(mpb);
+                            mpb.SetTexture(BaseMapPropId, lease.Asset.Texture);
+                            mpb.SetTexture(MainTexPropId, lease.Asset.Texture);
+                            bgRenderer.SetPropertyBlock(mpb);
+                            agent.TrackEncounterBgRenderer(bgRenderer);
+                            agent.TakeSecondaryLease(ref lease);
                             return;
                         }
 
                         Material bgMat = _encounterInstancedBgMatField?.GetValue(encComp) as Material;
-                        if (bgMat == null && _encounterBackgroundRendererField?.GetValue(encComp) is MeshRenderer bgMr && bgMr != null)
-                        {
-                            bgMat = bgMr.material;
-                        }
                         if (bgMat != null)
                         {
-                            try
-                            {
-                                if (bgMat.HasProperty("_BaseMap")) bgMat.SetTexture("_BaseMap", entry.Texture);
-                                else bgMat.mainTexture = entry.Texture;
-                                agent.BindSecondaryTextureEntry(entry);
-                                return;
-                            }
-                            catch { }
+                            agent.EnsureOriginalMaterialSnapshot(bgMat);
+                            if (bgMat.HasProperty(BaseMapPropId)) bgMat.SetTexture(BaseMapPropId, lease.Asset.Texture);
+                            else bgMat.mainTexture = lease.Asset.Texture;
+                            agent.TakeSecondaryLease(ref lease);
+                            return;
                         }
+
                         if (_cardFrameUpdateBgMethod != null)
                         {
                             var frameComp = encComp.GetComponentInChildren(_cardFrameUpdateBgMethod.DeclaringType, true);
                             if (frameComp != null)
                             {
-                                try
-                                {
-                                    _cardFrameUpdateBgMethod.Invoke(frameComp, new object[] { entry.Texture });
-                                    agent.BindSecondaryTextureEntry(entry);
-                                    return;
-                                }
-                                catch { }
+                                _cardFrameUpdateBgMethod.Invoke(frameComp, new object[] { lease.Asset.Texture });
+                                agent.TakeSecondaryLease(ref lease);
+                                return;
                             }
                         }
                     }
@@ -1322,14 +2415,20 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     {
                         LogHookErrorThrottled("TryApplyEncounterVisual.BgCallback", ex);
                     }
-
-                    CardTextureCache.Instance.Release(entry);
+                    finally
+                    {
+                        lease?.Dispose();
+                    }
                 });
             }
 
-            if (!matchedAny && triggerSyncIfMissing && !string.IsNullOrEmpty(portraitQuery.InstanceId))
+            if (!matchedAny)
             {
-                ModContentSyncClient.Instance?.NotifyUnboundInstanceSeen(portraitQuery.InstanceId, portraitQuery.TemplateId);
+                agent.RestoreOriginalEncounterVisuals(encComp);
+                if (triggerSyncIfMissing && !string.IsNullOrEmpty(portraitQuery.InstanceId))
+                {
+                    ModContentSyncClient.Instance?.NotifyUnboundInstanceSeen(portraitQuery.InstanceId, portraitQuery.TemplateId);
+                }
             }
         }
         catch (Exception ex)
@@ -1338,7 +2437,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
-    // ── 辅助工具与防异步竞态代理组件（铁律四） ──────────────────────────────
+    // ── 辅助工具与防异步竞态代理组件 ─────────────────────────────────────────
 
     private static void LogHookErrorThrottled(string hookName, Exception ex)
     {
@@ -1358,6 +2457,8 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             Tier = t.GetProperty("Tier", BindingFlags.Public | BindingFlags.Instance),
             Enchantment = t.GetProperty("Enchantment", BindingFlags.Public | BindingFlags.Instance),
             Id = t.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance),
+            Owner = t.GetProperty("Owner", BindingFlags.Public | BindingFlags.Instance),
+            Size = t.GetProperty("Size", BindingFlags.Public | BindingFlags.Instance),
         });
     }
 
@@ -1378,7 +2479,9 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     private static CardVisualOverrideAgent GetOrAddAgent(Component host)
     {
         var existing = host.GetComponent<CardVisualOverrideAgent>();
-        return existing != null ? existing : host.gameObject.AddComponent<CardVisualOverrideAgent>();
+        var agent = existing != null ? existing : host.gameObject.AddComponent<CardVisualOverrideAgent>();
+        agent.ClassifyHostType(host);
+        return agent;
     }
 
     private static CardVisualQuery BuildQueryFromCard(object cardObj, CardVisualTarget target)
@@ -1387,6 +2490,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
 
         CardPropBag bag = GetCardPropBag(cardObj.GetType());
         string iid = SafeGetPropertyValue(bag.InstanceId, cardObj)?.ToString();
+        string customId = TryGetPreviewCustomCardId(cardObj);
         string tplId = SafeGetPropertyValue(bag.TemplateId, cardObj)?.ToString() ?? ReadTemplateId(cardObj);
         int tier = 0;
         try
@@ -1394,22 +2498,28 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             object tv = SafeGetPropertyValue(bag.Tier, cardObj);
             if (tv != null) tier = Convert.ToInt32(tv);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L2501", diagEx); }
         string ench = SafeGetPropertyValue(bag.Enchantment, cardObj)?.ToString();
 
-        return new CardVisualQuery(iid, null, tplId, tier, ench, target);
+        return new CardVisualQuery(iid, customId, tplId, tier, ench, target);
     }
 
     private static CardVisualQuery BuildQueryFromPreview(Component previewComp, CardVisualTarget target)
     {
+        string customId = TryGetPreviewCustomCardId(previewComp);
         object clientCard = _previewClientCardField?.GetValue(previewComp);
         if (clientCard != null)
         {
-            return BuildQueryFromCard(clientCard, target);
+            var q = BuildQueryFromCard(clientCard, target);
+            if (string.IsNullOrEmpty(q.CustomCardId) && !string.IsNullOrEmpty(customId))
+            {
+                return new CardVisualQuery(q.InstanceId, customId, q.TemplateId, q.Tier, q.Enchantment, q.Target);
+            }
+            return q;
         }
 
         object cardData = _previewCardDataField?.GetValue(previewComp);
-        return new CardVisualQuery(null, null, ReadTemplateId(cardData), 0, null, target);
+        return new CardVisualQuery(null, customId, ReadTemplateId(cardData), 0, null, target);
     }
 
     private static string ReadTemplateId(object obj)
@@ -1428,12 +2538,11 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
-    /// <summary>挂在对象池视图上的轻量版本号代理：防止池化复用后晚到的异步 PNG 回调污染新卡（铁律四），回收/销毁时彻底清零上下文与引用计数（铁律六），并托管原生 3D World-Space 通用自定义机制徽章。</summary>
     internal sealed class CardVisualOverrideAgent : MonoBehaviour
     {
         private uint _epoch;
-        private CardTextureCache.CacheEntry _primaryEntry;
-        private CardTextureCache.CacheEntry _secondaryEntry;
+        private readonly TextureLeaseSlot<CardTextureCache.CacheEntry> _primarySlot = new();
+        private readonly TextureLeaseSlot<CardTextureCache.CacheEntry> _secondarySlot = new();
         private int _lastAppliedMaterialId;
         private string _lastAppliedImagePath;
         private CardTextureCache.MaterialTextureSnapshot _originalMatSnapshot;
@@ -1441,14 +2550,57 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         private Task _pendingTypedSetupTask;
         private readonly CardMechanismBadgeView _badgeView = new();
 
+        // 管线 2（技能）快照
+        private Component _skillUpdaterRef;
+        private Texture _originalSkillTex;
+        private bool _hasOriginalSkillTex;
+
+        // 管线 3（2D 预览）快照
+        private RawImage _previewRawImageRef;
+        private Texture _originalPreviewRawTex;
+        private bool _hasOriginalPreviewRawTex;
+        private Image _previewImageRef;
+        private Sprite _originalPreviewSprite;
+        private bool _hasOriginalPreviewSprite;
+
+        // 管线 4（遭遇前景 + 背景 MPB）快照
+        private SpriteRenderer _encPortraitSr;
+        private Sprite _origEncSprite;
+        private bool _origEncGoActive;
+        private bool _origEncSrEnabled;
+        private GameObject _origEncAnimGo;
+        private bool _origEncAnimActive;
+        private bool _hasOrigEncPortrait;
+        private Renderer _encBgRenderer;
+        private MaterialPropertyBlock _encBgMpb;
+
         public uint Epoch => _epoch;
         public bool HasContext { get; private set; }
         public CardVisualQuery LastQuery { get; private set; }
         public Component HostController { get; set; }
         public object BoundCardObj { get; set; }
+        public bool IsRecapPooledHost { get; private set; }
+        public bool IsPreviewPooledHost { get; private set; }
 
         public bool IsTypedSetupInFlight =>
             _inTypedSetupSyncEntry || (_pendingTypedSetupTask != null && !_pendingTypedSetupTask.IsCompleted);
+
+        public void ClassifyHostType(Component host)
+        {
+            if (host == null) return;
+            if (_previewBaseType != null && _previewBaseType.IsInstanceOfType(host))
+            {
+                IsPreviewPooledHost = true;
+            }
+            if (_recapItemVisualControllerType != null
+                && (_recapItemVisualControllerType.IsInstanceOfType(host)
+                    || host.GetComponentInParent(_recapItemVisualControllerType) != null))
+            {
+                IsRecapPooledHost = true;
+            }
+        }
+
+        public void MarkBadgeDirty() => _badgeView.MarkDirty();
 
         public void BeginTypedSetup(in CardVisualQuery query)
         {
@@ -1505,6 +2657,144 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             ReleaseBoundEntries();
         }
 
+        public void SaveOriginalSkillTexture(Component updater, Texture origTex)
+        {
+            if (updater == null) return;
+            _skillUpdaterRef = updater;
+            _originalSkillTex = origTex;
+            _hasOriginalSkillTex = true;
+        }
+
+        public void RestoreOriginalSkillTextureIfApplied()
+        {
+            if (_hasOriginalSkillTex && _skillUpdaterRef != null && _originalSkillTex != null)
+            {
+                try { ApplySkillIconToUpdaterSafe(_skillUpdaterRef, _originalSkillTex); } catch { }
+            }
+            _hasOriginalSkillTex = false;
+            _originalSkillTex = null;
+            _skillUpdaterRef = null;
+            ReleaseBoundEntries();
+        }
+
+        public void EnsureOriginalPreviewRawImage(RawImage rawImg)
+        {
+            if (rawImg == null) return;
+            if (_hasOriginalPreviewRawTex && ReferenceEquals(_previewRawImageRef, rawImg)) return;
+            _previewRawImageRef = rawImg;
+            _originalPreviewRawTex = rawImg.texture;
+            _hasOriginalPreviewRawTex = true;
+        }
+
+        public void EnsureOriginalPreviewImage(Image img)
+        {
+            if (img == null) return;
+            if (_hasOriginalPreviewSprite && ReferenceEquals(_previewImageRef, img)) return;
+            _previewImageRef = img;
+            _originalPreviewSprite = img.sprite;
+            _hasOriginalPreviewSprite = true;
+        }
+
+        public void RestorePreviewVisualIfApplied(Component previewComp)
+        {
+            try
+            {
+                if (previewComp != null && _previewItemMaterialField != null
+                    && _previewItemMaterialField.GetValue(previewComp) is Material mat && mat != null)
+                {
+                    RestoreOriginalMaterialIfApplied(mat);
+                }
+                if (_hasOriginalPreviewRawTex && _previewRawImageRef != null)
+                {
+                    _previewRawImageRef.texture = _originalPreviewRawTex;
+                }
+                if (_hasOriginalPreviewSprite && _previewImageRef != null)
+                {
+                    _previewImageRef.sprite = _originalPreviewSprite;
+                }
+            }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L2716", diagEx); }
+            _hasOriginalPreviewRawTex = false;
+            _originalPreviewRawTex = null;
+            _previewRawImageRef = null;
+            _hasOriginalPreviewSprite = false;
+            _originalPreviewSprite = null;
+            _previewImageRef = null;
+            ReleaseBoundEntries();
+        }
+
+        public void EnsureOriginalEncounterPortraitSnapshot(SpriteRenderer sr, GameObject animGo)
+        {
+            if (sr == null || _hasOrigEncPortrait) return;
+            _encPortraitSr = sr;
+            _origEncSprite = sr.sprite;
+            _origEncGoActive = sr.gameObject.activeSelf;
+            _origEncSrEnabled = sr.enabled;
+            _origEncAnimGo = animGo;
+            _origEncAnimActive = animGo != null && animGo.activeSelf;
+            _hasOrigEncPortrait = true;
+        }
+
+        public MaterialPropertyBlock GetOrCreateEncounterBgMpb()
+        {
+            return _encBgMpb ??= new MaterialPropertyBlock();
+        }
+
+        public void TrackEncounterBgRenderer(Renderer r)
+        {
+            _encBgRenderer = r;
+        }
+
+        public void RestoreOriginalEncounterVisuals(Component encComp)
+        {
+            try
+            {
+                if (_hasOrigEncPortrait && _encPortraitSr != null)
+                {
+                    _encPortraitSr.sprite = _origEncSprite;
+                    _encPortraitSr.enabled = _origEncSrEnabled;
+                    _encPortraitSr.gameObject.SetActive(_origEncGoActive);
+                    if (_origEncAnimGo != null)
+                    {
+                        _origEncAnimGo.SetActive(_origEncAnimActive);
+                    }
+                }
+                if (_encBgRenderer != null)
+                {
+                    _encBgRenderer.SetPropertyBlock(null);
+                }
+                if (encComp != null && _encounterInstancedBgMatField?.GetValue(encComp) is Material bgMat && bgMat != null)
+                {
+                    RestoreOriginalMaterialIfApplied(bgMat);
+                }
+            }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L2771", diagEx); }
+            _hasOrigEncPortrait = false;
+            _encPortraitSr = null;
+            _origEncSprite = null;
+            _origEncAnimGo = null;
+            _encBgRenderer = null;
+            ReleaseBoundEntries();
+        }
+
+        public void RestoreAllKnownSnapshots()
+        {
+            if (HostController != null)
+            {
+                if (_itemVisualsControllerType != null && _itemVisualsControllerType.IsInstanceOfType(HostController))
+                {
+                    Material mat = _itemMatInstanceField?.GetValue(HostController) as Material;
+                    if (mat != null) RestoreOriginalMaterialIfApplied(mat);
+                }
+                if (IsPreviewPooledHost) RestorePreviewVisualIfApplied(HostController);
+                if (_encounterControllerType != null && _encounterControllerType.IsInstanceOfType(HostController))
+                {
+                    RestoreOriginalEncounterVisuals(HostController);
+                }
+            }
+            RestoreOriginalSkillTextureIfApplied();
+        }
+
         public void SetContext(in CardVisualQuery query)
         {
             _epoch++;
@@ -1513,11 +2803,14 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _lastAppliedMaterialId = 0;
             _lastAppliedImagePath = null;
             _originalMatSnapshot = null;
+            _hasOriginalSkillTex = false;
+            _hasOriginalPreviewRawTex = false;
+            _hasOriginalPreviewSprite = false;
+            _hasOrigEncPortrait = false;
             _badgeView.HideAndClear();
             ReleaseBoundEntries();
         }
 
-        /// <summary>对象池回收（Cleanup）或销毁时彻底清空全部旧卡上下文与自定义徽章，严禁跨卡污染。</summary>
         public void ClearContext()
         {
             _epoch++;
@@ -1529,29 +2822,39 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _lastAppliedMaterialId = 0;
             _lastAppliedImagePath = null;
             _originalMatSnapshot = null;
+            _hasOriginalSkillTex = false;
+            _originalSkillTex = null;
+            _skillUpdaterRef = null;
+            _hasOriginalPreviewRawTex = false;
+            _originalPreviewRawTex = null;
+            _previewRawImageRef = null;
+            _hasOriginalPreviewSprite = false;
+            _originalPreviewSprite = null;
+            _previewImageRef = null;
+            _hasOrigEncPortrait = false;
+            _encPortraitSr = null;
+            _origEncSprite = null;
+            _origEncAnimGo = null;
+            _encBgRenderer = null;
             _badgeView.HideAndClear();
             ReleaseBoundEntries();
         }
 
-        public void BindTextureEntry(CardTextureCache.CacheEntry entry)
+        public void TakePrimaryLease(ref TextureLease<CardTextureCache.CacheEntry> lease)
         {
-            if (ReferenceEquals(_primaryEntry, entry)) return;
-            CardTextureCache.Instance.Release(_primaryEntry);
-            _primaryEntry = entry;
+            _primarySlot.Take(ref lease);
         }
 
-        public void BindSecondaryTextureEntry(CardTextureCache.CacheEntry entry)
+        public void TakeSecondaryLease(ref TextureLease<CardTextureCache.CacheEntry> lease)
         {
-            if (ReferenceEquals(_secondaryEntry, entry)) return;
-            CardTextureCache.Instance.Release(_secondaryEntry);
-            _secondaryEntry = entry;
+            _secondarySlot.Take(ref lease);
         }
 
         private void LateUpdate()
         {
             try
             {
-                if (!HasContext || LastQuery.Target != CardVisualTarget.ItemArt || HostController == null)
+                if (!HasContext || HostController == null || IsPreviewPooledHost)
                 {
                     _badgeView.HideAndClear();
                     return;
@@ -1566,48 +2869,71 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     return;
                 }
 
-                // 优先从所属 ItemController.CardData 读取最新活体 Card，避免切场景/战斗切换导致旧引用失效
-                object liveCard = ResolveLiveCardFromVisuals(HostController) ?? BoundCardObj;
-                if (liveCard == null || !LiveCardMatchesAgent(HostController, this))
+                if (LastQuery.Target == CardVisualTarget.ItemArt
+                    && _itemVisualsControllerType != null && _itemVisualsControllerType.IsInstanceOfType(HostController))
+                {
+                    object liveCard = ResolveLiveCardFromVisuals(HostController) ?? BoundCardObj;
+                    if (liveCard == null || !LiveCardMatchesAgent(HostController, this))
+                    {
+                        _badgeView.HideAndClear();
+                        return;
+                    }
+
+                    bool backVisible = _itemBackVisibleField?.GetValue(HostController) is bool bv && bv;
+                    Renderer artR = _itemArtRendererField?.GetValue(HostController) as Renderer;
+                    Transform frameAnchor = _itemFrameAnchorField?.GetValue(HostController) as Transform;
+                    object itemCtrlObj = _itemControllerField?.GetValue(HostController);
+
+                    _badgeView.Sync(HostController, itemCtrlObj, artR, frameAnchor, backVisible, liveCard, ov.CounterDisplays);
+                }
+                else if (LastQuery.Target == CardVisualTarget.SkillIcon || LastQuery.Target == CardVisualTarget.EncounterPortrait)
+                {
+                    object liveCard = BoundCardObj;
+                    if (liveCard == null && _encounterControllerType != null && _encounterControllerType.IsInstanceOfType(HostController))
+                    {
+                        liveCard = _encounterCardDataProp?.GetValue(HostController);
+                    }
+                    if (liveCard == null)
+                    {
+                        _badgeView.HideAndClear();
+                        return;
+                    }
+
+                    Renderer boundsR = LastQuery.Target == CardVisualTarget.EncounterPortrait
+                        ? (_encounterPortraitRendererField?.GetValue(HostController) as Renderer)
+                        : null;
+                    _badgeView.SyncForAnyHost(HostController, boundsR, null, liveCard, ov.CounterDisplays);
+                }
+                else
                 {
                     _badgeView.HideAndClear();
-                    return;
                 }
-
-                bool backVisible = _itemBackVisibleField?.GetValue(HostController) is bool bv && bv;
-                Renderer artR = _itemArtRendererField?.GetValue(HostController) as Renderer;
-                Transform frameAnchor = _itemFrameAnchorField?.GetValue(HostController) as Transform;
-                object itemCtrlObj = _itemControllerField?.GetValue(HostController);
-
-                _badgeView.Sync(HostController, itemCtrlObj, artR, frameAnchor, backVisible, liveCard, ov.CounterDisplays);
             }
-            catch { }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L2912", diagEx); }
         }
 
         private void OnDisable()
         {
-            // 注意：切储物箱或进出战斗时 Unity 会临时禁用/启用卡牌物体，绝不可在 OnDisable 清空 BoundCardObj、HasContext 或释放贴图引用；
-            // 对象池回收由 ItemVisualsCleanupPrefix -> ClearContext() 精准清理，销毁由 OnDestroy() 清理。
+            // P0-29：仅针对池化 UI 宿主（RecapItemVisualController 与 CardPreviewBase）在 OnDisable 归还租约与隐藏徽章；
+            // 绝不在普通棋盘/仓库 CardController 上触发（切 Stash 会临时 SetActive(false)，过早清理会引起白块）！
+            if (IsPreviewPooledHost || IsRecapPooledHost)
+            {
+                RestoreAllKnownSnapshots();
+                ClearContext();
+            }
         }
 
         private void OnDestroy()
         {
             _badgeView.DestroyAll();
+            RestoreAllKnownSnapshots();
             ClearContext();
         }
 
         private void ReleaseBoundEntries()
         {
-            if (_primaryEntry != null)
-            {
-                CardTextureCache.Instance.Release(_primaryEntry);
-                _primaryEntry = null;
-            }
-            if (_secondaryEntry != null)
-            {
-                CardTextureCache.Instance.Release(_secondaryEntry);
-                _secondaryEntry = null;
-            }
+            _primarySlot.Clear();
+            _secondarySlot.Clear();
         }
     }
 

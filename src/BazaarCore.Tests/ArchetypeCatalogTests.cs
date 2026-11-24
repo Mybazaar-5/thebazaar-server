@@ -17,7 +17,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class ArchetypeCatalogTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
     private readonly ITestOutputHelper _output;
 
     public ArchetypeCatalogTests(ITestOutputHelper output)
@@ -119,14 +119,13 @@ public sealed class ArchetypeCatalogTests
     [Fact]
     public void ShouldMatchLatestProdCacheGameDataAndOfficialZhCnTranslations()
     {
-        var localLow = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "AppData", "LocalLow", "Tempo Storm", "The Bazaar", "prod", "cache");
-        var prodDbPath = Path.Combine(localLow, "GameData.db");
-        var zhDbPath = Path.Combine(localLow, "translations", "zh-CN.bytes");
+        var prodDbPath = TestInfrastructure.TestDataLocator.ResolveGameDataDbPath();
+        var zhDbPath = TestInfrastructure.TestDataLocator.ResolveZhCnPath();
 
-        Assert.True(File.Exists(prodDbPath), $"未找到本地 prod GameData.db: {prodDbPath}");
-        Assert.True(File.Exists(zhDbPath), $"未找到本地 zh-CN.bytes: {zhDbPath}");
+        Assert.True(File.Exists(prodDbPath), $"未找到权威 GameData.db: {prodDbPath}");
+        Assert.True(File.Exists(zhDbPath), $"未找到权威 zh-CN.bytes: {zhDbPath}");
+        Assert.False(TestInfrastructure.TestDataLocator.IsUnderSteamProdCache(prodDbPath));
+        Assert.False(TestInfrastructure.TestDataLocator.IsUnderSteamProdCache(zhDbPath));
 
         var zhMap = new Dictionary<string, string>(StringComparer.Ordinal);
         using (var zhConn = new SqliteConnection(new SqliteConnectionStringBuilder

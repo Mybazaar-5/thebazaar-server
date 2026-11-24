@@ -28,7 +28,7 @@ from typing import Any
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_LOCAL_DB = REPO_ROOT / "dist" / "data" / "GameData.db"
-FALLBACK_MAIN_DB = pathlib.Path(r"e:\thebazaar\dist\data\GameData.db")
+FALLBACK_MAIN_DB = pathlib.Path(r"./dist\data\GameData.db")
 DEFAULT_OUT_DIR = REPO_ROOT / "dist" / "data"
 
 # 各导出目标的定义：(SQLite 表名, 输出文件名, 包装方式, 排序SQL, manifest 键名)

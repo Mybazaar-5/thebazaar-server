@@ -14,7 +14,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V12WikiCombatMechanicsTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {

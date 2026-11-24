@@ -1,3 +1,6 @@
+using System.Collections.Concurrent;
+using System.Collections.Frozen;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -30,7 +33,9 @@ public sealed record DiscoveredModStatus(
     int CustomModeCount,
     int AssetCount,
     IReadOnlyList<ModValidationIssue> Issues,
-    int CardPatchCount = 0);
+    int CardPatchCount = 0,
+    int CustomMechanicCount = 0,
+    int CustomMutatorCount = 0);
 
 /// <summary>
 /// 服务端 Mod 热加载主机：
@@ -61,11 +66,12 @@ public sealed class ServerModHost
     private readonly string _stateFilePath;
 
     private CardPool? _boundCardPool;
-    private List<Data.MonsterTemplate>? _boundMonsters;
+    private MonsterPoolStore? _boundMonsterStore;
     private CommunityModStore? _communityStore;
     private readonly Dictionary<string, RunModContext> _runModContextCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, ModRegistry> _isolatedRegistryCache = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>单局或锦标赛房间专用的独立 Mod 运行上下文（不影响服务器全局默认池）。</summary>
+    /// <summary>单局或锦标赛房间专用的独立 Mod 运行上下文（不影响服务器全局默认池；P0-18/P0-22/P0-30 契约完整导出）。</summary>
     public sealed record RunModContext(
         string ContextKey,
         GameDataRepository Repository,
@@ -74,7 +80,70 @@ public sealed class ServerModHost
         CardArchetypeIndex ArchetypeIndex,
         IReadOnlyDictionary<string, CustomCardVisualBinding> VisualBindingsByCustomId,
         IReadOnlyList<string> ActiveModIds,
-        ModRegistry? IsolatedRegistry = null);
+        ModRegistry? IsolatedRegistry = null,
+        ModRuntimeContext? RuntimeContext = null,
+        string EffectiveModSetHash = "")
+    {
+        private readonly ConcurrentDictionary<string, CustomCardVisualBinding> _transientBindings = new(StringComparer.OrdinalIgnoreCase);
+        private int _visualBindingsRevision;
+
+        public IReadOnlyDictionary<string, MutatorMetadata> CustomMutatorsById =>
+            RuntimeContext?.EffectiveCustomMutatorsById ?? FrozenDictionary<string, MutatorMetadata>.Empty;
+
+        public IReadOnlyDictionary<string, CustomModeDefinition> CustomModesById =>
+            RuntimeContext?.EffectiveCustomModesById ?? FrozenDictionary<string, CustomModeDefinition>.Empty;
+
+        public int VisualBindingsRevision => Volatile.Read(ref _visualBindingsRevision);
+
+        public bool TryGetGameModeHook(string? modeId, out IGameModeHook? hook)
+        {
+            if (!string.IsNullOrWhiteSpace(modeId) && RuntimeContext?.ModeHooks != null
+                && RuntimeContext.ModeHooks.TryGetValue(modeId.Trim(), out var found))
+            {
+                hook = found;
+                return true;
+            }
+            hook = null;
+            return false;
+        }
+
+        public CustomMutatorRuleSummary ResolveMutatorRuleSummary(CustomRunRuleSet? rules)
+            => MutatorCatalog.ResolveRuleSummary(rules?.MutatorIds, CustomMutatorsById);
+
+        /// <summary>P0-19：供战中变形自定义卡回写临时视觉绑定并递增修订版本号。</summary>
+        public void RegisterTransientVisualBinding(CustomCardVisualBinding binding)
+        {
+            if (binding == null || string.IsNullOrWhiteSpace(binding.CustomTemplateId)) return;
+            _transientBindings[binding.CustomTemplateId.Trim()] = binding;
+            Interlocked.Increment(ref _visualBindingsRevision);
+        }
+
+        public bool TryResolveVisualBinding(string? customId, out CustomCardVisualBinding? binding, string? instanceId = null)
+        {
+            if (!string.IsNullOrWhiteSpace(customId))
+            {
+                string key = customId.Trim();
+                if (_transientBindings.TryGetValue(key, out var tb)
+                    || VisualBindingsByCustomId.TryGetValue(key, out tb))
+                {
+                    binding = string.IsNullOrWhiteSpace(instanceId) ? tb : tb.BindToInstance(instanceId);
+                    return true;
+                }
+            }
+            binding = null;
+            return false;
+        }
+
+        public IReadOnlyDictionary<string, CustomCardVisualBinding> GetMergedVisualCatalog()
+        {
+            if (_transientBindings.IsEmpty)
+                return VisualBindingsByCustomId;
+            var merged = new Dictionary<string, CustomCardVisualBinding>(VisualBindingsByCustomId, StringComparer.OrdinalIgnoreCase);
+            foreach (var (k, v) in _transientBindings)
+                merged[k] = v;
+            return merged;
+        }
+    }
 
     private Dictionary<string, bool> _enabledOverrides = new(StringComparer.OrdinalIgnoreCase);
     private volatile IReadOnlyList<ModPackage> _discoveredPackages = Array.Empty<ModPackage>();
@@ -98,7 +167,8 @@ public sealed class ServerModHost
 
         _validVisualWhitelist = validVisualWhitelist
             ?? new HashSet<string>(rawBaseRepo.CardsById.Keys, StringComparer.OrdinalIgnoreCase);
-        _registry = new ModRegistry(_baseRepoWithOverlay, _validVisualWhitelist);
+        // 仅主服务器全局注册表发布至静态 ModRuntimeHooks；按房隔离/校验沙盒一律使用 ModRegistry.CreateIsolated
+        _registry = new ModRegistry(_baseRepoWithOverlay, _validVisualWhitelist, publishGlobalRuntimeHooks: true);
 
         _modsRootDir = ResolveModsDirectory(dataRoot, modsRootOverride);
         _stateFilePath = Path.Combine(stateDir, "mods_state.json");
@@ -130,6 +200,7 @@ public sealed class ServerModHost
         {
             _communityStore = communityStore;
             _runModContextCache.Clear();
+            _isolatedRegistryCache.Clear();
         }
     }
 
@@ -139,16 +210,28 @@ public sealed class ServerModHost
         lock (_gate)
         {
             _runModContextCache.Clear();
+            _isolatedRegistryCache.Clear();
         }
     }
 
-    /// <summary>绑定运行期活动卡池与野怪池，每次 Mod 热重载/启停后自动无锁刷新。</summary>
+    /// <summary>绑定运行期活动卡池与不可变野怪池快照存储，每次 Mod 热重载/启停后原子切换快照。</summary>
+    public void BindPools(CardPool cardPool, MonsterPoolStore? monsterStore)
+    {
+        lock (_gate)
+        {
+            _boundCardPool = cardPool;
+            _boundMonsterStore = monsterStore;
+            SyncBoundPoolsLocked();
+        }
+    }
+
+    /// <summary>向后兼容重载：内部包装为不可变 <see cref="MonsterPoolStore"/>，绝不再对调用方传入的 List 执行就地 Clear/AddRange。</summary>
     public void BindPools(CardPool cardPool, List<Data.MonsterTemplate>? monsters = null)
     {
         lock (_gate)
         {
             _boundCardPool = cardPool;
-            _boundMonsters = monsters;
+            _boundMonsterStore = monsters != null ? new MonsterPoolStore(monsters) : null;
             SyncBoundPoolsLocked();
         }
     }
@@ -196,6 +279,7 @@ public sealed class ServerModHost
 
             // 5. 同步刷新运行期 CardPool 与野怪池，并清空按房隔离缓存
             _runModContextCache.Clear();
+            _isolatedRegistryCache.Clear();
             SyncBoundPoolsLocked();
 
             Console.WriteLine(
@@ -298,7 +382,9 @@ public sealed class ServerModHost
                     CustomModeCount: pkg.Modes.Count,
                     AssetCount: pkg.AssetsByLogicalPath.Count,
                     Issues: modIssues,
-                    CardPatchCount: pkg.Patches.Count));
+                    CardPatchCount: pkg.Patches.Count,
+                    CustomMechanicCount: pkg.Mechanics.Count,
+                    CustomMutatorCount: pkg.CustomMutators.Count));
             }
             return list;
         }
@@ -322,9 +408,9 @@ public sealed class ServerModHost
     }
 
     /// <summary>
-    /// 按单局或锦标赛房间选中的 Mod ID 列表解析独立运行上下文：
-    /// 未选用额外 Mod 时零开销直接复用全局默认池；选中额外社区/未默认启用的 Mod 时，
-    /// 合并全局已启用 Mod + 选中 Mod 构建隔离副本并按组合键缓存，绝不污染其他玩家的普通对局。
+    /// 按单局或锦标赛房间选中的 Mod ID 列表解析独立运行上下文（P0-18）：
+    /// 递归展开所有选中 Mod 的依赖闭包（兼容全局已启用 + 社区仓库 + 本地目录），
+    /// 统一交由隔离 <see cref="ModRegistry"/> 导出合并仓库、合并视觉绑定、合成词典、自定义词条/模式与运行时钩子，绝不污染全局。
     /// </summary>
     public RunModContext ResolveRunModContext(
         IReadOnlyList<string>? selectedModIds,
@@ -332,81 +418,28 @@ public sealed class ServerModHost
         List<Data.MonsterTemplate> defaultMonsters,
         CardArchetypeIndex defaultArchetypeIndex)
     {
-        if (selectedModIds == null || selectedModIds.Count == 0)
-        {
-            return new RunModContext(
-                ContextKey: "default",
-                Repository: ActiveRepository,
-                Pool: defaultPool,
-                Monsters: defaultMonsters,
-                ArchetypeIndex: defaultArchetypeIndex,
-                VisualBindingsByCustomId: VisualBindingsByCustomId,
-                ActiveModIds: _registry.LoadedPackages.Select(p => p.Manifest.Id).ToList(),
-                IsolatedRegistry: null);
-        }
-
         lock (_gate)
         {
-            var requested = new List<string>();
-            var seenReq = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string raw in selectedModIds)
-            {
-                if (string.IsNullOrWhiteSpace(raw)) continue;
-                string id = raw.Trim();
-                if (seenReq.Add(id)) requested.Add(id);
-            }
+            var isoRegistry = ResolveEffectiveRegistryLocked(selectedModIds, out string cacheKey, out bool isDefaultGlobal);
+            string effHash = ComputeEffectiveModSetHashFromPackages(isoRegistry.LoadedPackages);
 
-            var extraPackages = new List<ModPackage>();
-            var globalLoadedIds = new HashSet<string>(_registry.LoadedPackages.Select(p => p.Manifest.Id), StringComparer.OrdinalIgnoreCase);
-            foreach (string id in requested)
-            {
-                if (globalLoadedIds.Contains(id)) continue;
-                var pkg = _communityStore?.ResolvePackage(id) ?? FindDiscoveredPackage(id);
-                if (pkg != null)
-                    extraPackages.Add(pkg);
-            }
-
-            if (extraPackages.Count == 0)
+            if (isDefaultGlobal)
             {
                 return new RunModContext(
                     ContextKey: "default",
                     Repository: ActiveRepository,
                     Pool: defaultPool,
-                    Monsters: defaultMonsters,
+                    Monsters: _boundMonsterStore?.SnapshotList() ?? defaultMonsters,
                     ArchetypeIndex: defaultArchetypeIndex,
                     VisualBindingsByCustomId: VisualBindingsByCustomId,
                     ActiveModIds: _registry.LoadedPackages.Select(p => p.Manifest.Id).ToList(),
-                    IsolatedRegistry: null);
+                    IsolatedRegistry: null,
+                    RuntimeContext: _registry.RuntimeContext,
+                    EffectiveModSetHash: effHash);
             }
-
-            // 组合全部需加载的 Mod（全局已启用 + 房间/本局额外选中），按包哈希构建稳定缓存键
-            var combined = new List<ModPackage>(_registry.LoadedPackages.Count + extraPackages.Count);
-            var combinedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var gp in _registry.LoadedPackages)
-            {
-                if (combinedIds.Add(gp.Manifest.Id))
-                    combined.Add(gp);
-            }
-            foreach (var ep in extraPackages)
-            {
-                if (combinedIds.Add(ep.Manifest.Id))
-                    combined.Add(ep);
-            }
-
-            string cacheKey = ModSetHash + "|" + string.Join(",",
-                combined.OrderBy(p => p.Manifest.Id, StringComparer.OrdinalIgnoreCase)
-                        .Select(p => $"{p.Manifest.Id}:{p.PackageHash}"));
 
             if (_runModContextCache.TryGetValue(cacheKey, out var cached))
                 return cached;
-
-            var isoRegistry = new ModRegistry(_baseRepoWithOverlay, _validVisualWhitelist);
-            isoRegistry.LoadPackages(
-                combined,
-                sourceLabel: "room-isolated",
-                baseRepositoryOverride: _baseRepoWithOverlay,
-                validVisualWhitelistOverride: _validVisualWhitelist,
-                keepPreviousOnError: false);
 
             var isoRepo = isoRegistry.ActiveRepository;
             var isoPool = defaultPool.CreateIsolatedOverlay(isoRepo, isoRegistry.VisualBindingsByCustomId);
@@ -421,7 +454,9 @@ public sealed class ServerModHost
                 ArchetypeIndex: isoArchetypes,
                 VisualBindingsByCustomId: isoRegistry.VisualBindingsByCustomId,
                 ActiveModIds: isoRegistry.LoadedPackages.Select(p => p.Manifest.Id).ToList(),
-                IsolatedRegistry: isoRegistry);
+                IsolatedRegistry: isoRegistry,
+                RuntimeContext: isoRegistry.RuntimeContext,
+                EffectiveModSetHash: effHash);
 
             if (_runModContextCache.Count >= 16)
                 _runModContextCache.Clear();
@@ -430,30 +465,156 @@ public sealed class ServerModHost
         }
     }
 
-    /// <summary>收集指定对局内全部活跃实例对应的 Mod 自定义卡视觉与文本绑定（覆盖玩家卡牌、最近战斗的对手幽灵/锦标赛自定义卡牌以及房间额外社区 Mod）。</summary>
+    /// <summary>
+    /// P0-18：双作用域同构解析有效 ModRegistry（全局已启用 + 递归展开 selectedModIds 依赖闭包，按包哈希缓存隔离实例）。
+    /// </summary>
+    public ModRegistry ResolveEffectiveRegistryForMods(IReadOnlyList<string>? selectedModIds)
+    {
+        lock (_gate)
+        {
+            return ResolveEffectiveRegistryLocked(selectedModIds, out _, out _);
+        }
+    }
+
+    /// <summary>
+    /// P0-26：供观战端点与 /api/mods/active-bindings 使用的轻量只读 Mod 视图解析（零重建 CardPool/MonsterPool 开销，
+    /// 优先复用已缓存 <see cref="RunModContext"/> 的瞬态绑定与修订版本号）。
+    /// </summary>
+    public (ModRegistry Registry, GameDataRepository Repository, RunModContext? CachedContext, int TransientRevision, string EffectiveModSetHash) ResolveReadOnlyModView(
+        IReadOnlyList<string>? selectedModIds)
+    {
+        lock (_gate)
+        {
+            var isoRegistry = ResolveEffectiveRegistryLocked(selectedModIds, out string cacheKey, out bool isDefaultGlobal);
+            string effHash = ComputeEffectiveModSetHashFromPackages(isoRegistry.LoadedPackages);
+            RunModContext? cachedCtx = null;
+            if (!isDefaultGlobal)
+                _runModContextCache.TryGetValue(cacheKey, out cachedCtx);
+            int transientRev = cachedCtx?.VisualBindingsRevision ?? 0;
+            var repo = isDefaultGlobal ? ActiveRepository : isoRegistry.ActiveRepository;
+            return (isoRegistry, repo, cachedCtx, transientRev, effHash);
+        }
+    }
+
+    private ModRegistry ResolveEffectiveRegistryLocked(
+        IReadOnlyList<string>? selectedModIds,
+        out string cacheKey,
+        out bool isDefaultGlobal)
+    {
+        if (selectedModIds == null || selectedModIds.Count == 0)
+        {
+            cacheKey = "default";
+            isDefaultGlobal = true;
+            return _registry;
+        }
+
+        var closure = ResolveDependencyClosurePackagesLocked(selectedModIds);
+        var globalIds = new HashSet<string>(_registry.LoadedPackages.Select(p => p.Manifest.Id), StringComparer.OrdinalIgnoreCase);
+        bool hasAnyExtra = closure.Any(p => !globalIds.Contains(p.Manifest.Id));
+        if (!hasAnyExtra)
+        {
+            cacheKey = "default";
+            isDefaultGlobal = true;
+            return _registry;
+        }
+
+        isDefaultGlobal = false;
+        cacheKey = ModSetHash + "|" + string.Join(",",
+            closure.OrderBy(p => p.Manifest.Id, StringComparer.OrdinalIgnoreCase)
+                   .Select(p => $"{p.Manifest.Id}:{p.PackageHash}"));
+
+        if (_isolatedRegistryCache.TryGetValue(cacheKey, out var cachedIso))
+            return cachedIso;
+
+        // P0-17/P0-18：房间隔离注册表严禁触碰全局静态 ModRuntimeHooks，统一从隔离注册表导出绑定/词典/机制
+        var isoRegistry = ModRegistry.CreateIsolated(_baseRepoWithOverlay, _validVisualWhitelist);
+        isoRegistry.LoadPackages(
+            closure,
+            sourceLabel: "room-isolated",
+            baseRepositoryOverride: _baseRepoWithOverlay,
+            validVisualWhitelistOverride: _validVisualWhitelist,
+            keepPreviousOnError: false);
+
+        if (_isolatedRegistryCache.Count >= 16)
+            _isolatedRegistryCache.Clear();
+        _isolatedRegistryCache[cacheKey] = isoRegistry;
+        return isoRegistry;
+    }
+
+    private List<ModPackage> ResolveDependencyClosurePackagesLocked(IReadOnlyCollection<string>? selectedModIds)
+    {
+        var ordered = new List<ModPackage>();
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var visiting = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        ModPackage? ResolveSingle(string id)
+            => _communityStore?.ResolvePackage(id)
+               ?? FindDiscoveredPackage(id)
+               ?? _registry.LoadedPackages.FirstOrDefault(p => string.Equals(p.Manifest.Id, id, StringComparison.OrdinalIgnoreCase));
+
+        void Dfs(ModPackage pkg)
+        {
+            string pid = pkg.Manifest.Id.Trim();
+            if (visited.Contains(pid) || !visiting.Add(pid)) return;
+            if (pkg.Manifest.Dependencies is { Count: > 0 })
+            {
+                foreach (var depRaw in pkg.Manifest.Dependencies)
+                {
+                    if (string.IsNullOrWhiteSpace(depRaw)) continue;
+                    var depPkg = ResolveSingle(depRaw.Trim());
+                    if (depPkg != null) Dfs(depPkg);
+                }
+            }
+            visiting.Remove(pid);
+            if (visited.Add(pid))
+                ordered.Add(pkg);
+        }
+
+        // 先载入全局已启用基线
+        foreach (var gp in _registry.LoadedPackages)
+            Dfs(gp);
+
+        // 再递归展开本局/本房额外选中的 Mod 及其全部传递依赖
+        if (selectedModIds != null)
+        {
+            foreach (var raw in selectedModIds)
+            {
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                var pkg = ResolveSingle(raw.Trim());
+                if (pkg != null) Dfs(pkg);
+            }
+        }
+
+        return ordered;
+    }
+
+    /// <summary>
+    /// P0-18：统一从目标对局的有效隔离 ModRegistry（含递归依赖与两阶段 Patch 合并）收集实例级视觉绑定，
+    /// 并对每一条绑定（含社区 Mod 与全局 Mod）一律调用 BindToInstance(instanceId)！
+    /// </summary>
     public Dictionary<string, CustomCardVisualBinding> CollectActiveVisualBindings(RunState? run)
     {
         var result = new Dictionary<string, CustomCardVisualBinding>(StringComparer.Ordinal);
         if (run == null) return result;
 
-        var extraCatalog = CollectExtraVisualCatalogForRun(run);
+        var effRegistry = ResolveEffectiveRegistryForMods(run.CustomRules?.SelectedModIds);
         void TryAddInstanceBinding(string? instanceId, string? customId)
         {
             if (string.IsNullOrWhiteSpace(instanceId) || string.IsNullOrWhiteSpace(customId))
                 return;
-            if (_registry.TryResolveVisualBinding(customId, out var binding, instanceId) && binding != null)
+            if (effRegistry.TryResolveVisualBinding(customId, out var binding, instanceId) && binding != null)
             {
                 result[instanceId] = binding;
-            }
-            else if (extraCatalog != null && extraCatalog.TryGetValue(customId, out var extraBinding))
-            {
-                result[instanceId] = extraBinding;
             }
         }
 
         foreach (var entry in run.Cards.Values)
         {
-            TryAddInstanceBinding(entry.InstanceId, entry.CustomCardId);
+            // 对 Patch 原版卡（CustomCardId 为空但 TemplateId 被 Patch）同样支持解析视觉绑定
+            string lookupId = !string.IsNullOrWhiteSpace(entry.CustomCardId)
+                ? entry.CustomCardId!
+                : entry.TemplateId.ToString();
+            TryAddInstanceBinding(entry.InstanceId, lookupId);
         }
 
         if (run.ActiveCombatOpponentCustomCardIds.Count > 0)
@@ -461,46 +622,165 @@ public sealed class ServerModHost
             foreach (var (oppInstId, oppCustomId) in run.ActiveCombatOpponentCustomCardIds)
             {
                 if (!result.ContainsKey(oppInstId))
-                {
                     TryAddInstanceBinding(oppInstId, oppCustomId);
-                }
             }
         }
 
         return result;
     }
 
-    /// <summary>返回指定对局有效的全量自定义卡模板视觉目录（合并全局已启用 Mod + 本局/本房额外选中的社区 Mod）。</summary>
+    /// <summary>P0-18：返回指定对局有效的全量模板级视觉目录（统一从递归依赖后的隔离 ModRegistry 导出）。</summary>
     public IReadOnlyDictionary<string, CustomCardVisualBinding> GetVisualCatalogForRun(RunState? run)
-    {
-        var extra = CollectExtraVisualCatalogForRun(run);
-        if (extra == null || extra.Count == 0)
-            return _registry.VisualBindingsByCustomId;
+        => ResolveEffectiveRegistryForMods(run?.CustomRules?.SelectedModIds).VisualBindingsByCustomId;
 
-        var merged = new Dictionary<string, CustomCardVisualBinding>(_registry.VisualBindingsByCustomId, StringComparer.OrdinalIgnoreCase);
-        foreach (var (k, v) in extra)
-            merged[k] = v;
-        return merged;
-    }
-
-    private Dictionary<string, CustomCardVisualBinding>? CollectExtraVisualCatalogForRun(RunState? run)
-    {
-        var modIds = run?.CustomRules?.SelectedModIds;
-        if (modIds == null || modIds.Count == 0) return null;
-
-        Dictionary<string, CustomCardVisualBinding>? extra = null;
-        foreach (string id in modIds)
-        {
-            var pkg = _communityStore?.ResolvePackage(id) ?? FindDiscoveredPackage(id);
-            if (pkg == null || pkg.VisualBindingsByCustomId.Count == 0) continue;
-            extra ??= new Dictionary<string, CustomCardVisualBinding>(StringComparer.OrdinalIgnoreCase);
-            foreach (var (cid, binding) in pkg.VisualBindingsByCustomId)
-                extra[cid] = binding;
-        }
-        return extra;
-    }
+    /// <summary>P0-18：按指定选中 Mod 集导出同构合并后的四层本地化词典（递归展开依赖）。</summary>
+    public MergedLocalizationExport ExportMergedLocalizationForMods(IReadOnlyList<string>? selectedModIds)
+        => ResolveEffectiveRegistryForMods(selectedModIds).ExportMergedLocalization();
 
     public MergedLocalizationExport ExportMergedLocalization() => _registry.ExportMergedLocalization();
+
+    /// <summary>P0-22：返回全局 + 指定自选 Mod 的全部可用自定义突变词条。</summary>
+    public IReadOnlyList<MutatorMetadata> GetAllAvailableMutators(IReadOnlyList<string>? selectedModIds = null)
+    {
+        var reg = ResolveEffectiveRegistryForMods(selectedModIds);
+        return MutatorCatalog.GetAll(reg.CustomMutatorsById);
+    }
+
+    /// <summary>P0-22：根据规则或显式模式 ID 解析已注册的自定义游戏模式定义。</summary>
+    public CustomModeDefinition? ResolveActiveCustomMode(string? modeId, RunModContext? ctx = null)
+    {
+        if (string.IsNullOrWhiteSpace(modeId)) return null;
+        string clean = modeId.Trim();
+        if (ctx != null && ctx.CustomModesById.TryGetValue(clean, out var fromCtx))
+            return fromCtx;
+        return _registry.GetCustomMode(clean);
+    }
+
+    /// <summary>
+    /// P0-30 单一权威纯函数（便捷重载）：计算对局有效幽灵池分区键。
+    /// 标准无玩法 Mod 局返回 "standard"；纯玩法 Mod 返回 "mod:&lt;hash12&gt;"；自定义规则+玩法 Mod 返回 "mod:&lt;hash12&gt;+custom"。
+    /// </summary>
+    public static string ResolveEffectiveGhostPoolPartition(
+        IReadOnlyList<string>? selectedModIds,
+        bool isCustomRule,
+        ServerModHost? modHost)
+    {
+        string rulePart = isCustomRule ? "custom" : "standard";
+        string modHash12 = ComputeEffectiveModSetHash(selectedModIds, modHost);
+        if (string.IsNullOrEmpty(modHash12))
+            return rulePart;
+        return rulePart == "standard" ? $"mod:{modHash12}" : $"mod:{modHash12}+{rulePart}";
+    }
+
+    /// <summary>
+    /// P0-30 单一权威纯函数（完整重载）：统一结合 CustomRunRuleSet.ResolveGhostPoolPartition()、有效玩法 Mod 集哈希与局内自建卡标记。
+    /// </summary>
+    public static string ResolveEffectiveGhostPoolPartition(
+        CustomRunRuleSet? rules,
+        IReadOnlyList<string>? selectedModIds,
+        bool hasCustomCardInRun,
+        ServerModHost? modHost)
+    {
+        var effIds = selectedModIds ?? rules?.SelectedModIds;
+        string rulePart;
+        if (rules == null)
+        {
+            rulePart = "standard";
+        }
+        else if (rules.SelectedModIds is { Count: > 0 })
+        {
+            // P0-30 × P0-22：剥离 SelectedModIds 判定纯规则分区时必须保留单局隔离自定义突变词条，
+            // 避免「玩法 Mod + 该 Mod 自定义词条」被无参 CloneNormalized() 洗空词条而误判为 "standard" 混入 "mod:<hash12>"
+            IReadOnlyDictionary<string, MutatorMetadata>? effMutators = modHost != null
+                ? modHost.ResolveEffectiveRegistryForMods(effIds).CustomMutatorsById
+                : null;
+            var rulesWithoutMods = rules.CloneNormalized(effMutators, preserveUnregisteredMutators: true);
+            rulesWithoutMods.SelectedModIds.Clear();
+            rulePart = rulesWithoutMods.ResolveGhostPoolPartition();
+        }
+        else
+        {
+            rulePart = rules.ResolveGhostPoolPartition();
+        }
+        if (string.Equals(rulePart, "none", StringComparison.OrdinalIgnoreCase))
+            return "none";
+
+        string modHash12 = ComputeEffectiveModSetHash(effIds, modHost);
+        if (hasCustomCardInRun && string.IsNullOrEmpty(modHash12))
+            return "none";
+
+        if (string.IsNullOrEmpty(modHash12))
+            return rulePart;
+
+        return string.Equals(rulePart, "standard", StringComparison.OrdinalIgnoreCase)
+            ? $"mod:{modHash12}"
+            : $"mod:{modHash12}+{rulePart}";
+    }
+
+    /// <summary>
+    /// D3-P1-12 / P0-30：展开递归依赖闭包后，过滤出所有非 cosmetic-only 玩法 Mod，
+    /// 按 Mod ID 升序拼装 {id}@{version}#{packageHash} 求 SHA-256 取前 12 位小写 hex；纯原版或仅 cosmetic 返回空串 ""。
+    /// </summary>
+    public static string ComputeEffectiveModSetHash(
+        IReadOnlyList<string>? selectedModIds,
+        ServerModHost? modHost)
+    {
+        if (modHost == null)
+        {
+            if (selectedModIds == null || selectedModIds.Count == 0)
+                return string.Empty;
+            var fallbackIds = selectedModIds
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Select(s => s.Trim().ToLowerInvariant())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (fallbackIds.Length == 0) return string.Empty;
+            byte[] fbHash = SHA256.HashData(Encoding.UTF8.GetBytes("bazaar-modset-ids:" + string.Join("|", fallbackIds)));
+            return Convert.ToHexString(fbHash).ToLowerInvariant()[..12];
+        }
+
+        IReadOnlyList<ModPackage> effectivePackages;
+        lock (modHost._gate)
+        {
+            var isoReg = modHost.ResolveEffectiveRegistryLocked(selectedModIds, out _, out _);
+            effectivePackages = isoReg.LoadedPackages;
+        }
+        return ComputeEffectiveModSetHashFromPackages(effectivePackages);
+    }
+
+    private static bool IsGameplayAffectingPackage(ModPackage pkg)
+    {
+        if (pkg == null) return false;
+        bool hasGameplayContent = pkg.Cards.Count > 0 || pkg.Patches.Count > 0 || pkg.Events.Count > 0
+            || pkg.Monsters.Count > 0 || pkg.Modes.Count > 0 || pkg.CustomMutators.Count > 0 || pkg.Mechanics.Count > 0;
+        if (hasGameplayContent) return true;
+        return pkg.Manifest.ForcesGhostPoolIsolation;
+    }
+
+    private static string ComputeEffectiveModSetHashFromPackages(IReadOnlyList<ModPackage> packages)
+    {
+        if (packages == null || packages.Count == 0) return string.Empty;
+        var gameplayPkgs = packages
+            .Where(IsGameplayAffectingPackage)
+            .OrderBy(p => p.Manifest.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (gameplayPkgs.Count == 0) return string.Empty;
+
+        var sb = new StringBuilder(128);
+        for (int i = 0; i < gameplayPkgs.Count; i++)
+        {
+            var p = gameplayPkgs[i];
+            if (i > 0) sb.Append(';');
+            sb.Append(p.Manifest.Id.Trim().ToLowerInvariant())
+              .Append('@')
+              .Append(p.Manifest.Version.Trim())
+              .Append('#')
+              .Append(p.PackageHash ?? string.Empty);
+        }
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString()));
+        return Convert.ToHexString(hash).ToLowerInvariant()[..12];
+    }
 
     public bool TryResolveAssetBySha256(string? sha256, out ModAssetEntry? asset)
     {
@@ -527,11 +807,10 @@ public sealed class ServerModHost
         {
             _boundCardPool.ApplyRepositoryOverlay(_registry.ActiveRepository, _registry.VisualBindingsByCustomId);
         }
-        if (_boundMonsters != null)
+        if (_boundMonsterStore != null)
         {
             var refreshed = MonsterPool.FromRepository(_registry.ActiveRepository);
-            _boundMonsters.Clear();
-            _boundMonsters.AddRange(refreshed);
+            _boundMonsterStore.Replace(refreshed);
         }
     }
 
@@ -567,7 +846,7 @@ public sealed class ServerModHost
     }
 
     /// <summary>
-    /// 扫描已加载 Mod 包中 modes/*mutator*.json 形式的扩展词条文件（例如 bazaar-chronicles-sample/modes/custom_mutators.json）。
+    /// 汇总已加载 Mod 包中的全部自定义突变词条（P0-22 优先直接消费 ModLoader 解析进 ModPackage.CustomMutators 的完整定义，保留磁盘回退兼容）。
     /// </summary>
     private static IReadOnlyList<MutatorMetadata> ExtractModCustomMutators(IReadOnlyList<ModPackage> loadedPackages)
     {
@@ -576,6 +855,17 @@ public sealed class ServerModHost
 
         foreach (var pkg in loadedPackages)
         {
+            if (pkg.CustomMutators.Count > 0)
+            {
+                foreach (var m in pkg.CustomMutators)
+                {
+                    if (m != null && !string.IsNullOrWhiteSpace(m.Id) && seen.Add(m.Id.Trim()))
+                        list.Add(m);
+                }
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(pkg.RootDirectory)) continue;
             string modesDir = Path.Combine(pkg.RootDirectory, "modes");
             if (!Directory.Exists(modesDir)) continue;
 

@@ -19,13 +19,13 @@ internal static class TournamentPresetStore
         [JsonProperty("slotIndex")] public int SlotIndex { get; set; }
         [JsonProperty("name")] public string Name { get; set; } = "";
         [JsonProperty("updatedAtUtc")] public string UpdatedAtUtc { get; set; } = "";
-        [JsonProperty("rules")] public CustomGameplayUI.CustomRunRuleSet Rules { get; set; }
+        [JsonProperty("rules")] public CustomRunRuleSet Rules { get; set; }
     }
 
     internal sealed class StoreData
     {
         [JsonProperty("version")] public int Version { get; set; } = 1;
-        [JsonProperty("lastTournamentRules")] public CustomGameplayUI.CustomRunRuleSet LastTournamentRules { get; set; }
+        [JsonProperty("lastTournamentRules")] public CustomRunRuleSet LastTournamentRules { get; set; }
         [JsonProperty("lastUpdatedAtUtc")] public string LastUpdatedAtUtc { get; set; } = "";
         [JsonProperty("presets")] public List<PresetSlot> Presets { get; set; } = new();
     }
@@ -55,7 +55,7 @@ internal static class TournamentPresetStore
         }
     }
 
-    internal static CustomGameplayUI.CustomRunRuleSet GetLastTournamentRules()
+    internal static CustomRunRuleSet GetLastTournamentRules()
     {
         lock (_sync)
         {
@@ -67,7 +67,7 @@ internal static class TournamentPresetStore
         }
     }
 
-    internal static void SaveLastTournamentRules(CustomGameplayUI.CustomRunRuleSet rules)
+    internal static void SaveLastTournamentRules(CustomRunRuleSet rules)
     {
         lock (_sync)
         {
@@ -87,7 +87,7 @@ internal static class TournamentPresetStore
         }
     }
 
-    internal static StoreData SavePresetSlot(int slotIndex, string name, CustomGameplayUI.CustomRunRuleSet rules)
+    internal static StoreData SavePresetSlot(int slotIndex, string name, CustomRunRuleSet rules)
     {
         if (slotIndex < 0 || slotIndex >= SlotCount) throw new ArgumentOutOfRangeException(nameof(slotIndex));
         lock (_sync)
@@ -96,7 +96,7 @@ internal static class TournamentPresetStore
             var slot = _cached.Presets[slotIndex];
             string cleanName = string.IsNullOrWhiteSpace(name) ? $"预设方案 {slotIndex + 1}" : name.Trim();
             if (cleanName.Length > 24) cleanName = cleanName.Substring(0, 24);
-            var copy = (rules ?? new CustomGameplayUI.CustomRunRuleSet()).Clone();
+            var copy = (rules ?? new CustomRunRuleSet()).Clone();
             NormalizeTournamentFlags(copy);
             slot.Name = cleanName;
             slot.Rules = copy;
@@ -138,7 +138,7 @@ internal static class TournamentPresetStore
         }
     }
 
-    internal static CustomGameplayUI.CustomRunRuleSet LoadPresetSlotRules(int slotIndex)
+    internal static CustomRunRuleSet LoadPresetSlotRules(int slotIndex)
     {
         if (slotIndex < 0 || slotIndex >= SlotCount) return null;
         lock (_sync)
@@ -157,8 +157,8 @@ internal static class TournamentPresetStore
         lock (_sync)
         {
             EnsureLoadedLocked();
-            var def = new CustomGameplayUI.CustomRunRuleSet();
-            def.ResetToStandardValues(preserveArchetypeAndLobbyFlags: false);
+            var def = new CustomRunRuleSet();
+            def.ResetToDefaults();
             _cached.LastTournamentRules = def;
             _cached.LastUpdatedAtUtc = DateTime.UtcNow.ToString("O");
             SaveToDiskLocked();
@@ -273,12 +273,10 @@ internal static class TournamentPresetStore
         }
     }
 
-    private static void NormalizeTournamentFlags(CustomGameplayUI.CustomRunRuleSet rules)
+    private static void NormalizeTournamentFlags(CustomRunRuleSet rules)
     {
         if (rules == null) return;
-        rules.EnsureCollections();
-        rules.PlayerCap = rules.PlayerCap == 10 ? 10 : 8;
-        rules.RefreshPowerFlag();
+        rules.NormalizeBounds();
     }
 
     private static void SaveToDiskLocked()

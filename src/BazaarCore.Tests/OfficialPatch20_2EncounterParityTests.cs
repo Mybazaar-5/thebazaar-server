@@ -18,6 +18,7 @@ namespace BazaarCore.Tests;
 /// Patch 20.2（2026-11-20）全量官方事件天数窗、小时禁令、三槽位归属与 BazaarDB 21.3 万局实测权重综合验收测试。
 /// 对应落盘档案：docs/recon/OFFICIAL_EVENTS_SPAWN_ATLAS.md &amp; official_events_spawn_registry.json。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class OfficialPatch20_2EncounterParityTests
 {
     private readonly ITestOutputHelper _output;
@@ -33,27 +34,8 @@ public sealed class OfficialPatch20_2EncounterParityTests
 
     private static readonly Lazy<RealFx> Fx = new(() =>
     {
-        string? dataDir = null;
-        string dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            string cand = Path.Combine(dir, "dist", "data");
-            if (File.Exists(Path.Combine(cand, "GameData.db")))
-            {
-                dataDir = cand;
-                break;
-            }
-            dir = Directory.GetParent(dir)?.FullName!;
-        }
-        if (dataDir == null && File.Exists(@"e:\thebazaar\dist\data\GameData.db"))
-            dataDir = @"e:\thebazaar\dist\data";
-        Assert.NotNull(dataDir);
-
-        string dbPath = Path.Combine(dataDir!, "GameData.db");
-        var repo = GameDatabaseLoader.Load(dbPath, null);
-        var pool = CardPool.FromRepository(repo, dataDir);
-        var idx = CardArchetypeIndex.Build(pool, repo);
-        return new RealFx { Pool = pool, Repo = repo, ArchetypeIndex = idx };
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
+        return new RealFx { Pool = shared.Pool, Repo = shared.Repo, ArchetypeIndex = shared.ArchetypeIndex };
     });
 
     private static CardPool.CardTemplate FindByName(CardPool pool, string internalName, string? type = null)

@@ -27,6 +27,7 @@ namespace BazaarCore.Tests;
 /// 覆盖 P1-17(SpawnCount)、P2-04、P2-06(Consumes)、P2-07、P2-08、P2-11、P2-12、P2-14、
 /// P2-16、P2-18、P2-26、P2-27、P2-28、P2-29、P2-30、P2-31、P2-32、P2-33、P2-34、P2-35、P2-36、P2-38、P2-48。
 /// </summary>
+[Xunit.Collection("ShopEngineStaticState")]
 public sealed class AuditWave4ServerP2Tests
 {
     private const string CutlassItemId = "1b955b8d-0ea6-4437-935c-d588be5898c1";
@@ -38,24 +39,17 @@ public sealed class AuditWave4ServerP2Tests
     private const string ColtId = "816e6ba0-8f5f-412e-9756-8e1901dd9d49";
     private const string KevsArmoryId = "a4fa13f8-6beb-4b6c-839b-60af167628d9";
 
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
     private static readonly Lazy<List<BazaarServer.Data.MonsterTemplate>> Monsters =
-        new(() => MonsterPool.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.CreateMonstersCopy());
     private static readonly Lazy<LevelUpTable> LevelUps =
-        new(() => LevelUpTable.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.LevelUps);
     private static readonly Lazy<GameModeConfig> Mode =
-        new(() => GameModeConfig.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.Mode);
 
     private static string ResolveDataPath(string fileName)
-    {
-        for (string? dir = AppContext.BaseDirectory; dir != null; dir = Directory.GetParent(dir)?.FullName)
-        {
-            string candidate = Path.Combine(dir, "dist", "data", fileName);
-            if (File.Exists(candidate)) return candidate;
-        }
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static GameDataRepository CloneRepoWithOverrides(
         GameDataRepository baseRepo,

@@ -400,8 +400,14 @@ public sealed class UpdateSyncPage : UserControl
             ? $"{modCount} 个 Mod · {assetCount} 张资产"
             : (report.DegradedOffline ? "离线缓存" : "0 个 Mod");
 
-        _lblSyncSummary.Text = report.SummaryMessage;
-        _lblSyncSummary.ForeColor = report.DegradedOffline
+        string summaryText = report.SummaryMessage;
+        if (report.HubUpgradeRecommended && !string.IsNullOrWhiteSpace(report.RecommendedHubVersion))
+        {
+            string prefix = report.HubUpgradeRequired ? "【需升级启动器】" : "【发现新版 Hub】";
+            summaryText = $"{prefix}建议升级至 BazaarHub v{report.RecommendedHubVersion} ｜ {summaryText}";
+        }
+        _lblSyncSummary.Text = summaryText;
+        _lblSyncSummary.ForeColor = report.DegradedOffline || report.HubUpgradeRequired
             ? HubTheme.StatusYellow
             : (report.Success ? HubTheme.StatusGreen : HubTheme.StatusRed);
         _progressBar.Value = 100;
@@ -420,9 +426,11 @@ public sealed class UpdateSyncPage : UserControl
 
             Color actionColor = item.Action switch
             {
-                "已更新" or "已是最新" => HubTheme.StatusGreen,
+                "已更新" or "已是最新" or "已保留" => HubTheme.StatusGreen,
+                "已保护" => HubTheme.StatusBlue,
+                "已回滚" => HubTheme.StatusYellow,
                 "待更新" or "待下载" => HubTheme.GoldLight,
-                "失败" => HubTheme.StatusRed,
+                "失败" or "已拦截" => HubTheme.StatusRed,
                 _ => HubTheme.TextPrimary
             };
             _gridFiles.Rows[idx].Cells[4].Style.ForeColor = actionColor;

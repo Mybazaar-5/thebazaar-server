@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Microsoft.Data.Sqlite;
 using BazaarCore.Data;
 using BazaarServer.Accounts;
 using BazaarServer.Data;
@@ -127,7 +128,7 @@ var communityModStore = new CommunityModStore(modHost, stateDir);
 builder.Services.AddSingleton(modHost);
 builder.Services.AddSingleton(communityModStore);
 builder.Services.AddSingleton<WorkshopValidatorService>();
-builder.Services.AddSingleton<OverlayLocalizationStore>(sp => sp.GetRequiredService<ServerModHost>().ActiveLocalization);
+// 严格保留原始基座仓库注册（#118-3：不破坏历史依赖 BaseRepository 的服务；热重载派生视图统一经 ServerRuntimeSnapshotProvider 提供）
 builder.Services.AddSingleton<GameDataRepository>(modHost.BaseRepository);
 
 // 3. 全部池化视图直接基于单次共享的 ActiveRepository 派生（零重复 SQLite IO）
@@ -136,24 +137,32 @@ var cardPool = CardPool.FromRepository(
     dataRoot,
     validWhitelistOverride: validVisualWhitelist,
     visualBindings: modHost.VisualBindingsByCustomId);
-var monsterPool = MonsterPool.FromRepository(modHost.ActiveRepository);
-var levelUpTable = LevelUpTable.FromRepository(modHost.ActiveRepository);
-var gameModeConfig = GameModeConfig.FromRepository(modHost.ActiveRepository);
+var monsterPoolStore = new MonsterPoolStore(MonsterPool.FromRepository(modHost.ActiveRepository));
 var ghostPool = PvpGhostPool.Load(dataRoot);
-modHost.BindPools(cardPool, monsterPool);
+modHost.BindPools(cardPool, monsterPoolStore);
 
+// D2-P2-04 & D8-P2-06：统一按 ModSetHash 原子刷新 OverlayLocalizationStore / LevelUpTable / GameModeConfig / CardArchetypeIndex 与目录 DTO
+var runtimeSnapshots = new ServerRuntimeSnapshotProvider(modHost, cardPool);
+builder.Services.AddSingleton(runtimeSnapshots);
+builder.Services.AddTransient<OverlayLocalizationStore>(sp =>
+    sp.GetRequiredService<ServerRuntimeSnapshotProvider>().Current.Localization);
+builder.Services.AddTransient<LevelUpTable>(sp =>
+    sp.GetRequiredService<ServerRuntimeSnapshotProvider>().Current.LevelUpTable);
+builder.Services.AddTransient<GameModeConfig>(sp =>
+    sp.GetRequiredService<ServerRuntimeSnapshotProvider>().Current.GameModeConfig);
+builder.Services.AddTransient<CardArchetypeIndex>(sp =>
+    sp.GetRequiredService<ServerRuntimeSnapshotProvider>().Current.ArchetypeIndex);
+
+builder.Services.AddSingleton(AdminAccessGuard.Default);
 builder.Services.AddSingleton(cardPool);
-builder.Services.AddSingleton(monsterPool);
-builder.Services.AddSingleton(levelUpTable);
-builder.Services.AddSingleton(gameModeConfig);
+builder.Services.AddSingleton(monsterPoolStore);
+builder.Services.AddTransient<List<BazaarServer.Data.MonsterTemplate>>(sp =>
+    sp.GetRequiredService<MonsterPoolStore>().SnapshotList());
 builder.Services.AddSingleton(ghostPool);
-
-var archetypeIndex = CardArchetypeIndex.Build(cardPool, modHost.ActiveRepository);
-builder.Services.AddSingleton(archetypeIndex);
 
 Console.WriteLine(
     $"[CoreEngine] 单次共享加载完成：卡牌={modHost.ActiveRepository.CardsById.Count}（有效资产={cardPool.TotalCards}），" +
-    $"野怪={monsterPool.Count}，已启Mod={modHost.EnabledModCount}，词典条数={modHost.ActiveLocalization.EntryCount}，" +
+    $"野怪={monsterPoolStore.Count}，已启Mod={modHost.EnabledModCount}，词典条数={modHost.ActiveLocalization.EntryCount}，" +
     $"未知规则类型={modHost.ActiveRepository.UnknownRuleTypes.Count}");
 
 // 4. 注册沙盒实验室桥接实现（必须在 MultiplayerEndpointModule.RegisterServices 之前注册以覆盖默认 Null 实现！）
@@ -165,6 +174,17 @@ string bindHost = Environment.GetEnvironmentVariable("BAZAAR_BIND")?.Trim();
 if (string.IsNullOrEmpty(bindHost)) bindHost = "0.0.0.0";
 string port = Environment.GetEnvironmentVariable("BAZAAR_PORT") ?? "8080";
 builder.WebHost.UseUrls($"http://{bindHost}:{port}");
+
+bool isLoopbackBind = string.Equals(bindHost, "127.0.0.1", StringComparison.OrdinalIgnoreCase)
+    || string.Equals(bindHost, "localhost", StringComparison.OrdinalIgnoreCase)
+    || string.Equals(bindHost, "::1", StringComparison.OrdinalIgnoreCase);
+string workshopModeEnv = (Environment.GetEnvironmentVariable("BAZAAR_WORKSHOP_MODE") ?? "auto").Trim();
+if (!isLoopbackBind
+    && !AdminAccessGuard.Default.IsTokenConfigured
+    && !string.Equals(workshopModeEnv, "readonly", StringComparison.OrdinalIgnoreCase))
+{
+    Console.WriteLine("[Security][WARN] 服务正监听非回环地址且未配置 BAZAAR_WORKSHOP_TOKEN。公网部署请务必在 Nginx 透传 X-Forwarded-For/X-Real-IP 并配置 BAZAAR_WORKSHOP_MODE=token-only 与高熵 BAZAAR_WORKSHOP_TOKEN。");
+}
 
 var app = builder.Build();
 
@@ -202,24 +222,8 @@ sessionStore.SessionEvicted += evictedSession =>
     try { spectateRecorder?.ClearForAccount(evictedSession.AccountId); } catch { }
 };
 
-// 缓存流派与卡牌目录（随 ModSetHash 自动感知热重载失效重建）
-string cachedCatalogHash = "";
-object? cachedCatalogObj = null;
-object catalogSync = new();
-object GetCurrentCatalog()
-{
-    string curHash = modHost.ModSetHash;
-    lock (catalogSync)
-    {
-        if (cachedCatalogObj != null && string.Equals(cachedCatalogHash, curHash, StringComparison.Ordinal))
-            return cachedCatalogObj;
-        var activeRepo = modHost.ActiveRepository;
-        var freshIndex = CardArchetypeIndex.Build(cardPool, activeRepo);
-        cachedCatalogObj = freshIndex.ToCatalogDto(cardPool, activeRepo);
-        cachedCatalogHash = curHash;
-        return cachedCatalogObj;
-    }
-}
+// 统一复用 ServerRuntimeSnapshotProvider 随 ModSetHash 原子维护的目录 DTO（消除启动期与回调重复重建）
+object GetCurrentCatalog() => runtimeSnapshots.Current.CatalogDto;
 
 TempoNetEndpoints.Map(app);
 GameServerEndpoints.Map(app);
@@ -243,9 +247,12 @@ _ = Task.Run(async () =>
             int evicted = sessionStore.EvictIdleSessions(TimeSpan.FromHours(2));
             int detachedHandles = SessionRegistry.DetachWhereMissing(sid => sessionStore.Get(sid) != null);
             int purgedCaches = GameServerEndpoints.PurgeOrphanRidCaches(sid => sessionStore.Get(sid) != null);
-            if (evicted > 0 || detachedHandles > 0 || purgedCaches > 0)
+            int purgedChatBuckets = SocialEndpoints.PurgeStaleRateBuckets();
+            int purgedChestBuckets = TempoNetEndpoints.PurgeStaleRateBuckets();
+            int evictedChallengeCache = app.Services.GetService<ChallengeService>()?.EvictStaleCacheEntries() ?? 0;
+            if (evicted > 0 || detachedHandles > 0 || purgedCaches > 0 || purgedChatBuckets > 0 || purgedChestBuckets > 0 || evictedChallengeCache > 0)
             {
-                Console.WriteLine($"[SessionStore] 定时清理完成：驱逐空闲会话={evicted}，回收句柄={detachedHandles}，清理幂等缓存={purgedCaches}");
+                Console.WriteLine($"[SessionStore] 定时清理完成：驱逐空闲会话={evicted}，回收句柄={detachedHandles}，清理幂等缓存={purgedCaches}，清理限流桶={purgedChatBuckets + purgedChestBuckets}，驱逐挑战缓存={evictedChallengeCache}");
             }
         }
     }
@@ -275,6 +282,9 @@ app.Use(async (ctx, next) =>
     }
     await next();
 });
+
+// 动态叠加中文词库（合并 custom_zh_overlay.json 与已启 Mod 哈希词条至 zh-CN.bytes，支持稳定 SHA-256 ETag/304）
+BazaarStaticDataPipeline.UseBazaarDynamicZhCnOverlay(app, dataRoot, stateDir, modHost);
 
 // 静态数据稳定 SHA-256 ETag 与 If-None-Match -> 304 Not Modified（配合安卓预置数据 0 首次下载）
 BazaarStaticDataPipeline.UseBazaarStaticDataStableEtag(app, dataRoot);
@@ -325,7 +335,152 @@ public static class BazaarStaticDataPipeline
     ];
 
     private static readonly ConcurrentDictionary<string, (long LastWriteUtcTicks, long Length, string ETag)> FileSha256EtagCache =
-        new(StringComparer.OrdinalIgnoreCase);
+        new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+    private static readonly object DynamicZhBuildLock = new();
+
+    /// <summary>
+    /// 动态叠加外挂词典（custom_zh_overlay.json）与已启用 Mod 的 hashOverrides 至官方 SQLite zh-CN.bytes，
+    /// 使无客户端插件的安卓官方端也能自动拉取全部 950+ 补全中文词条与 Mod 哈希翻译；无覆盖条目时零开销透传原文件。
+    /// </summary>
+    public static void UseBazaarDynamicZhCnOverlay(
+        IApplicationBuilder app,
+        string dataRoot,
+        string stateDir,
+        ServerModHost modHost)
+    {
+        string baseZhPath = Path.Combine(Path.GetFullPath(dataRoot), "translations", "zh-CN.bytes");
+        string cacheDir = Path.Combine(Path.GetFullPath(stateDir), "cache");
+
+        app.Use(async (ctx, next) =>
+        {
+            if ((HttpMethods.IsGet(ctx.Request.Method) || HttpMethods.IsHead(ctx.Request.Method))
+                && string.Equals(ctx.Request.Path.Value, "/translations/zh-CN.bytes", StringComparison.OrdinalIgnoreCase)
+                && File.Exists(baseZhPath))
+            {
+                var exported = modHost.ExportMergedLocalization();
+                var hashOverrides = exported.Document.HashOverrides;
+                if (hashOverrides != null && hashOverrides.Count > 0)
+                {
+                    string mergedPath = EnsureMergedZhCnBytesFile(baseZhPath, cacheDir, hashOverrides, exported.Sha256);
+                    string etag = ComputeCachedFileSha256Etag(mergedPath);
+                    ctx.Response.Headers.ETag = etag;
+                    ctx.Response.Headers.CacheControl = "no-cache";
+
+                    if (IsIfNoneMatchSatisfied(ctx.Request.Headers.IfNoneMatch, etag))
+                    {
+                        ctx.Response.StatusCode = StatusCodes.Status304NotModified;
+                        return;
+                    }
+
+                    ctx.Response.ContentType = "application/octet-stream";
+                    var fi = new FileInfo(mergedPath);
+                    ctx.Response.ContentLength = fi.Length;
+                    if (HttpMethods.IsHead(ctx.Request.Method))
+                    {
+                        ctx.Response.StatusCode = StatusCodes.Status200OK;
+                        return;
+                    }
+
+                    await ctx.Response.SendFileAsync(mergedPath, ctx.RequestAborted);
+                    return;
+                }
+            }
+
+            await next();
+        });
+    }
+
+    /// <summary>
+    /// 基于原版 zh-CN.bytes 与当前叠加词条哈希构造并缓存独立的 SQLite 词库文件（线程安全、原子落盘）。
+    /// </summary>
+    public static string EnsureMergedZhCnBytesFile(
+        string baseZhPath,
+        string cacheDir,
+        IReadOnlyDictionary<string, string> hashOverrides,
+        string overlaySha256)
+    {
+        string baseEtag = ComputeCachedFileSha256Etag(baseZhPath).Trim('"');
+        string keyRaw = $"{baseEtag}|{overlaySha256}|{hashOverrides.Count}";
+        string keyHash = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(keyRaw)))
+            .ToLowerInvariant()[..16];
+
+        Directory.CreateDirectory(cacheDir);
+        string outPath = Path.Combine(cacheDir, $"zh-CN-overlay-{keyHash}.bytes");
+        if (File.Exists(outPath) && new FileInfo(outPath).Length > 0)
+            return outPath;
+
+        lock (DynamicZhBuildLock)
+        {
+            if (File.Exists(outPath) && new FileInfo(outPath).Length > 0)
+                return outPath;
+
+            string tmpPath = outPath + ".tmp." + Guid.NewGuid().ToString("N");
+            try
+            {
+                File.Copy(baseZhPath, tmpPath, overwrite: true);
+
+                var csb = new SqliteConnectionStringBuilder
+                {
+                    DataSource = tmpPath,
+                    Mode = SqliteOpenMode.ReadWrite,
+                    Pooling = false,
+                };
+                using (var conn = new SqliteConnection(csb.ToString()))
+                {
+                    conn.Open();
+                    using (var pragma = conn.CreateCommand())
+                    {
+                        pragma.CommandText = "PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF;";
+                        pragma.ExecuteNonQuery();
+                    }
+                    using var tx = conn.BeginTransaction();
+                    using var cmd = conn.CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "INSERT OR REPLACE INTO translation(hash, text) VALUES ($h, $t)";
+                    var pHash = cmd.CreateParameter();
+                    pHash.ParameterName = "$h";
+                    var pText = cmd.CreateParameter();
+                    pText.ParameterName = "$t";
+                    cmd.Parameters.Add(pHash);
+                    cmd.Parameters.Add(pText);
+
+                    foreach (var (k, v) in hashOverrides)
+                    {
+                        if (string.IsNullOrWhiteSpace(k) || string.IsNullOrEmpty(v)) continue;
+                        pHash.Value = k.Trim();
+                        pText.Value = v;
+                        cmd.ExecuteNonQuery();
+                    }
+                    tx.Commit();
+                    using (var seal = conn.CreateCommand())
+                    {
+                        seal.CommandText = "PRAGMA journal_mode=DELETE;";
+                        seal.ExecuteNonQuery();
+                    }
+                }
+
+                File.Move(tmpPath, outPath, overwrite: true);
+
+                // 清理历史旧缓存（保留最新 4 份防止磁盘膨胀）
+                try
+                {
+                    var oldFiles = Directory.GetFiles(cacheDir, "zh-CN-overlay-*.bytes")
+                        .Select(p => new FileInfo(p))
+                        .OrderByDescending(fi => fi.LastWriteTimeUtc)
+                        .Skip(4);
+                    foreach (var old in oldFiles) old.Delete();
+                }
+                catch { }
+            }
+            finally
+            {
+                try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+            }
+
+            return outPath;
+        }
+    }
 
     /// <summary>
     /// 剥离安卓本地代理 / 伴侣等长前缀（/bz-enter、/bz-server、/bz-static-data），须在 app.UseRouting() 之前调用。
@@ -356,23 +511,60 @@ public static class BazaarStaticDataPipeline
         string fullRoot = Path.GetFullPath(dataRoot);
         if (!fullRoot.EndsWith(Path.DirectorySeparatorChar))
             fullRoot += Path.DirectorySeparatorChar;
+        StringComparison pathComparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
 
         app.Use(async (ctx, next) =>
         {
             if (HttpMethods.IsGet(ctx.Request.Method) || HttpMethods.IsHead(ctx.Request.Method))
             {
                 string reqPath = ctx.Request.Path.Value ?? "";
-                bool isTrackedStatic =
-                    string.Equals(reqPath, "/GameData.db.zip", StringComparison.OrdinalIgnoreCase)
-                    || (reqPath.StartsWith("/translations/", StringComparison.OrdinalIgnoreCase)
-                        && reqPath.EndsWith(".bytes", StringComparison.OrdinalIgnoreCase));
-
-                if (isTrackedStatic)
+                string? canonicalReqPath = null;
+                if (string.Equals(reqPath, "/GameData.db.zip", StringComparison.OrdinalIgnoreCase))
                 {
-                    string relPath = reqPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
-                    string candidate = Path.GetFullPath(Path.Combine(fullRoot, relPath));
-                    if (candidate.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase) && File.Exists(candidate))
+                    canonicalReqPath = "/GameData.db.zip";
+                }
+                else if (reqPath.StartsWith("/translations/", StringComparison.OrdinalIgnoreCase)
+                    && reqPath.EndsWith(".bytes", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.Equals(reqPath, "/translations/zh-CN.bytes", StringComparison.OrdinalIgnoreCase))
                     {
+                        canonicalReqPath = "/translations/zh-CN.bytes";
+                    }
+                    else
+                    {
+                        string fileName = reqPath["/translations/".Length..];
+                        if (!fileName.Contains('/') && !fileName.Contains('\\'))
+                        {
+                            string transDir = Path.Combine(fullRoot, "translations");
+                            string exactCandidate = Path.Combine(transDir, fileName);
+                            if (File.Exists(exactCandidate))
+                            {
+                                canonicalReqPath = "/translations/" + fileName;
+                            }
+                            else if (Directory.Exists(transDir))
+                            {
+                                string? matched = Directory.EnumerateFiles(transDir, "*.bytes")
+                                    .Select(Path.GetFileName)
+                                    .FirstOrDefault(n => string.Equals(n, fileName, StringComparison.OrdinalIgnoreCase));
+                                if (!string.IsNullOrEmpty(matched))
+                                    canonicalReqPath = "/translations/" + matched;
+                            }
+                        }
+                    }
+                }
+
+                if (canonicalReqPath != null)
+                {
+                    string relPath = canonicalReqPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
+                    string candidate = Path.GetFullPath(Path.Combine(fullRoot, relPath));
+                    if (candidate.StartsWith(fullRoot, pathComparison) && File.Exists(candidate))
+                    {
+                        // 规范化请求路径为磁盘真实大小写，确保 Linux 大小写敏感文件系统下 ETag 中间件与下游 StaticFileMiddleware 行为一致
+                        if (!string.Equals(reqPath, canonicalReqPath, StringComparison.Ordinal))
+                            ctx.Request.Path = new PathString(canonicalReqPath);
+
                         string etag = ComputeCachedFileSha256Etag(candidate);
                         if (IsIfNoneMatchSatisfied(ctx.Request.Headers.IfNoneMatch, etag))
                         {

@@ -35,49 +35,45 @@ public sealed class TournamentPvpCoordinator : ITournamentPvpCoordinator
         string aid = NormalizeAccountKey(board.AccountId);
         var normalized = board with { AccountId = aid, Day = safeDay };
 
-        // 仅允许同一天的首次冻结或覆盖同一天快照（绝不跨天混写）
-        _lockedBoards[(tournamentSessionId, safeDay, aid)] = normalized;
-
-        // 尝试持久化至 tournament_matchups 对应槽位（若该天已冻结配对）
+        // 锁外预先解析房间、当日冻结配对与序列化载荷，绝不在 pairLock 内反向触碰 LobbyStore 锁（遵循 L3 -> L4 锁序）
         var lobby = _lobbies.FindByTournamentSessionId(tournamentSessionId);
-        if (lobby != null)
+        var assignment = lobby?.Matchmaker.GetAssignment(aid, safeDay);
+        if (lobby == null || assignment == null)
         {
-            var assignment = lobby.Matchmaker.GetAssignment(aid, safeDay);
-            if (assignment != null)
-            {
-                string pairKey = TournamentMatchmaker.CanonicalPairKey(aid, assignment.OpponentAccountId);
-                string p1 = CanonicalFirst(aid, assignment.OpponentAccountId);
-                string p2 = CanonicalSecond(aid, assignment.OpponentAccountId);
-                bool selfIsP1 = string.Equals(aid, p1, StringComparison.OrdinalIgnoreCase);
-                string lockedJson = JsonSerializer.Serialize(normalized);
+            _lockedBoards[(tournamentSessionId, safeDay, aid)] = normalized;
+            return;
+        }
 
-                var existing = _db.LoadTournamentMatchup(lobby.LobbyId, safeDay, pairKey);
-                string p1Name = selfIsP1 ? normalized.Username : (existing?.P1Username ?? assignment.OpponentUsername);
-                string p2Name = !selfIsP1 ? normalized.Username : (existing?.P2Username ?? assignment.OpponentUsername);
-                bool p1IsBot = selfIsP1 ? false : (existing?.P1IsBot ?? assignment.OpponentIsBot);
-                bool p2IsBot = !selfIsP1 ? false : (existing?.P2IsBot ?? assignment.OpponentIsBot);
+        string pairKey = TournamentMatchmaker.CanonicalPairKey(aid, assignment.OpponentAccountId);
+        string p1 = CanonicalFirst(aid, assignment.OpponentAccountId);
+        string p2 = CanonicalSecond(aid, assignment.OpponentAccountId);
+        bool selfIsP1 = string.Equals(aid, p1, StringComparison.OrdinalIgnoreCase);
+        string lockedJson = JsonSerializer.Serialize(normalized);
+        string p1Name = selfIsP1 ? normalized.Username : assignment.OpponentUsername;
+        string p2Name = !selfIsP1 ? normalized.Username : assignment.OpponentUsername;
+        bool p1IsBot = !selfIsP1 && assignment.OpponentIsBot;
+        bool p2IsBot = selfIsP1 && assignment.OpponentIsBot;
 
-                _db.UpsertTournamentMatchup(new Persistence.TournamentMatchupRow(
-                    LobbyId: lobby.LobbyId,
-                    Day: safeDay,
-                    PairKey: pairKey,
-                    P1AccountId: p1,
-                    P1Username: p1Name,
-                    P1IsBot: p1IsBot,
-                    P2AccountId: p2,
-                    P2Username: p2Name,
-                    P2IsBot: p2IsBot,
-                    IsSyntheticSparring: assignment.OpponentIsSyntheticSparringBot,
-                    BattleSeed: assignment.BattleSeed,
-                    P1LockedBoardJson: selfIsP1 ? lockedJson : (existing?.P1LockedBoardJson ?? ""),
-                    P2LockedBoardJson: !selfIsP1 ? lockedJson : (existing?.P2LockedBoardJson ?? ""),
-                    WinnerAccountId: existing?.WinnerAccountId ?? "",
-                    LoserAccountId: existing?.LoserAccountId ?? "",
-                    LoserPrestigeDamage: existing?.LoserPrestigeDamage ?? 0,
-                    IsAutoResolved: existing?.IsAutoResolved ?? false,
-                    ReplayId: existing?.ReplayId ?? "",
-                    ResolvedAt: existing?.ResolvedAt));
-            }
+        var cacheKey = (tournamentSessionId, safeDay, pairKey);
+        object pairLock = _pairLocks.GetOrAdd(cacheKey, _ => new object());
+        lock (pairLock)
+        {
+            // 与同组 RecordOrGetResolvedMatch 串行化，并通过 SQLite 单槽条件更新防止 P1/P2 互相覆写或污染已裁决胜负
+            _lockedBoards[(tournamentSessionId, safeDay, aid)] = normalized;
+            _db.UpsertTournamentLockedBoard(
+                lobbyId: lobby.LobbyId,
+                day: safeDay,
+                pairKey: pairKey,
+                p1AccountId: p1,
+                p1Username: p1Name,
+                p1IsBot: p1IsBot,
+                p2AccountId: p2,
+                p2Username: p2Name,
+                p2IsBot: p2IsBot,
+                isSyntheticSparring: assignment.OpponentIsSyntheticSparringBot,
+                battleSeed: assignment.BattleSeed,
+                isP1: selfIsP1,
+                lockedBoardJson: lockedJson);
         }
     }
 
@@ -172,28 +168,44 @@ public sealed class TournamentPvpCoordinator : ITournamentPvpCoordinator
         string pairKey = TournamentMatchmaker.CanonicalPairKey(normA, normB);
         var cacheKey = (tournamentSessionId, safeDay, pairKey);
 
+        // 锁外预先解析房间与成员标量快照，确保 pairLock 为纯叶子协调锁（绝不持有 pairLock 反向获取 lobby.Members）
+        string p1 = CanonicalFirst(normA, normB);
+        string p2 = CanonicalSecond(normA, normB);
+        var lobby = _lobbies.FindByTournamentSessionId(tournamentSessionId);
+        string lobbyId = lobby?.LobbyId ?? tournamentSessionId.ToString("N");
+        var p1Member = lobby != null ? _lobbies.FindMember(lobby, p1) : null;
+        var p2Member = lobby != null ? _lobbies.FindMember(lobby, p2) : null;
+        string? p1UsernameSnap = p1Member?.Username;
+        bool? p1IsBotSnap = p1Member != null ? p1Member.IsAi : null;
+        string? p2UsernameSnap = p2Member?.Username;
+        bool? p2IsBotSnap = p2Member != null ? p2Member.IsAi : null;
+
+        SymmetricHumanPvpOutcome resultOutcome;
+        bool newlyCommitted = false;
+
         object pairLock = _pairLocks.GetOrAdd(cacheKey, _ => new object());
         lock (pairLock)
         {
             if (_resolvedMatches.TryGetValue(cacheKey, out var existing))
                 return existing;
 
-            string lobbyId = ResolveLobbyId(tournamentSessionId);
             var existingRow = _db.LoadTournamentMatchup(lobbyId, safeDay, pairKey);
             if (existingRow != null && !string.IsNullOrWhiteSpace(existingRow.WinnerAccountId))
             {
+                // 从 SQLite 恢复已裁决事实时严禁混入本次 proposed 的模拟动画缓存，防止重放与权威胜负相悖
                 var dbOutcome = new SymmetricHumanPvpOutcome(
                     WinnerAccountId: existingRow.WinnerAccountId,
                     LoserAccountId: existingRow.LoserAccountId,
                     BattleSeed: existingRow.BattleSeed,
                     LoserPrestigeDamage: existingRow.LoserPrestigeDamage,
                     ReplayId: existingRow.ReplayId,
-                    CachedCombatSimForP1: proposed.CachedCombatSimForP1,
-                    CachedCombatSimForP2: proposed.CachedCombatSimForP2);
+                    CachedCombatSimForP1: null,
+                    CachedCombatSimForP2: null);
                 _resolvedMatches[cacheKey] = dbOutcome;
                 return dbOutcome;
             }
 
+            // 保留原有归一化语义（兼容同步 PvP 平局哨兵 SyncDrawWinnerSentinel，确保 winner_account_id 保持非空）
             string normWinner = NormalizeAccountKey(proposed.WinnerAccountId);
             string normLoser = string.Equals(normWinner, normA, StringComparison.OrdinalIgnoreCase) ? normB : normA;
             var canonicalOutcome = proposed with
@@ -203,12 +215,6 @@ public sealed class TournamentPvpCoordinator : ITournamentPvpCoordinator
                 LoserPrestigeDamage = Math.Max(0, proposed.LoserPrestigeDamage),
                 ReplayId = proposed.ReplayId ?? "",
             };
-
-            string p1 = CanonicalFirst(normA, normB);
-            string p2 = CanonicalSecond(normA, normB);
-            var lobby = _lobbies.FindByTournamentSessionId(tournamentSessionId);
-            var p1Member = lobby != null ? _lobbies.FindMember(lobby, p1) : null;
-            var p2Member = lobby != null ? _lobbies.FindMember(lobby, p2) : null;
 
             string p1BoardJson = existingRow?.P1LockedBoardJson ?? "";
             if (string.IsNullOrWhiteSpace(p1BoardJson) && _lockedBoards.TryGetValue((tournamentSessionId, safeDay, p1), out var b1))
@@ -222,11 +228,11 @@ public sealed class TournamentPvpCoordinator : ITournamentPvpCoordinator
                 Day: safeDay,
                 PairKey: pairKey,
                 P1AccountId: p1,
-                P1Username: p1Member?.Username ?? existingRow?.P1Username ?? p1,
-                P1IsBot: p1Member?.IsAi ?? existingRow?.P1IsBot ?? false,
+                P1Username: p1UsernameSnap ?? existingRow?.P1Username ?? p1,
+                P1IsBot: p1IsBotSnap ?? existingRow?.P1IsBot ?? false,
                 P2AccountId: p2,
-                P2Username: p2Member?.Username ?? existingRow?.P2Username ?? p2,
-                P2IsBot: p2Member?.IsAi ?? existingRow?.P2IsBot ?? false,
+                P2Username: p2UsernameSnap ?? existingRow?.P2Username ?? p2,
+                P2IsBot: p2IsBotSnap ?? existingRow?.P2IsBot ?? false,
                 IsSyntheticSparring: existingRow?.IsSyntheticSparring ?? false,
                 BattleSeed: canonicalOutcome.BattleSeed,
                 P1LockedBoardJson: p1BoardJson,
@@ -238,12 +244,19 @@ public sealed class TournamentPvpCoordinator : ITournamentPvpCoordinator
                 ReplayId: canonicalOutcome.ReplayId,
                 ResolvedAt: DateTime.UtcNow));
 
-            lobby?.Matchmaker.RecordHumanMatchResolution(
-                safeDay, p1, p2, canonicalOutcome.WinnerAccountId, canonicalOutcome.LoserPrestigeDamage, canonicalOutcome.BattleSeed);
-
             _resolvedMatches[cacheKey] = canonicalOutcome;
-            return canonicalOutcome;
+            resultOutcome = canonicalOutcome;
+            newlyCommitted = true;
         }
+
+        // 释放 pairLock 后再同步更新 Matchmaker 记录，杜绝跨锁嵌套
+        if (newlyCommitted)
+        {
+            lobby?.Matchmaker.RecordHumanMatchResolution(
+                safeDay, p1, p2, resultOutcome.WinnerAccountId, resultOutcome.LoserPrestigeDamage, resultOutcome.BattleSeed);
+        }
+
+        return resultOutcome;
     }
 
     /// <summary>清理已完结或已归档锦标赛的内存锁定与裁决缓存，防止长跑泄漏。</summary>

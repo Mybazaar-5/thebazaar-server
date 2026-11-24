@@ -1,6 +1,7 @@
 using System.Text.Json;
 using BazaarCore.Data;
 using BazaarCore.Models;
+using BazaarCore.Runtime;
 using Microsoft.Data.Sqlite;
 
 namespace BazaarServer.Data;
@@ -30,16 +31,16 @@ public sealed class GameModeConfig
     public int ExperiencePerHour { get; init; } = 1;
     public int MaxLevel { get; init; } = 999;
 
-    public int PrestigeInitial { get; init; } = 20;
-    public int PrestigeMax { get; init; } = 20;
+    public int PrestigeInitial { get; init; } = GameDefaults.StartingPrestige;
+    public int PrestigeMax { get; init; } = GameDefaults.StartingPrestige;
     /// <summary>PvE 野怪战败声望扣减量（无损透传自 GameModeData.Prestige.PrestigeLossFromMonsters）。</summary>
     public int PrestigeLossFromMonsters { get; init; }
 
-    /// <summary>开局初始资源默认值（可由配置或测试覆写；官方默认起始经验 3、起始生命 300）。</summary>
-    public int StartingGold { get; init; } = 15;
-    public int StartingIncome { get; init; } = 5;
-    public int StartingExperience { get; init; } = 3;
-    public int StartingHealth { get; init; } = 300;
+    /// <summary>开局初始资源默认值（可由配置或测试覆写；单一信源为 GameDefaults：300 HP / 15 Gold / 5 Income / 3 XP）。</summary>
+    public int StartingGold { get; init; } = GameDefaults.StartingGold;
+    public int StartingIncome { get; init; } = GameDefaults.StartingIncome;
+    public int StartingExperience { get; init; } = GameDefaults.StartingExperience;
+    public int StartingHealth { get; init; } = GameDefaults.StartingHealth;
 
     public string FatesTemplateId { get; init; } = "aef5e7d8-ea0b-4e7e-8f3d-6e7ba492fa10";
     public int FatesSpawnAtOrBelowPrestige { get; init; }
@@ -96,14 +97,14 @@ public sealed class GameModeConfig
             ExperiencePerHour = source.ExperiencePerHour >= 0 ? source.ExperiencePerHour : 1,
             MaxLevel = source.MaxLevel > 0 ? source.MaxLevel : 999,
 
-            PrestigeInitial = source.Prestige?.PrestigeInitial > 0 ? source.Prestige.PrestigeInitial : 20,
-            PrestigeMax = source.Prestige?.PrestigeMax > 0 ? source.Prestige.PrestigeMax : 20,
+            PrestigeInitial = source.Prestige?.PrestigeInitial > 0 ? source.Prestige.PrestigeInitial : GameDefaults.StartingPrestige,
+            PrestigeMax = source.Prestige?.PrestigeMax > 0 ? source.Prestige.PrestigeMax : GameDefaults.StartingPrestige,
             PrestigeLossFromMonsters = Math.Max(0, source.Prestige?.PrestigeLossFromMonsters ?? 0),
 
-            StartingGold = 15,
-            StartingIncome = 5,
-            StartingExperience = Math.Max(0, source.StartingExperience),
-            StartingHealth = 300,
+            StartingGold = GameDefaults.StartingGold,
+            StartingIncome = GameDefaults.StartingIncome,
+            StartingExperience = source.StartingExperience > 0 ? source.StartingExperience : GameDefaults.StartingExperience,
+            StartingHealth = GameDefaults.StartingHealth,
 
             FatesTemplateId = !string.IsNullOrWhiteSpace(source.Fates?.TemplateId)
                 ? source.Fates.TemplateId!

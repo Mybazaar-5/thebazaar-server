@@ -14,7 +14,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V4DurationAndPermSyncTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static JsonElement JsonFixedValue(double v)
         => JsonDocument.Parse($"{{\"$type\":\"TFixedValue\",\"Value\":{v.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}").RootElement.Clone();
@@ -357,7 +357,7 @@ public sealed class V4DurationAndPermSyncTests
         // 也测试模拟过程中给 tempTarget 施加临时附魔与临时升阶（通过克隆侧）
         var simP1 = p1.CloneForCombat();
         var simTemp = simP1.Hand.Cards.First(c => c.InstanceId == tempTarget.InstanceId);
-        simTemp.ApplyEnchantment("Fiery", preventOverride: false, isTemporary: true);
+        simTemp.ApplyEnchantment("Fiery", DurationTarget.Combat, preventOverride: false);
         simTemp.TryUpgrade(isTemporary: true);
 
         CombatSimulator.SyncPermanentChangesBack(simP1, p1);

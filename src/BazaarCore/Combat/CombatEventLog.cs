@@ -94,6 +94,14 @@ public sealed class CombatEvent
     // P1-10 战内限时变形还原时被移除的临时产物实例 ID 列表（仅 CardTransformReverted 填充）
     public IReadOnlyList<string>? RevertedTransformedInstanceIds { get; init; }
 
+    // D1-P2-09 (#124-1)：每跳仅发 1 条 SandstormTick，同时携带双边真实减伤后拆账字段供转换器过滤 0 伤与 FlipPerspective 互换
+    public int? P1SandstormDamage { get; init; }
+    public int P1SandstormShieldAbsorbed { get; init; }
+    public int P1SandstormHpDamage { get; init; }
+    public int? P2SandstormDamage { get; init; }
+    public int P2SandstormShieldAbsorbed { get; init; }
+    public int P2SandstormHpDamage { get; init; }
+
     // 供 UI 同步显示的快照（可选）
     public int Player1Health { get; init; }
     public int Player1Shield { get; init; }
@@ -204,8 +212,18 @@ public sealed class CardPermanentSyncDelta
     public CardInstance SourceCard { get; init; } = null!;
     public Dictionary<string, double> PermanentAddChanges { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> PermanentMultChanges { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>P0-04：战中写入的 UntilEndOfDay 属性差量。</summary>
+    public Dictionary<string, double> DayAddChanges { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> DayMultChanges { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>P0-04：战中写入的 UntilEndOfHour 属性差量。</summary>
+    public Dictionary<string, double> HourAddChanges { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> HourMultChanges { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public string? NewEnchantment { get; init; }
     public bool EnchantmentChanged { get; init; }
+    public string? NewDayEnchantment { get; init; }
+    public bool DayEnchantmentChanged { get; init; }
+    public string? NewHourEnchantment { get; init; }
+    public bool HourEnchantmentChanged { get; init; }
     public CardTier? NewTier { get; init; }
     public bool TierChanged { get; init; }
     public List<string> AddedExtraTags { get; init; } = new();
@@ -224,10 +242,26 @@ public sealed class PostCombatPermanentSyncResult
     public List<CardPermanentSyncDelta> UpdatedCards { get; init; } = new();
     public List<CardInstance> SpawnedCards { get; init; } = new();
     public Dictionary<string, double> PlayerAttributeDeltas { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>P0-04：战中玩家层 UntilEndOfDay / UntilEndOfHour 非瞬态属性同步差量。</summary>
+    public Dictionary<string, double> PlayerDayAddDeltas { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> PlayerDayAdditiveMultDeltas { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> PlayerDayPureMultChanges { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> PlayerHourAddDeltas { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> PlayerHourAdditiveMultDeltas { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> PlayerHourPureMultChanges { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>按原始卡牌 InstanceId 索引的完整永久变形产物列表（支持一对多永久变形，修复 P1-3）。</summary>
     public Dictionary<string, List<CardInstance>> PermanentReplacements { get; init; } = new(StringComparer.Ordinal);
     public bool HasAnyChanges =>
-        UpdatedCards.Count > 0 || SpawnedCards.Count > 0 || PlayerAttributeDeltas.Count > 0 || PermanentReplacements.Count > 0;
+        UpdatedCards.Count > 0
+        || SpawnedCards.Count > 0
+        || PlayerAttributeDeltas.Count > 0
+        || PlayerDayAddDeltas.Count > 0
+        || PlayerDayAdditiveMultDeltas.Count > 0
+        || PlayerDayPureMultChanges.Count > 0
+        || PlayerHourAddDeltas.Count > 0
+        || PlayerHourAdditiveMultDeltas.Count > 0
+        || PlayerHourPureMultChanges.Count > 0
+        || PermanentReplacements.Count > 0;
 }
 
 public sealed class CombatResult
@@ -251,6 +285,8 @@ public sealed class CombatResult
     public List<CombatEvent> Events { get; init; } = new();
     public List<CombatTickState> Timeline { get; init; } = new();
     public PostCombatPermanentSyncResult? PostCombatPermanentSync { get; set; }
+    /// <summary>P0-40：同步真人 PvP 规范模拟下 canonicalP2 侧专用永久同步结果槽（绝不与 P1 专槽互串早退）。</summary>
+    public PostCombatPermanentSyncResult? PostCombatPermanentSyncP2 { get; set; }
     /// <summary>本场战斗中发生的 UntilEndOfCombat 临时变形清单（P1-10，供战后 RunEngine 还原客户端变形视图）。</summary>
     public List<CombatTemporaryTransformRecord> TemporaryTransforms { get; init; } = new();
     /// <summary>V14 自定义机制经由受控门面登记的战后结转操作（由 RunEngine 统一校验并同步给客户端）。</summary>
@@ -260,4 +296,6 @@ public sealed class CombatResult
     public int MechanicCircuitBreakerTrips { get; init; }
     public int MechanicBudgetViolations { get; init; }
     internal PlayerState? SimPlayer1 { get; init; }
+    /// <summary>P0-40：同步真人 PvP 规范模拟下保存的模拟态 P2，用于 canonicalP2 无损同步战后永久/当日/本小时变更。</summary>
+    internal PlayerState? SimPlayer2 { get; init; }
 }

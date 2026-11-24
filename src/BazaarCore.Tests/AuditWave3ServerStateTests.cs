@@ -27,26 +27,20 @@ namespace BazaarCore.Tests;
 /// 覆盖 P1-02、P1-09、P1-10、P1-11、P1-13、P1-14、P1-16、P1-17、P1-18、
 /// P1-26、P1-28、P1-30~P1-41、P1-44、P1-55。
 /// </summary>
+[Xunit.Collection("ShopEngineStaticState")]
 public sealed class AuditWave3ServerStateTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
     private static readonly Lazy<List<BazaarServer.Data.MonsterTemplate>> Monsters =
-        new(() => MonsterPool.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.CreateMonstersCopy());
     private static readonly Lazy<LevelUpTable> LevelUps =
-        new(() => LevelUpTable.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.LevelUps);
     private static readonly Lazy<GameModeConfig> Mode =
-        new(() => GameModeConfig.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.Mode);
 
     private static string ResolveDataPath(string fileName)
-    {
-        for (string? dir = AppContext.BaseDirectory; dir != null; dir = Directory.GetParent(dir)?.FullName)
-        {
-            string candidate = Path.Combine(dir, "dist", "data", fileName);
-            if (File.Exists(candidate)) return candidate;
-        }
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static string CreateTempDbPath(string tag)
     {
@@ -593,8 +587,8 @@ public sealed class AuditWave3ServerStateTests
 
         item.CoreCard!.SetTier(CardTier.Gold, isTemporary: true);
         item.Tier = ETier.Gold;
-        item.CoreCard.ApplyEnchantment("Heavy", preventOverride: false, DurationTarget.Day);
-        item.CoreCard.ApplyEnchantment("Icy", preventOverride: false, DurationTarget.Hour);
+        item.CoreCard.ApplyEnchantment("Heavy", DurationTarget.Day, preventOverride: false);
+        item.CoreCard.ApplyEnchantment("Icy", DurationTarget.Hour, preventOverride: false);
         item.Enchantment = EEnchantmentType.Icy;
 
         string json = RunSnapshotSerializer.Serialize(run, startSelectionDone: true);

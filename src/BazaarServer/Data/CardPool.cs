@@ -90,8 +90,18 @@ public sealed class CardPool
         public int? ModMinDay { get; init; }
         /// <summary>Mod 自定义遭遇最晚允许出现天数（纯原版卡为 null）。</summary>
         public int? ModMaxDay { get; init; }
-        /// <summary>是否为 Mod 自定义卡。</summary>
-        public bool IsCustomModCard => !string.IsNullOrWhiteSpace(BaseVisualTemplateId);
+        /// <summary>Mod 自定义遭遇允许出现小时列表（null/空表示全白昼时段允许）。</summary>
+        public int[]? ModAllowedHours { get; init; }
+        /// <summary>P0-21：Mod 自定义野怪遭遇难度槽位（Bronze / Silver / Gold / Any）。</summary>
+        public string? ModDifficultySlot { get; init; }
+        /// <summary>P0-25：是否为原版卡 Patch 覆盖模板（非借壳新建自定义卡）。</summary>
+        public bool IsPatchOverride { get; init; }
+        /// <summary>P0-23：是否为不限英雄的通用自定义 Mod 技能。</summary>
+        public bool IsUniversalCustomSkill { get; init; }
+        /// <summary>W2-A 核心模板显式标注的自定义 Mod 卡标记。</summary>
+        public bool CoreIsCustomModCard { get; init; }
+        /// <summary>是否为 Mod 自定义卡（P0-25：排除原位 Patch 卡，优先遵循 core.IsCustomModCard 或借壳 BaseVisualTemplateId）。</summary>
+        public bool IsCustomModCard => !IsPatchOverride && (CoreIsCustomModCard || !string.IsNullOrWhiteSpace(BaseVisualTemplateId));
     }
 
     public const string TravelAgentEncounterId = "002d8f6d-0e36-4921-89ed-3f0f28682d7b";
@@ -330,12 +340,20 @@ public sealed class CardPool
         IReadOnlyDictionary<string, CustomCardVisualBinding>? visualBindings = null)
     {
         ArgumentNullException.ThrowIfNull(activeRepo);
+        // D2-P2-01：保留独立仓库的 GameMode 配置（GameModeId / TierChancesByDay / StandardPrices），避免回退至基座旧值
+        var gm = activeRepo.GameMode;
+        Guid modeId = gm != null && Guid.TryParse(gm.Id, out var parsedGmId) ? parsedGmId : DefaultGameModeId;
+        var tierChances = gm?.ItemSkillSpawnTierPercantagesByDay is { Count: > 0 }
+            ? TierChances.FromGameModeMap(gm.ItemSkillSpawnTierPercantagesByDay, gm.NumberOfDays > 0 ? gm.NumberOfDays : 10)
+            : TierChancesByDay;
+        var stdPrices = gm?.StandardPrices ?? StandardPrices;
+
         var clone = new CardPool
         {
-            DefaultGameModeId = DefaultGameModeId,
-            TierChancesByDay = TierChancesByDay,
-            StandardPrices = StandardPrices,
-            LoadedFrom = LoadedFrom,
+            DefaultGameModeId = modeId,
+            TierChancesByDay = tierChances,
+            StandardPrices = stdPrices,
+            LoadedFrom = activeRepo.SourceDataPath ?? activeRepo.SourceZipPath ?? LoadedFrom,
             WhitelistEnabled = WhitelistEnabled,
             WhitelistLoadedFrom = WhitelistLoadedFrom,
             ZhTranslationLoaded = ZhTranslationLoaded,
@@ -367,7 +385,8 @@ public sealed class CardPool
         {
             foreach (var (cid, b) in visualBindings)
             {
-                if (!string.IsNullOrWhiteSpace(cid) && !string.IsNullOrWhiteSpace(b.BaseVisualTemplateId))
+                // P0-25：原位 Patch 覆盖卡绝不写入借壳映射表 CustomToBaseVisualId
+                if (!b.IsPatchOverride && !string.IsNullOrWhiteSpace(cid) && !string.IsNullOrWhiteSpace(b.BaseVisualTemplateId))
                     customMap[cid] = b.BaseVisualTemplateId;
             }
         }
@@ -422,7 +441,7 @@ public sealed class CardPool
         var snap = _snap;
         if (snap.CustomToBaseVisualId.TryGetValue(templateId, out var baseId) && !string.IsNullOrWhiteSpace(baseId))
             return baseId;
-        if (snap.ById.TryGetValue(templateId, out var tpl) && !string.IsNullOrWhiteSpace(tpl.BaseVisualTemplateId))
+        if (snap.ById.TryGetValue(templateId, out var tpl) && !tpl.IsPatchOverride && !string.IsNullOrWhiteSpace(tpl.BaseVisualTemplateId))
             return tpl.BaseVisualTemplateId!;
         if (WhitelistEnabled && !_validCardIds.Contains(templateId) &&
             BuiltinVisualFallbackMap.TryGetValue(templateId, out var builtinFallback) &&
@@ -460,11 +479,23 @@ public sealed class CardPool
         CustomCardVisualBinding? binding)
     {
         var tiers = new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
-        if (core.Tiers != null)
+        // D3-P1-01：始终以顶层 core.Attributes 作为底表，逐阶叠加 core.Tiers[tier].Attributes
+        Dictionary<string, int>? baseAttrs = null;
+        if (core.Attributes is { Count: > 0 })
+        {
+            baseAttrs = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (ak, av) in core.Attributes)
+                baseAttrs[ak] = (int)Math.Round(av);
+        }
+
+        string startTierName = string.IsNullOrWhiteSpace(core.StartingTier) ? "Bronze" : core.StartingTier;
+        if (core.Tiers is { Count: > 0 })
         {
             foreach (var (tierName, tierData) in core.Tiers)
             {
-                var attrs = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                var attrs = baseAttrs != null
+                    ? new Dictionary<string, int>(baseAttrs, StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                 if (tierData?.Attributes != null)
                 {
                     foreach (var (ak, av) in tierData.Attributes)
@@ -473,12 +504,35 @@ public sealed class CardPool
                 tiers[tierName] = attrs;
             }
         }
-        else if (core.Attributes is { Count: > 0 })
+        else if (baseAttrs is { Count: > 0 })
         {
-            var attrs = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var (ak, av) in core.Attributes)
-                attrs[ak] = (int)Math.Round(av);
-            tiers[string.IsNullOrWhiteSpace(core.StartingTier) ? "Bronze" : core.StartingTier] = attrs;
+            tiers[startTierName] = new Dictionary<string, int>(baseAttrs, StringComparer.OrdinalIgnoreCase);
+        }
+
+        // D3-P1-01 & P0-25：对自定义新卡（排除原位 Patch）按 StartingTier -> Diamond 向高阶补齐缺省属性快照，防止中后期商店被 TierAttributes.ContainsKey 误吞
+        bool isPatchOverride = binding?.IsPatchOverride ?? false;
+        bool isCustomCard = !isPatchOverride && (core.IsCustomModCard || !string.IsNullOrWhiteSpace(binding?.BaseVisualTemplateId));
+        if (isCustomCard && tiers.Count > 0)
+        {
+            string[] standardProgression = ["Bronze", "Silver", "Gold", "Diamond"];
+            int startOrder = TierOrder(startTierName);
+            Dictionary<string, int>? prevAttrs = tiers.TryGetValue(startTierName, out var st)
+                ? st
+                : tiers.Values.First();
+            foreach (string tierName in standardProgression)
+            {
+                if (TierOrder(tierName) < startOrder) continue;
+                if (tiers.TryGetValue(tierName, out var existing))
+                {
+                    prevAttrs = existing;
+                }
+                else
+                {
+                    var inherited = new Dictionary<string, int>(prevAttrs, StringComparer.OrdinalIgnoreCase);
+                    tiers[tierName] = inherited;
+                    prevAttrs = inherited;
+                }
+            }
         }
 
         var selReqs = new List<RuleNode>();
@@ -529,10 +583,15 @@ public sealed class CardPool
             RewardVictory = core.RewardVictory,
             RewardDefeat = core.RewardDefeat,
             BaseVisualTemplateId = binding?.BaseVisualTemplateId,
-            ModId = binding?.ModId ?? (core.Version?.StartsWith("mod:", StringComparison.OrdinalIgnoreCase) == true ? core.Version[4..] : null),
+            ModId = binding?.ModId ?? core.CustomModOrigin ?? (core.Version?.StartsWith("mod:", StringComparison.OrdinalIgnoreCase) == true ? core.Version[4..] : null),
             ModSpawnWeight = core.ModSpawnWeight,
             ModMinDay = core.ModMinDay,
             ModMaxDay = core.ModMaxDay,
+            ModAllowedHours = core.AllowedHours is { Count: > 0 } ? core.AllowedHours.ToArray() : null,
+            ModDifficultySlot = core.ModDifficultySlot,
+            IsPatchOverride = isPatchOverride,
+            IsUniversalCustomSkill = core.IsUniversalCustomSkill,
+            CoreIsCustomModCard = core.IsCustomModCard,
         };
     }
 
@@ -825,16 +884,12 @@ public sealed class CardPool
         return tpl != null && HasZhTranslation(tpl);
     }
 
-    /// <summary>全局排除误标 Always 的开发调试/新手教程/剧情伏击废卡。</summary>
+    /// <summary>全局排除误标 Always 的开发调试/新手教程/剧情伏击废卡（D2-P1-11：解除 3 张官方活跃卡与 1 只野怪误封）。</summary>
     private static readonly HashSet<string> ExcludedDevOrStoryTemplateIds = new(StringComparer.OrdinalIgnoreCase)
     {
         "1400ea5b-6492-4c41-9bf9-c7016973ee0a", // Greenheart Help Jules Ambush Giant Mosquito
         "c20ccde2-99be-462c-9b32-8a340ee8b017", // Greenheart Help Merchant Help Kyver Drone
         "85a40ccc-9683-4794-8641-65940237da3a", // [Jungle Expedition] Greenheart Guardian Exit
-        "fd862d85-66cd-431f-a85a-07742cbc2e1b", // Test Subject Alpha (Monster)
-        "071cf90c-57a4-40f2-8d79-4c87f0d100d4", // Test Subject Alpha
-        "41cdf4ee-7790-4da1-96f8-a46d3391a0d9", // The Tester
-        "47704642-ae7a-4775-a26a-e5e5a8cff7bf", // Eating Contest
         "62d59e46-31cc-411d-af27-0f3bf82ca57b", // Big Bad Wolf
         "4cdcc6d3-c0e6-4996-a0ea-c3457211f406", // [DEBUG] Transform
     };
@@ -851,10 +906,7 @@ public sealed class CardPool
 
         return name.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase)
             || name.Contains("Tutorial", StringComparison.OrdinalIgnoreCase)
-            || name.StartsWith("Greenheart Help", StringComparison.OrdinalIgnoreCase)
-            || name.StartsWith("Test Subject Alpha", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(name, "The Tester", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(name, "Eating Contest", StringComparison.OrdinalIgnoreCase);
+            || name.StartsWith("Greenheart Help", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>判断物品模板在指定品阶或起步品阶是否显式配置了 BuyPrice &lt;= 0（如 0 元包裹类）。</summary>
@@ -884,12 +936,18 @@ public sealed class CardPool
     {
         if (tpl == null) return false;
         if (!IsAssetValid(tpl.Id)) return false;
+        // D2-P2-02：黑名单（开发/剧情废卡）必须永远优先拦截；SpawningEligibility == "Never" 对全部真实卡与非 EncounterStep 合成卡同样硬拦截
+        // （仅测试合成 EncounterStep 在显式 ID 查找 allowGuidOnly 路径下按需放行，与官方库 0 张真实 Never EncounterStep 零冲突）
+        if (IsExcludedDevOrStoryTemplate(tpl))
+            return false;
+        bool isSyntheticEncounterStep = allowGuidOnly
+            && tpl.IsSyntheticTestTemplate
+            && string.Equals(tpl.Type, "EncounterStep", StringComparison.OrdinalIgnoreCase);
+        if (!isSyntheticEncounterStep && string.Equals(tpl.SpawningEligibility, "Never", StringComparison.OrdinalIgnoreCase))
+            return false;
         // 单元测试合成覆盖卡（无官方本地化键且非 DEBUG）仅在显式 ID 查找路径下放行，随机抽卡池依旧严守 Always 与汉化校验
         if (allowGuidOnly && tpl.IsSyntheticTestTemplate)
             return true;
-        if (IsExcludedDevOrStoryTemplate(tpl))
-            return false;
-        if (string.Equals(tpl.SpawningEligibility, "Never", StringComparison.OrdinalIgnoreCase)) return false;
         if (!allowGuidOnly && !string.Equals(tpl.SpawningEligibility, "Always", StringComparison.OrdinalIgnoreCase))
             return false;
         if (ZhTranslationLoaded
@@ -1108,12 +1166,17 @@ public sealed class CardPool
     }
 
     /// <summary>
-    /// 商店可售物品池：Type=Item，SpawningEligibility=Always，属于该英雄或 Common，且通过资产白名单与中文词库校验。
+    /// 商店可售物品池：Type=Item，SpawningEligibility=Always，通过资产白名单与中文词库校验。
+    /// D2-P1-12：默认排除 136 件纯原版 Common 非商店野怪/Loot 物品（保留通用自定义 Mod 物品），
+    /// 仅当 <paramref name="includeCommon"/> 为 true 时才显式放行纯 Common 中立池。
     /// </summary>
-    public List<CardTemplate> ShopItems(string hero)
+    public List<CardTemplate> ShopItems(string hero, bool includeCommon = false)
         => OfType("Item")
             .Where(t => IsPlayerSpawnable(t, allowGuidOnly: false))
-            .Where(t => t.Heroes.Contains(hero, StringComparer.OrdinalIgnoreCase) || t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase))
+            .Where(t => t.Heroes.Contains(hero, StringComparer.OrdinalIgnoreCase)
+                     || (includeCommon && t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase))
+                     || (t.IsCustomModCard && t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase)
+                         && !t.Tags.Contains("Loot", StringComparer.OrdinalIgnoreCase)))
             .ToList();
 
     /// <summary>遭遇池：EventEncounter / CombatEncounter / PedestalEncounter（自动过滤缺失资产/Never/未汉化卡）。</summary>
@@ -1214,9 +1277,6 @@ public sealed class CardPool
             || name.Contains("Greenheart", StringComparison.OrdinalIgnoreCase)
             || name.StartsWith("Trophy Hunt", StringComparison.OrdinalIgnoreCase)
             || name.StartsWith("Partner Portal - Forja", StringComparison.OrdinalIgnoreCase)
-            || name.StartsWith("Test Subject Alpha", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(name, "The Tester", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(name, "Eating Contest", StringComparison.OrdinalIgnoreCase)
             || NonHourlyMilestoneEnchantPedestalNames.Contains(name);
     }
 
@@ -1224,13 +1284,14 @@ public sealed class CardPool
     /// 技能池：Type=Skill（通过资产白名单与中文词库校验）。
     /// V13.1 问题 #5：官方全职业通用技能已在 Heroes 中显式列全全部 8 英雄，
     /// 而 Heroes==["Common"] 的 124 张活跃技能中 123 张为野怪专属技能；
-    /// 因此默认仅返回匹配当前英雄的干净技能池，仅当 <paramref name="includeMonsterCommon"/> 为 true 时才放行 Common。
+    /// P0-23：默认隔离原版 Common 野怪技能，但始终放行通用自定义 Mod 技能（IsCustomModCard &amp;&amp; Common 或 IsUniversalCustomSkill）。
     /// </summary>
     public List<CardTemplate> Skills(string hero, bool includeMonsterCommon = false)
         => OfType("Skill")
             .Where(t => IsPlayerSpawnable(t, allowGuidOnly: false))
             .Where(t => t.Heroes.Contains(hero, StringComparer.OrdinalIgnoreCase)
-                     || (includeMonsterCommon && t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase)))
+                     || t.IsUniversalCustomSkill
+                     || ((includeMonsterCommon || t.IsCustomModCard) && t.Heroes.Contains("Common", StringComparer.OrdinalIgnoreCase)))
             .ToList();
 
     // ── 抽样 ────────────────────────────────────────────────────────────────
@@ -1341,12 +1402,52 @@ public sealed class CardPool
     private static HashSet<string> CollectRepositoryReferencedCardIds(GameDataRepository repo)
     {
         var refs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        static void AddCardRef(string? candidate, string selfId, GameDataRepository r, HashSet<string> sink)
+        {
+            if (string.IsNullOrWhiteSpace(candidate)) return;
+            if (candidate.Equals(selfId, StringComparison.OrdinalIgnoreCase)) return;
+            // D3-P2-07：除 36 位标准 GUID 外，兼容非 36 位逻辑 ID（如 Mod 自定义卡 ID）只要在 repo.CardsById 登记即纳入引用集
+            bool isGuid = candidate.Length == 36 && Guid.TryParse(candidate, out _);
+            if (isGuid || r.CardsById.ContainsKey(candidate))
+                sink.Add(candidate);
+        }
+
+        // D2-P2-01：补扫全库 LevelUps 奖励树与 Monsters 装备/技能/插槽引用
+        foreach (var lv in repo.LevelUps.Values)
+        {
+            if (lv?.Rewards != null)
+                CollectRuleNodeGuidRefs(lv.Rewards, string.Empty, repo, refs);
+        }
+
+        foreach (var m in repo.MonstersById.Values)
+        {
+            if (m?.Player == null) continue;
+            if (m.Player.Hand?.Items != null)
+                foreach (var it in m.Player.Hand.Items) AddCardRef(it.TemplateId, string.Empty, repo, refs);
+            if (m.Player.Stash?.Items != null)
+                foreach (var it in m.Player.Stash.Items) AddCardRef(it.TemplateId, string.Empty, repo, refs);
+            if (m.Player.Skills != null)
+                foreach (var sk in m.Player.Skills) AddCardRef(sk.TemplateId, string.Empty, repo, refs);
+            foreach (var se in m.Player.GetEffectiveSocketEffects())
+                AddCardRef(se.TemplateId, string.Empty, repo, refs);
+        }
+
         foreach (var card in repo.CardsById.Values)
         {
             if (card == null) continue;
             string selfId = card.Id;
+            AddCardRef(card.NewSetIdOnExit, selfId, repo, refs);
+            if (card.Behavior != null)
+                CollectRuleNodeGuidRefs(card.Behavior, selfId, repo, refs);
+            if (card.SelectionCriteria != null)
+                CollectRuleNodeGuidRefs(card.SelectionCriteria, selfId, repo, refs);
+            if (card.SelectionRequirements != null)
+                CollectRuleNodeGuidRefs(card.SelectionRequirements, selfId, repo, refs);
+            if (card.CombatantType != null)
+                CollectRuleNodeGuidRefs(card.CombatantType, selfId, repo, refs);
             if (card.SelectionContext?.SpawnContext != null)
-                CollectRuleNodeGuidRefs(card.SelectionContext.SpawnContext, selfId, refs);
+                CollectRuleNodeGuidRefs(card.SelectionContext.SpawnContext, selfId, repo, refs);
             if (card.SelectionContext?.Rules?.NextEncounterOnExit is { } exitElem)
             {
                 CollectJsonGuidRefs(exitElem.GetRawText(), selfId, refs);
@@ -1354,25 +1455,22 @@ public sealed class CardPool
             if (card.NextEncounterOnSelection != null)
             {
                 foreach (var opt in card.NextEncounterOnSelection)
-                {
-                    if (!string.IsNullOrWhiteSpace(opt.Id) && !opt.Id.Equals(selfId, StringComparison.OrdinalIgnoreCase))
-                        refs.Add(opt.Id);
-                }
+                    AddCardRef(opt.Id, selfId, repo, refs);
             }
             if (card.RewardVictory?.SpawnContext != null)
-                CollectRuleNodeGuidRefs(card.RewardVictory.SpawnContext, selfId, refs);
+                CollectRuleNodeGuidRefs(card.RewardVictory.SpawnContext, selfId, repo, refs);
             if (card.RewardDefeat?.SpawnContext != null)
-                CollectRuleNodeGuidRefs(card.RewardDefeat.SpawnContext, selfId, refs);
+                CollectRuleNodeGuidRefs(card.RewardDefeat.SpawnContext, selfId, repo, refs);
             if (card.Abilities != null)
             {
                 foreach (var ab in card.Abilities.Values)
                 {
-                    CollectRuleNodeGuidRefs(ab.Trigger, selfId, refs);
-                    CollectRuleNodeGuidRefs(ab.Action, selfId, refs);
+                    CollectRuleNodeGuidRefs(ab.Trigger, selfId, repo, refs);
+                    CollectRuleNodeGuidRefs(ab.Action, selfId, repo, refs);
                     if (ab.Prerequisites != null)
                     {
                         foreach (var p in ab.Prerequisites)
-                            CollectRuleNodeGuidRefs(p, selfId, refs);
+                            CollectRuleNodeGuidRefs(p, selfId, repo, refs);
                     }
                 }
             }
@@ -1380,72 +1478,151 @@ public sealed class CardPool
             {
                 foreach (var au in card.Auras.Values)
                 {
-                    CollectRuleNodeGuidRefs(au.Action, selfId, refs);
+                    CollectRuleNodeGuidRefs(au.Action, selfId, repo, refs);
                     if (au.Prerequisites != null)
                     {
                         foreach (var p in au.Prerequisites)
-                            CollectRuleNodeGuidRefs(p, selfId, refs);
+                            CollectRuleNodeGuidRefs(p, selfId, repo, refs);
                     }
+                }
+            }
+            if (card.Enchantments != null)
+            {
+                foreach (var ench in card.Enchantments.Values)
+                {
+                    if (ench.Abilities != null)
+                    {
+                        foreach (var ab in ench.Abilities.Values)
+                        {
+                            CollectRuleNodeGuidRefs(ab.Trigger, selfId, repo, refs);
+                            CollectRuleNodeGuidRefs(ab.Action, selfId, repo, refs);
+                            if (ab.Prerequisites != null)
+                                foreach (var p in ab.Prerequisites) CollectRuleNodeGuidRefs(p, selfId, repo, refs);
+                        }
+                    }
+                    if (ench.Auras != null)
+                    {
+                        foreach (var au in ench.Auras.Values)
+                        {
+                            CollectRuleNodeGuidRefs(au.Action, selfId, repo, refs);
+                            if (au.Prerequisites != null)
+                                foreach (var p in au.Prerequisites) CollectRuleNodeGuidRefs(p, selfId, repo, refs);
+                        }
+                    }
+                }
+            }
+            if (card.Quests != null)
+            {
+                foreach (var q in card.Quests)
+                {
+                    if (q.Prerequisites != null)
+                        foreach (var p in q.Prerequisites) CollectRuleNodeGuidRefs(p, selfId, repo, refs);
+                    if (q.Entries != null)
+                    {
+                        foreach (var entry in q.Entries)
+                        {
+                            CollectRuleNodeGuidRefs(entry.Trigger, selfId, repo, refs);
+                            if (entry.Prerequisites != null)
+                                foreach (var p in entry.Prerequisites) CollectRuleNodeGuidRefs(p, selfId, repo, refs);
+                            if (entry.Reward?.Abilities != null)
+                            {
+                                foreach (var ab in entry.Reward.Abilities.Values)
+                                {
+                                    CollectRuleNodeGuidRefs(ab.Trigger, selfId, repo, refs);
+                                    CollectRuleNodeGuidRefs(ab.Action, selfId, repo, refs);
+                                }
+                            }
+                            if (entry.Reward?.Auras != null)
+                            {
+                                foreach (var au in entry.Reward.Auras.Values)
+                                    CollectRuleNodeGuidRefs(au.Action, selfId, repo, refs);
+                            }
+                        }
+                    }
+                }
+            }
+            if (card.Transform?.Abilities != null)
+            {
+                foreach (var ab in card.Transform.Abilities.Values)
+                {
+                    CollectRuleNodeGuidRefs(ab.Trigger, selfId, repo, refs);
+                    CollectRuleNodeGuidRefs(ab.Action, selfId, repo, refs);
                 }
             }
         }
         return refs;
     }
 
-    private static void CollectRuleNodeGuidRefs(RuleNode? node, string selfId, HashSet<string> refs)
+    private static void CollectRuleNodeGuidRefs(RuleNode? node, string selfId, GameDataRepository repo, HashSet<string> refs, int depth = 0)
     {
-        if (node == null) return;
+        if (node == null || depth > 24) return;
 
-        void AddIfGuid(string? candidate)
+        void AddIfCardRef(string? candidate)
         {
             if (string.IsNullOrWhiteSpace(candidate)) return;
-            if (candidate.Length == 36 && Guid.TryParse(candidate, out _) &&
-                !candidate.Equals(selfId, StringComparison.OrdinalIgnoreCase))
-            {
+            if (candidate.Equals(selfId, StringComparison.OrdinalIgnoreCase)) return;
+            bool isGuid = candidate.Length == 36 && Guid.TryParse(candidate, out _);
+            if (isGuid || repo.CardsById.ContainsKey(candidate))
                 refs.Add(candidate);
-            }
         }
 
-        AddIfGuid(node.Id);
-        AddIfGuid(node.EncounterId);
-        AddIfGuid(node.MonsterTemplateId);
+        AddIfCardRef(node.Id);
+        AddIfCardRef(node.EncounterId);
+        AddIfCardRef(node.MonsterTemplateId);
         if (node.Ids != null)
         {
-            foreach (string id in node.Ids) AddIfGuid(id);
+            foreach (string id in node.Ids) AddIfCardRef(id);
         }
         if (node.EncounterIds != null)
         {
-            foreach (string id in node.EncounterIds) AddIfGuid(id);
+            foreach (string id in node.EncounterIds) AddIfCardRef(id);
         }
 
-        CollectRuleNodeGuidRefs(node.ReferenceValue, selfId, refs);
-        CollectRuleNodeGuidRefs(node.Target, selfId, refs);
-        CollectRuleNodeGuidRefs(node.TargetPlayer, selfId, refs);
-        CollectRuleNodeGuidRefs(node.TargetCount, selfId, refs);
-        CollectRuleNodeGuidRefs(node.Source, selfId, refs);
-        CollectRuleNodeGuidRefs(node.Subject, selfId, refs);
-        CollectRuleNodeGuidRefs(node.SubjectOther, selfId, refs);
-        CollectRuleNodeGuidRefs(node.Duration, selfId, refs);
-        CollectRuleNodeGuidRefs(node.Cost, selfId, refs);
-        CollectRuleNodeGuidRefs(node.Limit, selfId, refs);
-        CollectRuleNodeGuidRefs(node.SpawnContext, selfId, refs);
-        CollectRuleNodeGuidRefs(node.SelectionContextRules, selfId, refs);
+        int nextDepth = depth + 1;
+        CollectRuleNodeGuidRefs(node.ReferenceValue, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.Target, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.TargetPlayer, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.TargetCount, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.Source, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.Subject, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.SubjectOther, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.Duration, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.Cost, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.Limit, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.SpawnContext, selfId, repo, refs, nextDepth);
+        CollectRuleNodeGuidRefs(node.SelectionContextRules, selfId, repo, refs, nextDepth);
 
+        if (node.Actions != null)
+        {
+            foreach (var a in node.Actions) CollectRuleNodeGuidRefs(a, selfId, repo, refs, nextDepth);
+        }
+        if (node.Triggers != null)
+        {
+            foreach (var t in node.Triggers) CollectRuleNodeGuidRefs(t, selfId, repo, refs, nextDepth);
+        }
+        if (node.Abilities != null)
+        {
+            foreach (var ab in node.Abilities.Values)
+            {
+                CollectRuleNodeGuidRefs(ab.Trigger, selfId, repo, refs, nextDepth);
+                CollectRuleNodeGuidRefs(ab.Action, selfId, repo, refs, nextDepth);
+            }
+        }
         if (node.Groups != null)
         {
-            foreach (var g in node.Groups) CollectRuleNodeGuidRefs(g, selfId, refs);
+            foreach (var g in node.Groups) CollectRuleNodeGuidRefs(g, selfId, repo, refs, nextDepth);
         }
         if (node.Filters != null)
         {
-            foreach (var f in node.Filters) CollectRuleNodeGuidRefs(f, selfId, refs);
+            foreach (var f in node.Filters) CollectRuleNodeGuidRefs(f, selfId, repo, refs, nextDepth);
         }
         if (node.Prerequisites != null)
         {
-            foreach (var p in node.Prerequisites) CollectRuleNodeGuidRefs(p, selfId, refs);
+            foreach (var p in node.Prerequisites) CollectRuleNodeGuidRefs(p, selfId, repo, refs, nextDepth);
         }
         if (node.Behaviors != null)
         {
-            foreach (var b in node.Behaviors) CollectRuleNodeGuidRefs(b, selfId, refs);
+            foreach (var b in node.Behaviors) CollectRuleNodeGuidRefs(b, selfId, repo, refs, nextDepth);
         }
         if (node.RawConditionsElement.HasValue)
             CollectJsonGuidRefs(node.RawConditionsElement.Value.GetRawText(), selfId, refs);
@@ -1515,6 +1692,10 @@ public sealed class CardPool
                 .Where(t => t.Heroes.Any(h => HeroNames.PlayableHeroes.Contains(h, StringComparer.OrdinalIgnoreCase)))
                 .ToList()
             : ownHeroPool;
+        // D6-P1-13：拆分互斥的非本英雄池，确保 CrossHeroOwnHeroBias 精确控制本英雄 vs 他英雄抽签比例（与 SpawnQueryEngine:403-420 语义一致）
+        List<CardTemplate> otherHeroPool = isCrossHero
+            ? crossHeroPool.Where(t => !t.Heroes.Contains(hero, StringComparer.OrdinalIgnoreCase)).ToList()
+            : ownHeroPool;
 
         if (crossHeroPool.Count == 0 && ownHeroPool.Count == 0)
             return new List<(CardTemplate, string)>();
@@ -1553,10 +1734,22 @@ public sealed class CardPool
                     tryOrder.Add(t);
             }
 
-            // 跨职业混池模式：按 40% 本英雄保底 + 60% 全英雄混池分流抽选
-            var activePool = isCrossHero && ownHeroPool.Count > 0 && rng.NextDouble() < ownBias
-                ? ownHeroPool
-                : (crossHeroPool.Count > 0 ? crossHeroPool : ownHeroPool);
+            // D6-P1-13：跨职业混池模式按 ownBias 在互斥的 ownHeroPool / otherHeroPool 之间精确分流
+            List<CardTemplate> activePool;
+            List<CardTemplate> fallbackPool;
+            if (isCrossHero)
+            {
+                bool pickOwn = ownHeroPool.Count > 0 && (otherHeroPool.Count == 0 || (ownBias > 0.0 && rng.NextDouble() < ownBias));
+                activePool = pickOwn ? ownHeroPool : (otherHeroPool.Count > 0 ? otherHeroPool : ownHeroPool);
+                fallbackPool = ReferenceEquals(activePool, ownHeroPool)
+                    ? (otherHeroPool.Count > 0 ? otherHeroPool : crossHeroPool)
+                    : (ownBias > 0.0 ? crossHeroPool : otherHeroPool);
+            }
+            else
+            {
+                activePool = ownHeroPool;
+                fallbackPool = ownHeroPool;
+            }
 
             CardTemplate? picked = null;
             string pickedTier = rolledTier;
@@ -1571,9 +1764,9 @@ public sealed class CardPool
                              && !HasExplicitZeroOrNegativeBuyPrice(c, tier)
                              && IsAllowedByOwnedMaxTiers(c.Id, rolledCoreTier, ownedLookup))
                     .ToList();
-                if (candidates.Count == 0 && isCrossHero && !ReferenceEquals(activePool, crossHeroPool))
+                if (candidates.Count == 0 && isCrossHero && !ReferenceEquals(activePool, fallbackPool))
                 {
-                    candidates = crossHeroPool
+                    candidates = fallbackPool
                         .Where(c => !used.Contains(c.Id)
                                  && TierOrder(c.StartingTier) <= tierOrder
                                  && c.TierAttributes.ContainsKey(tier)

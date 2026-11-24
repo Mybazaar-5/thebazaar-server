@@ -38,7 +38,7 @@ public sealed class DatasetGenOptions
     public int MaxDegreeOfParallelism { get; set; } = Math.Max(1, Environment.ProcessorCount);
 
     /// <summary>输出目录路径。</summary>
-    public string OutputDir { get; set; } = @"e:\thebazaar\output\pvp_dataset";
+    public string OutputDir { get; set; } = Path.Combine("output", "pvp_dataset");
 
     /// <summary>可选自定义 GameData.db 或 GameData.db.zip 路径。</summary>
     public string? DataPath { get; set; }
@@ -46,7 +46,7 @@ public sealed class DatasetGenOptions
     /// <summary>可选自定义 zh-CN.bytes 本地化词库路径。</summary>
     public string? TranslationPath { get; set; }
 
-    /// <summary>可选巴扎罗盘四层真值蒸馏包（compass_distilled.json）路径。</summary>
+    /// <summary>可选外部天梯统计源四层真值蒸馏包（compass_distilled.json）路径。</summary>
     public string? CompassDataPath { get; set; }
 
     /// <summary>若设置则进入真实社区数据导入模式，读取该 JSON/JSONL 路径。</summary>
@@ -147,10 +147,10 @@ public sealed class DatasetGenOptions
         sb.AppendLine("  --benchmarks <N>        每日交叉定级基准对手数（默认 20）");
         sb.AppendLine("  --threads <N>           并发线程数（默认 CPU 核心数）");
         sb.AppendLine("  --seed <N>              全局随机种子（默认 20260501）");
-        sb.AppendLine("  --out <目录>            输出目录（默认 ./output/pvp_dataset）");
+        sb.AppendLine($"  --out <目录>            输出目录（默认 {Path.Combine("output", "pvp_dataset")}）");
         sb.AppendLine("  --data <路径>           自定义 GameData.db / GameData.db.zip 路径");
         sb.AppendLine("  --zh <路径>             自定义 zh-CN.bytes 路径");
-        sb.AppendLine("  --compass <路径>        指定巴扎罗盘四层真值蒸馏包 compass_distilled.json");
+        sb.AppendLine("  --compass <路径>        指定外部天梯统计源四层真值蒸馏包 compass_distilled.json");
         sb.AppendLine("  --import-real <路径>    导入外部脱敏社区玩家数据 JSON/JSONL 至 SQLite");
         sb.AppendLine("  --allow-non-zh          允许缺少官方中文名的卡牌（仅调试用）");
         return sb.ToString();

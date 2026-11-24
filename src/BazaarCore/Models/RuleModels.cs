@@ -58,6 +58,7 @@ public sealed class RuleNode
     public int? DurationInMs { get; set; }
 
     public string? AttributeType { get; set; }
+    public string? CardAttributeType { get; set; }
     public string? AttributeChanged { get; set; }
     public string? Attribute { get; set; }
     public string? AttributeOther { get; set; }
@@ -161,6 +162,12 @@ public sealed class RuleNode
 
     // 线程安全延迟反序列化缓存（避免战斗高频调用重复走 JsonSerializer）
     private static readonly object NullCacheSentinel = new();
+    private static readonly JsonSerializerOptions SelectionRulesJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+    private sealed record SelectionRulesCacheEntry(RuleNode Source, SelectionRulesData? Data);
+    private SelectionRulesCacheEntry? _cachedSelectionRules;
     private object? _cachedValueNode;
     private object? _cachedSingleCondition;
     private object? _cachedConditionList;
@@ -354,6 +361,107 @@ public sealed class RuleNode
         }
         Interlocked.CompareExchange(ref _cachedEnchantments, list, null);
         return Volatile.Read(ref _cachedEnchantments)!;
+    }
+
+    /// <summary>
+    /// P0-01：强类型延迟解析 <see cref="SelectionContextRules"/> 并返回独立深拷贝，
+    /// 保留 <see cref="SelectionContextRules"/> 的原始 <see cref="RuleNode"/> 形态与 <see cref="ExtensionData"/> 兼容性，
+    /// 同时确保消费方修改绝不污染全局共享模板缓存。
+    /// </summary>
+    [JsonIgnore]
+    public SelectionRulesData? ParsedSelectionContextRules => GetSelectionContextRulesData();
+
+    /// <summary>
+    /// P0-01：从 <see cref="SelectionContextRules"/> 的 <see cref="ExtensionData"/> 线程安全解析官方全部 7 项选择规则字段，
+    /// 每次调用均返回独立深拷贝（<see cref="SelectionRulesData.Clone"/>）。
+    /// </summary>
+    public SelectionRulesData? GetSelectionContextRulesData()
+    {
+        var currentNode = SelectionContextRules;
+        if (currentNode == null) return null;
+
+        var cached = Volatile.Read(ref _cachedSelectionRules);
+        if (cached != null && ReferenceEquals(cached.Source, currentNode))
+            return cached.Data?.Clone();
+
+        var parsed = ParseSelectionRulesNode(currentNode);
+        Volatile.Write(ref _cachedSelectionRules, new SelectionRulesCacheEntry(currentNode, parsed));
+        return parsed.Clone();
+    }
+
+    /// <summary>
+    /// P0-01：将强类型 <see cref="SelectionRulesData"/> 构造为携带完整 <see cref="ExtensionData"/> 的 <see cref="RuleNode"/>，
+    /// 与直接读取 <see cref="ExtensionData"/> 的遗留调用方 100% 互通。
+    /// </summary>
+    public static RuleNode FromSelectionRulesData(SelectionRulesData rules)
+    {
+        ArgumentNullException.ThrowIfNull(rules);
+        var ext = new Dictionary<string, JsonElement>(StringComparer.Ordinal)
+        {
+            ["CanSelectMultiple"] = JsonSerializer.SerializeToElement(rules.CanSelectMultiple),
+            ["SelectionIsFree"] = JsonSerializer.SerializeToElement(rules.SelectionIsFree),
+            ["CanExit"] = JsonSerializer.SerializeToElement(rules.CanExit),
+            ["WillAutoSellOnExit"] = JsonSerializer.SerializeToElement(rules.WillAutoSellOnExit)
+        };
+        if (rules.MaxSelections.HasValue)
+            ext["MaxSelections"] = JsonSerializer.SerializeToElement(rules.MaxSelections.Value);
+        if (rules.NextEncounterOnExit.HasValue
+            && rules.NextEncounterOnExit.Value.ValueKind != JsonValueKind.Null
+            && rules.NextEncounterOnExit.Value.ValueKind != JsonValueKind.Undefined)
+        {
+            ext["NextEncounterOnExit"] = rules.NextEncounterOnExit.Value.Clone();
+        }
+        if (rules.RerollRules != null)
+            ext["RerollRules"] = JsonSerializer.SerializeToElement(rules.RerollRules, SelectionRulesJsonOptions);
+
+        return new RuleNode { ExtensionData = ext };
+    }
+
+    private static SelectionRulesData ParseSelectionRulesNode(RuleNode node)
+    {
+        var data = new SelectionRulesData();
+        if (node.ExtensionData == null || node.ExtensionData.Count == 0)
+            return data;
+
+        foreach (var (key, el) in node.ExtensionData)
+        {
+            if (string.Equals(key, "CanSelectMultiple", StringComparison.OrdinalIgnoreCase))
+            {
+                if (el.ValueKind == JsonValueKind.True) data.CanSelectMultiple = true;
+                else if (el.ValueKind == JsonValueKind.False) data.CanSelectMultiple = false;
+            }
+            else if (string.Equals(key, "SelectionIsFree", StringComparison.OrdinalIgnoreCase))
+            {
+                if (el.ValueKind == JsonValueKind.True) data.SelectionIsFree = true;
+                else if (el.ValueKind == JsonValueKind.False) data.SelectionIsFree = false;
+            }
+            else if (string.Equals(key, "CanExit", StringComparison.OrdinalIgnoreCase))
+            {
+                if (el.ValueKind == JsonValueKind.True) data.CanExit = true;
+                else if (el.ValueKind == JsonValueKind.False) data.CanExit = false;
+            }
+            else if (string.Equals(key, "WillAutoSellOnExit", StringComparison.OrdinalIgnoreCase))
+            {
+                if (el.ValueKind == JsonValueKind.True) data.WillAutoSellOnExit = true;
+                else if (el.ValueKind == JsonValueKind.False) data.WillAutoSellOnExit = false;
+            }
+            else if (string.Equals(key, "MaxSelections", StringComparison.OrdinalIgnoreCase))
+            {
+                if (el.ValueKind == JsonValueKind.Number && el.TryGetInt32(out int maxSel))
+                    data.MaxSelections = maxSel;
+            }
+            else if (string.Equals(key, "NextEncounterOnExit", StringComparison.OrdinalIgnoreCase))
+            {
+                if (el.ValueKind != JsonValueKind.Null && el.ValueKind != JsonValueKind.Undefined)
+                    data.NextEncounterOnExit = el.Clone();
+            }
+            else if (string.Equals(key, "RerollRules", StringComparison.OrdinalIgnoreCase))
+            {
+                if (el.ValueKind == JsonValueKind.Object)
+                    data.RerollRules = el.Deserialize<RerollRulesData>(SelectionRulesJsonOptions);
+            }
+        }
+        return data;
     }
 }
 

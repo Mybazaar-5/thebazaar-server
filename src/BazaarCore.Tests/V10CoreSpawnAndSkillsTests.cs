@@ -20,8 +20,8 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V10CoreSpawnAndSkillsTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
 
     private const string JayJayId = "85db60ee-3619-4e39-bfb2-2f4ac56f172b";
     private const string KinaId = "5b7c5fc4-c942-44fe-9ca8-726dc36a2ad6";
@@ -39,16 +39,7 @@ public sealed class V10CoreSpawnAndSkillsTests
     private const string GunpowderId = "3e563d2a-87e7-4e9a-bfa2-3268b27b7447";
 
     private static string ResolveDataPath(string fileName)
-    {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            string candidate = Path.Combine(dir, "dist", "data", fileName);
-            if (File.Exists(candidate)) return candidate;
-            dir = Directory.GetParent(dir)?.FullName;
-        }
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static HashSet<string> BuildValidAssetSet(CardPool pool, GameDataRepository repo)
     {

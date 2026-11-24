@@ -70,7 +70,37 @@ internal static partial class CompatAuditPatch
     private static PropertyInfo _ufColliderEnabledProp;
     private static MethodInfo _ufPhysicsSyncTransformsMethod;
 
-    private static readonly List<object> _tempEnabledLayoutColliders = new(16);
+    /// <summary>D4-P1-8：插件卸载时在主线程释放动态 CJK 字体图集、材质与字体资产 GPU 显存。</summary>
+    internal static void ReleasePrivateCjkFontOnMain()
+    {
+        DestroyTmpFontAssetWithGpuResources(ref _gmcPrivateOsCjkFont);
+        _gmcOsFontAttempted = false;
+    }
+
+    private static void DestroyTmpFontAssetWithGpuResources(ref TMP_FontAsset fa)
+    {
+        if (fa == null) return;
+        try
+        {
+            if (fa.atlasTextures != null)
+            {
+                for (int i = 0; i < fa.atlasTextures.Length; i++)
+                {
+                    if (fa.atlasTextures[i] != null)
+                    {
+                        try { UnityEngine.Object.Destroy(fa.atlasTextures[i]); } catch { }
+                    }
+                }
+            }
+            if (fa.material != null)
+            {
+                try { UnityEngine.Object.Destroy(fa.material); } catch { }
+            }
+            try { UnityEngine.Object.Destroy(fa); } catch { }
+        }
+        catch { }
+        fa = null;
+    }
 
     /// <summary>切场/结束对局/热卸载时递增看门狗序列号，取消全部尚未触发的延迟主线程回调。</summary>
     private static void CancelPendingRunScopedWatchdogs()
@@ -440,11 +470,11 @@ internal static partial class CompatAuditPatch
                         _gmcPrivateOsCjkFont = fa;
                         return fa;
                     }
-                    UnityEngine.Object.Destroy(fa);
+                    DestroyTmpFontAssetWithGpuResources(ref fa);
                 }
                 catch
                 {
-                    if (fa != null) { try { UnityEngine.Object.Destroy(fa); } catch { } }
+                    DestroyTmpFontAssetWithGpuResources(ref fa);
                 }
             }
         }
@@ -494,9 +524,9 @@ internal static partial class CompatAuditPatch
         return true;
     }
 
-    private static void LayoutGuardCardsPrefix(object __instance, object[] __args)
+    private static void LayoutGuardCardsPrefix(object __instance, object[] __args, out List<object> __state)
     {
-        _tempEnabledLayoutColliders.Clear();
+        __state = null;
         try
         {
             if (__args == null || __args.Length == 0 || __args[0] is not IEnumerable list) return;
@@ -522,7 +552,8 @@ internal static partial class CompatAuditPatch
                 if (col != null && _ufColliderEnabledProp.GetValue(col) is bool isEn && !isEn)
                 {
                     _ufColliderEnabledProp.SetValue(col, true);
-                    _tempEnabledLayoutColliders.Add(col);
+                    __state ??= new List<object>(8);
+                    __state.Add(col);
                     anyEnabled = true;
                 }
             }
@@ -540,27 +571,22 @@ internal static partial class CompatAuditPatch
         catch { }
     }
 
-    private static void LayoutGuardCardsPostfix()
+    private static void LayoutGuardCardsPostfix(List<object> __state)
     {
+        // D4-P1-12：不依赖 IsStorageOpen，无条件成对还原 Prefix 临时启用的碰撞体，防止货架/选牌卡片在非储物箱态仍残留误开启碰撞体
         try
         {
-            if (_tempEnabledLayoutColliders.Count == 0) return;
-            bool stashOpen = _dataIsStorageOpenProp?.GetValue(null) is bool open && open;
-            if (stashOpen && _ufColliderEnabledProp != null)
+            if (__state == null || __state.Count == 0 || _ufColliderEnabledProp == null) return;
+            for (int i = 0; i < __state.Count; i++)
             {
-                for (int i = 0; i < _tempEnabledLayoutColliders.Count; i++)
+                var col = __state[i];
+                if (IsUnityObjectAlive(col))
                 {
-                    var col = _tempEnabledLayoutColliders[i];
-                    if (IsUnityObjectAlive(col))
-                        _ufColliderEnabledProp.SetValue(col, false);
+                    _ufColliderEnabledProp.SetValue(col, false);
                 }
             }
         }
         catch { }
-        finally
-        {
-            _tempEnabledLayoutColliders.Clear();
-        }
     }
 
     private static void ProcessCardDealtGeneralWatchdogPostfix()

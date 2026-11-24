@@ -28,17 +28,7 @@ public sealed class DatasetQualityTests
         _output = output;
     }
 
-    private static readonly Lazy<GameDataRepository> Repo = new(() => LoadRepositoryCompat());
-
-    private static GameDataRepository LoadRepositoryCompat()
-    {
-        var twoArg = typeof(GameDatabaseLoader).GetMethod(
-            nameof(GameDatabaseLoader.Load),
-            new[] { typeof(string), typeof(string) });
-        if (twoArg != null)
-            return (GameDataRepository)twoArg.Invoke(null, new object?[] { null, null })!;
-        return GameDatabaseLoader.Load();
-    }
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     [Fact]
     public void ShouldParseCliOptionsProperly()
@@ -114,7 +104,7 @@ public sealed class DatasetQualityTests
                 MaxDay = 15,
                 MinCandidatesPerDayHeroCell = 2,
                 BenchmarkOpponentsPerDay = 8,
-                MaxDegreeOfParallelism = Math.Max(4, Environment.ProcessorCount),
+                MaxDegreeOfParallelism = Math.Min(8, Environment.ProcessorCount),
                 Seed = 12345,
                 OutputDir = tempDir,
                 RequireOfficialZh = false
@@ -275,7 +265,7 @@ public sealed class DatasetQualityTests
             BenchmarkOpponentsPerDay = 20,
             PoolPerDay = 32,
             MinCandidatesPerDayHeroCell = 2,
-            MaxDegreeOfParallelism = Math.Max(4, Environment.ProcessorCount),
+            MaxDegreeOfParallelism = Math.Min(8, Environment.ProcessorCount),
             Seed = 20260501
         };
 
@@ -657,7 +647,7 @@ public sealed class DatasetQualityTests
             return;
 
         string outputDir = Environment.GetEnvironmentVariable("BAZAAR_OUTPUT_DIR")
-            ?? @"e:\thebazaar\output\pvp_dataset";
+            ?? Path.Combine(TestInfrastructure.TestDataLocator.ResolveRepoRoot(), "output", "pvp_dataset");
         Assert.True(Directory.Exists(outputDir), $"生产输出目录不存在: {outputDir}");
 
         var repo = Repo.Value;
@@ -857,7 +847,7 @@ public sealed class DatasetQualityTests
         Assert.True(ExecuteScalarLong(conn, "SELECT COUNT(*) FROM runs") >= minRuns);
         Assert.True(ExecuteScalarLong(conn, "SELECT COUNT(*) FROM day_boards") >= minBoards);
         Assert.True(ExecuteScalarLong(conn, "SELECT COUNT(*) FROM board_items") > 0);
-        Assert.True(ExecuteScalarLong(conn, "SELECT COUNT(*) FROM board_skills") >= 0);
+        Assert.True(ExecuteScalarLong(conn, "SELECT COUNT(*) FROM board_skills") > 0, "多天模拟数据集应包含非空 board_skills 技能记录");
         Assert.Equal(expectedBalancedCount, ExecuteScalarLong(conn, "SELECT COUNT(*) FROM day_boards WHERE is_balanced_pool = 1"));
         if (expectedNaturalCount.HasValue)
             Assert.Equal(expectedNaturalCount.Value, ExecuteScalarLong(conn, "SELECT COUNT(*) FROM day_boards WHERE is_natural_pool = 1"));

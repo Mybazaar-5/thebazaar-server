@@ -25,20 +25,15 @@ using Microsoft.Extensions.Logging;
 
 namespace BazaarCore.Tests;
 
+[Xunit.Collection("GlobalStaticState")]
 public sealed class V8IntegrationTests
 {
     private sealed record Fx(CardPool Pool, List<BazaarServer.Data.MonsterTemplate> Monsters, LevelUpTable LevelUps, GameModeConfig Mode, GameDataRepository Repo, PvpGhostPool Ghosts, CardArchetypeIndex Index);
 
     private static readonly Lazy<Fx> Shared = new(() =>
     {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 10 && !string.IsNullOrEmpty(dir); i++, dir = Directory.GetParent(dir)?.FullName)
-            if (File.Exists(Path.Combine(dir, "dist", "data", "GameData.db"))) { dir = Path.Combine(dir, "dist", "data"); break; }
-        dir ??= @"e:\thebazaar\dist\data";
-        string db = Path.Combine(dir, "GameData.db");
-        var pool = CardPool.Load(db);
-        var repo = GameDatabaseLoader.Load(db, null);
-        return new Fx(pool, MonsterPool.Load(db), LevelUpTable.Load(db), GameModeConfig.Load(db), repo, PvpGhostPool.Load(dir), CardArchetypeIndex.Build(pool, repo));
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
+        return new Fx(shared.Pool, shared.CreateMonstersCopy(), shared.LevelUps, shared.Mode, shared.Repo, shared.Ghosts, shared.ArchetypeIndex);
     });
 
     private sealed class TempDb : IDisposable

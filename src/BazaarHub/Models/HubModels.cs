@@ -1,14 +1,17 @@
+using System.Reflection;
+using BazaarHub.Services;
+
 namespace BazaarHub.Models;
 
 /// <summary>
-/// 服务器连接模式枚举。
+/// 服务器连接模式枚举（保留 0..3 整数值向后兼容既有 hub-settings.json）。
 /// </summary>
 public enum ServerMode
 {
-    /// <summary>远程自建服预设（请在自定义模式填入你的服务器地址）。</summary>
-    CloudTencent = 0,
+    /// <summary>可选外置预设远程服（仅当同级或用户目录存在有效 hub-presets.json 时启用）。</summary>
+    PresetRemote = 0,
 
-    /// <summary>本地单机离线版（http://127.0.0.1:8080）。</summary>
+    /// <summary>本地单机离线版（http://127.0.0.1:8080，开源默认首选）。</summary>
     LocalStandalone = 1,
 
     /// <summary>玩家自定义自建服地址。</summary>
@@ -31,6 +34,7 @@ public sealed class GameInstallInfo
     public bool HasDoorstopConfig { get; init; }
     public bool HasBepInExCore { get; init; }
     public bool HasBazaarLauncherPlugin { get; init; }
+    public bool HasBazaarModSdk { get; init; }
     public bool HasBootConfig { get; init; }
     public bool HasAddressablesSettings { get; init; }
     public string? LauncherPluginVersion { get; init; }
@@ -39,8 +43,13 @@ public sealed class GameInstallInfo
     /// <summary>核心本体文件是否完整。</summary>
     public bool IsValidGameInstall => Exists && HasGameExecutable && HasManagedDirectory;
 
-    /// <summary>BepInEx 与自建服插件是否已就绪。</summary>
-    public bool IsBepInExReady => HasWinhttpProxy && HasBepInExCore && HasBazaarLauncherPlugin;
+    /// <summary>BepInEx 引导与核心自建服插件是否完整就绪（D7-P1-07：补检 doorstop_config.ini 与 BazaarModSdk.dll）。</summary>
+    public bool IsBepInExReady =>
+        HasWinhttpProxy &&
+        HasDoorstopConfig &&
+        HasBepInExCore &&
+        HasBazaarLauncherPlugin &&
+        HasBazaarModSdk;
 
     public string BuildSummaryText()
     {
@@ -53,11 +62,18 @@ public sealed class GameInstallInfo
             ? (HasBazaarLauncherPlugin ? "已安装" : "未安装")
             : $"v{LauncherPluginVersion}";
 
-        string bepState = IsBepInExReady
-            ? $"BepInEx 与插件就绪（BazaarLauncher {pluginVer}）"
-            : "游戏本体有效，但缺少 BepInEx 或 BazaarLauncher.dll";
+        if (IsBepInExReady)
+        {
+            return $"已定位游戏本体 ｜ BepInEx 与插件就绪（BazaarLauncher {pluginVer}）";
+        }
 
-        return $"已定位游戏本体 ｜ {bepState}";
+        var missing = new List<string>();
+        if (!HasWinhttpProxy) missing.Add("winhttp.dll");
+        if (!HasDoorstopConfig) missing.Add("doorstop_config.ini");
+        if (!HasBepInExCore) missing.Add("BepInEx.dll");
+        if (!HasBazaarLauncherPlugin) missing.Add("BazaarLauncher.dll");
+        if (!HasBazaarModSdk) missing.Add("BazaarModSdk.dll");
+        return $"已定位游戏本体 ｜ 缺少引导或核心插件（{string.Join(" / ", missing)}）";
     }
 }
 
@@ -67,7 +83,7 @@ public sealed class GameInstallInfo
 public sealed class LauncherConfigSnapshot
 {
     public bool Enabled { get; set; } = true;
-    public string ServerBase { get; set; } = LauncherConstants.CloudTencentUrl;
+    public string ServerBase { get; set; } = LauncherConstants.LocalStandaloneUrl;
     public bool AcceptServerMods { get; set; } = true;
     public string ConfigPlayerName { get; set; } = string.Empty;
     public string PlayerNameFileValue { get; set; } = string.Empty;
@@ -88,24 +104,26 @@ public sealed class LauncherConfigSnapshot
             : PlayerNameFileValue.Trim();
 
     /// <summary>
-    /// 推断当前对应的服务器模式。
+    /// 推断当前对应的服务器模式（优先匹配本机 8080 单机回环，彻底杜绝远程预设碰撞）。
     /// </summary>
-    public ServerMode InferServerMode()
+    public ServerMode InferServerMode(HubPresetConfig? preset = null)
     {
         if (!Enabled)
         {
             return ServerMode.PureOfficial;
         }
 
-        string normalized = ServerBase.Trim().TrimEnd('/');
-        if (string.Equals(normalized, LauncherConstants.CloudTencentUrl, StringComparison.OrdinalIgnoreCase))
-        {
-            return ServerMode.CloudTencent;
-        }
-
-        if (string.Equals(normalized, LauncherConstants.LocalStandaloneUrl, StringComparison.OrdinalIgnoreCase))
+        string normalized = LauncherConfigService.NormalizeServerUrl(ServerBase);
+        if (string.IsNullOrEmpty(normalized) || HubPresetLoader.IsLocalStandaloneEndpoint(normalized))
         {
             return ServerMode.LocalStandalone;
+        }
+
+        HubPresetConfig activePreset = preset ?? HubPresetRegistry.Current;
+        if (activePreset.HasPresetRemote &&
+            string.Equals(normalized, activePreset.PresetRemoteUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            return ServerMode.PresetRemote;
         }
 
         return ServerMode.CustomServer;
@@ -118,7 +136,7 @@ public sealed class LauncherConfigSnapshot
 public sealed class HubPreferences
 {
     public string LastGameDirectory { get; set; } = string.Empty;
-    public ServerMode SelectedMode { get; set; } = ServerMode.CloudTencent;
+    public ServerMode SelectedMode { get; set; } = ServerMode.LocalStandalone;
     public string CustomServerUrl { get; set; } = "http://127.0.0.1:8080";
     public List<string> SavedCustomServers { get; set; } = new();
     public bool AutoSyncBeforeLaunch { get; set; } = true;
@@ -145,12 +163,40 @@ public sealed class ServerProbeResult
 }
 
 /// <summary>
-/// 全局常量与默认路径约定。
+/// 全局常量与默认路径约定（零私人硬编码 IP）。
 /// </summary>
 public static class LauncherConstants
 {
-    public const string HubVersion = "15.4.0";
-    public const string CloudTencentUrl = "http://127.0.0.1:8080";
+    private const string FallbackHubVersion = "15.4.0";
+
+    /// <summary>
+    /// 启动器版本号（D7-P1-01：动态读取根级 Directory.Build.props 注入的 AssemblyInformationalVersion）。
+    /// </summary>
+    public static string HubVersion { get; } = ResolveHubVersion();
+
+    private static string ResolveHubVersion()
+    {
+        try
+        {
+            string? info = typeof(LauncherConstants).Assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            if (!string.IsNullOrWhiteSpace(info))
+            {
+                int plusIdx = info.IndexOf('+');
+                string clean = (plusIdx > 0 ? info[..plusIdx] : info).Trim();
+                if (!string.IsNullOrWhiteSpace(clean))
+                {
+                    return clean;
+                }
+            }
+        }
+        catch
+        {
+            // 忽略反射异常回退默认版本号
+        }
+        return FallbackHubVersion;
+    }
+
     public const string LocalStandaloneUrl = "http://127.0.0.1:8080";
     public const string LauncherCfgRelativePath = @"BepInEx\config\local.thebazaar.bazaarlauncher.cfg";
     public const string BepInExCfgRelativePath = @"BepInEx\config\BepInEx.cfg";
@@ -160,6 +206,7 @@ public static class LauncherConstants
     public const string ModCacheRelativeDir = @"BepInEx\config\BazaarModCache";
     public const string ZhOverlayRelativePath = @"BepInEx\config\custom_zh_overlay.json";
     public const string BackupRootFolderName = "_BazaarHubBackups";
+    public const string StagingRootFolderName = "_BazaarHubStaging";
     public const string OriginalBackupSubFolder = "original";
     public const string PlayerNameFileName = "player-name.txt";
 }

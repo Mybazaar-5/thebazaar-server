@@ -17,26 +17,20 @@ namespace BazaarCore.Tests;
 /// Wave 2 Batch 2B（遭遇生态、探险闭环、切板演出与野怪初值）全量回归与蒙特卡洛单测：
 /// 覆盖 P0-12、P0-13、P0-14、P0-15、P0-16、P1-01、P1-04、P1-05、P1-22、P1-23、P1-24、P1-25。
 /// </summary>
+[Xunit.Collection("ShopEngineStaticState")]
 public sealed class AuditWave2EncountersTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
     private static readonly Lazy<List<BazaarServer.Data.MonsterTemplate>> Monsters =
-        new(() => MonsterPool.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.CreateMonstersCopy());
     private static readonly Lazy<LevelUpTable> LevelUps =
-        new(() => LevelUpTable.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.LevelUps);
     private static readonly Lazy<GameModeConfig> Mode =
-        new(() => GameModeConfig.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.Mode);
 
     private static string ResolveDataPath(string fileName)
-    {
-        for (string? dir = AppContext.BaseDirectory; dir != null; dir = Directory.GetParent(dir)?.FullName)
-        {
-            string candidate = Path.Combine(dir, "dist", "data", fileName);
-            if (File.Exists(candidate)) return candidate;
-        }
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static (RunState Run, RunEngine Engine) CreateStartedRun(
         EHero hero = EHero.Vanessa,
@@ -815,8 +809,10 @@ public sealed class AuditWave2EncountersTests
         uint[] choiceHours = [1u, 2u, 4u, 5u];
         const int runsPerHero = 1000;
 
-        foreach (var hero in allHeroes)
+        int[] metCounts = new int[allHeroes.Length];
+        Parallel.For(0, allHeroes.Length, new ParallelOptions { MaxDegreeOfParallelism = Math.Min(4, Environment.ProcessorCount) }, hIdx =>
         {
+            var hero = allHeroes[hIdx];
             int metCount = 0;
             for (int r = 0; r < runsPerHero; r++)
             {
@@ -851,7 +847,13 @@ public sealed class AuditWave2EncountersTests
                 }
                 if (met) metCount++;
             }
+            metCounts[hIdx] = metCount;
+        });
 
+        for (int hIdx = 0; hIdx < allHeroes.Length; hIdx++)
+        {
+            var hero = allHeroes[hIdx];
+            int metCount = metCounts[hIdx];
             // Patch 20.2 + BazaarDB 21.3 万局实测：The Travel Agent Day 2–5 日出现率依次为 4.9% / 2.6% / 2.6% / 1.7%，
             // 4 天累计真实遇见率约 ~11.3%（合理蒙特卡洛验收区间 [6%, 20%]）
             double rate = (double)metCount / runsPerHero;
@@ -1235,8 +1237,7 @@ public sealed class AuditWave2EncountersTests
         }
 
         // 2. PvpGhostPool 加载期硬剔演菜 AI 人格，且 Day 1..14 全天期压倒性优先抽中真实玩家盘面
-        string dataDir = Path.GetDirectoryName(ResolveDataPath("GameData.db"))!;
-        var realGhosts = PvpGhostPool.Load(dataDir);
+        var realGhosts = TestInfrastructure.SharedGameDataFixture.Shared.Ghosts;
         Assert.True(realGhosts.Count >= 10000, $"升级后的镜像池应 >= 10,000 条，实际 {realGhosts.Count}");
         var rng = new Random(20261123);
         int realCommHits = 0;

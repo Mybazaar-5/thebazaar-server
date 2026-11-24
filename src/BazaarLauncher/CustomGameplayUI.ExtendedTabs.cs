@@ -68,7 +68,35 @@ internal sealed partial class CustomGameplayUI
     private Transform _socialLeaderboardContainer;
     private string _activeLeaderboardKey = "endless";
     private string _activeChatChannel = "lobby";
-    private CancellationTokenSource _socialSseCts;
+    private sealed class SocialSseHandle
+    {
+        public CancellationTokenSource Cts { get; }
+        private int _disposed;
+
+        public SocialSseHandle(CancellationTokenSource cts)
+        {
+            Cts = cts ?? throw new ArgumentNullException(nameof(cts));
+        }
+
+        public bool IsCancellationRequested
+        {
+            get
+            {
+                if (Volatile.Read(ref _disposed) != 0) return true;
+                try { return Cts.IsCancellationRequested; }
+                catch (ObjectDisposedException) { return true; }
+            }
+        }
+
+        public void CancelAndDisposeOnce()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            try { Cts.Cancel(); } catch { }
+            try { Cts.Dispose(); } catch { }
+        }
+    }
+
+    private SocialSseHandle _socialSseHandle;
     private string _subscribedSseKey = string.Empty;
     private long _lastSocialEventId;
     private readonly List<(long Id, string Channel, string Sender, string Content)> _socialMessages = new();
@@ -159,12 +187,11 @@ internal sealed partial class CustomGameplayUI
     internal void ApplyQuickModeFromNativeLobby(string quickId, string modeId, string presetId, string titleZh)
     {
         _normalRules.EnsureCollections();
-        _normalRules.SpecialModeId = modeId;
-        _normalRules.PresetId = presetId;
-        ApplyLocalPresetDefaults(_normalRules, presetId, modeId);
-        _normalRules.RefreshPowerFlag();
+        _normalRules.ApplyLocalPresetDefaults(presetId, modeId);
         _normalBuf.SyncFromRules(_normalRules);
 
+        // D4-P1-4：进入 Task.Run 前在主线程先深拷贝不可变规则快照，禁止后台直接访问可变 _normalRules
+        var rulesSnapshot = _normalRules.Clone();
         _rulesVersion++;
         MarkHudDirty();
         SetStatus($"正在同步玩法模式「{titleZh}」...", isError: false);
@@ -182,10 +209,10 @@ internal sealed partial class CustomGameplayUI
                 resp = await NameAuth.PostJsonAsync($"/custom-rules/me/preset/{Uri.EscapeDataString(presetId)}", new { presetId, modeId }).ConfigureAwait(false);
             }
 
-            // 向后兼容旧服务端：若快捷端点不存在则回退 PUT /custom-rules/me
+            // 向后兼容旧服务端：若快捷端点不存在则回退 PUT /custom-rules/me（使用主线程不可变快照）
             if (!resp.Ok && (resp.StatusCode == 404 || resp.StatusCode == 405))
             {
-                resp = await NameAuth.PutJsonAsync("/custom-rules/me", _normalRules).ConfigureAwait(false);
+                resp = await NameAuth.PutJsonAsync("/custom-rules/me", rulesSnapshot).ConfigureAwait(false);
             }
 
             _pendingUpdates.Enqueue(() =>
@@ -196,6 +223,7 @@ internal sealed partial class CustomGameplayUI
                     if (srv != null)
                     {
                         _normalRules = srv;
+                        _normalRules.NormalizeBounds();
                         _normalBuf.SyncFromRules(_normalRules);
                     }
                     SetStatus($"已激活玩法「{titleZh}」并同步服务端（开局即生效）", isError: false);
@@ -207,77 +235,13 @@ internal sealed partial class CustomGameplayUI
                     ShowToastBanner($"服务端同步提示：{Truncate(resp.Error, 48)}", isError: true);
                 }
 
+                NativeMenuEmbedModule.Instance?.SyncSelectedQuickModeFromRules(_normalRules.SpecialModeId, _normalRules.PresetId);
                 BazaarLauncherPlugin.Host?.EventBus.Publish(
                     new ActiveRulesUpdatedModEvent(_rulesVersion, _normalRules.SpecialModeId, _normalRules.PresetId, false));
                 MarkHudDirty();
                 if (_isOpen) RefreshModalContentsIfOpen();
             });
         });
-    }
-
-    private static void ApplyLocalPresetDefaults(CustomRunRuleSet rules, string presetId, string modeId)
-    {
-        if (string.Equals(modeId, "SandboxLab", StringComparison.OrdinalIgnoreCase))
-        {
-            rules.StartingGold = 999;
-            rules.StartingIncome = 100;
-            rules.StartingExperience = 0;
-            rules.StartingHealth = 1000;
-            rules.StartingPrestige = 99;
-            rules.SandboxFreeInfiniteReroll = true;
-            rules.ShopHighTierBonusPct = 0.0;
-            rules.ShopPriceMultiplier = 1.0;
-            rules.MonsterLootBonusChoices = 0;
-            rules.MonsterLootTierBonus = 0;
-            rules.EnemyStatMultiplier = 1.0;
-            rules.DisableFatesRevive = false;
-            return;
-        }
-        if (string.Equals(presetId, "EnhancedFun", StringComparison.OrdinalIgnoreCase))
-        {
-            rules.StartingGold = 25;
-            rules.StartingIncome = 7;
-            rules.StartingExperience = 6;
-            rules.StartingPrestige = 25;
-            rules.StartingHealth = 350;
-            rules.MonsterLootChooseOne = true;
-            rules.MonsterLootBonusChoices = 1;
-            rules.MonsterLootTierBonus = 0;
-            rules.ShopHighTierBonusPct = 15.0;
-            rules.ShopPriceMultiplier = 1.0;
-            rules.EnemyStatMultiplier = 1.0;
-            rules.DisableFatesRevive = false;
-            return;
-        }
-        if (string.Equals(presetId, "ExtremeRoguelike", StringComparison.OrdinalIgnoreCase))
-        {
-            rules.StartingGold = 12;
-            rules.StartingIncome = 4;
-            rules.StartingExperience = 3;
-            rules.StartingPrestige = 12;
-            rules.StartingHealth = 220;
-            rules.MonsterLootChooseOne = true;
-            rules.MonsterLootBonusChoices = 0;
-            rules.MonsterLootTierBonus = 1;
-            rules.ShopHighTierBonusPct = 20.0;
-            rules.ShopPriceMultiplier = 1.10;
-            rules.EnemyStatMultiplier = 1.25;
-            rules.DisableFatesRevive = false;
-            return;
-        }
-
-        rules.StartingGold = 15;
-        rules.StartingIncome = 5;
-        rules.StartingExperience = 3;
-        rules.StartingPrestige = 20;
-        rules.StartingHealth = 300;
-        rules.MonsterLootChooseOne = true;
-        rules.MonsterLootBonusChoices = 0;
-        rules.MonsterLootTierBonus = 0;
-        rules.ShopHighTierBonusPct = 0.0;
-        rules.ShopPriceMultiplier = 1.0;
-        rules.EnemyStatMultiplier = 1.0;
-        rules.DisableFatesRevive = false;
     }
 
     // ── 构建三大全新原生级页签（由 BuildModalPanel 调用） ──────────────────────
@@ -791,28 +755,25 @@ internal sealed partial class CustomGameplayUI
         _socialSpectateContainer = _ui.CreateVerticalGroup("SpectateList", specCard.transform, spacing: 4f).transform;
         _socialReplaysContainer = _ui.CreateVerticalGroup("ReplaysList", specCard.transform, spacing: 4f).transform;
 
-        // 4. 模式排行榜
+        // 4. 模式排行榜（D6-P1-11：完整补齐全部 7 榜：无尽/Boss车轮/每日/排位/肉鸽词条/跨职业/锦标赛）
         var lbCard = _ui.CreateCard("SocialLeaderboardCard", _socialTabRoot.transform, NativeUguiFactory.ColCardBg, NativeUguiFactory.ColGoldDim, padH: 14, padV: 10, spacing: 6f);
-        var lbHdr = _ui.CreateHorizontalRow("LbHdr", lbCard.transform, spacing: 6f);
-        var lbTitle = _ui.CreateText("Title", lbHdr.transform, "玩法模式排行榜", 15f, NativeUguiFactory.ColGold, FontStyles.Bold);
-        NativeUguiFactory.SetLayout(lbTitle.gameObject, flexW: 1f, minH: 26f);
+        var lbTitle = _ui.CreateText("Title", lbCard.transform, "玩法模式排行榜（7 大全模式榜单）", 15f, NativeUguiFactory.ColGold, FontStyles.Bold);
+        NativeUguiFactory.SetLayout(lbTitle.gameObject, minH: 24f);
 
-        foreach (var (key, label) in new[]
+        var lbRow1 = _ui.CreateHorizontalRow("LbRow1", lbCard.transform, spacing: 6f);
+        var lbRow2 = _ui.CreateHorizontalRow("LbRow2", lbCard.transform, spacing: 6f);
+        for (int bi = 0; bi < LeaderboardBoards.Length; bi++)
         {
-            ("endless", "无尽爬塔榜"),
-            ("boss_rush", "Boss车轮榜"),
-            ("daily:today", "每日挑战榜"),
-            ("ranked", "赛季排位榜"),
-        })
-        {
-            string k = key;
-            var b = _ui.CreateButton("Lb_" + k, lbHdr.transform, label, 12f,
+            string k = LeaderboardBoards[bi].Key;
+            string label = LeaderboardBoards[bi].LabelZh;
+            Transform rowParent = bi < 4 ? lbRow1.transform : lbRow2.transform;
+            var b = _ui.CreateButton("Lb_" + k, rowParent, label, 12f,
                 NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
                 {
                     _activeLeaderboardKey = k;
                     RefreshLeaderboardAsync();
                 });
-            NativeUguiFactory.SetLayout(b.Root, minW: 92f, prefW: 98f, minH: 26f);
+            NativeUguiFactory.SetLayout(b.Root, minW: 100f, flexW: 1f, minH: 26f);
         }
         _socialLeaderboardContainer = _ui.CreateVerticalGroup("LbList", lbCard.transform, spacing: 4f).transform;
 
@@ -835,6 +796,13 @@ internal sealed partial class CustomGameplayUI
             : _socialRoomNameInput.text.Trim();
         string pwd = _socialRoomPwdInput?.text?.Trim() ?? string.Empty;
 
+        // D4-P1-4：在主线程捕获不可变规则快照，禁止在 Task.Run 后台读取可变 _normalRules / _lobbyRules
+        int capSnap = Math.Clamp(_lobbyRules?.PlayerCap ?? 8, 2, 16);
+        string modeSnap = _normalRules?.SpecialModeId ?? "Standard";
+        string presetSnap = _normalRules?.PresetId ?? "PureOfficial";
+        var mutatorsSnap = _normalRules?.MutatorIds != null ? new List<string>(_normalRules.MutatorIds) : new List<string>();
+        var modsSnap = _lobbyRules?.SelectedModIds != null ? new List<string>(_lobbyRules.SelectedModIds) : new List<string>();
+
         _ = Task.Run(async () =>
         {
             var payload = new
@@ -842,11 +810,11 @@ internal sealed partial class CustomGameplayUI
                 name = roomName,
                 password = string.IsNullOrEmpty(pwd) ? null : pwd,
                 isPublic = true,
-                playerCap = _lobbyRules?.PlayerCap ?? 8,
-                modeId = _normalRules?.SpecialModeId ?? "Standard",
-                presetId = _normalRules?.PresetId ?? "PureOfficial",
-                mutatorIds = _normalRules?.MutatorIds ?? new List<string>(),
-                selectedModIds = _lobbyRules?.SelectedModIds ?? new List<string>(),
+                playerCap = capSnap,
+                modeId = modeSnap,
+                presetId = presetSnap,
+                mutatorIds = mutatorsSnap,
+                selectedModIds = modsSnap,
             };
             var resp = await NameAuth.PostJsonAsync("/lobbies", payload).ConfigureAwait(false);
             _pendingUpdates.Enqueue(() =>
@@ -1125,13 +1093,8 @@ internal sealed partial class CustomGameplayUI
 
     private void StopSocialSse()
     {
-        var cts = Interlocked.Exchange(ref _socialSseCts, null);
-        try
-        {
-            cts?.Cancel();
-            cts?.Dispose();
-        }
-        catch { }
+        var prev = Interlocked.Exchange(ref _socialSseHandle, null);
+        prev?.CancelAndDisposeOnce();
         _subscribedSseKey = string.Empty;
     }
 
@@ -1162,7 +1125,8 @@ internal sealed partial class CustomGameplayUI
         }
 
         string desiredKey = ComputeDesiredSseTopic(out _);
-        if (_socialSseCts == null || _socialSseCts.IsCancellationRequested
+        var current = Volatile.Read(ref _socialSseHandle);
+        if (current == null || current.IsCancellationRequested
             || !string.Equals(_subscribedSseKey, desiredKey, StringComparison.Ordinal))
         {
             EnsureSocialSseSubscribed();
@@ -1175,19 +1139,20 @@ internal sealed partial class CustomGameplayUI
         if (string.IsNullOrWhiteSpace(baseUrl)) return;
 
         string desiredKey = ComputeDesiredSseTopic(out string sseUrl);
-        var existingCts = _socialSseCts;
-        if (existingCts != null && !existingCts.IsCancellationRequested)
+        var existing = Volatile.Read(ref _socialSseHandle);
+        if (existing != null && !existing.IsCancellationRequested
+            && string.Equals(_subscribedSseKey, desiredKey, StringComparison.Ordinal))
         {
-            if (string.Equals(_subscribedSseKey, desiredKey, StringComparison.Ordinal))
-                return;
-            StopSocialSse();
+            return;
         }
 
         _subscribedSseKey = desiredKey;
         Interlocked.Exchange(ref _lastSocialEventId, 0L);
-        var cts = HttpClientHub.CreateLinkedCts();
-        _socialSseCts = cts;
-        var token = cts.Token;
+        var handle = new SocialSseHandle(HttpClientHub.CreateLinkedCts());
+        var token = handle.Cts.Token;
+        // 无论旧句柄是否已请求取消，均通过原子交接确保旧 CTS 必被单次取消释放、零跨代污染零泄漏
+        var prev = Interlocked.Exchange(ref _socialSseHandle, handle);
+        prev?.CancelAndDisposeOnce();
 
         _ = Task.Run(async () =>
         {
@@ -1213,7 +1178,6 @@ internal sealed partial class CustomGameplayUI
                         {
                             if ((int)resp.StatusCode == 404)
                             {
-                                // 房间已解散或不存在，退避等待状态刷新而非高频轰炸
                                 backoffMs = Math.Min(15000, Math.Max(backoffMs * 2, 5000));
                             }
                             else
@@ -1228,10 +1192,29 @@ internal sealed partial class CustomGameplayUI
                         receivedHealthyTraffic = true;
 
                         using var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
-                        using var reader = new StreamReader(stream, Encoding.UTF8);
-                        while (!token.IsCancellationRequested && !reader.EndOfStream)
+                        // D4-P1-5：netstandard2.1 无 ReadLineAsync(ct)，移除同步阻塞的 reader.EndOfStream，
+                        // 注册取消回调主动 Dispose(stream) 即时唤醒挂起的 ReadLineAsync，零线程挂死
+                        using var cancelCloseReg = token.Register(() =>
                         {
-                            string line = await reader.ReadLineAsync().ConfigureAwait(false);
+                            try { stream.Dispose(); } catch { }
+                        });
+                        using var reader = new StreamReader(stream, Encoding.UTF8);
+                        while (!token.IsCancellationRequested)
+                        {
+                            string line;
+                            try
+                            {
+                                line = await reader.ReadLineAsync().ConfigureAwait(false);
+                            }
+                            catch (ObjectDisposedException) when (token.IsCancellationRequested)
+                            {
+                                break;
+                            }
+                            catch (IOException) when (token.IsCancellationRequested)
+                            {
+                                break;
+                            }
+
                             if (line == null) break;
                             if (line.StartsWith("id:", StringComparison.Ordinal))
                             {
@@ -1300,14 +1283,14 @@ internal sealed partial class CustomGameplayUI
             }
             finally
             {
-                // 若本循环因异常/取消退出且仍为当前活跃订阅句柄，释放并置空，杜绝后续订阅永久短路假死
-                if (Interlocked.CompareExchange(ref _socialSseCts, null, cts) == cts)
+                // D4-P1-5：按句柄实例级归属与幂等 CancelAndDisposeOnce 释放，彻底消除跨代竞态与句柄泄漏
+                if (Interlocked.CompareExchange(ref _socialSseHandle, null, handle) == handle)
                 {
                     _subscribedSseKey = string.Empty;
                 }
-                try { cts.Dispose(); } catch { }
+                handle.CancelAndDisposeOnce();
             }
-        }, token);
+        });
     }
 
     private void RefreshSpectateAndReplaysAsync()
@@ -1340,9 +1323,32 @@ internal sealed partial class CustomGameplayUI
                                     string code = (string)(so["WatchCode"] ?? so["Code"] ?? so["watchCode"]) ?? "-";
                                     string name = (string)(so["Name"] ?? so["name"]) ?? code;
                                     int pCount = (so["Players"] as JArray)?.Count ?? 0;
-                                    _ui.CreateText("Spec_" + i, _socialSpectateContainer,
+
+                                    var specRow = _ui.CreateHorizontalRow("SpecRow_" + i, _socialSpectateContainer, spacing: 6f);
+                                    var specTxt = _ui.CreateText("Spec_" + i, specRow.transform,
                                         $"• [实时观战] {name}（观战码 {code}）· 活跃选手 {pCount} 人",
                                         12.5f, NativeUguiFactory.ColEmeraldText);
+                                    NativeUguiFactory.SetLayout(specTxt.gameObject, flexW: 1f, minH: 24f);
+
+                                    // P0-26：观战入口主动调用 /api/mods/active-bindings?watchCode=... 同步该场观战的自定义 Mod 视觉绑定
+                                    string capturedCode = code;
+                                    var syncSpecBtn = _ui.CreateButton("SyncSpec_" + i, specRow.transform, "同步观战Mod", 11.5f,
+                                        NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColGold, () =>
+                                        {
+                                            SetStatus($"正在同步观战房 {capturedCode} 的自定义 Mod 贴图与文案...", false);
+                                            _ = Task.Run(async () =>
+                                            {
+                                                await ModContentSyncClient.Instance.SyncActiveBindingsAsync(
+                                                    watchCode: capturedCode,
+                                                    ct: HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                                                _pendingUpdates.Enqueue(() =>
+                                                {
+                                                    SetStatus($"已同步观战房 {capturedCode} 的活跃 Mod 绑定", false);
+                                                    ShowToastBanner($"已加载观战房 {capturedCode} Mod 视觉");
+                                                });
+                                            });
+                                        }, padH: 8, padV: 2);
+                                    NativeUguiFactory.SetLayout(syncSpecBtn.Root, minW: 96f, prefW: 102f, minH: 24f);
                                 }
                             }
                         }
@@ -1369,22 +1375,89 @@ internal sealed partial class CustomGameplayUI
                             }
                             else
                             {
+                                string viewerAcc = NameAuth.CurrentAccountId;
                                 int cnt = Math.Min(arr.Count, 8);
                                 for (int i = 0; i < cnt; i++)
                                 {
                                     if (arr[i] is not JObject ro) continue;
-                                    string opp = (string)(ro["p2Username"] ?? ro["opponentName"]) ?? "对手";
-                                    string winner = (string)(ro["winnerSide"] ?? ro["winner"]) ?? "-";
+                                    string replayId = (string)(ro["id"] ?? ro["Id"] ?? ro["replayId"]) ?? string.Empty;
+                                    string p1Acc = (string)(ro["p1AccountId"] ?? ro["P1AccountId"]) ?? string.Empty;
+                                    string p2Acc = (string)(ro["p2AccountId"] ?? ro["P2AccountId"]) ?? string.Empty;
+                                    string oppAcc = (string)(ro["opponentAccountId"] ?? ro["OpponentAccountId"]) ?? string.Empty;
+                                    string p1Name = (string)(ro["p1Username"] ?? ro["P1Username"]) ?? string.Empty;
+                                    string p2Name = (string)(ro["p2Username"] ?? ro["P2Username"] ?? ro["opponentName"] ?? ro["OpponentName"]) ?? "对手";
+                                    string winAcc = (string)(ro["winnerAccountId"] ?? ro["WinnerAccountId"]) ?? string.Empty;
+                                    string winSide = (string)(ro["winnerSide"] ?? ro["WinnerSide"] ?? ro["winner"]) ?? string.Empty;
+                                    bool? isDraw = (bool?)(ro["isDraw"] ?? ro["IsDraw"]);
                                     int day = (int?)(ro["day"] ?? ro["Day"]) ?? 1;
                                     string mode = (string)(ro["modeId"] ?? ro["combatType"]) ?? "PVP";
-                                    _ui.CreateText("Rep_" + i, _socialReplaysContainer,
-                                        $"• [第{day}天 {mode}] vs {opp} · 结果: {(winner == "Player1" ? "胜利" : "落败")}",
-                                        12.5f, NativeUguiFactory.ColCream);
+
+                                    // D6-P1-12：按当前查看账号视角精确判定胜/负/平与对手昵称
+                                    var outcome = ReplayOutcomeResolver.ResolvePerspective(
+                                        viewerAcc, p1Acc, p2Acc, oppAcc, p1Name, p2Name, winAcc, winSide, isDraw);
+                                    Color col = outcome.IsDraw
+                                        ? NativeUguiFactory.ColGold
+                                        : (outcome.IsWin ? NativeUguiFactory.ColEmeraldText : NativeUguiFactory.ColCream);
+
+                                    var repRow = _ui.CreateHorizontalRow("RepRow_" + i, _socialReplaysContainer, spacing: 6f);
+                                    var repTxt = _ui.CreateText("Rep_" + i, repRow.transform,
+                                        $"• [第{day}天 {mode}] vs {outcome.OpponentName} · 结果: {outcome.LabelZh}",
+                                        12.5f, col);
+                                    NativeUguiFactory.SetLayout(repTxt.gameObject, flexW: 1f, minH: 24f);
+
+                                    // P0-26：加载历史战报内的视觉绑定快照（兼容 visualBindings / visualBindingsJson）
+                                    if (!string.IsNullOrEmpty(replayId))
+                                    {
+                                        string capturedId = replayId;
+                                        var snapBtn = _ui.CreateButton("RepSnap_" + i, repRow.transform, "载入回放Mod", 11.5f,
+                                            NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
+                                            {
+                                                LoadReplayVisualBindingsByIdAsync(capturedId);
+                                            }, padH: 8, padV: 2);
+                                        NativeUguiFactory.SetLayout(snapBtn.Root, minW: 92f, prefW: 98f, minH: 24f);
+                                    }
                                 }
                             }
                         }
                         catch { }
                     }
+                }
+            });
+        });
+    }
+
+    private void LoadReplayVisualBindingsByIdAsync(string replayId)
+    {
+        if (string.IsNullOrWhiteSpace(replayId)) return;
+        SetStatus($"正在载入历史战报 {replayId} 的自定义 Mod 快照...", false);
+        _ = Task.Run(async () =>
+        {
+            var resp = await NameAuth.GetJsonAsync($"/api/replays/{Uri.EscapeDataString(replayId)}").ConfigureAwait(false);
+            bool appliedSnap = false;
+            if (resp.Ok && !string.IsNullOrWhiteSpace(resp.Body))
+            {
+                try
+                {
+                    var jo = JObject.Parse(resp.Body);
+                    JToken snapTok = jo["visualBindings"] ?? jo["VisualBindings"] ?? jo["visualBindingsJson"] ?? jo["VisualBindingsJson"];
+                    if (snapTok != null)
+                    {
+                        await ModContentSyncClient.Instance.ApplyReplayVisualBindingsSnapshotAsync(
+                            snapTok, HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                        appliedSnap = true;
+                    }
+                }
+                catch { }
+            }
+            _pendingUpdates.Enqueue(() =>
+            {
+                if (!resp.Ok)
+                {
+                    SetStatus("拉取战报详情失败：" + resp.Error, true);
+                }
+                else
+                {
+                    SetStatus(appliedSnap ? $"已载入战报 {replayId} 的自定义卡图快照" : $"战报 {replayId} 未包含额外自定义 Mod 绑定", false);
                 }
             });
         });

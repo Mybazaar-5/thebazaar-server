@@ -1,6 +1,8 @@
+using System.Runtime.CompilerServices;
 using BazaarCore.Combat;
 using BazaarCore.Data;
 using BazaarCore.Models;
+using BazaarCore.Mods;
 using BazaarCore.Runtime;
 using BazaarGameShared.Domain.Core;
 using BazaarGameShared.Domain.Core.Types;
@@ -41,8 +43,10 @@ public static class CombatSimConverter
     private sealed class CardRenderState
     {
         public RunState.CardEntry Entry { get; set; } = null!;
+        public string? CoreTemplateId { get; set; }
         public ECombatantId Owner { get; init; }
         public Dictionary<ECardAttributeType, int> PrevAttributes { get; } = new();
+        public HashSet<ECardAttributeType> PrevExtraAttrKeys { get; } = new();
         public HashSet<ECardTag> PrevTags { get; } = new();
         public HashSet<EHiddenTag> PrevHiddenTags { get; } = new();
         public HashSet<EHero> PrevHeroes { get; } = new();
@@ -53,6 +57,12 @@ public static class CombatSimConverter
         public int LastEmittedCdValue { get; set; } = -1;
         public double LastEmittedCdRate { get; set; } = 1.0;
     }
+
+    /// <summary>
+    /// P0-19（#92-2）：按 <see cref="GameDataRepository"/> 懒构建并缓存官方合法 VFX 白名单
+    /// （合并 ModRuleCatalog.OfficialVfxAliasMap.Values 与原版全库非自定义卡携带的所有 VFXOverrideKey，涵盖全部 131+ 官方特效且零污染 ModRuleCatalog）。
+    /// </summary>
+    private static readonly ConditionalWeakTable<GameDataRepository, HashSet<string>> OfficialVfxKeyWhitelistCache = new();
 
     private sealed class RewardThresholdTracker
     {
@@ -71,8 +81,285 @@ public static class CombatSimConverter
     }
 
     /// <summary>
+    /// P0-40：将规范视角（canonicalP1）的 <see cref="CombatSim"/> 严格深拷贝镜像为对手视角（canonicalP2）。
+    /// - 顶层翻转 Winner/Loser，深拷贝 VfxKeys/PortraitKeys/OpponentHealthThresholdsForGold/Xp，重映射并深拷贝 CardStats；
+    /// - 每帧互换 PlayerUpdates 与 OpponentUpdates（显式深拷贝 IsPlayerDead/Attributes/HealthAdjustments/Portrait）；
+    /// - CardUpdates 逐键重映射并深拷贝全部属性/标签/状态与 Placement（翻转 Owner），战中动态衍生新 ID 不在映射表内时原样透传仅翻阵营；
+    /// - Events 穷举 switch 全部 15 类 ICombatSimEvent 子类并深拷贝翻转所有阵营与卡牌实体 ID，零共享可变引用。
+    /// </summary>
+    public static CombatSim FlipPerspective(
+        CombatSim source,
+        IReadOnlyDictionary<string, string>? cardIdRemap = null)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+
+        static ECombatantId FlipSide(ECombatantId side)
+            => side == ECombatantId.Player ? ECombatantId.Opponent : ECombatantId.Player;
+
+        string RemapId(string id)
+        {
+            if (string.IsNullOrEmpty(id) || cardIdRemap == null)
+                return id;
+            return cardIdRemap.TryGetValue(id, out var mapped) && !string.IsNullOrEmpty(mapped) ? mapped : id;
+        }
+
+        InstanceId RemapInstanceId(InstanceId id)
+        {
+            if (string.IsNullOrEmpty(id.Value)) return id;
+            string mapped = RemapId(id.Value);
+            return string.Equals(mapped, id.Value, StringComparison.Ordinal) ? id : new InstanceId(mapped);
+        }
+
+        InstanceId? RemapNullableInstanceId(InstanceId? id)
+            => id.HasValue ? RemapInstanceId(id.Value) : null;
+
+        IEffectTarget? FlipEffectTarget(IEffectTarget? target) => target switch
+        {
+            null => null,
+            EffectTargetPlayer tp => new EffectTargetPlayer { Target = FlipSide(tp.Target) },
+            EffectTargetCard tc => new EffectTargetCard { Target = RemapInstanceId(tc.Target) },
+            _ => target
+        };
+
+        SimEventCardTransformation CloneAndFlipTransformation(SimEventCardTransformation t)
+            => new(
+                RemapId(t.InstanceId),
+                t.TemplateId,
+                t.Type,
+                FlipSide(t.CombatantId),
+                t.Section,
+                t.Socket);
+
+        static CombatSimPlayerUpdate? ClonePlayerUpdate(CombatSimPlayerUpdate? src)
+        {
+            if (src == null) return null;
+            var dst = new CombatSimPlayerUpdate
+            {
+                IsPlayerDead = src.IsPlayerDead,
+                Portrait = src.Portrait != null
+                    ? new CombatSimPlayerPortraitUpdate { Index = src.Portrait.Index }
+                    : null,
+            };
+            if (src.Attributes != null)
+            {
+                dst.Attributes = new Dictionary<EPlayerAttributeType, CombatSimPlayerAttributeUpdate>(src.Attributes.Count);
+                foreach (var (k, v) in src.Attributes)
+                {
+                    dst.Attributes[k] = new CombatSimPlayerAttributeUpdate
+                    {
+                        AttributeType = v.AttributeType,
+                        PreviousValue = v.PreviousValue,
+                        CurrentValue = v.CurrentValue,
+                    };
+                }
+            }
+            if (src.HealthAdjustments != null)
+            {
+                dst.HealthAdjustments = new List<CombatSimPlayerHealthAdjustment>(src.HealthAdjustments.Count);
+                foreach (var adj in src.HealthAdjustments)
+                {
+                    dst.HealthAdjustments.Add(new CombatSimPlayerHealthAdjustment
+                    {
+                        DamageType = adj.DamageType,
+                        AttributeChanged = adj.AttributeChanged,
+                        Amount = adj.Amount,
+                        IsCrit = adj.IsCrit,
+                        IsDamageReduced = adj.IsDamageReduced,
+                    });
+                }
+            }
+            return dst;
+        }
+
+        CombatSimCardUpdate CloneAndFlipCardUpdate(CombatSimCardUpdate src)
+        {
+            var dst = new CombatSimCardUpdate
+            {
+                CardInstanceId = RemapInstanceId(src.CardInstanceId),
+                Enchantment = src.Enchantment,
+                Size = src.Size,
+                Tier = src.Tier,
+                Heroes = src.Heroes != null ? new HashSet<EHero>(src.Heroes) : null,
+                Tags = src.Tags != null ? new HashSet<ECardTag>(src.Tags) : null,
+                HiddenTags = src.HiddenTags != null ? new HashSet<EHiddenTag>(src.HiddenTags) : null,
+                Placement = src.Placement != null
+                    ? new CardDeltaPlacement
+                    {
+                        Owner = src.Placement.Owner.HasValue ? FlipSide(src.Placement.Owner.Value) : null,
+                        Section = src.Placement.Section,
+                        Socket = src.Placement.Socket,
+                    }
+                    : null,
+                State = src.State != null
+                    ? new CombatSimCardStateUpdate
+                    {
+                        PreviousValue = src.State.PreviousValue,
+                        CurrentValue = src.State.CurrentValue,
+                    }
+                    : null,
+            };
+            if (src.Attributes != null)
+            {
+                dst.Attributes = new Dictionary<ECardAttributeType, CombatSimCardAttributeUpdate>(src.Attributes.Count);
+                foreach (var (k, v) in src.Attributes)
+                {
+                    dst.Attributes[k] = new CombatSimCardAttributeUpdate
+                    {
+                        AttributeType = v.AttributeType,
+                        PreviousValue = v.PreviousValue,
+                        CurrentValue = v.CurrentValue,
+                    };
+                }
+            }
+            return dst;
+        }
+
+        ICombatSimEvent CloneAndFlipEvent(ICombatSimEvent ev) => ev switch
+        {
+            CombatSimEventCombatantDied died => new CombatSimEventCombatantDied
+            {
+                CombatantId = FlipSide(died.CombatantId)
+            },
+            CombatSimEventEffectExecuted exec => new CombatSimEventEffectExecuted
+            {
+                ExecutionContextId = exec.ExecutionContextId,
+                EffectId = exec.EffectId,
+                ActionType = exec.ActionType,
+                VfxIndex = exec.VfxIndex,
+                Source = RemapNullableInstanceId(exec.Source),
+                TriggerSource = RemapNullableInstanceId(exec.TriggerSource),
+                Target = FlipEffectTarget(exec.Target)
+            },
+            CombatSimEventEffectTriggered trig => new CombatSimEventEffectTriggered
+            {
+                ExecutionContextId = trig.ExecutionContextId,
+                EffectId = trig.EffectId,
+                Source = RemapNullableInstanceId(trig.Source),
+                TriggerSource = RemapNullableInstanceId(trig.TriggerSource),
+                Targets = trig.Targets?.Select(t => FlipEffectTarget(t)!).ToList()
+            },
+            CombatSimEventEffectAuraExecuted aura => new CombatSimEventEffectAuraExecuted
+            {
+                ExecutionContextId = aura.ExecutionContextId,
+                EffectId = aura.EffectId,
+                Source = RemapNullableInstanceId(aura.Source),
+                TriggerSource = RemapNullableInstanceId(aura.TriggerSource),
+                AppliedTo = aura.AppliedTo != null
+                    ? new HashSet<IEffectTarget>(aura.AppliedTo.Select(t => FlipEffectTarget(t)!))
+                    : null,
+                RemovedFrom = aura.RemovedFrom != null
+                    ? new HashSet<IEffectTarget>(aura.RemovedFrom.Select(t => FlipEffectTarget(t)!))
+                    : null
+            },
+            CombatSimEventCardTransformed trans => new CombatSimEventCardTransformed(
+                trans.ExecutionContextId,
+                RemapId(trans.OriginalInstanceId),
+                trans.TransformedCards?.Select(CloneAndFlipTransformation).ToList() ?? new List<SimEventCardTransformation>()),
+            CombatSimEventCardTransformReverted rev => new CombatSimEventCardTransformReverted(
+                rev.OriginalCard != null ? CloneAndFlipTransformation(rev.OriginalCard) : null!,
+                rev.TransformedCardInstanceIds?.Select(RemapId).ToList() ?? new List<string>()),
+            CombatSimEventCardEnchanted ench => new CombatSimEventCardEnchanted
+            {
+                InstanceId = RemapId(ench.InstanceId),
+                EnchantmentType = ench.EnchantmentType,
+                IsReverted = ench.IsReverted
+            },
+            CombatSimEventCardQuestUpdated qu => new CombatSimEventCardQuestUpdated(
+                RemapId(qu.InstanceId),
+                qu.QuestGroupIndex,
+                qu.QuestEntryIndex,
+                qu.OldProgress,
+                qu.NewProgress),
+            CombatSimEventCardQuestCompleted qc => new CombatSimEventCardQuestCompleted(
+                RemapId(qc.InstanceId),
+                qc.QuestGroupIndex,
+                qc.QuestEntryIndex),
+            CombatSimEventCardActionCostSpent cost => new CombatSimEventCardActionCostSpent
+            {
+                ExecutingCard = RemapInstanceId(cost.ExecutingCard),
+                PlayerAttributeSpent = cost.PlayerAttributeSpent,
+                CardAttributeSpent = cost.CardAttributeSpent
+            },
+            CombatSimEventCardAttributeDeleted del => new CombatSimEventCardAttributeDeleted
+            {
+                InstanceId = RemapInstanceId(del.InstanceId),
+                AttributeType = del.AttributeType
+            },
+            CombatSimEventSandstormCountdownStarted => new CombatSimEventSandstormCountdownStarted(),
+            CombatSimEventSandstormStarted => new CombatSimEventSandstormStarted(),
+            CombatSimEventMonsterGoldReceived mg => new CombatSimEventMonsterGoldReceived { HealthAmount = mg.HealthAmount },
+            CombatSimEventMonsterXpReceived mx => new CombatSimEventMonsterXpReceived { HealthAmount = mx.HealthAmount },
+            _ => throw new NotSupportedException($"FlipPerspective 遇到未覆盖的 ICombatSimEvent 子类：{ev.GetType().FullName}")
+        };
+
+        var flipped = new CombatSim
+        {
+            Winner = FlipSide(source.Winner),
+            Loser = FlipSide(source.Loser),
+            IsDraw = source.IsDraw,
+            VfxKeys = source.VfxKeys != null ? new List<string>(source.VfxKeys) : new List<string>(),
+            PortraitKeys = source.PortraitKeys != null ? new List<string>(source.PortraitKeys) : new List<string>(),
+            OpponentHealthThresholdsForGold = source.OpponentHealthThresholdsForGold != null
+                ? new List<float>(source.OpponentHealthThresholdsForGold)
+                : new List<float>(),
+            OpponentHealthThresholdsForXp = source.OpponentHealthThresholdsForXp != null
+                ? new List<float>(source.OpponentHealthThresholdsForXp)
+                : new List<float>(),
+            CardStats = new Dictionary<string, Dictionary<ECardStats, int>>(StringComparer.Ordinal),
+        };
+
+        if (source.CardStats != null)
+        {
+            foreach (var (cid, statsDict) in source.CardStats)
+            {
+                string mappedCid = RemapId(cid);
+                flipped.CardStats[mappedCid] = statsDict != null
+                    ? new Dictionary<ECardStats, int>(statsDict)
+                    : new Dictionary<ECardStats, int>();
+            }
+        }
+
+        flipped.Frames.Clear();
+        if (source.Frames != null)
+        {
+            foreach (var sf in source.Frames)
+            {
+                var df = new CombatSimFrame
+                {
+                    PlayerUpdates = ClonePlayerUpdate(sf.OpponentUpdates),
+                    OpponentUpdates = ClonePlayerUpdate(sf.PlayerUpdates),
+                    CardUpdates = new Dictionary<InstanceId, CombatSimCardUpdate>(),
+                    Events = new List<ICombatSimEvent>(sf.Events?.Count ?? 0),
+                };
+
+                if (sf.CardUpdates != null)
+                {
+                    foreach (var (cid, cu) in sf.CardUpdates)
+                    {
+                        var mappedKey = RemapInstanceId(cid);
+                        df.CardUpdates[mappedKey] = CloneAndFlipCardUpdate(cu);
+                    }
+                }
+
+                if (sf.Events != null)
+                {
+                    foreach (var ev in sf.Events)
+                    {
+                        df.Events.Add(CloneAndFlipEvent(ev));
+                    }
+                }
+
+                flipped.Frames.Add(df);
+            }
+        }
+
+        return flipped;
+    }
+
+    /// <summary>
     /// 将战斗模拟结果转换为客户端 <see cref="CombatSim"/> 消息流。
-    /// 保留 6 参数默认签名兼容，支持可选传入 PvE 野怪战金币与经验奖励以生成血条节点与跳币/经验特效。
+    /// 保留 6 参数默认签名兼容，支持可选传入 PvE 野怪战金币与经验奖励以生成血条节点与跳币/经验特效，
+    /// 以及 P0-40 同步 PvP 权威平局覆盖参数 <paramref name="isDrawOverride"/>（同步作用于顶层 IsDraw 与末帧死亡事件判定）。
     /// </summary>
     public static CombatSim ToCombatSim(
         CombatResult result,
@@ -82,14 +369,18 @@ public static class CombatSimConverter
         IReadOnlyList<RunState.CardEntry> playerBoardCards,
         IReadOnlyList<RunState.CardEntry> opponentBoardCards,
         int pveGoldReceived = 0,
-        int pveXpReceived = 0)
+        int pveXpReceived = 0,
+        bool? isDrawOverride = null,
+        Func<string, Guid?>? resolveWireTemplateGuid = null,
+        Action<string, string, Guid>? onRuntimeCardTransformed = null)
     {
+        bool effectiveIsDraw = isDrawOverride ?? result.IsDraw;
         bool playerWon = string.Equals(result.WinnerPlayerId, "player", StringComparison.OrdinalIgnoreCase);
         var sim = new CombatSim
         {
             Winner = playerWon ? ECombatantId.Player : ECombatantId.Opponent,
             Loser = playerWon ? ECombatantId.Opponent : ECombatantId.Player,
-            IsDraw = result.IsDraw,
+            IsDraw = effectiveIsDraw,
         };
         sim.Frames.Clear();
 
@@ -206,7 +497,9 @@ public static class CombatSimConverter
                     vfxKeyMap,
                     simHealthState,
                     ref sandstormCountdownEmitted,
-                    ref sandstormStartedEmitted);
+                    ref sandstormStartedEmitted,
+                    resolveWireTemplateGuid,
+                    onRuntimeCardTransformed);
             }
 
             // 保护客户端 DataExtensions.Update：若本帧存在 HealthAdjustments 且净额与实际 HP 差分不一致，强制携带最终 Health 校准
@@ -223,9 +516,9 @@ public static class CombatSimConverter
                 EmitCrossedMonsterRewards(frame, rewardTracker, result.Player2RemainingHp, forceFlushRemaining: true);
                 EmitPostCombatCleanupIntoFrame(frame, cardEntryByCoreId);
 
-                if (result.IsDraw)
+                if (effectiveIsDraw)
                 {
-                    // 修复 P1-55：平局模式下严格按 IsSimultaneousDeath / IsTimeout 区分双死与超时双存，绝不误把存活方置死
+                    // 修复 P1-55 / P0-40：平局模式下严格按 IsSimultaneousDeath / IsTimeout 区分双死与超时双存，绝不误把存活方置死
                     if (result.IsSimultaneousDeath || (result.Player1RemainingHp <= 0 && result.Player2RemainingHp <= 0))
                     {
                         frame.PlayerUpdates ??= new CombatSimPlayerUpdate();
@@ -324,19 +617,24 @@ public static class CombatSimConverter
     {
         foreach (var e in entries)
         {
+            CardInstance? coreCard = e.CoreCard;
+            if (coreCard == null && coreByEntryId.TryGetValue(e.InstanceId, out var resolvedCore))
+                coreCard = resolvedCore;
+
+            string coreTplId = !string.IsNullOrWhiteSpace(coreCard?.Template?.Id)
+                ? coreCard!.Template.Id
+                : (!string.IsNullOrWhiteSpace(e.CustomCardId) ? e.CustomCardId! : e.TemplateId.ToString());
+
             var state = new CardRenderState
             {
                 Entry = e,
+                CoreTemplateId = coreTplId,
                 Owner = owner,
             };
             foreach (var kv in e.Attributes)
             {
                 state.PrevAttributes[kv.Key] = kv.Value;
             }
-
-            CardInstance? coreCard = e.CoreCard;
-            if (coreCard == null && coreByEntryId.TryGetValue(e.InstanceId, out var resolvedCore))
-                coreCard = resolvedCore;
 
             if (coreCard != null)
             {
@@ -346,7 +644,7 @@ public static class CombatSimConverter
             }
             else
             {
-                var tpl = repo.GetCard(e.TemplateId.ToString());
+                var tpl = ResolveTemplateForCard(repo, state);
                 if (tpl != null)
                 {
                     PopulateParsedEnumSet(tpl.Tags, state.PrevTags);
@@ -514,6 +812,33 @@ public static class CombatSimConverter
                 EmitAttrIfChangedLazy(state, cardId, ref cu, cattr, cval, ref hasUpdate);
         }
 
+        // D2-P1-05：消费 CombatSnapshotExtras 稀疏扩展属性并做差分与归零同步（覆盖 Item 与 Skill）
+        HashSet<ECardAttributeType>? seenExtraKeys = null;
+        if (CombatSnapshotExtras.TryGet(cf, out var extras) && extras != null && extras.Count > 0)
+        {
+            seenExtraKeys = new HashSet<ECardAttributeType>();
+            foreach (var (extraKey, extraVal) in extras)
+            {
+                if (Enum.TryParse<ECardAttributeType>(extraKey, ignoreCase: true, out var attrEnum))
+                {
+                    seenExtraKeys.Add(attrEnum);
+                    state.PrevExtraAttrKeys.Add(attrEnum);
+                    EmitAttrIfChangedLazy(state, cardId, ref cu, attrEnum, extraVal, ref hasUpdate);
+                }
+            }
+        }
+
+        if (state.PrevExtraAttrKeys.Count > 0)
+        {
+            foreach (var trackedAttr in state.PrevExtraAttrKeys)
+            {
+                if (seenExtraKeys == null || !seenExtraKeys.Contains(trackedAttr))
+                {
+                    EmitAttrIfChangedLazy(state, cardId, ref cu, trackedAttr, 0, ref hasUpdate);
+                }
+            }
+        }
+
         // 兼容 Core 侧可能使用 GetAttribute("SellPrice") 或 GetSellPrice() 两种初始价口径，防止把商店售价误归零
         if (!state.SellPriceOffsetResolved)
         {
@@ -651,14 +976,16 @@ public static class CombatSimConverter
         Dictionary<string, int> vfxKeyMap,
         FrameCombatantState simHealthState,
         ref bool sandstormCountdownEmitted,
-        ref bool sandstormStartedEmitted)
+        ref bool sandstormStartedEmitted,
+        Func<string, Guid?>? resolveWireTemplateGuid,
+        Action<string, string, Guid>? onRuntimeCardTransformed)
     {
         switch (ev.Type)
         {
             case CombatEventType.CardFired:
                 if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var srcMeta))
                 {
-                    var tpl = repo.GetCard(srcMeta.Entry.TemplateId.ToString());
+                    var tpl = ResolveTemplateForCard(repo, srcMeta);
                     string effectId = ResolveEffectId(ev, tpl);
                     EActionCommandType act = ResolveActionCommandType(ev, tpl);
                     sim.UpdateStats(srcMeta.Entry.InstanceId, ECardStats.UseCount, 1);
@@ -677,7 +1004,7 @@ public static class CombatSimConverter
                         Source = new InstanceId(srcMeta.Entry.InstanceId),
                         TriggerSource = ResolveTriggerSourceId(ev, srcMeta, cardEntryByCoreId),
                         Target = target,
-                        VfxIndex = ResolveVfxIndex(tpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, sim.VfxKeys),
+                        VfxIndex = ResolveVfxIndex(repo, tpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, sim.VfxKeys, ev.VfxKeyOverride),
                     });
 
                     // 记录本时间点该卡由 CardFired 覆盖的动作，防止主效果重复发射 EffectExecuted
@@ -837,6 +1164,24 @@ public static class CombatSimConverter
                 }
                 break;
 
+            case CombatEventType.BurnRemoved:
+                // D2-P1-05：灼烧净化动作发射 PlayerBurnRemove（属性差分仍由快照驱动，不重复改值）
+                if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var brSrc))
+                {
+                    var targetSide = ParseCombatantSide(ev.TargetPlayerId);
+                    EmitActionExecutionIfNeeded(sim, frame, ev, brSrc, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.PlayerBurnRemove, new EffectTargetPlayer { Target = targetSide }, itemActionCredits, passiveUseRecorded, vfxKeyMap, sim.VfxKeys);
+                }
+                break;
+
+            case CombatEventType.PoisonRemoved:
+                // D2-P1-05：剧毒净化动作发射 PlayerPoisonRemove（属性差分仍由快照驱动，不重复改值）
+                if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var prSrc))
+                {
+                    var targetSide = ParseCombatantSide(ev.TargetPlayerId);
+                    EmitActionExecutionIfNeeded(sim, frame, ev, prSrc, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.PlayerPoisonRemove, new EffectTargetPlayer { Target = targetSide }, itemActionCredits, passiveUseRecorded, vfxKeyMap, sim.VfxKeys);
+                }
+                break;
+
             case CombatEventType.HasteApplied:
                 EmitCardTargetedEffect(sim, frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.CardHaste, passiveUseRecorded, vfxKeyMap, sim.VfxKeys);
                 if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var hSrc))
@@ -891,11 +1236,11 @@ public static class CombatSimConverter
                 break;
 
             case CombatEventType.CardTransformed:
-                HandleCardTransformedEvent(sim, frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, passiveUseRecorded, vfxKeyMap, sim.VfxKeys);
+                HandleCardTransformedEvent(sim, frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, passiveUseRecorded, vfxKeyMap, sim.VfxKeys, resolveWireTemplateGuid, onRuntimeCardTransformed);
                 break;
 
             case CombatEventType.CardTransformReverted:
-                HandleCardTransformRevertedEvent(frame, ev, repo, cardEntryByCoreId);
+                HandleCardTransformRevertedEvent(frame, ev, repo, cardEntryByCoreId, resolveWireTemplateGuid);
                 break;
 
             case CombatEventType.AuraExecuted:
@@ -959,32 +1304,57 @@ public static class CombatSimConverter
                 break;
 
             case CombatEventType.ActionCostSpent:
-                if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var costSrc) &&
-                    string.Equals(ev.Detail, "Tempo", StringComparison.OrdinalIgnoreCase))
+                if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var costSrc) && !string.IsNullOrWhiteSpace(ev.Detail))
                 {
-                    frame.Events.Add(new CombatSimEventCardActionCostSpent
+                    string costToken = ev.Detail.Trim();
+                    if (string.Equals(costToken, "Tempo", StringComparison.OrdinalIgnoreCase))
                     {
-                        ExecutingCard = new InstanceId(costSrc.Entry.InstanceId),
-                        PlayerAttributeSpent = EPlayerAttributeType.Tempo,
-                        CardAttributeSpent = null,
-                    });
-                    // P0-11：同步发射 PlayerTempoRemove 动作事件（Target 指向消费方玩家），触发 BoardUIController.OnEffectExecuted -> PlayActiveTempoSpendBurst()
-                    var costTpl = repo.GetCard(costSrc.Entry.TemplateId.ToString());
-                    string costEffectId = ResolveEffectId(ev, costTpl);
-                    frame.Events.Add(new CombatSimEventEffectExecuted
+                        frame.Events.Add(new CombatSimEventCardActionCostSpent
+                        {
+                            ExecutingCard = new InstanceId(costSrc.Entry.InstanceId),
+                            PlayerAttributeSpent = EPlayerAttributeType.Tempo,
+                            CardAttributeSpent = null,
+                        });
+                        // P0-11：同步发射 PlayerTempoRemove 动作事件（Target 指向消费方玩家），触发 BoardUIController.OnEffectExecuted -> PlayActiveTempoSpendBurst()
+                        var costTpl = ResolveTemplateForCard(repo, costSrc);
+                        string costEffectId = ResolveEffectId(ev, costTpl);
+                        frame.Events.Add(new CombatSimEventEffectExecuted
+                        {
+                            ExecutionContextId = ResolveExecutionContextId(ev, frameIndex, eventSeq, "ctx_tempo"),
+                            EffectId = costEffectId,
+                            ActionType = EActionCommandType.PlayerTempoRemove,
+                            Source = new InstanceId(costSrc.Entry.InstanceId),
+                            TriggerSource = ResolveTriggerSourceId(ev, costSrc, cardEntryByCoreId),
+                            Target = new EffectTargetPlayer { Target = costSrc.Owner },
+                            VfxIndex = ResolveVfxIndex(repo, costTpl, costEffectId, costSrc.Entry.Enchantment, vfxKeyMap, sim.VfxKeys, ev.VfxKeyOverride),
+                        });
+                        TryRecordPassiveUseCount(sim, ev, costSrc, passiveUseRecorded);
+                        int spent = Math.Max(0, (int)Math.Round(ev.Value));
+                        if (spent > 0)
+                            sim.UpdateStats(costSrc.Entry.InstanceId, ECardStats.TempoSpent, spent);
+                    }
+                    else if (Enum.TryParse<EPlayerAttributeType>(costToken, ignoreCase: true, out var playerCostAttr))
                     {
-                        ExecutionContextId = ResolveExecutionContextId(ev, frameIndex, eventSeq, "ctx_tempo"),
-                        EffectId = costEffectId,
-                        ActionType = EActionCommandType.PlayerTempoRemove,
-                        Source = new InstanceId(costSrc.Entry.InstanceId),
-                        TriggerSource = ResolveTriggerSourceId(ev, costSrc, cardEntryByCoreId),
-                        Target = new EffectTargetPlayer { Target = costSrc.Owner },
-                        VfxIndex = ResolveVfxIndex(costTpl, costEffectId, costSrc.Entry.Enchantment, vfxKeyMap, sim.VfxKeys, ev.VfxKeyOverride),
-                    });
-                    TryRecordPassiveUseCount(sim, ev, costSrc, passiveUseRecorded);
-                    int spent = Math.Max(0, (int)Math.Round(ev.Value));
-                    if (spent > 0)
-                        sim.UpdateStats(costSrc.Entry.InstanceId, ECardStats.TempoSpent, spent);
+                        // D2-P1-05：解除仅限 Tempo 限制，支持任意玩家资源消耗（如 Health/Shield/Gold/Rage/Joy）
+                        frame.Events.Add(new CombatSimEventCardActionCostSpent
+                        {
+                            ExecutingCard = new InstanceId(costSrc.Entry.InstanceId),
+                            PlayerAttributeSpent = playerCostAttr,
+                            CardAttributeSpent = null,
+                        });
+                        TryRecordPassiveUseCount(sim, ev, costSrc, passiveUseRecorded);
+                    }
+                    else if (Enum.TryParse<ECardAttributeType>(costToken, ignoreCase: true, out var cardCostAttr))
+                    {
+                        // D2-P1-05：支持任意卡牌自身资源消耗（如 Ammo/Counter/Custom_0 等）
+                        frame.Events.Add(new CombatSimEventCardActionCostSpent
+                        {
+                            ExecutingCard = new InstanceId(costSrc.Entry.InstanceId),
+                            PlayerAttributeSpent = null,
+                            CardAttributeSpent = cardCostAttr,
+                        });
+                        TryRecordPassiveUseCount(sim, ev, costSrc, passiveUseRecorded);
+                    }
                 }
                 break;
 
@@ -1064,11 +1434,34 @@ public static class CombatSimConverter
                         frame.Events.Add(new CombatSimEventSandstormStarted());
                         sandstormStartedEmitted = true;
                     }
-                    int amt = Math.Max(0, (int)Math.Round(ev.Value));
-                    if (amt > 0)
+                    // D1-P2-09：优先消费按玩家拆分的实际减伤后伤害与盾/血明细，避免 100% 减伤或固定减伤下对双方误播原伤
+                    bool hasPerSideSplit = ev.P1SandstormDamage.HasValue || ev.P2SandstormDamage.HasValue;
+                    if (hasPerSideSplit)
                     {
-                        ApplyDamageWithShieldSplit(frame, simHealthState, ECombatantId.Player, EDamageType.Sandstorm, amt, false);
-                        ApplyDamageWithShieldSplit(frame, simHealthState, ECombatantId.Opponent, EDamageType.Sandstorm, amt, false);
+                        int p1Shield = Math.Max(0, ev.P1SandstormShieldAbsorbed);
+                        int p1Hp = Math.Max(0, ev.P1SandstormHpDamage);
+                        int p1Total = Math.Max(0, ev.P1SandstormDamage ?? (p1Shield + p1Hp));
+                        if (p1Shield > 0 || p1Hp > 0)
+                            ApplyExplicitDamageSplit(frame, simHealthState, ECombatantId.Player, EDamageType.Sandstorm, p1Shield, p1Hp, isCrit: false);
+                        else if (p1Total > 0)
+                            ApplyDamageWithShieldSplit(frame, simHealthState, ECombatantId.Player, EDamageType.Sandstorm, p1Total, false);
+
+                        int p2Shield = Math.Max(0, ev.P2SandstormShieldAbsorbed);
+                        int p2Hp = Math.Max(0, ev.P2SandstormHpDamage);
+                        int p2Total = Math.Max(0, ev.P2SandstormDamage ?? (p2Shield + p2Hp));
+                        if (p2Shield > 0 || p2Hp > 0)
+                            ApplyExplicitDamageSplit(frame, simHealthState, ECombatantId.Opponent, EDamageType.Sandstorm, p2Shield, p2Hp, isCrit: false);
+                        else if (p2Total > 0)
+                            ApplyDamageWithShieldSplit(frame, simHealthState, ECombatantId.Opponent, EDamageType.Sandstorm, p2Total, false);
+                    }
+                    else
+                    {
+                        int amt = Math.Max(0, (int)Math.Round(ev.Value));
+                        if (amt > 0)
+                        {
+                            ApplyDamageWithShieldSplit(frame, simHealthState, ECombatantId.Player, EDamageType.Sandstorm, amt, false);
+                            ApplyDamageWithShieldSplit(frame, simHealthState, ECombatantId.Opponent, EDamageType.Sandstorm, amt, false);
+                        }
                     }
                 }
                 break;
@@ -1122,7 +1515,7 @@ public static class CombatSimConverter
         if (!hasSrc && !hasTgt) return;
 
         var effectiveSrc = hasSrc ? srcMeta : tgtMeta;
-        var tpl = repo.GetCard(effectiveSrc.Entry.TemplateId.ToString());
+        var tpl = ResolveTemplateForCard(repo, effectiveSrc);
         string effectId = ResolveEffectId(ev, tpl);
         EActionCommandType act = !string.IsNullOrEmpty(ev.ActionType)
             ? MapActionTypeString(ev.ActionType, ev.Value, defaultAction)
@@ -1141,7 +1534,7 @@ public static class CombatSimConverter
             Source = new InstanceId(effectiveSrc.Entry.InstanceId),
             TriggerSource = ResolveTriggerSourceId(ev, effectiveSrc, cardEntryByCoreId),
             Target = target,
-            VfxIndex = ResolveVfxIndex(tpl, effectId, effectiveSrc.Entry.Enchantment, vfxKeyMap, vfxKeys, ev.VfxKeyOverride),
+            VfxIndex = ResolveVfxIndex(repo, tpl, effectId, effectiveSrc.Entry.Enchantment, vfxKeyMap, vfxKeys, ev.VfxKeyOverride),
         });
         if (hasSrc)
             TryRecordPassiveUseCount(sim, ev, srcMeta, passiveUseRecorded);
@@ -1163,7 +1556,7 @@ public static class CombatSimConverter
         Dictionary<string, int> vfxKeyMap,
         List<string> vfxKeys)
     {
-        var tpl = repo.GetCard(srcMeta.Entry.TemplateId.ToString());
+        var tpl = ResolveTemplateForCard(repo, srcMeta);
         string effectId = ResolveEffectId(ev, tpl);
         EActionCommandType act = !string.IsNullOrEmpty(ev.ActionType)
             ? MapActionTypeString(ev.ActionType, ev.Value, defaultAction)
@@ -1191,7 +1584,7 @@ public static class CombatSimConverter
             Source = new InstanceId(srcMeta.Entry.InstanceId),
             TriggerSource = ResolveTriggerSourceId(ev, srcMeta, cardEntryByCoreId),
             Target = target,
-            VfxIndex = ResolveVfxIndex(tpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys, ev.VfxKeyOverride),
+            VfxIndex = ResolveVfxIndex(repo, tpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys, ev.VfxKeyOverride),
         });
         TryRecordPassiveUseCount(sim, ev, srcMeta, passiveUseRecorded);
     }
@@ -1245,14 +1638,26 @@ public static class CombatSimConverter
         string? tgtKey = !string.IsNullOrEmpty(ev.TargetCardInstanceId) ? ev.TargetCardInstanceId : ev.SourceCardInstanceId;
         if (!TryResolveCard(cardEntryByCoreId, tgtKey, out var tgtMeta)) return;
 
-        if (TryParseEnchantment(ev.Detail, out var enchType))
+        if (TryParseEnchantmentDetail(ev.Detail, out var enchType, out var restoredEnch))
         {
+            var cardId = new InstanceId(tgtMeta.Entry.InstanceId);
             if (!isReverted)
             {
-                var cardId = new InstanceId(tgtMeta.Entry.InstanceId);
+                tgtMeta.Entry.Enchantment = enchType;
                 var cu = GetOrCreateCardUpdate(frame, cardId);
                 cu.Enchantment = enchType;
                 frame.CardUpdates[cardId] = cu;
+            }
+            else
+            {
+                // D2-P1-05：附魔撤回时同步清除或恢复内部 Entry.Enchantment，防止后续帧按旧附魔查错 VFX
+                tgtMeta.Entry.Enchantment = restoredEnch;
+                if (restoredEnch.HasValue)
+                {
+                    var cu = GetOrCreateCardUpdate(frame, cardId);
+                    cu.Enchantment = restoredEnch.Value;
+                    frame.CardUpdates[cardId] = cu;
+                }
             }
 
             frame.Events.Add(new CombatSimEventCardEnchanted
@@ -1327,15 +1732,15 @@ public static class CombatSimConverter
         InstanceId? trigId = TryResolveInstanceId(cardEntryByCoreId, ev.TriggerSourceCardInstanceId) ?? srcId;
         string auraId = ev.AbilityId ?? string.Empty;
 
-        // P2-01：同步检索 AuraDefinition.VFXConfig.VFXOverrideKey（含 Enchantments.*.Auras）并预注册至 CombatSim.VfxKeys
+        // P2-01 / P0-19：同步检索 AuraDefinition.VFXConfig.VFXOverrideKey（仅查当前持有附魔 + 官方白名单校验）并预注册至 CombatSim.VfxKeys
         if (hasSrcMeta)
         {
-            var srcTpl = repo.GetCard(srcMeta.Entry.TemplateId.ToString());
-            RegisterAuraVfxKeyIfAny(srcTpl, auraId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys, ev.VfxKeyOverride);
+            var srcTpl = ResolveTemplateForCard(repo, srcMeta);
+            RegisterAuraVfxKeyIfAny(repo, srcTpl, auraId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys, ev.VfxKeyOverride);
         }
         else if (!string.IsNullOrWhiteSpace(ev.VfxKeyOverride))
         {
-            RegisterAuraVfxKeyIfAny(null, auraId, null, vfxKeyMap, vfxKeys, ev.VfxKeyOverride);
+            RegisterAuraVfxKeyIfAny(repo, null, auraId, null, vfxKeyMap, vfxKeys, ev.VfxKeyOverride);
         }
 
         frame.Events.Add(new CombatSimEventEffectAuraExecuted
@@ -1353,7 +1758,8 @@ public static class CombatSimConverter
         CombatSimFrame frame,
         CombatEvent ev,
         GameDataRepository repo,
-        Dictionary<string, CardRenderState> cardEntryByCoreId)
+        Dictionary<string, CardRenderState> cardEntryByCoreId,
+        Func<string, Guid?>? resolveWireTemplateGuid)
     {
         string? origKey = !string.IsNullOrEmpty(ev.TargetCardInstanceId) ? ev.TargetCardInstanceId : ev.SourceCardInstanceId;
         if (!TryResolveCard(cardEntryByCoreId, origKey, out var origMeta)) return;
@@ -1398,16 +1804,19 @@ public static class CombatSimConverter
         origMeta.PrevDestroyed = false;
         frame.CardUpdates[origInstId] = origUpdate;
 
-        string origTemplateStr = !string.IsNullOrWhiteSpace(ev.Detail) && Guid.TryParse(ev.Detail, out _)
-            ? ev.Detail
-            : origMeta.Entry.TemplateId.ToString();
-        var origTpl = repo.GetCard(origTemplateStr);
+        string origCoreTemplateId = !string.IsNullOrWhiteSpace(ev.Detail)
+            ? ev.Detail.Trim()
+            : ResolveCoreTemplateId(origMeta);
+        var origTpl = repo.GetCard(origCoreTemplateId) ?? ResolveTemplateForCard(repo, origMeta);
+        origMeta.CoreTemplateId = origCoreTemplateId;
+        Guid origWireGuid = ResolveSafeWireTemplateGuid(origCoreTemplateId, origTpl, origMeta.Entry.TemplateId, repo, resolveWireTemplateGuid);
+        string origWireTemplateStr = origWireGuid != Guid.Empty ? origWireGuid.ToString() : origMeta.Entry.TemplateId.ToString();
         ECardType origType = ParseCoreCardType(origTpl?.Type, origMeta.Entry.Type);
 
         frame.Events.Add(new CombatSimEventCardTransformReverted(
             new SimEventCardTransformation(
                 origMeta.Entry.InstanceId,
-                origTemplateStr,
+                origWireTemplateStr,
                 origType,
                 origMeta.Owner,
                 origMeta.Entry.Section,
@@ -1425,7 +1834,9 @@ public static class CombatSimConverter
         Dictionary<string, CardRenderState> cardEntryByCoreId,
         HashSet<(int TimeMs, string CardInstanceId, string ChainKey)> passiveUseRecorded,
         Dictionary<string, int> vfxKeyMap,
-        List<string> vfxKeys)
+        List<string> vfxKeys,
+        Func<string, Guid?>? resolveWireTemplateGuid,
+        Action<string, string, Guid>? onRuntimeCardTransformed)
     {
         TryParseTransformDetail(ev.Detail, out string? detailOrigOrNewId, out string? newTemplateId, out bool isArrowFormat);
 
@@ -1453,7 +1864,7 @@ public static class CombatSimConverter
 
         // 先构造与变换事件同 ContextId 的 EffectExecuted 弹道（供 TransformManager 提取播动画）
         var srcMeta = TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var sm) ? sm : origMeta;
-        var srcTpl = repo.GetCard(srcMeta.Entry.TemplateId.ToString());
+        var srcTpl = ResolveTemplateForCard(repo, srcMeta);
         string effectId = ResolveEffectId(ev, srcTpl);
         IEffectTarget target = new EffectTargetCard { Target = origInstId };
         frame.Events.Add(new CombatSimEventEffectExecuted
@@ -1464,14 +1875,25 @@ public static class CombatSimConverter
             Source = new InstanceId(srcMeta.Entry.InstanceId),
             TriggerSource = ResolveTriggerSourceId(ev, srcMeta, cardEntryByCoreId),
             Target = target,
-            VfxIndex = ResolveVfxIndex(srcTpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys),
+            VfxIndex = ResolveVfxIndex(repo, srcTpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys, ev.VfxKeyOverride),
         });
         TryRecordPassiveUseCount(sim, ev, srcMeta, passiveUseRecorded);
 
-        if (!Guid.TryParse(newTemplateId, out var newTemplateGuid))
+        if (string.IsNullOrWhiteSpace(newTemplateId))
         {
             return;
         }
+
+        // P0-19：放行非 GUID 自定义模板 ID，通过安全 Wire GUID 映射表/官方同尺寸借壳生成合法 Wire GUID 并触发回调
+        string newCoreTemplateId = newTemplateId.Trim();
+        var newTpl = repo.GetCard(newCoreTemplateId);
+        Guid newWireTemplateGuid = ResolveSafeWireTemplateGuid(newCoreTemplateId, newTpl, origMeta.Entry.TemplateId, repo, resolveWireTemplateGuid);
+        if (newWireTemplateGuid == Guid.Empty)
+        {
+            return;
+        }
+        bool isNativeGuid = Guid.TryParse(newCoreTemplateId, out var parsedNative) && parsedNative != Guid.Empty;
+        newTpl ??= repo.GetCard(newWireTemplateGuid.ToString());
 
         // CombatSimHandler 严格要求 frame.CardUpdates 同时包含原卡和新卡条目，否则抛 KeyNotFoundException
         var origUpdate = GetOrCreateCardUpdate(frame, origInstId);
@@ -1496,7 +1918,6 @@ public static class CombatSimConverter
         }
 
         string newProtoInstId = !string.IsNullOrEmpty(coreReplacementId) ? coreReplacementId : $"trn_{frameIndex}_{eventSeq}";
-        var newTpl = repo.GetCard(newTemplateGuid.ToString());
         ECardType newCardType = ParseCoreCardType(newTpl?.Type, origMeta.Entry.Type);
         ECardSize newSize = newTpl != null ? ParseCoreCardSize(newTpl.Size) : origMeta.Entry.Size;
         ETier newTier = origMeta.Entry.Tier;
@@ -1504,7 +1925,8 @@ public static class CombatSimConverter
         var newEntry = new RunState.CardEntry
         {
             InstanceId = newProtoInstId,
-            TemplateId = newTemplateGuid,
+            TemplateId = newWireTemplateGuid,
+            CustomCardId = isNativeGuid ? null : newCoreTemplateId,
             Type = newCardType,
             Size = newSize,
             Tier = newTier,
@@ -1518,6 +1940,7 @@ public static class CombatSimConverter
         var newState = new CardRenderState
         {
             Entry = newEntry,
+            CoreTemplateId = newCoreTemplateId,
             Owner = origMeta.Owner,
         };
         foreach (var kv in newEntry.Attributes)
@@ -1528,6 +1951,9 @@ public static class CombatSimConverter
         {
             cardEntryByCoreId[coreReplacementId] = newState;
         }
+
+        // P0-19：通知上层（如 RunEngine / RunModContext）为新生成的战中变形实例回写临时视觉绑定
+        onRuntimeCardTransformed?.Invoke(newProtoInstId, newCoreTemplateId, newWireTemplateGuid);
 
         var newInstIdObj = new InstanceId(newProtoInstId);
         var newCardUpdate = GetOrCreateCardUpdate(frame, newInstIdObj);
@@ -1580,7 +2006,7 @@ public static class CombatSimConverter
             {
                 new(
                     newProtoInstId,
-                    newTemplateGuid.ToString(),
+                    newWireTemplateGuid.ToString(),
                     newCardType,
                     origMeta.Owner,
                     origMeta.Entry.Section,
@@ -1598,7 +2024,7 @@ public static class CombatSimConverter
         string? cardKey = !string.IsNullOrEmpty(ev.TargetCardInstanceId) ? ev.TargetCardInstanceId : ev.SourceCardInstanceId;
         if (!TryResolveCard(cardEntryByCoreId, cardKey, out var state)) return;
 
-        var tpl = repo.GetCard(state.Entry.TemplateId.ToString());
+        var tpl = ResolveTemplateForCard(repo, state);
         var (groupIdx, entryIdx, questAttrType, parsedOld, parsedNew) = ResolveQuestLocation(ev.Detail, tpl, (int)Math.Round(ev.Value));
         var progressKey = (state.Entry.InstanceId, groupIdx, entryIdx);
         int oldVal = parsedOld ?? prevQuestProgress.GetValueOrDefault(progressKey, 0);
@@ -1632,7 +2058,7 @@ public static class CombatSimConverter
         string? cardKey = !string.IsNullOrEmpty(ev.TargetCardInstanceId) ? ev.TargetCardInstanceId : ev.SourceCardInstanceId;
         if (!TryResolveCard(cardEntryByCoreId, cardKey, out var state)) return;
 
-        var tpl = repo.GetCard(state.Entry.TemplateId.ToString());
+        var tpl = ResolveTemplateForCard(repo, state);
         var (groupIdx, entryIdx, questAttrType, _, parsedNew) = ResolveQuestLocation(ev.Detail, tpl, (int)Math.Round(ev.Value));
 
         // 若模板定义了任务目标值，确保在 CombatSimEventCardQuestCompleted 之前把 Quest_N 与 QuestCompletedCount 推进到目标值
@@ -2023,11 +2449,153 @@ public static class CombatSimConverter
         return tpl?.Abilities.Keys.FirstOrDefault() ?? string.Empty;
     }
 
+    private static string ResolveCoreTemplateId(CardRenderState state)
+    {
+        if (!string.IsNullOrWhiteSpace(state.CoreTemplateId))
+            return state.CoreTemplateId!;
+        if (!string.IsNullOrWhiteSpace(state.Entry.CoreCard?.Template?.Id))
+            return state.Entry.CoreCard!.Template.Id;
+        if (!string.IsNullOrWhiteSpace(state.Entry.CustomCardId))
+            return state.Entry.CustomCardId!;
+        return state.Entry.TemplateId.ToString();
+    }
+
+    private static CardTemplate? ResolveTemplateForCard(GameDataRepository repo, CardRenderState state)
+    {
+        string coreId = ResolveCoreTemplateId(state);
+        return repo.GetCard(coreId) ?? repo.GetCard(state.Entry.TemplateId.ToString());
+    }
+
+    private static Guid ResolveSafeWireTemplateGuid(
+        string coreTemplateId,
+        CardTemplate? tpl,
+        Guid fallbackOrigGuid,
+        GameDataRepository repo,
+        Func<string, Guid?>? resolveWireTemplateGuid)
+    {
+        if (Guid.TryParse(coreTemplateId, out var directGuid) && directGuid != Guid.Empty)
+            return directGuid;
+
+        if (resolveWireTemplateGuid != null)
+        {
+            var resolved = resolveWireTemplateGuid(coreTemplateId);
+            if (resolved.HasValue && resolved.Value != Guid.Empty)
+                return resolved.Value;
+        }
+
+        // 若目标自定义卡可查到模板，优先按同 Type + Size 匹配官方非自定义模板 GUID 借壳，确保 Unity Addressables 绝不空引用
+        if (tpl != null)
+        {
+            Guid? sameTypeFallback = null;
+            foreach (var cand in repo.CardsById.Values)
+            {
+                if (cand.IsCustomModCard) continue;
+                if (!Guid.TryParse(cand.Id, out var candGuid) || candGuid == Guid.Empty) continue;
+                if (!string.Equals(cand.Type, tpl.Type, StringComparison.OrdinalIgnoreCase)) continue;
+                sameTypeFallback ??= candGuid;
+                if (string.Equals(cand.Size, tpl.Size, StringComparison.OrdinalIgnoreCase))
+                    return candGuid;
+            }
+            if (sameTypeFallback.HasValue)
+                return sameTypeFallback.Value;
+        }
+
+        return fallbackOrigGuid;
+    }
+
+    private static HashSet<string> GetValidOfficialVfxKeySet(GameDataRepository repo)
+    {
+        return OfficialVfxKeyWhitelistCache.GetValue(repo, static r =>
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var preset in ModRuleCatalog.OfficialVfxPresets)
+            {
+                string? official = ModRuleCatalog.ResolveOfficialVfxKey(preset.Id);
+                if (!string.IsNullOrWhiteSpace(official))
+                    set.Add(official.Trim());
+            }
+            // 补充公开别名表中内置于 ModRuleCatalog 的额外官方键（不触碰 ModRuleCatalog.cs）
+            foreach (string extraAlias in new[] { "FireClaw", "Slash" })
+            {
+                string? official = ModRuleCatalog.ResolveOfficialVfxKey(extraAlias);
+                if (!string.IsNullOrWhiteSpace(official))
+                    set.Add(official.Trim());
+            }
+
+            foreach (var tpl in r.CardsById.Values)
+            {
+                if (tpl.IsCustomModCard) continue;
+                CollectTemplateOfficialVfxKeys(tpl, set);
+            }
+
+            return set;
+        });
+    }
+
+    private static void CollectTemplateOfficialVfxKeys(CardTemplate tpl, HashSet<string> sink)
+    {
+        foreach (var ab in tpl.Abilities.Values)
+        {
+            string? key = ab.VFXConfig?.VFXOverrideKey;
+            if (!string.IsNullOrWhiteSpace(key))
+                sink.Add(key.Trim());
+        }
+        foreach (var aura in tpl.Auras.Values)
+        {
+            string? key = aura.VFXConfig?.VFXOverrideKey;
+            if (!string.IsNullOrWhiteSpace(key))
+                sink.Add(key.Trim());
+        }
+        if (tpl.Enchantments != null)
+        {
+            foreach (var ench in tpl.Enchantments.Values)
+            {
+                foreach (var ab in ench.Abilities.Values)
+                {
+                    string? key = ab.VFXConfig?.VFXOverrideKey;
+                    if (!string.IsNullOrWhiteSpace(key))
+                        sink.Add(key.Trim());
+                }
+                foreach (var aura in ench.Auras.Values)
+                {
+                    string? key = aura.VFXConfig?.VFXOverrideKey;
+                    if (!string.IsNullOrWhiteSpace(key))
+                        sink.Add(key.Trim());
+                }
+            }
+        }
+    }
+
+    private static bool TryNormalizeAndValidateOfficialVfxKey(
+        string? rawKey,
+        GameDataRepository repo,
+        out string validKey)
+    {
+        validKey = string.Empty;
+        if (string.IsNullOrWhiteSpace(rawKey))
+            return false;
+
+        string candidate = ModRuleCatalog.ResolveOfficialVfxKey(rawKey) ?? rawKey.Trim();
+        if (string.IsNullOrWhiteSpace(candidate))
+            return false;
+
+        var whitelist = GetValidOfficialVfxKeySet(repo);
+        if (whitelist.TryGetValue(candidate, out var canonical))
+        {
+            validKey = canonical;
+            return true;
+        }
+
+        return false;
+    }
+
     /// <summary>
-    /// 从官方 GameData.db 的 Ability.VFXConfig.VFXOverrideKey（全库 523 项技能、131 种专属弹道/斩击/激光特效）
+    /// 从官方 GameData.db 的 Ability.VFXConfig.VFXOverrideKey（全库 523 项技能、131+ 种专属弹道/斩击/激光特效）
     /// 解析当前动作的专属 VFX 键并登记进 <c>CombatSim.VfxKeys</c>，返回客户端 <c>CombatSimHandler.ExtractFrameEffects</c> 所需的 <c>VfxIndex</c>。
+    /// P0-19：严禁跨附魔回退遍历，且所有候选键均须经 <see cref="ModRuleCatalog.ResolveOfficialVfxKey"/> 归一化并通过官方白名单校验。
     /// </summary>
     private static int? ResolveVfxIndex(
+        GameDataRepository repo,
         CardTemplate? tpl,
         string effectId,
         EEnchantmentType? enchantment,
@@ -2035,50 +2603,33 @@ public static class CombatSimConverter
         List<string> vfxKeys,
         string? explicitOverrideKey = null)
     {
+        string? candidate = null;
         if (!string.IsNullOrWhiteSpace(explicitOverrideKey))
         {
-            string customKey = BazaarCore.Mods.ModRuleCatalog.ResolveOfficialVfxKey(explicitOverrideKey) ?? explicitOverrideKey.Trim();
-            if (!vfxKeyMap.TryGetValue(customKey, out int customIdx))
+            candidate = explicitOverrideKey;
+        }
+        else if (tpl != null && !string.IsNullOrEmpty(effectId))
+        {
+            if (tpl.Abilities.TryGetValue(effectId, out var ab))
             {
-                customIdx = vfxKeys.Count;
-                vfxKeys.Add(customKey);
-                vfxKeyMap[customKey] = customIdx;
+                candidate = ab.VFXConfig?.VFXOverrideKey;
             }
-            return customIdx;
-        }
-        if (tpl == null || string.IsNullOrEmpty(effectId)) return null;
 
-        string? overrideKey = null;
-        if (tpl.Abilities.TryGetValue(effectId, out var ab))
-        {
-            overrideKey = ab.VFXConfig?.VFXOverrideKey;
-        }
-
-        if (string.IsNullOrEmpty(overrideKey) && enchantment.HasValue && tpl.Enchantments != null)
-        {
-            string enchName = enchantment.Value.ToString();
-            if (tpl.Enchantments.TryGetValue(enchName, out var enchData) &&
-                enchData.Abilities.TryGetValue(effectId, out var enchAb))
+            // 仅查当前卡实际持有的附魔，严禁遍历其它无关附魔回退
+            if (string.IsNullOrEmpty(candidate) && enchantment.HasValue && tpl.Enchantments != null)
             {
-                overrideKey = enchAb.VFXConfig?.VFXOverrideKey;
-            }
-        }
-
-        if (string.IsNullOrEmpty(overrideKey) && tpl.Enchantments != null)
-        {
-            foreach (var enchData in tpl.Enchantments.Values)
-            {
-                if (enchData.Abilities.TryGetValue(effectId, out var enchAb) &&
-                    !string.IsNullOrEmpty(enchAb.VFXConfig?.VFXOverrideKey))
+                string enchName = enchantment.Value.ToString();
+                if (tpl.Enchantments.TryGetValue(enchName, out var enchData) &&
+                    enchData.Abilities.TryGetValue(effectId, out var enchAb))
                 {
-                    overrideKey = enchAb.VFXConfig!.VFXOverrideKey;
-                    break;
+                    candidate = enchAb.VFXConfig?.VFXOverrideKey;
                 }
             }
         }
 
-        if (string.IsNullOrWhiteSpace(overrideKey)) return null;
-        string key = overrideKey.Trim();
+        if (!TryNormalizeAndValidateOfficialVfxKey(candidate, repo, out string key))
+            return null;
+
         if (!vfxKeyMap.TryGetValue(key, out int idx))
         {
             idx = vfxKeys.Count;
@@ -2089,9 +2640,10 @@ public static class CombatSimConverter
     }
 
     /// <summary>
-    /// P2-01：从 AuraDefinition.VFXConfig.VFXOverrideKey（含 Enchantments.*.Auras）检索自定义光环特效键并登记至 CombatSim.VfxKeys。
+    /// P2-01 / P0-19：从 AuraDefinition.VFXConfig.VFXOverrideKey（仅查基础光环与当前实际附魔光环）检索官方合法特效键并登记至 CombatSim.VfxKeys。
     /// </summary>
     private static void RegisterAuraVfxKeyIfAny(
+        GameDataRepository repo,
         CardTemplate? tpl,
         string auraId,
         EEnchantmentType? enchantment,
@@ -2099,39 +2651,28 @@ public static class CombatSimConverter
         List<string> vfxKeys,
         string? explicitOverrideKey = null)
     {
-        string? overrideKey = !string.IsNullOrWhiteSpace(explicitOverrideKey) ? explicitOverrideKey : null;
+        string? candidate = !string.IsNullOrWhiteSpace(explicitOverrideKey) ? explicitOverrideKey : null;
 
-        if (string.IsNullOrEmpty(overrideKey) && tpl != null && !string.IsNullOrEmpty(auraId))
+        if (string.IsNullOrEmpty(candidate) && tpl != null && !string.IsNullOrEmpty(auraId))
         {
             if (tpl.Auras.TryGetValue(auraId, out var aura))
-                overrideKey = aura.VFXConfig?.VFXOverrideKey;
+                candidate = aura.VFXConfig?.VFXOverrideKey;
 
-            if (string.IsNullOrEmpty(overrideKey) && enchantment.HasValue && tpl.Enchantments != null)
+            // 仅查当前卡实际持有的附魔，严禁跨附魔回退
+            if (string.IsNullOrEmpty(candidate) && enchantment.HasValue && tpl.Enchantments != null)
             {
                 string enchName = enchantment.Value.ToString();
                 if (tpl.Enchantments.TryGetValue(enchName, out var enchData)
                     && enchData.Auras.TryGetValue(auraId, out var enchAura))
                 {
-                    overrideKey = enchAura.VFXConfig?.VFXOverrideKey;
-                }
-            }
-
-            if (string.IsNullOrEmpty(overrideKey) && tpl.Enchantments != null)
-            {
-                foreach (var enchData in tpl.Enchantments.Values)
-                {
-                    if (enchData.Auras.TryGetValue(auraId, out var enchAura)
-                        && !string.IsNullOrEmpty(enchAura.VFXConfig?.VFXOverrideKey))
-                    {
-                        overrideKey = enchAura.VFXConfig!.VFXOverrideKey;
-                        break;
-                    }
+                    candidate = enchAura.VFXConfig?.VFXOverrideKey;
                 }
             }
         }
 
-        if (string.IsNullOrWhiteSpace(overrideKey)) return;
-        string key = overrideKey.Trim();
+        if (!TryNormalizeAndValidateOfficialVfxKey(candidate, repo, out string key))
+            return;
+
         if (!vfxKeyMap.ContainsKey(key))
         {
             int idx = vfxKeys.Count;
@@ -2323,13 +2864,37 @@ public static class CombatSimConverter
         return fallback;
     }
 
-    private static bool TryParseEnchantment(string? detail, out EEnchantmentType enchantmentType)
+    private static bool TryParseEnchantmentDetail(
+        string? detail,
+        out EEnchantmentType enchantmentType,
+        out EEnchantmentType? restoredEnchantment)
     {
         enchantmentType = default;
+        restoredEnchantment = null;
         if (string.IsNullOrWhiteSpace(detail)) return false;
+
         string token = detail.Trim();
         int sep = token.LastIndexOf(':');
-        if (sep >= 0 && sep + 1 < token.Length) token = token[(sep + 1)..].Trim();
+        if (sep >= 0 && sep + 1 < token.Length)
+            token = token[(sep + 1)..].Trim();
+
+        int arrowIdx = token.IndexOf("->", StringComparison.Ordinal);
+        if (arrowIdx >= 0)
+        {
+            string left = token[..arrowIdx].Trim();
+            string right = token[(arrowIdx + 2)..].Trim();
+            if (!Enum.TryParse(left, ignoreCase: true, out enchantmentType))
+                return false;
+
+            if (!string.IsNullOrEmpty(right) &&
+                !right.Equals("None", StringComparison.OrdinalIgnoreCase) &&
+                Enum.TryParse<EEnchantmentType>(right, ignoreCase: true, out var restored))
+            {
+                restoredEnchantment = restored;
+            }
+            return true;
+        }
+
         return Enum.TryParse(token, ignoreCase: true, out enchantmentType);
     }
 
@@ -2348,7 +2913,8 @@ public static class CombatSimConverter
             string left = trimmed[..arrowIdx].Trim();
             string right = trimmed[(arrowIdx + 2)..].Trim();
             if (!string.IsNullOrEmpty(left)) firstToken = left;
-            if (Guid.TryParse(right, out _)) newTemplateId = right;
+            // P0-19：放行非 GUID 自定义模板 ID（如 "mod:custom_blade"），不再硬拦截 Guid.TryParse
+            if (!string.IsNullOrEmpty(right)) newTemplateId = right;
             return newTemplateId != null;
         }
 
@@ -2358,19 +2924,35 @@ public static class CombatSimConverter
             return true;
         }
 
-        string[] parts = trimmed.Split(['|', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        foreach (string p in parts)
+        if (trimmed.IndexOfAny(['|', ',', ';']) >= 0)
         {
-            if (Guid.TryParse(p, out _) && newTemplateId == null)
+            string[] parts = trimmed.Split(['|', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (string p in parts)
             {
-                newTemplateId = p;
+                if (Guid.TryParse(p, out _) && newTemplateId == null)
+                {
+                    newTemplateId = p;
+                }
+                else if (firstToken == null && !p.Equals("-", StringComparison.Ordinal))
+                {
+                    firstToken = p;
+                }
+                else if (newTemplateId == null && !p.Equals("-", StringComparison.Ordinal))
+                {
+                    newTemplateId = p;
+                }
             }
-            else if (firstToken == null && !p.Equals("-", StringComparison.Ordinal))
+            if (newTemplateId == null && firstToken != null)
             {
-                firstToken = p;
+                newTemplateId = firstToken;
+                firstToken = null;
             }
+            return newTemplateId != null;
         }
-        return newTemplateId != null;
+
+        // 单段非 GUID 自定义模板 ID（如 "mod:custom_blade"）
+        newTemplateId = trimmed;
+        return true;
     }
 
     private static (int GroupIdx, int EntryIdx, ECardAttributeType AttrType, int? OldVal, int? NewVal) ResolveQuestLocation(

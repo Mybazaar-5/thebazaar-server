@@ -183,7 +183,7 @@ internal static class CombatPatch
                 object val = _speedMultiplierProp.GetValue(null);
                 if (val is float f && f > 0.1f) return f;
             }
-            catch { }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L186", diagEx); }
         }
         if (_manualUiSpeed > 0.1f) return _manualUiSpeed;
         if (IsFirstFightDay1() && IsFirstFightFastForwardEnabled()) return 3f;
@@ -220,7 +220,7 @@ internal static class CombatPatch
                 _bypassSetSpeedPrefix = false;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L223", diagEx); }
     }
 
     private static void SyncFixedDeltaTimeForSpeed(float speed)
@@ -240,7 +240,7 @@ internal static class CombatPatch
                 Time.fixedDeltaTime = targetFixed;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L243", diagEx); }
     }
 
     private static void UpdateHighResTimer(bool enable)
@@ -267,7 +267,7 @@ internal static class CombatPatch
                                         WinMmTimeEndPeriod(1);
                                     }
                                 }
-                                catch { }
+                                catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L270", diagEx); }
                             };
                         }
                     }
@@ -320,7 +320,7 @@ internal static class CombatPatch
                     _smoothTickerGo = null;
                 }
             }
-            catch { }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L323", diagEx); }
         };
 
         if (Thread.CurrentThread.ManagedThreadId == _mainThreadId)
@@ -427,7 +427,7 @@ internal static class CombatPatch
                 return runState;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L430", diagEx); }
         return null;
     }
 
@@ -745,7 +745,7 @@ internal static class CombatPatch
             {
                 _bypassSetSpeedPrefix = true;
                 try { _setSpeedMethod.Invoke(h, new object[] { 1f, false }); }
-                catch { }
+                catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L748", diagEx); }
                 finally { _bypassSetSpeedPrefix = false; }
             }
             CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: false);
@@ -776,7 +776,7 @@ internal static class CombatPatch
                 __result = true;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L779", diagEx); }
     }
 
     private static void SetSpeedPrefix(object __instance, ref float speed, out float __state)
@@ -825,7 +825,7 @@ internal static class CombatPatch
                 speed = _manualUiSpeed;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L828", diagEx); }
     }
 
     private static void SetSpeedPostfix(float __state)
@@ -837,7 +837,7 @@ internal static class CombatPatch
                 CustomGameplayUI.Instance?.NotifyCombatSpeedChangedOnMain();
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L840", diagEx); }
     }
 
     private static bool IsFirstFightDay1()
@@ -936,7 +936,7 @@ internal static class CombatPatch
                 }
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L939", diagEx); }
     }
 
     private static void OptionsFastForwardChangedPostfix(bool value)
@@ -952,7 +952,7 @@ internal static class CombatPatch
                 BazaarLauncherPlugin.FastForwardFirstFight.Value = value;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L955", diagEx); }
     }
 
     // ── 4. FinalBlowSlowDown 与 GameServiceManager.EnforceMaxTimeScale 守卫 ─
@@ -1005,7 +1005,7 @@ internal static class CombatPatch
                 _finalBlowCurrentStateField.SetValue(null, _finalBlowCompleteEnumVal);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1008", diagEx); }
     }
 
     private static void EnsureGameServiceManagerHandles()
@@ -1053,7 +1053,7 @@ internal static class CombatPatch
                 maximum = 1f;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1056", diagEx); }
     }
 
     private static bool FinalBlowProcessPrefix(int framesLeft)
@@ -1115,7 +1115,7 @@ internal static class CombatPatch
                 _enforceMaxTimeScaleMethod?.Invoke(inst, new object[] { 1f });
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1118", diagEx); }
     }
 
     // ── 5. ReplayState 自动退出回放机制 ──────────────────────────────────────
@@ -1160,13 +1160,13 @@ internal static class CombatPatch
             _replayReadyToExit = false;
             _replayEnteredAt = Time.realtimeSinceStartup;
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1163", diagEx); }
     }
 
     private static void ReplayPostCombatUpdatedPostfix()
     {
         try { _replayReadyToExit = true; }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1169", diagEx); }
     }
 
     /// <summary>由 GameDriver.Update 每帧调用：在战后数据更新且看板/动画空闲时自动退出 ReplayState。</summary>
@@ -1240,7 +1240,7 @@ internal static class CombatPatch
                 hour = Convert.ToUInt32(GameInspector.GetMember(run, "Hour") ?? 0u);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1243", diagEx); }
 
         string appStateName = GameInspector.GetAppStateName();
         bool isPvp = appStateName == "PVPCombatState";
@@ -1288,7 +1288,7 @@ internal static class CombatPatch
                     var title = GameInspector.GetMember(loc, "Title");
                     name = GameInspector.GetMember(title, "Text") as string ?? GameInspector.GetMember(tpl, "InternalName")?.ToString() ?? "";
                 }
-                catch { }
+                catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1291", diagEx); }
 
                 cardTrackers[iid] = new CardTriggerTracker
                 {
@@ -1627,7 +1627,7 @@ internal static class CombatPatch
             }
             _combatEndedListenersAdded = true;
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1630", diagEx); }
     }
 
     internal static void UnregisterStaticCombatEndedListeners()
@@ -1652,7 +1652,7 @@ internal static class CombatPatch
                 }
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1655", diagEx); }
         finally
         {
             _combatEndedListenersAdded = false;
@@ -1663,7 +1663,7 @@ internal static class CombatPatch
     private static void PostCombatVisualCleanupPostfix()
     {
         try { CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: false); }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1666", diagEx); }
     }
 
     /// <summary>
@@ -1672,7 +1672,7 @@ internal static class CombatPatch
     private static void ReplayOnExitVisualCleanupPostfix(Task __result)
     {
         try { CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: false); }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1675", diagEx); }
 
         if (__result != null && !__result.IsCompleted)
         {
@@ -1681,7 +1681,7 @@ internal static class CombatPatch
                 BazaarLauncher.Core.MainThreadDispatcher.Enqueue(() =>
                 {
                     try { CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: true); }
-                    catch { }
+                    catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1684", diagEx); }
                 });
             }, TaskScheduler.Default);
         }
@@ -1699,7 +1699,7 @@ internal static class CombatPatch
                 CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: true);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1702", diagEx); }
     }
 
     private static void CleanupResidualFreezeAndFlyVisuals(bool onlyWhenOutOfCombat)
@@ -1797,7 +1797,7 @@ internal static class CombatPatch
             if (attrs.Contains(attrType) && attrs[attrType] is int iv)
                 return iv;
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1800", diagEx); }
         return 0;
     }
 
@@ -2046,7 +2046,7 @@ internal static class CombatPatch
                     _animSetBoolIntMethod?.Invoke(animObj, new object[] { hash, false });
                 }
             }
-            catch { }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L2049", diagEx); }
         }
     }
 
@@ -2061,7 +2061,7 @@ internal static class CombatPatch
             UnityEngine.Object.DontDestroyOnLoad(_smoothTickerGo);
             _smoothTickerGo.AddComponent<CooldownSmoothTicker>();
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L2064", diagEx); }
     }
 
     private static void ClearSmoothCooldownTracks()
@@ -2214,7 +2214,7 @@ internal static class CombatPatch
                 track.CurrentY = targetY;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L2217", diagEx); }
     }
 
     private static void CooldownEffectShowPostfix(object __instance, bool show)
@@ -2233,7 +2233,7 @@ internal static class CombatPatch
                 _cdTracks.Remove(tr.GetInstanceID());
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L2236", diagEx); }
     }
 
     private static bool IsGameCurrentlyPaused()
@@ -2250,7 +2250,7 @@ internal static class CombatPatch
                     return paused;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L2253", diagEx); }
         return Time.timeScale <= 0.001f;
     }
 
@@ -2375,6 +2375,6 @@ internal static class CombatPatch
             string fusedText = fusedHasAttr ? FormatCooldownSecondsSmart(fusedSec) : string.Empty;
             _cdRendererSetCooldownMethod.Invoke(__instance, new object[] { curText, canFuse && fusedHasAttr, fusedText });
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L2378", diagEx); }
     }
 }

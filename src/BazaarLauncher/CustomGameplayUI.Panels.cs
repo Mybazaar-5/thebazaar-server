@@ -12,6 +12,48 @@ using UnityEngine.UI;
 namespace BazaarLauncher;
 
 /// <summary>
+/// D6-P2-07：零 Unity 依赖的锦标赛成员只读规则与 Mod 同步摘要格式化纯 .NET 内核。
+/// 覆盖 Wave 2-3 倍率（敌方强度/商店价格）、突变词条、禁用遭遇统计及逐 Mod 同步状态，可供纯 .NET 8 单元测试直测。
+/// </summary>
+public static class LobbyMemberRulesSummaryFormatter
+{
+    public static string FormatSummary(
+        string specialMode,
+        string preset,
+        IEnumerable<string> mutators,
+        IEnumerable<string> bannedEncounterIds,
+        IEnumerable<(string ModId, string Status)> modSyncStatuses,
+        double enemyStatMult,
+        double shopPriceMult)
+    {
+        var sb = new System.Text.StringBuilder(256);
+        sb.Append("模式: ").Append(string.IsNullOrWhiteSpace(specialMode) ? "Standard" : specialMode.Trim());
+        sb.Append(" | 预设: ").Append(string.IsNullOrWhiteSpace(preset) ? "PureOfficial" : preset.Trim());
+        sb.Append(" | 敌方倍率: ").Append(enemyStatMult.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)).Append('x');
+        sb.Append(" | 商店价格: ").Append(shopPriceMult.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)).Append('x');
+
+        var mutList = mutators?.Where(m => !string.IsNullOrWhiteSpace(m)).ToList() ?? new List<string>();
+        if (mutList.Count > 0)
+            sb.Append("\n词条: ").Append(string.Join("、", mutList));
+
+        var bannedList = bannedEncounterIds?.Where(b => !string.IsNullOrWhiteSpace(b)).Distinct(StringComparer.OrdinalIgnoreCase).ToList() ?? new List<string>();
+        sb.Append("\n禁用遭遇: ").Append(bannedList.Count).Append(" 项");
+
+        var modList = modSyncStatuses?.Where(m => !string.IsNullOrWhiteSpace(m.ModId)).ToList() ?? new List<(string ModId, string Status)>();
+        if (modList.Count > 0)
+        {
+            sb.Append("\n房间 Mod: ");
+            for (int i = 0; i < modList.Count; i++)
+            {
+                if (i > 0) sb.Append(" | ");
+                sb.Append(modList[i].ModId).Append('[').Append(string.IsNullOrWhiteSpace(modList[i].Status) ? "未知" : modList[i].Status).Append(']');
+            }
+        }
+        return sb.ToString();
+    }
+}
+
+/// <summary>
 /// CustomGameplayUI 原生 uGUI 界面装配与零每帧开销刷新逻辑：
 /// - 全部控件基于 UnityEngine.UI + TextMeshProUGUI 构建；
 /// - 弹窗闭合时 _modalPanelRoot.SetActive(false)，不触发任何布局、字符串拼接或 GC；
@@ -34,7 +76,7 @@ internal sealed partial class CustomGameplayUI
 
         public TMP_InputField ItemSearchInput;
         public NativeUguiFactory.ToggleHandle ItemHeroOnlyToggle;
-        public readonly NativeUguiFactory.ButtonHandle[] ItemTierButtons = new NativeUguiFactory.ButtonHandle[4];
+        public readonly NativeUguiFactory.ButtonHandle[] ItemTierButtons = new NativeUguiFactory.ButtonHandle[Tiers.Length];
         public TextMeshProUGUI ItemEnchantLabel;
         public Transform ItemMatchesContainer;
         public Transform SelectedItemsContainer;
@@ -42,7 +84,7 @@ internal sealed partial class CustomGameplayUI
 
         public TMP_InputField SkillSearchInput;
         public NativeUguiFactory.ToggleHandle SkillHeroOnlyToggle;
-        public readonly NativeUguiFactory.ButtonHandle[] SkillTierButtons = new NativeUguiFactory.ButtonHandle[4];
+        public readonly NativeUguiFactory.ButtonHandle[] SkillTierButtons = new NativeUguiFactory.ButtonHandle[Tiers.Length];
         public Transform SkillMatchesContainer;
         public Transform SelectedSkillsContainer;
         public TextMeshProUGUI SelectedSkillsHeader;
@@ -55,6 +97,26 @@ internal sealed partial class CustomGameplayUI
         public string BuiltSkillMatchesFingerprint = "";
         public string BuiltSelectedItemsFingerprint = "";
         public string BuiltSelectedSkillsFingerprint = "";
+
+        // D6-P1-01/02/03：Wave 2/3 全部扩展字段与动态词条控件
+        public TextMeshProUGUI ActiveModePresetLabel;
+        public TMP_InputField ArchetypeWeightInput;
+        public TMP_InputField ArchetypeCapInput;
+        public TMP_InputField EndlessMaxDayInput;
+        public TMP_InputField CrossHeroBiasInput;
+        public TMP_InputField BossRushWavesInput;
+        public NativeUguiFactory.ToggleHandle BossRushPvpToggle;
+        public NativeUguiFactory.ToggleHandle SandboxRerollToggle;
+        public NativeUguiFactory.ToggleHandle SandboxZeroPriceToggle;
+        public TMP_InputField ShopHighTierInput;
+        public TMP_InputField ShopPriceMultInput;
+        public TMP_InputField LootBonusChoicesInput;
+        public TMP_InputField LootTierBonusInput;
+        public TMP_InputField EnemyStatMultInput;
+        public NativeUguiFactory.ToggleHandle DisableFatesReviveToggle;
+        public TMP_InputField FixedSeedInput;
+        public Transform MutatorsContainer;
+        public string BuiltMutatorsFingerprint = "";
     }
 
     private sealed class ArchetypeGridWidgets
@@ -89,6 +151,7 @@ internal sealed partial class CustomGameplayUI
     private RectTransform _safeViewportRoot;
     private Canvas _modalCanvas;
     private GraphicRaycaster _modalRaycaster;
+    private RectTransform _modalWindowRt;
     private Camera _cachedMainCam;
     private bool? _cachedCircleGlyphsSupported;
 
@@ -502,10 +565,12 @@ internal sealed partial class CustomGameplayUI
             padV: 12,
             spacing: 8f);
         var wrt = (RectTransform)win.transform;
+        _modalWindowRt = wrt;
         wrt.anchorMin = new Vector2(0.5f, 0.5f);
         wrt.anchorMax = new Vector2(0.5f, 0.5f);
         wrt.pivot = new Vector2(0.5f, 0.5f);
         wrt.sizeDelta = new Vector2(1260f, 880f);
+        FitModalWindowToSafeViewport();
         // 阻止点击卡片内部穿透到背景遮罩
         win.GetComponent<Image>().raycastTarget = true;
 
@@ -1083,6 +1148,9 @@ internal sealed partial class CustomGameplayUI
         _ui.CreateText("NoticeTitle", _tourneyMemberBody.transform, "《本场锦标赛房主规则公示》（每 2.5 秒自动同步，仅房主可修改）", 15.5f, NativeUguiFactory.ColGold, FontStyles.Bold);
         _tourneyMemberSummaryText = _ui.CreateText("MemberSummary", _tourneyMemberBody.transform, "", 14f, NativeUguiFactory.ColCream);
         NativeUguiFactory.SetLayout(_tourneyMemberSummaryText.gameObject, minH: 120f);
+        var memberActionRow = _ui.CreateHorizontalRow("MemberModActions", _tourneyMemberBody.transform, spacing: 8f);
+        var btnRetrySync = _ui.CreateButton("RetrySyncRoomMods", memberActionRow.transform, "重试同步房间 Mod", 13.5f, NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () => SyncCurrentLobbyRequiredModsAsync(force: true));
+        NativeUguiFactory.SetLayout(btnRetrySync.Root, minW: 156f, prefW: 170f, minH: 30f);
     }
 
     private void BuildTournamentHostControls(Transform parent)
@@ -1109,6 +1177,23 @@ internal sealed partial class CustomGameplayUI
             RefreshModalContentsIfOpen();
         }, fontStyle: FontStyles.Bold);
         NativeUguiFactory.SetLayout(_btnCap10.Root, minW: 96f, prefW: 102f, minH: 30f);
+
+        // D6-P1-02：补齐 2..16 人数微调按钮（不限制为 8/10 死值）
+        var btnCapDec = _ui.CreateButton("CapDec", row.transform, "-1人", 12.5f, NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
+        {
+            _lobbyRules.PlayerCap = Math.Clamp(_lobbyRules.PlayerCap - 1, 2, 16);
+            _lobbyDirty = true;
+            RefreshModalContentsIfOpen();
+        }, padH: 4, padV: 2);
+        NativeUguiFactory.SetLayout(btnCapDec.Root, minW: 48f, prefW: 52f, minH: 30f);
+
+        var btnCapInc = _ui.CreateButton("CapInc", row.transform, "+1人", 12.5f, NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
+        {
+            _lobbyRules.PlayerCap = Math.Clamp(_lobbyRules.PlayerCap + 1, 2, 16);
+            _lobbyDirty = true;
+            RefreshModalContentsIfOpen();
+        }, padH: 4, padV: 2);
+        NativeUguiFactory.SetLayout(btnCapInc.Root, minW: 48f, prefW: 52f, minH: 30f);
 
         var botLbl = _ui.CreateText("BotLbl", row.transform, "   机器人：", 14f, NativeUguiFactory.ColCream, wrap: false);
         NativeUguiFactory.SetLayout(botLbl.gameObject, minW: 86f, prefW: 88f, minH: 30f);
@@ -1281,31 +1366,25 @@ internal sealed partial class CustomGameplayUI
         var sTitle = _ui.CreateText("Title", sHeader.transform, "开局数值预设", 15.5f, NativeUguiFactory.ColGold, FontStyles.Bold);
         NativeUguiFactory.SetLayout(sTitle.gameObject, flexW: 1f, minH: 26f);
 
-        var btnResetStats = _ui.CreateButton("BtnResetStats", sHeader.transform, "恢复标准 15/5/3/20/300", 13f,
+        var btnResetStats = _ui.CreateButton("BtnResetStats", sHeader.transform, "恢复全部默认规则", 13f,
             NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
             {
                 var r = getRules();
                 var b = getBuf();
                 if (r != null)
                 {
-                    r.StartingGold = 15;
-                    r.StartingIncome = 5;
-                    r.StartingExperience = 3;
-                    r.StartingPrestige = 20;
-                    r.StartingHealth = 300;
-                    // 同步清零预设遗留的隐藏倍率与额外野怪自选次数，避免从爽玩/肉鸽切回标准数值后仍隐形锁死 2 选
-                    r.MonsterLootBonusChoices = 0;
-                    r.MonsterLootTierBonus = 0;
-                    r.ShopHighTierBonusPct = 0.0;
-                    r.ShopPriceMultiplier = 1.0;
-                    r.EnemyStatMultiplier = 1.0;
-                    r.DisableFatesRevive = false;
+                    // D6-P1-02：统一调用 ResetToDefaults()，杜绝部分字段漏清零导致隐形倍率/词条残留
+                    r.ResetToDefaults();
                     b?.SyncFromRules(r);
+                    if (!isTournament)
+                    {
+                        Modules.NativeMenuEmbedModule.Instance?.SyncSelectedQuickModeFromRules(r.SpecialModeId, r.PresetId);
+                    }
                 }
-                SyncStatsInputs(w, getRules(), getBuf());
+                SyncEditorWidgets(w, getRules(), getBuf());
                 onEdited?.Invoke();
             });
-        NativeUguiFactory.SetLayout(btnResetStats.Root, minW: 196f, prefW: 204f, minH: 26f);
+        NativeUguiFactory.SetLayout(btnResetStats.Root, minW: 168f, prefW: 176f, minH: 26f);
 
         var statsRow = _ui.CreateHorizontalRow("StatsRow", statsCard.transform, spacing: 8f);
         w.GoldInput = BuildStatCell(statsRow.transform, "初始金币", 0, 9999, 5, () => getRules().StartingGold, v =>
@@ -1478,7 +1557,153 @@ internal sealed partial class CustomGameplayUI
         var multBody = _ui.CreateVerticalGroup("MultGroups", multCard.transform, spacing: 6f);
         w.MultipliersGroupContainer = multBody.transform;
 
+        // 5. D6-P1-01/02/03：Wave 2/3 模式预设、动态肉鸽词条与全部 21 项进阶规则调参区
+        BuildWave23AdvancedControlsCard(parent, w, getRules, getBuf, onEdited);
+
         return w;
+    }
+
+    private void BuildWave23AdvancedControlsCard(
+        Transform parent,
+        RuleEditorWidgets w,
+        Func<CustomRunRuleSet> getRules,
+        Func<RuleEditorBuffer> getBuf,
+        Action onEdited)
+    {
+        var card = _ui.CreateCard("Wave23AdvancedCard", parent, NativeUguiFactory.ColCardBg, NativeUguiFactory.ColGoldDim, padH: 12, padV: 10, spacing: 6f);
+        var hdr = _ui.CreateHorizontalRow("Header", card.transform, spacing: 8f);
+        var title = _ui.CreateText("Title", hdr.transform, "进阶玩法模式 / 肉鸽词条 / 经济与掉率调参（21 项全参数）", 15f, NativeUguiFactory.ColGold, FontStyles.Bold);
+        NativeUguiFactory.SetLayout(title.gameObject, flexW: 1f, minH: 24f);
+        w.ActiveModePresetLabel = _ui.CreateText("ActiveMode", hdr.transform, "经典官方", 13f, NativeUguiFactory.ColEmeraldText, FontStyles.Bold, TextAlignmentOptions.MidlineRight, wrap: false);
+        NativeUguiFactory.SetLayout(w.ActiveModePresetLabel.gameObject, minW: 160f, prefW: 200f, minH: 24f);
+
+        // 快捷预设/模式选择排（拆分每日挑战与肉鸽词条为独立按钮）
+        var modeRow = _ui.CreateHorizontalRow("ModePresetRow", card.transform, spacing: 4f);
+        var quickButtons = new (string Label, string PresetId, string ModeId)[]
+        {
+            ("经典官方", "PureOfficial", "Standard"),
+            ("爽玩增强", "EnhancedFun", "Standard"),
+            ("极限肉鸽", "ExtremeRoguelike", "Standard"),
+            ("无尽爬塔", "PureOfficial", "EndlessTower"),
+            ("跨职业", "PureOfficial", "CrossHeroMayhem"),
+            ("每日挑战", "PureOfficial", "DailyChallenge"),
+            ("肉鸽词条", "ExtremeRoguelike", "MutatorChallenge"),
+            ("Boss车轮", "PureOfficial", "BossRush"),
+            ("沙盒实验", "PureOfficial", "SandboxLab"),
+        };
+        for (int i = 0; i < quickButtons.Length; i++)
+        {
+            var qb = quickButtons[i];
+            var btn = _ui.CreateButton("ModeBtn_" + i, modeRow.transform, qb.Label, 11.5f,
+                NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
+                {
+                    var r = getRules();
+                    if (r == null) return;
+                    r.ApplyLocalPresetDefaults(qb.PresetId, qb.ModeId);
+                    if (!w.IsTournament)
+                    {
+                        Modules.NativeMenuEmbedModule.Instance?.SyncSelectedQuickModeFromRules(r.SpecialModeId, r.PresetId);
+                    }
+                    SyncEditorWidgets(w, r, getBuf());
+                    onEdited?.Invoke();
+                }, padH: 4, padV: 2);
+            NativeUguiFactory.SetLayout(btn.Root, minW: 78f, flexW: 1f, minH: 26f);
+        }
+
+        // 第一行数值：经济与掉率（商店高阶概率 / 商店价格倍率 / 野怪额外选 / 野怪品阶加成 / 敌人数值倍率）
+        var econRow = _ui.CreateHorizontalRow("EconRow", card.transform, spacing: 6f);
+        w.ShopHighTierInput = BuildDoubleStatCell(econRow.transform, "高阶率加成%", -50.0, 100.0, 5.0, "0.#", () => getRules().ShopHighTierBonusPct, v => getRules().ShopHighTierBonusPct = v, onEdited);
+        w.ShopPriceMultInput = BuildDoubleStatCell(econRow.transform, "商店价格倍率", 0.1, 5.0, 0.1, "0.##", () => getRules().ShopPriceMultiplier, v => getRules().ShopPriceMultiplier = v, onEdited);
+        w.LootBonusChoicesInput = BuildStatCell(econRow.transform, "野怪额外选", 0, 5, 1, () => getRules().MonsterLootBonusChoices, v => getRules().MonsterLootBonusChoices = v, onEdited);
+        w.LootTierBonusInput = BuildStatCell(econRow.transform, "战利品升阶", 0, 3, 1, () => getRules().MonsterLootTierBonus, v => getRules().MonsterLootTierBonus = v, onEdited);
+        w.EnemyStatMultInput = BuildDoubleStatCell(econRow.transform, "敌人强度倍率", 0.25, 5.0, 0.1, "0.##", () => getRules().EnemyStatMultiplier, v => getRules().EnemyStatMultiplier = v, onEdited);
+
+        // 第二行数值：模式专参 & 流派权重 & 固定种子
+        var modeNumRow = _ui.CreateHorizontalRow("ModeNumRow", card.transform, spacing: 6f);
+        w.EndlessMaxDayInput = BuildStatCell(modeNumRow.transform, "无尽最大天", 15, 999, 5, () => getRules().EndlessMaxDay, v => getRules().EndlessMaxDay = v, onEdited);
+        w.CrossHeroBiasInput = BuildDoubleStatCell(modeNumRow.transform, "本职业权重", 0.0, 1.0, 0.05, "0.##", () => getRules().CrossHeroOwnHeroBias, v => getRules().CrossHeroOwnHeroBias = v, onEdited);
+        w.BossRushWavesInput = BuildStatCell(modeNumRow.transform, "Boss总波次", 5, 30, 1, () => getRules().BossRushTotalWaves, v => getRules().BossRushTotalWaves = v, onEdited);
+        w.ArchetypeWeightInput = BuildDoubleStatCell(modeNumRow.transform, "流派权重倍率", 1.0, 10.0, 0.5, "0.#", () => getRules().ArchetypeWeightMultiplier, v => getRules().ArchetypeWeightMultiplier = v, onEdited);
+        w.ArchetypeCapInput = BuildDoubleStatCell(modeNumRow.transform, "多流派上限", 1.0, 10.0, 0.5, "0.#", () => getRules().ArchetypeMultiMatchCap, v => getRules().ArchetypeMultiMatchCap = v, onEdited);
+
+        // 第三行开关与固定种子
+        var flagRow = _ui.CreateHorizontalRow("ModeFlagsRow", card.transform, spacing: 8f);
+        w.DisableFatesReviveToggle = _ui.CreateToggle("TogNoRevive", flagRow.transform, "禁用命运复活", false, v => { getRules().DisableFatesRevive = v; onEdited?.Invoke(); }, fontSize: 12.5f);
+        w.BossRushPvpToggle = _ui.CreateToggle("TogBossPvp", flagRow.transform, "Boss战含里程碑PvP", true, v => { getRules().BossRushIncludeMilestonePvp = v; onEdited?.Invoke(); }, fontSize: 12.5f);
+        w.SandboxRerollToggle = _ui.CreateToggle("TogSbReroll", flagRow.transform, "沙盒免费刷新", true, v => { getRules().SandboxFreeInfiniteReroll = v; onEdited?.Invoke(); }, fontSize: 12.5f);
+        w.SandboxZeroPriceToggle = _ui.CreateToggle("TogSbZero", flagRow.transform, "沙盒0金商店", false, v => { getRules().SandboxZeroShopPrice = v; onEdited?.Invoke(); }, fontSize: 12.5f);
+
+        w.FixedSeedInput = _ui.CreateInputField("FixedSeed", flagRow.transform, "固定种子(可空)", "", 12.5f, 12, TMP_InputField.ContentType.IntegerNumber);
+        NativeUguiFactory.SetLayout(w.FixedSeedInput.gameObject, minW: 128f, prefW: 140f, minH: 26f);
+        w.FixedSeedInput.onEndEdit.AddListener(txt =>
+        {
+            var r = getRules();
+            if (r == null) return;
+            r.FixedRunSeed = int.TryParse(txt?.Trim(), out int s) ? s : (int?)null;
+            onEdited?.Invoke();
+        });
+
+        // 第四行：来自 /custom-rules/catalog 的动态肉鸽突变词条勾选区
+        _ui.CreateText("MutTitle", card.transform, "肉鸽突变词条（来自服务端规则目录，点击开关并自动避让冲突组）", 12.5f, NativeUguiFactory.ColMuted);
+        var mutBox = _ui.CreateVerticalGroup("MutatorsBox", card.transform, spacing: 4f);
+        w.MutatorsContainer = mutBox.transform;
+    }
+
+    private TMP_InputField BuildDoubleStatCell(
+        Transform parent,
+        string label,
+        double min,
+        double max,
+        double step,
+        string fmt,
+        Func<double> getter,
+        Action<double> setter,
+        Action onEdited)
+    {
+        var cell = _ui.CreateCard("DStat_" + label, parent, NativeUguiFactory.ColSubCardBg, null, padH: 6, padV: 5, spacing: 3f);
+        NativeUguiFactory.SetLayout(cell, minW: 160f, flexW: 1f);
+        _ui.CreateText("Label", cell.transform, label, 12f, NativeUguiFactory.ColMuted, wrap: false);
+
+        var row = _ui.CreateHorizontalRow("InputRow", cell.transform, spacing: 3f);
+        TMP_InputField input = null;
+
+        var btnMinus = _ui.CreateButton("Minus", row.transform, "-", 14f, NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
+        {
+            double next = Math.Round(Math.Clamp(getter() - step, min, max), 2);
+            setter(next);
+            if (input != null) input.SetTextWithoutNotify(next.ToString(fmt, System.Globalization.CultureInfo.InvariantCulture));
+            onEdited?.Invoke();
+        }, fontStyle: FontStyles.Bold, padH: 4, padV: 2);
+        NativeUguiFactory.SetLayout(btnMinus.Root, minW: 26f, prefW: 26f, minH: 26f);
+
+        input = _ui.CreateInputField("Val", row.transform, "", getter().ToString(fmt, System.Globalization.CultureInfo.InvariantCulture), 13f, 8);
+        NativeUguiFactory.SetLayout(input.gameObject, minW: 60f, flexW: 1f, minH: 26f);
+        input.onEndEdit.AddListener(txt =>
+        {
+            double cur = getter();
+            if (double.TryParse(txt?.Trim(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double parsed))
+            {
+                double clamped = Math.Round(Math.Clamp(parsed, min, max), 2);
+                setter(clamped);
+                input.SetTextWithoutNotify(clamped.ToString(fmt, System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                input.SetTextWithoutNotify(cur.ToString(fmt, System.Globalization.CultureInfo.InvariantCulture));
+            }
+            onEdited?.Invoke();
+        });
+
+        var btnPlus = _ui.CreateButton("Plus", row.transform, "+", 14f, NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, () =>
+        {
+            double next = Math.Round(Math.Clamp(getter() + step, min, max), 2);
+            setter(next);
+            if (input != null) input.SetTextWithoutNotify(next.ToString(fmt, System.Globalization.CultureInfo.InvariantCulture));
+            onEdited?.Invoke();
+        }, fontStyle: FontStyles.Bold, padH: 4, padV: 2);
+        NativeUguiFactory.SetLayout(btnPlus.Root, minW: 26f, prefW: 26f, minH: 26f);
+
+        return input;
     }
 
     private TMP_InputField BuildStatCell(
@@ -1728,10 +1953,28 @@ internal sealed partial class CustomGameplayUI
         _safeViewportRoot.offsetMin = Vector2.zero;
         _safeViewportRoot.offsetMax = Vector2.zero;
 
-        // 分辨率/安全区变更时强制重算胶囊自适应宽度并立即触发下一段 HUD 同步，防止窄窗口下越过顶部中线
+        // 分辨率/安全区变更时同步钳制模态主窗大小并刷新胶囊自适应宽度（D4-P1-11）
+        FitModalWindowToSafeViewport();
         _lastPillKey = "";
         _lastInRunBadgeKey = "";
         _nextHudSyncTime = 0f;
+    }
+
+    private void FitModalWindowToSafeViewport()
+    {
+        if (_modalWindowRt == null || _modalCanvas == null) return;
+        try
+        {
+            float scaleFactor = _modalCanvas.scaleFactor > 0.01f ? _modalCanvas.scaleFactor : 1f;
+            float logicalW = Screen.width / scaleFactor;
+            float logicalH = Screen.height / scaleFactor;
+            if (logicalW < 100f || logicalH < 100f) return;
+
+            float clampedW = Mathf.Clamp(logicalW * 0.92f, 760f, 1260f);
+            float clampedH = Mathf.Clamp(logicalH * 0.90f, 520f, 880f);
+            _modalWindowRt.sizeDelta = new Vector2(clampedW, clampedH);
+        }
+        catch { }
     }
 
     private static bool RectApproximatelyEqual(Rect a, Rect b)
@@ -2495,12 +2738,33 @@ internal sealed partial class CustomGameplayUI
             {
                 sb.AppendLine("- 事件倍率调整：" + string.Join("，", multDiffs));
             }
-            if (r.SelectedModIds != null && r.SelectedModIds.Count > 0)
+            var modStatuses = new List<(string ModId, string Status)>();
+            if (_currentLobby.RequiredMods != null && _currentLobby.RequiredMods.Count > 0)
             {
-                var names = _currentLobby.RequiredMods?.Count > 0
-                    ? _currentLobby.RequiredMods.Select(m => $"{m.Name}({m.ModId})")
-                    : r.SelectedModIds;
-                sb.AppendLine("- 本房 Mod：" + string.Join("、", names));
+                foreach (var m in _currentLobby.RequiredMods)
+                {
+                    string display = string.IsNullOrWhiteSpace(m.Name) ? m.ModId : $"{m.Name}({m.ModId})";
+                    modStatuses.Add((display, m.AvailableOnServer ? "服务端就绪" : "服务端缺失"));
+                }
+            }
+            else if (r.SelectedModIds != null && r.SelectedModIds.Count > 0)
+            {
+                foreach (var id in r.SelectedModIds)
+                    modStatuses.Add((id, "待同步"));
+            }
+
+            sb.AppendLine();
+            sb.AppendLine(LobbyMemberRulesSummaryFormatter.FormatSummary(
+                GetModeDisplayZh(r.SpecialModeId, r.PresetId),
+                r.PresetId,
+                r.MutatorIds,
+                r.BannedEncounterIds,
+                modStatuses,
+                r.EnemyStatMultiplier,
+                r.ShopPriceMultiplier));
+            if (Math.Abs(r.ShopHighTierBonusPct) > 0.01 || r.MonsterLootBonusChoices != 0 || r.MonsterLootTierBonus != 0)
+            {
+                sb.AppendLine($"- 商店高阶率加成：{r.ShopHighTierBonusPct:+0.#;-0.#;0}% | 野怪额外选项：+{r.MonsterLootBonusChoices} | 野怪品阶加成：+{r.MonsterLootTierBonus}");
             }
             _tourneyMemberSummaryText.text = sb.ToString();
         }
@@ -2706,7 +2970,108 @@ internal sealed partial class CustomGameplayUI
         });
         changed |= !string.Equals(prevCatFp, w.BuiltCategoriesFingerprint, StringComparison.Ordinal);
         SyncMultipliersUi(w, rules);
+        changed |= SyncWave23AdvancedControlsUi(w, rules);
         return changed;
+    }
+
+    private bool SyncWave23AdvancedControlsUi(RuleEditorWidgets w, CustomRunRuleSet rules)
+    {
+        if (w == null || rules == null) return false;
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+
+        if (w.ActiveModePresetLabel != null)
+            w.ActiveModePresetLabel.text = $"{GetModeDisplayZh(rules.SpecialModeId, rules.PresetId)} ({rules.PresetId})";
+        if (w.ShopHighTierInput != null && !w.ShopHighTierInput.isFocused)
+            w.ShopHighTierInput.SetTextWithoutNotify(rules.ShopHighTierBonusPct.ToString("0.#", inv));
+        if (w.ShopPriceMultInput != null && !w.ShopPriceMultInput.isFocused)
+            w.ShopPriceMultInput.SetTextWithoutNotify(rules.ShopPriceMultiplier.ToString("0.##", inv));
+        if (w.LootBonusChoicesInput != null && !w.LootBonusChoicesInput.isFocused)
+            w.LootBonusChoicesInput.SetTextWithoutNotify(rules.MonsterLootBonusChoices.ToString(inv));
+        if (w.LootTierBonusInput != null && !w.LootTierBonusInput.isFocused)
+            w.LootTierBonusInput.SetTextWithoutNotify(rules.MonsterLootTierBonus.ToString(inv));
+        if (w.EnemyStatMultInput != null && !w.EnemyStatMultInput.isFocused)
+            w.EnemyStatMultInput.SetTextWithoutNotify(rules.EnemyStatMultiplier.ToString("0.##", inv));
+        if (w.EndlessMaxDayInput != null && !w.EndlessMaxDayInput.isFocused)
+            w.EndlessMaxDayInput.SetTextWithoutNotify(rules.EndlessMaxDay.ToString(inv));
+        if (w.CrossHeroBiasInput != null && !w.CrossHeroBiasInput.isFocused)
+            w.CrossHeroBiasInput.SetTextWithoutNotify(rules.CrossHeroOwnHeroBias.ToString("0.##", inv));
+        if (w.BossRushWavesInput != null && !w.BossRushWavesInput.isFocused)
+            w.BossRushWavesInput.SetTextWithoutNotify(rules.BossRushTotalWaves.ToString(inv));
+        if (w.ArchetypeWeightInput != null && !w.ArchetypeWeightInput.isFocused)
+            w.ArchetypeWeightInput.SetTextWithoutNotify(rules.ArchetypeWeightMultiplier.ToString("0.#", inv));
+        if (w.ArchetypeCapInput != null && !w.ArchetypeCapInput.isFocused)
+            w.ArchetypeCapInput.SetTextWithoutNotify(rules.ArchetypeMultiMatchCap.ToString("0.#", inv));
+        if (w.FixedSeedInput != null && !w.FixedSeedInput.isFocused)
+            w.FixedSeedInput.SetTextWithoutNotify(rules.FixedRunSeed.HasValue ? rules.FixedRunSeed.Value.ToString(inv) : string.Empty);
+
+        w.DisableFatesReviveToggle?.Toggle?.SetIsOnWithoutNotify(rules.DisableFatesRevive);
+        w.BossRushPvpToggle?.Toggle?.SetIsOnWithoutNotify(rules.BossRushIncludeMilestonePvp);
+        w.SandboxRerollToggle?.Toggle?.SetIsOnWithoutNotify(rules.SandboxFreeInfiniteReroll);
+        w.SandboxZeroPriceToggle?.Toggle?.SetIsOnWithoutNotify(rules.SandboxZeroShopPrice);
+
+        if (w.MutatorsContainer == null) return false;
+        var mutList = _catalog?.Mutators;
+        string fp = (mutList == null ? "0" : mutList.Count.ToString(inv)) + "|" + string.Join(",", rules.MutatorIds);
+        if (string.Equals(fp, w.BuiltMutatorsFingerprint, StringComparison.Ordinal)) return false;
+        w.BuiltMutatorsFingerprint = fp;
+
+        ClearChildren(w.MutatorsContainer);
+        if (mutList == null || mutList.Count == 0)
+        {
+            _ui.CreateText("MutEmpty", w.MutatorsContainer, "待拉取服务端规则目录后展示可选肉鸽词条。", 12f, NativeUguiFactory.ColMuted);
+            return true;
+        }
+
+        GameObject curRow = null;
+        for (int i = 0; i < mutList.Count; i++)
+        {
+            if (i % 4 == 0)
+            {
+                curRow = _ui.CreateHorizontalRow("MutRow_" + (i / 4), w.MutatorsContainer, spacing: 5f);
+            }
+            var m = mutList[i];
+            if (m == null || string.IsNullOrWhiteSpace(m.Id)) continue;
+            bool selected = rules.MutatorIds.Exists(id => string.Equals(id, m.Id, StringComparison.OrdinalIgnoreCase));
+            var capturedMut = m;
+            var btn = _ui.CreateButton("Mut_" + m.Id, curRow.transform,
+                (selected ? "✓ " : "") + (string.IsNullOrWhiteSpace(m.NameZh) ? m.Id : m.NameZh),
+                11.5f,
+                selected ? NativeUguiFactory.ColGoldBtn : NativeUguiFactory.ColBtnNormal,
+                selected ? NativeUguiFactory.ColGoldBtnHover : NativeUguiFactory.ColBtnHover,
+                selected ? Color.white : NativeUguiFactory.ColCream,
+                () =>
+                {
+                    var r = w.GetRules();
+                    if (r == null) return;
+                    r.EnsureCollections();
+                    int idx = r.MutatorIds.FindIndex(id => string.Equals(id, capturedMut.Id, StringComparison.OrdinalIgnoreCase));
+                    if (idx >= 0)
+                    {
+                        r.MutatorIds.RemoveAt(idx);
+                    }
+                    else
+                    {
+                        if (!string.IsNullOrWhiteSpace(capturedMut.ConflictGroup) && _catalog?.Mutators != null)
+                        {
+                            for (int k = r.MutatorIds.Count - 1; k >= 0; k--)
+                            {
+                                var other = _catalog.Mutators.Find(x => string.Equals(x.Id, r.MutatorIds[k], StringComparison.OrdinalIgnoreCase));
+                                if (other != null && string.Equals(other.ConflictGroup, capturedMut.ConflictGroup, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    r.MutatorIds.RemoveAt(k);
+                                }
+                            }
+                        }
+                        r.MutatorIds.Add(capturedMut.Id);
+                    }
+                    r.RefreshPowerFlag();
+                    if (w.IsTournament) _lobbyDirty = true;
+                    SyncWave23AdvancedControlsUi(w, r);
+                    RefreshSummaryIndicators();
+                }, padH: 5, padV: 2);
+            NativeUguiFactory.SetLayout(btn.Root, minW: 110f, flexW: 1f, minH: 25f);
+        }
+        return true;
     }
 
     private static void SyncStatsInputs(RuleEditorWidgets w, CustomRunRuleSet rules, RuleEditorBuffer buf)

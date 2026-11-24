@@ -19,14 +19,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V11FullCardScannerTests
 {
-    private const string AuthoritativeDbPath = @"e:\thebazaar\dist\data\GameData.db";
-
-    private static readonly Lazy<GameDataRepository> Repo = new(() =>
-    {
-        if (File.Exists(AuthoritativeDbPath))
-            return GameDatabaseLoader.Load(AuthoritativeDbPath);
-        return GameDatabaseLoader.Load();
-    });
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static readonly string[] AllTwelveEnchantments =
     [
@@ -437,7 +430,7 @@ public sealed class V11FullCardScannerTests
         // 2. 战后 ResetForCombat 清理 Freeze/Slow/Haste/Flying/Heated/Chilled/临时标签/临时附魔并补满弹药
         var musketTpl = repo.GetCard("01841d2e-9409-4bb6-a886-b89f8ebfb0e3") ?? repo.AllItems.First(i => (i.Tiers?.Values.Any(td => td.Attributes.ContainsKey("AmmoMax")) ?? false));
         var dirty = new CardInstance(musketTpl);
-        dirty.ApplyEnchantment("Icy", preventOverride: false, DurationTarget.Combat);
+        dirty.ApplyEnchantment("Icy", DurationTarget.Combat, preventOverride: false);
         dirty.CombatTags.Add("TemporarySweepTag");
         dirty.CombatAdd["DamageAmount"] = 99;
         dirty.FreezeMs = 1500;
@@ -462,7 +455,7 @@ public sealed class V11FullCardScannerTests
 
         // 3. UntilEndOfDay 临时附魔在当日进战斗克隆中保留，过天后清理
         var dayCard = new CardInstance(targetItemTpl);
-        dayCard.ApplyEnchantment("Fiery", preventOverride: false, DurationTarget.Day);
+        dayCard.ApplyEnchantment("Fiery", DurationTarget.Day, preventOverride: false);
         var combatClone = dayCard.CloneForCombat();
         Assert.Equal("Fiery", combatClone.Enchantment);
         dayCard.ClearEndOfDayModifiers();
@@ -719,37 +712,44 @@ public sealed class V11FullCardScannerTests
         using (RuleExecutionContext.BeginUnknownRuleTypeScope((cat, typeName) => unknownHits.Add($"{cat}:{typeName}")))
         {
             // 1. 扫描全部可上场模板（Item / Skill / SocketEffect / MusicNoteSocketEffect / PlayerEffect）
-            //    覆盖 StartingTier、最高 Tier 与全 12 种附魔
-            foreach (var tpl in mountableCards)
-            {
-                var startTier = tpl.DefaultTier;
-                var maxTier = GetMaxSupportedTier(tpl);
-                CardTier[] tiersToTest = maxTier != startTier ? [startTier, maxTier] : [startTier];
+            //    覆盖 StartingTier、最高 Tier 与全 12 种附魔（按工作线程独立挂载 ThreadStatic 未知类型观测器，零削弱覆盖率且无竞态）
+            var scanParallelOpts = new ParallelOptions { MaxDegreeOfParallelism = Math.Min(4, Environment.ProcessorCount) };
+            Parallel.ForEach(
+                mountableCards,
+                scanParallelOpts,
+                () => RuleExecutionContext.BeginUnknownRuleTypeScope((cat, typeName) => unknownHits.Add($"{cat}:{typeName}")),
+                (tpl, _, localScope) =>
+                {
+                    var startTier = tpl.DefaultTier;
+                    var maxTier = GetMaxSupportedTier(tpl);
+                    CardTier[] tiersToTest = maxTier != startTier ? [startTier, maxTier] : [startTier];
 
-                foreach (var tier in tiersToTest)
-                {
-                    RunSingleCardLifecycleAndMicroCombat(scanRepo, tpl, tier, enchantment: null, richLeftPartnerTpl, richRightPartnerTpl, oppFastStrikerTpl, oppCap5sTpl, runFullOocLifecycle: true);
-                    scannedBaseCount++;
-                }
+                    foreach (var tier in tiersToTest)
+                    {
+                        RunSingleCardLifecycleAndMicroCombat(scanRepo, tpl, tier, enchantment: null, richLeftPartnerTpl, richRightPartnerTpl, oppFastStrikerTpl, oppCap5sTpl, runFullOocLifecycle: true);
+                        Interlocked.Increment(ref scannedBaseCount);
+                    }
 
-                if (tpl.Type == "Item")
-                {
-                    var enchantList = AllTwelveEnchantments.Where(e => tpl.Enchantments == null || tpl.Enchantments.Count == 0 || tpl.Enchantments.ContainsKey(e));
-                    foreach (var ench in enchantList)
+                    if (tpl.Type == "Item")
                     {
-                        RunSingleCardLifecycleAndMicroCombat(scanRepo, tpl, maxTier, ench, richLeftPartnerTpl, richRightPartnerTpl, oppFastStrikerTpl, oppCap5sTpl, runFullOocLifecycle: false);
-                        scannedEnchantedCount++;
+                        var enchantList = AllTwelveEnchantments.Where(e => tpl.Enchantments == null || tpl.Enchantments.Count == 0 || tpl.Enchantments.ContainsKey(e));
+                        foreach (var ench in enchantList)
+                        {
+                            RunSingleCardLifecycleAndMicroCombat(scanRepo, tpl, maxTier, ench, richLeftPartnerTpl, richRightPartnerTpl, oppFastStrikerTpl, oppCap5sTpl, runFullOocLifecycle: false);
+                            Interlocked.Increment(ref scannedEnchantedCount);
+                        }
                     }
-                }
-                else if (tpl.Enchantments is { Count: > 0 })
-                {
-                    foreach (var ench in tpl.Enchantments.Keys)
+                    else if (tpl.Enchantments is { Count: > 0 })
                     {
-                        RunSingleCardLifecycleAndMicroCombat(scanRepo, tpl, maxTier, ench, richLeftPartnerTpl, richRightPartnerTpl, oppFastStrikerTpl, oppCap5sTpl, runFullOocLifecycle: false);
-                        scannedEnchantedCount++;
+                        foreach (var ench in tpl.Enchantments.Keys)
+                        {
+                            RunSingleCardLifecycleAndMicroCombat(scanRepo, tpl, maxTier, ench, richLeftPartnerTpl, richRightPartnerTpl, oppFastStrikerTpl, oppCap5sTpl, runFullOocLifecycle: false);
+                            Interlocked.Increment(ref scannedEnchantedCount);
+                        }
                     }
-                }
-            }
+                    return localScope;
+                },
+                localScope => localScope.Dispose());
 
             // 2. 扫描全部 EncounterStep (599) + EventEncounter (561) + PedestalEncounter (41) + CombatEncounter (184) + Monsters (179)
             var encounterTemplates = repo.CardsById.Values
@@ -1003,7 +1003,7 @@ public sealed class V11FullCardScannerTests
         targetCard.CombatAdd["DamageAmount"] = 10;
         targetCard.CombatTags.Add("CombatScanDirty");
         if (targetCard.Template.Type == "Item")
-            targetCard.ApplyEnchantment("Icy", preventOverride: false, DurationTarget.Combat);
+            targetCard.ApplyEnchantment("Icy", DurationTarget.Combat, preventOverride: false);
         targetCard.ResetForCombat(repo);
 
         Assert.Equal(0, targetCard.FreezeMs);

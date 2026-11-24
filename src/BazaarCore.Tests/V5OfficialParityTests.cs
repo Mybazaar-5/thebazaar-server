@@ -25,6 +25,7 @@ namespace BazaarCore.Tests;
 /// <summary>
 /// V5 官方机制全量对标测试套件（覆盖 P0-1 ~ P0-10、P1-1 ~ P1-10 与 P2-2 / P2-3）。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V5OfficialParityTests
 {
     private const string PawnShopId = "31b35938-9402-4990-b4d9-473ce5887af9";
@@ -60,30 +61,17 @@ public sealed class V5OfficialParityTests
 
     private static readonly Lazy<RealDataFixture> Fixture = new(() =>
     {
-        string? dir = AppContext.BaseDirectory;
-        string? dataDir = null;
-        for (int i = 0; i < 10 && !string.IsNullOrEmpty(dir); i++)
-        {
-            string candidate = Path.Combine(dir, "dist", "data");
-            if (File.Exists(Path.Combine(candidate, "GameData.db")))
-            {
-                dataDir = candidate;
-                break;
-            }
-            dir = Path.GetDirectoryName(dir);
-        }
-        dataDir ??= @"e:\thebazaar\dist\data";
-        string dbPath = Path.Combine(dataDir, "GameData.db");
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new RealDataFixture
         {
-            DataDir = dataDir,
-            DbPath = dbPath,
-            Pool = CardPool.Load(dbPath),
-            Monsters = MonsterPool.Load(dbPath),
-            LevelUps = LevelUpTable.Load(dbPath),
-            Mode = GameModeConfig.Load(dbPath),
-            Repo = GameDatabaseLoader.Load(dbPath, null),
-            Ghosts = PvpGhostPool.Load(dataDir),
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
         };
     });
 
@@ -1426,7 +1414,7 @@ public sealed class V5OfficialParityTests
                 day = 1,
                 hero = "Vanessa",
                 level = 1,
-                healthMax = 250,
+                healthMax = fx.Mode.StartingHealth,
                 prestige = 20,
                 wins = 0,
                 losses = 0,
@@ -1468,6 +1456,7 @@ public sealed class V5OfficialParityTests
             };
             var engine = new RunEngine(run, fx.Pool, fx.Monsters, fx.LevelUps, fx.Mode, fx.Repo, customGhosts);
             engine.StartRun();
+            Assert.Equal(fx.Mode.StartingHealth, run.PlayerAttributes[EPlayerAttributeType.HealthMax]);
             engine.Handle(new CheatCommand { Args = ["skipstart"] });
             engine.Handle(new CheatCommand { Args = ["hour", "6"] });
             engine.Handle(new CheatCommand { Args = ["deal"] });
@@ -1576,10 +1565,49 @@ public sealed class V5OfficialParityTests
         Assert.True(reviveWin.DurationMs >= 3000);
         Assert.Single(reviveWin.Events, e => e.Type == CombatEventType.HealApplied && e.SourceCardInstanceId == "revive_once");
 
-        // 4b. 若复活后再次受致命伤，整场只触发 1 次 OnPlayerDied，第 2 次直接阵亡
+        // 4b. 带 Custom_0==0 限次的复活技能（对齐官方 Memento Mori / Fiery Rebirth）整场仅触发 1 次，第 2 次直接阵亡
         var p1NoWep = new PlayerState("player", "P1", HeroNames.Vanessa, 100, 20, 1, 5);
         var p2Heavy = new PlayerState("opp", "P2", HeroNames.Vanessa, 200, 20, 1, 5);
-        p1NoWep.Skills.Add(new CardInstance(MakeReviveSkill("revive_once_only", 80), CardTier.Bronze, null, "revive_once_only"));
+        var onceSkillTpl = MakeReviveSkill("revive_once_only", 80);
+        onceSkillTpl.Attributes = new Dictionary<string, double> { ["Custom_0"] = 0 };
+        onceSkillTpl.Abilities["revive"].Prerequisites =
+        [
+            DeserializeNode("""
+            {
+              "$type": "TPrerequisiteCardCount",
+              "Subject": {
+                "$type": "TTargetCardSelf",
+                "Conditions": {
+                  "$type": "TCardConditionalAttribute",
+                  "Attribute": "Custom_0",
+                  "ComparisonOperator": "Equal",
+                  "ComparisonValue": { "$type": "TFixedValue", "Value": 0.0 }
+                }
+              },
+              "Amount": 1
+            }
+            """)
+        ];
+        onceSkillTpl.Abilities["revive_limit"] = new AbilityDefinition
+        {
+            Id = "revive_limit",
+            Trigger = DeserializeNode("""
+                {
+                  "$type": "TTriggerOnPlayerDied",
+                  "Subject": { "$type": "TTargetPlayerRelative", "TargetMode": "Self" }
+                }
+                """),
+            Action = DeserializeNode("""
+                {
+                  "$type": "TActionCardModifyAttribute",
+                  "Target": { "$type": "TTargetCardSelf" },
+                  "AttributeType": "Custom_0",
+                  "Operation": "Add",
+                  "Value": { "$type": "TFixedValue", "Value": 1.0 }
+                }
+                """)
+        };
+        p1NoWep.Skills.Add(new CardInstance(onceSkillTpl, CardTier.Bronze, null, "revive_once_only"));
         p2Heavy.Hand.TryAddAuto(new CardInstance(MakeWeapon("p2_repeat", 2000, 120), CardTier.Bronze, null, "p2_repeat"));
 
         var secondDeath = CombatSimulator.Simulate(fx.Repo, p1NoWep, p2Heavy, seed: 2, combatType: "PVP", recordEvents: true);

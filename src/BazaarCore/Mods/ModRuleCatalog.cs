@@ -28,7 +28,7 @@ public static class ModRuleCatalog
     /// <summary>
     /// 经过 dist/data/GameData.db 实测验证的官方 Unity Addressable 真实 VFX 特效预设库。
     /// 友好短名（如 Fireball / Cannonball / LaserRed）会自动解析为客户端真实可加载的 Prefab 键；
-    /// 也完全支持高级作者直接填写 GameData.db 中全部 131 个原生 Assets/.../*.prefab 路径。
+    /// 也完全支持高级作者直接填写 GameData.db 中全部 133 个原生 Assets/.../*.prefab 路径。
     /// </summary>
     public static readonly IReadOnlyList<CatalogItem> OfficialVfxPresets =
     [
@@ -37,6 +37,7 @@ public static class ModRuleCatalog
         new("Firecracker", "爆竹火花 (Firecracker)", "轻快连续火花爆裂弹道（官方 Firecrackers 特效）", true, null, "火焰/爆炸"),
         new("PowderKeg", "火药桶巨爆 (PowderKeg)", "大范围高能引爆特效（官方 Powder Keg 特效）", true, null, "火焰/爆炸"),
         new("FireSlash", "烈焰斩击 (FireSlash)", "巨剑火焰劈斩特效（官方 Infernal Greatsword 特效）", true, null, "火焰/爆炸"),
+        new("FireClaw", "烈焰利爪 (FireClaw)", "炽热爪击爆燃特效（官方 Fire Claw 特效）", false, null, "火焰/爆炸"),
         new("BurnThrow", "燃焰抛射 (BurnThrow)", "灼烧药瓶抛射爆燃特效", false, null, "火焰/爆炸"),
         new("Cannonball", "重型炮弹 (Cannonball)", "经典加农炮弹抛射（官方 Cannon 特效）", true, null, "弹道/重火"),
         new("Missile", "追踪导弹 (Missile)", "连发火箭导弹齐射（官方 Miss Isles 特效）", true, null, "弹道/重火"),
@@ -48,6 +49,7 @@ public static class ModRuleCatalog
         new("SpaceLaser", "轨道太空激光 (SpaceLaser)", "巨型太空光束打击（官方 Space Laser 特效）", true, null, "激光/电击"),
         new("Electric", "高压电弧 (Electric)", "电击闪电弹道（官方 Arc Blaster 特效）", true, null, "激光/电击"),
         new("DragonSlash", "龙息斩击 (DragonSlash)", "凌厉刃气斩击（官方 Dragon Slash 特效）", true, null, "斩击/射击"),
+        new("Slash", "疾风斩击 (Slash)", "利落弧光斩击特效（官方 Slash Tier2 特效）", false, null, "斩击/射击"),
         new("Arrow", "劲箭射击 (Arrow)", "高速箭矢弹道（官方 Recurve Bow 特效）", false, null, "斩击/射击"),
         new("Gunshot", "燧发枪击 (Gunshot)", "清脆手枪子弹射击（官方 Pistol Sword 特效）", false, null, "斩击/射击"),
         new("IceBurst", "寒霜冰爆 (IceBurst)", "冰冻寒霜抛射特效", true, null, "异常/辅助"),
@@ -55,6 +57,9 @@ public static class ModRuleCatalog
         new("ShieldOrb", "壁垒光球 (ShieldOrb)", "护盾防御弹道特效", false, null, "异常/辅助"),
         new("HealOrb", "治愈光球 (HealOrb)", "生命回复弹道特效", false, null, "异常/辅助"),
     ];
+
+    /// <summary>官方 30 个友好特效别名到真实 Addressable Prefab 键的权威只读映射表。</summary>
+    public static IReadOnlyDictionary<string, string> OfficialVfxAliases => OfficialVfxAliasMap;
 
     private static readonly Dictionary<string, string> OfficialVfxAliasMap = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -258,10 +263,47 @@ public static class ModRuleCatalog
                 new CatalogItem("Silver", "白银 (Silver)", "2 阶进阶品质", true),
                 new CatalogItem("Gold", "黄金 (Gold)", "3 阶稀有品质", true),
                 new CatalogItem("Diamond", "钻石 (Diamond)", "4 阶顶级品质", true),
-                new CatalogItem("Legendary", "传说 (Legendary)", "特殊传说品质", false),
+                new CatalogItem("Legendary", "传说 (Legendary)", "5 阶特殊传说品质", false),
             },
+            eventTypes = new[]
+            {
+                new CatalogItem("EventEncounter", "普通奇遇 (EventEncounter)", "多选项奇遇事件，可包含多个 EncounterStep 选项", true),
+                new CatalogItem("PedestalEncounter", "基座改造/附魔 (PedestalEncounter)", "提供单次升级/附魔/改造基座的特殊奇遇", true),
+                new CatalogItem("EncounterStep", "单步选项 (EncounterStep)", "独立的单步奇遇节点（通常作为子选项或链式后续节点）", false),
+                new CatalogItem("CombatEncounter", "野怪战斗事件 (CombatEncounter)", "触发与指定怪物的 PvE 战斗（通过 combatMonster 配置敌方阵容与奖励）", true),
+            },
+            visualTargets = new[]
+            {
+                new CatalogItem("ItemArt", "物品立绘 (ItemArt)", "定向替换普通物品卡面立绘与文本", true),
+                new CatalogItem("SkillIcon", "技能图标 (SkillIcon)", "定向替换技能圆形图标与文本", true),
+                new CatalogItem("EncounterPortrait", "奇遇/野怪肖像 (EncounterPortrait)", "定向替换奇遇、步骤或野怪遭遇的立绘肖像及背景板", true),
+            },
+            standardPrices = BuildStandardPricesDto(),
             mechanicSchema = BuildMechanicSchemaDto(),
             presets = BuildEffectPresets()
+        };
+    }
+
+    private static object BuildStandardPricesDto()
+    {
+        var settings = new StandardPricesSettings();
+        CardTier[] allTiers = [CardTier.Bronze, CardTier.Silver, CardTier.Gold, CardTier.Diamond, CardTier.Legendary];
+
+        Dictionary<string, object> BuildItemTable(CardSize size) =>
+            allTiers.ToDictionary(
+                t => t.ToString(),
+                t => (object)new { buy = settings.GetItemBuyPrice(size, t), sell = settings.GetItemSellPrice(size, t) },
+                StringComparer.Ordinal);
+
+        return new Dictionary<string, object>(StringComparer.Ordinal)
+        {
+            ["Small"] = BuildItemTable(CardSize.Small),
+            ["Medium"] = BuildItemTable(CardSize.Medium),
+            ["Large"] = BuildItemTable(CardSize.Large),
+            ["Skill"] = allTiers.ToDictionary(
+                t => t.ToString(),
+                t => (object)new { buy = settings.GetSkillBuyPrice(t), sell = settings.GetSkillSellPrice(t) },
+                StringComparer.Ordinal)
         };
     }
 
@@ -290,16 +332,16 @@ public static class ModRuleCatalog
             new CatalogItem("Stop", "中止当前钩子后续步骤 (Stop)", "立即结束本次钩子链剩余步骤", false, null, "流程控制"),
             new CatalogItem("SetFlag", "写入自定义标记 (SetFlag)", "给卡牌或战斗黑板打上任意自定义 Flag（如 unrepairable / primed）", true, null, "状态黑板"),
             new CatalogItem("ClearFlag", "清除自定义标记 (ClearFlag)", "移除卡牌或战斗黑板上的指定 Flag", false, null, "状态黑板"),
-            new CatalogItem("ModifyCounter", "读写黑板计数器 (ModifyCounter)", "增减/设值自定义计数器，并可选同步投影到 Custom_0..3 在卡面实时显示", true, null, "状态黑板"),
+            new CatalogItem("ModifyCounter", "读写黑板计数器 (ModifyCounter)", "增减/设值自定义计数器，并可选同步投影到 Custom_0..8 在卡面实时显示", true, null, "状态黑板"),
             new CatalogItem("DealDamage", "造成受控伤害 (DealDamage)", "对敌方或己方造成伤害（可选穿盾与官方白名单 VFX 键）", true, null, "战斗动作"),
             new CatalogItem("ApplyStatus", "施加标准状态 (ApplyStatus)", "施加 Shield/Burn/Poison/Heal/Regen/Haste/Slow/Freeze/Charge", true, null, "战斗动作"),
-            new CatalogItem("ModifyCardAttribute", "修改卡牌属性 (ModifyCardAttribute)", "修改目标卡牌伤害/护盾/冷却百分比等（自动强钳制防 0 秒死循环）", true, null, "战斗动作"),
+            new CatalogItem("ModifyCardAttribute", "修改卡牌属性 (ModifyCardAttribute)", "修改目标卡牌伤害/护盾/冷却百分比等（自动强钳制防 0 秒死循环；可选 grantIfMissing 赋予原本不存在的属性）", true, null, "战斗动作"),
             new CatalogItem("ModifyPlayerAttribute", "修改玩家属性 (ModifyPlayerAttribute)", "修改生命上限/减伤等玩家属性", false, null, "战斗动作"),
             new CatalogItem("ChangeCardState", "变更卡牌状态 (ChangeCardState)", "受控执行 Disable / Destroy / Repair（支持自定义 Reason 与关闭常规摧毁联动）", true, null, "战斗动作"),
             new CatalogItem("ForceUseCard", "强制触发卡牌 (ForceUseCard)", "受帧预算保护强制触发目标卡牌一次", false, null, "战斗动作"),
             new CatalogItem("EmitCustomEvent", "广播自定义事件 (EmitCustomEvent)", "向同场战斗广播命名自定义事件供其他机制响应", true, null, "事件联动"),
             new CatalogItem("QueuePostCombatRemoveCard", "登记战后永久移除卡牌 (QueuePostCombatRemoveCard)", "战后由 RunEngine 统一从棋盘移除并下发官方协议事件", true, null, "局外结转"),
-            new CatalogItem("QueuePostCombatModifyAttr", "登记战后永久属性改动 (QueuePostCombatModifyAttr)", "战后由 RunEngine 安全回写永久属性加成", false, null, "局外结转")
+            new CatalogItem("QueuePostCombatModifyAttr", "登记战后永久属性改动 (QueuePostCombatModifyAttr)", "战后由 RunEngine 安全回写永久属性加成（可选 grantIfMissing）", false, null, "局外结转")
         },
         paramTypes = new[]
         {
@@ -310,7 +352,7 @@ public static class ModRuleCatalog
             new CatalogItem("tag", "卡牌标签 (tag)", "下拉选择官方卡牌标签（Weapon/Friend/Aquatic 等）", true),
             new CatalogItem("attribute", "卡牌属性 (attribute)", "下拉选择卡牌属性（DamageAmount/CooldownMax/PercentCooldownReduction 等）", true),
             new CatalogItem("targetMode", "目标模式 (targetMode)", "下拉选择沙盒目标模式（Self/AllAllies/Adjacent 等）", true),
-            new CatalogItem("vfxKey", "官方特效 (vfxKey)", "下拉选择官方 131 种白名单 VFX 特效键", true)
+            new CatalogItem("vfxKey", "官方特效 (vfxKey)", "下拉选择官方 133 种白名单 VFX 特效键", true)
         },
         targetModes = new[]
         {
@@ -340,12 +382,69 @@ public static class ModRuleCatalog
             new CatalogItem("Freeze", "冻结 (ms)", "冻结目标卡牌冷却", true),
             new CatalogItem("Charge", "充能 (ms)", "立即推进目标卡牌冷却进度", true)
         },
-        syncAttributes = new[]
+        hookScopes = MechanicDefinition.AllowedScopes
+            .OrderBy(s => s, StringComparer.Ordinal)
+            .Select(s => new CatalogItem(s, GetHookScopeNameZh(s), GetHookScopeDescZh(s), true))
+            .ToList(),
+        playerAttributes = MechanicDefinition.AllowedPlayerAttributes
+            .OrderBy(s => s, StringComparer.Ordinal)
+            .Select(s => new CatalogItem(s, GetPlayerAttributeNameZh(s), $"玩家属性 {s}", true))
+            .ToList(),
+        syncAttributes = MechanicDefinition.AllowedSyncAttributes
+            .OrderBy(s => s, StringComparer.Ordinal)
+            .ToArray(),
+        counterDisplayAttributes = MechanicDefinition.AllowedCounterDisplayAttributes
+            .OrderBy(s => s, StringComparer.Ordinal)
+            .ToArray(),
+        counterDisplayStyles = new[]
         {
-            "Custom_0", "Custom_1", "Custom_2", "Custom_3", "Custom_4",
-            "Custom_5", "Custom_6", "Custom_7", "Custom_8"
+            new CatalogItem("auto", "自动 (auto)", "有上限且 ≤8 格时用点阵，否则使用胶囊/进度条", true),
+            new CatalogItem("pips", "格点 (pips)", "离散能量点/护盾格（如 ●●●○○）", true),
+            new CatalogItem("bar", "进度条 (bar)", "充能条/阈值进度条（配合 maxConst / maxAttr）", true),
+            new CatalogItem("gem", "宝石徽章 (gem)", "紧凑圆宝石角标（适合短数字层数）", true),
+            new CatalogItem("pill", "胶囊标签 (pill)", "完整文字+数值胶囊（适合长标签或百分比）", true),
+        },
+        counterDisplayValueTypes = new[]
+        {
+            new CatalogItem("count", "计数 (count)", "原始整数层数（如 3）", true),
+            new CatalogItem("progress", "进度比 (progress)", "当前/上限格式（如 2/5）", true),
+            new CatalogItem("percent", "百分比 (percent)", "自动追加 % 后缀（如 +40%）", true),
+            new CatalogItem("seconds", "秒数 (seconds)", "毫秒自动折算为秒展示（如 1.5s）", true),
+            new CatalogItem("multiplier", "倍率 (multiplier)", "倍率格式（如 ×2.5）", true),
+            new CatalogItem("delta", "带正负号增减 (delta)", "正数自动补 + 号（如 +12 / -5）", true),
+        },
+        counterDisplayPositions = new[]
+        {
+            new CatalogItem("bottom", "底部居中 (bottom)", "卡面底边居中，适合进度条与格点", true),
+            new CatalogItem("bottomRight", "右下角 (bottomRight)", "卡面右下角徽章位置", true),
+            new CatalogItem("topLeft", "左上角 (topLeft)", "卡面左上角角标位置", true),
+            new CatalogItem("topRight", "右上角 (topRight)", "卡面右上角角标位置", true),
+        },
+        stepOperations = new[]
+        {
+            new CatalogItem("Add", "增加 (Add)", "在原值基础上相加", true),
+            new CatalogItem("Subtract", "减少 (Subtract)", "在原值基础上相减", true),
+            new CatalogItem("Set", "设为 (Set)", "直接覆盖为目标值", true),
+            new CatalogItem("Multiply", "乘以 (Multiply)", "按倍率缩放原值", true),
+        },
+        changeKinds = new[]
+        {
+            new CatalogItem("Disable", "禁用/冻结槽位 (Disable)", "临时停用目标卡牌", true),
+            new CatalogItem("Destroy", "摧毁 (Destroy)", "本场战斗内摧毁目标卡牌", true),
+            new CatalogItem("Repair", "修复 (Repair)", "修复被摧毁或禁用的目标卡牌", true),
+        },
+        playerTargets = new[]
+        {
+            new CatalogItem("Self", "己方玩家 (Self)", "本卡所属玩家", true),
+            new CatalogItem("Opponent", "敌方玩家 (Opponent)", "对手玩家", true),
+        },
+        durations = new[]
+        {
+            new CatalogItem("Combat", "仅本场战斗 (Combat)", "战斗结束自动还原", true),
+            new CatalogItem("Permanent", "永久局内生效 (Permanent)", "战后也保留至后续回合", false),
         },
         vfxPresets = OfficialVfxPresets,
+        vfxAliases = OfficialVfxAliasMap,
         budgets = new
         {
             maxChainDepth = CombatMechanicRuntime.MaxChainDepth,
@@ -354,6 +453,49 @@ public static class ModRuleCatalog
             maxDelayedCallbacksPerCombat = CombatMechanicRuntime.MaxDelayedCallbacksPerCombat,
             maxRepeatCount = CombatMechanicRuntime.MaxRepeatCount
         }
+    };
+
+    private static string GetHookScopeNameZh(string s) => s switch
+    {
+        "SelfCard" => "仅自身卡牌 (SelfCard)",
+        "OwnerBoard" => "己方棋盘 (OwnerBoard)",
+        "EnemyBoard" => "敌方棋盘 (EnemyBoard)",
+        "OwnerPlayer" => "己方玩家 (OwnerPlayer)",
+        "EnemyPlayer" => "敌方玩家 (EnemyPlayer)",
+        "Global" => "全局双方 (Global)",
+        "Any" => "任意来源 (Any)",
+        _ => s
+    };
+
+    private static string GetHookScopeDescZh(string s) => s switch
+    {
+        "SelfCard" => "仅当事件主体/目标是挂载本机制的卡牌自身时触发",
+        "OwnerBoard" => "监听己方棋盘上任意卡牌的事件",
+        "EnemyBoard" => "监听敌方棋盘上任意卡牌的事件",
+        "OwnerPlayer" => "监听己方玩家受击/状态变更等事件",
+        "EnemyPlayer" => "监听敌方玩家受击/状态变更等事件",
+        "Global" => "监听整场战斗双方所有事件",
+        "Any" => "不限制来源范围，任意对象均可命中",
+        _ => $"钩子监听作用域 {s}"
+    };
+
+    private static string GetPlayerAttributeNameZh(string a) => a switch
+    {
+        "Health" => "当前生命 (Health)",
+        "HealthMax" => "生命上限 (HealthMax)",
+        "Shield" => "护盾 (Shield)",
+        "Burn" => "灼烧 (Burn)",
+        "Poison" => "剧毒 (Poison)",
+        "HealthRegen" => "生命再生 (HealthRegen)",
+        "Regen" => "再生 (Regen)",
+        "Rage" => "怒气 (Rage)",
+        "RageMax" => "怒气上限 (RageMax)",
+        "Tempo" => "节奏 (Tempo)",
+        "Joy" => "愉悦 (Joy)",
+        "Gold" => "金币 (Gold)",
+        "Income" => "每小时收入 (Income)",
+        "PercentDamageReduction" => "百分比减伤 (PercentDamageReduction)",
+        _ => a
     };
 
     private static List<CatalogItem> GetCommonAttributes() =>
@@ -382,6 +524,12 @@ public static class ModRuleCatalog
         new("Custom_0", "自定义数值 0", "供技能成长/光环/自定义机制引用的自由数值槽", true, "点", "扩展"),
         new("Custom_1", "自定义数值 1", "供技能成长/经济奖励引用的自由数值槽", true, "点", "扩展"),
         new("Custom_2", "自定义数值 2", "自由数值槽 2", false, "点", "扩展"),
+        new("Custom_3", "自定义数值 3（默认计数槽）", "自定义机制默认计数器投影槽位", true, "点", "扩展"),
+        new("Custom_4", "自定义数值 4", "扩展自由数值槽 4", false, "点", "扩展"),
+        new("Custom_5", "自定义数值 5", "扩展自由数值槽 5", false, "点", "扩展"),
+        new("Custom_6", "自定义数值 6", "扩展自由数值槽 6", false, "点", "扩展"),
+        new("Custom_7", "自定义数值 7", "扩展自由数值槽 7", false, "点", "扩展"),
+        new("Custom_8", "自定义数值 8", "扩展自由数值槽 8", false, "点", "扩展"),
         new("GoldGainAmount", "金币获取量", "单次触发获得的金币数", false, "金币", "经济")
     ];
 

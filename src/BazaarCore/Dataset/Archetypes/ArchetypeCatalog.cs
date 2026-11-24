@@ -102,7 +102,7 @@ public sealed class ArchetypeCatalog : IArchetypeCatalog
     }
 
     /// <summary>
-    /// 基于现有扩展目录叠加外部真值构筑蓝图（如巴扎罗盘 builds），自动按 ID 去重并经过 ValidateAgainst 校验。
+    /// 基于现有扩展目录叠加外部真值构筑蓝图（如外部天梯统计源 builds），自动按 ID 去重并经过 ValidateAgainst 校验。
     /// </summary>
     public static ArchetypeCatalog CreateFromMerged(
         GameDataRepository repo,

@@ -11,7 +11,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class GameDataLoadTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     [Fact]
     public void ShouldLoadAllDatabaseTablesCompletely()
@@ -28,15 +28,11 @@ public sealed class GameDataLoadTests
         Assert.Equal(20000, repo.GameMode.Sandstorm.CountdownStartTime);
         Assert.Equal(10000, repo.GameMode.Sandstorm.CountdownDuration);
 
-        var prodCacheDb = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "AppData", "LocalLow", "Tempo Storm", "The Bazaar", "prod", "cache", "GameData.db");
-        if (File.Exists(prodCacheDb))
-        {
-            Assert.NotNull(repo.SourceDataPath);
-            Assert.EndsWith(".db", repo.SourceDataPath!, StringComparison.OrdinalIgnoreCase);
-            Assert.Equal(Path.GetFullPath(prodCacheDb), Path.GetFullPath(repo.SourceDataPath!));
-        }
+        string expectedDb = TestInfrastructure.TestDataLocator.ResolveGameDataDbPath();
+        Assert.NotNull(repo.SourceDataPath);
+        Assert.EndsWith(".db", repo.SourceDataPath!, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(Path.GetFullPath(expectedDb), Path.GetFullPath(repo.SourceDataPath!));
+        Assert.False(TestInfrastructure.TestDataLocator.IsUnderSteamProdCache(repo.SourceDataPath!));
     }
 
     [Fact]

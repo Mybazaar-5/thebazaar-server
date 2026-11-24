@@ -437,9 +437,10 @@ public sealed class TournamentMatchmaker
                 return existing;
             }
 
-            string loser = string.Equals(winnerAccountId, accountA, StringComparison.OrdinalIgnoreCase)
-                ? accountB
-                : accountA;
+            // D6-P1-16：识别同步 PvP 平局哨兵 "__draw__"，置 LoserAccountId = "__draw__"，绝不误填 accountA
+            string loser = string.Equals(winnerAccountId, "__draw__", StringComparison.OrdinalIgnoreCase)
+                ? "__draw__"
+                : (string.Equals(winnerAccountId, accountA, StringComparison.OrdinalIgnoreCase) ? accountB : accountA);
             int seed = battleSeed ?? GetOrCreatePairBattleSeedLocked(day, pairKey);
 
             var resolution = new HumanMatchResolution(

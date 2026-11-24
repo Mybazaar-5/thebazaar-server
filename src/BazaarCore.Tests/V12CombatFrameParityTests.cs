@@ -17,7 +17,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V12CombatFrameParityTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
     private readonly ITestOutputHelper _output;
 
     private const string HealthyJoltId = "721fa7ca-3451-4bbd-ac17-ffcff4a31ac6";
@@ -748,49 +748,60 @@ public sealed class V12CombatFrameParityTests
         var allDurationsSec = new List<double>(200);
         int p1Wins = 0;
 
-        for (int i = 0; i < matchups.Count; i++)
-        {
-            var (label, day, p1, p2, seed) = matchups[i];
-            var runA = CombatSimulator.Simulate(repo, p1, p2, seed: seed, combatType: "PVP", recordTimeline: false, recordEvents: false);
-            var runB = CombatSimulator.Simulate(repo, p1, p2, seed: seed, combatType: "PVP", recordTimeline: false, recordEvents: false);
-
-            // 1. 100% 比特级确定性断言
-            Assert.Equal(runA.WinnerPlayerId, runB.WinnerPlayerId);
-            Assert.Equal(runA.LoserPlayerId, runB.LoserPlayerId);
-            Assert.Equal(runA.IsDraw, runB.IsDraw);
-            Assert.Equal(runA.DurationMs, runB.DurationMs);
-            Assert.Equal(runA.Player1RemainingHp, runB.Player1RemainingHp);
-            Assert.Equal(runA.Player2RemainingHp, runB.Player2RemainingHp);
-            Assert.Equal(runA.Player1TotalDamageDealt, runB.Player1TotalDamageDealt);
-            Assert.Equal(runA.Player2TotalDamageDealt, runB.Player2TotalDamageDealt);
-            Assert.Equal(runA.Player1TotalShieldGained, runB.Player1TotalShieldGained);
-            Assert.Equal(runA.Player2TotalShieldGained, runB.Player2TotalShieldGained);
-
-            // 2. 零 NaN / Infinity / 负血量 / 死循环断言
-            Assert.False(string.IsNullOrEmpty(runA.WinnerPlayerId), $"{label} 缺少胜者");
-            Assert.False(runA.IsDraw, $"{label} 不应返回 IsDraw=true");
-            Assert.InRange(runA.DurationMs, 0, CombatSimulator.MaxDurationMs);
-            Assert.True(runA.Player1RemainingHp >= 0, $"{label} P1 负血量: {runA.Player1RemainingHp}");
-            Assert.True(runA.Player2RemainingHp >= 0, $"{label} P2 负血量: {runA.Player2RemainingHp}");
-            Assert.False(double.IsNaN(runA.Player1TotalDamageDealt) || double.IsInfinity(runA.Player1TotalDamageDealt));
-            Assert.False(double.IsNaN(runA.Player2TotalDamageDealt) || double.IsInfinity(runA.Player2TotalDamageDealt));
-            Assert.False(double.IsNaN(runA.Player1TotalShieldGained) || double.IsInfinity(runA.Player1TotalShieldGained));
-            Assert.False(double.IsNaN(runA.Player2TotalShieldGained) || double.IsInfinity(runA.Player2TotalShieldGained));
-
-            // 抽样验证开启 Events/Timeline 与无头模式完全一致
-            if (i < 24)
+        // 200 场独立对局（每场各自持有全新 p1/p2 实例与确定性种子），并发执行后按原下标汇总保证结果逐位等价
+        var matchOutcomes = new (int Day, double Sec, bool P1Won)[matchups.Count];
+        Parallel.For(
+            0,
+            matchups.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Min(4, Environment.ProcessorCount) },
+            i =>
             {
-                var runFull = CombatSimulator.Simulate(repo, p1, p2, seed: seed, combatType: "PVP", recordTimeline: true, recordEvents: true);
-                Assert.Equal(runA.WinnerPlayerId, runFull.WinnerPlayerId);
-                Assert.Equal(runA.DurationMs, runFull.DurationMs);
-                Assert.Equal(runA.Player1RemainingHp, runFull.Player1RemainingHp);
-                Assert.Equal(runA.Player2RemainingHp, runFull.Player2RemainingHp);
-                Assert.NotEmpty(runFull.Timeline);
-                Assert.NotEmpty(runFull.Events);
-            }
+                var (label, day, p1, p2, seed) = matchups[i];
+                var runA = CombatSimulator.Simulate(repo, p1, p2, seed: seed, combatType: "PVP", recordTimeline: false, recordEvents: false);
+                var runB = CombatSimulator.Simulate(repo, p1, p2, seed: seed, combatType: "PVP", recordTimeline: false, recordEvents: false);
 
-            if (runA.WinnerPlayerId == p1.PlayerId) p1Wins++;
-            double sec = runA.DurationMs / 1000.0;
+                // 1. 100% 比特级确定性断言
+                Assert.Equal(runA.WinnerPlayerId, runB.WinnerPlayerId);
+                Assert.Equal(runA.LoserPlayerId, runB.LoserPlayerId);
+                Assert.Equal(runA.IsDraw, runB.IsDraw);
+                Assert.Equal(runA.DurationMs, runB.DurationMs);
+                Assert.Equal(runA.Player1RemainingHp, runB.Player1RemainingHp);
+                Assert.Equal(runA.Player2RemainingHp, runB.Player2RemainingHp);
+                Assert.Equal(runA.Player1TotalDamageDealt, runB.Player1TotalDamageDealt);
+                Assert.Equal(runA.Player2TotalDamageDealt, runB.Player2TotalDamageDealt);
+                Assert.Equal(runA.Player1TotalShieldGained, runB.Player1TotalShieldGained);
+                Assert.Equal(runA.Player2TotalShieldGained, runB.Player2TotalShieldGained);
+
+                // 2. 零 NaN / Infinity / 负血量 / 死循环断言
+                Assert.False(string.IsNullOrEmpty(runA.WinnerPlayerId), $"{label} 缺少胜者");
+                Assert.False(runA.IsDraw, $"{label} 不应返回 IsDraw=true");
+                Assert.InRange(runA.DurationMs, 0, CombatSimulator.MaxDurationMs);
+                Assert.True(runA.Player1RemainingHp >= 0, $"{label} P1 负血量: {runA.Player1RemainingHp}");
+                Assert.True(runA.Player2RemainingHp >= 0, $"{label} P2 负血量: {runA.Player2RemainingHp}");
+                Assert.False(double.IsNaN(runA.Player1TotalDamageDealt) || double.IsInfinity(runA.Player1TotalDamageDealt));
+                Assert.False(double.IsNaN(runA.Player2TotalDamageDealt) || double.IsInfinity(runA.Player2TotalDamageDealt));
+                Assert.False(double.IsNaN(runA.Player1TotalShieldGained) || double.IsInfinity(runA.Player1TotalShieldGained));
+                Assert.False(double.IsNaN(runA.Player2TotalShieldGained) || double.IsInfinity(runA.Player2TotalShieldGained));
+
+                // 抽样验证开启 Events/Timeline 与无头模式完全一致
+                if (i < 24)
+                {
+                    var runFull = CombatSimulator.Simulate(repo, p1, p2, seed: seed, combatType: "PVP", recordTimeline: true, recordEvents: true);
+                    Assert.Equal(runA.WinnerPlayerId, runFull.WinnerPlayerId);
+                    Assert.Equal(runA.DurationMs, runFull.DurationMs);
+                    Assert.Equal(runA.Player1RemainingHp, runFull.Player1RemainingHp);
+                    Assert.Equal(runA.Player2RemainingHp, runFull.Player2RemainingHp);
+                    Assert.NotEmpty(runFull.Timeline);
+                    Assert.NotEmpty(runFull.Events);
+                }
+
+                matchOutcomes[i] = (day, runA.DurationMs / 1000.0, runA.WinnerPlayerId == p1.PlayerId);
+            });
+
+        for (int i = 0; i < matchOutcomes.Length; i++)
+        {
+            var (day, sec, p1Won) = matchOutcomes[i];
+            if (p1Won) p1Wins++;
             durationsByDay[day].Add(sec);
             allDurationsSec.Add(sec);
         }
@@ -910,18 +921,7 @@ public sealed class V12CombatFrameParityTests
     }
 
     private static string ResolveCompassDistilledPath()
-    {
-        const string fallback = @"e:\thebazaar\dist\dataset-worker-win-x64\data\compass_distilled.json";
-        if (File.Exists(fallback)) return fallback;
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            string candidate = Path.Combine(dir, "dist", "dataset-worker-win-x64", "data", "compass_distilled.json");
-            if (File.Exists(candidate)) return candidate;
-            dir = Directory.GetParent(dir)?.FullName;
-        }
-        return fallback;
-    }
+        => TestInfrastructure.TestDataLocator.ResolveCompassDistilledPath();
 
     private static PlayerState CreatePlayer(string id, string hero, int hp)
         => new(id, id, hero, initialHealthMax: hp, initialPrestige: 20, initialGold: 10, unlockedHandSlots: 10);

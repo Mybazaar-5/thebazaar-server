@@ -9,7 +9,11 @@ public sealed class RemoteClientFileEntry
     public string Name { get; init; } = string.Empty;
     public string Category { get; init; } = "plugin";
     public string Version { get; init; } = string.Empty;
+    public string FileVersion { get; init; } = string.Empty;
     public string RelativeTargetPath { get; init; } = string.Empty;
+    public bool HasExplicitTargetPath { get; init; }
+    public string UpdatePolicy { get; init; } = "always";
+    public string AtomicGroup { get; init; } = string.Empty;
     public string DownloadUrl { get; init; } = string.Empty;
     public string Sha256 { get; init; } = string.Empty;
     public long SizeBytes { get; init; }
@@ -22,10 +26,12 @@ public sealed class RemoteClientFileEntry
 public sealed class ClientUpdateManifest
 {
     public string Channel { get; init; } = "stable";
+    public string ServerVersion { get; init; } = string.Empty;
     public string LauncherVersion { get; init; } = string.Empty;
     public string HubVersion { get; init; } = string.Empty;
     public string LocalizationVersion { get; init; } = string.Empty;
     public string MinRequiredVersion { get; init; } = string.Empty;
+    public string MinHubVersion { get; init; } = string.Empty;
     public string ReleaseNotes { get; init; } = string.Empty;
     public List<RemoteClientFileEntry> Files { get; init; } = new();
 }
@@ -47,7 +53,7 @@ public sealed class RemoteModEntry
 }
 
 /// <summary>
-/// 服务端 Mod 资产（PNG/WebP 等客户端贴图）描述。
+/// 服务端 Mod 资产（PNG/JPEG 客户端贴图）描述。
 /// </summary>
 public sealed class RemoteModAssetEntry
 {
@@ -102,12 +108,37 @@ public sealed class SyncItemStatus
 }
 
 /// <summary>
+/// 启动前同步结果门禁决策动作（P0-47）。
+/// </summary>
+public enum LaunchGateAction
+{
+    /// <summary>同步成功或离线优雅降级，允许直接启动游戏。</summary>
+    AllowLaunch = 0,
+
+    /// <summary>检测到游戏进程运行中阻断了核心插件写入，硬阻断二次启动。</summary>
+    BlockRunningGame = 1,
+
+    /// <summary>核心插件或引导组件更新失败/回滚，默认阻断启动并弹窗决策。</summary>
+    BlockCoreFailure = 2,
+
+    /// <summary>仅非核心资产（Mod 贴图/词典）存在失败，弹窗二次确认后可启动。</summary>
+    WarnNonCoreFailure = 3
+}
+
+/// <summary>
 /// 同步检查与执行结果汇总。
 /// </summary>
 public sealed class UpdateSyncReport
 {
     public bool Success { get; set; }
     public bool DegradedOffline { get; set; }
+    public bool BlockedByRunningGame { get; set; }
+    public bool BlockedByMinVersion { get; set; }
+    public bool HubUpgradeRequired { get; set; }
+    public bool HubUpgradeRecommended { get; set; }
+    public string RecommendedHubVersion { get; set; } = string.Empty;
+    public int DowngradeProtectedCount { get; set; }
+    public bool HasCorePluginFailure { get; set; }
     public string ServerBase { get; set; } = string.Empty;
     public string SummaryMessage { get; set; } = string.Empty;
     public ClientUpdateManifest? ClientManifest { get; set; }
@@ -117,6 +148,7 @@ public sealed class UpdateSyncReport
     public int SkippedUpToDateCount { get; set; }
     public int FailedCount { get; set; }
     public long TotalBytesDownloaded { get; set; }
+    public List<string> RolledBackAtomicGroups { get; } = new();
     public List<SyncItemStatus> Items { get; } = new();
     public List<string> Warnings { get; } = new();
     public List<string> Errors { get; } = new();

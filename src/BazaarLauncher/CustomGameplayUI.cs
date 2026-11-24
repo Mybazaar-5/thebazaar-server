@@ -72,6 +72,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     private static BazaarLauncher.Core.SafeHarmonyPatcher _hostPatcher;
     private static BazaarLauncher.Core.SafeHarmonyPatcher _fallbackPatcher;
     private static int _lastEscConsumedFrame = -1;
+    internal static int LastEscConsumedFrame => _lastEscConsumedFrame;
     private readonly List<IDisposable> _eventSubscriptions = new();
     private int _rulesVersion;
     private bool _hudDirty = true;
@@ -105,8 +106,6 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     private static Type _cachedTssType;
     private static PropertyInfo _tssCurrentStatusProp;
     private static PropertyInfo _serverTimeProp;
-    private static FieldInfo _eventsCombatBlockedField;
-    private static MethodInfo _combatBlockedTriggerMethod;
 
     // ── 零 GC 热键检测（优先新 InputSystem，保留 Legacy Input 兜底）───────────
     private bool _inputChecked;
@@ -234,11 +233,15 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             _latestTourneyStatus = null;
             _tourneyWaitErrorNotice = "";
             _tourneyWaitErrorUntil = 0f;
-            // P2-41：返回主菜单清空跨局残留缓存并停用闲置 SSE 长连接
+            // P2-41 & D6-P1-08：返回主菜单清空跨局/跨房残留缓存、释放房间 Mod 与回放视觉快照并停用闲置 SSE 长连接
+            _currentLobby = null;
+            _lobbyDirty = false;
             _lastOpeningPromptedRunId = "";
             _autoAppliedLobbyIds.Clear();
             _activeRunLockedMask = 0UL;
             _activeRunFetchInFlight = false;
+            BazaarLauncher.Core.ModContentSyncClient.Instance?.ClearSyncedRoomBundleMods();
+            BazaarLauncher.Core.ModContentSyncClient.Instance?.ClearReplayVisualBindings();
             StopSocialSse();
         }
         _lastViewportScreenW = -1;
@@ -278,14 +281,23 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             SavePersonalTendencyDraftAsync(_normalRules.SelectedArchetypeMask);
         }
 
-        // 热键 F8 打开/收起，Esc 关闭弹窗（零分配检查 + P1-49 同帧 FightMenuDialog 互斥防穿透）
-        if (WasKeyPressedThisFrame(isEscape: false) && !IsInActiveCombatPlayback())
+        // 热键 F8 打开/收起，Esc 关闭弹窗（D4-P1-10：输入框聚焦时屏蔽 F8/热键，同帧 Esc 与 PopupManager.HandleEscape 互斥防穿透）
+        bool inputFocused = IsAnyTmpInputFieldFocused();
+        if (!inputFocused && WasKeyPressedThisFrame(isEscape: false) && !IsInActiveCombatPlayback())
         {
             ToggleOpen();
         }
         else if ((_isOpen || _showPreRunPrompt) && _lastEscConsumedFrame != Time.frameCount && WasKeyPressedThisFrame(isEscape: true))
         {
-            TryConsumeEscapeForCustomModal();
+            if (inputFocused)
+            {
+                _lastEscConsumedFrame = Time.frameCount;
+                try { EventSystem.current?.SetSelectedGameObject(null); } catch { }
+            }
+            else
+            {
+                TryConsumeEscapeForCustomModal();
+            }
         }
 
         // 事件驱动按需刷新（修复 P1-1 & 拖拽 Top 10）：将 AppState 反射轮询降频至 0.25s，避免每帧反射开销
@@ -526,8 +538,8 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         {
             return (false, 400, "规则配置数据不能为空", null);
         }
-        rules.EnsureCollections();
-        rules.RefreshPowerFlag();
+        var snapshot = rules.Clone();
+        snapshot.NormalizeBounds();
 
         bool isTournament = string.Equals(target, "tournament", StringComparison.OrdinalIgnoreCase);
         if (isTournament)
@@ -537,10 +549,10 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             {
                 return (false, 404, "当前未处于任何锦标赛房间中", null);
             }
-            var resp = await NameAuth.PutJsonAsync($"/lobbies/{Uri.EscapeDataString(lobbyId)}/rules", rules).ConfigureAwait(false);
+            var resp = await NameAuth.PutJsonAsync($"/lobbies/{Uri.EscapeDataString(lobbyId)}/rules", snapshot).ConfigureAwait(false);
             if (resp.Ok)
             {
-                var saved = TryDeserializeRules(resp.Body) ?? rules.Clone();
+                var saved = TryDeserializeRules(resp.Body) ?? snapshot.Clone();
                 TournamentPresetStore.SaveLastTournamentRules(saved);
                 GameDriver.RunOnMain(() =>
                 {
@@ -560,15 +572,16 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         }
         else
         {
-            var resp = await NameAuth.PutJsonAsync("/custom-rules/me", rules).ConfigureAwait(false);
+            var resp = await NameAuth.PutJsonAsync("/custom-rules/me", snapshot).ConfigureAwait(false);
             if (resp.Ok)
             {
-                var saved = TryDeserializeRules(resp.Body) ?? rules.Clone();
+                var saved = TryDeserializeRules(resp.Body) ?? snapshot.Clone();
                 GameDriver.RunOnMain(() =>
                 {
                     DrainPendingUpdates();
                     _normalRules = saved.Clone();
                     _normalBuf.SyncFromRules(_normalRules);
+                    Modules.NativeMenuEmbedModule.Instance?.SyncSelectedQuickModeFromRules(_normalRules.SpecialModeId, _normalRules.PresetId);
                     SetStatus("已通过调试接口应用个人玩法规则", isError: false);
                     RefreshModalContentsIfOpen();
                     RefreshHudOverlays(force: true);
@@ -650,7 +663,9 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                         }
 
                         _normalRules = parsedRules;
+                        _normalRules.NormalizeBounds();
                         _normalBuf.SyncFromRules(_normalRules);
+                        Modules.NativeMenuEmbedModule.Instance?.SyncSelectedQuickModeFromRules(_normalRules.SpecialModeId, _normalRules.PresetId);
                     }
                     if (catResp.Ok && meResp.Ok)
                     {
@@ -680,7 +695,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     private void SaveNormalRulesAsync()
     {
         var snapshot = _normalRules.Clone();
-        snapshot.RefreshPowerFlag();
+        snapshot.NormalizeBounds();
         _isBusy = true;
         SetStatus("正在保存普通/排位玩法配置...", isError: false);
         RefreshModalContentsIfOpen();
@@ -697,8 +712,10 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                     if (saved != null)
                     {
                         _normalRules = saved;
+                        _normalRules.NormalizeBounds();
                         _normalBuf.SyncFromRules(_normalRules);
                     }
+                    Modules.NativeMenuEmbedModule.Instance?.SyncSelectedQuickModeFromRules(_normalRules.SpecialModeId, _normalRules.PresetId);
                     SetStatus("配置已保存并生效！", isError: false);
                 }
                 else
@@ -727,17 +744,17 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 if (resp.Ok)
                 {
                     _normalRules = reset ?? new CustomRunRuleSet();
-                    _normalRules.EnsureCollections();
-                    _normalRules.RefreshPowerFlag();
+                    _normalRules.NormalizeBounds();
                     _normalBuf.SyncFromRules(_normalRules);
                     SetStatus("已恢复私服标准默认配置（野怪自选默认生效，超模项已关闭）", isError: false);
                 }
                 else
                 {
-                    _normalRules.ResetToStandardValues(preserveArchetypeAndLobbyFlags: false);
+                    _normalRules.ResetToDefaults();
                     _normalBuf.SyncFromRules(_normalRules);
                     SetStatus("本地已重置；服务端重置失败：" + Truncate(resp.Error, 56), isError: true);
                 }
+                Modules.NativeMenuEmbedModule.Instance?.SyncSelectedQuickModeFromRules(_normalRules.SpecialModeId, _normalRules.PresetId);
                 RefreshHudOverlays(force: true);
                 RefreshModalContentsIfOpen();
             });
@@ -1224,6 +1241,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     {
         if (_isBusy) return;
         _isBusy = true;
+        string runIdSnapshot = _activeRunId;
         SetStatus("正在向服务端锁定本局流派倾向...", isError: false);
         RefreshStatusBarUi();
 
@@ -1232,7 +1250,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             var payload = new
             {
                 selectedArchetypeMask = rawMask,
-                runId = string.IsNullOrEmpty(_activeRunId) ? null : _activeRunId,
+                runId = string.IsNullOrEmpty(runIdSnapshot) ? null : runIdSnapshot,
             };
             var resp = await NameAuth.PostJsonAsync("/custom-rules/me/lock-opening-tendency", payload).ConfigureAwait(false);
 
@@ -1395,8 +1413,23 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                     label: "CustomUI.NetworkManager.HandleCommandErrorMessage");
             }
 
-            // P1-49：FightMenuDialog.OpenMenu 仅由 PopupManager.HandleEscape 调用（右上角齿轮按钮直接走 ShowDialogs），
-            // 挂载同帧 Esc 互斥 Prefix 彻底防止按 Esc 关自定义弹窗时穿透拉起原生暂停菜单
+            // P1-49 & D4-P1-10：同时拦截 PopupManager.HandleEscape 与 FightMenuDialog.OpenMenu，
+            // 优先消费自定义弹窗并在同帧互斥防穿透原生菜单
+            var popupMgrType = GameInspector.FindTypeSafe("TheBazaar.UI.PopupManager", "PopupManager");
+            if (popupMgrType != null)
+            {
+                var handleEscBool = AccessTools.Method(popupMgrType, "HandleEscape", new[] { typeof(bool) })
+                    ?? AccessTools.Method(popupMgrType, "HandleEscape", Type.EmptyTypes);
+                if (handleEscBool != null)
+                {
+                    patcher.TryPatchMethod(
+                        handleEscBool,
+                        prefix: AccessTools.Method(typeof(CustomGameplayUI), nameof(OnPopupManagerHandleEscapePrefix)),
+                        optional: true,
+                        label: "CustomUI.PopupManager.HandleEscape");
+                }
+            }
+
             var fightMenuType = GameInspector.FindTypeSafe("FightMenuDialog", "TheBazaar.FightMenuDialog");
             var openMenuMethod = fightMenuType == null ? null : AccessTools.Method(fightMenuType, "OpenMenu", Type.EmptyTypes);
             if (openMenuMethod != null)
@@ -1412,6 +1445,48 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         {
             BazaarLauncherPlugin.Log?.LogWarning("InstallHarmonyHooksOnce: " + ex.Message);
         }
+    }
+
+    private static bool IsAnyTmpInputFieldFocused()
+    {
+        try
+        {
+            var es = EventSystem.current;
+            var go = es != null ? es.currentSelectedGameObject : null;
+            if (go == null) return false;
+            var tmpInput = go.GetComponent<TMPro.TMP_InputField>();
+            if (tmpInput != null && tmpInput.isFocused) return true;
+            var uguiInput = go.GetComponent<UnityEngine.UI.InputField>();
+            if (uguiInput != null && uguiInput.isFocused) return true;
+        }
+        catch { }
+        return false;
+    }
+
+    private static bool OnPopupManagerHandleEscapePrefix()
+    {
+        try
+        {
+            int frame = Time.frameCount;
+            if (_lastEscConsumedFrame == frame)
+                return false;
+
+            if (IsAnyTmpInputFieldFocused())
+            {
+                _lastEscConsumedFrame = frame;
+                try { EventSystem.current?.SetSelectedGameObject(null); } catch { }
+                return false;
+            }
+
+            var inst = Instance;
+            if (inst != null && (inst._isOpen || inst._showPreRunPrompt))
+            {
+                inst.TryConsumeEscapeForCustomModal();
+                return false;
+            }
+        }
+        catch { }
+        return true;
     }
 
     private static bool OnFightMenuOpenMenuPrefix()
@@ -1596,42 +1671,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 return true;
 
             // 触发原生 Events.CombatBlocked 让状态机保持备战一致，并用右上角简体中文横幅代替英文弹窗阻塞
-            // 注意：TheBazaar.Event<T>.Trigger(T parameter = default) 为 internal 且带 1 个可选参数，必须查 NonPublic 并传入对应数量参数
-            try
-            {
-                if (_eventsCombatBlockedField == null)
-                {
-                    var eventsType = AccessTools.TypeByName("TheBazaar.Events");
-                    _eventsCombatBlockedField = eventsType?.GetField("CombatBlocked", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                }
-                var evObj = _eventsCombatBlockedField?.GetValue(null);
-                if (evObj != null)
-                {
-                    _combatBlockedTriggerMethod ??= evObj.GetType().GetMethod(
-                        "Trigger",
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (_combatBlockedTriggerMethod != null)
-                    {
-                        var ps = _combatBlockedTriggerMethod.GetParameters();
-                        if (ps.Length == 0)
-                        {
-                            _combatBlockedTriggerMethod.Invoke(evObj, null);
-                        }
-                        else
-                        {
-                            var invokeArgs = new object[ps.Length];
-                            for (int i = 0; i < ps.Length; i++)
-                            {
-                                invokeArgs[i] = ps[i].HasDefaultValue
-                                    ? ps[i].DefaultValue
-                                    : (ps[i].ParameterType.IsValueType ? Activator.CreateInstance(ps[i].ParameterType) : null);
-                            }
-                            _combatBlockedTriggerMethod.Invoke(evObj, invokeArgs);
-                        }
-                    }
-                }
-            }
-            catch { }
+            BazaarLauncher.Core.GameEventsBridge.TryTrigger("CombatBlocked");
 
             _tourneyWaitErrorNotice = zhNotice;
             _tourneyWaitErrorUntil = Time.unscaledTime + 8f;
@@ -1727,10 +1767,18 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             var dto = GameInspector.GetMember(sm, "DTO");
             bool hasStarted = dto != null && GameInspector.GetMember(dto, "HasStarted") is bool hs && hs;
 
-            if (dto != null && isHost && !hasStarted)
+            // D6-P1-08：去除 && isHost 限制，房主与非房主通过原版 UI 进房时均主动刷新房间详情并同步房间 Mod 套件；
+            // 仅房主且未开赛时自动提交上次记忆规则
+            if (dto != null)
             {
                 inst._nextLobbyPollTime = 0f;
-                inst.RefreshTournamentLobbyAsync(forceOverwriteHostDraft: false, autoApplyLastIfNewHostLobby: true);
+                inst.RefreshTournamentLobbyAsync(forceOverwriteHostDraft: false, autoApplyLastIfNewHostLobby: isHost && !hasStarted);
+            }
+            else if (inst._currentLobby != null)
+            {
+                inst._currentLobby = null;
+                inst._lobbyDirty = false;
+                BazaarLauncher.Core.ModContentSyncClient.Instance?.ClearSyncedRoomBundleMods();
             }
             inst.RefreshHudOverlays(force: true);
         }

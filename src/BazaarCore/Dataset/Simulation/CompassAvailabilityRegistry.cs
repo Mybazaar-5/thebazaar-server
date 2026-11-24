@@ -3,7 +3,7 @@ using System.Collections.Concurrent;
 namespace BazaarCore.Dataset.Simulation;
 
 /// <summary>
-/// 来自巴扎罗盘（availability/{hero}.json）的各英雄分天真实卡牌获取概率缓存（并发安全只读）。
+/// 来自外部天梯统计源（availability/{hero}.json）的各英雄分天真实卡牌获取概率缓存（并发安全只读）。
 /// </summary>
 public static class CompassAvailabilityRegistry
 {

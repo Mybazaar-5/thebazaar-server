@@ -842,8 +842,16 @@ public sealed class LevelUpTable
             (string TemplateId, CardTier Tier) chosen;
             if (string.Equals(Group.SelectionMethod, "Sequential", StringComparison.OrdinalIgnoreCase))
             {
-                chosen = avail[Math.Min(_seqIdx, avail.Count - 1)];
-                _seqIdx++;
+                // D2-P2-03：当不允许重复（!AllowDuplicates）时，avail 已移除已抽项，直接取 avail[0] 杜绝跳项；允许重复时按 _seqIdx 模数顺序推进
+                if (!AllowDuplicates)
+                {
+                    chosen = avail[0];
+                }
+                else
+                {
+                    chosen = avail[_seqIdx % avail.Count];
+                    _seqIdx++;
+                }
             }
             else
             {
@@ -878,7 +886,7 @@ public sealed class LevelUpTable
     /// <summary>
     /// 判断指定目标新等级对当前英雄是否属于标准多选一升级层（实际至少 3 项，区别于 Dooley/Jules/Hero8 Lv3 必出或 Lv10/19 附魔台 2 选层）。
     /// </summary>
-    public bool IsStandardMultiChoiceLevel(int targetNewLevel, RuleExecutionContext ctx)
+    public bool IsStandardMultiChoiceLevel(int targetNewLevel, RuleExecutionContext ctx, Func<string, bool>? isAssetValid = null)
     {
         var entry = ResolveLevelEntry(targetNewLevel);
         if (entry == null) return true;
@@ -890,7 +898,7 @@ public sealed class LevelUpTable
             : 3);
         if (limit is > 0 and < 3) return false;
 
-        // 按官方前置条件与英雄归属过滤后统计真实最大可发选项数，准确区分 1~2 选层与标准 3+ 选层
+        // 按官方前置条件、英雄归属与资产白名单过滤后统计真实最大可发选项数，准确区分 1~2 选层与标准 3+ 选层（D2-P2-03）
         var topBehaviors = entry.RewardsNode?.Behaviors ?? [];
         int maxPossiblePicks = 0;
         foreach (var grp in entry.Groups)
@@ -901,7 +909,7 @@ public sealed class LevelUpTable
                 continue;
             }
 
-            var (candidates, _) = ResolveGroupCandidates(grp, topBehaviors, ctx, isAssetValid: null);
+            var (candidates, _) = ResolveGroupCandidates(grp, topBehaviors, ctx, isAssetValid: isAssetValid);
             if (candidates.Count == 0) continue;
 
             int grpCap = grp.GroupNode?.Limit != null

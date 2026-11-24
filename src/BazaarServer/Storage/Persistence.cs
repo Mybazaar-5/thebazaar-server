@@ -19,20 +19,30 @@ public sealed partial class Persistence : IDisposable
 {
     public const int DefaultSaveDebounceMs = 1500;
     public const int MaxReplayBlobBytes = 512 * 1024; // 单条 GZip 战斗回放上限 512 KB
+    public const int MaxDebounceRetries = 5;
+    public const int MaxTrackedRunGenEntries = 10_000;
 
-    private sealed record PendingRunSave(RunRow Row, long Generation, long DueTickMs);
+    private sealed record PendingRunSave(RunRow Row, long Generation, long DueTickMs, int RetryCount = 0);
 
     private readonly string _writeConnString;
     private readonly string _readConnString;
     private readonly object _writeLock = new();
     private readonly object _debounceSync = new();
     private readonly Dictionary<string, PendingRunSave> _pendingSaves = new(StringComparer.Ordinal);
+    // 严格分锁：_endedRunGenerations 仅在 _debounceSync (L6) 内独立维护与裁剪
+    private readonly Dictionary<string, (long Gen, bool IsConceded)> _endedRunGenerations = new(StringComparer.Ordinal);
+    // 严格分锁：_lastPersistedGen 仅在 _writeLock (L7) 内独立维护与裁剪，严禁与 L6 交叉
     private readonly Dictionary<string, long> _lastPersistedGen = new(StringComparer.Ordinal);
     private readonly List<Action> _flushCallbacks = new();
     private readonly Timer _debounceTimer;
     private long _debounceGeneration;
     private long _completedRunWriteCount;
+    private long _debounceWriteErrorCount;
+    private long _lastDebounceErrorLogTickMs;
     private int _disposed;
+
+    /// <summary>测试故障注入钩子：在每次 WriteBatch 写入前触发，用于验证定时器异常保护与退避重试。</summary>
+    public Action? BeforeWriteBatchHookForTesting { get; set; }
 
     public string DbPath { get; }
 
@@ -47,6 +57,9 @@ public sealed partial class Persistence : IDisposable
 
     /// <summary>累计已完成 SQLite 写入的对局快照次数（用于并发压测与防抖合并验证）。</summary>
     public long CompletedRunWriteCount => Volatile.Read(ref _completedRunWriteCount);
+
+    /// <summary>防抖后台定时落盘遇到瞬时写入异常的累计次数（用于可观测性与防崩回归验证）。</summary>
+    public long DebounceWriteErrorCount => Interlocked.Read(ref _debounceWriteErrorCount);
 
     public Persistence(string dbPath)
     {
@@ -333,6 +346,7 @@ public sealed partial class Persistence : IDisposable
                         password_hash                  TEXT NOT NULL DEFAULT '',
                         is_invite_only                 INTEGER NOT NULL DEFAULT 0,
                         invite_token_hash              TEXT NOT NULL DEFAULT '',
+                        invite_token_expires_at        TEXT NOT NULL DEFAULT '',
                         exclude_host_from_gameplay     INTEGER NOT NULL DEFAULT 0,
                         state                          TEXT NOT NULL DEFAULT 'waiting',
                         tournament_session_id          TEXT NOT NULL DEFAULT '',
@@ -458,7 +472,8 @@ public sealed partial class Persistence : IDisposable
                         p2_board_json         TEXT NOT NULL,
                         timeline_summary_json TEXT NOT NULL DEFAULT '{}',
                         combat_sim_gzip       BLOB,
-                        created_at            TEXT NOT NULL
+                        created_at            TEXT NOT NULL,
+                        visual_bindings_json  TEXT NOT NULL DEFAULT ''
                     );
                     CREATE INDEX IF NOT EXISTS idx_replays_p1      ON match_history_and_replays(p1_account_id, created_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_replays_p2      ON match_history_and_replays(p2_account_id, created_at DESC);
@@ -506,6 +521,13 @@ public sealed partial class Persistence : IDisposable
                     CREATE INDEX IF NOT EXISTS idx_season_progress_account
                         ON account_season_progress(account_id, season_id);
                     """);
+            });
+
+            ApplyMigration(conn, 5, "wave2b_replay_visual_bindings_json", c =>
+            {
+                EnsureColumn(c, "match_history_and_replays", "visual_bindings_json", "TEXT NOT NULL DEFAULT ''");
+                // D6-P2-01：幂等补列 invite_token_expires_at，确保邀请码过期时间跨重启持久化
+                EnsureColumn(c, "tournament_lobbies", "invite_token_expires_at", "TEXT NOT NULL DEFAULT ''");
             });
         }
     }
@@ -1089,20 +1111,36 @@ public sealed partial class Persistence : IDisposable
     {
         ArgumentNullException.ThrowIfNull(run);
         var row = BuildRunRowFromState(run, accountIdOrSnapshot, explicitSnapshotJson: null, isCustomRule);
+        bool isTerminalRow = row.IsEnded || IsTerminalState(row.State);
 
+        bool writeDirectly = false;
+        long directGen = 0;
         lock (_debounceSync)
         {
-            if (_disposed != 0)
+            // D2-P1-01：已终结局直接丢弃迟到非终态快照；已投降局拦截任何后续覆盖
+            if (_endedRunGenerations.TryGetValue(row.RunId, out var endInfo)
+                && (!isTerminalRow || endInfo.IsConceded))
             {
-                SaveRunCore(row, assignNewGen: true, explicitGeneration: 0);
                 return;
             }
 
-            long gen = ++_debounceGeneration;
-            long dueMs = Environment.TickCount64 + DefaultSaveDebounceMs;
-            _pendingSaves[row.RunId] = new PendingRunSave(row, gen, dueMs);
-            RescheduleTimerLocked();
+            if (_disposed != 0)
+            {
+                writeDirectly = true;
+                directGen = ++_debounceGeneration;
+            }
+            else
+            {
+                long gen = ++_debounceGeneration;
+                long dueMs = Environment.TickCount64 + DefaultSaveDebounceMs;
+                _pendingSaves[row.RunId] = new PendingRunSave(row, gen, dueMs, RetryCount: 0);
+                RescheduleTimerLocked();
+            }
         }
+
+        // 严禁在持有 _debounceSync 时获取 _writeLock（保持 L6 与 L7 永不嵌套）
+        if (writeDirectly)
+            WriteBatch(new[] { new PendingRunSave(row, directGen, 0, RetryCount: 0) });
     }
 
     /// <summary>优雅停服或测试断言前冲刷所有挂起的防抖对局快照及已注册的防抖缓存。</summary>
@@ -1116,7 +1154,9 @@ public sealed partial class Persistence : IDisposable
             _pendingSaves.Clear();
             callbacks = new List<Action>(_flushCallbacks);
             if (_disposed == 0)
-                _debounceTimer.Change(Timeout.Infinite, Timeout.Infinite);
+            {
+                try { _debounceTimer.Change(Timeout.Infinite, Timeout.Infinite); } catch (ObjectDisposedException) { }
+            }
         }
 
         if (batch.Count > 0)
@@ -1130,74 +1170,152 @@ public sealed partial class Persistence : IDisposable
 
     private void OnDebounceTimerElapsed(object? _)
     {
-        List<PendingRunSave>? dueBatch = null;
-        lock (_debounceSync)
+        try
         {
-            if (_disposed != 0 || _pendingSaves.Count == 0)
+            List<PendingRunSave>? dueBatch = null;
+            lock (_debounceSync)
+            {
+                if (_disposed != 0 || _pendingSaves.Count == 0)
+                    return;
+
+                long now = Environment.TickCount64;
+                foreach (var kv in _pendingSaves)
+                {
+                    if (kv.Value.DueTickMs <= now)
+                    {
+                        dueBatch ??= new List<PendingRunSave>();
+                        dueBatch.Add(kv.Value);
+                    }
+                }
+
+                if (dueBatch != null)
+                {
+                    foreach (var item in dueBatch)
+                        _pendingSaves.Remove(item.Row.RunId);
+                }
+
+                RescheduleTimerLocked();
+            }
+
+            if (dueBatch is not { Count: > 0 })
                 return;
 
-            long now = Environment.TickCount64;
-            foreach (var kv in _pendingSaves)
+            try
             {
-                if (kv.Value.DueTickMs <= now)
+                WriteBatch(dueBatch);
+            }
+            catch (Exception ex)
+            {
+                long errCount = Interlocked.Increment(ref _debounceWriteErrorCount);
+                long nowTick = Environment.TickCount64;
+                long prevLog = Volatile.Read(ref _lastDebounceErrorLogTickMs);
+                if (prevLog == 0 || nowTick - prevLog >= 5000)
                 {
-                    dueBatch ??= new List<PendingRunSave>();
-                    dueBatch.Add(kv.Value);
+                    Volatile.Write(ref _lastDebounceErrorLogTickMs, nowTick);
+                    Console.Error.WriteLine($"[Persistence][WARN] 防抖批量落盘异常（累计 {errCount} 次，将自动退避重试）：{ex.Message}");
+                }
+
+                // 指数退避重试未超过上限且未被更新版本/终态栅栏替代的条目
+                lock (_debounceSync)
+                {
+                    if (_disposed != 0)
+                        return;
+
+                    long retryNow = Environment.TickCount64;
+                    foreach (var item in dueBatch)
+                    {
+                        if (_pendingSaves.ContainsKey(item.Row.RunId))
+                            continue;
+
+                        bool isTerminal = item.Row.IsEnded || IsTerminalState(item.Row.State);
+                        if (_endedRunGenerations.TryGetValue(item.Row.RunId, out var endInfo)
+                            && (!isTerminal || endInfo.IsConceded))
+                        {
+                            continue;
+                        }
+
+                        if (item.RetryCount >= MaxDebounceRetries)
+                            continue;
+
+                        long backoffMs = Math.Min(8000L, 500L << item.RetryCount);
+                        _pendingSaves[item.Row.RunId] = item with
+                        {
+                            DueTickMs = retryNow + backoffMs,
+                            RetryCount = item.RetryCount + 1,
+                        };
+                    }
+
+                    RescheduleTimerLocked();
                 }
             }
-
-            if (dueBatch != null)
-            {
-                foreach (var item in dueBatch)
-                    _pendingSaves.Remove(item.Row.RunId);
-            }
-
-            RescheduleTimerLocked();
         }
-
-        if (dueBatch is { Count: > 0 })
-            WriteBatch(dueBatch);
+        catch (Exception fatalEx)
+        {
+            // 绝对兜底：绝不允许任何异常逃出 ThreadPool Timer 回调导致宿主进程崩溃
+            Interlocked.Increment(ref _debounceWriteErrorCount);
+            try
+            {
+                Console.Error.WriteLine($"[Persistence][ERROR] 防抖定时器回调捕获未预期异常：{fatalEx.Message}");
+            }
+            catch { }
+        }
     }
 
     private void RescheduleTimerLocked()
     {
         if (_disposed != 0) return;
-        if (_pendingSaves.Count == 0)
+        try
         {
-            _debounceTimer.Change(Timeout.Infinite, Timeout.Infinite);
-            return;
-        }
+            if (_pendingSaves.Count == 0)
+            {
+                _debounceTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                return;
+            }
 
-        long earliest = long.MaxValue;
-        foreach (var entry in _pendingSaves.Values)
+            long earliest = long.MaxValue;
+            foreach (var entry in _pendingSaves.Values)
+            {
+                if (entry.DueTickMs < earliest)
+                    earliest = entry.DueTickMs;
+            }
+
+            long delay = Math.Max(10L, earliest - Environment.TickCount64);
+            _debounceTimer.Change(delay, Timeout.Infinite);
+        }
+        catch (ObjectDisposedException)
         {
-            if (entry.DueTickMs < earliest)
-                earliest = entry.DueTickMs;
         }
-
-        long delay = Math.Max(10L, earliest - Environment.TickCount64);
-        _debounceTimer.Change(delay, Timeout.Infinite);
     }
 
     private void SaveRunCore(RunRow run, bool assignNewGen, long explicitGeneration)
     {
+        bool isTerminalRow = run.IsEnded || IsTerminalState(run.State);
         long gen = explicitGeneration;
         if (assignNewGen)
         {
             lock (_debounceSync)
             {
+                // D2-P1-01：允许正常胜负终局后紧随其后的终局快照（IsEnded=true），但拒绝非终态覆写与已投降局覆写
+                if (_endedRunGenerations.TryGetValue(run.RunId, out var endInfo)
+                    && (!isTerminalRow || endInfo.IsConceded))
+                {
+                    return;
+                }
+
                 _pendingSaves.Remove(run.RunId);
                 gen = ++_debounceGeneration;
                 RescheduleTimerLocked();
             }
         }
 
-        WriteBatch(new[] { new PendingRunSave(run, gen, 0) });
+        WriteBatch(new[] { new PendingRunSave(run, gen, 0, RetryCount: 0) });
     }
 
     private void WriteBatch(IReadOnlyList<PendingRunSave> batch)
     {
         if (batch.Count == 0) return;
+
+        BeforeWriteBatchHookForTesting?.Invoke();
 
         ExecuteWrite((conn, tx) =>
         {
@@ -1211,7 +1329,46 @@ public sealed partial class Persistence : IDisposable
                 _lastPersistedGen[run.RunId] = item.Generation;
                 Interlocked.Increment(ref _completedRunWriteCount);
             }
+
+            if (_lastPersistedGen.Count > MaxTrackedRunGenEntries)
+                PruneLastPersistedGenLocked();
         });
+    }
+
+    /// <summary>仅在持有 _writeLock (L7) 时按自身 Generation 裁剪 _lastPersistedGen，绝不触碰 L6 锁或 _pendingSaves。</summary>
+    private void PruneLastPersistedGenLocked()
+    {
+        if (_lastPersistedGen.Count <= MaxTrackedRunGenEntries)
+            return;
+
+        int removeCount = _lastPersistedGen.Count - (MaxTrackedRunGenEntries * 4 / 5);
+        if (removeCount <= 0) return;
+
+        var oldestKeys = _lastPersistedGen
+            .OrderBy(kv => kv.Value)
+            .Take(removeCount)
+            .Select(kv => kv.Key)
+            .ToList();
+        foreach (string k in oldestKeys)
+            _lastPersistedGen.Remove(k);
+    }
+
+    /// <summary>仅在持有 _debounceSync (L6) 时按自身 Gen 裁剪 _endedRunGenerations，绝不触碰 L7 锁。</summary>
+    private void PruneEndedRunGenerationsLocked()
+    {
+        if (_endedRunGenerations.Count <= MaxTrackedRunGenEntries)
+            return;
+
+        int removeCount = _endedRunGenerations.Count - (MaxTrackedRunGenEntries * 4 / 5);
+        if (removeCount <= 0) return;
+
+        var oldestKeys = _endedRunGenerations
+            .OrderBy(kv => kv.Value.Gen)
+            .Take(removeCount)
+            .Select(kv => kv.Key)
+            .ToList();
+        foreach (string k in oldestKeys)
+            _endedRunGenerations.Remove(k);
     }
 
     private static void ExecuteSaveRunCommand(SqliteConnection conn, SqliteTransaction? tx, RunRow run)
@@ -1249,8 +1406,11 @@ public sealed partial class Persistence : IDisposable
                 prestige = excluded.prestige, gold = excluded.gold,
                 income = excluded.income, state = excluded.state,
                 saved_at = excluded.saved_at, snapshot = excluded.snapshot,
-                is_ended = excluded.is_ended,
-                ended_reason = excluded.ended_reason,
+                is_ended = MAX(runs.is_ended, excluded.is_ended),
+                ended_reason = CASE
+                    WHEN runs.ended_reason != '' THEN runs.ended_reason
+                    ELSE excluded.ended_reason
+                END,
                 is_custom_rule = excluded.is_custom_rule,
                 tournament_session_id = CASE
                     WHEN excluded.tournament_session_id != '' THEN excluded.tournament_session_id
@@ -1268,10 +1428,8 @@ public sealed partial class Persistence : IDisposable
                 final_rank = CASE WHEN excluded.final_rank > 0 THEN excluded.final_rank ELSE runs.final_rank END,
                 rules_json = CASE WHEN excluded.rules_json != '' THEN excluded.rules_json ELSE runs.rules_json END,
                 is_tainted = MAX(runs.is_tainted, excluded.is_tainted),
-                career_recorded = CASE
-                    WHEN excluded.is_ended = 0 THEN 0
-                    ELSE MAX(runs.career_recorded, excluded.career_recorded)
-                END
+                career_recorded = MAX(runs.career_recorded, excluded.career_recorded)
+            WHERE runs.is_ended = 0 OR (excluded.is_ended = 1 AND runs.ended_reason != 'conceded')
             """;
         cmd.Parameters.AddWithValue("$rid", run.RunId);
         cmd.Parameters.AddWithValue("$aid", aidText);
@@ -1461,10 +1619,28 @@ public sealed partial class Persistence : IDisposable
         });
     }
 
-    /// <summary>标记指定对局已结束（胜利/战败/投降）。</summary>
+    /// <summary>标记指定对局已结束（胜利/战败/投降），同步剔除挂起防抖快照并设置不可逆代数栅栏。</summary>
     public void MarkRunEnded(string runId, ERunState endState, string reason)
     {
         if (string.IsNullOrWhiteSpace(runId)) return;
+        string normalizedReason = string.IsNullOrWhiteSpace(reason) ? "ended" : reason.Trim();
+        bool isConceded = string.Equals(normalizedReason, "conceded", StringComparison.OrdinalIgnoreCase);
+
+        // 步骤 1（L6）：移除挂起防抖项并登记终态栅栏
+        long endGen;
+        lock (_debounceSync)
+        {
+            _pendingSaves.Remove(runId);
+            endGen = ++_debounceGeneration;
+            if (_endedRunGenerations.TryGetValue(runId, out var prevEnd))
+                _endedRunGenerations[runId] = (endGen, prevEnd.IsConceded || isConceded);
+            else
+                _endedRunGenerations[runId] = (endGen, isConceded);
+            PruneEndedRunGenerationsLocked();
+            RescheduleTimerLocked();
+        }
+
+        // 步骤 2（L7）：落盘并推进 _lastPersistedGen，阻断已出队在途旧 WriteBatch 覆写
         ExecuteWrite((conn, tx) =>
         {
             using var cmd = conn.CreateCommand();
@@ -1472,22 +1648,52 @@ public sealed partial class Persistence : IDisposable
             cmd.CommandText = """
                 UPDATE runs
                 SET state = $st, is_ended = 1, ended_reason = $er, saved_at = $sa
-                WHERE run_id = $rid
+                WHERE run_id = $rid AND (ended_reason != 'conceded' OR $er = 'conceded')
                 """;
             cmd.Parameters.AddWithValue("$st", (int)endState);
-            cmd.Parameters.AddWithValue("$er", reason ?? "ended");
+            cmd.Parameters.AddWithValue("$er", normalizedReason);
             cmd.Parameters.AddWithValue("$sa", DateTime.UtcNow.ToString("O"));
             cmd.Parameters.AddWithValue("$rid", runId);
             cmd.ExecuteNonQuery();
+
+            _lastPersistedGen[runId] = _lastPersistedGen.TryGetValue(runId, out long prevGen)
+                ? Math.Max(prevGen, endGen)
+                : endGen;
+            if (_lastPersistedGen.Count > MaxTrackedRunGenEntries)
+                PruneLastPersistedGenLocked();
         });
     }
 
-    /// <summary>将账号名下所有未完结对局标记为投降结束，并返回最新一局（若有）。</summary>
+    /// <summary>将账号名下所有未完结对局标记为投降结束（同步清理内存防抖队列并设置不可逆终态栅栏），并返回最新一局（若有）。</summary>
     public RunRow? ConcedeActiveRuns(Guid accountId)
     {
-        return ExecuteWrite((conn, tx) =>
+        // 步骤 1（L6）：摘除内存防抖队列中该账号名下的全部待写快照并立即写入投降终态栅栏
+        var pendingRunIds = new List<string>();
+        long fenceGen;
+        lock (_debounceSync)
         {
-            RunRow? latest = null;
+            foreach (var kv in _pendingSaves)
+            {
+                if (kv.Value.Row.AccountId == accountId)
+                    pendingRunIds.Add(kv.Key);
+            }
+
+            fenceGen = ++_debounceGeneration;
+            foreach (string rid in pendingRunIds)
+            {
+                _pendingSaves.Remove(rid);
+                _endedRunGenerations[rid] = (fenceGen, IsConceded: true);
+            }
+            if (pendingRunIds.Count > 0)
+                PruneEndedRunGenerationsLocked();
+            RescheduleTimerLocked();
+        }
+
+        // 步骤 2（L7）：查出 DB 中该账号全部活跃对局，批量标记为 conceded 并推进 _lastPersistedGen
+        var dbActiveRunIds = new List<string>();
+        RunRow? latest = ExecuteWrite((conn, tx) =>
+        {
+            RunRow? firstRow = null;
             using (var sel = conn.CreateCommand())
             {
                 sel.Transaction = tx;
@@ -1499,11 +1705,16 @@ public sealed partial class Persistence : IDisposable
                            max_floor, score, final_rank, rules_json, is_tainted
                     FROM runs
                     WHERE account_id = $aid AND is_ended = 0 AND state NOT IN (3, 4, 10)
-                    ORDER BY saved_at DESC LIMIT 1
+                    ORDER BY saved_at DESC
                     """;
                 sel.Parameters.AddWithValue("$aid", accountId.ToString("D"));
                 using var r = sel.ExecuteReader();
-                if (r.Read()) latest = ReadRunRow(r);
+                while (r.Read())
+                {
+                    var row = ReadRunRow(r);
+                    firstRow ??= row;
+                    dbActiveRunIds.Add(row.RunId);
+                }
             }
 
             using (var upd = conn.CreateCommand())
@@ -1519,8 +1730,40 @@ public sealed partial class Persistence : IDisposable
                 upd.ExecuteNonQuery();
             }
 
-            return latest;
+            foreach (string rid in pendingRunIds)
+            {
+                _lastPersistedGen[rid] = _lastPersistedGen.TryGetValue(rid, out long prevGen)
+                    ? Math.Max(prevGen, fenceGen)
+                    : fenceGen;
+            }
+            foreach (string rid in dbActiveRunIds)
+            {
+                _lastPersistedGen[rid] = _lastPersistedGen.TryGetValue(rid, out long prevGen)
+                    ? Math.Max(prevGen, fenceGen)
+                    : fenceGen;
+            }
+            if (_lastPersistedGen.Count > MaxTrackedRunGenEntries)
+                PruneLastPersistedGenLocked();
+
+            return firstRow;
         });
+
+        // 步骤 3（L6，L7 已释放后）：将 DB 查到的活跃 run_id 补写入 _endedRunGenerations 并清除窗口期内可能残留的项
+        if (dbActiveRunIds.Count > 0)
+        {
+            lock (_debounceSync)
+            {
+                foreach (string rid in dbActiveRunIds)
+                {
+                    _pendingSaves.Remove(rid);
+                    _endedRunGenerations[rid] = (fenceGen, IsConceded: true);
+                }
+                PruneEndedRunGenerationsLocked();
+                RescheduleTimerLocked();
+            }
+        }
+
+        return latest;
     }
 
     /// <summary>幂等抢占某局生涯结算标记，返回 true 表示首次结算、false 表示已结算过。</summary>
@@ -1620,6 +1863,13 @@ public sealed partial class Persistence : IDisposable
         if (partition == "none" || partition == "sandbox")
             return 0;
 
+        // D2-P1-10 强不变量防线：自定义规则/Mod 镜像绝不允许写入 "standard" 分区，发现越界立即纠偏为 "custom" 并告警
+        if (isCustomRule && string.Equals(partition, "standard", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"[Persistence][WARN] InsertPvpGhost 拦截非法分区组合 (isCustomRule=true, partition=standard)，已自动改写为 custom (day={row.Day}, hero={row.Hero})");
+            partition = "custom";
+        }
+
         bool effectiveCustom = isCustomRule || !string.Equals(partition, "standard", StringComparison.OrdinalIgnoreCase);
         if (!effectiveCustom && !IsSaneGhostForDay(row.Day, row.HealthMax))
             return 0;
@@ -1702,8 +1952,12 @@ public sealed partial class Persistence : IDisposable
             string filter;
             if (!string.IsNullOrWhiteSpace(poolPartition))
             {
-                filter = "WHERE pool_partition = $part";
-                cmd.Parameters.AddWithValue("$part", poolPartition.Trim().ToLowerInvariant());
+                string normPart = poolPartition.Trim().ToLowerInvariant();
+                // D2-P1-10：显式查询 "standard" 分区时强制叠加 AND is_custom_rule = 0，彻底杜绝自定义镜像混入标准池
+                filter = string.Equals(normPart, "standard", StringComparison.OrdinalIgnoreCase)
+                    ? "WHERE pool_partition = $part AND is_custom_rule = 0"
+                    : "WHERE pool_partition = $part";
+                cmd.Parameters.AddWithValue("$part", normPart);
             }
             else if (includeCustomRule)
             {
@@ -1918,6 +2172,15 @@ public sealed partial class Persistence : IDisposable
 
             foreach (string lid in staleLobbyIds)
             {
+                // D6-P2-08：归档历史房间时在同一事务内级联清理对应的孤儿大厅聊天记录
+                using (var delLobbyChat = conn.CreateCommand())
+                {
+                    delLobbyChat.Transaction = tx;
+                    delLobbyChat.CommandText = "DELETE FROM chat_messages WHERE channel_type = 'lobby' AND channel_id = $lid;";
+                    delLobbyChat.Parameters.AddWithValue("$lid", lid);
+                    deletedChat += delLobbyChat.ExecuteNonQuery();
+                }
+
                 foreach (string tbl in new[] { "tournament_matchups", "tournament_lobby_members", "tournament_lobbies" })
                 {
                     using var delLob = conn.CreateCommand();

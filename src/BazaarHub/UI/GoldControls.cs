@@ -1758,7 +1758,7 @@ public sealed class ServerModeCard : Control
         _subtitle = subtitle;
         _icon = mode switch
         {
-            ServerMode.CloudTencent => HubIconKind.ServerCloud,
+            ServerMode.PresetRemote => HubIconKind.ServerCloud,
             ServerMode.LocalStandalone => HubIconKind.ServerLocal,
             ServerMode.CustomServer => HubIconKind.ServerCustom,
             _ => HubIconKind.Official

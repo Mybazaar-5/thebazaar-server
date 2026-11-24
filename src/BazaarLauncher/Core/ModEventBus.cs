@@ -1,16 +1,23 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using BazaarModSdk;
 
 namespace BazaarLauncher.Core;
 
 /// <summary>
-/// 强类型、零装箱、异常自动隔离的客户端事件总线实现（IModEventBus）。
+/// 强类型、零装箱、异常自动隔离且强制主线程封送的客户端事件总线实现（IModEventBus，修复 D4-P1-4）。
 /// </summary>
 internal sealed class ModEventBus : IModEventBus
 {
+    private static volatile int _mainThreadId;
     private readonly object _sync = new();
     private readonly Dictionary<Type, object> _channels = new();
+
+    internal static void BindMainThread()
+    {
+        _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+    }
 
     private sealed class SubscriptionEntry<TEvent> where TEvent : struct
     {
@@ -78,6 +85,20 @@ internal sealed class ModEventBus : IModEventBus
     }
 
     public void Publish<TEvent>(in TEvent evt) where TEvent : struct
+    {
+        // D4-P1-4：非 Unity 主线程发布事件时强制经 MainThreadDispatcher 封送回主线程投递，防止跨线程操作 UnityEngine API 崩溃
+        int mainTid = _mainThreadId;
+        if (mainTid != 0 && Thread.CurrentThread.ManagedThreadId != mainTid)
+        {
+            TEvent copy = evt;
+            MainThreadDispatcher.Enqueue(() => DispatchOnCurrentThread(in copy));
+            return;
+        }
+
+        DispatchOnCurrentThread(in evt);
+    }
+
+    private void DispatchOnCurrentThread<TEvent>(in TEvent evt) where TEvent : struct
     {
         SubscriptionEntry<TEvent>[] snapshot;
         lock (_sync)

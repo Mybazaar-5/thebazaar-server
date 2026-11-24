@@ -54,12 +54,13 @@ public static class DailyChallengeSeedGenerator
         return nextDayLocal.ToUniversalTime();
     }
 
-    /// <summary>按确定性 FNV-1a 32-bit 算法计算每日主种子。</summary>
+    /// <summary>按确定性 FNV-1a 32-bit 算法计算每日主种子（P0-41：极低概率 0 碰撞兜底为 1，防止绕过 FixedRunSeed != 0 守卫）。</summary>
     public static int ComputeMasterSeed(string dateKey)
     {
         string normalized = string.IsNullOrWhiteSpace(dateKey) ? GetTodayDateKeyUtc8() : dateKey.Trim();
         uint hash = ComputeFnv1a32($"bazaar-daily-v1:{normalized}");
-        return unchecked((int)hash);
+        int signed = unchecked((int)hash);
+        return signed == 0 ? 1 : signed;
     }
 
     /// <summary>
@@ -223,6 +224,36 @@ public static class EndlessTowerScaler
             MilestoneBonusGold: bonusGold,
             GuaranteedRandomEnchantCount: guaranteedEnchants,
             MinimumGhostItemTier: minTier);
+    }
+
+    /// <summary>
+    /// P0-43：按无尽幽灵原始录制层数（<paramref name="sourceDay"/>）与目标挑战层数（<paramref name="targetDay"/>）计算相对缩放倍率。
+    /// 同层真镜像（<c>sourceDay &gt;= targetDay</c>）恒为 1.0x，低层补位（如 Day 15 -&gt; Day 25）仅乘相对比 <c>Compute(targetDay) / Compute(sourceDay)</c>；
+    /// 当 <paramref name="sourceDay"/> &lt;= 10 时平滑退化为 <c>Compute(targetDay)</c>。
+    /// </summary>
+    public static (double HealthMultiplier, double OffenseMultiplier, double CooldownReductionPct) ComputeRelativeScaling(
+        int sourceDay,
+        int targetDay,
+        int maxDay = DefaultMaxDay)
+    {
+        if (targetDay <= 10 || sourceDay >= targetDay)
+            return (1.0, 1.0, 0.0);
+
+        var targetScale = Compute(targetDay, maxDay);
+        var sourceScale = Compute(Math.Max(1, sourceDay), maxDay);
+        double hpMult = Math.Clamp(
+            targetScale.EnemyHealthMultiplier / Math.Max(1e-6, sourceScale.EnemyHealthMultiplier),
+            1.0,
+            MaxHealthMultiplier);
+        double offMult = Math.Clamp(
+            targetScale.EnemyOffenseMultiplier / Math.Max(1e-6, sourceScale.EnemyOffenseMultiplier),
+            1.0,
+            MaxOffenseMultiplier);
+        double cdrPct = Math.Clamp(
+            targetScale.EnemyCooldownReductionPct - sourceScale.EnemyCooldownReductionPct,
+            0.0,
+            MaxCooldownReductionPct);
+        return (Math.Round(hpMult, 4), Math.Round(offMult, 4), Math.Round(cdrPct, 4));
     }
 
     /// <summary>将原始敌方血量安全缩放并钳制在 [1, MaxEnemyHealthCap] 范围内。</summary>

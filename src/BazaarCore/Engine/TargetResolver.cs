@@ -195,11 +195,10 @@ public static class TargetResolver
 
                     if (isSocketEffect)
                     {
-                        // 对齐官方 TTargetCardOccupying：SocketEffect 查询其覆盖槽位上的 Hand 物品（不包含其他 SocketEffect）
+                        // D1-P1-06：严格对齐官方 BazaarGameShared.TTargetCardOccupying（仅对 ctx.SelfCard 校验 cardStateFilter，占格目标仅过 Conditions）
                         foreach (var c in owner.Hand.Cards)
                         {
                             if (ReferenceEquals(c, ctx.SelfCard) || c.StartSlot < 0) continue;
-                            if (c.IsDestroyed) continue;
                             if (c.StartSlot < selfEnd && selfStart < c.StartSlot + c.SlotWidth)
                                 occ.Add((c, owner));
                         }
@@ -210,7 +209,6 @@ public static class TargetResolver
                         foreach (var c in owner.SocketEffects)
                         {
                             if (ReferenceEquals(c, ctx.SelfCard) || c.StartSlot < 0) continue;
-                            if (!includeDestroyed && c.IsDestroyed) continue;
                             if (c.StartSlot < selfEnd && selfStart < c.StartSlot + c.SlotWidth)
                                 occ.Add((c, owner));
                         }
@@ -231,8 +229,7 @@ public static class TargetResolver
                     candidates.AddRange(ResolvePositionalNeighbors(originOwner, origin, target.TargetMode, includeDestroyed, includeDisabled));
                 }
 
-                // 严格对齐官方反编译 TTargetCardPositional.cs:33-36：
-                // if (IncludeOrigin && !list.Contains(ctx.TargetingCard)) list.Add(ctx.TargetingCard);
+                // D1-P1-06：严格对齐官方 BazaarGameShared.TTargetCardPositional.cs:33-37（IncludeOrigin 始终附加 ctx.SelfCard 且无前置 cardStateFilter，并与 MatchesCard 双向等价）
                 if (target.IncludeOrigin == true && !candidates.Contains(ctx.SelfCard))
                 {
                     candidates.Add(ctx.SelfCard);
@@ -354,10 +351,12 @@ public static class TargetResolver
             : 2,
         // TActionCardUpgrade: Conditionals.CanUpgrade（含 5 阶特例卡 Maker's Mark）
         "TActionCardUpgrade" => card.CanUpgrade() ? 0 : 1,
-        // TActionCardForceUse: Conditionals.NotFrozen + 可激活冷却（优先非冻结且有冷却有弹药，次选非冻结有冷却，不回落至冻结/无冷却卡）
-        "TActionCardForceUse" => (card.FreezeMs <= 0 && card.HasActiveCooldown)
-            ? ((card.EffectiveAmmoMax <= 0 || card.CurrentAmmo > 0) ? 0 : 1)
-            : 2,
+        // TActionCardForceUse: Conditionals.NotFrozen + 可激活冷却（优先未冻结有冷却有弹药 -> 未冻结有冷却 -> 已冻结有冷却回退 -> 其他）
+        "TActionCardForceUse" => card.HasActiveCooldown
+            ? (card.FreezeMs <= 0
+                ? ((card.EffectiveAmmoMax <= 0 || card.CurrentAmmo > 0) ? 0 : 1)
+                : 2)
+            : 3,
         // Haste / Slow / Freeze: Conditionals.Priorities [HasCooldown, HasNoCooldown]
         _ => card.HasActiveCooldown ? 0 : 1
     };
@@ -367,19 +366,22 @@ public static class TargetResolver
         var tier0 = new List<CardInstance>(pool.Count);
         var tier1 = new List<CardInstance>(pool.Count);
         var tier2 = new List<CardInstance>();
+        var tier3 = new List<CardInstance>();
         for (int i = 0; i < pool.Count; i++)
         {
             var c = pool[i];
             int t = GetTargetingPriorityTier(c, actionType);
             if (t == 0) tier0.Add(c);
             else if (t == 1) tier1.Add(c);
-            else tier2.Add(c);
+            else if (t == 2) tier2.Add(c);
+            else tier3.Add(c);
         }
 
         if (tier0.Count > 0) return tier0;
         if (tier1.Count > 0) return tier1;
-        if (actionType is "TActionCardCharge" or "TActionCardForceUse") return [];
-        return tier2;
+        if (actionType == "TActionCardCharge") return [];
+        if (tier2.Count > 0) return tier2;
+        return tier3;
     }
 
     private static List<CardInstance> SelectRandomByTargetingPriorities(
@@ -393,13 +395,15 @@ public static class TargetResolver
         var tier0 = new List<CardInstance>(pool.Count);
         var tier1 = new List<CardInstance>(pool.Count);
         var tier2 = new List<CardInstance>();
+        var tier3 = new List<CardInstance>();
         for (int i = 0; i < pool.Count; i++)
         {
             var c = pool[i];
             int t = GetTargetingPriorityTier(c, actionType);
             if (t == 0) tier0.Add(c);
             else if (t == 1) tier1.Add(c);
-            else tier2.Add(c);
+            else if (t == 2) tier2.Add(c);
+            else tier3.Add(c);
         }
 
         var picked = new List<CardInstance>(Math.Min(effectiveTake, pool.Count));
@@ -423,8 +427,11 @@ public static class TargetResolver
 
         DrawFromTier(tier0);
         DrawFromTier(tier1);
-        if (actionType is not ("TActionCardCharge" or "TActionCardForceUse"))
+        if (actionType != "TActionCardCharge")
+        {
             DrawFromTier(tier2);
+            DrawFromTier(tier3);
+        }
         return picked;
     }
 
@@ -484,22 +491,25 @@ public static class TargetResolver
             case "TTargetCardPositional":
             {
                 if (ctx.SelfCard == null) return false;
-                var origin = target.Origin == "TriggerSource" ? ctx.TriggerSourceCard : ctx.SelfCard;
-                if (origin == null) return false;
                 bool hit = false;
-                if (target.IncludeOrigin == true && ReferenceEquals(candidate, origin) && IsEligible(origin))
+                // D1-P1-06：与 ResolveCards 及官方 TTargetCardPositional.cs:33-37 严格等价
+                if (target.IncludeOrigin == true && ReferenceEquals(candidate, ctx.SelfCard))
                 {
                     hit = true;
                 }
                 else
                 {
-                    var originOwner = FindOwner(origin, ctx);
-                    foreach (var n in ResolvePositionalNeighbors(originOwner, origin, target.TargetMode, includeDestroyed, includeDisabled))
+                    var origin = target.Origin == "TriggerSource" ? ctx.TriggerSourceCard : ctx.SelfCard;
+                    if (origin != null)
                     {
-                        if (ReferenceEquals(n, candidate))
+                        var originOwner = FindOwner(origin, ctx);
+                        foreach (var n in ResolvePositionalNeighbors(originOwner, origin, target.TargetMode, includeDestroyed, includeDisabled))
                         {
-                            hit = true;
-                            break;
+                            if (ReferenceEquals(n, candidate))
+                            {
+                                hit = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -518,9 +528,10 @@ public static class TargetResolver
                 int selfEnd = selfStart + ctx.SelfCard.SlotWidth;
                 if (!(candidate.StartSlot < selfEnd && selfStart < candidate.StartSlot + candidate.SlotWidth))
                     return false;
+                // D1-P1-06：与 ResolveCards 及官方 TTargetCardOccupying.cs:19,28-31 严格等价
                 bool inContainer = IsSocketEffectCard(ctx.SelfCard)
-                    ? (!candidate.IsDestroyed && owner.Hand.Cards.Contains(candidate))
-                    : ((includeDestroyed || !candidate.IsDestroyed) && owner.SocketEffects.Contains(candidate));
+                    ? owner.Hand.Cards.Contains(candidate)
+                    : owner.SocketEffects.Contains(candidate);
                 if (!inContainer) return false;
                 return cond == null || ValueAndConditionEvaluator.EvaluateCardCondition(cond, candidate, owner, ctx);
             }

@@ -13,7 +13,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V12BiliCombatStatusParityTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private const string AbductedCowId = "03f90f0b-088f-453d-bbf7-ebb5e777afe2";
     private const string JerkyId = "bf480fe7-530e-4a33-b494-1cb9a841f996";
@@ -564,9 +564,9 @@ public sealed class V12BiliCombatStatusParityTests
 
         // 2. Q14: 双重附魔覆盖与 preventOverride / Hour 临时覆盖校验
         var enchCard = new CardInstance(repo.GetCard(IceSwanId)!, CardTier.Gold, enchantment: "Deadly");
-        enchCard.ApplyEnchantment("Turbo", preventOverride: true);
+        enchCard.ApplyEnchantment("Turbo", DurationTarget.Permanent, preventOverride: true);
         Assert.Equal("Deadly", enchCard.Enchantment);
-        enchCard.ApplyEnchantment("Shiny", preventOverride: false, DurationTarget.Hour);
+        enchCard.ApplyEnchantment("Shiny", DurationTarget.Hour, preventOverride: false);
         Assert.Equal("Shiny", enchCard.Enchantment);
         enchCard.ClearEndOfHourModifiers();
         Assert.Equal("Deadly", enchCard.Enchantment);

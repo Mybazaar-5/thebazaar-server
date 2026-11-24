@@ -31,6 +31,7 @@ namespace BazaarCore.Tests;
 /// 沙盒模式发放原版/全局 Mod/社区与单局 Mod 卡牌、ID/短 ID/中文名解析、
 /// sandbox_sync 即时同步协议与 /api/mods/active-bindings 映射回归测试。
 /// </summary>
+[Xunit.Collection("GlobalStaticState")]
 public sealed class SandboxModGrantAndSyncTests
 {
     private const string CutlassId = "1b955b8d-0ea6-4437-935c-d588be5898c1";
@@ -49,39 +50,16 @@ public sealed class SandboxModGrantAndSyncTests
 
     private static BaseFixture LoadBaseFixture()
     {
-        var cur = new DirectoryInfo(AppContext.BaseDirectory);
-        string? repoRoot = null;
-        while (cur != null)
-        {
-            if (File.Exists(Path.Combine(cur.FullName, "Bazaar.sln")))
-            {
-                repoRoot = cur.FullName;
-                break;
-            }
-            cur = cur.Parent;
-        }
-        Assert.False(string.IsNullOrWhiteSpace(repoRoot), "未定位到 Bazaar.sln 根目录");
-
-        string dataDir = Path.Combine(repoRoot!, "dist", "data");
-        string modsDir = Path.Combine(repoRoot!, "mods");
-        string dbPath = Path.Combine(dataDir, "GameData.db");
-        string? zhPath = SteamPathResolver.ResolveZhCnTranslationPath(dataDir);
-        string? overlayPath = Path.Combine(dataDir, "translations", "custom_zh_overlay.json");
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
+        string? overlayPath = Path.Combine(shared.DataDir, "translations", "custom_zh_overlay.json");
         if (!File.Exists(overlayPath)) overlayPath = null;
-
-        var baseRepo = GameDatabaseLoader.Load(dbPath, zhPath);
-        var wl = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        using (var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(dataDir, "valid_card_ids.json"), Encoding.UTF8)))
-        {
-            var arr = doc.RootElement.ValueKind == JsonValueKind.Array
-                ? doc.RootElement
-                : doc.RootElement.GetProperty("valid_ids");
-            foreach (var it in arr.EnumerateArray())
-                if (it.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(it.GetString()))
-                    wl.Add(it.GetString()!);
-        }
-
-        return new BaseFixture(repoRoot!, dataDir, modsDir, overlayPath, baseRepo, wl);
+        return new BaseFixture(
+            shared.RepoRoot,
+            shared.DataDir,
+            shared.ModsRoot,
+            overlayPath,
+            shared.Repo,
+            shared.CreateValidCardIdsCopy());
     }
 
     private sealed class TestHarness : IAsyncDisposable
@@ -182,7 +160,7 @@ public sealed class SandboxModGrantAndSyncTests
         var monsters = MonsterPool.FromRepository(modHost.ActiveRepository);
         var levelUps = LevelUpTable.FromRepository(modHost.ActiveRepository);
         var gameMode = GameModeConfig.FromRepository(modHost.ActiveRepository);
-        var ghosts = PvpGhostPool.Load(fx.DataDir);
+        var ghosts = TestInfrastructure.SharedGameDataFixture.Shared.Ghosts;
         var archetypes = CardArchetypeIndex.Build(cardPool, modHost.ActiveRepository);
         modHost.BindPools(cardPool, monsters);
         var communityStore = new CommunityModStore(modHost, stateDir);

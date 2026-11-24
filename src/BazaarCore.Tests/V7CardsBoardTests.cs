@@ -14,7 +14,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V7CardsBoardTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static JsonElement JsonFixed(double val)
         => JsonDocument.Parse($"{{\"$type\":\"TFixedValue\",\"Value\":{val.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}").RootElement.Clone();
@@ -118,34 +118,52 @@ public sealed class V7CardsBoardTests
             baseAttrs: new Dictionary<string, double> { ["DamageAmount"] = 10, ["CooldownMax"] = 2000 }));
         p1.Hand.TryPlaceWithDisplaceOrSwap(weapon, 0);
 
-        // 常规 HandAndStash 战斗光环置于 Stash：局内不得向 Hand 生效
-        var regularStashBuffer = new CardInstance(MakeItemTemplate(
+        // D1-P1-10：Stash 中 HandOnly 与 OutOfCombatOnly 光环在战中必须严格隔离；HandAndStash（WorksIn != OutOfCombatOnly）与 StashOnly 战中正常生效
+        var handOnlyStashBuffer = new CardInstance(MakeItemTemplate(
+            "v7_stash_handonly",
+            auras: new Dictionary<string, AuraDefinition>
+            {
+                ["ho"] = MakeHandBuffAura("ho", activeIn: "HandOnly", worksIn: "Anywhere", damageBonus: 40)
+            }));
+        p1.Stash.TryPlaceWithDisplaceOrSwap(handOnlyStashBuffer, 0);
+
+        var oocOnlyStashBuffer = new CardInstance(MakeItemTemplate(
+            "v7_stash_ooconly",
+            auras: new Dictionary<string, AuraDefinition>
+            {
+                ["ooc"] = MakeHandBuffAura("ooc", activeIn: "HandAndStash", worksIn: "OutOfCombatOnly", damageBonus: 30)
+            }));
+        p1.Stash.TryPlaceWithDisplaceOrSwap(oocOnlyStashBuffer, 4);
+
+        var handAndStashBuffer = new CardInstance(MakeItemTemplate(
             "v7_stash_handandstash",
             auras: new Dictionary<string, AuraDefinition>
             {
                 ["a1"] = MakeHandBuffAura("a1", activeIn: "HandAndStash", worksIn: "Anywhere", damageBonus: 50)
             }));
-        p1.Stash.TryPlaceWithDisplaceOrSwap(regularStashBuffer, 0);
+        p1.Stash.TryPlaceWithDisplaceOrSwap(handAndStashBuffer, 5);
 
-        // 真实 DB 卡 Speedrunner [Deadly]（ActiveIn=HandAndStash, WorksIn=Anywhere, SelfHand CritChance+30）在 Stash 中同样不得在局内加成 Hand
+        // 真实 DB 卡 Speedrunner [Deadly]（官方实库已为 ActiveIn=HandOnly）在 Stash 中不得在局内加成 Hand
         var realSpeedrunner = new CardInstance(repo.GetCard("2215483f-1fc3-495a-b492-d917dd7d588c")!, enchantment: "Deadly");
         p1.Stash.TryPlaceWithDisplaceOrSwap(realSpeedrunner, 1);
 
-        // 局外（OutOfCombat）仍保留 HandAndStash 经济/商店光环（例如真实 Loupe SellPrice 加成 & regular HandAndStash 光环）
+        // 真实 DB 卡 Loupe（ActiveIn=HandAndStash, WorksIn=Anywhere）局外与局内均保持 SellPrice 加成
         var realLoupe = new CardInstance(repo.GetCard("234ae6aa-b94b-456d-a2fb-f0cbcaa9c655")!); // Loupe
         p1.Stash.TryPlaceWithDisplaceOrSwap(realLoupe, 2);
 
         double sellBeforeOoc = weapon.GetAttribute("SellPrice");
         AuraEngine.RecalculateAuras(p1, null, RuleScope.OutOfCombat, p1.Day, p1.Hour, repo);
-        Assert.Equal(60, weapon.GetAttribute("DamageAmount"));
+        // 局外：10 基础 + 30 (OutOfCombatOnly HandAndStash) + 50 (Anywhere HandAndStash) = 90；HandOnly 在 Stash 隔离
+        Assert.Equal(90, weapon.GetAttribute("DamageAmount"));
         Assert.True(weapon.GetAttribute("SellPrice") > sellBeforeOoc, "局外 Stash 中的 Loupe HandAndStash 经济光环应保持生效");
 
-        // 切换为局内 InCombat：Stash 中常规 HandAndStash 光环不得加成 Hand
+        // 切换为局内 InCombat：HandOnly / OutOfCombatOnly / Speedrunner [Deadly] 严格隔离；HandAndStash (Anywhere) 与 Loupe 精确放行
         AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
-        Assert.Equal(10, weapon.GetAttribute("DamageAmount"));
+        Assert.Equal(60, weapon.GetAttribute("DamageAmount"));
         Assert.Equal(0, weapon.GetAttribute("CritChance"));
+        Assert.True(weapon.GetAttribute("SellPrice") > sellBeforeOoc, "局内 Stash 中的 Loupe HandAndStash 光环应保持与局外一致");
 
-        // 显式 StashOnly 局内例外应允许生效
+        // 显式 StashOnly 局内例外应允许叠加生效
         var stashOnlyException = new CardInstance(MakeItemTemplate(
             "v7_stash_only_exception",
             auras: new Dictionary<string, AuraDefinition>
@@ -154,13 +172,13 @@ public sealed class V7CardsBoardTests
             }));
         p1.Stash.TryPlaceWithDisplaceOrSwap(stashOnlyException, 3);
         AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
-        Assert.Equal(35, weapon.GetAttribute("DamageAmount"));
-
-        // 若把 regularStashBuffer 放到 Hand 中，则应在 InCombat 生效
-        p1.Stash.Remove(regularStashBuffer);
-        p1.Hand.TryPlaceWithDisplaceOrSwap(regularStashBuffer, 1);
-        AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
         Assert.Equal(85, weapon.GetAttribute("DamageAmount"));
+
+        // 若把 HandOnly 卡移到 Hand 中，则应在 InCombat 立即生效
+        p1.Stash.Remove(handOnlyStashBuffer);
+        p1.Hand.TryPlaceWithDisplaceOrSwap(handOnlyStashBuffer, 1);
+        AuraEngine.RecalculateAuras(p1, p2, RuleScope.InCombat, p1.Day, p1.Hour, repo);
+        Assert.Equal(125, weapon.GetAttribute("DamageAmount"));
     }
 
     // =========================================================================

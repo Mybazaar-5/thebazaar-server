@@ -50,15 +50,31 @@ public sealed class AccountStore : IDisposable
         DateTime ExpiresAt,
         bool IsRevoked);
 
+    public const int MaxFailedLoginsPerWindow = 10;
+    public const long FailedLoginWindowMs = 60_000;
+    private const int MaxAccountSaveRetries = 5;
+
+    private sealed class LoginFailureWindow
+    {
+        public readonly object Sync = new();
+        public readonly Queue<long> TimestampsMs = new();
+    }
+
     private readonly Persistence _db;
     private readonly ConcurrentDictionary<string, Account> _byKey = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<Guid, Account> _byAccountId = new();
     private readonly ConcurrentDictionary<string, Account> _byEmail = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, CachedToken> _tokenCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<Guid, Account> _dirtyAccounts = new();
+    private readonly ConcurrentDictionary<Guid, int> _dirtySaveRetries = new();
+    private readonly ConcurrentDictionary<string, LoginFailureWindow> _loginFailureWindows = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _lock = new();
     private readonly Timer _accountSaveTimer;
+    private long _accountSaveErrorCount;
     private int _disposed;
+
+    /// <summary>防抖后台账号落盘失败累计次数（用于可观测性与防崩回归验证）。</summary>
+    public long AccountSaveErrorCount => Interlocked.Read(ref _accountSaveErrorCount);
 
     public AccountStore(Persistence db)
     {
@@ -187,10 +203,10 @@ public sealed class AccountStore : IDisposable
     }
 
     /// <summary>
-    /// 按用户名或邮箱登录并校验/绑定可选口令或设备密钥：
-    /// - 邮箱输入优先匹配已绑定邮箱，否则按 @ 前缀自动归一到 PC 同名账号（例如 alice@bazaar.local -> alice）；
-    /// - 若账号尚未设置口令：传统显式口令登录（allowAutoBindSecret=true）自动首次绑定；移动端邮箱登录（allowAutoBindSecret=false）无口令保护账号直登，避免锁死 PC 免密登录；
-    /// - 若账号已设置口令，必须提供匹配口令方可通过（同时兼容明文与移动端 SHA-256 哈希）。
+    /// 按用户名或邮箱登录并校验/绑定可选口令或设备密钥（D8-P1-03 无锁 PBKDF2 + 原子建号防抢登 + 失败限流）：
+    /// - 阶段 1（短持 _lock，纯只读查找）：绝不提前向内存表插入未设密新账号；
+    /// - 阶段 2（完全无锁）：在锁外并发执行 PBKDF2 校验或哈希计算，绝不阻塞全局 _lock；
+    /// - 阶段 3（短持 _lock，原子建号 / CAS 提交）：新账号首纳秒即带完整 AuthSecretHash，消除无密抢登窗口。
     /// </summary>
     public (bool Ok, Account? Account, IssuedTokenPair? Tokens, string? ErrorZh) LoginByNameWithSecret(
         string username,
@@ -208,25 +224,35 @@ public sealed class AccountStore : IDisposable
 
         string clean = NormalizeName(ExtractEmailPrefixOrSelf(username));
         string key = "name:" + clean.ToLowerInvariant();
-        Account acc;
-        bool needSave = false;
+        string rateKey = !string.IsNullOrEmpty(normalizedEmail) ? "email:" + normalizedEmail : key;
 
-        lock (_lock)
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            if (!string.IsNullOrEmpty(normalizedEmail) && _byEmail.TryGetValue(normalizedEmail, out var emailAcc))
+            // 阶段 1：短持 _lock，仅做只读查找（不存在时绝不提前创建无密 Account 入表！）
+            Account? existingAcc;
+            string? storedHash = null;
+            bool hasProtection = false;
+
+            lock (_lock)
             {
-                acc = emailAcc;
-            }
-            else
-            {
-                acc = EnsureAccountLoadedLocked(key, clean, out bool isNew);
-                if (isNew) needSave = true;
+                existingAcc = TryFindExistingAccountLocked(key, normalizedEmail);
+                if (existingAcc != null)
+                {
+                    storedHash = existingAcc.AuthSecretHash;
+                    hasProtection = existingAcc.HasSecretProtection;
+                }
             }
 
-            if (acc.HasSecretProtection)
+            // 阶段 2：完全无锁执行限流与 PBKDF2（120k~180k 轮，允许全服并发，不阻塞登录与其他账号操作）
+            string? candidateHash = null;
+            if (hasProtection)
             {
-                if (string.IsNullOrWhiteSpace(secret) || !VerifySecretHash(secret.Trim(), acc.AuthSecretHash))
+                if (IsLoginRateLimited(rateKey))
+                    return (false, null, null, "账号口令错误次数过多，请 1 分钟后再试。");
+
+                if (string.IsNullOrWhiteSpace(secret) || !VerifySecretHash(secret.Trim(), storedHash!))
                 {
+                    RecordFailedLogin(rateKey);
                     return (false, null, null, "账号口令校验失败，请输入正确的登录口令。");
                 }
             }
@@ -236,27 +262,87 @@ public sealed class AccountStore : IDisposable
                 if (trimmed.Length < 4 || trimmed.Length > 128)
                     return (false, null, null, "账号口令长度需在 4 到 128 个字符之间。");
 
-                acc.AuthSecretHash = HashSecret(trimmed);
-                needSave = true;
+                candidateHash = HashSecret(trimmed);
             }
 
-            if (!string.IsNullOrEmpty(normalizedEmail) && string.IsNullOrWhiteSpace(acc.BoundEmail))
+            // 阶段 3：短持 _lock，原子建号或 CAS 核验提交
+            Account? committedAcc = null;
+            bool needSave = false;
+            bool shouldRetry = false;
+
+            lock (_lock)
             {
-                acc.BoundEmail = normalizedEmail;
-                _byEmail[normalizedEmail] = acc;
-                needSave = true;
+                if (existingAcc == null)
+                {
+                    // 复查是否被并发线程抢先创建
+                    var raced = TryFindExistingAccountLocked(key, normalizedEmail);
+                    if (raced != null)
+                    {
+                        shouldRetry = true;
+                    }
+                    else
+                    {
+                        // 一次性原子构造带最终口令哈希的完整 Account 再入表，杜绝无密抢登窗口
+                        var created = new Account
+                        {
+                            AccountId = GuidFromHash("acc:" + key),
+                            Username = clean,
+                            IdentityKey = key,
+                            AuthSecretHash = candidateHash ?? string.Empty,
+                            BoundEmail = normalizedEmail,
+                            LastActiveUtc = DateTime.UtcNow,
+                        };
+                        _byKey[key] = created;
+                        _byAccountId[created.AccountId] = created;
+                        IndexBoundEmail(created);
+                        committedAcc = created;
+                        needSave = true;
+                    }
+                }
+                else
+                {
+                    // CAS 复核：若并发期间口令被他人修改/绑定，释放锁后按新状态重走一次无锁验证
+                    if (!string.Equals(existingAcc.AuthSecretHash ?? "", storedHash ?? "", StringComparison.Ordinal))
+                    {
+                        shouldRetry = true;
+                    }
+                    else
+                    {
+                        if (!existingAcc.HasSecretProtection && !string.IsNullOrEmpty(candidateHash))
+                        {
+                            existingAcc.AuthSecretHash = candidateHash;
+                            needSave = true;
+                        }
+                        if (!string.IsNullOrEmpty(normalizedEmail) && string.IsNullOrWhiteSpace(existingAcc.BoundEmail))
+                        {
+                            existingAcc.BoundEmail = normalizedEmail;
+                            _byEmail[normalizedEmail] = existingAcc;
+                            needSave = true;
+                        }
+                        existingAcc.LastActiveUtc = DateTime.UtcNow;
+                        committedAcc = existingAcc;
+                    }
+                }
             }
-            acc.LastActiveUtc = DateTime.UtcNow;
+
+            if (shouldRetry)
+                continue;
+
+            if (committedAcc != null)
+            {
+                ClearFailedLogins(rateKey);
+                if (needSave)
+                    SaveAccount(committedAcc);
+
+                var pair = IssuePersistentTokens(committedAcc, clientKind, deviceId);
+                return (true, committedAcc, pair, null);
+            }
         }
 
-        if (needSave)
-            SaveAccount(acc);
-
-        var pair = IssuePersistentTokens(acc, clientKind, deviceId);
-        return (true, acc, pair, null);
+        return (false, null, null, "账号登录状态正在并发更新，请稍后重试。");
     }
 
-    /// <summary>为已登录账号设置或修改登录口令保护。</summary>
+    /// <summary>为已登录账号设置或修改登录口令保护（无锁 PBKDF2 + CAS 提交）。</summary>
     public (bool Ok, string? ErrorZh) SetOrUpdateSecret(Account acc, string? currentSecret, string newSecret)
     {
         if (acc == null) return (false, "账号不存在。");
@@ -264,20 +350,106 @@ public sealed class AccountStore : IDisposable
         if (trimmedNew.Length < 4 || trimmedNew.Length > 128)
             return (false, "新口令长度必须在 4 到 128 个字符之间。");
 
-        string newHash;
+        // 阶段 1：短锁快照当前哈希
+        string originalHash;
         lock (_lock)
         {
-            if (acc.HasSecretProtection)
-            {
-                if (string.IsNullOrWhiteSpace(currentSecret) || !VerifySecretHash(currentSecret.Trim(), acc.AuthSecretHash))
-                    return (false, "原口令不正确，无法修改。");
-            }
-            newHash = HashSecret(trimmedNew);
+            originalHash = acc.AuthSecretHash ?? string.Empty;
+        }
+
+        // 阶段 2：无锁执行旧口令验算与新口令 PBKDF2 派生
+        if (!string.IsNullOrWhiteSpace(originalHash))
+        {
+            if (string.IsNullOrWhiteSpace(currentSecret) || !VerifySecretHash(currentSecret.Trim(), originalHash))
+                return (false, "原口令不正确，无法修改。");
+        }
+        string newHash = HashSecret(trimmedNew);
+
+        // 阶段 3：短锁 CAS 提交
+        lock (_lock)
+        {
+            if (!string.Equals(acc.AuthSecretHash ?? string.Empty, originalHash, StringComparison.Ordinal))
+                return (false, "账号口令已被其他会话修改，请刷新后重试。");
             acc.AuthSecretHash = newHash;
         }
 
         _db.UpdateAccountSecretHash(acc.AccountId, newHash);
         return (true, null);
+    }
+
+    private Account? TryFindExistingAccountLocked(string key, string normalizedEmail)
+    {
+        if (!string.IsNullOrEmpty(normalizedEmail) && _byEmail.TryGetValue(normalizedEmail, out var emailAcc))
+        {
+            _byAccountId[emailAcc.AccountId] = emailAcc;
+            return emailAcc;
+        }
+
+        if (_byKey.TryGetValue(key, out var existing))
+        {
+            _byAccountId[existing.AccountId] = existing;
+            return existing;
+        }
+
+        var row = _db.LoadAccount(key);
+        if (row == null)
+            return null;
+
+        var loaded = AccountFromRow(row);
+        _byKey[key] = loaded;
+        _byAccountId[loaded.AccountId] = loaded;
+        IndexBoundEmail(loaded);
+        return loaded;
+    }
+
+    private bool IsLoginRateLimited(string rateKey)
+    {
+        if (!_loginFailureWindows.TryGetValue(rateKey, out var win))
+            return false;
+
+        long now = Environment.TickCount64;
+        lock (win.Sync)
+        {
+            while (win.TimestampsMs.Count > 0 && now - win.TimestampsMs.Peek() > FailedLoginWindowMs)
+                win.TimestampsMs.Dequeue();
+            return win.TimestampsMs.Count >= MaxFailedLoginsPerWindow;
+        }
+    }
+
+    private void RecordFailedLogin(string rateKey)
+    {
+        long now = Environment.TickCount64;
+        var win = _loginFailureWindows.GetOrAdd(rateKey, _ => new LoginFailureWindow());
+        lock (win.Sync)
+        {
+            while (win.TimestampsMs.Count > 0 && now - win.TimestampsMs.Peek() > FailedLoginWindowMs)
+                win.TimestampsMs.Dequeue();
+            win.TimestampsMs.Enqueue(now);
+        }
+
+        if (_loginFailureWindows.Count > 4096)
+            PruneExpiredLoginFailureWindows(now);
+    }
+
+    private void ClearFailedLogins(string rateKey)
+    {
+        _loginFailureWindows.TryRemove(rateKey, out _);
+    }
+
+    private void PruneExpiredLoginFailureWindows(long nowMs)
+    {
+        foreach (var kv in _loginFailureWindows)
+        {
+            bool empty;
+            lock (kv.Value.Sync)
+            {
+                while (kv.Value.TimestampsMs.Count > 0 && nowMs - kv.Value.TimestampsMs.Peek() > FailedLoginWindowMs)
+                    kv.Value.TimestampsMs.Dequeue();
+                empty = kv.Value.TimestampsMs.Count == 0;
+            }
+            if (empty)
+                _loginFailureWindows.TryRemove(kv.Key, out _);
+        }
     }
 
     private Account GetOrCreate(string key, string username, string clientKind, string deviceId)
@@ -684,17 +856,49 @@ public sealed class AccountStore : IDisposable
     {
         if (acc == null) return;
         _dirtyAccounts.TryRemove(acc.AccountId, out _);
+        _dirtySaveRetries.TryRemove(acc.AccountId, out _);
         SaveAccountCore(acc);
     }
 
-    /// <summary>将所有挂起防抖的账号进度立即同步落盘（优雅停机调用）。</summary>
+    /// <summary>将所有挂起防抖的账号进度立即同步落盘（优雅停机调用）；瞬时失败时自动重入队退避重试。</summary>
     public void FlushPendingAccountSaves()
     {
         var toFlush = _dirtyAccounts.Keys.ToList();
+        bool needRetrySchedule = false;
+        long maxBackoffMs = AccountProgressSaveDebounceMs;
+
         foreach (Guid id in toFlush)
         {
-            if (_dirtyAccounts.TryRemove(id, out var acc))
-                SaveAccountCore(acc);
+            if (!_dirtyAccounts.TryRemove(id, out var acc))
+                continue;
+
+            if (SaveAccountCore(acc))
+            {
+                _dirtySaveRetries.TryRemove(id, out _);
+                continue;
+            }
+
+            Interlocked.Increment(ref _accountSaveErrorCount);
+            if (_disposed == 0)
+            {
+                int retries = _dirtySaveRetries.AddOrUpdate(id, 1, (_, old) => old + 1);
+                if (retries <= MaxAccountSaveRetries)
+                {
+                    _dirtyAccounts.TryAdd(id, acc);
+                    long backoff = Math.Min(8000L, 500L << Math.Min(retries - 1, 4));
+                    if (backoff > maxBackoffMs) maxBackoffMs = backoff;
+                    needRetrySchedule = true;
+                }
+                else
+                {
+                    _dirtySaveRetries.TryRemove(id, out _);
+                }
+            }
+        }
+
+        if (needRetrySchedule && _disposed == 0)
+        {
+            try { _accountSaveTimer.Change(maxBackoffMs, Timeout.Infinite); } catch (ObjectDisposedException) { }
         }
     }
 
@@ -712,11 +916,20 @@ public sealed class AccountStore : IDisposable
 
     private void OnAccountSaveTimer(object? _)
     {
-        if (_disposed != 0) return;
-        FlushPendingAccountSaves();
+        try
+        {
+            if (_disposed != 0) return;
+            FlushPendingAccountSaves();
+        }
+        catch (Exception ex)
+        {
+            // 绝对兜底：防止任何未捕获异常从 ThreadPool Timer 回调逃逸导致进程终止
+            Interlocked.Increment(ref _accountSaveErrorCount);
+            try { Console.Error.WriteLine($"[AccountStore][ERROR] 账号防抖定时器回调异常：{ex.Message}"); } catch { }
+        }
     }
 
-    private void SaveAccountCore(Account acc)
+    private bool SaveAccountCore(Account acc)
     {
         try
         {
@@ -742,8 +955,13 @@ public sealed class AccountStore : IDisposable
                 runsCompleted, victories, defeats, bestDay,
                 acc.CreatedAt, DateTime.UtcNow, careerJson,
                 secretHash, role, pingMs));
+            return true;
         }
-        catch { /* 持久化失败不中断玩家当前操作 */ }
+        catch (Exception ex)
+        {
+            try { Console.Error.WriteLine($"[AccountStore][WARN] 保存账号 {acc.AccountId:N} 失败：{ex.Message}"); } catch { }
+            return false;
+        }
     }
 
     /// <summary>终局或投降结算生涯战绩（按 RunId 幂等，不会重复累计）。</summary>

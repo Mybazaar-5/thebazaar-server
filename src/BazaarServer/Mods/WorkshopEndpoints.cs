@@ -1,4 +1,5 @@
 using System.Net;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -11,12 +12,30 @@ using Microsoft.Net.Http.Headers;
 namespace BazaarServer.Mods;
 
 /// <summary>
-/// V13.1 零代码 Web 创意工坊 API 路由与 `/workshop` 单页应用静态托管：
-/// - 全部 11+ 个 `/api/workshop/*` 端点（原版 3,368 白名单卡搜索、规则积木中文目录、草稿保存、PNG 资产上传校验、10 道铁闸 + 50 场战斗体检、全绿强门禁发布热重载、.bazaarmod.zip 导入导出与安全删除）；
+/// V15.4 零代码 Web 创意工坊 API 路由与 `/workshop` 单页应用静态托管：
+/// - 全部 11+ 个 `/api/workshop/*` 端点（原版 3,368 白名单卡搜索、规则积木中文目录、草稿保存、PNG/JPEG 资产上传校验、10 道铁闸 + 50 场战斗体检、全绿强门禁发布热重载、.bazaarmod.zip 导入导出与安全删除）；
 /// - 安全门控：本机回环默认全功能读写；公网访问默认只读沙盒（浏览/检索/内存体检/导出可用），写操作需 BAZAAR_WORKSHOP_MODE=open 或 X-Workshop-Token 常量时间匹配 BAZAAR_WORKSHOP_TOKEN。
 /// </summary>
 public static class WorkshopEndpoints
 {
+    private static readonly Lazy<string> CachedServerVersion = new(ComputeServerVersion);
+
+    /// <summary>从程序集 InformationalVersion 权威解析服务端版本号（剥离 +commit 元数据后缀）。</summary>
+    internal static string ResolveServerVersion() => CachedServerVersion.Value;
+
+    private static string ComputeServerVersion()
+    {
+        var asm = typeof(WorkshopEndpoints).Assembly;
+        string? infoVer = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(infoVer))
+        {
+            int plusIdx = infoVer.IndexOf('+');
+            string cleaned = (plusIdx >= 0 ? infoVer[..plusIdx] : infoVer).Trim();
+            if (!string.IsNullOrEmpty(cleaned))
+                return cleaned;
+        }
+        return asm.GetName().Version?.ToString(3) ?? "15.4.0";
+    }
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -44,8 +63,63 @@ public static class WorkshopEndpoints
         var modHost = app.Services.GetRequiredService<ServerModHost>();
         var service = app.Services.GetService<WorkshopValidatorService>() ?? new WorkshopValidatorService(modHost);
 
-        // ── 静态页面与资产托管（同时兼容 /workshop、/workshop/ 与公网反代 /bz/workshop/）──
+        // ── 静态页面与资产托管（前置中间件统一拦截 /workshop、/workshop/、/workshop/index.html，强制注入 {{ASSET_PREFIX}} 并严格支持 HEAD）──
         string? workshopStaticDir = ResolveWorkshopStaticDirectory();
+
+        async Task WriteWorkshopIndexAsync(HttpContext ctx)
+        {
+            if (workshopStaticDir == null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+                ctx.Response.ContentType = "text/plain; charset=utf-8";
+                if (!HttpMethods.IsHead(ctx.Request.Method))
+                    await ctx.Response.WriteAsync("未找到 wwwroot/workshop 静态前端目录，请确认 BazaarServer 完整发布。", Encoding.UTF8, ctx.RequestAborted);
+                return;
+            }
+            string indexPath = Path.Combine(workshopStaticDir, "index.html");
+            if (!File.Exists(indexPath))
+            {
+                ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+                ctx.Response.ContentType = "text/plain; charset=utf-8";
+                if (!HttpMethods.IsHead(ctx.Request.Method))
+                    await ctx.Response.WriteAsync("未找到 workshop/index.html", Encoding.UTF8, ctx.RequestAborted);
+                return;
+            }
+
+            string rawPath = ctx.Request.Path.Value ?? string.Empty;
+            bool inWorkshopDir = rawPath.EndsWith("/", StringComparison.Ordinal)
+                || rawPath.EndsWith("/index.html", StringComparison.OrdinalIgnoreCase);
+            string prefix = inWorkshopDir ? "./" : "./workshop/";
+
+            string html = await File.ReadAllTextAsync(indexPath, Encoding.UTF8, ctx.RequestAborted);
+            html = html.Replace("{{ASSET_PREFIX}}", prefix, StringComparison.Ordinal);
+            byte[] htmlBytes = Encoding.UTF8.GetBytes(html);
+
+            ctx.Response.StatusCode = StatusCodes.Status200OK;
+            ctx.Response.ContentType = "text/html; charset=utf-8";
+            ctx.Response.Headers[HeaderNames.CacheControl] = "no-cache";
+            ctx.Response.ContentLength = htmlBytes.Length;
+            if (HttpMethods.IsHead(ctx.Request.Method))
+                return;
+            await ctx.Response.Body.WriteAsync(htmlBytes, ctx.RequestAborted);
+        }
+
+        app.Use(async (ctx, next) =>
+        {
+            if (HttpMethods.IsGet(ctx.Request.Method) || HttpMethods.IsHead(ctx.Request.Method))
+            {
+                string path = ctx.Request.Path.Value ?? string.Empty;
+                if (path.Equals("/workshop", StringComparison.OrdinalIgnoreCase)
+                    || path.Equals("/workshop/", StringComparison.OrdinalIgnoreCase)
+                    || path.Equals("/workshop/index.html", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteWorkshopIndexAsync(ctx);
+                    return;
+                }
+            }
+            await next();
+        });
+
         if (workshopStaticDir != null)
         {
             app.UseStaticFiles(new StaticFileOptions
@@ -56,37 +130,18 @@ public static class WorkshopEndpoints
             });
         }
 
-        IResult ServeWorkshopIndex(HttpContext ctx)
-        {
-            if (workshopStaticDir == null)
-            {
-                return Results.Text("未找到 wwwroot/workshop 静态前端目录，请确认 BazaarServer 完整发布。", "text/plain; charset=utf-8", statusCode: 404);
-            }
-            string indexPath = Path.Combine(workshopStaticDir, "index.html");
-            if (!File.Exists(indexPath))
-                return Results.NotFound("未找到 workshop/index.html");
-
-            string html = File.ReadAllText(indexPath, Encoding.UTF8);
-            bool hasTrailingSlash = (ctx.Request.Path.Value ?? string.Empty).EndsWith('/');
-            string prefix = hasTrailingSlash ? "./" : "./workshop/";
-            html = html.Replace("{{ASSET_PREFIX}}", prefix, StringComparison.Ordinal);
-            ctx.Response.Headers[HeaderNames.CacheControl] = "no-cache";
-            return Results.Content(html, "text/html; charset=utf-8", Encoding.UTF8);
-        }
-
-        app.MapGet("/workshop", ServeWorkshopIndex);
-
         // ── 1. 工坊运行态元信息（含权限模式判定） ───────────────────────────
         app.MapGet("/api/workshop/meta", (HttpContext ctx) =>
         {
-            var access = ResolveAccessPolicy(ctx);
+            var access = AdminAccessGuard.ResolveFrom(ctx.RequestServices).Evaluate(ctx);
             return Results.Json(new
             {
                 ok = true,
                 mode = access.ModeLabel,
-                canWrite = access.CanWrite,
-                tokenConfigured = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BAZAAR_WORKSHOP_TOKEN")),
-                serverVersion = "15.4.0",
+                canWrite = access.Allowed,
+                tokenConfigured = access.TokenConfigured,
+                requireTokenOnly = access.RequireTokenOnly,
+                serverVersion = ResolveServerVersion(),
                 baseCardCount = modHost.BaseRepository.CardsById.Count,
                 whitelistedCardCount = modHost.ValidVisualWhitelist.Count,
                 registeredMechanicCount = modHost.Registry.MechanicsById.Count,
@@ -170,26 +225,35 @@ public static class WorkshopEndpoints
         app.MapGet("/api/workshop/mods", () =>
         {
             var statuses = modHost.GetAllModStatuses();
-            var items = statuses.Select(s => new
+            var items = statuses.Select(s =>
             {
-                id = s.Id,
-                name = s.Name,
-                version = s.Version,
-                author = s.Author,
-                description = s.Description,
-                scope = s.Scope,
-                enabled = s.Enabled,
-                loaded = s.Loaded,
-                affectsGhostPool = s.AffectsGhostPool,
-                cardCount = s.CustomCardCount,
-                patchCount = s.CardPatchCount,
-                eventCount = s.CustomEventCount,
-                monsterCount = s.CustomMonsterCount,
-                modeCount = s.CustomModeCount,
-                assetCount = s.AssetCount,
-                packageHash = s.PackageHash,
-                lastValidationPassed = !s.Issues.Any(i => i.Severity == ModValidationSeverity.Error),
-                issues = s.Issues
+                int mechCount = s.CustomMechanicCount > 0
+                    ? s.CustomMechanicCount
+                    : (modHost.FindDiscoveredPackage(s.Id)?.Mechanics.Count ?? 0);
+                return new
+                {
+                    id = s.Id,
+                    name = s.Name,
+                    version = s.Version,
+                    author = s.Author,
+                    description = s.Description,
+                    scope = s.Scope,
+                    enabled = s.Enabled,
+                    loaded = s.Loaded,
+                    affectsGhostPool = s.AffectsGhostPool,
+                    cardCount = s.CustomCardCount,
+                    patchCount = s.CardPatchCount,
+                    eventCount = s.CustomEventCount,
+                    monsterCount = s.CustomMonsterCount,
+                    modeCount = s.CustomModeCount,
+                    mechanicCount = mechCount,
+                    customMechanicCount = mechCount,
+                    mutatorCount = s.CustomMutatorCount,
+                    assetCount = s.AssetCount,
+                    packageHash = s.PackageHash,
+                    lastValidationPassed = !s.Issues.Any(i => i.Severity == ModValidationSeverity.Error),
+                    issues = s.Issues
+                };
             }).ToList();
 
             return Results.Json(new
@@ -243,12 +307,12 @@ public static class WorkshopEndpoints
             }, JsonOpts);
         });
 
-        // ── 7. 上传并自动校验/保存 PNG 资产 + 草稿图实时预览 ─────────────────
+        // ── 7. 上传并自动校验/保存 PNG/JPEG 资产 + 草稿图实时预览 ─────────────
         app.MapPost("/api/workshop/mods/{modId}/assets", async (HttpContext ctx, string modId) =>
         {
             if (RejectIfReadOnly(ctx, out var denied)) return denied!;
             if (!ctx.Request.HasFormContentType)
-                return Results.Json(new { ok = false, error = "请使用 multipart/form-data 上传 PNG 图片字段 'file'。" }, JsonOpts, statusCode: 400);
+                return Results.Json(new { ok = false, error = "请使用 multipart/form-data 上传 PNG/JPEG 图片字段 'file'。" }, JsonOpts, statusCode: 400);
 
             var form = await ctx.Request.ReadFormAsync(ctx.RequestAborted);
             var file = form.Files.GetFile("file") ?? form.Files.FirstOrDefault();
@@ -280,15 +344,20 @@ public static class WorkshopEndpoints
         app.MapPost("/api/workshop/mods/{modId}/validate", async (HttpContext ctx, string modId) =>
         {
             ValidateRequestBody? body = null;
-            if (ctx.Request.ContentLength is > 0)
+            if (ctx.Request.ContentLength != 0)
             {
-                try
+                using var reader = new StreamReader(ctx.Request.Body, Encoding.UTF8);
+                string rawBody = await reader.ReadToEndAsync(ctx.RequestAborted);
+                if (!string.IsNullOrWhiteSpace(rawBody))
                 {
-                    body = await JsonSerializer.DeserializeAsync<ValidateRequestBody>(ctx.Request.Body, JsonOpts, ctx.RequestAborted);
-                }
-                catch (Exception ex)
-                {
-                    return Results.Json(new { ok = false, error = $"校验请求 JSON 格式错误：{ex.Message}" }, JsonOpts, statusCode: 400);
+                    try
+                    {
+                        body = JsonSerializer.Deserialize<ValidateRequestBody>(rawBody, JsonOpts);
+                    }
+                    catch (Exception ex)
+                    {
+                        return Results.Json(new { ok = false, error = $"校验请求 JSON 格式错误：{ex.Message}" }, JsonOpts, statusCode: 400);
+                    }
                 }
             }
 
@@ -333,9 +402,24 @@ public static class WorkshopEndpoints
         // ── 10. 导出 & 严苛检疫导入 .bazaarmod.zip ────────────────────────────
         app.MapGet("/api/workshop/mods/{modId}/export", async (HttpContext ctx, string modId) =>
         {
-            var (ok, err, zipBytes, fileName) = await service.ExportZipAsync(modId, ctx.RequestAborted);
+            bool allowDraft = string.Equals(ctx.Request.Query["allowDraft"].FirstOrDefault(), "true", StringComparison.OrdinalIgnoreCase);
+            var (ok, statusCode, err, zipBytes, fileName, validation) = await service.ExportZipWithReportAsync(modId, allowDraft, ctx.RequestAborted);
             if (!ok || zipBytes == null)
-                return Results.Json(new { ok = false, error = err }, JsonOpts, statusCode: 404);
+            {
+                if (statusCode == StatusCodes.Status422UnprocessableEntity)
+                {
+                    return Results.Json(new
+                    {
+                        ok = false,
+                        blocked = true,
+                        modId,
+                        error = err,
+                        messageZh = err,
+                        validation
+                    }, JsonOpts, statusCode: statusCode);
+                }
+                return Results.Json(new { ok = false, error = err }, JsonOpts, statusCode: statusCode);
+            }
 
             return Results.File(zipBytes, "application/zip", fileDownloadName: fileName ?? $"{modId}.bazaarmod.zip");
         });
@@ -391,83 +475,10 @@ public static class WorkshopEndpoints
         });
     }
 
-    // ── 公网/本机写权限安全门控 ───────────────────────────────────────────────
-
-    private readonly record struct AccessPolicy(bool CanWrite, string ModeLabel);
-
-    private static AccessPolicy ResolveAccessPolicy(HttpContext ctx)
-    {
-        string modeEnv = (Environment.GetEnvironmentVariable("BAZAAR_WORKSHOP_MODE") ?? "auto").Trim().ToLowerInvariant();
-        string? configuredToken = Environment.GetEnvironmentVariable("BAZAAR_WORKSHOP_TOKEN");
-
-        if (modeEnv == "readonly")
-            return new AccessPolicy(false, "readonly");
-
-        if (modeEnv == "open")
-            return new AccessPolicy(true, "open-rw");
-
-        // 校验 X-Workshop-Token（常量时间比较防时序侧信道攻击）
-        if (!string.IsNullOrEmpty(configuredToken)
-            && ctx.Request.Headers.TryGetValue("X-Workshop-Token", out var providedVals))
-        {
-            string provided = providedVals.FirstOrDefault() ?? string.Empty;
-            if (ConstantTimeEquals(provided, configuredToken))
-                return new AccessPolicy(true, "token-rw");
-        }
-
-        // 本机回环地址且无外部代理来源头（X-Forwarded-For / X-Real-IP 非本机）默认全功能开放
-        bool isLoopback = IsDirectLocalLoopback(ctx);
-        if (isLoopback)
-            return new AccessPolicy(true, "local-rw");
-
-        return new AccessPolicy(false, "readonly");
-    }
+    // ── 公网/本机写权限安全门控（统一委托全服唯一 AdminAccessGuard，P0-36）────
 
     private static bool RejectIfReadOnly(HttpContext ctx, out IResult? deniedResult)
-    {
-        var policy = ResolveAccessPolicy(ctx);
-        if (policy.CanWrite)
-        {
-            deniedResult = null;
-            return false;
-        }
-
-        deniedResult = Results.Json(new
-        {
-            ok = false,
-            errorCode = "WORKSHOP_READONLY_MODE",
-            error = "当前为公网只读安全沙盒模式，禁止直接向服务器磁盘写入或热重载。你可以在本机运行单机版 /workshop 创作，或在右上角填入管理员口令（X-Workshop-Token）解锁写入权限。"
-        }, JsonOpts, statusCode: StatusCodes.Status403Forbidden);
-        return true;
-    }
-
-    private static bool IsDirectLocalLoopback(HttpContext ctx)
-    {
-        // 如果存在反代转发头，必须验证首个来源 IP 也是回环地址，防止 Nginx 反代把公网请求伪装成 127.0.0.1！
-        if (ctx.Request.Headers.TryGetValue("X-Forwarded-For", out var xff))
-        {
-            string first = (xff.FirstOrDefault() ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim() ?? string.Empty;
-            if (!string.IsNullOrEmpty(first) && (!IPAddress.TryParse(first, out var fwdIp) || !IPAddress.IsLoopback(fwdIp)))
-                return false;
-        }
-        if (ctx.Request.Headers.TryGetValue("X-Real-IP", out var xri))
-        {
-            string ipText = (xri.FirstOrDefault() ?? string.Empty).Trim();
-            if (!string.IsNullOrEmpty(ipText) && (!IPAddress.TryParse(ipText, out var realIp) || !IPAddress.IsLoopback(realIp)))
-                return false;
-        }
-
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp == null) return true; // TestServer / 内存测试环境无真实 socket IP 视作本机
-        return IPAddress.IsLoopback(remoteIp);
-    }
-
-    private static bool ConstantTimeEquals(string a, string b)
-    {
-        byte[] ba = Encoding.UTF8.GetBytes(a);
-        byte[] bb = Encoding.UTF8.GetBytes(b);
-        return ba.Length == bb.Length && CryptographicOperations.FixedTimeEquals(ba, bb);
-    }
+        => AdminAccessGuard.ResolveFrom(ctx.RequestServices).TryReject(ctx, JsonOpts, out deniedResult);
 
     private static string? ResolveWorkshopStaticDirectory()
     {

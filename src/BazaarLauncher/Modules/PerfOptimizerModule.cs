@@ -147,6 +147,8 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
     private IModContext _ctx;
     private readonly List<IDisposable> _eventSubscriptions = new();
     private PerfRuntimeBehaviour _behaviour;
+    private bool _vfxConfigSubscribed;
+    private static bool _syncingVfxConfig;
 
     public double CurrentFps => _currentFps;
     public double OnePercentLowFps => _onePercentLowFps;
@@ -160,6 +162,49 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         _ctx = context;
         Instance = this;
         LoadConfigFromStore();
+        BindPluginVfxConfigSync();
+    }
+
+    private void BindPluginVfxConfigSync()
+    {
+        var entry = BazaarLauncherPlugin.ReduceHighConcurrencyVfx;
+        if (entry == null || _vfxConfigSubscribed) return;
+        _vfxConfigSubscribed = true;
+        entry.SettingChanged += OnPluginReduceVfxChanged;
+    }
+
+    private void UnbindPluginVfxConfigSync()
+    {
+        var entry = BazaarLauncherPlugin.ReduceHighConcurrencyVfx;
+        if (entry == null || !_vfxConfigSubscribed) return;
+        _vfxConfigSubscribed = false;
+        entry.SettingChanged -= OnPluginReduceVfxChanged;
+    }
+
+    private void OnPluginReduceVfxChanged(object sender, EventArgs e)
+    {
+        if (_syncingVfxConfig) return;
+        var entry = BazaarLauncherPlugin.ReduceHighConcurrencyVfx;
+        if (entry == null) return;
+        OptVfxThrottle = entry.Value;
+        SaveConfigToStore(syncPluginCfg: false);
+    }
+
+    private static void SyncPluginVfxConfigFromOpt()
+    {
+        var entry = BazaarLauncherPlugin.ReduceHighConcurrencyVfx;
+        if (entry == null || entry.Value == OptVfxThrottle) return;
+        _syncingVfxConfig = true;
+        try
+        {
+            entry.Value = OptVfxThrottle;
+            entry.ConfigFile?.Save();
+        }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L203", diagEx); }
+        finally
+        {
+            _syncingVfxConfig = false;
+        }
     }
 
     public void OnEnable()
@@ -219,6 +264,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
 
     public void OnUnload()
     {
+        UnbindPluginVfxConfigSync();
         OnDisable();
         if (Instance == this) Instance = null;
     }
@@ -292,8 +338,12 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         if (persist) SaveConfigToStore();
     }
 
-    internal void SaveConfigToStore()
+    internal void SaveConfigToStore(bool syncPluginCfg = true)
     {
+        if (syncPluginCfg)
+        {
+            SyncPluginVfxConfigFromOpt();
+        }
         if (_ctx?.Config == null) return;
         var c = _ctx.Config;
         c.SetString("profile", ActiveProfileName);
@@ -316,16 +366,40 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         c.Save();
     }
 
+    internal static bool ResolveStartupVfxThrottle(bool? pluginCfgVfx, Func<bool, bool> readJsonVfx, Action<bool> writeJsonVfx)
+    {
+        if (pluginCfgVfx.HasValue)
+        {
+            bool desired = pluginCfgVfx.Value;
+            writeJsonVfx?.Invoke(desired);
+            return desired;
+        }
+        return readJsonVfx != null ? readJsonVfx(true) : true;
+    }
+
     private void LoadConfigFromStore()
     {
-        if (_ctx?.Config == null) return;
+        if (_ctx?.Config == null)
+        {
+            if (BazaarLauncherPlugin.ReduceHighConcurrencyVfx != null)
+            {
+                OptVfxThrottle = BazaarLauncherPlugin.ReduceHighConcurrencyVfx.Value;
+            }
+            return;
+        }
         var c = _ctx.Config;
         ActiveProfileName = c.GetString("profile", "Balanced");
         OptFixNegativeFpsBug = c.GetBool("fixNegativeFpsBug", true);
         OptBlurDownsampleOrSkip = c.GetBool("blurDownsampleOrSkip", string.Equals(ActiveProfileName, "UltraLow", StringComparison.OrdinalIgnoreCase));
         OptFixCameraLeak = c.GetBool("fixCameraLeak", true);
         OptCombatHighSpeedSmooth = c.GetBool("combatHighSpeedSmooth", true);
-        OptVfxThrottle = c.GetBool("vfxThrottle", true);
+        // D4-NEW-01：启动时以 BepInEx [Performance] ReduceHighConcurrencyVfx（与 BazaarHub 共享）为单一事实源，
+        // 严禁用旧 JSON 中的 vfxThrottle 反写覆盖 .cfg，确保在 Hub 取消勾选/恢复默认后立即生效；
+        // 游戏内修改仍由 SaveConfigToStore 双向同步回 .cfg
+        OptVfxThrottle = ResolveStartupVfxThrottle(
+            BazaarLauncherPlugin.ReduceHighConcurrencyVfx?.Value,
+            def => c.GetBool("vfxThrottle", def),
+            val => c.SetBool("vfxThrottle", val));
         OptMaxConcurrentVfx = Math.Clamp(c.GetInt("maxConcurrentVfx", 48), 12, 256);
         OptAudioHandleGuard = c.GetBool("audioHandleGuard", true);
         OptAssetLoaderCacheAndLru = c.GetBool("assetLoaderCacheAndLru", true);
@@ -366,7 +440,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                 // A-10：根据当前战斗态调整 Unity 增量 GC 单帧时间片
                 ApplyIncrementalGcSlice(_inCombat);
             }
-            catch { }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L443", diagEx); }
         });
     }
 
@@ -778,7 +852,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                     double r = Screen.currentResolution.refreshRateRatio.value;
                     if (r >= 30.0 && r <= 360.0) refresh = r;
                 }
-                catch { }
+                catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L855", diagEx); }
 
                 int configuredFg = FrameRateGuard.GetConfiguredMaxForegroundFps();
                 double effectiveFps = configuredFg > 0 ? Math.Min(refresh, configuredFg) : refresh;
@@ -886,7 +960,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             _lastLoadedSoundtrackPath = reqPath;
             _lastSoundtrackLoadUnscaledTime = now;
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L963", diagEx); }
         return true;
     }
 
@@ -993,7 +1067,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             }
             _lastSecTipValidSideByCtrlId[uo.GetInstanceID()] = side;
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L1070", diagEx); }
     }
 
     /// <summary>P1-47：节流跳过副 Tooltip 重建时，恢复 ResetPositioningSide() 清空的侧向并补发箭头动画与 OnPositioningComplete 回调。</summary>
@@ -1097,7 +1171,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                 return false;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L1174", diagEx); }
         return true;
     }
 
@@ -1152,7 +1226,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         {
             ResetDragHoverCaches();
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L1229", diagEx); }
     }
 
     /// <summary>拖拽 Top 2：ItemController.HoveredMove 状态守卫，防止重复 Kill(complete:true) 并重建同目标 DOTween 引发抖动与 GC。</summary>
@@ -1314,7 +1388,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
             // 战斗态收紧至 1.5ms 保护 1% Low 帧率，大厅/商店放宽至 3ms
             GarbageCollector.incrementalTimeSliceNanoseconds = inCombat ? 1_500_000UL : 3_000_000UL;
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L1391", diagEx); }
     }
 
     private void RunSceneBoundaryCleanup(bool force)
@@ -1326,7 +1400,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
         {
             GarbageCollector.CollectIncremental(2_000_000UL);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L1403", diagEx); }
 
         // 2. 驱逐未被引用的自定义卡图缓存
         CardTextureCache.Instance.EvictUnreferencedOnSceneChange();
@@ -1341,7 +1415,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                 _ = Resources.UnloadUnusedAssets();
                 BazaarLauncherPlugin.Log?.LogInfo("[PerfOptimizer] 已在切场景安全空窗触发温和增量 GC 与未使用资源清理");
             }
-            catch { }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L1418", diagEx); }
         }
     }
 
@@ -1410,7 +1484,7 @@ internal sealed class PerfOptimizerModule : IBuiltInPatchModule, IPerformanceTel
                     }
                 }
             }
-            catch { }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("PerfOptimizerModule:L1487", diagEx); }
             finally
             {
                 Interlocked.Exchange(ref _pingInFlight, 0);

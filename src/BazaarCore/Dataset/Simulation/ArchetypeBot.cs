@@ -1,4 +1,5 @@
 using BazaarCore.Data;
+using BazaarCore.Engine;
 using BazaarCore.Models;
 using BazaarCore.Runtime;
 
@@ -405,7 +406,7 @@ public sealed class ArchetypeBot
             score += soldTriggerBonus;
         }
 
-        // 7. 若加载了巴扎罗盘分天真实获取概率表，轻度引导选牌贴合游戏当日真实出现概率曲线
+        // 7. 若加载了外部天梯统计源分天真实获取概率表，轻度引导选牌贴合游戏当日真实出现概率曲线
         if (CompassAvailabilityRegistry.TryGetAvailability(participant.Hero, day, template.Id, out double compassAvail)
             && compassAvail > 0)
         {
@@ -1014,7 +1015,7 @@ public sealed class ArchetypeBot
             }
 
             if (bestEnch == card.Enchantment) continue;
-            card.ApplyEnchantment(bestEnch, preventOverride: false);
+            card.ApplyEnchantment(bestEnch, DurationTarget.Permanent, preventOverride: false);
             return true;
         }
 
@@ -2218,7 +2219,7 @@ public sealed class ArchetypeBot
                         continue;
 
                     string? oldEnch = card.Enchantment;
-                    card.ApplyEnchantment(action.Enchantment, preventOverride);
+                    card.ApplyEnchantment(action.Enchantment, DurationTarget.Permanent, preventOverride);
                     if (!string.Equals(oldEnch, card.Enchantment, StringComparison.OrdinalIgnoreCase) && depth < 4 && ctx.Repo != null)
                         FireSafeOutOfCombatTriggers(ps, "TTriggerOnCardEnchanted", card, ctx.Repo, ctx.Rng, idx, depth: depth + 1);
                 }
@@ -2256,7 +2257,7 @@ public sealed class ArchetypeBot
                     }
 
                     string? oldEnch = card.Enchantment;
-                    card.ApplyEnchantment(picked, preventOverride);
+                    card.ApplyEnchantment(picked, DurationTarget.Permanent, preventOverride);
                     if (!string.Equals(oldEnch, card.Enchantment, StringComparison.OrdinalIgnoreCase) && depth < 4 && ctx.Repo != null)
                         FireSafeOutOfCombatTriggers(ps, "TTriggerOnCardEnchanted", card, ctx.Repo, ctx.Rng, idx, depth: depth + 1);
                 }

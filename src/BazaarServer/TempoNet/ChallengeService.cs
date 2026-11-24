@@ -141,12 +141,23 @@ public sealed class ChallengeService
         public List<PersistedChallengeSlot> WeeklyChallenges { get; set; } = new();
     }
 
+    private const int AccountLockStripeCount = 64;
+    private const int MaxCachedAccounts = 4096;
+    private const long CacheSlidingTtlMs = 2L * 60 * 60 * 1000;
+
+    private sealed class CachedChallengeEntry
+    {
+        public required PersistedAccountChallengeState State { get; init; }
+        public long LastAccessTickMs;
+    }
+
     private readonly Persistence _db;
     private readonly GameDataRepository _repo;
     private readonly AccountStore? _accounts;
     private readonly Func<Random> _rngFactory;
-    private readonly ConcurrentDictionary<Guid, object> _accountLocks = new();
-    private readonly ConcurrentDictionary<Guid, PersistedAccountChallengeState> _cache = new();
+    // D8-P2-05：固定 64 条带无符号 FNV-1a 锁 + 有界 4096/2h TTL 挑战缓存，根治长跑内存泄漏
+    private readonly object[] _accountLockStripes = Enumerable.Range(0, AccountLockStripeCount).Select(_ => new object()).ToArray();
+    private readonly ConcurrentDictionary<Guid, CachedChallengeEntry> _cache = new();
 
     public ChallengeService(
         Persistence db,
@@ -696,8 +707,48 @@ public sealed class ChallengeService
         }
     }
 
+    private static uint ComputeFnv1a32(Guid accountId)
+    {
+        Span<byte> bytes = stackalloc byte[16];
+        accountId.TryWriteBytes(bytes);
+        uint hash = 2166136261u;
+        for (int i = 0; i < bytes.Length; i++)
+        {
+            hash ^= bytes[i];
+            hash *= 16777619u;
+        }
+        return hash;
+    }
+
     private object GetAccountLock(Guid accountId)
-        => _accountLocks.GetOrAdd(accountId, _ => new object());
+        => _accountLockStripes[ComputeFnv1a32(accountId) % (uint)_accountLockStripes.Length];
+
+    /// <summary>D8-P2-05：按 2 小时滑动 TTL 与 4096 上限驱逐陈旧挑战缓存条目。</summary>
+    public int EvictStaleCacheEntries()
+    {
+        long nowMs = Environment.TickCount64;
+        int removed = 0;
+        foreach (var (aid, entry) in _cache)
+        {
+            long lastMs = Volatile.Read(ref entry.LastAccessTickMs);
+            if (nowMs - lastMs > CacheSlidingTtlMs && _cache.TryRemove(aid, out _))
+                removed++;
+        }
+        if (_cache.Count > MaxCachedAccounts)
+        {
+            var oldest = _cache
+                .OrderBy(kv => Volatile.Read(ref kv.Value.LastAccessTickMs))
+                .Take(_cache.Count - (MaxCachedAccounts * 3 / 4))
+                .Select(kv => kv.Key)
+                .ToList();
+            foreach (var aid in oldest)
+            {
+                if (_cache.TryRemove(aid, out _))
+                    removed++;
+            }
+        }
+        return removed;
+    }
 
     private ChallengeTemplate? FindTemplate(Guid id)
         => _repo.GetChallenge(id.ToString("D"));
@@ -705,8 +756,16 @@ public sealed class ChallengeService
     private PersistedAccountChallengeState LoadOrRefreshLocked(Guid accountId, DateTime utcNow, out bool dirty)
     {
         dirty = false;
-        if (!_cache.TryGetValue(accountId, out var state))
+        long nowTick = Environment.TickCount64;
+        PersistedAccountChallengeState? state;
+        if (_cache.TryGetValue(accountId, out var cachedEntry))
         {
+            Volatile.Write(ref cachedEntry.LastAccessTickMs, nowTick);
+            state = cachedEntry.State;
+        }
+        else
+        {
+            state = null;
             string raw = _db.LoadAccountChallengesJson(accountId);
             if (!string.IsNullOrWhiteSpace(raw))
             {
@@ -718,7 +777,9 @@ public sealed class ChallengeService
                 state = new PersistedAccountChallengeState();
                 dirty = true;
             }
-            _cache[accountId] = state;
+            if (_cache.Count >= MaxCachedAccounts)
+                EvictStaleCacheEntries();
+            _cache[accountId] = new CachedChallengeEntry { State = state, LastAccessTickMs = nowTick };
         }
 
         string dailyKey = utcNow.ToString("yyyy-MM-dd");

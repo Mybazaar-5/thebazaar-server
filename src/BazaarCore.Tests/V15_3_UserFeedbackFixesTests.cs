@@ -26,6 +26,7 @@ namespace BazaarCore.Tests;
 ///   - 问题 5A：Day 1~10 PvP 对手符合正常每日升级分布（不再一刀切锁死 Day 1 Lv1）
 ///   - 问题 6：Resume 恢复事件流前置下发 GameSimEventSocketsUnlocked，且 SQLite 持久化往返 100% 保留手牌/仓库/技能
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V15_3_UserFeedbackFixesTests
 {
     private sealed class SharedData
@@ -41,33 +42,21 @@ public sealed class V15_3_UserFeedbackFixesTests
     }
 
     private static string ResolveDataDir()
-    {
-        string? cur = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && !string.IsNullOrEmpty(cur); i++)
-        {
-            string cand = Path.Combine(cur, "dist", "data");
-            if (File.Exists(Path.Combine(cand, "GameData.db")))
-                return cand;
-            cur = Path.GetDirectoryName(cur);
-        }
-        throw new DirectoryNotFoundException("无法定位 dist/data/GameData.db");
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataDir();
 
     private static readonly Lazy<SharedData> Fx = new(() =>
     {
-        string dir = ResolveDataDir();
-        var repo = GameDatabaseLoader.Load(Path.Combine(dir, "GameData.db"), null);
-        var pool = CardPool.FromRepository(repo, dir);
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new SharedData
         {
-            DataDir = dir,
-            Repo = repo,
-            Pool = pool,
-            Monsters = MonsterPool.FromRepository(repo),
-            LevelUps = LevelUpTable.FromRepository(repo),
-            Mode = GameModeConfig.FromRepository(repo),
-            Ghosts = PvpGhostPool.Load(dir),
-            Arch = CardArchetypeIndex.Build(pool, repo),
+            DataDir = shared.DataDir,
+            Repo = shared.Repo,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Ghosts = shared.Ghosts,
+            Arch = shared.ArchetypeIndex,
         };
     });
 

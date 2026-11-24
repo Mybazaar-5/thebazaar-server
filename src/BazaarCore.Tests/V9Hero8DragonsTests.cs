@@ -25,6 +25,7 @@ namespace BazaarCore.Tests;
 /// 覆盖 Hero8 元信息、卡池/Always 汉化、12 套流派统计、开局/Day1-5商店/Lv2音符奖励、
 /// 主动与被动 Tempo 获能/消耗触发/消耗减免、CombatSimConverter 帧事件同步，以及七音阶音符槽循环占位。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V9Hero8DragonsTests
 {
     private const string DragonsHideoutId = "d33129a9-5df2-47e5-9b6a-7469743fe5a8";
@@ -71,40 +72,18 @@ public sealed class V9Hero8DragonsTests
 
     private static readonly Lazy<RealFixture> Fx = new(() =>
     {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 10 && !string.IsNullOrEmpty(dir); i++, dir = Directory.GetParent(dir)?.FullName)
-        {
-            string candidate = Path.Combine(dir, "dist", "data");
-            if (File.Exists(Path.Combine(candidate, "ghost_pool_balanced.jsonl")))
-            {
-                dir = candidate;
-                break;
-            }
-        }
-        if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
-            dir = @"e:\thebazaar\dist\data";
-
-        string dbPath = File.Exists(Path.Combine(dir, "GameData.db"))
-            ? Path.Combine(dir, "GameData.db")
-            : (SteamPathResolver.ResolveGameDataSourcePath() ?? Path.Combine(dir, "GameData.db"));
-        string? zhPath = File.Exists(Path.Combine(dir, "translations", "zh-CN.bytes"))
-            ? Path.Combine(dir, "translations", "zh-CN.bytes")
-            : SteamPathResolver.ResolveZhCnTranslationPath();
-
-        var repo = GameDatabaseLoader.Load(dbPath, zhPath);
-        var pool = CardPool.Load(dbPath);
-        var archetypes = CardArchetypeIndex.Build(pool, repo);
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new RealFixture
         {
-            DataDir = dir,
-            DbPath = dbPath,
-            Repo = repo,
-            Pool = pool,
-            Monsters = MonsterPool.Load(dbPath),
-            LevelUps = LevelUpTable.Load(dbPath),
-            Mode = GameModeConfig.Load(dbPath),
-            Ghosts = PvpGhostPool.Load(dir),
-            Archetypes = archetypes,
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Repo = shared.Repo,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Ghosts = shared.Ghosts,
+            Archetypes = shared.ArchetypeIndex,
         };
     });
 

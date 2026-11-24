@@ -906,7 +906,7 @@ internal static partial class CompatAuditPatch
             if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
             _spmCurrentSkillEntryIndexField?.SetValue(__instance, 0);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L909", diagEx); }
     }
 
     private static void SkillPresentationSetTempTexturePrefix(object __instance, out Texture2D __state)
@@ -917,7 +917,7 @@ internal static partial class CompatAuditPatch
             if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
             __state = _spmTempBoardTextureField?.GetValue(__instance) as Texture2D;
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L920", diagEx); }
     }
 
     private static void SkillPresentationSetTempTexturePostfix(object __instance, Texture2D __state)
@@ -930,7 +930,7 @@ internal static partial class CompatAuditPatch
                 _spmTempBoardTextureField?.SetValue(__instance, __state);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L933", diagEx); }
     }
 
     private static bool SkillPresentationResetBoardTexturesPrefix(object __instance)
@@ -954,7 +954,7 @@ internal static partial class CompatAuditPatch
             if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
             _spmTempBoardTextureField?.SetValue(__instance, null);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L957", diagEx); }
     }
 
     private static void SkillPresentationSetSkillEntryTexturePostfix(object __instance)
@@ -964,7 +964,7 @@ internal static partial class CompatAuditPatch
             if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
             _spmTempBoardTextureField?.SetValue(__instance, null);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L967", diagEx); }
     }
 
     // ── 4. CardQuestGroupData：任务条目越界、实例空安全与跨局 _subscribedGroups 泄漏清理 (P2-42) ──
@@ -1313,7 +1313,7 @@ internal static partial class CompatAuditPatch
                     if (__instance is Component c) c.gameObject.SetActive(false);
                 }
             }
-            catch { }
+            catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L1316", diagEx); }
         }
         return null;
     }
@@ -1326,7 +1326,7 @@ internal static partial class CompatAuditPatch
             trophyImg.GetType().GetProperty("enabled", BindingFlags.Public | BindingFlags.Instance)?.SetValue(trophyImg, false);
             if (trophyImg is Component c) c.gameObject.SetActive(false);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L1329", diagEx); }
     }
 
     private static void MainMenuBaseStateOnEnterPostfix(object __instance)
@@ -1337,7 +1337,7 @@ internal static partial class CompatAuditPatch
             if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
             SyncMainMenuResumeAndPlaymodeVisibility(__instance);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L1340", diagEx); }
     }
 
     private static Exception MainMenuBaseStateOnEnterFinalizer(object __instance, Exception __exception)
@@ -1351,7 +1351,7 @@ internal static partial class CompatAuditPatch
                 SyncMainMenuResumeAndPlaymodeVisibility(__instance);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L1354", diagEx); }
         return null;
     }
 
@@ -1375,7 +1375,7 @@ internal static partial class CompatAuditPatch
         {
             RefreshActiveMainMenuUiFromData();
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L1378", diagEx); }
     }
 
     /// <summary>
@@ -1487,7 +1487,6 @@ internal static partial class CompatAuditPatch
         if (needInit)
         {
             var respType = GameInspector.FindTypeSafe(
-                "BazaarGameShared.TempoNet.Responses.RunRewardLevelResponse",
                 "BazaarGameShared.TempoNet.Models.RunRewardLevelResponse");
             var curType = GameInspector.FindTypeSafe("BazaarGameShared.TempoNet.Models.CurrencyValue");
             var updateM = tr.GetType().GetMethod("Update", BindingFlags.Public | BindingFlags.Instance);
@@ -1745,7 +1744,7 @@ internal static partial class CompatAuditPatch
                 }
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L1747", diagEx); }
         return (day, hour, maxHealth);
     }
 
@@ -1783,7 +1782,7 @@ internal static partial class CompatAuditPatch
             var cur = _dataSimPvpOpponentProp?.GetValue(null);
             __state = BuildPvpSnapshot(cur);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L1785", diagEx); }
     }
 
     private static void ApplySimPvpOpponentPostfix(PvpOpponentSnapshot __state)
@@ -1918,7 +1917,7 @@ internal static partial class CompatAuditPatch
                 return h;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L1920", diagEx); }
         return 6;
     }
 
@@ -1942,7 +1941,7 @@ internal static partial class CompatAuditPatch
             if (_newDayIsActiveProp?.GetValue(ctrl) is bool active && active) return true;
             if (_newDayHasPendingProp?.GetValue(ctrl) is bool pending && pending) return true;
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L1944", diagEx); }
         return false;
     }
 
@@ -2033,7 +2032,7 @@ internal static partial class CompatAuditPatch
                 BazaarLauncher.Core.MainThreadDispatcher.Enqueue(() => RunHour6ChoiceRevealWatchdogOnMain(seq));
             }, TaskScheduler.Default);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.GameSim:L2035", diagEx); }
     }
 
     private static void RunHour6ChoiceRevealWatchdogOnMain(int expectedSeq)

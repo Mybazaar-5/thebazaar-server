@@ -11,6 +11,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using BazaarGameShared.Domain.Core.Types;
+using BazaarLauncher.Core;
 using BepInEx;
 using HarmonyLib;
 using Newtonsoft.Json;
@@ -531,11 +532,11 @@ internal sealed class GameDriver : MonoBehaviour
 
                 string target = (string)req["target"] ?? "normal";
                 JObject rulesObj = req["rules"] as JObject ?? req;
-                CustomGameplayUI.CustomRunRuleSet parsed;
+                CustomRunRuleSet parsed;
                 try
                 {
-                    parsed = rulesObj.ToObject<CustomGameplayUI.CustomRunRuleSet>()
-                             ?? new CustomGameplayUI.CustomRunRuleSet();
+                    parsed = rulesObj.ToObject<CustomRunRuleSet>()
+                             ?? new CustomRunRuleSet();
                     parsed.EnsureCollections();
                     parsed.RefreshPowerFlag();
                 }
@@ -1136,9 +1137,8 @@ internal sealed class GameDriver : MonoBehaviour
 
         if (hide || string.IsNullOrWhiteSpace(targetId))
         {
-            var hideM = tipParent.GetType().GetMethod("HideCardTooltipController", BindingFlags.Public | BindingFlags.Instance)
-                     ?? tipParent.GetType().GetMethod("HideAllTooltips", BindingFlags.Public | BindingFlags.Instance);
-            try { hideM?.Invoke(tipParent, null); } catch { }
+            var hideM = tipParent.GetType().GetMethod("HideCardTooltipController", BindingFlags.Public | BindingFlags.Instance);
+            try { hideM?.Invoke(tipParent, null); } catch (Exception ex) { Core.DiagLog.SwallowOnce("GameDriver.HideTooltip", ex); }
             return new { ok = true, op = "hovercard", hidden = true };
         }
 
@@ -1493,14 +1493,8 @@ internal sealed class GameDriver : MonoBehaviour
             var itemCtrlType = GameInspector.FindTypeSafe("TheBazaar.ItemController", "ItemController");
             if (itemCtrlType == null || !itemCtrlType.IsInstanceOfType(ctrl)) return;
 
-            var eventsType = GameInspector.FindTypeSafe("TheBazaar.Events");
-            if (eventsType == null) return;
-
-            var reqMet = eventsType.GetField("PedestalRequirementMet", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-            reqMet?.GetType().GetMethod("Trigger", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null)?.Invoke(reqMet, null);
-
-            var itemDropped = eventsType.GetField("ItemDroppedOnPedestal", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-            itemDropped?.GetType().GetMethod("Trigger", BindingFlags.Public | BindingFlags.Instance, null, new[] { itemCtrlType }, null)?.Invoke(itemDropped, new[] { ctrl });
+            GameEventsBridge.TryTrigger("PedestalRequirementMet");
+            GameEventsBridge.TryTrigger("ItemDroppedOnPedestal", ctrl);
         }
         catch { }
     }
@@ -2026,9 +2020,7 @@ internal sealed class GameDriver : MonoBehaviour
                     runCfg.GetType().GetMethod("SetTournamentSessionId", BindingFlags.Public | BindingFlags.Instance)?.Invoke(runCfg, new object[] { null });
                     runCfg.GetType().GetMethod("ClearPersistedInitializedRunState", BindingFlags.NonPublic | BindingFlags.Static)?.Invoke(null, null);
                 }
-                var eventsType = AccessTools.TypeByName("TheBazaar.Events");
-                var runCfgUpdated = eventsType?.GetField("RunConfigurationUpdated", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-                runCfgUpdated?.GetType().GetMethod("Trigger", BindingFlags.Public | BindingFlags.Instance)?.Invoke(runCfgUpdated, new[] { runCfg });
+                GameEventsBridge.TryTrigger("RunConfigurationUpdated", runCfg);
             }
             catch { }
             CompatAuditPatch.RefreshActiveMainMenuUiFromData();
@@ -2061,9 +2053,7 @@ internal sealed class GameDriver : MonoBehaviour
             {
                 runCfg.GetType().GetMethod("SetTournamentSessionId", BindingFlags.Public | BindingFlags.Instance)?.Invoke(runCfg, new object[] { null });
                 runCfg.GetType().GetMethod("ClearPersistedInitializedRunState", BindingFlags.NonPublic | BindingFlags.Static)?.Invoke(null, null);
-                var eventsType = AccessTools.TypeByName("TheBazaar.Events");
-                var runCfgUpdated = eventsType?.GetField("RunConfigurationUpdated", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-                runCfgUpdated?.GetType().GetMethod("Trigger", BindingFlags.Public | BindingFlags.Instance)?.Invoke(runCfgUpdated, new[] { runCfg });
+                GameEventsBridge.TryTrigger("RunConfigurationUpdated", runCfg);
             }
             catch { }
             CompatAuditPatch.RefreshActiveMainMenuUiFromData();
@@ -3031,13 +3021,7 @@ internal sealed class GameDriver : MonoBehaviour
 
         try
         {
-            var eventsType = AccessTools.TypeByName("TheBazaar.Events");
-            var heroChanged = eventsType?.GetField("HeroChanged", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-            if (heroChanged != null)
-            {
-                AccessTools.Method(heroChanged.GetType(), "Trigger", new[] { typeof(EHero) })
-                    ?.Invoke(heroChanged, new object[] { hero });
-            }
+            GameEventsBridge.TryTrigger("HeroChanged", hero);
         }
         catch { }
 
@@ -3245,21 +3229,10 @@ internal sealed class GameDriver : MonoBehaviour
                         var cm = ResolveGameService("TheBazaar.CollectionManager");
                         var onUpd = cm?.GetType().GetField("OnLoadoutUpdated", BindingFlags.Public | BindingFlags.Instance)?.GetValue(cm) as Action;
                         onUpd?.Invoke();
-                        var eventsType = AccessTools.TypeByName("TheBazaar.Events");
-                        var skinEv = eventsType?.GetField("HeroSkinChanged", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-                        if (skinEv != null)
-                        {
-                            AccessTools.Method(skinEv.GetType(), "Trigger", new[] { typeof(object) })
-                                ?.Invoke(skinEv, new object[] { null });
-                        }
+                        GameEventsBridge.TryTrigger("HeroSkinChanged", new object[] { null });
                         if (Enum.TryParse<EHero>(heroId, true, out var parsedHero))
                         {
-                            var loadEv = eventsType?.GetField("HeroLoadoutChanged", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-                            if (loadEv != null)
-                            {
-                                AccessTools.Method(loadEv.GetType(), "Trigger", new[] { typeof(EHero) })
-                                    ?.Invoke(loadEv, new object[] { parsedHero });
-                            }
+                            GameEventsBridge.TryTrigger("HeroLoadoutChanged", parsedHero);
                         }
                     }
                     catch { }
@@ -3276,36 +3249,45 @@ internal sealed class GameDriver : MonoBehaviour
 
     private static byte[] CaptureScreenshot(double scale)
     {
+        Texture2D tex = null;
+        Texture2D outTex = null;
+        RenderTexture rt = null;
+        RenderTexture prev = null;
+        bool rtBound = false;
         try
         {
-            var tex = ScreenCapture.CaptureScreenshotAsTexture();
+            tex = ScreenCapture.CaptureScreenshotAsTexture();
             if (tex == null) return null;
 
-            Texture2D outTex = tex;
+            outTex = tex;
             if (scale < 0.999)
             {
                 int w = Math.Max(1, (int)(tex.width * scale));
                 int h = Math.Max(1, (int)(tex.height * scale));
-                var rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32);
+                rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32);
                 Graphics.Blit(tex, rt);
-                var prev = RenderTexture.active;
+                prev = RenderTexture.active;
                 RenderTexture.active = rt;
+                rtBound = true;
                 outTex = new Texture2D(w, h, TextureFormat.RGBA32, false);
                 outTex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
                 outTex.Apply();
-                RenderTexture.active = prev;
-                RenderTexture.ReleaseTemporary(rt);
             }
 
-            byte[] png = outTex.EncodeToPNG();
-            UnityEngine.Object.Destroy(tex);
-            if (outTex != tex) UnityEngine.Object.Destroy(outTex);
-            return png;
+            return outTex.EncodeToPNG();
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogError("screenshot: " + ex);
             return null;
+        }
+        finally
+        {
+            // D4-P2-6：无论是否抛异常均严格恢复 RenderTexture.active 并释放临时 RT 与 Texture2D，杜绝 GPU VRAM 泄漏
+            if (rtBound) RenderTexture.active = prev;
+            if (rt != null) RenderTexture.ReleaseTemporary(rt);
+            if (outTex != null && outTex != tex) UnityEngine.Object.Destroy(outTex);
+            if (tex != null) UnityEngine.Object.Destroy(tex);
         }
     }
 

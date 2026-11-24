@@ -23,7 +23,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class AuditWave2ProtocolTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static RuleNode ParseNode(string json)
         => JsonSerializer.Deserialize<RuleNode>(json, GameDatabaseLoader.JsonOptions)!;

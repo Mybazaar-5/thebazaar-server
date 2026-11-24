@@ -116,12 +116,15 @@ internal static partial class CompatAuditPatch
                 _pedestalHintsPatchedCount++;
             }
 
-            var onExit = AccessTools.Method(pedType, "OnExit", Type.EmptyTypes);
+            // D4-P2-3：PedestalState 若未声明重写 OnExit，显式瞄准其基类 TheBazaar.AppState.OnExit，消除基类方法隐式漂移
+            var appStateType = GameInspector.FindTypeSafe("TheBazaar.AppState");
+            var onExit = pedType.GetMethod("OnExit", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly, null, Type.EmptyTypes, null)
+                ?? (appStateType != null ? AccessTools.Method(appStateType, "OnExit", Type.EmptyTypes) : AccessTools.Method(pedType, "OnExit", Type.EmptyTypes));
             if (onExit != null && patcher.TryPatchMethod(
                 onExit,
                 prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(PedestalOnExitPrefix)),
                 optional: true,
-                label: "PedestalState.OnExit"))
+                label: onExit.DeclaringType == pedType ? "PedestalState.OnExit" : "AppState.OnExit(PedestalGuard)"))
             {
                 _pedestalHintsPatchedCount++;
             }
@@ -377,8 +380,8 @@ internal static partial class CompatAuditPatch
             // P2-32：缓存 Data.CurrentEncounterId（属性）并补丁 AppState.SetState(ERunState)，在 PedestalState.cs:66 清空后写回链式下一跳 ID
             var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
             _dataCurrentEncounterIdProp ??= dataType?.GetProperty("CurrentEncounterId", BindingFlags.Public | BindingFlags.Static);
-            var appStateType = GameInspector.FindTypeSafe("TheBazaar.AppState");
-            var setStateByRunState = appStateType == null ? null : AccessTools.Method(appStateType, "SetState", new[] { typeof(ERunState) });
+            var chainedAppStateType = GameInspector.FindTypeSafe("TheBazaar.AppState");
+            var setStateByRunState = chainedAppStateType == null ? null : AccessTools.Method(chainedAppStateType, "SetState", new[] { typeof(ERunState) });
             if (setStateByRunState != null && patcher.TryPatchMethod(
                 setStateByRunState,
                 prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(AppStateSetStateChainedPedestalPrefix)),

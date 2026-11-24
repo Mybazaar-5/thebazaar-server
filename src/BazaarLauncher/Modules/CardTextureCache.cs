@@ -3,12 +3,331 @@ using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using BazaarLauncher.Core;
 using UnityEngine;
 using UnityEngine.Rendering;
 
 namespace BazaarLauncher.Modules;
+
+/// <summary>
+/// D3-P2-06：零 Unity 依赖的并发同键读盘合并器（In-Flight Coalescer）：
+/// - 多个并发请求命中相同纹理键时，仅首个请求成为唯一读盘加载者（TryBeginOrJoin 返回 true），其余请求挂接等待队列；
+/// - Complete 时统一向全部等待者分别签发独立租约（调用 leaseFactory），彻底消除启动期重复磁盘 I/O 与解码风暴。
+/// </summary>
+public sealed class TextureInFlightCoalescer<TLease>
+{
+    private readonly object _sync = new();
+    private readonly Dictionary<string, List<Action<TLease>>> _waiters = new(StringComparer.OrdinalIgnoreCase);
+
+    public bool TryBeginOrJoin(string key, Action<TLease> callback)
+    {
+        if (string.IsNullOrEmpty(key) || callback == null)
+            return false;
+
+        lock (_sync)
+        {
+            if (_waiters.TryGetValue(key, out var list))
+            {
+                list.Add(callback);
+                return false;
+            }
+            _waiters[key] = new List<Action<TLease>>(2) { callback };
+            return true;
+        }
+    }
+
+    public void Complete(string key, Func<TLease> leaseFactory)
+    {
+        if (string.IsNullOrEmpty(key)) return;
+        List<Action<TLease>> callbacks;
+        lock (_sync)
+        {
+            if (!_waiters.TryGetValue(key, out callbacks))
+                return;
+            _waiters.Remove(key);
+        }
+
+        for (int i = 0; i < callbacks.Count; i++)
+        {
+            TLease lease = leaseFactory != null ? leaseFactory() : default;
+            try
+            {
+                callbacks[i]?.Invoke(lease);
+            }
+            catch
+            {
+                if (lease is IDisposable disp)
+                    try { disp.Dispose(); } catch { }
+            }
+        }
+    }
+
+    public void Clear()
+    {
+        lock (_sync) _waiters.Clear();
+    }
+}
+
+/// <summary>
+/// 顶层零 Unity 依赖的纹理引用计数缓存条目（可供纯 .NET 8 单元测试直接加载验证）。
+/// </summary>
+internal sealed class TextureRefEntry<TAsset>
+{
+    public string CacheKey { get; }
+    public TAsset Asset { get; }
+    public long EstimatedBytes { get; }
+    public int RefCount;
+    public long LastAccessTick;
+    public bool Evicted;
+
+    public TextureRefEntry(string cacheKey, TAsset asset, long estimatedBytes, int initialRefCount, long lastAccessTick)
+    {
+        CacheKey = cacheKey;
+        Asset = asset;
+        EstimatedBytes = estimatedBytes;
+        RefCount = initialRefCount;
+        LastAccessTick = lastAccessTick;
+    }
+}
+
+/// <summary>
+/// RAII 纹理租约句柄（P0-35 根治核心）：
+/// 1. Interlocked.Exchange 保证 Dispose() 100% 单次幂等释放，绝不重复递减 RefCount；
+/// 2. 正常 Dispose 立即 SuppressFinalize，零 GC Finalizer 开销；
+/// 3. 异常遗忘释放时由 ~TextureLease 兜底仅在纯 C# 锁内递减 RefCount，绝不触碰任何 Unity 主线程 API。
+/// </summary>
+internal sealed class TextureLease<TAsset> : IDisposable
+{
+    private readonly TextureRefPool<TAsset> _pool;
+    internal readonly TextureRefEntry<TAsset> Entry;
+    private int _released;
+
+    internal TextureLease(TextureRefPool<TAsset> pool, TextureRefEntry<TAsset> entry)
+    {
+        _pool = pool;
+        Entry = entry;
+    }
+
+    public bool IsActive => Volatile.Read(ref _released) == 0;
+    public TAsset Asset => IsActive ? Entry.Asset : default;
+    public string CacheKey => Entry.CacheKey;
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _released, 1) == 0)
+        {
+            GC.SuppressFinalize(this);
+            _pool.ReleaseEntry(Entry, fromFinalizer: false);
+        }
+    }
+
+    ~TextureLease()
+    {
+        if (Interlocked.Exchange(ref _released, 1) == 0)
+        {
+            _pool.ReleaseEntry(Entry, fromFinalizer: true);
+        }
+    }
+}
+
+/// <summary>
+/// 视图代理纹理租约槽位（单所有权语义）：
+/// 同一底层缓存条目再次 Acquire 传入新租约时立即 Dispose 多余租约，彻底根除重绑早退锁死 VRAM 的漏洞。
+/// </summary>
+internal sealed class TextureLeaseSlot<TAsset> : IDisposable
+{
+    private TextureLease<TAsset> _current;
+
+    public bool HasLease => _current != null && _current.IsActive;
+
+    public void Take(ref TextureLease<TAsset> incoming)
+    {
+        var next = incoming;
+        incoming = null;
+
+        if (next == null)
+        {
+            Clear();
+            return;
+        }
+
+        if (ReferenceEquals(_current, next))
+        {
+            return;
+        }
+
+        if (_current != null && ReferenceEquals(_current.Entry, next.Entry))
+        {
+            // P0-35 根治点：同一底层缓存条目重新获取了新租约，立即归还多余的 1 次 RefCount
+            next.Dispose();
+            return;
+        }
+
+        var prev = _current;
+        _current = next;
+        prev?.Dispose();
+    }
+
+    public void Clear()
+    {
+        var prev = _current;
+        _current = null;
+        prev?.Dispose();
+    }
+
+    public void Dispose() => Clear();
+}
+
+/// <summary>
+/// 顶层零 Unity 依赖的线程安全引用计数 + LRU 淘汰 + 单调世代隔离池：
+/// - _sync 严格作为绝对叶子锁，锁内绝不执行外部回调、队列投递或资产销毁；
+/// - DrainAll 递增 _generation，彻底拦截后台解码完成于卸载之后的跨世代 VRAM 泄漏。
+/// </summary>
+internal sealed class TextureRefPool<TAsset>
+{
+    private readonly object _sync = new();
+    private readonly Dictionary<string, TextureRefEntry<TAsset>> _entries = new(StringComparer.OrdinalIgnoreCase);
+    private long _totalEstimatedBytes;
+    private long _accessClock;
+    private long _generation;
+    private long _finalizerLeakCount;
+
+    public long Generation
+    {
+        get { lock (_sync) return _generation; }
+    }
+
+    public int Count
+    {
+        get { lock (_sync) return _entries.Count; }
+    }
+
+    public long TotalEstimatedBytes
+    {
+        get { lock (_sync) return _totalEstimatedBytes; }
+    }
+
+    public long FinalizerLeakCount
+    {
+        get { lock (_sync) return _finalizerLeakCount; }
+    }
+
+    public int GetRefCount(string key)
+    {
+        if (string.IsNullOrEmpty(key)) return 0;
+        lock (_sync)
+        {
+            return _entries.TryGetValue(key, out var e) ? e.RefCount : 0;
+        }
+    }
+
+    public bool TryAcquireExisting(string key, out TextureLease<TAsset> lease, out long capturedGeneration)
+    {
+        lock (_sync)
+        {
+            capturedGeneration = _generation;
+            if (!string.IsNullOrEmpty(key) && _entries.TryGetValue(key, out var existing) && existing.Asset != null)
+            {
+                existing.RefCount++;
+                existing.LastAccessTick = ++_accessClock;
+                lease = new TextureLease<TAsset>(this, existing);
+                return true;
+            }
+        }
+
+        lease = null;
+        return false;
+    }
+
+    public void RegisterOrAcquire(
+        long expectedGeneration,
+        string key,
+        TAsset candidateAsset,
+        long estimatedBytes,
+        out TextureLease<TAsset> lease,
+        out TAsset redundantAssetToDestroy)
+    {
+        redundantAssetToDestroy = default;
+        lock (_sync)
+        {
+            if (expectedGeneration != _generation)
+            {
+                // 后台读盘/解码期间已发生 DrainAll 卸载：严禁入池，原样交回调用方在锁外销毁
+                lease = null;
+                redundantAssetToDestroy = candidateAsset;
+                return;
+            }
+
+            if (_entries.TryGetValue(key, out var existing) && existing.Asset != null)
+            {
+                // 并发竞态命中：复用已有条目递增引用计数，冗余解码产物交回锁外销毁
+                existing.RefCount++;
+                existing.LastAccessTick = ++_accessClock;
+                lease = new TextureLease<TAsset>(this, existing);
+                redundantAssetToDestroy = candidateAsset;
+                return;
+            }
+
+            var entry = new TextureRefEntry<TAsset>(key, candidateAsset, Math.Max(0L, estimatedBytes), initialRefCount: 1, ++_accessClock);
+            _entries[key] = entry;
+            _totalEstimatedBytes += entry.EstimatedBytes;
+            lease = new TextureLease<TAsset>(this, entry);
+        }
+    }
+
+    internal void ReleaseEntry(TextureRefEntry<TAsset> entry, bool fromFinalizer)
+    {
+        if (entry == null) return;
+        lock (_sync)
+        {
+            // 对 EvictLru / DrainAll 后的残留旧租约仅安全递减其自身 RefCount，严禁下溢且绝不触碰 _entries
+            if (entry.RefCount > 0) entry.RefCount--;
+            if (fromFinalizer) _finalizerLeakCount++;
+        }
+    }
+
+    public void EvictLru(long targetBudgetBytes, List<TAsset> evictedAssetsOut)
+    {
+        lock (_sync)
+        {
+            if (_totalEstimatedBytes <= targetBudgetBytes) return;
+
+            var candidates = new List<TextureRefEntry<TAsset>>();
+            foreach (var e in _entries.Values)
+            {
+                if (e.RefCount <= 0) candidates.Add(e);
+            }
+            if (candidates.Count == 0) return;
+
+            candidates.Sort((a, b) => a.LastAccessTick.CompareTo(b.LastAccessTick));
+            foreach (var c in candidates)
+            {
+                if (_totalEstimatedBytes <= targetBudgetBytes) break;
+                _entries.Remove(c.CacheKey);
+                c.Evicted = true;
+                _totalEstimatedBytes = Math.Max(0L, _totalEstimatedBytes - c.EstimatedBytes);
+                evictedAssetsOut?.Add(c.Asset);
+            }
+        }
+    }
+
+    public void DrainAll(List<TAsset> allAssetsOut)
+    {
+        lock (_sync)
+        {
+            _generation++;
+            foreach (var e in _entries.Values)
+            {
+                e.Evicted = true;
+                allAssetsOut?.Add(e.Asset);
+            }
+            _entries.Clear();
+            _totalEstimatedBytes = 0;
+        }
+    }
+}
 
 /// <summary>
 /// 中心化自定义 PNG 卡图解码、URP Shader 注入与显存 LRU 缓存管理器。
@@ -18,7 +337,7 @@ namespace BazaarLauncher.Modules;
 ///   铁律三：长边 > 1024px 时在 GPU RenderTexture(sRGB) 双线性缩放 + Clamp/Trilinear/Aniso4 + Apply(true, makeNoLongerReadable:true)；
 ///   铁律四：与 CardVisualOverrideAgent 配合维护 Epoch 版本号防对象池异步竞态；
 ///   铁律五：仅写实例化材质，严禁污染 AssetLoader 共享材质；
-///   铁律六：按 SHA-256（或路径+时间戳）去重 + RefCount 引用计数 + LRU 显存上限（默认 128MB），仅驱逐 RefCount==0 纹理并销毁派生 Sprite。
+///   铁律六：基于 RAII TextureLease + TextureRefPool + 单调世代隔离与 LRU 显存上限（默认 128MB），锁外销毁并彻底杜绝 VRAM 泄漏。
 /// </summary>
 internal sealed class CardTextureCache
 {
@@ -32,8 +351,6 @@ internal sealed class CardTextureCache
         public Texture2D Texture;
         public Sprite DerivedSprite;
         public long EstimatedVramBytes;
-        public int RefCount;
-        public long LastAccessTick;
     }
 
     internal sealed class ShaderSlotProfile
@@ -51,22 +368,18 @@ internal sealed class CardTextureCache
 
     internal static CardTextureCache Instance { get; } = new();
 
-    private readonly object _sync = new();
-    private readonly Dictionary<string, CacheEntry> _entries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly TextureRefPool<CacheEntry> _pool = new();
+    private readonly object _shaderSync = new();
     private readonly Dictionary<int, ShaderSlotProfile> _shaderProfiles = new();
-    private long _totalEstimatedVramBytes;
-    private long _accessClock;
     private Texture2D _transparent1x1;
     private Shader _cachedSafeUnlitShader;
+    private readonly TextureInFlightCoalescer<TextureLease<CacheEntry>> _inFlight = new();
 
     internal long VramBudgetBytes { get; set; } = DefaultVramBudgetBytes;
 
     internal CacheStats GetStats()
     {
-        lock (_sync)
-        {
-            return new CacheStats(_entries.Count, _totalEstimatedVramBytes);
-        }
+        return new CacheStats(_pool.Count, _pool.TotalEstimatedBytes);
     }
 
     internal Texture2D GetTransparent1x1()
@@ -87,9 +400,10 @@ internal sealed class CardTextureCache
     }
 
     /// <summary>
-    /// 异步读盘校验魔数 -> 主线程 sRGB 安全解码并增加引用计数。失败时返回 null（上层自动回退原版底座，0 白块 0 红问号）。
+    /// 异步读盘校验魔数 -> 主线程 sRGB 安全解码并签发 RAII TextureLease。
+    /// 调用方须通过 TextureLeaseSlot.Take(ref lease) 接管所有权，或在 finally 中 lease?.Dispose() 归还计数。
     /// </summary>
-    internal void AcquireTextureAsync(string localPath, string sha256Hint, Action<CacheEntry> onReadyOnMain)
+    internal void AcquireTextureAsync(string localPath, string sha256Hint, Action<TextureLease<CacheEntry>> onReadyOnMain)
     {
         if (string.IsNullOrWhiteSpace(localPath) || onReadyOnMain == null)
         {
@@ -97,35 +411,99 @@ internal sealed class CardTextureCache
         }
 
         string key = BuildCacheKey(localPath, sha256Hint);
-        lock (_sync)
+        if (_pool.TryAcquireExisting(key, out var hitLease, out long capturedGen))
         {
-            if (_entries.TryGetValue(key, out var existing) && existing.Texture != null)
+            // 在 _pool 叶子锁之外投递主线程，彻底消除跨锁嵌套
+            MainThreadDispatcher.Enqueue(() =>
             {
-                existing.RefCount++;
-                existing.LastAccessTick = ++_accessClock;
-                MainThreadDispatcher.Enqueue(() => onReadyOnMain(existing));
-                return;
-            }
+                if (_pool.Generation != capturedGen || hitLease.Asset == null || hitLease.Asset.Texture == null)
+                {
+                    hitLease.Dispose();
+                    onReadyOnMain(null);
+                    return;
+                }
+                InvokeLeaseCallbackSafely(hitLease, onReadyOnMain);
+            });
+            return;
         }
+
+        // D3-P2-06：同键并发读盘合并，避免多卡共享同贴图时同时触发多次重复文件读取与解码
+        if (!_inFlight.TryBeginOrJoin(key, onReadyOnMain))
+            return;
 
         _ = Task.Run(() =>
         {
-            byte[] bytes = TryReadAndValidateImageBytes(localPath);
+            byte[] bytes = null;
+            try
+            {
+                bytes = TryReadAndValidateImageBytes(localPath);
+            }
+            catch (Exception ex)
+            {
+                DiagLog.SwallowOnce("CardTextureCache.ReadBytes", ex);
+            }
+
             if (bytes == null)
             {
-                MainThreadDispatcher.Enqueue(() => onReadyOnMain(null));
+                MainThreadDispatcher.Enqueue(() => _inFlight.Complete(key, static () => null));
                 return;
             }
 
             MainThreadDispatcher.Enqueue(() =>
             {
-                var entry = DecodeAndRegisterOnMain(key, bytes);
-                onReadyOnMain(entry);
+                TextureLease<CacheEntry> firstLease = null;
+                bool usedFirst = false;
+                try
+                {
+                    firstLease = DecodeAndRegisterOnMain(capturedGen, key, bytes);
+                    _inFlight.Complete(key, () =>
+                    {
+                        if (!usedFirst)
+                        {
+                            usedFirst = true;
+                            return firstLease;
+                        }
+                        if (firstLease == null) return null;
+                        return _pool.TryAcquireExisting(key, out var extraLease, out long gen) && gen == capturedGen
+                            ? extraLease
+                            : null;
+                    });
+                }
+                catch (Exception ex)
+                {
+                    DiagLog.SwallowOnce("CardTextureCache.DecodeOnMain", ex);
+                    _inFlight.Complete(key, static () => null);
+                }
+                finally
+                {
+                    if (!usedFirst && firstLease != null)
+                        firstLease.Dispose();
+                }
             });
         });
     }
 
-    /// <summary>获取或按需派生对应缓存项的 2D Sprite（供 EncounterController / CardPreviewEncounter 使用）。</summary>
+    private static void InvokeLeaseCallbackSafely(TextureLease<CacheEntry> lease, Action<TextureLease<CacheEntry>> callback)
+    {
+        try
+        {
+            callback(lease);
+        }
+        catch
+        {
+            lease?.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>获取或按需派生对应租约缓存项的 2D Sprite（供 EncounterController / CardPreviewEncounter 使用）。</summary>
+    internal Sprite GetOrCreateSpriteOnMain(TextureLease<CacheEntry> lease)
+    {
+        if (lease == null || !lease.IsActive) return null;
+        return GetOrCreateSpriteOnMain(lease.Asset);
+    }
+
+    /// <summary>获取或按需派生对应缓存项的 2D Sprite。</summary>
     internal Sprite GetOrCreateSpriteOnMain(CacheEntry entry)
     {
         if (entry == null || entry.Texture == null) return null;
@@ -139,22 +517,14 @@ internal sealed class CardTextureCache
                 new Rect(0f, 0f, tex.width, tex.height),
                 new Vector2(0.5f, 0.5f),
                 100f);
+            // D3-P1-09：防止切场景 Resources.UnloadUnusedAssets 意外回收派生 Sprite 导致奇遇/2D预览白块
+            entry.DerivedSprite.hideFlags = HideFlags.HideAndDontSave;
             entry.DerivedSprite.name = "ModCardSprite_" + entry.CacheKey.Substring(0, Math.Min(8, entry.CacheKey.Length));
             return entry.DerivedSprite;
         }
         catch
         {
             return null;
-        }
-    }
-
-    /// <summary>递减纹理引用计数（视图销毁或对象池换卡时调用）。</summary>
-    internal void Release(CacheEntry entry)
-    {
-        if (entry == null) return;
-        lock (_sync)
-        {
-            if (entry.RefCount > 0) entry.RefCount--;
         }
     }
 
@@ -170,16 +540,12 @@ internal sealed class CardTextureCache
         MainThreadDispatcher.Enqueue(() => EvictLruOnMain(0));
     }
 
-    /// <summary>销毁全部纹理资源（插件卸载时调用）。</summary>
+    /// <summary>销毁全部纹理资源并递增世代号拦截在途解码（插件卸载时调用）。</summary>
     internal void DisposeAllOnMain()
     {
-        List<CacheEntry> all;
-        lock (_sync)
-        {
-            all = new List<CacheEntry>(_entries.Values);
-            _entries.Clear();
-            _totalEstimatedVramBytes = 0;
-        }
+        _inFlight.Clear();
+        var all = new List<CacheEntry>();
+        _pool.DrainAll(all);
 
         foreach (var e in all)
         {
@@ -309,7 +675,6 @@ internal sealed class CardTextureCache
             return true;
         }
 
-        // 兜底降级：仅当 Shader 没有任何合规 2D 主画槽位时才回退到安全 URP Unlit Shader（严禁使用 Standard 变洋红粉块）
         Shader safeShader = ResolveSafeUrpShader();
         if (safeShader != null)
         {
@@ -325,7 +690,7 @@ internal sealed class CardTextureCache
     private ShaderSlotProfile GetOrBuildShaderProfile(Shader shader)
     {
         int id = shader.GetInstanceID();
-        lock (_sync)
+        lock (_shaderSync)
         {
             if (_shaderProfiles.TryGetValue(id, out var cached)) return cached;
         }
@@ -349,7 +714,6 @@ internal sealed class CardTextureCache
             int score = ScorePrimaryArtSlot(propName);
             if (score > bestPrimaryScore)
             {
-                // 修正：判断被替换下来的旧 bestPrimaryName 是否为视差层，防止前景槽位排在主贴图之前时漏清零
                 if (bestPrimaryId >= 0 && !string.IsNullOrEmpty(bestPrimaryName) && IsParallaxLayerSlot(bestPrimaryName))
                 {
                     secondaryList.Add(bestPrimaryId);
@@ -367,7 +731,7 @@ internal sealed class CardTextureCache
         profile.PrimaryTexturePropId = bestPrimaryId;
         profile.SecondaryParallaxPropIds = secondaryList.ToArray();
 
-        lock (_sync)
+        lock (_shaderSync)
         {
             _shaderProfiles[id] = profile;
         }
@@ -436,7 +800,14 @@ internal sealed class CardTextureCache
             byte[] bytes = File.ReadAllBytes(localPath);
             if (!IsSupportedImageMagic(bytes))
             {
-                BazaarLauncherPlugin.Log?.LogWarning($"[CardTextureCache] 跳过非合法 PNG/JPEG 文件: {localPath}");
+                if (IsWebpMagic(bytes))
+                {
+                    BazaarLauncherPlugin.Log?.LogWarning($"[CardTextureCache] 跳过不支持的 WebP 资产（Unity 运行期不支持 WebP 解码，请将 Mod 资产转换为 PNG 或 JPEG）：{localPath}");
+                }
+                else
+                {
+                    BazaarLauncherPlugin.Log?.LogWarning($"[CardTextureCache] 跳过非合法 PNG/JPEG 文件: {localPath}");
+                }
                 return null;
             }
             return bytes;
@@ -447,28 +818,39 @@ internal sealed class CardTextureCache
         }
     }
 
-    private static bool IsSupportedImageMagic(byte[] b)
+    internal static bool IsSupportedImageMagic(byte[] b)
     {
         if (b == null || b.Length < 12) return false;
-        // PNG: 89 50 4E 47 0D 0A 1A 0A
         bool isPng = b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47
                   && b[4] == 0x0D && b[5] == 0x0A && b[6] == 0x1A && b[7] == 0x0A;
         if (isPng) return true;
-        // JPEG: FF D8 FF
         bool isJpeg = b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF;
         return isJpeg;
     }
 
-    private CacheEntry DecodeAndRegisterOnMain(string key, byte[] bytes)
+    /// <summary>P0-28 方案 A：识别 RIFF....WEBP 魔数以输出清晰告警，优雅回落原版图不生白块。</summary>
+    internal static bool IsWebpMagic(byte[] b)
     {
-        lock (_sync)
+        if (b == null || b.Length < 12) return false;
+        return b[0] == (byte)'R' && b[1] == (byte)'I' && b[2] == (byte)'F' && b[3] == (byte)'F'
+            && b[8] == (byte)'W' && b[9] == (byte)'E' && b[10] == (byte)'B' && b[11] == (byte)'P';
+    }
+
+    private TextureLease<CacheEntry> DecodeAndRegisterOnMain(long expectedGeneration, string key, byte[] bytes)
+    {
+        if (_pool.Generation != expectedGeneration)
         {
-            if (_entries.TryGetValue(key, out var raceHit) && raceHit.Texture != null)
+            return null;
+        }
+
+        if (_pool.TryAcquireExisting(key, out var raceHitLease, out long currentGen))
+        {
+            if (currentGen == expectedGeneration && raceHitLease.Asset != null && raceHitLease.Asset.Texture != null)
             {
-                raceHit.RefCount++;
-                raceHit.LastAccessTick = ++_accessClock;
-                return raceHit;
+                return raceHitLease;
             }
+            raceHitLease.Dispose();
+            return null;
         }
 
         // 铁律二：强制 sRGB (linear: false) 防止 URP Linear 管线过曝发白
@@ -483,12 +865,10 @@ internal sealed class CardTextureCache
             bool loaded = ImageConversion.LoadImage(tex, bytes, markNonReadable: false);
             if (!loaded || tex.width <= 8 || tex.height <= 8)
             {
-                // 铁律二：LoadImage 失败时 Unity 会生成 8x8 红问号，必须立即销毁并回退原版底座
                 UnityEngine.Object.Destroy(tex);
                 return null;
             }
 
-            // 铁律三：长边 > 1024px 时在 GPU sRGB RenderTexture 缩放，防 4K 巨图撑爆显存
             if (tex.width > MaxTextureEdgePx || tex.height > MaxTextureEdgePx)
             {
                 Texture2D resized = DownscaleTextureOnGpuSrgb(tex, MaxTextureEdgePx);
@@ -500,31 +880,28 @@ internal sealed class CardTextureCache
             tex.wrapMode = TextureWrapMode.Clamp;
             tex.filterMode = FilterMode.Trilinear;
             tex.anisoLevel = 4;
-            // 铁律三：上传 GPU 并立即释放 CPU 端系统内存拷贝（立省 50% 内存）
             tex.Apply(updateMipmaps: true, makeNoLongerReadable: true);
 
             long estVram = (long)(tex.width * (long)tex.height * 4L * 1.33);
-            var entry = new CacheEntry
+            var candidate = new CacheEntry
             {
                 CacheKey = key,
                 Texture = tex,
                 EstimatedVramBytes = estVram,
-                RefCount = 1,
-                LastAccessTick = ++_accessClock,
             };
 
-            lock (_sync)
+            _pool.RegisterOrAcquire(expectedGeneration, key, candidate, estVram, out var lease, out var redundant);
+            if (redundant != null)
             {
-                _entries[key] = entry;
-                _totalEstimatedVramBytes += estVram;
+                DestroyEntryAssets(redundant);
             }
 
-            if (_totalEstimatedVramBytes > VramBudgetBytes)
+            if (lease != null && _pool.TotalEstimatedBytes > VramBudgetBytes)
             {
                 EvictLruOnMain(VramBudgetBytes);
             }
 
-            return entry;
+            return lease;
         }
         catch (Exception ex)
         {
@@ -563,36 +940,12 @@ internal sealed class CardTextureCache
 
     private void EvictLruOnMain(long targetBudgetBytes)
     {
-        List<CacheEntry> toDestroy = null;
-        lock (_sync)
+        var toDestroy = new List<CacheEntry>();
+        _pool.EvictLru(targetBudgetBytes, toDestroy);
+
+        foreach (var e in toDestroy)
         {
-            if (_totalEstimatedVramBytes <= targetBudgetBytes) return;
-
-            var candidates = new List<CacheEntry>();
-            foreach (var e in _entries.Values)
-            {
-                if (e.RefCount <= 0) candidates.Add(e);
-            }
-            if (candidates.Count == 0) return;
-
-            candidates.Sort((a, b) => a.LastAccessTick.CompareTo(b.LastAccessTick));
-            toDestroy = new List<CacheEntry>();
-
-            foreach (var c in candidates)
-            {
-                if (_totalEstimatedVramBytes <= targetBudgetBytes) break;
-                _entries.Remove(c.CacheKey);
-                _totalEstimatedVramBytes = Math.Max(0, _totalEstimatedVramBytes - c.EstimatedVramBytes);
-                toDestroy.Add(c);
-            }
-        }
-
-        if (toDestroy != null)
-        {
-            foreach (var e in toDestroy)
-            {
-                DestroyEntryAssets(e);
-            }
+            DestroyEntryAssets(e);
         }
     }
 

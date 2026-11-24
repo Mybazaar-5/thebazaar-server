@@ -28,6 +28,7 @@ namespace BazaarCore.Tests;
 ///   4. 事件出现权威门控与分布验证：Day 1 禁止金/钻与 Mountain Pass / B1&amp;B2、银商仅放行 Curio、Day 2–3 禁止金商/金事件、
 ///      Day 1 奇怪的蘑菇+丛林遗迹占比平滑（不再 70% 刷屏）、同小时/同日杜绝同名多阶重复事件。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V13_2_CombatSmoothDragLootEventTests
 {
     private const string KatanaId = "54f957f2-9522-486b-a7c6-bb234f74846c";
@@ -54,38 +55,17 @@ public sealed class V13_2_CombatSmoothDragLootEventTests
 
     private static readonly Lazy<RealDataFx> Fx = new(() =>
     {
-        string? resolvedDir = null;
-        string? probe = AppContext.BaseDirectory;
-        for (int i = 0; i < 10 && !string.IsNullOrEmpty(probe); i++, probe = Directory.GetParent(probe)?.FullName)
-        {
-            string candidate = Path.Combine(probe, "dist", "data");
-            string dbFile = Path.Combine(candidate, "GameData.db");
-            if (File.Exists(dbFile) && new FileInfo(dbFile).Length > 1024 * 1024)
-            {
-                resolvedDir = candidate;
-                break;
-            }
-        }
-        if (string.IsNullOrEmpty(resolvedDir))
-        {
-            string mainDist = @"e:\thebazaar\dist\data";
-            if (File.Exists(Path.Combine(mainDist, "GameData.db")))
-                resolvedDir = mainDist;
-        }
-        Assert.False(string.IsNullOrEmpty(resolvedDir), "未找到 dist/data/GameData.db");
-        string dbPath = Path.Combine(resolvedDir!, "GameData.db");
-        var repo = GameDatabaseLoader.Load(dbPath, null);
-        var pool = CardPool.FromRepository(repo, resolvedDir);
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new RealDataFx
         {
-            DataDir = resolvedDir!,
-            Pool = pool,
-            Monsters = MonsterPool.FromRepository(repo),
-            LevelUps = LevelUpTable.FromRepository(repo),
-            Mode = GameModeConfig.FromRepository(repo),
-            Repo = repo,
-            Ghosts = PvpGhostPool.Load(resolvedDir!),
-            ArchetypeIndex = CardArchetypeIndex.Build(pool, repo),
+            DataDir = shared.DataDir,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
+            ArchetypeIndex = shared.ArchetypeIndex,
         };
     });
 

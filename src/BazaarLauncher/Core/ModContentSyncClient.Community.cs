@@ -79,22 +79,44 @@ internal sealed partial class ModContentSyncClient
         }
     }
 
-    /// <summary>切换服务器后清空旧服内存绑定与 server_overlay 词典层并立即重新拉取新服清单。</summary>
-    internal void OnServerChanged()
+    /// <summary>切换服务器后先取消旧任务、按旧服 URL 删除旧磁盘缓存、递增同步代数，再以新服 URL 立即重新拉取清单（P0-29）。</summary>
+    internal void OnServerChanged(string oldServerBase = null)
     {
+        // 1. 先递增代数并取消旧在途同步任务，防止旧服异步回调反写污染新服
+        CancellationTokenSource oldCts;
+        lock (_sync)
+        {
+            Interlocked.Increment(ref _syncGeneration);
+            Interlocked.Increment(ref _roomBundleSyncEpoch);
+            oldCts = _serverSyncCts;
+            _serverSyncCts = null;
+        }
+        if (oldCts != null)
+        {
+            try { oldCts.Cancel(); } catch { }
+            try { oldCts.Dispose(); } catch { }
+        }
+
         ClearSyncedServerMods();
         try { LocalizationOverlayModule.Instance?.ClearServerOverlayLayer(); } catch { }
+
+        // 2. 精确按旧服务器 URL 删旧服 overlay 缓存（修复先改 URL 后误删新服缓存的 Bug）
         try
         {
-            // 删除旧服磁盘 overlay 缓存，避免新服无 /api/localization/overlay 时回退加载旧服残留词典
-            if (File.Exists(OverlayCachePath)) File.Delete(OverlayCachePath);
+            if (!string.IsNullOrWhiteSpace(oldServerBase))
+            {
+                string oldOverlayPath = GetOverlayCachePathForUrl(oldServerBase);
+                if (File.Exists(oldOverlayPath)) File.Delete(oldOverlayPath);
+            }
         }
         catch { }
+
         lock (_sync)
         {
             _communityMods = new List<CommunityModEntry>();
             _lastModSetHash = string.Empty;
             _lastOverlaySha256 = string.Empty;
+            _lastVisualBindingsRev = string.Empty;
             _lastSyncedRoomModKey = string.Empty;
         }
         TriggerFullSyncInBackground(forceDownload: false);
@@ -123,35 +145,44 @@ internal sealed partial class ModContentSyncClient
         catch { }
     }
 
-    /// <summary>卸载当前已注册的所有服务器/房间同步 Mod 视觉与文案覆盖并触发缓存刷新。</summary>
+    /// <summary>卸载当前已注册的所有服务器/房间/回放同步 Mod 视觉与文案覆盖并触发缓存刷新。</summary>
     internal void ClearSyncedServerMods()
     {
         lock (_sync)
         {
             DisposeHandlesLocked(_syncedVisualHandles);
             DisposeHandlesLocked(_syncedActiveBindingHandles);
+            DisposeHandlesLocked(_syncedReplayBindingHandles);
             DisposeHandlesLocked(_syncedRoomBundleVisualHandles);
             DisposeHandlesLocked(_syncedRoomBundleTextHandles);
             DisposeHandlesLocked(_syncedCardTextHandles);
             _serverMods = new List<ServerModEntry>();
             _customContents = new List<ServerCustomContentItem>();
-            _donorTemplateIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _globalDonorTemplateIds.Clear();
+            _roomDonorTemplateIds.Clear();
+            _activeDonorTemplateIds.Clear();
+            RebuildDonorTemplateIdsLocked();
             _lastSyncedRoomModKey = string.Empty;
+            _lastVisualBindingsRev = string.Empty;
         }
         NotifyVisualAndLocaleChanged("clear-server-mods");
     }
 
-    /// <summary>离房或房主清空 Mod 时卸载房间专属 Mod 句柄并刷新视觉/文本缓存。</summary>
+    /// <summary>离房或房主清空 Mod 时递增 syncEpoch、卸载房间专属 Mod 句柄、重建 _donorTemplateIds 并刷新视觉/文本缓存（D6-P1-08）。</summary>
     internal void ClearSyncedRoomBundleMods()
     {
         bool hadAny;
         lock (_sync)
         {
+            Interlocked.Increment(ref _roomBundleSyncEpoch);
             hadAny = _syncedRoomBundleVisualHandles.Count > 0
                 || _syncedRoomBundleTextHandles.Count > 0
+                || _roomDonorTemplateIds.Count > 0
                 || !string.IsNullOrEmpty(_lastSyncedRoomModKey);
             DisposeHandlesLocked(_syncedRoomBundleVisualHandles);
             DisposeHandlesLocked(_syncedRoomBundleTextHandles);
+            _roomDonorTemplateIds.Clear();
+            RebuildDonorTemplateIdsLocked();
             _lastSyncedRoomModKey = string.Empty;
         }
         if (hadAny)
@@ -253,11 +284,19 @@ internal sealed partial class ModContentSyncClient
             return (true, $"本房 {cleanIds.Count} 个 Mod 已同步");
         }
 
+        // D6-P1-08：单调 syncEpoch 防止退房或切房后旧异步请求乱序反写房间 Mod
+        long myEpoch = Interlocked.Increment(ref _roomBundleSyncEpoch);
+        long myGen = Volatile.Read(ref _syncGeneration);
+
         string path = "/api/community/mods/bundle?modIds=" + Uri.EscapeDataString(string.Join(",", cleanIds));
         var resp = await NameAuth.GetJsonAsync(path, ct).ConfigureAwait(false);
         if (!resp.Ok || string.IsNullOrWhiteSpace(resp.Body))
         {
             return (false, "拉取房间 Mod 资源失败：" + (resp.Error ?? "网络错误"));
+        }
+        if (!IsRoomBundleEpochCurrent(myEpoch) || !IsSyncGenerationCurrent(myGen))
+        {
+            return (true, "房间状态已变更，已忽略过期 Mod 同步结果");
         }
 
         try
@@ -269,6 +308,8 @@ internal sealed partial class ModContentSyncClient
             {
                 foreach (var token in assetsArr)
                 {
+                    if (!IsRoomBundleEpochCurrent(myEpoch) || !IsSyncGenerationCurrent(myGen))
+                        return (true, "房间状态已变更，已中止过期 Mod 资产下载");
                     if (token is not JObject ao) continue;
                     string sha = NormalizeSha((string)(ao["sha256"] ?? ao["hash"]));
                     if (string.IsNullOrEmpty(sha)) continue;
@@ -294,7 +335,7 @@ internal sealed partial class ModContentSyncClient
                 }
             }
 
-            // 同步解析 /api/community/mods/bundle 返回的 cardOverrides，确保纯文案/词条魔改 Mod 也能在房间内生效
+            // P0-18：纯文本 cardOverrides 优先级设为 90（低于 visualBindings 100），并由字段级合并保障绝不反杀元数据
             if (root["cardOverrides"] is JObject overridesMap)
             {
                 foreach (var prop in overridesMap.Properties())
@@ -305,26 +346,25 @@ internal sealed partial class ModContentSyncClient
                     if (string.IsNullOrWhiteSpace(cid)) continue;
 
                     string titleZh = (string)(co["titleZh"] ?? co["title"] ?? co["nameZh"]);
+                    string titleEn = (string)(co["titleEn"] ?? co["nameEn"]);
                     string descZh = (string)(co["descriptionZh"] ?? co["description"] ?? co["descZh"]);
+                    string descEn = (string)(co["descriptionEn"] ?? co["descEn"]);
                     string[] activeTips = ReadStringArray(co["activeTooltipsZh"] ?? co["activeTooltips"]);
+                    string[] activeTipsEn = ReadStringArray(co["activeTooltipsEn"]);
                     string[] passiveTips = ReadStringArray(co["passiveTooltipsZh"] ?? co["passiveTooltips"]);
+                    string[] passiveTipsEn = ReadStringArray(co["passiveTooltipsEn"]);
                     string[] extraTags = ReadStringArray(co["tags"] ?? co["extraDisplayTags"] ?? co["displayTags"]);
+                    Dictionary<string, string[]> enchTips = ParseEnchantTooltipsMap((co["enchantTooltipsZh"] ?? co["enchantmentTooltips"]) as JObject);
+                    Dictionary<string, string[]> enchTipsEn = ParseEnchantTooltipsMap(co["enchantTooltipsEn"] as JObject);
 
-                    Dictionary<string, string[]> enchTips = null;
-                    if ((co["enchantTooltipsZh"] ?? co["enchantmentTooltips"]) is JObject eo)
-                    {
-                        enchTips = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
-                        foreach (var ep in eo.Properties())
-                        {
-                            var arr = ReadStringArray(ep.Value);
-                            if (arr != null && arr.Length > 0) enchTips[ep.Name] = arr;
-                        }
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(titleZh) || !string.IsNullOrWhiteSpace(descZh)
+                    if (!string.IsNullOrWhiteSpace(titleZh) || !string.IsNullOrWhiteSpace(titleEn)
+                        || !string.IsNullOrWhiteSpace(descZh) || !string.IsNullOrWhiteSpace(descEn)
                         || (activeTips != null && activeTips.Length > 0)
+                        || (activeTipsEn != null && activeTipsEn.Length > 0)
                         || (passiveTips != null && passiveTips.Length > 0)
+                        || (passiveTipsEn != null && passiveTipsEn.Length > 0)
                         || (enchTips != null && enchTips.Count > 0)
+                        || (enchTipsEn != null && enchTipsEn.Count > 0)
                         || (extraTags != null && extraTags.Length > 0))
                     {
                         textOverrides.Add(new CardTextOverride
@@ -334,15 +374,25 @@ internal sealed partial class ModContentSyncClient
                             TemplateId = Guid.TryParse(cid, out _) ? cid : null,
                             Locale = "zh-CN",
                             Title = string.IsNullOrWhiteSpace(titleZh) ? null : titleZh,
+                            TitleEn = string.IsNullOrWhiteSpace(titleEn) ? null : titleEn,
                             Description = string.IsNullOrWhiteSpace(descZh) ? null : descZh,
+                            DescriptionEn = string.IsNullOrWhiteSpace(descEn) ? null : descEn,
                             ActiveTooltips = activeTips,
+                            ActiveTooltipsEn = activeTipsEn,
                             PassiveTooltips = passiveTips,
+                            PassiveTooltipsEn = passiveTipsEn,
                             EnchantmentTooltips = enchTips,
+                            EnchantmentTooltipsEn = enchTipsEn,
                             ExtraDisplayTags = extraTags,
-                            Priority = 150,
+                            Priority = 90,
                         });
                     }
                 }
+            }
+
+            if (!IsRoomBundleEpochCurrent(myEpoch) || !IsSyncGenerationCurrent(myGen))
+            {
+                return (true, "房间状态已变更，已放弃提交过期房间 Mod 句柄");
             }
 
             // 合并写入独立句柄组，不覆盖全局 Mod 句柄
@@ -369,15 +419,25 @@ internal sealed partial class ModContentSyncClient
 
             lock (_sync)
             {
+                if (!IsRoomBundleEpochCurrent(myEpoch) || !IsSyncGenerationCurrent(myGen))
+                {
+                    DisposeHandlesLocked(newVisHandles);
+                    DisposeHandlesLocked(newTextHandles);
+                    return (true, "房间状态已变更，已回收过期 Mod 句柄");
+                }
+
                 DisposeHandlesLocked(_syncedRoomBundleVisualHandles);
                 DisposeHandlesLocked(_syncedRoomBundleTextHandles);
                 _syncedRoomBundleVisualHandles.AddRange(newVisHandles);
                 _syncedRoomBundleTextHandles.AddRange(newTextHandles);
+                var roomDonors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var item in dummyContents)
                 {
                     if (!string.IsNullOrWhiteSpace(item.BaseVisualTemplateId))
-                        _donorTemplateIds.Add(item.BaseVisualTemplateId.Trim());
+                        roomDonors.Add(item.BaseVisualTemplateId.Trim());
                 }
+                _roomDonorTemplateIds = roomDonors;
+                RebuildDonorTemplateIdsLocked();
                 _lastSyncedRoomModKey = key;
             }
 
@@ -407,26 +467,53 @@ internal sealed partial class ModContentSyncClient
             return (false, "尚未设置服务器地址", string.Empty, string.Empty);
 
         string cleanId = modId.Trim();
+        if (!SafePathAndZipGuard.IsValidModId(cleanId))
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"[ModSync] 拦截非法社区 Mod ID 下载请求：{cleanId}");
+            return (false, $"非法的 Mod ID（包含不允许的路径字符或保留名）：{cleanId}", string.Empty, string.Empty);
+        }
+
         try
         {
             using var linked = HttpClientHub.CreateLinkedCts(ct);
             using var req = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/api/community/mods/{Uri.EscapeDataString(cleanId)}/download");
             NameAuth.ApplyAuthHeaders(req);
-            using var resp = await HttpClientHub.DownloadClient.SendAsync(req, linked.Token).ConfigureAwait(false);
+            using var resp = await HttpClientHub.DownloadClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, linked.Token).ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode)
             {
                 return (false, $"下载失败（HTTP {(int)resp.StatusCode}）", string.Empty, string.Empty);
             }
 
-            byte[] zipBytes = await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+            byte[] zipBytes = await SafePathAndZipGuard.ReadHttpContentWithLimitAsync(
+                resp.Content,
+                SafePathAndZipGuard.MaxCommunityZipBytes,
+                linked.Token).ConfigureAwait(false);
             if (zipBytes == null || zipBytes.Length == 0)
                 return (false, "下载到的压缩包为空", string.Empty, string.Empty);
 
-            string zipPath = Path.Combine(LocalZipArchiveRoot, $"{cleanId}.bazaarmod.zip");
-            File.WriteAllBytes(zipPath, zipBytes);
+            // 先安全校验并解压（Fail-Closed：若含路径穿越、可执行文件或 Zip Bomb 则绝不落盘归档）
+            string extractTarget = ExtractModZipSafely(zipBytes, LocalModsDownloadRoot, cleanId);
 
-            string extractTarget = Path.Combine(LocalModsDownloadRoot, cleanId);
-            ExtractModZipSafely(zipBytes, extractTarget, cleanId);
+            string zipPath = SafePathAndZipGuard.ResolveSafeChildPath(LocalZipArchiveRoot, $"{cleanId}.bazaarmod.zip");
+            string zipTmp = zipPath + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
+            try
+            {
+                File.WriteAllBytes(zipTmp, zipBytes);
+                if (File.Exists(zipPath))
+                {
+                    File.Copy(zipTmp, zipPath, overwrite: true);
+                    try { File.Delete(zipTmp); } catch { }
+                }
+                else
+                {
+                    File.Move(zipTmp, zipPath);
+                }
+            }
+            catch
+            {
+                try { if (File.Exists(zipTmp)) File.Delete(zipTmp); } catch { }
+                throw;
+            }
 
             return (true, $"已下载并保存到本地：{extractTarget}", zipPath, extractTarget);
         }
@@ -527,6 +614,8 @@ internal sealed partial class ModContentSyncClient
                 if (string.IsNullOrEmpty(manifestPath))
                     return (false, "该目录缺少 mod.json / manifest.json，无法作为 Mod 上传");
                 var meta = ReadModSummaryFromManifest(manifestPath, Path.GetFileName(pathOrDir));
+                if (!SafePathAndZipGuard.IsValidModId(meta.Id))
+                    return (false, $"Mod ID 不合法（仅允许字母、数字、点、下划线、连字符，且不得含 .. 或系统保留名）：{meta.Id}");
                 zipBytes = PackLocalModFolderToZip(pathOrDir, meta.Id);
                 uploadName = $"{meta.Id}.bazaarmod.zip";
             }
@@ -587,11 +676,15 @@ internal sealed partial class ModContentSyncClient
         if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(modId))
             return (false, "参数无效");
 
+        string cleanId = modId.Trim();
+        if (!SafePathAndZipGuard.IsValidModId(cleanId))
+            return (false, $"非法的 Mod ID：{cleanId}");
+
         try
         {
             await NameAuth.EnsureAccountIdentityAsync(ct).ConfigureAwait(false);
             using var linked = HttpClientHub.CreateLinkedCts(ct);
-            using var req = new HttpRequestMessage(HttpMethod.Delete, $"{baseUrl}/api/community/mods/{Uri.EscapeDataString(modId.Trim())}");
+            using var req = new HttpRequestMessage(HttpMethod.Delete, $"{baseUrl}/api/community/mods/{Uri.EscapeDataString(cleanId)}");
             NameAuth.ApplyAuthHeaders(req);
             string playerName = PlayerIdentity.ResolveName();
             if (!string.IsNullOrWhiteSpace(playerName))
@@ -634,10 +727,8 @@ internal sealed partial class ModContentSyncClient
 
     private static byte[] PackLocalModFolderToZip(string sourceDir, string modId)
     {
-        var forbidden = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ".dll", ".exe", ".bat", ".cmd", ".ps1", ".sh", ".py", ".js", ".vbs", ".msi", ".so", ".dylib"
-        };
+        if (!SafePathAndZipGuard.IsValidModId(modId))
+            throw new InvalidOperationException($"非法的 Mod ID：{modId}");
 
         using var ms = new MemoryStream();
         using (var archive = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true, Encoding.UTF8))
@@ -653,7 +744,7 @@ internal sealed partial class ModContentSyncClient
                     || rel.IndexOf("/obj/", StringComparison.OrdinalIgnoreCase) >= 0
                     || rel.IndexOf("/__pycache__/", StringComparison.OrdinalIgnoreCase) >= 0)
                     continue;
-                if (forbidden.Contains(Path.GetExtension(rel)))
+                if (SafePathAndZipGuard.IsForbiddenExtension(rel))
                     continue;
 
                 var entry = archive.CreateEntry($"{modId}/{rel}", CompressionLevel.Optimal);
@@ -665,51 +756,8 @@ internal sealed partial class ModContentSyncClient
         return ms.ToArray();
     }
 
-    private static void ExtractModZipSafely(byte[] zipBytes, string targetDir, string modId)
+    private static string ExtractModZipSafely(byte[] zipBytes, string allowedModsRoot, string modId)
     {
-        var forbidden = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ".dll", ".exe", ".bat", ".cmd", ".ps1", ".sh", ".py", ".js", ".vbs", ".msi", ".so", ".dylib"
-        };
-
-        string tempDir = targetDir + ".tmp_" + Guid.NewGuid().ToString("N").Substring(0, 8);
-        try
-        {
-            Directory.CreateDirectory(tempDir);
-            string guard = Path.GetFullPath(tempDir) + Path.DirectorySeparatorChar;
-            using (var ms = new MemoryStream(zipBytes))
-            using (var archive = new ZipArchive(ms, ZipArchiveMode.Read))
-            {
-                foreach (var entry in archive.Entries)
-                {
-                    if (string.IsNullOrEmpty(entry.Name) && entry.FullName.EndsWith("/", StringComparison.Ordinal))
-                        continue;
-                    string rel = entry.FullName.Replace('\\', '/').TrimStart('/');
-                    if (string.IsNullOrWhiteSpace(rel) || rel.Contains("..")) continue;
-                    if (forbidden.Contains(Path.GetExtension(rel))) continue;
-
-                    // 剥离顶层 <modId>/ 前缀避免嵌套双层目录
-                    string prefix = modId + "/";
-                    if (rel.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                        rel = rel.Substring(prefix.Length);
-                    if (string.IsNullOrWhiteSpace(rel)) continue;
-
-                    string dst = Path.GetFullPath(Path.Combine(tempDir, rel.Replace('/', Path.DirectorySeparatorChar)));
-                    if (!dst.StartsWith(guard, StringComparison.OrdinalIgnoreCase)) continue;
-                    Directory.CreateDirectory(Path.GetDirectoryName(dst));
-                    using var src = entry.Open();
-                    using var fs = File.Create(dst);
-                    src.CopyTo(fs);
-                }
-            }
-
-            if (Directory.Exists(targetDir))
-                Directory.Delete(targetDir, recursive: true);
-            Directory.Move(tempDir, targetDir);
-        }
-        finally
-        {
-            try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true); } catch { }
-        }
+        return SafePathAndZipGuard.ExtractModZipSafely(zipBytes, allowedModsRoot, modId);
     }
 }

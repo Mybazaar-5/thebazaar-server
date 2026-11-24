@@ -8,7 +8,6 @@
     <RootNamespace>BazaarModSdk</RootNamespace>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-    <Version>15.4.0</Version>
     <Authors>BazaarModKit</Authors>
     <Description>《The Bazaar》客户端第三方 Mod 扩展公共契约 SDK（零硬编码依赖游戏内部私有类型）。</Description>
   </PropertyGroup>

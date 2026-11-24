@@ -5,6 +5,7 @@ using System.Text.Json.Serialization;
 using BazaarServer.Accounts;
 using BazaarServer.Endpoints;
 using BazaarServer.Game;
+using BazaarServer.Tournament;
 using Microsoft.Net.Http.Headers;
 
 namespace BazaarServer.Mods;
@@ -86,7 +87,7 @@ public static class ModEndpoints
             return Results.Json(new
             {
                 schemaVersion = clientManifest.SchemaVersion,
-                serverVersion = "2.0.0",
+                serverVersion = WorkshopEndpoints.ResolveServerVersion(),
                 generatedAtUtc = clientManifest.GeneratedAtUtc,
                 modSetHash = modHost.ModSetHash,
                 manifestHash = clientManifest.ManifestHash,
@@ -160,6 +161,8 @@ public static class ModEndpoints
                     e.Heroes,
                 }).ToList(),
                 modes = pkg.Modes,
+                customMechanicCount = pkg.Mechanics.Count,
+                mechanics = pkg.Mechanics,
                 assets = pkg.AssetsByLogicalPath.Values.Select(a => new
                 {
                     a.LogicalPath,
@@ -194,15 +197,18 @@ public static class ModEndpoints
             return Results.File(asset.FullFilePath, asset.ContentType, enableRangeProcessing: true);
         });
 
-        // 4. 当前活跃对局实例级视觉绑定查询（支持按账号自动定位或传 ?runId=...）
+        // 4. 当前活跃对局实例级视觉绑定查询（P0-26：支持 ?watchCode= / ?runId= / ?accountId= 或按账号自动定位，附 X-Visual-Bindings-Rev / X-Mod-Set-Hash 响应头）
         app.MapGet("/api/mods/active-bindings", (
             HttpContext ctx,
             AccountStore accounts,
             SessionStore sessions,
             ServerModHost modHost) =>
         {
+            var lobbies = ctx.RequestServices.GetService<LobbyStore>();
+            string? watchCodeQuery = ctx.Request.Query["watchCode"].FirstOrDefault();
             string? runIdQuery = ctx.Request.Query["runId"].FirstOrDefault();
-            return BuildActiveBindingsResponse(ctx, runIdQuery, accounts, sessions, modHost);
+            string? accountIdQuery = ctx.Request.Query["accountId"].FirstOrDefault();
+            return BuildActiveBindingsResponse(ctx, watchCodeQuery, runIdQuery, accountIdQuery, accounts, sessions, lobbies, modHost);
         });
 
         app.MapGet("/api/runs/{runId}/visual-bindings", (
@@ -212,12 +218,21 @@ public static class ModEndpoints
             SessionStore sessions,
             ServerModHost modHost) =>
         {
-            return BuildActiveBindingsResponse(ctx, runId, accounts, sessions, modHost);
+            var lobbies = ctx.RequestServices.GetService<LobbyStore>();
+            return BuildActiveBindingsResponse(ctx, null, runId, null, accounts, sessions, lobbies, modHost);
         });
 
-        // 5. 热重载全部 Mod 与外挂中文词典
-        app.MapPost("/api/mods/reload", (ServerModHost modHost) =>
+        // 5. 热重载全部 Mod 与外挂中文词典（P0-36：全服统一 AdminAccessGuard 鉴权）
+        app.MapPost("/api/mods/reload", (HttpContext ctx, ServerModHost modHost) =>
         {
+            var guard = AdminAccessGuard.ResolveFrom(ctx.RequestServices);
+            if (guard.TryReject(ctx, JsonOpts, out var denied,
+                errorCode: "ADMIN_ACCESS_DENIED",
+                customMessageZh: "仅限服务器本机管理员或携带有效 X-Workshop-Token 的运维请求热重载全服 Mod。"))
+            {
+                return denied!;
+            }
+
             var report = modHost.Reload();
             return Results.Json(new
             {
@@ -231,9 +246,17 @@ public static class ModEndpoints
             }, JsonOpts);
         });
 
-        // 6. 运行时启停指定 Mod
+        // 6. 运行时启停指定 Mod（P0-36：全服统一 AdminAccessGuard 鉴权）
         app.MapPost("/api/mods/{modId}/toggle", async (HttpContext ctx, string modId, ServerModHost modHost) =>
         {
+            var guard = AdminAccessGuard.ResolveFrom(ctx.RequestServices);
+            if (guard.TryReject(ctx, JsonOpts, out var denied,
+                errorCode: "ADMIN_ACCESS_DENIED",
+                customMessageZh: "仅限服务器本机管理员或携带有效 X-Workshop-Token 的运维请求启停全服 Mod。"))
+            {
+                return denied!;
+            }
+
             bool? desiredEnabled = null;
             if (ctx.Request.ContentLength is > 0)
             {
@@ -294,15 +317,73 @@ public static class ModEndpoints
 
     private static IResult BuildActiveBindingsResponse(
         HttpContext ctx,
+        string? watchCode,
         string? runId,
+        string? accountId,
         AccountStore accounts,
         SessionStore sessions,
+        LobbyStore? lobbies,
         ServerModHost modHost)
     {
         SessionRegistry.Handle? handle = null;
-        if (!string.IsNullOrWhiteSpace(runId))
+
+        // 优先级：watchCode > runId > accountId > Authorization 令牌 > 本机回环默认
+        if (!string.IsNullOrWhiteSpace(watchCode))
         {
-            handle = SessionRegistry.TryFindByRunId(runId);
+            string trimmedCode = watchCode.Trim();
+            var lobby = lobbies != null ? (lobbies.GetByCode(trimmedCode) ?? lobbies.Get(trimmedCode)) : null;
+            if (lobby == null || lobby.IsCancelled)
+            {
+                return Results.Json(new
+                {
+                    ok = false,
+                    code = "SPECTATE_NOT_FOUND",
+                    error = $"未找到对应的观战房间：{trimmedCode}",
+                }, JsonOpts, statusCode: StatusCodes.Status404NotFound);
+            }
+
+            if (!string.IsNullOrWhiteSpace(accountId))
+            {
+                string normAid = LobbyStore.NormalizeAccountKey(accountId);
+                if (lobbies!.FindMember(lobby, normAid) == null)
+                {
+                    return Results.Json(new
+                    {
+                        ok = false,
+                        code = "TARGET_NOT_IN_LOBBY",
+                        error = $"目标玩家不在观战房间 {lobby.Code} 中",
+                    }, JsonOpts, statusCode: StatusCodes.Status404NotFound);
+                }
+
+                handle = TryFindHandleByAccountId(normAid, accountId, sessions);
+            }
+            else
+            {
+                List<string> candidateAccountIds;
+                lock (lobby.Members)
+                {
+                    candidateAccountIds = lobby.Members
+                        .OrderBy(m => m.IsAi ? 1 : 0)
+                        .ThenBy(m => m.HasFinishedRun ? 1 : 0)
+                        .Select(m => m.AccountId)
+                        .ToList();
+                }
+
+                foreach (string aid in candidateAccountIds)
+                {
+                    handle = TryFindHandleByAccountId(aid, aid, sessions);
+                    if (handle != null) break;
+                }
+            }
+        }
+        else if (!string.IsNullOrWhiteSpace(runId))
+        {
+            handle = SessionRegistry.TryFindByRunId(runId.Trim());
+        }
+        else if (!string.IsNullOrWhiteSpace(accountId))
+        {
+            string normAid = LobbyStore.NormalizeAccountKey(accountId);
+            handle = TryFindHandleByAccountId(normAid, accountId, sessions);
         }
         else
         {
@@ -314,19 +395,49 @@ public static class ModEndpoints
                     ?? sessions.GetByAccount(acc.AccountId.ToString("D"));
                 if (mem != null) handle = SessionRegistry.Get(mem.Sid);
             }
+            // 本机回环兜底（《巴扎伴侣》离线直连 127.0.0.1:28080 且未走代理截获 Token 时，自动命中本机活跃对局）
+            if (handle == null && string.IsNullOrWhiteSpace(auth)
+                && ctx.Connection.RemoteIpAddress != null
+                && System.Net.IPAddress.IsLoopback(ctx.Connection.RemoteIpAddress))
+            {
+                handle = SessionRegistry.TryGetSingleOrLatest();
+            }
         }
 
-        var bindings = modHost.CollectActiveVisualBindings(handle?.Run);
+        var run = handle?.Run;
+        var modView = run != null ? modHost.ResolveReadOnlyModView(run.CustomRules?.SelectedModIds) : default;
+        int revision = (run?.VisualBindingsRevision ?? 0) + (run != null ? modView.TransientRevision : 0);
+        string effectiveModSetHash = run != null
+            ? modView.EffectiveModSetHash
+            : modHost.ModSetHash;
+
+        ctx.Response.Headers["X-Visual-Bindings-Rev"] = revision.ToString();
+        ctx.Response.Headers["X-Mod-Set-Hash"] = effectiveModSetHash;
+
+        var bindings = modHost.CollectActiveVisualBindings(run);
         return Results.Json(new
         {
             ok = true,
-            runId = handle?.Run?.RunId,
-            revision = handle?.Run?.VisualBindingsRevision ?? 0,
-            modSetHash = modHost.ModSetHash,
+            runId = run?.RunId,
+            revision,
+            modSetHash = !string.IsNullOrEmpty(effectiveModSetHash) ? effectiveModSetHash : modHost.ModSetHash,
             bindingCount = bindings.Count,
             bindings,
-            templateCatalog = modHost.GetVisualCatalogForRun(handle?.Run),
+            templateCatalog = modHost.GetVisualCatalogForRun(run),
         }, JsonOpts);
+    }
+
+    private static SessionRegistry.Handle? TryFindHandleByAccountId(
+        string normalizedAccountId,
+        string rawAccountId,
+        SessionStore sessions)
+    {
+        var mem = sessions.GetByAccount(normalizedAccountId);
+        if (mem == null && !string.Equals(normalizedAccountId, rawAccountId, StringComparison.OrdinalIgnoreCase))
+            mem = sessions.GetByAccount(rawAccountId.Trim());
+        if (mem == null && Guid.TryParse(rawAccountId, out var parsedGuid))
+            mem = sessions.GetByAccount(parsedGuid.ToString("N")) ?? sessions.GetByAccount(parsedGuid.ToString("D"));
+        return mem != null ? SessionRegistry.Get(mem.Sid) : null;
     }
 
     private static bool IsNotModified(HttpRequest request, string etag)

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using BazaarLauncher.Core;
 using BazaarLauncher.Modules;
 using HarmonyLib;
@@ -11,16 +12,33 @@ using UnityEngine;
 namespace BazaarLauncher;
 
 /// <summary>
-/// 锦标赛、奇遇禁用与高频原生视图硬编码英文兜底补丁（已升级并接入 LocalizationOverlayModule 四层词典，修复 P1-9）：
-///   1. 严格校验当前游戏语言（非中文模式不强行篡改英文界面）；
+/// 锦标赛、奇遇禁用与高频原生视图硬编码英文兜底补丁（D4-P1-9 升级版）：
+///   1. 严格校验当前游戏语言，使用 ConditionalWeakTable 缓存英文原文备忘录，支持运行期中英双向无损切换；
 ///   2. 缓存所有反射 FieldInfo/PropertyInfo 与静态上下文词典，彻底消除热路径反射与 Dictionary 重复分配；
 ///   3. 优先查询 LocalizationOverlayModule 四层外挂词典，回退内置兜底词典。
 /// </summary>
 internal static class TournamentLocalizationPatch
 {
+    private sealed class OriginalTextMemento
+    {
+        public string OriginalText;
+        public string ContextKey;
+        public IReadOnlyDictionary<string, string> Overrides;
+    }
+
+    private sealed class OriginalDropdownMemento
+    {
+        public string[] OriginalOptions;
+    }
+
     private static bool _applied;
     private static readonly HashSet<string> _loggedOnce = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<(Type, string), MemberInfo> _memberCache = new();
+    private static readonly ConditionalWeakTable<TMP_Text, OriginalTextMemento> _tmpMementos = new();
+    private static readonly ConditionalWeakTable<TMP_Dropdown, OriginalDropdownMemento> _dropdownMementos = new();
+    private static readonly object _trackedLock = new();
+    private static readonly List<WeakReference<TMP_Text>> _trackedTmps = new();
+    private static readonly List<WeakReference<TMP_Dropdown>> _trackedDropdowns = new();
 
     private static readonly Dictionary<string, string> ExactEnglishToZh = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -257,9 +275,166 @@ internal static class TournamentLocalizationPatch
     private static bool IsChineseActive()
         => LocalizationOverlayModule.IsChineseLocale(LocalizationOverlayModule.DetectCurrentGameLocale());
 
+    /// <summary>D4-P1-9：由 LocalizationOverlayModule 监听原生 LocaleChanged 触发，实现已汉化锦标赛界面中英双向实时切换。</summary>
+    internal static void RefreshOnLocaleChanged(string newLocale)
+    {
+        bool toZh = LocalizationOverlayModule.IsChineseLocale(newLocale);
+        List<TMP_Text> aliveTmps = new();
+        List<TMP_Dropdown> aliveDropdowns = new();
+
+        lock (_trackedLock)
+        {
+            for (int i = _trackedTmps.Count - 1; i >= 0; i--)
+            {
+                if (_trackedTmps[i].TryGetTarget(out var t) && t != null) aliveTmps.Add(t);
+                else _trackedTmps.RemoveAt(i);
+            }
+            for (int i = _trackedDropdowns.Count - 1; i >= 0; i--)
+            {
+                if (_trackedDropdowns[i].TryGetTarget(out var d) && d != null) aliveDropdowns.Add(d);
+                else _trackedDropdowns.RemoveAt(i);
+            }
+        }
+
+        for (int i = 0; i < aliveTmps.Count; i++)
+        {
+            var tmp = aliveTmps[i];
+            if (tmp == null || !_tmpMementos.TryGetValue(tmp, out var mem)) continue;
+            try
+            {
+                if (!toZh)
+                {
+                    if (!string.Equals(tmp.text, mem.OriginalText, StringComparison.Ordinal))
+                        tmp.text = mem.OriginalText;
+                }
+                else if (TryTranslateString(mem.OriginalText, mem.Overrides, mem.ContextKey, out string zh))
+                {
+                    if (!string.Equals(tmp.text, zh, StringComparison.Ordinal))
+                        tmp.text = zh;
+                }
+            }
+            catch { }
+        }
+
+        for (int i = 0; i < aliveDropdowns.Count; i++)
+        {
+            var dd = aliveDropdowns[i];
+            if (dd == null || dd.options == null || !_dropdownMementos.TryGetValue(dd, out var dmem) || dmem.OriginalOptions == null) continue;
+            try
+            {
+                bool changed = false;
+                for (int k = 0; k < dd.options.Count && k < dmem.OriginalOptions.Length; k++)
+                {
+                    string orig = dmem.OriginalOptions[k] ?? string.Empty;
+                    string target = !toZh
+                        ? orig
+                        : (TryTranslateString(orig, null, "EncounterBanPopupController", out string zh) ? zh : orig);
+                    if (!string.Equals(dd.options[k].text, target, StringComparison.Ordinal))
+                    {
+                        dd.options[k].text = target;
+                        changed = true;
+                    }
+                }
+                if (changed) dd.RefreshShownValue();
+            }
+            catch { }
+        }
+    }
+
+    private static void ApplyTrackedTmpText(
+        TMP_Text tmp,
+        string translated,
+        IReadOnlyDictionary<string, string> overrides,
+        string contextKey)
+    {
+        if (tmp == null) return;
+        if (!_tmpMementos.TryGetValue(tmp, out var mem))
+        {
+            mem = new OriginalTextMemento
+            {
+                OriginalText = tmp.text ?? string.Empty,
+                Overrides = overrides,
+                ContextKey = contextKey,
+            };
+            _tmpMementos.Add(tmp, mem);
+            lock (_trackedLock)
+            {
+                _trackedTmps.Add(new WeakReference<TMP_Text>(tmp));
+            }
+        }
+        else
+        {
+            mem.Overrides = overrides ?? mem.Overrides;
+            mem.ContextKey = contextKey ?? mem.ContextKey;
+        }
+
+        if (!string.Equals(tmp.text, translated, StringComparison.Ordinal))
+        {
+            tmp.text = translated;
+        }
+    }
+
+    private static void RestoreTrackedChildTexts(Component root)
+    {
+        if (root == null) return;
+        var texts = root.GetComponentsInChildren<TMP_Text>(includeInactive: true);
+        if (texts != null)
+        {
+            for (int i = 0; i < texts.Length; i++)
+            {
+                var tmp = texts[i];
+                if (tmp != null && _tmpMementos.TryGetValue(tmp, out var mem))
+                {
+                    if (!string.Equals(tmp.text, mem.OriginalText, StringComparison.Ordinal))
+                        tmp.text = mem.OriginalText;
+                }
+            }
+        }
+        var dds = root.GetComponentsInChildren<TMP_Dropdown>(includeInactive: true);
+        if (dds != null)
+        {
+            for (int i = 0; i < dds.Length; i++)
+            {
+                var dd = dds[i];
+                if (dd == null || dd.options == null || !_dropdownMementos.TryGetValue(dd, out var dmem) || dmem.OriginalOptions == null) continue;
+                bool changed = false;
+                for (int k = 0; k < dd.options.Count && k < dmem.OriginalOptions.Length; k++)
+                {
+                    if (!string.Equals(dd.options[k].text, dmem.OriginalOptions[k], StringComparison.Ordinal))
+                    {
+                        dd.options[k].text = dmem.OriginalOptions[k];
+                        changed = true;
+                    }
+                }
+                if (changed) dd.RefreshShownValue();
+            }
+        }
+    }
+
+    private static void RememberDropdownOriginals(TMP_Dropdown dd)
+    {
+        if (dd == null || dd.options == null) return;
+        if (_dropdownMementos.TryGetValue(dd, out _)) return;
+        var origs = new string[dd.options.Count];
+        for (int i = 0; i < dd.options.Count; i++)
+        {
+            origs[i] = dd.options[i]?.text ?? string.Empty;
+        }
+        _dropdownMementos.Add(dd, new OriginalDropdownMemento { OriginalOptions = origs });
+        lock (_trackedLock)
+        {
+            _trackedDropdowns.Add(new WeakReference<TMP_Dropdown>(dd));
+        }
+    }
+
     private static void BanPopupRefreshPostfix(object __instance)
     {
-        if (!IsChineseActive() || __instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+        if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+        if (!IsChineseActive())
+        {
+            if (__instance is Component c && c != null) RestoreTrackedChildTexts(c);
+            return;
+        }
         try
         {
             TranslateBanPopupLabels(__instance);
@@ -283,6 +458,7 @@ internal static class TournamentLocalizationPatch
         var catDropdown = GetFieldOrProp<TMP_Dropdown>(popup, "_categoryDropdown");
         if (catDropdown != null && catDropdown.options != null)
         {
+            RememberDropdownOriginals(catDropdown);
             for (int i = 0; i < catDropdown.options.Count && i < zhCategories.Length; i++)
             {
                 catDropdown.options[i].text = zhCategories[i];
@@ -295,7 +471,7 @@ internal static class TournamentLocalizationPatch
         {
             if (string.IsNullOrWhiteSpace(ph.text) || IsAsciiOnly(ph.text))
             {
-                ph.text = "搜索奇遇名称或ID...";
+                ApplyTrackedTmpText(ph, "搜索奇遇名称或ID...", null, "EncounterBanPopupController");
             }
         }
     }
@@ -322,6 +498,7 @@ internal static class TournamentLocalizationPatch
             var recent = GetFieldOrProp<TMP_Dropdown>(__instance, "_recentBansDropdown");
             if (recent != null && recent.options != null && recent.options.Count > 0)
             {
+                RememberDropdownOriginals(recent);
                 string opt0 = recent.options[0].text;
                 if (string.IsNullOrEmpty(opt0) || string.Equals(opt0.Trim(), "Recent Bans", StringComparison.OrdinalIgnoreCase))
                 {
@@ -338,7 +515,12 @@ internal static class TournamentLocalizationPatch
 
     private static void HostSettingsRefreshPostfix(object __instance)
     {
-        if (!IsChineseActive() || __instance is not Component comp || comp == null) return;
+        if (__instance is not Component comp || comp == null) return;
+        if (!IsChineseActive())
+        {
+            RestoreTrackedChildTexts(comp);
+            return;
+        }
         try
         {
             TranslateChildTexts(comp, HostSettingsUiOverrides, "TournamentHostSettingsView");
@@ -351,7 +533,12 @@ internal static class TournamentLocalizationPatch
 
     private static void LobbyViewSetIsHostPostfix(object __instance, bool isHost)
     {
-        if (!IsChineseActive() || __instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+        if (__instance == null || (__instance is UnityEngine.Object uo && uo == null)) return;
+        if (!IsChineseActive())
+        {
+            if (__instance is Component c && c != null) RestoreTrackedChildTexts(c);
+            return;
+        }
         try
         {
             var leaveBtn = GetFieldOrProp<object>(__instance, "_leaveButton");
@@ -360,7 +547,11 @@ internal static class TournamentLocalizationPatch
                 var btnText = GetFieldOrProp<TMP_Text>(leaveBtn, "ButtonText");
                 if (btnText != null)
                 {
-                    btnText.text = isHost ? "解散房间" : "离开房间";
+                    ApplyTrackedTmpText(
+                        btnText,
+                        isHost ? "解散房间" : "离开房间",
+                        isHost ? LobbyHostOverrides : LobbyGuestOverrides,
+                        isHost ? "TournamentLobbyView.Host" : "TournamentLobbyView.Guest");
                 }
             }
 
@@ -380,7 +571,12 @@ internal static class TournamentLocalizationPatch
 
     private static void LobbyViewSetInfoPostfix(object __instance)
     {
-        if (!IsChineseActive() || __instance is not Component comp || comp == null) return;
+        if (__instance is not Component comp || comp == null) return;
+        if (!IsChineseActive())
+        {
+            RestoreTrackedChildTexts(comp);
+            return;
+        }
         try
         {
             bool isHost = GetFieldOrProp<bool>(__instance, "_isHost");
@@ -397,14 +593,24 @@ internal static class TournamentLocalizationPatch
 
     private static void GenericViewTranslatePostfix(object __instance)
     {
-        if (!IsChineseActive() || __instance is not Component comp || comp == null) return;
+        if (__instance is not Component comp || comp == null) return;
+        if (!IsChineseActive())
+        {
+            RestoreTrackedChildTexts(comp);
+            return;
+        }
         try { TranslateChildTexts(comp, null, __instance.GetType().Name); }
         catch { }
     }
 
     private static void QueueViewTranslatePostfix(object __instance)
     {
-        if (!IsChineseActive() || __instance is not Component comp || comp == null) return;
+        if (__instance is not Component comp || comp == null) return;
+        if (!IsChineseActive())
+        {
+            RestoreTrackedChildTexts(comp);
+            return;
+        }
         try { TranslateChildTexts(comp, QueueUiOverrides, "TournamentQueueView"); }
         catch { }
     }
@@ -415,7 +621,7 @@ internal static class TournamentLocalizationPatch
         if (tmp == null || string.IsNullOrWhiteSpace(tmp.text)) return;
         if (TryTranslateString(tmp.text, null, contextKey, out string zh) && !string.Equals(tmp.text, zh, StringComparison.Ordinal))
         {
-            tmp.text = zh;
+            ApplyTrackedTmpText(tmp, zh, null, contextKey);
         }
     }
 
@@ -431,7 +637,7 @@ internal static class TournamentLocalizationPatch
             if (tmp == null || string.IsNullOrWhiteSpace(tmp.text)) continue;
             if (TryTranslateString(tmp.text, overrides, contextKey, out string zh) && !string.Equals(tmp.text, zh, StringComparison.Ordinal))
             {
-                tmp.text = zh;
+                ApplyTrackedTmpText(tmp, zh, overrides, contextKey);
             }
         }
     }

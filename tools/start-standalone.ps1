@@ -70,12 +70,12 @@ function Resolve-GameDir {
     }
 
     $candidates = @(
-        "D:\SteamLibrary\steamapps\common\The Bazaar",
+        "<THE_BAZAAR_GAME_DIR>",
         "C:\Program Files (x86)\Steam\steamapps\common\The Bazaar",
         "D:\Steam\steamapps\common\The Bazaar",
         "E:\Steam\steamapps\common\The Bazaar",
-        "E:\SteamLibrary\steamapps\common\The Bazaar",
-        "F:\SteamLibrary\steamapps\common\The Bazaar"
+        "<THE_BAZAAR_GAME_DIR>",
+        "<THE_BAZAAR_GAME_DIR>"
     )
     foreach ($dir in $candidates) {
         if (Test-Path (Join-Path $dir "TheBazaar.exe")) {
@@ -88,28 +88,63 @@ function Resolve-GameDir {
 function Ensure-ClientPluginInstalled {
     param([string]$TargetGameDir, [string]$RepoRoot)
     $pluginPath = Join-Path $TargetGameDir "BepInEx\plugins\BazaarLauncher.dll"
+    $sdkPath = Join-Path $TargetGameDir "BepInEx\plugins\BazaarModSdk.dll"
     $winhttpPath = Join-Path $TargetGameDir "winhttp.dll"
+    $doorstopPath = Join-Path $TargetGameDir "doorstop_config.ini"
     $payloadDir = Join-Path $RepoRoot "dist\client\payload"
 
-    if (-not (Test-Path $pluginPath) -or -not (Test-Path $winhttpPath)) {
+    if (-not (Test-Path $pluginPath) -or -not (Test-Path $sdkPath) -or -not (Test-Path $winhttpPath) -or -not (Test-Path $doorstopPath)) {
         if (-not (Test-Path $payloadDir)) {
-            throw "BazaarLauncher plugin is missing in '$TargetGameDir' and payload not found at '$payloadDir'."
+            throw "BazaarLauncher/BazaarModSdk payload is missing in '$TargetGameDir' and payload not found at '$payloadDir'."
         }
-        Write-Host "[Standalone] Installing BepInEx & BazaarLauncher payload into game directory..." -ForegroundColor Yellow
-        Copy-Item -Path (Join-Path $payloadDir "winhttp.dll") -Destination $TargetGameDir -Force
-        Copy-Item -Path (Join-Path $payloadDir "doorstop_config.ini") -Destination $TargetGameDir -Force
+        Write-Host "[Standalone] Installing BepInEx, BazaarLauncher & BazaarModSdk payload into game directory..." -ForegroundColor Yellow
+        $winhttpSrc = Join-Path $payloadDir "winhttp.dll"
+        if (Test-Path $winhttpSrc) { Copy-Item -Path $winhttpSrc -Destination $TargetGameDir -Force }
+
+        $doorstopSrc = Join-Path $payloadDir "doorstop_config.ini"
+        if ((Test-Path $doorstopSrc) -and -not (Test-Path $doorstopPath)) {
+            Copy-Item -Path $doorstopSrc -Destination $TargetGameDir -Force
+        }
+
         $dsVer = Join-Path $payloadDir ".doorstop_version"
         if (Test-Path $dsVer) {
             Copy-Item -Path $dsVer -Destination $TargetGameDir -Force
         }
+
+        # D7-P1-06：逐文件部署 BepInEx 目录，严格跳过目标已存在的 BepInEx\config\*.cfg 防覆写玩家配置
         $bepInExSrc = Join-Path $payloadDir "BepInEx"
         $bepInExDst = Join-Path $TargetGameDir "BepInEx"
         if (Test-Path $bepInExSrc) {
-            Copy-Item -Path $bepInExSrc -Destination $TargetGameDir -Recurse -Force
+            Get-ChildItem -Path $bepInExSrc -Recurse -File | ForEach-Object {
+                $rel = [System.IO.Path]::GetRelativePath($bepInExSrc, $_.FullName)
+                $dstFile = Join-Path $bepInExDst $rel
+                $isExistingUserCfg = ($rel -match '(?i)^config[\\/].+\.cfg$') -and (Test-Path -LiteralPath $dstFile)
+                if ($isExistingUserCfg) {
+                    return
+                }
+                $dstParent = Split-Path $dstFile -Parent
+                if (-not (Test-Path $dstParent)) {
+                    New-Item -ItemType Directory -Force -Path $dstParent | Out-Null
+                }
+                Copy-Item -LiteralPath $_.FullName -Destination $dstFile -Force
+            }
         }
+
         $pluginsDir = Join-Path $bepInExDst "plugins"
         New-Item -ItemType Directory -Force -Path $pluginsDir | Out-Null
-        Copy-Item -Path (Join-Path $payloadDir "BazaarLauncher.dll") -Destination $pluginsDir -Force
+
+        $launcherSrc = Join-Path $payloadDir "BazaarLauncher.dll"
+        if (Test-Path $launcherSrc) {
+            Copy-Item -LiteralPath $launcherSrc -Destination (Join-Path $pluginsDir "BazaarLauncher.dll") -Force
+        }
+
+        $sdkSrc = Join-Path $payloadDir "BazaarModSdk.dll"
+        if (-not (Test-Path $sdkSrc)) {
+            $sdkSrc = Join-Path $payloadDir "BepInEx\plugins\BazaarModSdk.dll"
+        }
+        if (Test-Path $sdkSrc) {
+            Copy-Item -LiteralPath $sdkSrc -Destination (Join-Path $pluginsDir "BazaarModSdk.dll") -Force
+        }
     }
 }
 
@@ -238,6 +273,7 @@ try {
             throw "Cannot locate BazaarServer binary or project under $repoRoot"
         }
 
+        $env:BAZAAR_BIND = "127.0.0.1"
         $env:BAZAAR_PORT = "$Port"
         $env:BAZAAR_DATA = $resolvedData
         $env:BAZAAR_STATE = $StateDir

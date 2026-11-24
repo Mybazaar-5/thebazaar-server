@@ -30,6 +30,7 @@ namespace BazaarCore.Tests;
 /// 覆盖邮箱 @ 前缀账号互通、SHA-256 双模口令校验、三段式 JWT AccessToken、
 /// 移动端缺失路由、ActiveRun 双字段（PlayMode + Type）、路径前缀剥离与稳定 SHA-256 ETag/304。
 /// </summary>
+[Collection("GlobalStaticState")]
 public sealed class AndroidCompatServerTests
 {
     private static async Task<(WebApplication App, HttpClient Http, string TempDir, AccountStore Accounts, Persistence Db)> StartTestServerAsync()
@@ -401,6 +402,55 @@ public sealed class AndroidCompatServerTests
         {
             Environment.SetEnvironmentVariable("BAZAAR_ALLOW_MOBILE_DEVICE_AUTOLOGIN", prevEnv);
             await CleanupAsync(app, http, tempDir, accounts, db);
+        }
+    }
+
+    [Fact]
+    public void DynamicZhCnOverlay_MergesHashOverrides_AndProducesLoadableSqliteWithStableEtag()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "bazaar-zh-overlay-test-" + Guid.NewGuid().ToString("N"));
+        string cacheDir = Path.Combine(tempDir, "cache");
+        Directory.CreateDirectory(tempDir);
+        string baseZh = Path.Combine(tempDir, "zh-CN.bytes");
+
+        try
+        {
+            // 1. 构造最小官方结构 SQLite zh-CN.bytes
+            using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={baseZh};Pooling=False"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = """
+                    CREATE TABLE translation (hash TEXT PRIMARY KEY, text TEXT);
+                    INSERT INTO translation(hash, text) VALUES ('h_vanilla', '原版文案');
+                    INSERT INTO translation(hash, text) VALUES ('h_override', '旧英文原文');
+                    """;
+                cmd.ExecuteNonQuery();
+            }
+
+            var overrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["h_override"] = "已覆盖中文文案",
+                ["h_mod_new"] = "齿轮工坊新词条",
+            };
+
+            string merged1 = BazaarStaticDataPipeline.EnsureMergedZhCnBytesFile(baseZh, cacheDir, overrides, "sha_overlay_v1");
+            string merged2 = BazaarStaticDataPipeline.EnsureMergedZhCnBytesFile(baseZh, cacheDir, overrides, "sha_overlay_v1");
+            Assert.Equal(merged1, merged2);
+
+            string etag1 = BazaarStaticDataPipeline.ComputeCachedFileSha256Etag(merged1);
+            Assert.True(BazaarStaticDataPipeline.IsIfNoneMatchSatisfied(etag1, etag1));
+
+            // 2. 用官方 LocalizationLoader 无损读取，验证原版词条保留 + 覆盖词条生效 + 新增 Mod 词条可读
+            var loaded = BazaarCore.Data.LocalizationLoader.Load(merged1);
+            Assert.True(loaded.TryGetText("h_vanilla", out var t1) && t1 == "原版文案");
+            Assert.True(loaded.TryGetText("h_override", out var t2) && t2 == "已覆盖中文文案");
+            Assert.True(loaded.TryGetText("h_mod_new", out var t3) && t3 == "齿轮工坊新词条");
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
         }
     }
 }

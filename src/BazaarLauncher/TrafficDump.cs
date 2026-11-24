@@ -36,15 +36,7 @@ internal static class TrafficDump
             var prefix = AccessTools.Method(typeof(TrafficDump), nameof(Prefix));
             var postfix = AccessTools.Method(typeof(TrafficDump), nameof(Postfix));
 
-            patcher.TryPatch(
-                typeof(HttpClient),
-                "SendAsync",
-                new[] { typeof(HttpRequestMessage), typeof(CancellationToken) },
-                prefix: prefix,
-                postfix: postfix,
-                optional: true,
-                label: "TrafficDump.SendAsync(2)");
-
+            // D4-P1-7：仅挂底层 3 参 HttpClient.SendAsync，消除 2 参转发 3 参造成的双倍重复落盘
             patcher.TryPatch(
                 typeof(HttpClient),
                 "SendAsync",
@@ -76,7 +68,9 @@ internal static class TrafficDump
         return Environment.ExpandEnvironmentVariables(dir);
     }
 
-    internal static void Prefix(HttpRequestMessage __0, out DumpCtx __state)
+    private const long MaxBufferDumpBytes = 4 * 1024 * 1024;
+
+    internal static void Prefix(HttpRequestMessage __0, HttpCompletionOption __1, out DumpCtx __state)
     {
         __state = null;
         try
@@ -97,7 +91,6 @@ internal static class TrafficDump
                     headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
             }
 
-            // 仅安全判断可重读类型，绝不在 Prefix 同步阻塞或消耗流式请求体（修复 P0-3）
             string bodyNote = "<empty>";
             bool safeBufferable = false;
             if (__0.Content != null)
@@ -137,7 +130,14 @@ internal static class TrafficDump
                 catch { }
             });
 
-            __state = new DumpCtx { Dir = dir, Stem = stem, Uri = uri, Method = __0.Method.Method };
+            __state = new DumpCtx
+            {
+                Dir = dir,
+                Stem = stem,
+                Uri = uri,
+                Method = __0.Method.Method,
+                CompletionOption = __1,
+            };
         }
         catch (Exception ex)
         {
@@ -145,63 +145,103 @@ internal static class TrafficDump
         }
     }
 
-    internal static void Postfix(Task<HttpResponseMessage> __result, DumpCtx __state)
+    internal static void Postfix(ref Task<HttpResponseMessage> __result, DumpCtx __state)
     {
         if (__state == null || __result == null) return;
         try
         {
-            _ = __result.ContinueWith(async t =>
-            {
-                if (t.IsCanceled || t.IsFaulted || t.Result == null) return;
-                HttpResponseMessage resp = t.Result;
-                try
-                {
-                    var headers = new StringBuilder();
-                    foreach (var h in resp.Headers)
-                        headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
-                    if (resp.Content != null)
-                    {
-                        foreach (var h in resp.Content.Headers)
-                            headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
-                    }
-
-                    Directory.CreateDirectory(__state.Dir);
-                    string resPath = Path.Combine(__state.Dir, __state.Stem + "-res.txt");
-                    string binPath = Path.Combine(__state.Dir, __state.Stem + "-res.bin");
-
-                    string contentType = resp.Content?.Headers?.ContentType?.MediaType ?? string.Empty;
-                    if (contentType.IndexOf("event-stream", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        await File.WriteAllTextAsync(
-                            resPath,
-                            $"{(int)resp.StatusCode} {resp.StatusCode}\nHEADERS: {headers}\nBODY: <SSE 流式响应已跳过全量读取>",
-                            Encoding.UTF8).ConfigureAwait(false);
-                        return;
-                    }
-
-                    if (resp.Content != null)
-                    {
-                        await resp.Content.LoadIntoBufferAsync().ConfigureAwait(false);
-                        byte[] bytes = await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                        if (bytes.Length > 0)
-                        {
-                            await File.WriteAllBytesAsync(binPath, bytes).ConfigureAwait(false);
-                        }
-                        string text = $"{(int)resp.StatusCode} {resp.StatusCode}\nHEADERS: {headers}\nBODY: [{bytes.Length} bytes]\n{Preview(bytes)}";
-                        await File.WriteAllTextAsync(resPath, text, Encoding.UTF8).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        await File.WriteAllTextAsync(resPath, $"{(int)resp.StatusCode} {resp.StatusCode}\nHEADERS: {headers}\nBODY: <empty>", Encoding.UTF8).ConfigureAwait(false);
-                    }
-                }
-                catch { }
-            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            __result = WrapSendAsync(__result, __state);
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("TrafficDump Postfix 异常: " + ex.Message);
         }
+    }
+
+    private static async Task<HttpResponseMessage> WrapSendAsync(Task<HttpResponseMessage> innerTask, DumpCtx state)
+    {
+        HttpResponseMessage resp = await innerTask.ConfigureAwait(false);
+        if (resp == null) return null;
+
+        try
+        {
+            var headers = new StringBuilder();
+            foreach (var h in resp.Headers)
+                headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
+            if (resp.Content != null)
+            {
+                foreach (var h in resp.Content.Headers)
+                    headers.Append(h.Key).Append(": ").Append(string.Join(",", h.Value)).Append("; ");
+            }
+
+            string contentType = resp.Content?.Headers?.ContentType?.MediaType ?? string.Empty;
+            long? contentLen = resp.Content?.Headers?.ContentLength;
+            bool skipBodyBuffer = state.CompletionOption == HttpCompletionOption.ResponseHeadersRead
+                || contentType.IndexOf("event-stream", StringComparison.OrdinalIgnoreCase) >= 0
+                || (contentLen.HasValue && contentLen.Value > MaxBufferDumpBytes);
+
+            byte[] copiedBytes = null;
+            string skipReason = null;
+            if (resp.Content == null)
+            {
+                skipReason = "<empty>";
+            }
+            else if (skipBodyBuffer)
+            {
+                skipReason = state.CompletionOption == HttpCompletionOption.ResponseHeadersRead
+                    ? "<ResponseHeadersRead 流式响应已跳过缓冲>"
+                    : contentType.IndexOf("event-stream", StringComparison.OrdinalIgnoreCase) >= 0
+                        ? "<SSE 流式响应已跳过全量读取>"
+                        : $"<超大响应体 ({contentLen} bytes > 4MB) 已跳过缓冲>";
+            }
+            else
+            {
+                // D4-P1-7：在调用方读取前先完成安全缓冲，确保调用方与抓包均可独立无竞态读取完整字节副本
+                await resp.Content.LoadIntoBufferAsync().ConfigureAwait(false);
+                byte[] raw = await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+                if (raw != null && raw.Length > 0)
+                {
+                    copiedBytes = new byte[raw.Length];
+                    Buffer.BlockCopy(raw, 0, copiedBytes, 0, raw.Length);
+                }
+                else
+                {
+                    copiedBytes = Array.Empty<byte>();
+                }
+            }
+
+            int statusCode = (int)resp.StatusCode;
+            string statusName = resp.StatusCode.ToString();
+            string headerDump = headers.ToString();
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    Directory.CreateDirectory(state.Dir);
+                    string resPath = Path.Combine(state.Dir, state.Stem + "-res.txt");
+                    if (skipReason != null)
+                    {
+                        await File.WriteAllTextAsync(
+                            resPath,
+                            $"{statusCode} {statusName}\nHEADERS: {headerDump}\nBODY: {skipReason}",
+                            Encoding.UTF8).ConfigureAwait(false);
+                        return;
+                    }
+                    if (copiedBytes != null && copiedBytes.Length > 0)
+                    {
+                        string binPath = Path.Combine(state.Dir, state.Stem + "-res.bin");
+                        await File.WriteAllBytesAsync(binPath, copiedBytes).ConfigureAwait(false);
+                    }
+                    int len = copiedBytes?.Length ?? 0;
+                    string text = $"{statusCode} {statusName}\nHEADERS: {headerDump}\nBODY: [{len} bytes]\n{Preview(copiedBytes)}";
+                    await File.WriteAllTextAsync(resPath, text, Encoding.UTF8).ConfigureAwait(false);
+                }
+                catch { }
+            });
+        }
+        catch { }
+
+        return resp;
     }
 
     private static string Preview(byte[] bytes)
@@ -254,5 +294,6 @@ internal static class TrafficDump
         public string Stem;
         public string Uri;
         public string Method;
+        public HttpCompletionOption CompletionOption;
     }
 }

@@ -18,21 +18,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class AuditWave3CoreParityTests
 {
-    private static string ResolveDbPath()
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null)
-        {
-            var cand = Path.Combine(dir.FullName, "dist", "data", "GameData.db");
-            if (File.Exists(cand)) return cand;
-            dir = dir.Parent;
-        }
-        const string fallback = @"e:\thebazaar\dist\data\GameData.db";
-        if (File.Exists(fallback)) return fallback;
-        throw new FileNotFoundException("未找到测试用 GameData.db");
-    }
-
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load(ResolveDbPath()));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     // =========================================================================
     // P1-19：TargetingPriorities（Upgrade / ForceUse）下沉 Random/XMost + Maker's Mark 升至 Legendary

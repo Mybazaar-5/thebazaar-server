@@ -79,6 +79,26 @@ public sealed class CardTemplate
     /// <summary>Mod 自定义遭遇最晚允许出现天数（纯原版卡恒为 null）。</summary>
     public int? ModMaxDay { get; set; }
 
+    /// <summary>P0-23/P0-25：是否为 Mod 新建自定义卡牌（原版卡即便被 Patch 仍恒为 false）。</summary>
+    [JsonIgnore]
+    public bool IsCustomModCard { get; set; }
+
+    /// <summary>P0-23：是否为通用跨英雄自定义技能（Type=="Skill" 且 IsCustomModCard 且未限定特定英雄）。</summary>
+    [JsonIgnore]
+    public bool IsUniversalCustomSkill { get; set; }
+
+    /// <summary>新建自定义卡的归属 Mod ID（原版卡恒为 null）。</summary>
+    [JsonIgnore]
+    public string? CustomModOrigin { get; set; }
+
+    /// <summary>P0-24：透传自 CustomEventDefinition.Schedule.Hours（null/空表示全时段允许）。</summary>
+    [JsonIgnore]
+    public List<int>? AllowedHours { get; set; }
+
+    /// <summary>P0-21：透传自自定义野怪遭遇的难度槽位（Bronze / Silver / Gold / Any）。</summary>
+    [JsonIgnore]
+    public string? ModDifficultySlot { get; set; }
+
     public string DisplayTitle => Localization?.Title?.Text ?? InternalName;
 
     public CardSize CardSize => TierHelper.ParseSize(Size);
@@ -136,11 +156,45 @@ public sealed class EnchantmentData
     public bool HasAuras { get; set; }
 }
 
-public sealed class VfxConfigData
+public sealed class VfxConfigData : IJsonOnDeserialized
 {
     public string? VFXOverrideKey { get; set; }
     public bool VFXShouldPlay { get; set; } = true;
     public bool VFXIsTakeover { get; set; }
+
+    // P0-19：不建同名不同大小写的碰撞属性（避免 PropertyNameCaseInsensitive=true 加载 GameData.db 时抛 InvalidOperationException），
+    // 通过 JsonExtensionData + IJsonOnDeserialized 仅在大小写敏感反序列化器下兜底吸收 camelCase 的 vfxOverrideKey / vfxShouldPlay / vfxIsTakeover。
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? CompatExtras { get; set; }
+
+    public void OnDeserialized()
+    {
+        if (CompatExtras == null || CompatExtras.Count == 0)
+            return;
+
+        foreach (var (k, v) in CompatExtras)
+        {
+            if (string.IsNullOrWhiteSpace(VFXOverrideKey)
+                && k.Equals("vfxOverrideKey", StringComparison.OrdinalIgnoreCase)
+                && v.ValueKind == JsonValueKind.String)
+            {
+                VFXOverrideKey = v.GetString();
+            }
+            else if (k.Equals("vfxShouldPlay", StringComparison.OrdinalIgnoreCase)
+                && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False))
+            {
+                VFXShouldPlay = v.GetBoolean();
+            }
+            else if (k.Equals("vfxIsTakeover", StringComparison.OrdinalIgnoreCase)
+                && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False))
+            {
+                VFXIsTakeover = v.GetBoolean();
+            }
+        }
+
+        // 吸收完毕后清空，避免回写序列化时输出冗余 camelCase 字段
+        CompatExtras = null;
+    }
 }
 
 public sealed class AbilityDefinition
@@ -176,6 +230,11 @@ public sealed class QuestDefinition
 {
     public List<RuleNode>? Prerequisites { get; set; }
     public QuestRepeatableData? Repeatable { get; set; }
+    /// <summary>D1-P2-01：兼容官方 JSON 布尔字段 IsRepeatable，与旧对象型 Repeatable 统一收敛至 EffectiveRepeatable。</summary>
+    [JsonPropertyName("IsRepeatable")]
+    public bool? IsRepeatable { get; set; }
+    [JsonIgnore]
+    public bool EffectiveRepeatable => IsRepeatable ?? (Repeatable != null);
     public List<QuestEntry> Entries { get; set; } = new();
 }
 
@@ -249,6 +308,18 @@ public sealed class SelectionRulesData
             return Math.Max(1, MaxSelections.Value);
         return CanSelectMultiple ? null : 1;
     }
+
+    /// <summary>返回当前选择规则的独立深拷贝，防止消费方修改污染共享模板缓存。</summary>
+    public SelectionRulesData Clone() => new()
+    {
+        CanSelectMultiple = CanSelectMultiple,
+        SelectionIsFree = SelectionIsFree,
+        CanExit = CanExit,
+        RerollRules = RerollRules?.Clone(),
+        WillAutoSellOnExit = WillAutoSellOnExit,
+        NextEncounterOnExit = NextEncounterOnExit.HasValue ? NextEncounterOnExit.Value.Clone() : null,
+        MaxSelections = MaxSelections
+    };
 }
 
 public sealed class NextEncounterOption
@@ -286,6 +357,18 @@ public sealed class RerollRulesData
 
     /// <summary>解析初始刷新费用。</summary>
     public int GetEffectiveStartingCost() => Math.Max(0, StartingCost ?? 2);
+
+    /// <summary>返回当前刷新规则的独立拷贝。</summary>
+    public RerollRulesData Clone() => new()
+    {
+        CostIncrease = CostIncrease,
+        CostMax = CostMax,
+        ResetCostOnExit = ResetCostOnExit,
+        StartingCost = StartingCost,
+        MaxRerolls = MaxRerolls,
+        TotalAllowedRerolls = TotalAllowedRerolls,
+        RerollOnPurchase = RerollOnPurchase
+    };
 }
 
 public sealed class CombatRewardData

@@ -16,23 +16,15 @@ namespace BazaarCore.Tests;
 /// V4 核心测试套件（三）：验证 Gate 1 资源白名单（valid_card_ids.json + CardPool）、
 /// ECardType 保留、去兜底纯奇遇、多英雄开局、EncounterStepEngine 多步链式跳转与野怪战利品/战败折算。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class EncountersLootAndWhitelistTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
-    private static readonly Lazy<List<BazaarServer.Data.MonsterTemplate>> Monsters = new(() => MonsterPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
+    private static readonly Lazy<List<BazaarServer.Data.MonsterTemplate>> Monsters = new(() => TestInfrastructure.SharedGameDataFixture.Shared.CreateMonstersCopy());
 
     private static string ResolveDataPath(string fileName)
-    {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            string candidate = Path.Combine(dir, "dist", "data", fileName);
-            if (File.Exists(candidate)) return candidate;
-            dir = Directory.GetParent(dir)?.FullName;
-        }
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static GameDataRepository CreateRepoWithExtraCards(params CardTemplate[] extras)
     {

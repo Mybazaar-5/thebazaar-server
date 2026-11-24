@@ -32,6 +32,20 @@ public static class SessionRegistry
 
     public static Handle? Get(string sid) => _map.TryGetValue(sid, out var h) ? h : null;
 
+    /// <summary>本机回环单人模式兜底：优先返回唯一活跃会话，若存在多个则返回最新活动的对局句柄。</summary>
+    public static Handle? TryGetSingleOrLatest()
+    {
+        Handle? best = null;
+        foreach (var kv in _map)
+        {
+            var h = kv.Value;
+            if (h?.Run == null) continue;
+            if (best == null || h.Run.VisualBindingsRevision >= best.Run.VisualBindingsRevision)
+                best = h;
+        }
+        return best;
+    }
+
     public static void Detach(string sid) => _map.TryRemove(sid, out _);
 
     /// <summary>清理已不在 SessionStore 中的孤儿运行态句柄，配合空闲会话驱逐释放内存。</summary>

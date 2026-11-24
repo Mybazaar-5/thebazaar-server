@@ -47,7 +47,7 @@ DEFAULT_DIST_OUT = REPO_ROOT / "dist" / "data" / "translations" / "custom_zh_ove
 DEFAULT_ZH_BYTES = REPO_ROOT / "dist" / "data" / "translations" / "zh-CN.bytes"
 DEFAULT_WHITELIST = REPO_ROOT / "dist" / "data" / "valid_card_ids.json"
 DEFAULT_LOCAL_DB = REPO_ROOT / "dist" / "data" / "GameData.db"
-FALLBACK_MAIN_DB = pathlib.Path(r"e:\thebazaar\dist\data\GameData.db")
+FALLBACK_MAIN_DB = pathlib.Path(r"./dist\data\GameData.db")
 
 SCHEMA_URL = "https://bazaar-local.schema/custom-zh-overlay/v1"
 

@@ -5,14 +5,58 @@
     <Nullable>disable</Nullable>
     <AssemblyName>BazaarLauncher</AssemblyName>
     <RootNamespace>BazaarLauncher</RootNamespace>
-    <Version>15.4.0</Version>
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
-    <RestorePackages>false</RestorePackages>
-    <NoWarn>$(NoWarn);CS0168;CS0219;MSB3277</NoWarn>
-    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(BAZAAR_MANAGED_DIR)'!=''">$(BAZAAR_MANAGED_DIR)</ManagedDir>
-    <ManagedDir Condition="'$(ManagedDir)'==''">$(MSBuildThisFileDirectory)..\..\ext\Managed</ManagedDir>
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+
+    <!-- D8-P1-07：BepInExCore 零硬编码探测链（-p:BepInExCore -> 环境变量 -> 本仓/主仓相对 ext 目录） -->
     <BepInExCore Condition="'$(BepInExCore)'=='' And '$(BAZAAR_BEPINEX_CORE)'!=''">$(BAZAAR_BEPINEX_CORE)</BepInExCore>
+    <BepInExCore Condition="'$(BepInExCore)'=='' And Exists('$(MSBuildThisFileDirectory)..\..\ext\bepinex\extracted\BepInEx\core\BepInEx.dll')">$(MSBuildThisFileDirectory)..\..\ext\bepinex\extracted\BepInEx\core</BepInExCore>
+    <BepInExCore Condition="'$(BepInExCore)'=='' And Exists('$(MSBuildThisFileDirectory)..\..\..\..\ext\bepinex\extracted\BepInEx\core\BepInEx.dll')">$(MSBuildThisFileDirectory)..\..\..\..\ext\bepinex\extracted\BepInEx\core</BepInExCore>
     <BepInExCore Condition="'$(BepInExCore)'==''">$(MSBuildThisFileDirectory)..\..\ext\bepinex\extracted\BepInEx\core</BepInExCore>
+
+    <!-- D8-P1-07：ManagedDir 零硬编码探测链（-p:ManagedDir -> 环境变量 -> 完整 ext\Managed -> Steam 注册表与 libraryfolders.vdf 自动定位） -->
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(BAZAAR_MANAGED_DIR)'!=''">$(BAZAAR_MANAGED_DIR)</ManagedDir>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And Exists('$(MSBuildThisFileDirectory)..\..\ext\Managed\UnityEngine.CoreModule.dll')">$(MSBuildThisFileDirectory)..\..\ext\Managed</ManagedDir>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And Exists('$(MSBuildThisFileDirectory)..\..\..\..\ext\Managed\UnityEngine.CoreModule.dll')">$(MSBuildThisFileDirectory)..\..\..\..\ext\Managed</ManagedDir>
+
+    <!-- Windows 下通过 Steam 注册表与 steamapps\libraryfolders.vdf 动态解析游戏 Managed 目录，全程零个人路径字面量 -->
+    <_SteamRoot Condition="'$(ManagedDir)'=='' And '$([MSBuild]::IsOSPlatform(Windows))'=='true'">$([MSBuild]::GetRegistryValueFromView('HKEY_CURRENT_USER\Software\Valve\Steam', 'SteamPath', null, RegistryView.Registry32, RegistryView.Registry64))</_SteamRoot>
+    <_SteamRoot Condition="'$(ManagedDir)'=='' And '$(_SteamRoot)'=='' And '$([MSBuild]::IsOSPlatform(Windows))'=='true'">$([MSBuild]::GetRegistryValueFromView('HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Valve\Steam', 'InstallPath', null, RegistryView.Registry32, RegistryView.Registry64))</_SteamRoot>
+    <_SteamRoot Condition="'$(_SteamRoot)'!=''">$(_SteamRoot.Replace('/', '\').TrimEnd('\'))</_SteamRoot>
+
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(_SteamRoot)'!='' And Exists('$(_SteamRoot)\steamapps\common\The Bazaar\TheBazaar_Data\Managed\UnityEngine.CoreModule.dll')">$(_SteamRoot)\steamapps\common\The Bazaar\TheBazaar_Data\Managed</ManagedDir>
+
+    <_SteamVdfPath Condition="'$(ManagedDir)'=='' And '$(_SteamRoot)'!='' And Exists('$(_SteamRoot)\steamapps\libraryfolders.vdf')">$(_SteamRoot)\steamapps\libraryfolders.vdf</_SteamVdfPath>
+    <_SteamVdfPath Condition="'$(ManagedDir)'=='' And '$(_SteamVdfPath)'=='' And '$(_SteamRoot)'!='' And Exists('$(_SteamRoot)\config\libraryfolders.vdf')">$(_SteamRoot)\config\libraryfolders.vdf</_SteamVdfPath>
+    <_SteamVdfRaw Condition="'$(ManagedDir)'=='' And '$(_SteamVdfPath)'!='' And Exists('$(_SteamVdfPath)')">$([System.IO.File]::ReadAllText('$(_SteamVdfPath)'))</_SteamVdfRaw>
+    <_SteamVdfJoined Condition="'$(_SteamVdfRaw)'!=''">$([System.Text.RegularExpressions.Regex]::Replace($(_SteamVdfRaw), '(?is)&quot;path&quot;\s+&quot;([^&quot;]+)&quot;|.', '$1|'))</_SteamVdfJoined>
+    <_SteamVdfLibs Condition="'$(_SteamVdfJoined)'!=''">$([System.Text.RegularExpressions.Regex]::Replace($(_SteamVdfJoined), '\|+', ';').Replace('\\', '\').Replace('/', '\').Trim(';'))</_SteamVdfLibs>
+
+    <_SteamLib0 Condition="'$(ManagedDir)'=='' And '$(_SteamVdfLibs)'!='' And $(_SteamVdfLibs.Split(';').Length) &gt; 0">$(_SteamVdfLibs.Split(';')[0].Trim().TrimEnd('\'))</_SteamLib0>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(_SteamLib0)'!='' And Exists('$(_SteamLib0)\steamapps\common\The Bazaar\TheBazaar_Data\Managed\UnityEngine.CoreModule.dll')">$(_SteamLib0)\steamapps\common\The Bazaar\TheBazaar_Data\Managed</ManagedDir>
+
+    <_SteamLib1 Condition="'$(ManagedDir)'=='' And '$(_SteamVdfLibs)'!='' And $(_SteamVdfLibs.Split(';').Length) &gt; 1">$(_SteamVdfLibs.Split(';')[1].Trim().TrimEnd('\'))</_SteamLib1>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(_SteamLib1)'!='' And Exists('$(_SteamLib1)\steamapps\common\The Bazaar\TheBazaar_Data\Managed\UnityEngine.CoreModule.dll')">$(_SteamLib1)\steamapps\common\The Bazaar\TheBazaar_Data\Managed</ManagedDir>
+
+    <_SteamLib2 Condition="'$(ManagedDir)'=='' And '$(_SteamVdfLibs)'!='' And $(_SteamVdfLibs.Split(';').Length) &gt; 2">$(_SteamVdfLibs.Split(';')[2].Trim().TrimEnd('\'))</_SteamLib2>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(_SteamLib2)'!='' And Exists('$(_SteamLib2)\steamapps\common\The Bazaar\TheBazaar_Data\Managed\UnityEngine.CoreModule.dll')">$(_SteamLib2)\steamapps\common\The Bazaar\TheBazaar_Data\Managed</ManagedDir>
+
+    <_SteamLib3 Condition="'$(ManagedDir)'=='' And '$(_SteamVdfLibs)'!='' And $(_SteamVdfLibs.Split(';').Length) &gt; 3">$(_SteamVdfLibs.Split(';')[3].Trim().TrimEnd('\'))</_SteamLib3>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(_SteamLib3)'!='' And Exists('$(_SteamLib3)\steamapps\common\The Bazaar\TheBazaar_Data\Managed\UnityEngine.CoreModule.dll')">$(_SteamLib3)\steamapps\common\The Bazaar\TheBazaar_Data\Managed</ManagedDir>
+
+    <_SteamLib4 Condition="'$(ManagedDir)'=='' And '$(_SteamVdfLibs)'!='' And $(_SteamVdfLibs.Split(';').Length) &gt; 4">$(_SteamVdfLibs.Split(';')[4].Trim().TrimEnd('\'))</_SteamLib4>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(_SteamLib4)'!='' And Exists('$(_SteamLib4)\steamapps\common\The Bazaar\TheBazaar_Data\Managed\UnityEngine.CoreModule.dll')">$(_SteamLib4)\steamapps\common\The Bazaar\TheBazaar_Data\Managed</ManagedDir>
+
+    <_SteamLib5 Condition="'$(ManagedDir)'=='' And '$(_SteamVdfLibs)'!='' And $(_SteamVdfLibs.Split(';').Length) &gt; 5">$(_SteamVdfLibs.Split(';')[5].Trim().TrimEnd('\'))</_SteamLib5>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(_SteamLib5)'!='' And Exists('$(_SteamLib5)\steamapps\common\The Bazaar\TheBazaar_Data\Managed\UnityEngine.CoreModule.dll')">$(_SteamLib5)\steamapps\common\The Bazaar\TheBazaar_Data\Managed</ManagedDir>
+
+    <_SteamLib6 Condition="'$(ManagedDir)'=='' And '$(_SteamVdfLibs)'!='' And $(_SteamVdfLibs.Split(';').Length) &gt; 6">$(_SteamVdfLibs.Split(';')[6].Trim().TrimEnd('\'))</_SteamLib6>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(_SteamLib6)'!='' And Exists('$(_SteamLib6)\steamapps\common\The Bazaar\TheBazaar_Data\Managed\UnityEngine.CoreModule.dll')">$(_SteamLib6)\steamapps\common\The Bazaar\TheBazaar_Data\Managed</ManagedDir>
+
+    <_SteamLib7 Condition="'$(ManagedDir)'=='' And '$(_SteamVdfLibs)'!='' And $(_SteamVdfLibs.Split(';').Length) &gt; 7">$(_SteamVdfLibs.Split(';')[7].Trim().TrimEnd('\'))</_SteamLib7>
+    <ManagedDir Condition="'$(ManagedDir)'=='' And '$(_SteamLib7)'!='' And Exists('$(_SteamLib7)\steamapps\common\The Bazaar\TheBazaar_Data\Managed\UnityEngine.CoreModule.dll')">$(_SteamLib7)\steamapps\common\The Bazaar\TheBazaar_Data\Managed</ManagedDir>
+
+    <ManagedDir Condition="'$(ManagedDir)'==''">$(MSBuildThisFileDirectory)..\..\ext\Managed</ManagedDir>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\BazaarModSdk\BazaarModSdk.csproj" />
@@ -37,4 +81,3 @@
     <Reference Include="Newtonsoft.Json"><HintPath>$(ManagedDir)\Newtonsoft.Json.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 </Project>
-

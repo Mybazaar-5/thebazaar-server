@@ -70,6 +70,8 @@ public sealed class OutOfCombatBatchResult
     public List<CardInstance> QuestCompletedCards { get; } = new();
     public List<string> TriggeredAbilityLogs { get; } = new();
     public List<(List<CardInstance> Cards, string SpawnMode)> DealtSelectionRequests { get; } = new();
+    /// <summary>P0-01：强类型发牌请求列表（完整透传 SelectionContextRules，与 DealtSelectionRequests 同步追加保持兼容）。</summary>
+    public List<DealtCardsPayload> DealtSelectionPayloads { get; } = new();
     public List<string> RerollRequests { get; } = new();
     /// <summary>带可选 SpawnCount 覆盖的完整重掷请求明细（P1-17；与 RerollRequests 同步追加以保持向后兼容）。</summary>
     public List<(string RerollType, int? SpawnCount)> RerollEntries { get; } = new();
@@ -89,6 +91,24 @@ public static class OutOfCombatController
 
     private static readonly ConditionalWeakTable<PlayerState, List<CardInstance>> AttachedPlayerEffects = new();
     private static readonly ConditionalWeakTable<PlayerState, OutOfCombatSpawnPreferences> AttachedSpawnPreferences = new();
+    private static readonly ConditionalWeakTable<PlayerState, IReadOnlyCollection<string>> AttachedVisitedEncounters = new();
+
+    /// <summary>
+    /// D1-P1-06：向指定玩家实例绑定已访问遭遇 ID 集合，供局外触发器、任务与光环评估 TRunConditionalHasVisitedEncounter。
+    /// </summary>
+    public static void AttachVisitedEncounters(PlayerState player, IReadOnlyCollection<string>? visitedEncounters)
+    {
+        if (player == null) return;
+        if (visitedEncounters == null)
+        {
+            AttachedVisitedEncounters.Remove(player);
+            return;
+        }
+        AttachedVisitedEncounters.AddOrUpdate(player, visitedEncounters);
+    }
+
+    public static IReadOnlyCollection<string>? GetAttachedVisitedEncounters(PlayerState player)
+        => player != null && AttachedVisitedEncounters.TryGetValue(player, out var set) ? set : null;
 
     /// <summary>
     /// 为指定玩家实例挂载局外生成偏好（流派位掩码解析器与自定义规则集），
@@ -230,12 +250,14 @@ public static class OutOfCombatController
         var transitions = RecalculateAllOutOfCombatAuras(player, repo, activeEncounterCard, selectionCards);
         if (transitions.Count > 0)
         {
+            var visitedEnc = GetAttachedVisitedEncounters(player);
             var qCtx = new RuleExecutionContext(repo, RuleScope.OutOfCombat, player, null, new Random(0))
             {
                 LocalPlayerId = player.PlayerId,
                 CurrentDay = player.Day,
                 CurrentHour = player.Hour,
                 CurrentEncounterId = activeEncounterCard?.Template.Id,
+                VisitedEncounterIds = visitedEnc,
                 SelectionCards = selectionCards,
                 OnQuestUpdated = (card, questAttr, qPrev, qCur, qTarget) =>
                 {
@@ -413,12 +435,33 @@ public static class OutOfCombatController
     /// <summary>
     /// 商店拖拽换位后调用：重算 OutOfCombat 光环并收集发生数值/标签变化的卡牌。
     /// </summary>
+    /// <summary>
+    /// 局外卡牌换位/跨区移动后调用：
+    /// - 传入 <paramref name="movedCard"/> 时派发 <c>TTriggerOnCardMoved</c> 生命周期事件（支持触发局外移动变形/衍生等被动）并重算光环；
+    /// - 未传 <paramref name="movedCard"/> 时保持向后兼容，仅重算局外光环。
+    /// </summary>
     public static OutOfCombatBatchResult OnCardMoved(
         PlayerState player,
         GameDataRepository repo,
         CardInstance? activeEncounterCard = null,
-        IReadOnlyList<CardInstance>? selectionCards = null)
-        => RecalculateOutOfCombatAuras(player, repo, activeEncounterCard, selectionCards);
+        IReadOnlyList<CardInstance>? selectionCards = null,
+        CardInstance? movedCard = null,
+        Random? rng = null,
+        string? currentEncounterId = null)
+    {
+        if (movedCard == null)
+            return RecalculateOutOfCombatAuras(player, repo, activeEncounterCard, selectionCards);
+
+        return ExecuteLifecycleEvent(
+            player, repo, rng,
+            eventType: "TTriggerOnCardMoved",
+            sourceCard: movedCard,
+            targetCard: movedCard,
+            subjectPlayer: player,
+            currentEncounterId: currentEncounterId,
+            activeEncounterCard: activeEncounterCard,
+            selectionCards: selectionCards);
+    }
 
     /// <summary>
     /// 卡牌升阶（含二合一融合或外部升阶）后调用：触发 TTriggerOnCardUpgraded 并重算光环。
@@ -944,7 +987,9 @@ public static class OutOfCombatController
                         continue;
 
                     var prevAbId = abCtx.ActiveExecution.AbilityId;
+                    var prevAbObj = abCtx.ActiveExecution.Ability;
                     abCtx.ActiveExecution.AbilityId = ab.Id;
+                    abCtx.ActiveExecution.Ability = ab;
                     try
                     {
                         if (AbilityExecutor.ExecuteAction(ab.Action, card, abCtx))
@@ -953,6 +998,7 @@ public static class OutOfCombatController
                     finally
                     {
                         abCtx.ActiveExecution.AbilityId = prevAbId;
+                        abCtx.ActiveExecution.Ability = prevAbObj;
                     }
                 }
 
@@ -972,6 +1018,7 @@ public static class OutOfCombatController
         }
 
         AttachedSpawnPreferences.TryGetValue(player, out var spawnPrefs);
+        var visitedEncounters = GetAttachedVisitedEncounters(player);
         baseCtx = new RuleExecutionContext(repo, RuleScope.OutOfCombat, player, opponent, effectiveRng)
         {
             LocalPlayerId = player.PlayerId,
@@ -979,11 +1026,21 @@ public static class OutOfCombatController
             CurrentHour = player.Hour,
             CombatType = combatType,
             CurrentEncounterId = currentEncounterId ?? activeEncounterCard?.Template.Id,
+            VisitedEncounterIds = visitedEncounters,
             IsFusionUpgrade = isFusionUpgrade,
             SelectionCards = selectionCards,
             ArchetypeResolver = spawnPrefs?.ArchetypeResolver,
             CustomRules = spawnPrefs?.CustomRules,
-            OnDealCardsToSelection = (cards, mode) => result.DealtSelectionRequests.Add((cards, mode)),
+            OnDealCardsToSelection = (cards, mode) =>
+            {
+                result.DealtSelectionRequests.Add((cards, mode));
+                result.DealtSelectionPayloads.Add(new DealtCardsPayload(cards, mode, null, null));
+            },
+            OnDealCardsToSelectionWithRules = payload =>
+            {
+                result.DealtSelectionRequests.Add((payload.Cards, payload.SpawnMode));
+                result.DealtSelectionPayloads.Add(payload);
+            },
             OnRerollEncounter = rerollType =>
             {
                 result.RerollRequests.Add(rerollType);
@@ -1152,12 +1209,14 @@ public static class OutOfCombatController
         }
 
         string? encId = activeEncounterCard?.Template.Id;
+        var visitedEnc = GetAttachedVisitedEncounters(player);
         var transitions = AuraEngine.RecalculateAurasInternal(
             player, null, RuleScope.OutOfCombat, player.Day, player.Hour, repo,
             selectionCards: selectionCards,
             snapshotSink: null,
             externalAuraCards: externalAuras,
-            currentEncounterId: encId);
+            currentEncounterId: encId,
+            visitedEncounters: visitedEnc);
 
         // 非战斗光环重算后，将拥有弹药上限的卡牌当前弹药同步补满；若触发光环增弹引发 CurrentAmmo 变化，再刷新一次关联光环（修复 P1-4）
         bool anyAmmoChanged = false;
@@ -1174,7 +1233,8 @@ public static class OutOfCombatController
                 selectionCards: selectionCards,
                 snapshotSink: null,
                 externalAuraCards: externalAuras,
-                currentEncounterId: encId);
+                currentEncounterId: encId,
+                visitedEncounters: visitedEnc);
             if (secondTransitions.Count > 0)
             {
                 if (transitions.Count == 0)
@@ -1215,6 +1275,7 @@ public static class OutOfCombatController
         for (int i = 0; i < player.Skills.Count; i++) Add(player.Skills[i], false);
         for (int i = 0; i < player.SocketEffects.Count; i++) Add(player.SocketEffects[i], false);
         for (int i = 0; i < player.Stash.Cards.Count; i++) Add(player.Stash.Cards[i], false);
+        for (int i = 0; i < player.PlayerEffects.Count; i++) Add(player.PlayerEffects[i], false);
         if (AttachedPlayerEffects.TryGetValue(player, out var attachedEffects))
         {
             for (int i = 0; i < attachedEffects.Count; i++)

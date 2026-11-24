@@ -276,7 +276,7 @@ internal static partial class CompatAuditPatch
             ClearEndOfRunChallengeGuards();
             ClearCardQuestSubscribedGroups(reason);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch:L279", diagEx); }
     }
 
     internal static void ApplyGameSimGroup(SafeHarmonyPatcher patcher)

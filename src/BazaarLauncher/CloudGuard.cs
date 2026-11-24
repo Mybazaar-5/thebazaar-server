@@ -13,6 +13,45 @@ using HarmonyLib;
 namespace BazaarLauncher;
 
 /// <summary>
+/// D4-P2-4：零 Unity 依赖的 URL 白名单/外网遥测过滤纯 .NET 内核，供纯 .NET 8 单元测试通过反射直测。
+/// 放行本地回环（127.0.0.1/localhost/::1）、file:// 与当前自建服同主机 URL，拦截其余所有外网请求。
+/// </summary>
+public static class CloudGuardUrlFilterCore
+{
+    public static bool ShouldBlockUrl(string url, string serverBase)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return false;
+        if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri)) return false;
+        return !IsAllowedUri(uri, serverBase);
+    }
+
+    public static bool IsAllowedUri(Uri uri, string serverBase)
+    {
+        if (uri == null || !uri.IsAbsoluteUri) return true;
+        string scheme = uri.Scheme.ToLowerInvariant();
+        if (scheme == "file") return true;
+        if (scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss") return false;
+
+        string host = uri.Host;
+        if (string.Equals(host, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(host, "::1", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(serverBase) &&
+            Uri.TryCreate(serverBase.Trim(), UriKind.Absolute, out var serverUri))
+        {
+            if (string.Equals(host, serverUri.Host, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+}
+
+/// <summary>
 /// 100% 云端隔离防火墙（修复 P0-5）：
 /// 1. 禁用 Unity CrashReportHandler 崩溃上报、Sentry 与 AnalyticsManager 外部遥测；
 /// 2. 同时拦截 HttpClient.SendAsync 的 2 参和底层核心 3 参重载 (HttpRequestMessage, HttpCompletionOption, CancellationToken)；
@@ -119,21 +158,14 @@ internal static class CloudGuard
     {
         var prefix = AccessTools.Method(typeof(CloudGuard), nameof(HttpClientPrefix));
 
-        // 2 参重载
-        patcher.TryPatch(
-            typeof(HttpClient),
-            "SendAsync",
-            new[] { typeof(HttpRequestMessage), typeof(CancellationToken) },
-            prefix: prefix,
-            prefixPriority: Priority.First,
-            label: "HttpClient.SendAsync(2)");
-
-        // 3 参底层核心重载（GetAsync/PostAsync 最终均走此重载，彻底杜绝 P0-5 绕过缺口）
+        // D4-P2-4：仅挂 3 参底层核心重载（1 参/2 参 SendAsync、GetAsync/PostAsync 最终均转发至此重载），
+        // 彻底杜绝 2 参 + 3 参双钩子造成的双计数，同时完整保留 D3-P1-13 X-Visual-Bindings-Rev 响应头 Postfix
         patcher.TryPatch(
             typeof(HttpClient),
             "SendAsync",
             new[] { typeof(HttpRequestMessage), typeof(HttpCompletionOption), typeof(CancellationToken) },
             prefix: prefix,
+            postfix: AccessTools.Method(typeof(CloudGuard), nameof(HttpClientSend3Postfix)),
             prefixPriority: Priority.First,
             label: "HttpClient.SendAsync(3)");
     }
@@ -163,6 +195,7 @@ internal static class CloudGuard
             "SendWebRequest",
             Type.EmptyTypes,
             prefix: AccessTools.Method(typeof(CloudGuard), nameof(UnityWebRequestPrefix)),
+            postfix: AccessTools.Method(typeof(CloudGuard), nameof(UnityWebRequestPostfix)),
             prefixPriority: Priority.First,
             label: "UnityWebRequest.SendWebRequest");
     }
@@ -198,6 +231,50 @@ internal static class CloudGuard
         }
     }
 
+    /// <summary>
+    /// D3-P1-13：常驻监听所有自建服响应头中的 X-Visual-Bindings-Rev（含 TempoNet /sessions 与 /commands）。
+    /// 严格仅非阻塞只读 resp.Headers，绝不触碰 resp.Content、绝不修改 __result 任务流。
+    /// </summary>
+    private static void HttpClientSend3Postfix(HttpRequestMessage __0, Task<HttpResponseMessage> __result)
+    {
+        try
+        {
+            if (__result == null || __0?.RequestUri == null) return;
+            string path = __0.RequestUri.AbsolutePath ?? string.Empty;
+            if (path.IndexOf("/api/mods/active-bindings", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return;
+            }
+            if (!IsAllowedHost(__0.RequestUri))
+            {
+                return;
+            }
+
+            _ = __result.ContinueWith(static t =>
+            {
+                if (t.Status != TaskStatus.RanToCompletion) return;
+                try
+                {
+                    var resp = t.Result;
+                    if (resp?.Headers == null) return;
+                    if (resp.Headers.TryGetValues("X-Visual-Bindings-Rev", out var values))
+                    {
+                        foreach (string v in values)
+                        {
+                            if (!string.IsNullOrWhiteSpace(v))
+                            {
+                                ModContentSyncClient.Instance.NotifyVisualBindingsRevObserved(v.Trim());
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) { Core.DiagLog.SwallowOnce("CloudGuard.VisualRevHeader", ex); }
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+        catch (Exception ex) { Core.DiagLog.SwallowOnce("CloudGuard.Send3Postfix", ex); }
+    }
+
     private static bool WebSocketConnectPrefix(Uri __0, ref Task __result)
     {
         try
@@ -218,8 +295,9 @@ internal static class CloudGuard
         }
     }
 
-    private static bool UnityWebRequestPrefix(object __instance, ref object __result)
+    private static bool UnityWebRequestPrefix(object __instance, out bool __state)
     {
+        __state = false;
         try
         {
             if (__instance == null || _cachedUwrUrlProp == null) return true;
@@ -234,9 +312,9 @@ internal static class CloudGuard
             }
 
             RecordBlocked(url);
-            // 直接短路外部遥测，不向自建服转发垃圾请求，避免污染自建服日志与连接池
+            // D4-P2-4：Prefix 仅改写 URL 至本地无效端口并标记 __state=true，由 Postfix 紧随发送启动后 Abort()，避免发送前 Abort 引发原生异常
             _cachedUwrUrlProp.SetValue(__instance, "http://127.0.0.1:1/blocked-telemetry");
-            try { _cachedUwrAbortMethod?.Invoke(__instance, null); } catch { }
+            __state = true;
             return true;
         }
         catch (Exception ex)
@@ -246,30 +324,15 @@ internal static class CloudGuard
         }
     }
 
-    internal static bool IsAllowedHost(Uri uri)
+    private static void UnityWebRequestPostfix(object __instance, bool __state)
     {
-        if (uri == null || !uri.IsAbsoluteUri) return true;
-        string scheme = uri.Scheme.ToLowerInvariant();
-        if (scheme == "file") return true;
-        if (scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss") return false;
-
-        string host = uri.Host;
-        if (string.Equals(host, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(host, "::1", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        string serverBase = BazaarLauncherPlugin.ServerBase?.Value;
-        if (!string.IsNullOrWhiteSpace(serverBase) &&
-            Uri.TryCreate(serverBase, UriKind.Absolute, out var allowedUri))
-        {
-            return string.Equals(host, allowedUri.Host, StringComparison.OrdinalIgnoreCase);
-        }
-
-        return false;
+        if (!__state || __instance == null || _cachedUwrAbortMethod == null) return;
+        try { _cachedUwrAbortMethod.Invoke(__instance, null); }
+        catch (Exception ex) { DiagLog.SwallowOnce("CloudGuard.UwrAbort", ex); }
     }
+
+    internal static bool IsAllowedHost(Uri uri)
+        => CloudGuardUrlFilterCore.IsAllowedUri(uri, BazaarLauncherPlugin.ServerBase?.Value);
 
     private static void RecordBlocked(string url)
     {

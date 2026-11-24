@@ -186,7 +186,8 @@ public sealed partial class Persistence
         DateTime? StartedAt,
         DateTime ExpiresAt,
         DateTime? EndedAt,
-        DateTime UpdatedAt);
+        DateTime UpdatedAt,
+        DateTime? InviteTokenExpiresAtUtc = null);
 
     public sealed record TournamentLobbyMemberRow(
         string LobbyId,
@@ -247,7 +248,7 @@ public sealed partial class Persistence
                     INSERT INTO tournament_lobbies (
                         lobby_id, code, name, kind, play_mode, mode_id, preset_id, mutators_json,
                         host_account_id, host_username, player_cap, is_public,
-                        has_password, password_hash, is_invite_only, invite_token_hash,
+                        has_password, password_hash, is_invite_only, invite_token_hash, invite_token_expires_at,
                         exclude_host_from_gameplay, state, tournament_session_id,
                         round_countdown_seconds, accel_round_countdown_seconds,
                         rules_json, banned_encounter_ids_json, round_barriers_json, matchmaker_state_json,
@@ -255,7 +256,7 @@ public sealed partial class Persistence
                     ) VALUES (
                         $lid, $code, $name, $kind, $pm, $mid, $pid, $mut,
                         $haid, $huser, $cap, $pub,
-                        $hpw, $pwh, $inv, $invh,
+                        $hpw, $pwh, $inv, $invh, $inve,
                         $exh, $st, $tsid,
                         $rcs, $arcs,
                         $rjson, $bjson, $rbjson, $mmjson,
@@ -276,6 +277,7 @@ public sealed partial class Persistence
                         password_hash = excluded.password_hash,
                         is_invite_only = excluded.is_invite_only,
                         invite_token_hash = excluded.invite_token_hash,
+                        invite_token_expires_at = excluded.invite_token_expires_at,
                         state = excluded.state,
                         tournament_session_id = excluded.tournament_session_id,
                         round_countdown_seconds = excluded.round_countdown_seconds,
@@ -305,6 +307,7 @@ public sealed partial class Persistence
                 cmd.Parameters.AddWithValue("$pwh", lobby.PasswordHash ?? "");
                 cmd.Parameters.AddWithValue("$inv", lobby.IsInviteOnly ? 1 : 0);
                 cmd.Parameters.AddWithValue("$invh", lobby.InviteTokenHash ?? "");
+                cmd.Parameters.AddWithValue("$inve", lobby.InviteTokenExpiresAtUtc?.ToUniversalTime().ToString("O") ?? "");
                 cmd.Parameters.AddWithValue("$exh", lobby.ExcludeHostFromGameplay ? 1 : 0);
                 cmd.Parameters.AddWithValue("$st", lobby.State);
                 cmd.Parameters.AddWithValue("$tsid", lobby.TournamentSessionId ?? "");
@@ -432,7 +435,8 @@ public sealed partial class Persistence
                            exclude_host_from_gameplay, state, tournament_session_id,
                            round_countdown_seconds, accel_round_countdown_seconds,
                            rules_json, banned_encounter_ids_json, round_barriers_json, matchmaker_state_json,
-                           created_at, started_at, expires_at, ended_at, updated_at
+                           created_at, started_at, expires_at, ended_at, updated_at,
+                           invite_token_expires_at
                     FROM tournament_lobbies
                     WHERE state IN ('waiting', 'countdown', 'started')
                       AND expires_at > $now
@@ -454,7 +458,8 @@ public sealed partial class Persistence
                         string.IsNullOrWhiteSpace(r.GetString(26)) ? null : ParseUtc(r.GetString(26)),
                         ParseUtc(r.GetString(27)),
                         string.IsNullOrWhiteSpace(r.GetString(28)) ? null : ParseUtc(r.GetString(28)),
-                        ParseUtc(r.GetString(29))));
+                        ParseUtc(r.GetString(29)),
+                        r.IsDBNull(30) || string.IsNullOrWhiteSpace(r.GetString(30)) ? null : ParseUtc(r.GetString(30))));
                 }
             }
 
@@ -494,6 +499,75 @@ public sealed partial class Persistence
         });
     }
 
+    /// <summary>
+    /// 字段级单槽原子更新锦标赛锁板快照（P0-39）：
+    /// - P1 锁板绝不覆写 p2_locked_board_json，P2 锁板绝不覆写 p1_locked_board_json；
+    /// - 绝不触碰已裁决的胜负/伤害/回放字段，且在 winner_account_id != '' 后拒绝任何迟到锁板篡改。
+    /// </summary>
+    public void UpsertTournamentLockedBoard(
+        string lobbyId,
+        uint day,
+        string pairKey,
+        string p1AccountId,
+        string p1Username,
+        bool p1IsBot,
+        string p2AccountId,
+        string p2Username,
+        bool p2IsBot,
+        bool isSyntheticSparring,
+        int battleSeed,
+        bool isP1,
+        string lockedBoardJson)
+    {
+        ExecuteWrite((conn, tx) =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                INSERT INTO tournament_matchups (
+                    lobby_id, day, pair_key,
+                    p1_account_id, p1_username, p1_is_bot,
+                    p2_account_id, p2_username, p2_is_bot,
+                    is_synthetic_sparring, battle_seed,
+                    p1_locked_board_json, p2_locked_board_json,
+                    winner_account_id, loser_account_id, loser_prestige_damage,
+                    is_auto_resolved, replay_id, resolved_at
+                ) VALUES (
+                    $lid, $day, $pk,
+                    $p1id, $p1u, $p1b,
+                    $p2id, $p2u, $p2b,
+                    $syn, $seed,
+                    $p1lb, $p2lb,
+                    '', '', 0, 0, '', ''
+                )
+                ON CONFLICT(lobby_id, day, pair_key) DO UPDATE SET
+                    p1_locked_board_json = CASE
+                        WHEN $isP1 = 1 AND tournament_matchups.winner_account_id = '' THEN excluded.p1_locked_board_json
+                        ELSE tournament_matchups.p1_locked_board_json
+                    END,
+                    p2_locked_board_json = CASE
+                        WHEN $isP1 = 0 AND tournament_matchups.winner_account_id = '' THEN excluded.p2_locked_board_json
+                        ELSE tournament_matchups.p2_locked_board_json
+                    END;
+                """;
+            cmd.Parameters.AddWithValue("$lid", lobbyId);
+            cmd.Parameters.AddWithValue("$day", (int)day);
+            cmd.Parameters.AddWithValue("$pk", pairKey);
+            cmd.Parameters.AddWithValue("$p1id", p1AccountId);
+            cmd.Parameters.AddWithValue("$p1u", p1Username);
+            cmd.Parameters.AddWithValue("$p1b", p1IsBot ? 1 : 0);
+            cmd.Parameters.AddWithValue("$p2id", p2AccountId);
+            cmd.Parameters.AddWithValue("$p2u", p2Username);
+            cmd.Parameters.AddWithValue("$p2b", p2IsBot ? 1 : 0);
+            cmd.Parameters.AddWithValue("$syn", isSyntheticSparring ? 1 : 0);
+            cmd.Parameters.AddWithValue("$seed", battleSeed);
+            cmd.Parameters.AddWithValue("$p1lb", isP1 ? (lockedBoardJson ?? "") : "");
+            cmd.Parameters.AddWithValue("$p2lb", !isP1 ? (lockedBoardJson ?? "") : "");
+            cmd.Parameters.AddWithValue("$isP1", isP1 ? 1 : 0);
+            cmd.ExecuteNonQuery();
+        });
+    }
+
     public void UpsertTournamentMatchup(TournamentMatchupRow row)
     {
         ExecuteWrite((conn, tx) =>
@@ -519,14 +593,14 @@ public sealed partial class Persistence
                     $auto, $rep, $res
                 )
                 ON CONFLICT(lobby_id, day, pair_key) DO UPDATE SET
-                    p1_locked_board_json = CASE WHEN excluded.p1_locked_board_json != '' THEN excluded.p1_locked_board_json ELSE tournament_matchups.p1_locked_board_json END,
-                    p2_locked_board_json = CASE WHEN excluded.p2_locked_board_json != '' THEN excluded.p2_locked_board_json ELSE tournament_matchups.p2_locked_board_json END,
+                    p1_locked_board_json = CASE WHEN tournament_matchups.p1_locked_board_json != '' THEN tournament_matchups.p1_locked_board_json ELSE excluded.p1_locked_board_json END,
+                    p2_locked_board_json = CASE WHEN tournament_matchups.p2_locked_board_json != '' THEN tournament_matchups.p2_locked_board_json ELSE excluded.p2_locked_board_json END,
                     winner_account_id = CASE WHEN tournament_matchups.winner_account_id != '' THEN tournament_matchups.winner_account_id ELSE excluded.winner_account_id END,
-                    loser_account_id = CASE WHEN tournament_matchups.loser_account_id != '' THEN tournament_matchups.loser_account_id ELSE excluded.loser_account_id END,
+                    loser_account_id = CASE WHEN tournament_matchups.winner_account_id != '' THEN tournament_matchups.loser_account_id ELSE excluded.loser_account_id END,
                     loser_prestige_damage = CASE WHEN tournament_matchups.winner_account_id != '' THEN tournament_matchups.loser_prestige_damage ELSE excluded.loser_prestige_damage END,
                     is_auto_resolved = CASE WHEN tournament_matchups.winner_account_id != '' THEN tournament_matchups.is_auto_resolved ELSE excluded.is_auto_resolved END,
-                    replay_id = CASE WHEN tournament_matchups.replay_id != '' THEN tournament_matchups.replay_id ELSE excluded.replay_id END,
-                    resolved_at = CASE WHEN tournament_matchups.resolved_at != '' THEN tournament_matchups.resolved_at ELSE excluded.resolved_at END;
+                    replay_id = CASE WHEN tournament_matchups.winner_account_id != '' THEN tournament_matchups.replay_id ELSE excluded.replay_id END,
+                    resolved_at = CASE WHEN tournament_matchups.winner_account_id != '' THEN tournament_matchups.resolved_at ELSE excluded.resolved_at END;
                 """;
             cmd.Parameters.AddWithValue("$lid", row.LobbyId);
             cmd.Parameters.AddWithValue("$day", (int)row.Day);
@@ -645,13 +719,13 @@ public sealed partial class Persistence
     {
         ExecuteWrite((conn, tx) =>
         {
-            // 若为每日挑战，检查该账号今天是否已有过一次完赛记录
+            // D6-P1-11：严格按同一 board_key + LOWER(account_id) 判定首次尝试（保证昨日/他榜完赛不污染今日 daily:* 首次判定）
             bool isFirst = row.IsFirstAttempt;
             if (isFirst && row.BoardKey.StartsWith("daily:", StringComparison.OrdinalIgnoreCase))
             {
                 using var chk = conn.CreateCommand();
                 chk.Transaction = tx;
-                chk.CommandText = "SELECT COUNT(*) FROM mode_leaderboards WHERE board_key = $bk AND account_id = $aid AND run_id != $rid;";
+                chk.CommandText = "SELECT COUNT(*) FROM mode_leaderboards WHERE board_key = $bk AND LOWER(account_id) = LOWER($aid) AND run_id != $rid;";
                 chk.Parameters.AddWithValue("$bk", row.BoardKey);
                 chk.Parameters.AddWithValue("$aid", row.AccountId);
                 chk.Parameters.AddWithValue("$rid", row.RunId);
@@ -677,6 +751,7 @@ public sealed partial class Persistence
                     score = MAX(mode_leaderboards.score, excluded.score),
                     primary_metric = MAX(mode_leaderboards.primary_metric, excluded.primary_metric),
                     secondary_metric = MAX(mode_leaderboards.secondary_metric, excluded.secondary_metric),
+                    elapsed_seconds = CASE WHEN excluded.elapsed_seconds > 0 THEN excluded.elapsed_seconds ELSE mode_leaderboards.elapsed_seconds END,
                     day_reached = MAX(mode_leaderboards.day_reached, excluded.day_reached),
                     victories = MAX(mode_leaderboards.victories, excluded.victories),
                     defeats = excluded.defeats,
@@ -725,10 +800,11 @@ public sealed partial class Persistence
             if (firstAttemptOnly)
                 where += " AND is_first_attempt = 1";
 
+            // D6-P1-11：按 LOWER(account_id) 窗口函数取每账号历史最高分 1 席，total 为去重账号总数
             int total;
             using (var cnt = conn.CreateCommand())
             {
-                cnt.CommandText = $"SELECT COUNT(*) FROM mode_leaderboards {where};";
+                cnt.CommandText = $"SELECT COUNT(DISTINCT LOWER(account_id)) FROM mode_leaderboards {where};";
                 cnt.Parameters.AddWithValue("$bk", boardKey);
                 if (!string.IsNullOrWhiteSpace(heroFilter))
                     cnt.Parameters.AddWithValue("$hero", heroFilter.Trim());
@@ -739,13 +815,25 @@ public sealed partial class Persistence
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = $"""
+                    WITH ranked_per_account AS (
+                        SELECT id, board_key, season_id, mode_id, account_id, username, hero, run_id,
+                               score, primary_metric, secondary_metric, elapsed_seconds,
+                               day_reached, victories, defeats, prestige, is_first_attempt,
+                               mutators_json, summary_board_json, achieved_at,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY LOWER(account_id)
+                                   ORDER BY score DESC, primary_metric DESC, secondary_metric DESC, elapsed_seconds ASC, achieved_at ASC, id ASC
+                               ) AS rn
+                        FROM mode_leaderboards
+                        {where}
+                    )
                     SELECT id, board_key, season_id, mode_id, account_id, username, hero, run_id,
                            score, primary_metric, secondary_metric, elapsed_seconds,
                            day_reached, victories, defeats, prestige, is_first_attempt,
                            mutators_json, summary_board_json, achieved_at
-                    FROM mode_leaderboards
-                    {where}
-                    ORDER BY score DESC, primary_metric DESC, secondary_metric DESC, elapsed_seconds ASC, achieved_at ASC
+                    FROM ranked_per_account
+                    WHERE rn = 1
+                    ORDER BY score DESC, primary_metric DESC, secondary_metric DESC, elapsed_seconds ASC, achieved_at ASC, id ASC
                     LIMIT $lim OFFSET $off;
                     """;
                 cmd.Parameters.AddWithValue("$bk", boardKey);
@@ -775,51 +863,45 @@ public sealed partial class Persistence
             if (firstAttemptOnly)
                 extraWhere += " AND is_first_attempt = 1";
 
-            LeaderboardEntryRow? best = null;
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = $"""
+            // D6-P1-11：myBest 与 myRank 均基于同一去重窗口 CTE，保证 myRank 与去重榜单名次 100% 一致
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = $"""
+                WITH best_per_account AS (
                     SELECT id, board_key, season_id, mode_id, account_id, username, hero, run_id,
                            score, primary_metric, secondary_metric, elapsed_seconds,
                            day_reached, victories, defeats, prestige, is_first_attempt,
-                           mutators_json, summary_board_json, achieved_at
+                           mutators_json, summary_board_json, achieved_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY LOWER(account_id)
+                               ORDER BY score DESC, primary_metric DESC, secondary_metric DESC, elapsed_seconds ASC, achieved_at ASC, id ASC
+                           ) AS rn
                     FROM mode_leaderboards
-                    WHERE board_key = $bk AND LOWER(account_id) = LOWER($aid){extraWhere}
-                    ORDER BY score DESC, primary_metric DESC, secondary_metric DESC, elapsed_seconds ASC, achieved_at ASC
-                    LIMIT 1;
-                    """;
-                cmd.Parameters.AddWithValue("$bk", boardKey);
-                cmd.Parameters.AddWithValue("$aid", accountId);
-                if (!string.IsNullOrWhiteSpace(heroFilter))
-                    cmd.Parameters.AddWithValue("$hero", heroFilter.Trim());
-                using var r = cmd.ExecuteReader();
-                if (r.Read()) best = ReadLeaderboardRow(r);
-            }
-
-            if (best == null) return (null, 0);
-
-            using var rankCmd = conn.CreateCommand();
-            rankCmd.CommandText = $"""
-                SELECT COUNT(*) + 1
-                FROM mode_leaderboards
-                WHERE board_key = $bk{extraWhere}
-                  AND (
-                      score > $sc
-                      OR (score = $sc AND primary_metric > $pm)
-                      OR (score = $sc AND primary_metric = $pm AND secondary_metric > $sm)
-                      OR (score = $sc AND primary_metric = $pm AND secondary_metric = $sm AND elapsed_seconds < $es)
-                      OR (score = $sc AND primary_metric = $pm AND secondary_metric = $sm AND elapsed_seconds = $es AND achieved_at < $at)
-                  );
+                    WHERE board_key = $bk{extraWhere}
+                ),
+                ordered_board AS (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               ORDER BY score DESC, primary_metric DESC, secondary_metric DESC, elapsed_seconds ASC, achieved_at ASC, id ASC
+                           ) AS board_rank
+                    FROM best_per_account
+                    WHERE rn = 1
+                )
+                SELECT id, board_key, season_id, mode_id, account_id, username, hero, run_id,
+                       score, primary_metric, secondary_metric, elapsed_seconds,
+                       day_reached, victories, defeats, prestige, is_first_attempt,
+                       mutators_json, summary_board_json, achieved_at, board_rank
+                FROM ordered_board
+                WHERE LOWER(account_id) = LOWER($aid)
+                LIMIT 1;
                 """;
-            rankCmd.Parameters.AddWithValue("$bk", boardKey);
+            cmd.Parameters.AddWithValue("$bk", boardKey);
+            cmd.Parameters.AddWithValue("$aid", accountId);
             if (!string.IsNullOrWhiteSpace(heroFilter))
-                rankCmd.Parameters.AddWithValue("$hero", heroFilter.Trim());
-            rankCmd.Parameters.AddWithValue("$sc", best.Score);
-            rankCmd.Parameters.AddWithValue("$pm", best.PrimaryMetric);
-            rankCmd.Parameters.AddWithValue("$sm", best.SecondaryMetric);
-            rankCmd.Parameters.AddWithValue("$es", best.ElapsedSeconds);
-            rankCmd.Parameters.AddWithValue("$at", best.AchievedAt.ToString("O"));
-            int rank = Convert.ToInt32(rankCmd.ExecuteScalar());
+                cmd.Parameters.AddWithValue("$hero", heroFilter.Trim());
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return (null, 0);
+            var best = ReadLeaderboardRow(r);
+            int rank = r.GetInt32(20);
             return (best, rank);
         });
     }
@@ -874,7 +956,8 @@ public sealed partial class Persistence
         string P2BoardJson,
         string TimelineSummaryJson,
         bool HasCombatSimBlob,
-        DateTime CreatedAt);
+        DateTime CreatedAt,
+        string VisualBindingsJson = "");
 
     public static byte[]? CompressReplayPayload(byte[]? rawMsgPack)
     {
@@ -924,7 +1007,8 @@ public sealed partial class Persistence
                     p2_account_id, p2_username, p2_hero,
                     winner_side, duration_ms, p1_remaining_hp, p2_remaining_hp,
                     p1_damage_dealt, p2_damage_dealt,
-                    p1_board_json, p2_board_json, timeline_summary_json, combat_sim_gzip, created_at
+                    p1_board_json, p2_board_json, timeline_summary_json, combat_sim_gzip, created_at,
+                    visual_bindings_json
                 ) VALUES (
                     $rep, $run, $lid, $tsid, $mid, $ct,
                     $d, $h, $seed,
@@ -932,11 +1016,13 @@ public sealed partial class Persistence
                     $p2id, $p2u, $p2h,
                     $ws, $dur, $p1hp, $p2hp,
                     $p1dmg, $p2dmg,
-                    $p1b, $p2b, $tsum, $blob, $ca
+                    $p1b, $p2b, $tsum, $blob, $ca,
+                    $vbj
                 )
                 ON CONFLICT(replay_id) DO UPDATE SET
                     timeline_summary_json = excluded.timeline_summary_json,
-                    combat_sim_gzip = COALESCE(excluded.combat_sim_gzip, match_history_and_replays.combat_sim_gzip);
+                    combat_sim_gzip = COALESCE(excluded.combat_sim_gzip, match_history_and_replays.combat_sim_gzip),
+                    visual_bindings_json = CASE WHEN excluded.visual_bindings_json != '' THEN excluded.visual_bindings_json ELSE match_history_and_replays.visual_bindings_json END;
                 """;
             cmd.Parameters.AddWithValue("$rep", row.ReplayId);
             cmd.Parameters.AddWithValue("$run", row.RunId ?? "");
@@ -964,6 +1050,7 @@ public sealed partial class Persistence
             cmd.Parameters.AddWithValue("$tsum", string.IsNullOrWhiteSpace(row.TimelineSummaryJson) ? "{}" : row.TimelineSummaryJson);
             cmd.Parameters.AddWithValue("$blob", gzBlob != null ? gzBlob : DBNull.Value);
             cmd.Parameters.AddWithValue("$ca", row.CreatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$vbj", row.VisualBindingsJson ?? "");
             cmd.ExecuteNonQuery();
         });
     }
@@ -996,7 +1083,7 @@ public sealed partial class Persistence
                        p1_damage_dealt, p2_damage_dealt,
                        p1_board_json, p2_board_json, timeline_summary_json,
                        CASE WHEN combat_sim_gzip IS NOT NULL THEN 1 ELSE 0 END,
-                       created_at
+                       created_at, visual_bindings_json
                 FROM match_history_and_replays
                 {where}
                 ORDER BY created_at DESC
@@ -1032,7 +1119,7 @@ public sealed partial class Persistence
                        p1_damage_dealt, p2_damage_dealt,
                        p1_board_json, p2_board_json, timeline_summary_json,
                        CASE WHEN combat_sim_gzip IS NOT NULL THEN 1 ELSE 0 END,
-                       created_at
+                       created_at, visual_bindings_json
                 FROM match_history_and_replays
                 {where}
                 ORDER BY day DESC, created_at DESC
@@ -1064,7 +1151,7 @@ public sealed partial class Persistence
                        p1_damage_dealt, p2_damage_dealt,
                        p1_board_json, p2_board_json, timeline_summary_json,
                        CASE WHEN combat_sim_gzip IS NOT NULL THEN 1 ELSE 0 END,
-                       created_at
+                       created_at, visual_bindings_json
                 FROM match_history_and_replays
                 {where}
                 ORDER BY created_at DESC
@@ -1092,7 +1179,7 @@ public sealed partial class Persistence
                        p1_damage_dealt, p2_damage_dealt,
                        p1_board_json, p2_board_json, timeline_summary_json,
                        CASE WHEN combat_sim_gzip IS NOT NULL THEN 1 ELSE 0 END,
-                       created_at
+                       created_at, visual_bindings_json
                 FROM match_history_and_replays
                 WHERE replay_id = $rid LIMIT 1;
                 """;
@@ -1158,7 +1245,8 @@ public sealed partial class Persistence
         r.GetString(22),
         r.GetString(23),
         r.GetInt32(24) != 0,
-        ParseUtc(r.GetString(25)));
+        ParseUtc(r.GetString(25)),
+        r.FieldCount > 26 && !r.IsDBNull(26) ? r.GetString(26) : "");
 
     // ── 5. 聊天与系统播报表 (chat_messages) ─────────────────────────────────
 
@@ -1267,7 +1355,7 @@ public sealed partial class Persistence
                 cmd.CommandText = """
                     SELECT id, channel_type, channel_id, msg_type, sender_id, sender_name, content, meta_json, created_at
                     FROM chat_messages
-                    WHERE (channel_type = 'system' OR msg_type LIKE 'system_%') AND id > $since
+                    WHERE channel_type = 'system' AND id > $since
                     ORDER BY id ASC
                     LIMIT $lim;
                     """;
@@ -1280,7 +1368,7 @@ public sealed partial class Persistence
                     FROM (
                         SELECT id, channel_type, channel_id, msg_type, sender_id, sender_name, content, meta_json, created_at
                         FROM chat_messages
-                        WHERE channel_type = 'system' OR msg_type LIKE 'system_%'
+                        WHERE channel_type = 'system'
                         ORDER BY id DESC
                         LIMIT $lim
                     ) ORDER BY id ASC;

@@ -26,6 +26,7 @@ namespace BazaarCore.Tests;
 /// V7 Official Parity 全链路集成测试：
 /// 覆盖 Wave 1 四大模块 + Wave 2 RunEngine 跨模块钩子的真实端到端行为。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V7IntegrationTests
 {
     private const string SwashBuckleId = "69688b74-fd2b-42a2-a018-2b720a13f95a";
@@ -56,232 +57,47 @@ public sealed class V7IntegrationTests
     private static readonly Lazy<GameFixture> RealFixture = new(LoadRealFixture);
 
     private static string ResolveDataDir()
-    {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 10 && !string.IsNullOrEmpty(dir); i++)
-        {
-            string candidate = Path.Combine(dir, "dist", "data");
-            if (File.Exists(Path.Combine(candidate, "GameData.db")))
-                return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-
-        const string fallback = @"e:\thebazaar\dist\data";
-        if (File.Exists(Path.Combine(fallback, "GameData.db")))
-            return fallback;
-
-        throw new FileNotFoundException("未找到 dist/data/GameData.db");
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataDir();
 
     private static GameFixture LoadRealFixture()
     {
-        string dataDir = ResolveDataDir();
-        string dbPath = Path.Combine(dataDir, "GameData.db");
-
-        var rawCards = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var rawMonsters = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var rawModes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var rawLevels = new Dictionary<int, string>();
-
-        using (var conn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly"))
-        {
-            conn.Open();
-            ReadBlobTable(conn, "cards", rawCards);
-            ReadBlobTable(conn, "monsters", rawMonsters);
-            ReadBlobTable(conn, "game_modes", rawModes);
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = "SELECT Id, Data FROM level_ups";
-            using var r = cmd.ExecuteReader();
-            while (r.Read())
-                rawLevels[r.GetInt32(0)] = Encoding.UTF8.GetString((byte[])r.GetValue(1));
-        }
-
-        var validIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        string wlPath = Path.Combine(dataDir, "valid_card_ids.json");
-        if (File.Exists(wlPath))
-        {
-            using var doc = JsonDocument.Parse(File.ReadAllText(wlPath));
-            if (doc.RootElement.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var el in doc.RootElement.EnumerateArray())
-                    if (el.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(el.GetString()))
-                        validIds.Add(el.GetString()!);
-            }
-            else if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                     doc.RootElement.TryGetProperty("valid_ids", out var arr) &&
-                     arr.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var el in arr.EnumerateArray())
-                    if (el.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(el.GetString()))
-                        validIds.Add(el.GetString()!);
-            }
-        }
-
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
         return new GameFixture
         {
-            DataDir = dataDir,
-            DbPath = dbPath,
-            Pool = CardPool.Load(dbPath),
-            Monsters = MonsterPool.Load(dbPath),
-            LevelUps = LevelUpTable.Load(dbPath),
-            Mode = GameModeConfig.Load(dbPath),
-            Repo = GameDatabaseLoader.Load(dbPath, null),
-            Ghosts = PvpGhostPool.Load(dataDir),
-            RawCardsJson = rawCards,
-            RawMonstersJson = rawMonsters,
-            RawGameModesJson = rawModes,
-            RawLevelUpsJson = rawLevels,
-            ValidCardIds = validIds,
+            DataDir = shared.DataDir,
+            DbPath = shared.DbPath,
+            Pool = shared.Pool,
+            Monsters = shared.CreateMonstersCopy(),
+            LevelUps = shared.LevelUps,
+            Mode = shared.Mode,
+            Repo = shared.Repo,
+            Ghosts = shared.Ghosts,
+            ValidCardIds = shared.CreateValidCardIdsCopy(),
         };
-    }
-
-    private static void ReadBlobTable(SqliteConnection conn, string table, Dictionary<string, string> dst)
-    {
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = $"SELECT Id, Data FROM {table}";
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
-            dst[r.GetString(0)] = Encoding.UTF8.GetString((byte[])r.GetValue(1));
     }
 
     private sealed class OverlayContext : IDisposable
     {
-        public string TempDir { get; }
-        public string DbPath { get; }
-        public CardPool Pool { get; }
-        public List<BazaarServer.Data.MonsterTemplate> Monsters { get; }
-        public LevelUpTable LevelUps { get; }
-        public GameModeConfig Mode { get; }
-        public GameDataRepository Repo { get; }
-        public PvpGhostPool Ghosts { get; }
+        private readonly TestInfrastructure.SharedTestOverlay _inner;
+        public string TempDir => _inner.TempDir;
+        public string DbPath => TestInfrastructure.SharedGameDataFixture.Shared.DbPath;
+        public CardPool Pool => _inner.Pool;
+        public List<BazaarServer.Data.MonsterTemplate> Monsters => _inner.Monsters;
+        public LevelUpTable LevelUps => _inner.LevelUps;
+        public GameModeConfig Mode => _inner.Mode;
+        public GameDataRepository Repo => _inner.Repo;
+        public PvpGhostPool Ghosts => _inner.Ghosts;
 
         public OverlayContext(
             IEnumerable<(string Id, string Json)> customCards,
             IEnumerable<(int Level, string Json)>? customLevelUps = null)
         {
-            var real = RealFixture.Value;
-            TempDir = Path.Combine(Path.GetTempPath(), "bazaar_v7_int_" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(TempDir);
-            DbPath = Path.Combine(TempDir, "GameData.db");
-
-            var wl = new HashSet<string>(real.ValidCardIds, StringComparer.OrdinalIgnoreCase);
-
-            using (var conn = new SqliteConnection($"Data Source={DbPath}"))
-            {
-                conn.Open();
-                using var create = conn.CreateCommand();
-                create.CommandText = """
-                    CREATE TABLE cards (Id TEXT NOT NULL PRIMARY KEY, Data BLOB NOT NULL) STRICT, WITHOUT ROWID;
-                    CREATE TABLE challenges (Id TEXT NOT NULL PRIMARY KEY, Data BLOB NOT NULL) STRICT, WITHOUT ROWID;
-                    CREATE TABLE collectibles (Id TEXT NOT NULL PRIMARY KEY, Data BLOB NOT NULL) STRICT, WITHOUT ROWID;
-                    CREATE TABLE game_modes (Id TEXT NOT NULL PRIMARY KEY, Data BLOB NOT NULL) STRICT, WITHOUT ROWID;
-                    CREATE TABLE level_ups (Id INTEGER NOT NULL PRIMARY KEY, Data BLOB NOT NULL) STRICT, WITHOUT ROWID;
-                    CREATE TABLE monsters (Id TEXT NOT NULL PRIMARY KEY, Data BLOB NOT NULL) STRICT, WITHOUT ROWID;
-                    CREATE TABLE seasons (Id TEXT NOT NULL PRIMARY KEY, Data BLOB NOT NULL) STRICT, WITHOUT ROWID;
-                    CREATE TABLE tooltips (Id TEXT NOT NULL PRIMARY KEY, Data BLOB NOT NULL) STRICT, WITHOUT ROWID;
-                    """;
-                create.ExecuteNonQuery();
-
-                using var tx = conn.BeginTransaction();
-                foreach (var kv in real.RawGameModesJson)
-                    InsertTextRow(conn, tx, "game_modes", kv.Key, kv.Value);
-                foreach (var kv in real.RawMonstersJson)
-                    InsertTextRow(conn, tx, "monsters", kv.Key, kv.Value);
-                foreach (var kv in real.RawLevelUpsJson)
-                    InsertIntRow(conn, tx, "level_ups", kv.Key, kv.Value);
-
-                var seedCardIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    SwashBuckleId, CutlassId, RedGumballId, ChocolateBarId,
-                    PolShopId, RegalBladeId, FatesTemplateId, ShopEngine.Hour6PvpCardId,
-                    CardPool.JungleExpeditionTicketId, CardPool.CrashSiteExpeditionTicketId, CardPool.TinyWorldExpeditionTicketId,
-                    CardPool.JungleExpeditionRoomId, CardPool.CrashSiteExpeditionRoomId, CardPool.TinyWorldExpeditionRoomId,
-                    "99ac6ab3-0b14-44c3-b7f9-21e008291b85",
-                    "c0f1cad2-8561-475a-9e08-a88e8bd62d04",
-                    "cfaef293-1d93-4be9-8cf1-0baf3eee6dbb",
-                    "c01612a6-574c-4b17-8b2b-68b92f2c07c5",
-                    "b594f459-30db-442f-aa19-62804e466e43",
-                    "23380916-567d-4a87-b393-4ca5c49b74ba",
-                    "cee40d90-51c7-4983-8616-e5fe51161025",
-                    "bf424d49-9d37-431e-8686-426004f181be",
-                    "dd328ec0-7452-43d8-9d85-559b70947a91",
-                    "021639c0-4a9c-49d8-8254-6376994823e2",
-                };
-                foreach (var sk in real.Pool.Skills("Vanessa").Take(10))
-                    seedCardIds.Add(sk.Id);
-                foreach (var ev in real.Pool.HourlyEncounters("Vanessa", "EventEncounter").Take(12))
-                    seedCardIds.Add(ev.Id);
-                foreach (var it in real.Pool.ShopItems("Vanessa").Where(c => c.Size == "Large").Take(12))
-                    seedCardIds.Add(it.Id);
-                foreach (var it in real.Pool.ShopItems("Vanessa").Take(10))
-                    seedCardIds.Add(it.Id);
-                foreach (var cbt in real.Pool.OfType("CombatEncounter").Take(10))
-                    seedCardIds.Add(cbt.Id);
-
-                foreach (string sid in seedCardIds)
-                {
-                    if (real.RawCardsJson.TryGetValue(sid, out string? raw))
-                        InsertTextRow(conn, tx, "cards", sid, raw);
-                }
-
-                foreach (var (id, json) in customCards)
-                {
-                    InsertTextRow(conn, tx, "cards", id, json);
-                    wl.Add(id);
-                }
-
-                if (customLevelUps != null)
-                {
-                    foreach (var (lvl, json) in customLevelUps)
-                        InsertIntRow(conn, tx, "level_ups", lvl, json);
-                }
-
-                tx.Commit();
-            }
-
-            File.WriteAllText(Path.Combine(TempDir, "valid_card_ids.json"), JsonSerializer.Serialize(wl.ToList()));
-
-            Pool = CardPool.Load(DbPath);
-            Monsters = MonsterPool.Load(DbPath);
-            LevelUps = customLevelUps != null ? LevelUpTable.Load(DbPath) : real.LevelUps;
-            Mode = GameModeConfig.Load(DbPath);
-            Repo = GameDatabaseLoader.Load(DbPath, null);
-            Ghosts = real.Ghosts;
+            _inner = TestInfrastructure.SharedGameDataFixture.Shared.CreateMemoryOverlay(
+                customCards: customCards,
+                customLevelUps: customLevelUps);
         }
 
-        private static void InsertTextRow(SqliteConnection conn, SqliteTransaction tx, string table, string id, string json)
-        {
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = tx;
-            cmd.CommandText = $"INSERT OR REPLACE INTO {table}(Id, Data) VALUES (@id, @data)";
-            cmd.Parameters.AddWithValue("@id", id);
-            cmd.Parameters.AddWithValue("@data", Encoding.UTF8.GetBytes(json));
-            cmd.ExecuteNonQuery();
-        }
-
-        private static void InsertIntRow(SqliteConnection conn, SqliteTransaction tx, string table, int id, string json)
-        {
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = tx;
-            cmd.CommandText = $"INSERT OR REPLACE INTO {table}(Id, Data) VALUES (@id, @data)";
-            cmd.Parameters.AddWithValue("@id", id);
-            cmd.Parameters.AddWithValue("@data", Encoding.UTF8.GetBytes(json));
-            cmd.ExecuteNonQuery();
-        }
-
-        public void Dispose()
-        {
-            SqliteConnection.ClearAllPools();
-            try
-            {
-                if (Directory.Exists(TempDir))
-                    Directory.Delete(TempDir, recursive: true);
-            }
-            catch
-            {
-                // 忽略临时清理异常
-            }
-        }
+        public void Dispose() => _inner.Dispose();
     }
 
     private static (RunState Run, RunEngine Engine) CreateStartedEngine(

@@ -4,9 +4,439 @@ using Newtonsoft.Json;
 
 namespace BazaarLauncher;
 
+internal sealed class StartingItemRule
+{
+    [JsonProperty("templateId")] public string TemplateId { get; set; } = string.Empty;
+    [JsonProperty("tier")] public string Tier { get; set; } = "Bronze";
+    [JsonProperty("enchantment")] public string Enchantment { get; set; }
+}
+
+internal sealed class StartingSkillRule
+{
+    [JsonProperty("templateId")] public string TemplateId { get; set; } = string.Empty;
+    [JsonProperty("tier")] public string Tier { get; set; } = "Bronze";
+}
+
 /// <summary>
-/// CustomGameplayUI 数据模型、规则摘要与零序列化手写深拷贝工具（修复 P1-1 每 0.15s 全量 JSON 克隆 GC 风暴，
-/// 并完整对齐 Wave 2/3 的 3 套预设档位 + 7 大玩法模式 + 14 条肉鸽突变词条）。
+/// 客户端多模式与自定义玩法规则集（完整对齐服务端 CustomRuleModels，支持 21 项 Wave 2/3 字段、边界钳制与零序列化手写深拷贝）。
+/// </summary>
+internal sealed class CustomRunRuleSet
+{
+    [JsonProperty("selectedArchetypeMask")] public ulong SelectedArchetypeMask { get; set; }
+    [JsonProperty("archetypeWeightMultiplier")] public double ArchetypeWeightMultiplier { get; set; } = 2.0;
+    [JsonProperty("archetypeMultiMatchCap")] public double ArchetypeMultiMatchCap { get; set; } = 3.0;
+    [JsonProperty("allowTendencySelection")] public bool AllowTendencySelection { get; set; } = true;
+    [JsonProperty("promptTendencyBeforeRun")] public bool PromptTendencyBeforeRun { get; set; } = true;
+    [JsonProperty("startingGold")] public int StartingGold { get; set; } = 15;
+    [JsonProperty("startingIncome")] public int StartingIncome { get; set; } = 5;
+    [JsonProperty("startingExperience")] public int StartingExperience { get; set; } = 3;
+    [JsonProperty("startingPrestige")] public int StartingPrestige { get; set; } = 20;
+    [JsonProperty("startingHealth")] public int StartingHealth { get; set; } = 300;
+    [JsonProperty("startingItems")] public List<StartingItemRule> StartingItems { get; set; } = new();
+    [JsonProperty("startingSkills")] public List<StartingSkillRule> StartingSkills { get; set; } = new();
+    [JsonProperty("monsterLootChooseOne")] public bool MonsterLootChooseOne { get; set; } = true;
+    [JsonProperty("encounterCategoryMultipliers")] public Dictionary<string, double> EncounterCategoryMultipliers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    [JsonProperty("bannedEncounterIds")] public List<string> BannedEncounterIds { get; set; } = new();
+    [JsonProperty("playerCap")] public int PlayerCap { get; set; } = 8;
+    [JsonProperty("botNonLethalPrestigeLock")] public bool BotNonLethalPrestigeLock { get; set; } = true;
+    [JsonProperty("humanMatchEvery4Rounds")] public bool HumanMatchEvery4Rounds { get; set; } = true;
+    [JsonProperty("lastHumanStandingMode")] public bool LastHumanStandingMode { get; set; } = true;
+    [JsonProperty("isCustomPowerModified")] public bool IsCustomPowerModified { get; set; }
+
+    // Wave 2/3 新增：预设档位 + 7 大模式 + 14 突变词条 + 经济/掉率/种子调参（完整对齐服务端 CustomRuleModels）
+    [JsonProperty("presetId")] public string PresetId { get; set; } = "PureOfficial";
+    [JsonProperty("specialModeId")] public string SpecialModeId { get; set; } = "Standard";
+    [JsonProperty("mutatorIds")] public List<string> MutatorIds { get; set; } = new();
+    [JsonProperty("dailyChallengeDate")] public string DailyChallengeDate { get; set; }
+    [JsonProperty("fixedRunSeed")] public int? FixedRunSeed { get; set; }
+    [JsonProperty("endlessMaxDay")] public int EndlessMaxDay { get; set; } = 99;
+    [JsonProperty("crossHeroOwnHeroBias")] public double CrossHeroOwnHeroBias { get; set; } = 0.40;
+    [JsonProperty("bossRushTotalWaves")] public int BossRushTotalWaves { get; set; } = 10;
+    [JsonProperty("bossRushIncludeMilestonePvp")] public bool BossRushIncludeMilestonePvp { get; set; } = true;
+    [JsonProperty("sandboxFreeInfiniteReroll")] public bool SandboxFreeInfiniteReroll { get; set; } = true;
+    [JsonProperty("sandboxZeroShopPrice")] public bool SandboxZeroShopPrice { get; set; } = false;
+    [JsonProperty("shopHighTierBonusPct")] public double ShopHighTierBonusPct { get; set; } = 0.0;
+    [JsonProperty("shopPriceMultiplier")] public double ShopPriceMultiplier { get; set; } = 1.0;
+    [JsonProperty("monsterLootBonusChoices")] public int MonsterLootBonusChoices { get; set; } = 0;
+    [JsonProperty("monsterLootTierBonus")] public int MonsterLootTierBonus { get; set; } = 0;
+    [JsonProperty("enemyStatMultiplier")] public double EnemyStatMultiplier { get; set; } = 1.0;
+    [JsonProperty("disableFatesRevive")] public bool DisableFatesRevive { get; set; } = false;
+    [JsonProperty("selectedModIds")] public List<string> SelectedModIds { get; set; } = new();
+
+    public void EnsureCollections()
+    {
+        StartingItems ??= new List<StartingItemRule>();
+        StartingSkills ??= new List<StartingSkillRule>();
+        EncounterCategoryMultipliers ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        BannedEncounterIds ??= new List<string>();
+        MutatorIds ??= new List<string>();
+        SelectedModIds ??= new List<string>();
+        if (string.IsNullOrWhiteSpace(PresetId)) PresetId = "PureOfficial";
+        if (string.IsNullOrWhiteSpace(SpecialModeId)) SpecialModeId = "Standard";
+    }
+
+    /// <summary>D6-P1-02：统一默认重置入口（彻底清空全部 Wave 2/3 扩展字段与旧预设残留）。</summary>
+    public void ResetToDefaults() => ResetToStandardValues(preserveArchetypeAndLobbyFlags: false);
+
+    public void ResetToStandardValues(bool preserveArchetypeAndLobbyFlags = false)
+    {
+        ulong mask = preserveArchetypeAndLobbyFlags ? SelectedArchetypeMask : 0UL;
+        bool allowTend = !preserveArchetypeAndLobbyFlags || AllowTendencySelection;
+        bool promptBefore = !preserveArchetypeAndLobbyFlags || PromptTendencyBeforeRun;
+        int cap = preserveArchetypeAndLobbyFlags ? Math.Clamp(PlayerCap, 2, 16) : 8;
+        bool botLock = !preserveArchetypeAndLobbyFlags || BotNonLethalPrestigeLock;
+        bool match4 = !preserveArchetypeAndLobbyFlags || HumanMatchEvery4Rounds;
+        bool lastHuman = !preserveArchetypeAndLobbyFlags || LastHumanStandingMode;
+
+        SelectedArchetypeMask = mask;
+        ArchetypeWeightMultiplier = 2.0;
+        ArchetypeMultiMatchCap = 3.0;
+        AllowTendencySelection = allowTend;
+        PromptTendencyBeforeRun = promptBefore;
+        StartingGold = 15;
+        StartingIncome = 5;
+        StartingExperience = 3;
+        StartingPrestige = 20;
+        StartingHealth = 300;
+        StartingItems = new List<StartingItemRule>();
+        StartingSkills = new List<StartingSkillRule>();
+        MonsterLootChooseOne = true;
+        EncounterCategoryMultipliers = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        BannedEncounterIds = new List<string>();
+        PlayerCap = cap;
+        BotNonLethalPrestigeLock = botLock;
+        HumanMatchEvery4Rounds = match4;
+        LastHumanStandingMode = lastHuman;
+        PresetId = "PureOfficial";
+        SpecialModeId = "Standard";
+        MutatorIds = new List<string>();
+        DailyChallengeDate = null;
+        FixedRunSeed = null;
+        EndlessMaxDay = 99;
+        CrossHeroOwnHeroBias = 0.40;
+        BossRushTotalWaves = 10;
+        BossRushIncludeMilestonePvp = true;
+        SandboxFreeInfiniteReroll = true;
+        SandboxZeroShopPrice = false;
+        ShopHighTierBonusPct = 0.0;
+        ShopPriceMultiplier = 1.0;
+        MonsterLootBonusChoices = 0;
+        MonsterLootTierBonus = 0;
+        EnemyStatMultiplier = 1.0;
+        DisableFatesRevive = false;
+        SelectedModIds = new List<string>();
+        IsCustomPowerModified = false;
+    }
+
+    /// <summary>D6-P1-02/03：对齐服务端 CustomRuleModels.CloneNormalized() 的全部数值上下界与 PlayerCap(2..16)。</summary>
+    public void NormalizeBounds()
+    {
+        EnsureCollections();
+        ArchetypeWeightMultiplier = Math.Clamp(ArchetypeWeightMultiplier, 1.0, 10.0);
+        ArchetypeMultiMatchCap = Math.Clamp(ArchetypeMultiMatchCap, 1.0, 10.0);
+        StartingGold = Math.Clamp(StartingGold, 0, 9999);
+        StartingIncome = Math.Clamp(StartingIncome, 0, 999);
+        StartingExperience = Math.Clamp(StartingExperience, 0, 999);
+        StartingPrestige = Math.Clamp(StartingPrestige, 1, 999);
+        StartingHealth = Math.Clamp(StartingHealth, 50, 99999);
+        PlayerCap = Math.Clamp(PlayerCap, 2, 16);
+        EndlessMaxDay = Math.Clamp(EndlessMaxDay, 15, 999);
+        CrossHeroOwnHeroBias = Math.Clamp(CrossHeroOwnHeroBias, 0.0, 1.0);
+        BossRushTotalWaves = Math.Clamp(BossRushTotalWaves, 5, 30);
+        ShopHighTierBonusPct = Math.Clamp(ShopHighTierBonusPct, -50.0, 100.0);
+        ShopPriceMultiplier = Math.Clamp(ShopPriceMultiplier, 0.1, 5.0);
+        MonsterLootBonusChoices = Math.Clamp(MonsterLootBonusChoices, 0, 5);
+        MonsterLootTierBonus = Math.Clamp(MonsterLootTierBonus, 0, 3);
+        EnemyStatMultiplier = Math.Clamp(EnemyStatMultiplier, 0.25, 5.0);
+        RefreshPowerFlag();
+    }
+
+    /// <summary>D6-P1-02：统一预设/特殊模式本地默认值应用（修正 SandboxLab.StartingExperience=3 并清理前模式残留列表）。</summary>
+    public void ApplyLocalPresetDefaults(string presetId, string specialModeId)
+    {
+        EnsureCollections();
+        string normPreset = string.IsNullOrWhiteSpace(presetId) ? "PureOfficial" : presetId.Trim();
+        string normMode = string.IsNullOrWhiteSpace(specialModeId) ? "Standard" : specialModeId.Trim();
+
+        PresetId = normPreset;
+        SpecialModeId = normMode;
+
+        // 切换模式/预设时清理旧模式残留词条、日期与固定种子（肉鸽词条模式保留用户当前勾选的 MutatorIds）
+        if (!string.Equals(normMode, "MutatorChallenge", StringComparison.OrdinalIgnoreCase))
+        {
+            MutatorIds.Clear();
+        }
+        if (!string.Equals(normMode, "DailyChallenge", StringComparison.OrdinalIgnoreCase))
+        {
+            DailyChallengeDate = null;
+        }
+        FixedRunSeed = null;
+
+        if (string.Equals(normMode, "SandboxLab", StringComparison.OrdinalIgnoreCase))
+        {
+            StartingGold = 999;
+            StartingIncome = 100;
+            StartingExperience = 3;
+            StartingHealth = 1000;
+            StartingPrestige = 99;
+            SandboxFreeInfiniteReroll = true;
+            SandboxZeroShopPrice = false;
+            ShopHighTierBonusPct = 0.0;
+            ShopPriceMultiplier = 1.0;
+            MonsterLootBonusChoices = 0;
+            MonsterLootTierBonus = 0;
+            EnemyStatMultiplier = 1.0;
+            DisableFatesRevive = false;
+            NormalizeBounds();
+            return;
+        }
+
+        if (string.Equals(normPreset, "EnhancedFun", StringComparison.OrdinalIgnoreCase))
+        {
+            StartingGold = 25;
+            StartingIncome = 7;
+            StartingExperience = 6;
+            StartingPrestige = 25;
+            StartingHealth = 350;
+            MonsterLootChooseOne = true;
+            MonsterLootBonusChoices = 1;
+            MonsterLootTierBonus = 0;
+            ShopHighTierBonusPct = 15.0;
+            ShopPriceMultiplier = 1.0;
+            EnemyStatMultiplier = 1.0;
+            DisableFatesRevive = false;
+            NormalizeBounds();
+            return;
+        }
+
+        if (string.Equals(normPreset, "ExtremeRoguelike", StringComparison.OrdinalIgnoreCase))
+        {
+            StartingGold = 12;
+            StartingIncome = 4;
+            StartingExperience = 3;
+            StartingPrestige = 12;
+            StartingHealth = 220;
+            MonsterLootChooseOne = true;
+            MonsterLootBonusChoices = 0;
+            MonsterLootTierBonus = 1;
+            ShopHighTierBonusPct = 20.0;
+            ShopPriceMultiplier = 1.10;
+            EnemyStatMultiplier = 1.25;
+            DisableFatesRevive = false;
+            NormalizeBounds();
+            return;
+        }
+
+        StartingGold = 15;
+        StartingIncome = 5;
+        StartingExperience = 3;
+        StartingPrestige = 20;
+        StartingHealth = 300;
+        MonsterLootChooseOne = true;
+        MonsterLootBonusChoices = 0;
+        MonsterLootTierBonus = 0;
+        ShopHighTierBonusPct = 0.0;
+        ShopPriceMultiplier = 1.0;
+        EnemyStatMultiplier = 1.0;
+        DisableFatesRevive = false;
+        NormalizeBounds();
+    }
+
+    public bool ComputeCustomPowerModified()
+    {
+        EnsureCollections();
+        if (!string.Equals(SpecialModeId, "Standard", StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(PresetId, "PureOfficial", StringComparison.OrdinalIgnoreCase)
+            || MutatorIds.Count > 0
+            || SelectedModIds.Count > 0)
+        {
+            return true;
+        }
+        if (StartingGold != 15 || StartingIncome != 5 || StartingExperience != 3
+            || StartingPrestige != 20 || StartingHealth != 300
+            || Math.Abs(ShopHighTierBonusPct) > 1e-6
+            || Math.Abs(ShopPriceMultiplier - 1.0) > 1e-6
+            || MonsterLootBonusChoices != 0
+            || MonsterLootTierBonus != 0
+            || Math.Abs(EnemyStatMultiplier - 1.0) > 1e-6
+            || DisableFatesRevive)
+        {
+            return true;
+        }
+        if (StartingItems.Count > 0 || StartingSkills.Count > 0) return true;
+        if (BannedEncounterIds.Count > 0) return true;
+        foreach (var kv in EncounterCategoryMultipliers)
+        {
+            if (kv.Value < 0.8 || kv.Value > 1.25) return true;
+        }
+        return false;
+    }
+
+    public void RefreshPowerFlag() => IsCustomPowerModified = ComputeCustomPowerModified();
+
+    /// <summary>高性能手写成员深拷贝（零 JSON 序列化 GC）。</summary>
+    public CustomRunRuleSet Clone()
+    {
+        EnsureCollections();
+        var copy = new CustomRunRuleSet
+        {
+            SelectedArchetypeMask = SelectedArchetypeMask,
+            ArchetypeWeightMultiplier = ArchetypeWeightMultiplier,
+            ArchetypeMultiMatchCap = ArchetypeMultiMatchCap,
+            AllowTendencySelection = AllowTendencySelection,
+            PromptTendencyBeforeRun = PromptTendencyBeforeRun,
+            StartingGold = StartingGold,
+            StartingIncome = StartingIncome,
+            StartingExperience = StartingExperience,
+            StartingPrestige = StartingPrestige,
+            StartingHealth = StartingHealth,
+            StartingItems = new List<StartingItemRule>(StartingItems.Count),
+            StartingSkills = new List<StartingSkillRule>(StartingSkills.Count),
+            MonsterLootChooseOne = MonsterLootChooseOne,
+            EncounterCategoryMultipliers = new Dictionary<string, double>(EncounterCategoryMultipliers, StringComparer.OrdinalIgnoreCase),
+            BannedEncounterIds = new List<string>(BannedEncounterIds),
+            PlayerCap = PlayerCap,
+            BotNonLethalPrestigeLock = BotNonLethalPrestigeLock,
+            HumanMatchEvery4Rounds = HumanMatchEvery4Rounds,
+            LastHumanStandingMode = LastHumanStandingMode,
+            PresetId = PresetId,
+            SpecialModeId = SpecialModeId,
+            MutatorIds = new List<string>(MutatorIds),
+            DailyChallengeDate = DailyChallengeDate,
+            FixedRunSeed = FixedRunSeed,
+            EndlessMaxDay = EndlessMaxDay,
+            CrossHeroOwnHeroBias = CrossHeroOwnHeroBias,
+            BossRushTotalWaves = BossRushTotalWaves,
+            BossRushIncludeMilestonePvp = BossRushIncludeMilestonePvp,
+            SandboxFreeInfiniteReroll = SandboxFreeInfiniteReroll,
+            SandboxZeroShopPrice = SandboxZeroShopPrice,
+            ShopHighTierBonusPct = ShopHighTierBonusPct,
+            ShopPriceMultiplier = ShopPriceMultiplier,
+            MonsterLootBonusChoices = MonsterLootBonusChoices,
+            MonsterLootTierBonus = MonsterLootTierBonus,
+            EnemyStatMultiplier = EnemyStatMultiplier,
+            DisableFatesRevive = DisableFatesRevive,
+            SelectedModIds = new List<string>(SelectedModIds),
+        };
+
+        for (int i = 0; i < StartingItems.Count; i++)
+        {
+            var it = StartingItems[i];
+            if (it != null)
+            {
+                copy.StartingItems.Add(new StartingItemRule
+                {
+                    TemplateId = it.TemplateId,
+                    Tier = it.Tier,
+                    Enchantment = it.Enchantment,
+                });
+            }
+        }
+
+        for (int i = 0; i < StartingSkills.Count; i++)
+        {
+            var sk = StartingSkills[i];
+            if (sk != null)
+            {
+                copy.StartingSkills.Add(new StartingSkillRule
+                {
+                    TemplateId = sk.TemplateId,
+                    Tier = sk.Tier,
+                });
+            }
+        }
+
+        copy.RefreshPowerFlag();
+        return copy;
+    }
+}
+
+/// <summary>D6-P1-12：战报回放观看视角解析结果。</summary>
+internal sealed class ReplayPerspectiveResult
+{
+    public string LabelZh { get; set; } = string.Empty;
+    public string OpponentName { get; set; } = string.Empty;
+    public bool IsWin { get; set; }
+    public bool IsDraw { get; set; }
+}
+
+/// <summary>
+/// D6-P1-12：按当前查看账号视角判定战报回放的「胜利 / 落败 / 平局」与对手昵称，
+/// 大小写无关兼容 Player1/Player2/Draw 与 p1/p2/draw 及 winnerAccountId == "__draw__"。
+/// </summary>
+internal static class ReplayOutcomeResolver
+{
+    internal static ReplayPerspectiveResult ResolvePerspective(
+        string viewerAccountId,
+        string p1AccountId,
+        string p2AccountId,
+        string opponentAccountId,
+        string p1Name,
+        string p2Name,
+        string winnerAccountId,
+        string winnerSide,
+        bool? isDraw)
+    {
+        string v = NormalizeId(viewerAccountId);
+        string p1 = NormalizeId(p1AccountId);
+        string p2 = NormalizeId(p2AccountId);
+        string oppAcc = NormalizeId(opponentAccountId);
+        string winAcc = NormalizeId(winnerAccountId);
+        string ws = (winnerSide ?? string.Empty).Trim();
+
+        bool viewerIsP1 = !string.IsNullOrEmpty(v) && !string.IsNullOrEmpty(p1)
+            && string.Equals(v, p1, StringComparison.OrdinalIgnoreCase);
+        bool viewerIsP2 = !viewerIsP1 && !string.IsNullOrEmpty(v) && !string.IsNullOrEmpty(p2)
+            && string.Equals(v, p2, StringComparison.OrdinalIgnoreCase);
+        if (!viewerIsP1 && !viewerIsP2 && !string.IsNullOrEmpty(oppAcc) && !string.IsNullOrEmpty(p1)
+            && string.Equals(oppAcc, p1, StringComparison.OrdinalIgnoreCase))
+        {
+            viewerIsP2 = true;
+        }
+
+        string oppName = viewerIsP2
+            ? (!string.IsNullOrWhiteSpace(p1Name) ? p1Name.Trim() : "对手")
+            : (!string.IsNullOrWhiteSpace(p2Name) ? p2Name.Trim() : "对手");
+
+        bool draw = isDraw == true
+            || string.Equals(winnerAccountId?.Trim(), "__draw__", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(ws, "draw", StringComparison.OrdinalIgnoreCase);
+
+        bool isWin = false;
+        if (!draw)
+        {
+            if (!string.IsNullOrEmpty(winAcc) && !string.IsNullOrEmpty(v))
+            {
+                isWin = string.Equals(winAcc, v, StringComparison.OrdinalIgnoreCase);
+            }
+            else
+            {
+                bool p1Won = string.Equals(ws, "Player1", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(ws, "p1", StringComparison.OrdinalIgnoreCase);
+                bool p2Won = string.Equals(ws, "Player2", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(ws, "p2", StringComparison.OrdinalIgnoreCase);
+                isWin = viewerIsP2 ? p2Won : p1Won;
+            }
+        }
+
+        return new ReplayPerspectiveResult
+        {
+            LabelZh = draw ? "平局" : (isWin ? "胜利" : "落败"),
+            OpponentName = oppName,
+            IsWin = !draw && isWin,
+            IsDraw = draw,
+        };
+    }
+
+    private static string NormalizeId(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        return raw.Replace("-", string.Empty).Trim();
+    }
+}
+
+/// <summary>
+/// CustomGameplayUI 数据模型、规则摘要与零序列化手写深拷贝工具（完整对齐 Wave 2/3 的 3 套预设档位 + 7 大玩法模式 + 14 条肉鸽突变词条）。
 /// </summary>
 internal sealed partial class CustomGameplayUI
 {
@@ -66,6 +496,20 @@ internal sealed partial class CustomGameplayUI
         [JsonProperty("scoreMultiplierDelta")] public double ScoreMultiplierDelta { get; set; }
     }
 
+    internal sealed class PresetCatalogItem
+    {
+        [JsonProperty("id")] public string Id { get; set; } = string.Empty;
+        [JsonProperty("nameZh")] public string NameZh { get; set; } = string.Empty;
+        [JsonProperty("descZh")] public string DescZh { get; set; } = string.Empty;
+    }
+
+    internal sealed class SpecialModeCatalogItem
+    {
+        [JsonProperty("id")] public string Id { get; set; } = string.Empty;
+        [JsonProperty("nameZh")] public string NameZh { get; set; } = string.Empty;
+        [JsonProperty("descZh")] public string DescZh { get; set; } = string.Empty;
+    }
+
     internal sealed class CustomRulesCatalog
     {
         [JsonProperty("archetypes")] public List<ArchetypeCatalogEntry> Archetypes { get; set; } = new();
@@ -73,235 +517,8 @@ internal sealed partial class CustomGameplayUI
         [JsonProperty("items")] public List<CatalogCardEntry> Items { get; set; } = new();
         [JsonProperty("skills")] public List<CatalogCardEntry> Skills { get; set; } = new();
         [JsonProperty("mutators")] public List<MutatorCatalogItem> Mutators { get; set; } = new();
-    }
-
-    internal sealed class StartingItemRule
-    {
-        [JsonProperty("templateId")] public string TemplateId { get; set; } = string.Empty;
-        [JsonProperty("tier")] public string Tier { get; set; } = "Bronze";
-        [JsonProperty("enchantment")] public string Enchantment { get; set; }
-    }
-
-    internal sealed class StartingSkillRule
-    {
-        [JsonProperty("templateId")] public string TemplateId { get; set; } = string.Empty;
-        [JsonProperty("tier")] public string Tier { get; set; } = "Bronze";
-    }
-
-    internal sealed class CustomRunRuleSet
-    {
-        [JsonProperty("selectedArchetypeMask")] public ulong SelectedArchetypeMask { get; set; }
-        [JsonProperty("archetypeWeightMultiplier")] public double ArchetypeWeightMultiplier { get; set; } = 2.0;
-        [JsonProperty("archetypeMultiMatchCap")] public double ArchetypeMultiMatchCap { get; set; } = 3.0;
-        [JsonProperty("allowTendencySelection")] public bool AllowTendencySelection { get; set; } = true;
-        [JsonProperty("promptTendencyBeforeRun")] public bool PromptTendencyBeforeRun { get; set; } = true;
-        [JsonProperty("startingGold")] public int StartingGold { get; set; } = 15;
-        [JsonProperty("startingIncome")] public int StartingIncome { get; set; } = 5;
-        [JsonProperty("startingExperience")] public int StartingExperience { get; set; } = 3;
-        [JsonProperty("startingPrestige")] public int StartingPrestige { get; set; } = 20;
-        [JsonProperty("startingHealth")] public int StartingHealth { get; set; } = 300;
-        [JsonProperty("startingItems")] public List<StartingItemRule> StartingItems { get; set; } = new();
-        [JsonProperty("startingSkills")] public List<StartingSkillRule> StartingSkills { get; set; } = new();
-        [JsonProperty("monsterLootChooseOne")] public bool MonsterLootChooseOne { get; set; } = true;
-        [JsonProperty("encounterCategoryMultipliers")] public Dictionary<string, double> EncounterCategoryMultipliers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
-        [JsonProperty("bannedEncounterIds")] public List<string> BannedEncounterIds { get; set; } = new();
-        [JsonProperty("playerCap")] public int PlayerCap { get; set; } = 8;
-        [JsonProperty("botNonLethalPrestigeLock")] public bool BotNonLethalPrestigeLock { get; set; } = true;
-        [JsonProperty("humanMatchEvery4Rounds")] public bool HumanMatchEvery4Rounds { get; set; } = true;
-        [JsonProperty("lastHumanStandingMode")] public bool LastHumanStandingMode { get; set; } = true;
-        [JsonProperty("isCustomPowerModified")] public bool IsCustomPowerModified { get; set; }
-
-        // Wave 2/3 新增：预设档位 + 7 大模式 + 14 突变词条 + 经济/掉率/种子调参（完整对齐服务端 CustomRuleModels）
-        [JsonProperty("presetId")] public string PresetId { get; set; } = "PureOfficial";
-        [JsonProperty("specialModeId")] public string SpecialModeId { get; set; } = "Standard";
-        [JsonProperty("mutatorIds")] public List<string> MutatorIds { get; set; } = new();
-        [JsonProperty("dailyChallengeDate")] public string DailyChallengeDate { get; set; }
-        [JsonProperty("fixedRunSeed")] public int? FixedRunSeed { get; set; }
-        [JsonProperty("endlessMaxDay")] public int EndlessMaxDay { get; set; } = 99;
-        [JsonProperty("crossHeroOwnHeroBias")] public double CrossHeroOwnHeroBias { get; set; } = 0.40;
-        [JsonProperty("bossRushTotalWaves")] public int BossRushTotalWaves { get; set; } = 10;
-        [JsonProperty("bossRushIncludeMilestonePvp")] public bool BossRushIncludeMilestonePvp { get; set; } = true;
-        [JsonProperty("sandboxFreeInfiniteReroll")] public bool SandboxFreeInfiniteReroll { get; set; } = true;
-        [JsonProperty("sandboxZeroShopPrice")] public bool SandboxZeroShopPrice { get; set; } = false;
-        [JsonProperty("shopHighTierBonusPct")] public double ShopHighTierBonusPct { get; set; } = 0.0;
-        [JsonProperty("shopPriceMultiplier")] public double ShopPriceMultiplier { get; set; } = 1.0;
-        [JsonProperty("monsterLootBonusChoices")] public int MonsterLootBonusChoices { get; set; } = 0;
-        [JsonProperty("monsterLootTierBonus")] public int MonsterLootTierBonus { get; set; } = 0;
-        [JsonProperty("enemyStatMultiplier")] public double EnemyStatMultiplier { get; set; } = 1.0;
-        [JsonProperty("disableFatesRevive")] public bool DisableFatesRevive { get; set; } = false;
-        [JsonProperty("selectedModIds")] public List<string> SelectedModIds { get; set; } = new();
-
-        public void EnsureCollections()
-        {
-            StartingItems ??= new List<StartingItemRule>();
-            StartingSkills ??= new List<StartingSkillRule>();
-            EncounterCategoryMultipliers ??= new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-            BannedEncounterIds ??= new List<string>();
-            MutatorIds ??= new List<string>();
-            SelectedModIds ??= new List<string>();
-            if (string.IsNullOrWhiteSpace(PresetId)) PresetId = "PureOfficial";
-            if (string.IsNullOrWhiteSpace(SpecialModeId)) SpecialModeId = "Standard";
-        }
-
-        public void ResetToStandardValues(bool preserveArchetypeAndLobbyFlags = false)
-        {
-            ulong mask = preserveArchetypeAndLobbyFlags ? SelectedArchetypeMask : 0UL;
-            bool allowTend = !preserveArchetypeAndLobbyFlags || AllowTendencySelection;
-            bool promptBefore = !preserveArchetypeAndLobbyFlags || PromptTendencyBeforeRun;
-            int cap = preserveArchetypeAndLobbyFlags ? (PlayerCap == 10 ? 10 : 8) : 8;
-            bool botLock = !preserveArchetypeAndLobbyFlags || BotNonLethalPrestigeLock;
-            bool match4 = !preserveArchetypeAndLobbyFlags || HumanMatchEvery4Rounds;
-            bool lastHuman = !preserveArchetypeAndLobbyFlags || LastHumanStandingMode;
-
-            SelectedArchetypeMask = mask;
-            ArchetypeWeightMultiplier = 2.0;
-            ArchetypeMultiMatchCap = 3.0;
-            AllowTendencySelection = allowTend;
-            PromptTendencyBeforeRun = promptBefore;
-            StartingGold = 15;
-            StartingIncome = 5;
-            StartingExperience = 3;
-            StartingPrestige = 20;
-            StartingHealth = 300;
-            StartingItems = new List<StartingItemRule>();
-            StartingSkills = new List<StartingSkillRule>();
-            MonsterLootChooseOne = true;
-            EncounterCategoryMultipliers = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-            BannedEncounterIds = new List<string>();
-            PlayerCap = cap;
-            BotNonLethalPrestigeLock = botLock;
-            HumanMatchEvery4Rounds = match4;
-            LastHumanStandingMode = lastHuman;
-            PresetId = "PureOfficial";
-            SpecialModeId = "Standard";
-            MutatorIds = new List<string>();
-            DailyChallengeDate = null;
-            FixedRunSeed = null;
-            EndlessMaxDay = 99;
-            CrossHeroOwnHeroBias = 0.40;
-            BossRushTotalWaves = 10;
-            BossRushIncludeMilestonePvp = true;
-            SandboxFreeInfiniteReroll = true;
-            SandboxZeroShopPrice = false;
-            ShopHighTierBonusPct = 0.0;
-            ShopPriceMultiplier = 1.0;
-            MonsterLootBonusChoices = 0;
-            MonsterLootTierBonus = 0;
-            EnemyStatMultiplier = 1.0;
-            DisableFatesRevive = false;
-            SelectedModIds = new List<string>();
-            IsCustomPowerModified = false;
-        }
-
-        public bool ComputeCustomPowerModified()
-        {
-            EnsureCollections();
-            if (!string.Equals(SpecialModeId, "Standard", StringComparison.OrdinalIgnoreCase)
-                || !string.Equals(PresetId, "PureOfficial", StringComparison.OrdinalIgnoreCase)
-                || MutatorIds.Count > 0
-                || SelectedModIds.Count > 0)
-            {
-                return true;
-            }
-            if (StartingGold != 15 || StartingIncome != 5 || StartingExperience != 3
-                || StartingPrestige != 20 || StartingHealth != 300
-                || Math.Abs(ShopHighTierBonusPct) > 1e-6
-                || Math.Abs(ShopPriceMultiplier - 1.0) > 1e-6
-                || MonsterLootBonusChoices != 0
-                || MonsterLootTierBonus != 0
-                || Math.Abs(EnemyStatMultiplier - 1.0) > 1e-6
-                || DisableFatesRevive)
-            {
-                return true;
-            }
-            if (StartingItems.Count > 0 || StartingSkills.Count > 0) return true;
-            if (BannedEncounterIds.Count > 0) return true;
-            foreach (var kv in EncounterCategoryMultipliers)
-            {
-                if (kv.Value < 0.8 || kv.Value > 1.25) return true;
-            }
-            return false;
-        }
-
-        public void RefreshPowerFlag() => IsCustomPowerModified = ComputeCustomPowerModified();
-
-        /// <summary>
-        /// 高性能手写成员深拷贝（彻底替代 JsonConvert.SerializeObject/DeserializeObject，根治 P1-1 托管 GC 尖峰）。
-        /// </summary>
-        public CustomRunRuleSet Clone()
-        {
-            EnsureCollections();
-            var copy = new CustomRunRuleSet
-            {
-                SelectedArchetypeMask = SelectedArchetypeMask,
-                ArchetypeWeightMultiplier = ArchetypeWeightMultiplier,
-                ArchetypeMultiMatchCap = ArchetypeMultiMatchCap,
-                AllowTendencySelection = AllowTendencySelection,
-                PromptTendencyBeforeRun = PromptTendencyBeforeRun,
-                StartingGold = StartingGold,
-                StartingIncome = StartingIncome,
-                StartingExperience = StartingExperience,
-                StartingPrestige = StartingPrestige,
-                StartingHealth = StartingHealth,
-                StartingItems = new List<StartingItemRule>(StartingItems.Count),
-                StartingSkills = new List<StartingSkillRule>(StartingSkills.Count),
-                MonsterLootChooseOne = MonsterLootChooseOne,
-                EncounterCategoryMultipliers = new Dictionary<string, double>(EncounterCategoryMultipliers, StringComparer.OrdinalIgnoreCase),
-                BannedEncounterIds = new List<string>(BannedEncounterIds),
-                PlayerCap = PlayerCap,
-                BotNonLethalPrestigeLock = BotNonLethalPrestigeLock,
-                HumanMatchEvery4Rounds = HumanMatchEvery4Rounds,
-                LastHumanStandingMode = LastHumanStandingMode,
-                PresetId = PresetId,
-                SpecialModeId = SpecialModeId,
-                MutatorIds = new List<string>(MutatorIds),
-                DailyChallengeDate = DailyChallengeDate,
-                FixedRunSeed = FixedRunSeed,
-                EndlessMaxDay = EndlessMaxDay,
-                CrossHeroOwnHeroBias = CrossHeroOwnHeroBias,
-                BossRushTotalWaves = BossRushTotalWaves,
-                BossRushIncludeMilestonePvp = BossRushIncludeMilestonePvp,
-                SandboxFreeInfiniteReroll = SandboxFreeInfiniteReroll,
-                SandboxZeroShopPrice = SandboxZeroShopPrice,
-                ShopHighTierBonusPct = ShopHighTierBonusPct,
-                ShopPriceMultiplier = ShopPriceMultiplier,
-                MonsterLootBonusChoices = MonsterLootBonusChoices,
-                MonsterLootTierBonus = MonsterLootTierBonus,
-                EnemyStatMultiplier = EnemyStatMultiplier,
-                DisableFatesRevive = DisableFatesRevive,
-                SelectedModIds = new List<string>(SelectedModIds),
-            };
-
-            for (int i = 0; i < StartingItems.Count; i++)
-            {
-                var it = StartingItems[i];
-                if (it != null)
-                {
-                    copy.StartingItems.Add(new StartingItemRule
-                    {
-                        TemplateId = it.TemplateId,
-                        Tier = it.Tier,
-                        Enchantment = it.Enchantment,
-                    });
-                }
-            }
-
-            for (int i = 0; i < StartingSkills.Count; i++)
-            {
-                var sk = StartingSkills[i];
-                if (sk != null)
-                {
-                    copy.StartingSkills.Add(new StartingSkillRule
-                    {
-                        TemplateId = sk.TemplateId,
-                        Tier = sk.Tier,
-                    });
-                }
-            }
-
-            copy.RefreshPowerFlag();
-            return copy;
-        }
+        [JsonProperty("presets")] public List<PresetCatalogItem> Presets { get; set; } = new();
+        [JsonProperty("specialModes")] public List<SpecialModeCatalogItem> SpecialModes { get; set; } = new();
     }
 
     internal sealed class LobbyMemberSummary
@@ -464,11 +681,20 @@ internal sealed partial class CustomGameplayUI
             tags.Add("事件调整");
         }
 
-        if (isTournament && (rules.PlayerCap == 10 || !rules.BotNonLethalPrestigeLock
+        if (rules.MonsterLootBonusChoices > 0 || rules.MonsterLootTierBonus > 0
+            || Math.Abs(rules.ShopHighTierBonusPct) > 0.01
+            || Math.Abs(rules.ShopPriceMultiplier - 1.0) > 0.01
+            || Math.Abs(rules.EnemyStatMultiplier - 1.0) > 0.01
+            || rules.DisableFatesRevive)
+        {
+            tags.Add("进阶调参");
+        }
+
+        if (isTournament && (rules.PlayerCap != 8 || !rules.BotNonLethalPrestigeLock
                              || !rules.HumanMatchEvery4Rounds || !rules.LastHumanStandingMode
                              || !rules.AllowTendencySelection))
         {
-            tags.Add(rules.PlayerCap == 10 ? "10人赛制" : "赛制调整");
+            tags.Add(rules.PlayerCap != 8 ? $"{rules.PlayerCap}人赛制" : "赛制调整");
         }
 
         bool powerMod = rules.ComputeCustomPowerModified();
@@ -477,8 +703,30 @@ internal sealed partial class CustomGameplayUI
         return new RuleActivationSummary(customActive, powerMod, tags.Count, summary);
     }
 
-    private static readonly string[] Tiers = { "Bronze", "Silver", "Gold", "Diamond" };
-    private static readonly string[] TierLabelsZh = { "青铜", "白银", "黄金", "钻石" };
+    internal static readonly string[] Tiers = { "Bronze", "Silver", "Gold", "Diamond", "Legendary" };
+    internal static readonly string[] TierLabelsZh = { "青铜", "白银", "黄金", "钻石", "传奇" };
+
+    internal static readonly string[] LeaderboardBoardKeys =
+    {
+        "endless",
+        "boss_rush",
+        "daily:today",
+        "ranked",
+        "mutator",
+        "cross_hero",
+        "tournament",
+    };
+
+    internal static readonly (string Key, string LabelZh)[] LeaderboardBoards =
+    {
+        ("endless", "无尽爬塔榜"),
+        ("boss_rush", "Boss车轮榜"),
+        ("daily:today", "每日挑战榜"),
+        ("ranked", "赛季排位榜"),
+        ("mutator", "肉鸽词条榜"),
+        ("cross_hero", "跨职业混池榜"),
+        ("tournament", "锦标赛冠军榜"),
+    };
 
     private static readonly (string Key, string LabelZh)[] Enchantments =
     {

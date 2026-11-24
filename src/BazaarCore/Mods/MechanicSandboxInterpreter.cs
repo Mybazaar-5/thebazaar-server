@@ -12,7 +12,13 @@ public static class MechanicSandboxInterpreter
 {
     public const int MaxAstDepth = 8;
 
-    /// <summary>执行步骤列表（受单钩子/单帧步数硬预算与嵌套深度上限保护）。</summary>
+    private enum StepFlowControl
+    {
+        Continue = 0,
+        Stop = 1
+    }
+
+    /// <summary>执行步骤列表（受单钩子/单帧步数硬预算、嵌套深度上限与 Stop 哨兵保护）。</summary>
     public static void ExecuteSteps(
         IReadOnlyList<MechanicStep>? steps,
         MechanicDefinition def,
@@ -23,26 +29,39 @@ public static class MechanicSandboxInterpreter
         CombatPipelineEvent pipeEvent,
         CombatMechanicRuntime runtime,
         int depth)
+        => _ = ExecuteStepsCore(steps, def, attachment, selfCard, ownerPlayer, opponentPlayer, pipeEvent, runtime, depth);
+
+    private static StepFlowControl ExecuteStepsCore(
+        IReadOnlyList<MechanicStep>? steps,
+        MechanicDefinition def,
+        CardMechanicAttachment attachment,
+        CardInstance selfCard,
+        PlayerState ownerPlayer,
+        PlayerState opponentPlayer,
+        CombatPipelineEvent pipeEvent,
+        CombatMechanicRuntime runtime,
+        int depth)
     {
-        if (steps == null || steps.Count == 0 || depth > MaxAstDepth) return;
+        if (steps == null || steps.Count == 0 || depth > MaxAstDepth) return StepFlowControl.Continue;
 
         for (int i = 0; i < steps.Count; i++)
         {
             var step = steps[i];
             if (step == null || string.IsNullOrWhiteSpace(step.Op)) continue;
             if (!runtime.TryConsumeStep(def.Id, selfCard, pipeEvent.HookName))
-                return;
+                return StepFlowControl.Stop;
 
             string op = step.Op.Trim();
             switch (op.ToLowerInvariant())
             {
                 case "stop":
-                    return;
+                    return StepFlowControl.Stop;
 
                 case "if":
                 {
                     bool cond = EvaluateCondition(step.Condition, def, attachment, selfCard, ownerPlayer, opponentPlayer, pipeEvent, runtime, depth + 1);
-                    ExecuteSteps(cond ? step.Then : step.Else, def, attachment, selfCard, ownerPlayer, opponentPlayer, pipeEvent, runtime, depth + 1);
+                    if (ExecuteStepsCore(cond ? step.Then : step.Else, def, attachment, selfCard, ownerPlayer, opponentPlayer, pipeEvent, runtime, depth + 1) == StepFlowControl.Stop)
+                        return StepFlowControl.Stop;
                     break;
                 }
 
@@ -73,8 +92,9 @@ public static class MechanicSandboxInterpreter
                         }
                         else
                         {
-                            if (!runtime.TryConsumeStep(def.Id, selfCard, pipeEvent.HookName)) return;
-                            ExecuteSteps(step.Steps, def, attachment, selfCard, ownerPlayer, opponentPlayer, pipeEvent, runtime, depth + 1);
+                            if (!runtime.TryConsumeStep(def.Id, selfCard, pipeEvent.HookName)) return StepFlowControl.Stop;
+                            if (ExecuteStepsCore(step.Steps, def, attachment, selfCard, ownerPlayer, opponentPlayer, pipeEvent, runtime, depth + 1) == StepFlowControl.Stop)
+                                return StepFlowControl.Stop;
                         }
                     }
                     break;
@@ -294,6 +314,7 @@ public static class MechanicSandboxInterpreter
                 }
             }
         }
+        return StepFlowControl.Continue;
     }
 
     private static CardInstance? ResolveSingleCardRef(string? targetRef, CardInstance selfCard, CombatPipelineEvent pipeEvent)
@@ -315,7 +336,8 @@ public static class MechanicSandboxInterpreter
         CombatMechanicRuntime runtime,
         int depth)
     {
-        if (cond == null || depth > MaxAstDepth) return true;
+        if (cond == null) return true;
+        if (depth > MaxAstDepth) return false;
 
         if (cond.All is { Count: > 0 })
         {
@@ -548,7 +570,7 @@ public static class MechanicSandboxInterpreter
         {
             issues.Add(new ModValidationIssue(
                 ModValidationSeverity.Error, modId, "MECHANIC_INVALID_ID",
-                "自定义机制缺少合法 id（长度需在 1~96 字符内）。", targetId, GateId: 11,
+                "自定义机制缺少合法 id（长度需在 1~96 字符内）。", targetId, GateId: 4,
                 FixHintZh: "为机制指定唯一 slug，例如 'my-mod:custom-mechanic'。"));
         }
 
@@ -556,7 +578,7 @@ public static class MechanicSandboxInterpreter
         {
             issues.Add(new ModValidationIssue(
                 ModValidationSeverity.Warning, modId, "MECHANIC_MISSING_NAME",
-                $"机制 '{targetId}' 缺少中文展示名 nameZh。", targetId, GateId: 11));
+                $"机制 '{targetId}' 缺少中文展示名 nameZh。", targetId, GateId: 4));
         }
 
         var paramKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -566,27 +588,27 @@ public static class MechanicSandboxInterpreter
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_PARAM_EMPTY_KEY",
-                    $"机制 '{targetId}' 存在空 key 的参数定义。", targetId, GateId: 11));
+                    $"机制 '{targetId}' 存在空 key 的参数定义。", targetId, GateId: 4));
                 continue;
             }
             if (!paramKeys.Add(p.Key))
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_PARAM_DUP_KEY",
-                    $"机制 '{targetId}' 存在重复的参数键 '{p.Key}'。", targetId, GateId: 11));
+                    $"机制 '{targetId}' 存在重复的参数键 '{p.Key}'。", targetId, GateId: 4));
             }
             if (!MechanicDefinition.AllowedParamTypes.Contains(p.Type))
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_PARAM_INVALID_TYPE",
-                    $"机制 '{targetId}' 参数 '{p.Key}' 使用了非法类型 '{p.Type}'。", targetId, GateId: 11,
+                    $"机制 '{targetId}' 参数 '{p.Key}' 使用了非法类型 '{p.Type}'。", targetId, GateId: 4,
                     FixHintZh: "允许的参数类型：int / float / string / bool / tag / attribute / targetMode / vfxKey。"));
             }
             if (p.Min.HasValue && p.Max.HasValue && p.Min.Value > p.Max.Value)
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_PARAM_INVALID_RANGE",
-                    $"机制 '{targetId}' 参数 '{p.Key}' 的 min({p.Min}) 大于 max({p.Max})。", targetId, GateId: 11));
+                    $"机制 '{targetId}' 参数 '{p.Key}' 的 min({p.Min}) 大于 max({p.Max})。", targetId, GateId: 4));
             }
         }
 
@@ -594,9 +616,37 @@ public static class MechanicSandboxInterpreter
         {
             issues.Add(new ModValidationIssue(
                 ModValidationSeverity.Error, modId, "MECHANIC_NO_HOOKS",
-                $"机制 '{targetId}' 未绑定任何管线钩子 hooks。", targetId, GateId: 11,
+                $"机制 '{targetId}' 未绑定任何管线钩子 hooks。", targetId, GateId: 4,
                 FixHintZh: "至少添加一个管线钩子（如 OnFightStart / BeforeDamage / OnCardFired / BeforeCardStateChange）。"));
             return;
+        }
+
+        // D3-P1-06：校验 CounterDisplay / CounterDisplays 槽位数量与同步属性白名单
+        var allDisplays = new List<MechanicCounterDisplay>();
+        if (def.CounterDisplay != null) allDisplays.Add(def.CounterDisplay);
+        if (def.CounterDisplays is { Count: > 0 }) allDisplays.AddRange(def.CounterDisplays);
+        if (allDisplays.Count > 4)
+        {
+            issues.Add(new ModValidationIssue(
+                ModValidationSeverity.Error, modId, "MECHANIC_COUNTER_DISPLAY_TOO_MANY",
+                $"机制 '{targetId}' 声明了 {allDisplays.Count} 个 counterDisplay 槽位，超过上限 4。", targetId, GateId: 4));
+        }
+        for (int ci = 0; ci < allDisplays.Count; ci++)
+        {
+            var cd = allDisplays[ci];
+            if (cd == null) continue;
+            if (string.IsNullOrWhiteSpace(cd.SyncAttribute) || !MechanicDefinition.AllowedCounterDisplayAttributes.Contains(cd.SyncAttribute.Trim()))
+            {
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Error, modId, "MECHANIC_INVALID_COUNTER_DISPLAY",
+                    $"机制 '{targetId}' counterDisplay #{ci} 的 syncAttribute='{cd.SyncAttribute}' 不在合法白名单内。", targetId, GateId: 4));
+            }
+            if (!string.IsNullOrWhiteSpace(cd.MaxAttr) && !MechanicDefinition.AllowedCounterDisplayAttributes.Contains(cd.MaxAttr.Trim()))
+            {
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Error, modId, "MECHANIC_INVALID_COUNTER_DISPLAY",
+                    $"机制 '{targetId}' counterDisplay #{ci} 的 maxAttr='{cd.MaxAttr}' 不在合法白名单内。", targetId, GateId: 4));
+            }
         }
 
         for (int h = 0; h < def.Hooks.Count; h++)
@@ -606,8 +656,16 @@ public static class MechanicSandboxInterpreter
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_UNKNOWN_HOOK",
-                    $"机制 '{targetId}' 钩子 #{h} 使用了未授权的管线名称 '{hook.Hook}'。", targetId, GateId: 11,
+                    $"机制 '{targetId}' 钩子 #{h} 使用了未授权的管线名称 '{hook.Hook}'。", targetId, GateId: 4,
                     FixHintZh: $"允许的管线钩子：{string.Join(", ", MechanicDefinition.AllowedHooks)}。"));
+            }
+            // D3-P1-03：未知 Scope 静态报错拦截
+            if (!string.IsNullOrWhiteSpace(hook.Scope) && !MechanicDefinition.AllowedScopes.Contains(hook.Scope.Trim()))
+            {
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Error, modId, "MECHANIC_INVALID_SCOPE",
+                    $"机制 '{targetId}' 钩子 #{h} 使用了未知作用域 scope='{hook.Scope}'。", targetId, GateId: 4,
+                    FixHintZh: $"允许的作用域：{string.Join(", ", MechanicDefinition.AllowedScopes)}。"));
             }
             ValidateStepsStatic(hook.Steps, targetId, modId, paramKeys, depth: 0, issues);
         }
@@ -626,7 +684,7 @@ public static class MechanicSandboxInterpreter
         {
             issues.Add(new ModValidationIssue(
                 ModValidationSeverity.Error, modId, "MECHANIC_NESTING_TOO_DEEP",
-                $"机制 '{mechanicId}' 步骤嵌套深度超过上限 {MaxAstDepth}。", mechanicId, GateId: 11));
+                $"机制 '{mechanicId}' 步骤嵌套深度超过上限 {MaxAstDepth}。", mechanicId, GateId: 4));
             return;
         }
 
@@ -637,7 +695,7 @@ public static class MechanicSandboxInterpreter
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_UNKNOWN_OP",
-                    $"机制 '{mechanicId}' 使用了未授权的操作指令 '{s?.Op}'。", mechanicId, GateId: 11,
+                    $"机制 '{mechanicId}' 使用了未授权的操作指令 '{s?.Op}'。", mechanicId, GateId: 4,
                     FixHintZh: $"允许的安全操作指令：{string.Join(", ", MechanicDefinition.AllowedOps)}。"));
                 continue;
             }
@@ -646,27 +704,39 @@ public static class MechanicSandboxInterpreter
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_REPEAT_TOO_HIGH",
-                    $"机制 '{mechanicId}' 的 Repeat 次数 {s.Count.Const} 超过硬上限 {CombatMechanicRuntime.MaxRepeatCount}。", mechanicId, GateId: 11));
+                    $"机制 '{mechanicId}' 的 Repeat 次数 {s.Count.Const} 超过硬上限 {CombatMechanicRuntime.MaxRepeatCount}。", mechanicId, GateId: 4));
             }
             if (s.Op.Equals("ApplyStatus", StringComparison.OrdinalIgnoreCase)
                 && (string.IsNullOrWhiteSpace(s.Status) || !MechanicDefinition.AllowedStatuses.Contains(s.Status)))
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_INVALID_STATUS",
-                    $"机制 '{mechanicId}' 的 ApplyStatus 使用了未知状态 '{s.Status}'。", mechanicId, GateId: 11));
+                    $"机制 '{mechanicId}' 的 ApplyStatus 使用了未知状态 '{s.Status}'。", mechanicId, GateId: 4));
+            }
+            // P0-31：ModifyPlayerAttribute 玩家属性名白名单校验
+            if (s.Op.Equals("ModifyPlayerAttribute", StringComparison.OrdinalIgnoreCase)
+                && string.IsNullOrWhiteSpace(s.AttributeParam))
+            {
+                if (string.IsNullOrWhiteSpace(s.Attribute) || !MechanicDefinition.AllowedPlayerAttributes.Contains(s.Attribute.Trim()))
+                {
+                    issues.Add(new ModValidationIssue(
+                        ModValidationSeverity.Error, modId, "MECH_INVALID_PLAYER_ATTR",
+                        $"机制 '{mechanicId}' 的 ModifyPlayerAttribute 使用了未在白名单内的玩家属性 '{s.Attribute}'。", mechanicId, GateId: 4,
+                        FixHintZh: $"允许的玩家属性：{string.Join(", ", MechanicDefinition.AllowedPlayerAttributes)}。"));
+                }
             }
             if (!string.IsNullOrWhiteSpace(s.SyncAttribute) && !MechanicDefinition.AllowedSyncAttributes.Contains(s.SyncAttribute))
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_INVALID_SYNC_ATTR",
-                    $"机制 '{mechanicId}' 的 syncAttribute='{s.SyncAttribute}' 仅允许投影至 Custom_0..Custom_3。", mechanicId, GateId: 11));
+                    $"机制 '{mechanicId}' 的 syncAttribute='{s.SyncAttribute}' 仅允许投影至 Custom_0..Custom_8。", mechanicId, GateId: 4));
             }
             if (s.TargetSpec != null && !string.IsNullOrWhiteSpace(s.TargetSpec.Mode)
                 && !MechanicDefinition.AllowedTargetModes.Contains(s.TargetSpec.Mode))
             {
                 issues.Add(new ModValidationIssue(
                     ModValidationSeverity.Error, modId, "MECHANIC_INVALID_TARGET_MODE",
-                    $"机制 '{mechanicId}' 使用了未知目标模式 '{s.TargetSpec.Mode}'。", mechanicId, GateId: 11));
+                    $"机制 '{mechanicId}' 使用了未知目标模式 '{s.TargetSpec.Mode}'。", mechanicId, GateId: 4));
             }
 
             CheckValueExprParams(s.Value, mechanicId, modId, paramKeys, issues);
@@ -690,7 +760,7 @@ public static class MechanicSandboxInterpreter
         {
             issues.Add(new ModValidationIssue(
                 ModValidationSeverity.Error, modId, "MECHANIC_MISSING_PARAM_REF",
-                $"机制 '{mechanicId}' 引用了未声明的参数 '{expr.Param}'。", mechanicId, GateId: 11,
+                $"机制 '{mechanicId}' 引用了未声明的参数 '{expr.Param}'。", mechanicId, GateId: 4,
                 FixHintZh: $"请在 parameters 列表中声明 key='{expr.Param}' 的参数定义。"));
         }
     }
@@ -704,7 +774,7 @@ public static class MechanicSandboxInterpreter
         {
             issues.Add(new ModValidationIssue(
                 ModValidationSeverity.Error, modId, "MECHANIC_MISSING_PARAM_REF",
-                $"机制 '{mechanicId}' 条件引用了未声明的布尔参数 '{cond.ParamBool}'。", mechanicId, GateId: 11));
+                $"机制 '{mechanicId}' 条件引用了未声明的布尔参数 '{cond.ParamBool}'。", mechanicId, GateId: 4));
         }
         if (cond.All != null) foreach (var c in cond.All) CheckConditionParams(c, mechanicId, modId, paramKeys, depth + 1, issues);
         if (cond.Any != null) foreach (var c in cond.Any) CheckConditionParams(c, mechanicId, modId, paramKeys, depth + 1, issues);

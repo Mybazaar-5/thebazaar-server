@@ -9,7 +9,11 @@ namespace BazaarCore.Data;
 /// </summary>
 public static partial class SteamPathResolver
 {
-    public const string RelativeGameDataZip = @"The Bazaar\TheBazaar_Data\StreamingAssets\GameData.db.zip";
+    public static readonly string RelativeGameDataZip =
+        Path.Combine("The Bazaar", "TheBazaar_Data", "StreamingAssets", "GameData.db.zip");
+
+    private static readonly StringComparer PathComparer =
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     [GeneratedRegex("\"path\"\\s+\"([^\"]+)\"", RegexOptions.IgnoreCase)]
     private static partial Regex LibraryPathRegex();
@@ -128,7 +132,7 @@ public static partial class SteamPathResolver
 
     private static IEnumerable<string> DiscoverRelativeDistDataDirs()
     {
-        var yielded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var yielded = new HashSet<string>(PathComparer);
 
         IEnumerable<string> WalkUp(string? startDir)
         {
@@ -155,22 +159,36 @@ public static partial class SteamPathResolver
 
     private static IEnumerable<string> DiscoverProdCacheDirs()
     {
-        var profiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var profiles = new HashSet<string>(PathComparer);
         var special = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         if (!string.IsNullOrWhiteSpace(special)) profiles.Add(special);
 
-        var envProfile = Environment.GetEnvironmentVariable("USERPROFILE");
-        if (!string.IsNullOrWhiteSpace(envProfile)) profiles.Add(envProfile);
-
-        foreach (var profile in profiles)
+        if (OperatingSystem.IsWindows())
         {
-            yield return Path.Combine(profile, "AppData", "LocalLow", "Tempo Storm", "The Bazaar", "prod", "cache");
+            var envProfile = Environment.GetEnvironmentVariable("USERPROFILE");
+            if (!string.IsNullOrWhiteSpace(envProfile)) profiles.Add(envProfile);
+            foreach (var profile in profiles)
+                yield return Path.Combine(profile, "AppData", "LocalLow", "Tempo Storm", "The Bazaar", "prod", "cache");
+        }
+        else if (OperatingSystem.IsMacOS())
+        {
+            var home = Environment.GetEnvironmentVariable("HOME");
+            if (!string.IsNullOrWhiteSpace(home)) profiles.Add(home);
+            foreach (var profile in profiles)
+                yield return Path.Combine(profile, "Library", "Application Support", "Tempo Storm", "The Bazaar", "prod", "cache");
+        }
+        else
+        {
+            var home = Environment.GetEnvironmentVariable("HOME");
+            if (!string.IsNullOrWhiteSpace(home)) profiles.Add(home);
+            foreach (var profile in profiles)
+                yield return Path.Combine(profile, ".config", "unity3d", "Tempo Storm", "The Bazaar", "prod", "cache");
         }
     }
 
     /// <summary>
     /// 按优先级定位 GameData.db.zip：
-    /// 1) 显式传入路径；2) 环境变量 BAZAAR_GAME_DATA_ZIP；3) 注册表 SteamPath + libraryfolders.vdf；4) 常见盘符候选目录。
+    /// 1) 显式传入路径；2) 环境变量 BAZAAR_GAME_DATA_ZIP；3) 注册表/平台默认 Steam 根 + libraryfolders.vdf；4) Windows 常见盘符候选目录。
     /// </summary>
     public static string? ResolveGameDataZipPath(string? customPath = null)
     {
@@ -198,7 +216,10 @@ public static partial class SteamPathResolver
                 var content = File.ReadAllText(vdf);
                 foreach (Match match in LibraryPathRegex().Matches(content))
                 {
-                    var lib = match.Groups[1].Value.Replace(@"\\", @"\");
+                    var rawLib = match.Groups[1].Value;
+                    var lib = OperatingSystem.IsWindows()
+                        ? rawLib.Replace(@"\\", @"\")
+                        : rawLib.Replace(@"\\", "/").Replace('\\', '/');
                     var candidate = Path.Combine(lib, "steamapps", "common", RelativeGameDataZip);
                     if (File.Exists(candidate)) return candidate;
                 }
@@ -209,13 +230,24 @@ public static partial class SteamPathResolver
             }
         }
 
-        // 兜底检查常见盘符上的 SteamLibrary
-        foreach (var drive in new[] { "C:", "D:", "E:", "F:", "G:" })
+        // 兜底检查仅限 Windows 常见盘符上的 SteamLibrary
+        if (OperatingSystem.IsWindows())
         {
-            foreach (var folder in new[] { "Steam", "SteamLibrary", @"Program Files (x86)\Steam", @"Program Files\Steam" })
+            foreach (var drive in new[] { "C:", "D:", "E:", "F:", "G:" })
             {
-                var candidate = Path.Combine(drive + Path.DirectorySeparatorChar, folder, "steamapps", "common", RelativeGameDataZip);
-                if (File.Exists(candidate)) return candidate;
+                string driveRoot = drive + Path.DirectorySeparatorChar;
+                string[] folders =
+                [
+                    "Steam",
+                    "SteamLibrary",
+                    Path.Combine("Program Files (x86)", "Steam"),
+                    Path.Combine("Program Files", "Steam"),
+                ];
+                foreach (var folder in folders)
+                {
+                    var candidate = Path.Combine(driveRoot, folder, "steamapps", "common", RelativeGameDataZip);
+                    if (File.Exists(candidate)) return candidate;
+                }
             }
         }
 
@@ -224,9 +256,9 @@ public static partial class SteamPathResolver
 
     private static IEnumerable<string> DiscoverSteamRoots()
     {
-        var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var roots = new HashSet<string>(PathComparer);
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        if (OperatingSystem.IsWindows())
         {
             try
             {
@@ -239,10 +271,30 @@ public static partial class SteamPathResolver
             {
                 // 忽略注册表访问异常
             }
+
+            string driveRoot = "C:" + Path.DirectorySeparatorChar;
+            roots.Add(Path.Combine(driveRoot, "Program Files (x86)", "Steam"));
+            roots.Add(Path.Combine(driveRoot, "Program Files", "Steam"));
+        }
+        else if (OperatingSystem.IsMacOS())
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrWhiteSpace(home)) home = Environment.GetEnvironmentVariable("HOME") ?? "";
+            if (!string.IsNullOrWhiteSpace(home))
+                roots.Add(Path.Combine(home, "Library", "Application Support", "Steam"));
+        }
+        else
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrWhiteSpace(home)) home = Environment.GetEnvironmentVariable("HOME") ?? "";
+            if (!string.IsNullOrWhiteSpace(home))
+            {
+                roots.Add(Path.Combine(home, ".local", "share", "Steam"));
+                roots.Add(Path.Combine(home, ".steam", "steam"));
+                roots.Add(Path.Combine(home, ".steam", "root"));
+            }
         }
 
-        roots.Add(@"C:\Program Files (x86)\Steam");
-        roots.Add(@"C:\Program Files\Steam");
         return roots;
     }
 }

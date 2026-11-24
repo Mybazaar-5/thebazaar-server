@@ -268,7 +268,7 @@ public sealed class MechanicStep
     [JsonPropertyName("key")]
     public string? Key { get; set; }
 
-    /// <summary>可选将黑板计数器同步投影至官方原生属性槽（Custom_0..Custom_3），客户端卡面自动实时显示。</summary>
+    /// <summary>可选将黑板计数器同步投影至官方原生属性槽（Custom_0..Custom_8），客户端卡面自动实时显示。</summary>
     [JsonPropertyName("syncAttribute")]
     public string? SyncAttribute { get; set; }
 
@@ -384,9 +384,37 @@ public sealed class MechanicCounterDisplay
     [JsonPropertyName("maxConst")]
     public int? MaxConst { get; set; }
 
+    /// <summary>D3-P1-06：可选动态上限属性名（如 "AmmoMax" / "Custom_4"）。</summary>
+    [JsonPropertyName("maxAttr")]
+    public string? MaxAttr { get; set; }
+
+    /// <summary>D3-P1-06：反序列化兼容别名 maxValue（写入 MaxConst）。</summary>
+    [JsonPropertyName("maxValue")]
+    public int? MaxValueAlias
+    {
+        get => null;
+        set { if (!MaxConst.HasValue && value.HasValue) MaxConst = value; }
+    }
+
+    /// <summary>D3-P1-06：反序列化兼容别名 threshold（写入 MaxConst）。</summary>
+    [JsonPropertyName("threshold")]
+    public int? ThresholdAlias
+    {
+        get => null;
+        set { if (!MaxConst.HasValue && value.HasValue) MaxConst = value; }
+    }
+
     /// <summary>徽章主题色（十六进制如 "#F97316"）。</summary>
     [JsonPropertyName("colorHex")]
     public string? ColorHex { get; set; }
+
+    /// <summary>D3-P1-06：反序列化兼容别名 color（写入 ColorHex）。</summary>
+    [JsonPropertyName("color")]
+    public string? ColorAlias
+    {
+        get => null;
+        set { if (string.IsNullOrWhiteSpace(ColorHex) && !string.IsNullOrWhiteSpace(value)) ColorHex = value.Trim(); }
+    }
 
     /// <summary>为 true 时当层数为 0 自动隐藏徽章；默认 false 以便局外也能清晰看到当前进度。</summary>
     [JsonPropertyName("hideWhenZero")]
@@ -477,6 +505,30 @@ public sealed class MechanicDefinition
         "Custom_5", "Custom_6", "Custom_7", "Custom_8"
     };
 
+    /// <summary>D3-P1-03：合法单边作用域闭集（未知 Scope 静态报 Error、运行期返回 false）。</summary>
+    public static readonly IReadOnlySet<string> AllowedScopes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "SelfCard", "OwnerBoard", "EnemyBoard", "OwnerPlayer", "EnemyPlayer", "Global", "Any"
+    };
+
+    /// <summary>P0-31：ModifyPlayerAttribute 允许修改的合法玩家属性白名单。</summary>
+    public static readonly IReadOnlySet<string> AllowedPlayerAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "Health", "HealthMax", "Shield", "Burn", "Poison",
+        "HealthRegen", "Regen", "Rage", "RageMax", "Tempo", "Joy",
+        "Gold", "Income", "PercentDamageReduction"
+    };
+
+    /// <summary>D3-P1-06：CounterDisplays 允许绑定的同步/上限属性白名单。</summary>
+    public static readonly IReadOnlySet<string> AllowedCounterDisplayAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "Custom_0", "Custom_1", "Custom_2", "Custom_3", "Custom_4",
+        "Custom_5", "Custom_6", "Custom_7", "Custom_8",
+        "Counter", "Ammo", "AmmoMax",
+        "DamageAmount", "ShieldApplyAmount", "BurnApplyAmount", "PoisonApplyAmount",
+        "HealAmount", "RegenApplyAmount", "CritChance", "Multicast", "CooldownMax"
+    };
+
     [JsonPropertyName("id")]
     public string Id { get; set; } = string.Empty;
 
@@ -501,9 +553,17 @@ public sealed class MechanicDefinition
     [JsonPropertyName("tooltipTemplateZh")]
     public string? TooltipTemplateZh { get; set; }
 
-    /// <summary>可选：通用卡面实时计数角标配置（任意叠层/充能/倒计时机制均可声明）。</summary>
+    /// <summary>可选：通用卡面实时计数角标配置（单槽位兼容字段）。</summary>
     [JsonPropertyName("counterDisplay")]
     public MechanicCounterDisplay? CounterDisplay { get; set; }
+
+    /// <summary>D3-P1-06：可选多槽位实时计数角标列表（最多 4 槽位）。</summary>
+    [JsonPropertyName("counterDisplays")]
+    public List<MechanicCounterDisplay>? CounterDisplays { get; set; }
+
+    /// <summary>D3-P1-05：该机制显式声明为宿主卡牌授予的受保护输出属性列表。</summary>
+    [JsonPropertyName("grantedAttributes")]
+    public List<string>? GrantedAttributes { get; set; }
 
     [JsonPropertyName("hooks")]
     public List<MechanicHookDefinition> Hooks { get; set; } = new();

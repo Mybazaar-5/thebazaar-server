@@ -30,21 +30,11 @@ namespace BazaarCore.Tests;
 /// P1-06（seasons 21 赛季 + 配置切换）、P2-03（tooltips 136 条 + TooltipGlossary 兼容视图）、
 /// P2-04（GameModeConfig 单一信源代理）、P2-05（level_ups TutorialRewards Lv1~3 透传）与 P2-06（MonsterPool 死方法清理）。
 /// </summary>
+[Collection("GlobalStaticState")]
 public sealed class AuditWave4MetaTablesTests
 {
-    private static readonly Lazy<string> DbPathLazy = new(ResolveWorktreeGameDataDb);
-    private static readonly Lazy<GameDataRepository> RepoLazy = new(() => GameDatabaseLoader.Load(DbPathLazy.Value));
-
-    private static string ResolveWorktreeGameDataDb()
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
-        {
-            string candidate = Path.Combine(dir.FullName, "dist", "data", "GameData.db");
-            if (File.Exists(candidate)) return candidate;
-        }
-        throw new FileNotFoundException("未找到 worktree 下的 dist/data/GameData.db");
-    }
+    private static readonly Lazy<string> DbPathLazy = new(() => TestInfrastructure.SharedGameDataFixture.Shared.DbPath);
+    private static readonly Lazy<GameDataRepository> RepoLazy = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static async Task<(WebApplication App, HttpClient Http, string StateDbPath, ChallengeService Challenges)> StartHostAsync(
         GameDataRepository repo,

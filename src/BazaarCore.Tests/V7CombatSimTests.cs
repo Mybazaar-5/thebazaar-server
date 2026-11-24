@@ -19,7 +19,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V7CombatSimTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     [Fact]
     public void Task1_NormalAndSmallHeal_Cleanse5PercentMin1_AndTriggerPerformedHeal()

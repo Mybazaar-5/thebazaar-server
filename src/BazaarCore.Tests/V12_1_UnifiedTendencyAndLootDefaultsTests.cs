@@ -28,6 +28,7 @@ namespace BazaarCore.Tests;
 ///   4) RunSnapshotSerializer 无损持久化 TendencyLocked，锦标赛房主不覆盖成员个人倾向；
 ///   5) HTTP 端到端验证 active-run-tendency / lock-opening-tendency (200 -> 409) / tendency。
 /// </summary>
+[Collection("GlobalStaticState")]
 public sealed class V12_1_UnifiedTendencyAndLootDefaultsTests
 {
     private static readonly Lazy<TestFixture> Shared = new(() => new TestFixture());
@@ -44,33 +45,19 @@ public sealed class V12_1_UnifiedTendencyAndLootDefaultsTests
 
         public TestFixture()
         {
-            string dbPath = ResolveDataPath("GameData.db");
-            Repo = GameDatabaseLoader.Load();
-            Pool = CardPool.Load(dbPath);
-            Monsters = MonsterPool.Load(dbPath);
-            LevelUps = LevelUpTable.Load(dbPath);
-            Mode = GameModeConfig.Load(dbPath);
+            var shared = TestInfrastructure.SharedGameDataFixture.Shared;
+            Repo = shared.Repo;
+            Pool = shared.Pool;
+            Monsters = shared.CreateMonstersCopy();
+            LevelUps = shared.LevelUps;
+            Mode = shared.Mode;
             Ghosts = new PvpGhostPool();
-            ArchetypeIndex = CardArchetypeIndex.Build(Pool, Repo);
+            ArchetypeIndex = shared.ArchetypeIndex;
         }
     }
 
     private static string ResolveDataPath(string name)
-    {
-        string? env = Environment.GetEnvironmentVariable("BAZAAR_DATA_DIR");
-        string[] candidates =
-        [
-            env != null ? Path.Combine(env, name) : "",
-            Path.Combine(AppContext.BaseDirectory, "data", name),
-            Path.Combine(AppContext.BaseDirectory, name),
-            @"e:\thebazaar\dist\data\" + name,
-        ];
-        foreach (string c in candidates)
-        {
-            if (!string.IsNullOrWhiteSpace(c) && File.Exists(c)) return c;
-        }
-        throw new FileNotFoundException($"Missing {name}");
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(name);
 
     private static string NewTempDb(out string dir)
     {

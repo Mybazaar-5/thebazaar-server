@@ -43,6 +43,7 @@ namespace BazaarCore.Tests;
 /// 6. 3 套预设 + 5 大新模式端到端验证（无尽爬塔 Day 15+、跨英雄 40% 偏置、每日同种子、Boss 车轮战、沙盒全操作且 0 污染）；
 /// 7. 客户端增量更新与 Mod/词典分发 HTTP 端点（Manifest/SHA-256/ETag 304/路径穿越拦截）。
 /// </summary>
+[Xunit.Collection("GlobalStaticState")]
 public sealed class V13UltimateOverhaulTests
 {
     private static readonly Lazy<SharedTestData> Shared = new(LoadSharedData);
@@ -61,65 +62,27 @@ public sealed class V13UltimateOverhaulTests
 
     private static SharedTestData LoadSharedData()
     {
-        string repoRoot = LocateRepoRoot();
-        string dataRoot = Path.Combine(repoRoot, "dist", "data");
-        string modsRoot = Path.Combine(repoRoot, "mods");
-        string dbPath = Path.Combine(dataRoot, "GameData.db");
-        string zhPath = Path.Combine(dataRoot, "translations", "zh-CN.bytes");
-        string overlayPath = Path.Combine(dataRoot, "translations", "custom_zh_overlay.json");
-        string whitelistPath = Path.Combine(dataRoot, "valid_card_ids.json");
-
-        Assert.True(File.Exists(dbPath), $"未找到权威数据库：{dbPath}");
-        Assert.True(File.Exists(zhPath), $"未找到官方汉化包：{zhPath}");
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
+        string overlayPath = Path.Combine(shared.DataDir, "translations", "custom_zh_overlay.json");
+        Assert.True(File.Exists(shared.DbPath), $"未找到权威数据库：{shared.DbPath}");
+        Assert.True(File.Exists(shared.ZhCnPath), $"未找到官方汉化包：{shared.ZhCnPath}");
         Assert.True(File.Exists(overlayPath), $"未找到外挂中文词典：{overlayPath}");
-        Assert.True(Directory.Exists(Path.Combine(modsRoot, "bazaar-chronicles-sample")), $"未找到示例 Mod 目录：{modsRoot}");
+        Assert.True(Directory.Exists(Path.Combine(shared.ModsRoot, "bazaar-chronicles-sample")), $"未找到示例 Mod 目录：{shared.ModsRoot}");
 
-        var rawRepo = GameDatabaseLoader.Load(dbPath, zhPath);
-        var validWhitelist = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        using (var wlDoc = JsonDocument.Parse(File.ReadAllText(whitelistPath, Encoding.UTF8)))
-        {
-            var wlArr = wlDoc.RootElement.ValueKind == JsonValueKind.Array
-                ? wlDoc.RootElement
-                : wlDoc.RootElement.GetProperty("valid_ids");
-            foreach (var item in wlArr.EnumerateArray())
-            {
-                if (item.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(item.GetString()))
-                    validWhitelist.Add(item.GetString()!);
-            }
-        }
+        var validWhitelist = shared.CreateValidCardIdsCopy();
         Assert.True(validWhitelist.Count >= 3000, $"白名单资产 ID 数量异常：{validWhitelist.Count}");
 
-        var pool = CardPool.FromRepository(rawRepo, dataRoot, validWhitelistOverride: validWhitelist);
-        var monsters = MonsterPool.FromRepository(rawRepo);
-        var levelUps = LevelUpTable.FromRepository(rawRepo);
-        var mode = GameModeConfig.FromRepository(rawRepo);
-
         return new SharedTestData(
-            repoRoot,
-            dataRoot,
-            modsRoot,
+            shared.RepoRoot,
+            shared.DataDir,
+            shared.ModsRoot,
             overlayPath,
-            rawRepo,
+            shared.Repo,
             validWhitelist,
-            pool,
-            monsters,
-            levelUps,
-            mode);
-    }
-
-    private static string LocateRepoRoot()
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null)
-        {
-            if (File.Exists(Path.Combine(dir.FullName, "dist", "data", "GameData.db")) &&
-                Directory.Exists(Path.Combine(dir.FullName, "mods", "bazaar-chronicles-sample")))
-            {
-                return dir.FullName;
-            }
-            dir = dir.Parent;
-        }
-        throw new DirectoryNotFoundException("无法从测试输出目录向上定位仓库根目录 e:\\thebazaar。");
+            shared.CreateIsolatedCardPool(),
+            shared.CreateMonstersCopy(),
+            shared.LevelUps,
+            shared.Mode);
     }
 
     private static string CreateTempDir(string prefix)
@@ -1320,7 +1283,7 @@ public sealed class V13UltimateOverhaulTests
         var monsters = MonsterPool.FromRepository(modHost.ActiveRepository);
         var levelUps = LevelUpTable.FromRepository(modHost.ActiveRepository);
         var gameMode = GameModeConfig.FromRepository(modHost.ActiveRepository);
-        var ghosts = PvpGhostPool.Load(data.DataRoot);
+        var ghosts = TestInfrastructure.SharedGameDataFixture.Shared.Ghosts;
         modHost.BindPools(cardPool, monsters);
 
         builder.Services.AddSingleton(persistence);

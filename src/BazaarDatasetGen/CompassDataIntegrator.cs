@@ -9,7 +9,7 @@ using BazaarCore.Runtime;
 namespace BazaarDatasetGen;
 
 /// <summary>
-/// 巴扎罗盘四层真值整合器：
+/// 外部天梯统计源四层真值整合器：
 ///   Layer 1: 352 套天梯/标杆原盘直通（含原始技能/附魔/attributeOverrides）；
 ///   Layer 2: 6,300 套精选实测棋盘智能水合（严格保留原顺序/品质，补齐天梯分位血量、契合技能、Day 7+ 附魔与成长/任务属性）；
 ///   Layer 3: 252 套真实构筑并入流派目录 + 7 英雄分天获取概率注册表；
@@ -108,11 +108,11 @@ public static class CompassDataIntegrator
     public static CompassDistilledBundle LoadBundle(string jsonPath)
     {
         if (string.IsNullOrWhiteSpace(jsonPath) || !File.Exists(jsonPath))
-            throw new FileNotFoundException($"未找到巴扎罗盘蒸馏包: {jsonPath}", jsonPath);
+            throw new FileNotFoundException($"未找到外部天梯统计源蒸馏包: {jsonPath}", jsonPath);
 
         string json = File.ReadAllText(jsonPath);
         return JsonSerializer.Deserialize<CompassDistilledBundle>(json, ReadOpts)
-            ?? throw new InvalidDataException($"无法解析巴扎罗盘蒸馏包: {jsonPath}");
+            ?? throw new InvalidDataException($"无法解析外部天梯统计源蒸馏包: {jsonPath}");
     }
 
     public static void RegisterAvailability(CompassDistilledBundle bundle)
@@ -246,7 +246,7 @@ public static class CompassDataIntegrator
                 Id = b.Id,
                 Hero = b.Hero,
                 NameZh = b.NameZh,
-                DescriptionZh = $"巴扎罗盘真实构筑（{b.Period} / {b.Side}）：{b.NameZh}",
+                DescriptionZh = $"外部天梯统计源真实构筑（{b.Period} / {b.Side}）：{b.NameZh}",
                 CoreItemNames = coreNames.ToArray(),
                 SupportItemNames = supportNames.ToArray(),
                 CoreSkillNames = coreSkills.ToArray(),
@@ -264,7 +264,7 @@ public static class CompassDataIntegrator
     }
 
     /// <summary>
-    /// 水合巴扎罗盘真实天梯原盘 + 6,300 精选真棋盘 + 第 8 英雄社区十胜真值，返回可直接送入交叉定级的合法快照与父 Run。
+    /// 水合外部天梯统计源真实天梯原盘 + 6,300 精选真棋盘 + 第 8 英雄社区十胜真值，返回可直接送入交叉定级的合法快照与父 Run。
     /// </summary>
     public static (List<PvpRunRecord> Runs, List<PvpBoardSnapshot> Snapshots) BuildHydratedRealPool(
         GameDataRepository repo,
@@ -404,7 +404,7 @@ public static class CompassDataIntegrator
             });
         }
 
-        // 2. Layer 2：智能水合 6,300 块精选巴扎罗盘实测棋盘（保序保品质 + 天梯血量/技能/附魔/永久成长）
+        // 2. Layer 2：智能水合 6,300 块精选外部天梯统计源实测棋盘（保序保品质 + 天梯血量/技能/附魔/永久成长）
         for (int i = 0; i < bundle.Boards.Count; i++)
         {
             if (maxSnapshotsLimit > 0 && snapshots.Count >= maxSnapshotsLimit)

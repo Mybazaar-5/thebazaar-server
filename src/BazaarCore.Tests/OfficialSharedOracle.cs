@@ -292,6 +292,13 @@ public sealed class OfficialSharedOracle
         };
     }
 
+    private static long _deserializationFailureCount;
+
+    /// <summary>D8-P2-03：记录 Oracle 节点反序列化失败计数（取代静默空 catch），供回归测试显式校验。</summary>
+    internal static long DeserializationFailureCount => System.Threading.Interlocked.Read(ref _deserializationFailureCount);
+
+    internal static void ResetDeserializationFailureCount() => System.Threading.Interlocked.Exchange(ref _deserializationFailureCount, 0);
+
     internal static TCardAbility ConvertAbility(AbilityDefinition ab)
     {
         return AbilityCache.GetValue(ab, static def =>
@@ -303,9 +310,10 @@ public sealed class OfficialSharedOracle
                 {
                     trigger = DeserializeFromRuleNode<TTriggerBase>(def.Trigger);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // 若测试构造了未覆盖的自定义触发器节点，回退默认触发器
+                    System.Threading.Interlocked.Increment(ref _deserializationFailureCount);
+                    System.Diagnostics.Trace.WriteLine($"[OfficialSharedOracle] Trigger 反序列化失败 (AbilityId={def.Id}, Type={def.Trigger.Type}): {ex.GetType().Name}: {ex.Message}");
                 }
             }
 
@@ -316,9 +324,10 @@ public sealed class OfficialSharedOracle
                 {
                     action = DeserializeFromRuleNode<ITAction>(def.Action);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // 忽略无法映射的合成动作节点
+                    System.Threading.Interlocked.Increment(ref _deserializationFailureCount);
+                    System.Diagnostics.Trace.WriteLine($"[OfficialSharedOracle] Action 反序列化失败 (AbilityId={def.Id}, Type={def.Action.Type}): {ex.GetType().Name}: {ex.Message}");
                 }
             }
 
@@ -663,10 +672,18 @@ public sealed class OracleCard : ICard, ISocketable, IEnchantable
     public ITCard? GetTemplate() => _template;
 
     public int? GetAttributeValue(ECardAttributeType type)
-        => (int)Math.Round(Source.GetAttribute(type.ToString(), _prices), MidpointRounding.AwayFromZero);
+    {
+        var attr = type.ToString();
+        if (!Source.HasAttribute(attr)) return null;
+        return (int)Math.Round(Source.GetAttribute(attr, _prices), MidpointRounding.AwayFromZero);
+    }
 
     public int? GetUnscaledAttributeValue(ECardAttributeType type)
-        => (int)Math.Round(Source.GetAttributeUnscaled(type.ToString(), _prices), MidpointRounding.AwayFromZero);
+    {
+        var attr = type.ToString();
+        if (!Source.HasAttribute(attr)) return null;
+        return (int)Math.Round(Source.GetAttributeUnscaled(attr, _prices), MidpointRounding.AwayFromZero);
+    }
 
     public bool TryGetAttributeValue(ECardAttributeType type, out int? value)
     {

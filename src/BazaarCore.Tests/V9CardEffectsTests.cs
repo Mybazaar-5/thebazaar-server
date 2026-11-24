@@ -18,7 +18,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V9CardEffectsTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static JsonElement JsonFixed(double val)
         => JsonDocument.Parse($"{{\"$type\":\"TFixedValue\",\"Value\":{val.ToString(CultureInfo.InvariantCulture)}}}").RootElement.Clone();

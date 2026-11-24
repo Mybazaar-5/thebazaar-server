@@ -250,8 +250,8 @@ public static class CustomRuleEndpoints
             if (current.SelectedModIds is { Count: > 0 })
             {
                 next.SelectedModIds = new List<string>(current.SelectedModIds);
-                next = next.CloneNormalized();
             }
+            next = next.CloneNormalized();
 
             var updated = store.Set(accountId, next);
             return Results.Json(new
@@ -326,8 +326,8 @@ public static class CustomRuleEndpoints
             if (current.SelectedModIds is { Count: > 0 })
             {
                 next.SelectedModIds = new List<string>(current.SelectedModIds);
-                next = next.CloneNormalized();
             }
+            next = next.CloneNormalized();
 
             var updated = store.Set(accountId, next);
             return Results.Json(new

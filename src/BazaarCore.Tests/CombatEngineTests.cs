@@ -15,7 +15,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class CombatEngineTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
     private readonly ITestOutputHelper _output;
 
     public CombatEngineTests(ITestOutputHelper output)

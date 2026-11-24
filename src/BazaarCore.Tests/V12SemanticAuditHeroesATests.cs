@@ -19,8 +19,12 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class V12SemanticAuditHeroesATests
 {
-    private const string AuthoritativeDbPath = @"e:\thebazaar\dist\data\GameData.db";
-    private const string AuditReportPath = @"e:\thebazaar\logs\v12_sem_audit_a.json";
+    private static string ResolveAuditReportPath()
+    {
+        string outDir = Environment.GetEnvironmentVariable("BAZAAR_AUDIT_OUT_DIR")
+            ?? Path.Combine(Path.GetTempPath(), "bazaar_test_audit");
+        return Path.Combine(outDir, "v12_sem_audit_a.json");
+    }
 
     private static readonly HashSet<string> ShardAHeroes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -30,12 +34,7 @@ public sealed class V12SemanticAuditHeroesATests
         HeroNames.Mak
     };
 
-    private static readonly Lazy<GameDataRepository> Repo = new(() =>
-    {
-        if (File.Exists(AuthoritativeDbPath))
-            return GameDatabaseLoader.Load(AuthoritativeDbPath);
-        return GameDatabaseLoader.Load();
-    });
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static readonly string[] AllNonWeaponNonTechNonToyTags =
     [
@@ -2496,7 +2495,8 @@ public sealed class V12SemanticAuditHeroesATests
         List<string> e2eFindings,
         ConcurrentBag<string> unknownRuleHits)
     {
-        var dir = Path.GetDirectoryName(AuditReportPath);
+        string reportPath = ResolveAuditReportPath();
+        var dir = Path.GetDirectoryName(reportPath);
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
 
@@ -2518,6 +2518,6 @@ public sealed class V12SemanticAuditHeroesATests
         };
 
         var json = JsonSerializer.Serialize(summary, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(AuditReportPath, json);
+        File.WriteAllText(reportPath, json);
     }
 }

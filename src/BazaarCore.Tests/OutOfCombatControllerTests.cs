@@ -13,7 +13,7 @@ namespace BazaarCore.Tests;
 /// </summary>
 public sealed class OutOfCombatControllerTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static JsonElement JsonFixed(double val)
         => JsonDocument.Parse($"{{\"$type\":\"TFixedValue\",\"Value\":{val.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}").RootElement.Clone();
@@ -532,8 +532,14 @@ public sealed class OutOfCombatControllerTests
         var bulb = new CardInstance(lightbulbTpl);
         player.Hand.TryAddAuto(bulb);
 
+        int ownedBefore = player.Hand.Cards.Count + player.Stash.Cards.Count;
         var batch = OutOfCombatController.OnItemPurchased(player, bulb, repo, new Random(11));
         Assert.NotEmpty(batch.SpawnedCards);
+        Assert.Equal(ownedBefore + batch.SpawnedCards.Count, player.Hand.Cards.Count + player.Stash.Cards.Count);
+        Assert.All(batch.SpawnedCards, spawned =>
+            Assert.True(
+                player.Hand.Cards.Contains(spawned.Card) || player.Stash.Cards.Contains(spawned.Card),
+                $"Lightbulb 衍生卡 {spawned.Card.Template.InternalName} 必须实际落入 Hand 或 Stash"));
     }
 
     [Fact]

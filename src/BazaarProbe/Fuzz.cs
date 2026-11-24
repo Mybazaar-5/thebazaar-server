@@ -391,13 +391,17 @@ internal static class Fuzz
 
         private static string ResolveDataDir()
         {
+            string? envData = Environment.GetEnvironmentVariable("BAZAAR_DATA_DIR")
+                ?? Environment.GetEnvironmentVariable("BAZAAR_DATA");
             string[] candidates =
             [
-                @"e:\thebazaar\dist\data",
-                Path.Combine(AppContext.BaseDirectory, "data"),
+                envData ?? string.Empty,
                 Path.Combine(Environment.CurrentDirectory, "dist", "data"),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "dist", "data")),
+                Path.Combine(AppContext.BaseDirectory, "data"),
             ];
-            return candidates.FirstOrDefault(Directory.Exists) ?? @"e:\thebazaar\dist\data";
+            return candidates.FirstOrDefault(d => !string.IsNullOrWhiteSpace(d) && Directory.Exists(d))
+                ?? Path.Combine(Environment.CurrentDirectory, "dist", "data");
         }
 
         private int TryLoadFromSqliteDb(string dbPath, Action<string>? log)
@@ -465,8 +469,6 @@ internal static class Fuzz
                 Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "BazaarServer", "bin", "Debug", "net8.0")),
                 Path.Combine(Environment.CurrentDirectory, "src", "BazaarServer", "bin", "Release", "net8.0"),
                 Path.Combine(Environment.CurrentDirectory, "src", "BazaarServer", "bin", "Debug", "net8.0"),
-                @"e:\thebazaar\src\BazaarServer\bin\Release\net8.0",
-                @"e:\thebazaar\src\BazaarServer\bin\Debug\net8.0",
             };
 
             return candidates.FirstOrDefault(dir =>
@@ -765,9 +767,7 @@ internal static class Fuzz
 
         if (string.IsNullOrWhiteSpace(logPath))
         {
-            string defaultDir = Directory.Exists(@"e:\thebazaar\logs")
-                ? @"e:\thebazaar\logs"
-                : Path.Combine(Environment.CurrentDirectory, "logs");
+            string defaultDir = Path.Combine(Environment.CurrentDirectory, "logs");
             logPath = Path.Combine(defaultDir, $"fuzz_{totalRuns}_v11.log");
         }
 

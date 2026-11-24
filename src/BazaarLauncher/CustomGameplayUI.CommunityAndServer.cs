@@ -68,7 +68,7 @@ internal sealed partial class CustomGameplayUI
         var addSrvRow = _ui.CreateHorizontalRow("AddSrvRow", srvCard.transform, spacing: 6f);
         _srvAddNameInput = _ui.CreateInputField("SrvName", addSrvRow.transform, "名称（如 好友服）", "", fontSize: 13f, charLimit: 24);
         NativeUguiFactory.SetLayout(_srvAddNameInput.gameObject, minW: 130f, prefW: 145f, minH: 28f, prefH: 28f);
-        _srvAddUrlInput = _ui.CreateInputField("SrvUrl", addSrvRow.transform, "地址（如 http://1.2.3.4:8080）", "", fontSize: 13f, charLimit: 120);
+        _srvAddUrlInput = _ui.CreateInputField("SrvUrl", addSrvRow.transform, "地址（如 http://203.0.113.10:8080）", "", fontSize: 13f, charLimit: 120);
         NativeUguiFactory.SetLayout(_srvAddUrlInput.gameObject, minW: 220f, flexW: 1f, minH: 28f, prefH: 28f);
         var btnAddSwitch = _ui.CreateButton("BtnAddSwitch", addSrvRow.transform, "保存并切换", 12.5f,
             NativeUguiFactory.ColGoldBtn, NativeUguiFactory.ColGoldBtnHover, Color.white, () =>

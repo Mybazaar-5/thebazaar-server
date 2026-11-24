@@ -18,8 +18,6 @@ public static class LeaderboardEndpoints
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 
-    private static readonly TimeSpan ChinaUtcOffset = TimeSpan.FromHours(8);
-
     public static void Map(WebApplication app)
     {
         app.MapGet("/api/leaderboards/{mode}", (string mode, HttpContext ctx, AccountStore accounts, Persistence db) =>
@@ -75,14 +73,18 @@ public static class LeaderboardEndpoints
 
         app.MapGet("/api/daily-challenge/today", (HttpContext ctx, AccountStore accounts, Persistence db) =>
         {
-            DateTimeOffset chinaNow = DateTimeOffset.UtcNow.ToOffset(ChinaUtcOffset);
-            string dateKey = chinaNow.ToString("yyyy-MM-dd");
-            DateTimeOffset nextReset = new DateTimeOffset(chinaNow.Year, chinaNow.Month, chinaNow.Day, 0, 0, 0, ChinaUtcOffset).AddDays(1);
-            int remainingSec = Math.Max(0, (int)Math.Ceiling((nextReset - chinaNow).TotalSeconds));
-
-            int masterSeed = ComputeFnv1a32($"bazaar-daily-v1:{dateKey}");
-            var (featuredHero, mutators) = PickDailyRecipe(masterSeed);
-            double scoreMultiplier = MutatorCatalog.CalculateTotalScoreMultiplier(EGameModePreset.PureOfficial, mutators.Select(m => m.Id));
+            // P0-41：全栈统一复用 BazaarCore.Engine.DailyChallengeSeedGenerator 单一信源，彻底消除双份种子/词条漂移
+            var spec = BazaarCore.Engine.DailyChallengeSeedGenerator.GenerateSpec();
+            string dateKey = spec.DateKey;
+            int masterSeed = spec.MasterSeed;
+            string featuredHero = spec.FeaturedHero;
+            var mutators = spec.MutatorIds
+                .Select(id => MutatorCatalog.ById.TryGetValue(id, out var m) ? m : null)
+                .Where(m => m != null)
+                .Cast<MutatorMetadata>()
+                .ToList();
+            double scoreMultiplier = MutatorCatalog.CalculateTotalScoreMultiplier(EGameModePreset.PureOfficial, spec.MutatorIds);
+            int remainingSec = Math.Max(0, (int)Math.Ceiling((spec.NextResetUtc - DateTimeOffset.UtcNow).TotalSeconds));
 
             string boardKey = $"daily:{dateKey}";
             var (topEntries, totalParticipants) = db.QueryLeaderboard(boardKey, heroFilter: null, firstAttemptOnly: true, page: 1, limit: 50);
@@ -108,7 +110,7 @@ public static class LeaderboardEndpoints
                 featuredHero,
                 scoreMultiplier,
                 resetInSeconds = remainingSec,
-                resetAtUtc = nextReset.UtcDateTime,
+                resetAtUtc = spec.NextResetUtc.UtcDateTime,
                 mutators = mutators.Select(m => new
                 {
                     id = m.Id,
@@ -125,61 +127,9 @@ public static class LeaderboardEndpoints
         });
     }
 
-    /// <summary>获取东八区（UTC+8）当日日期键 yyyy-MM-dd。</summary>
+    /// <summary>获取东八区（UTC+8）当日日期键 yyyy-MM-dd（委托 DailyChallengeSeedGenerator 单一信源）。</summary>
     public static string GetChinaTodayDateKey()
-        => DateTimeOffset.UtcNow.ToOffset(ChinaUtcOffset).ToString("yyyy-MM-dd");
-
-    /// <summary>确定性 FNV-1a 32 位哈希（与审计报告 4.3 每日挑战规范严格一致）。</summary>
-    public static int ComputeFnv1a32(string text)
-    {
-        uint hash = 2166136261u;
-        foreach (byte b in System.Text.Encoding.UTF8.GetBytes(text))
-        {
-            hash ^= b;
-            hash *= 16777619u;
-        }
-        int signed = (int)(hash & 0x7FFFFFFFu);
-        return signed == 0 ? 1 : signed;
-    }
-
-    private static (string FeaturedHero, List<MutatorMetadata> Mutators) PickDailyRecipe(int masterSeed)
-    {
-        var rng = new Random(masterSeed);
-        string hero = AccountStore.KnownPlayableHeroes[rng.Next(AccountStore.KnownPlayableHeroes.Length)];
-
-        var positives = MutatorCatalog.All.Where(m => m.IsPositive).ToList();
-        var challenges = MutatorCatalog.All.Where(m => !m.IsPositive).ToList();
-
-        var pickedIds = new List<string>();
-        if (positives.Count > 0)
-            pickedIds.Add(positives[rng.Next(positives.Count)].Id);
-        if (challenges.Count > 0)
-            pickedIds.Add(challenges[rng.Next(challenges.Count)].Id);
-
-        // 50% 概率追加第 3 条不冲突词条，保证每日配方在 2~3 条之间
-        if (rng.Next(2) == 0 && MutatorCatalog.All.Count > 2)
-        {
-            for (int attempt = 0; attempt < 8; attempt++)
-            {
-                var extra = MutatorCatalog.All[rng.Next(MutatorCatalog.All.Count)];
-                var candidate = new List<string>(pickedIds) { extra.Id };
-                var resolved = MutatorCatalog.NormalizeAndResolveConflicts(candidate, maxCount: 3);
-                if (resolved.Count == 3)
-                {
-                    pickedIds = resolved;
-                    break;
-                }
-            }
-        }
-
-        var normalized = MutatorCatalog.NormalizeAndResolveConflicts(pickedIds, maxCount: 3);
-        var metas = normalized
-            .Select(id => MutatorCatalog.ById.TryGetValue(id, out var m) ? m : null)
-            .Where(m => m != null)
-            .Cast<MutatorMetadata>()
-            .ToList();
-        return (hero, metas);
-    }
+        => BazaarCore.Engine.DailyChallengeSeedGenerator.GetTodayDateKeyUtc8();
 
     private static string? ResolveBoardKey(
         string normMode,

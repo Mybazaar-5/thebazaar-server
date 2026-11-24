@@ -22,26 +22,20 @@ namespace BazaarCore.Tests;
 /// Wave 1 Batch 1B（服务端状态机与协议核心 P0）全量回归单测：
 /// 覆盖 P0-02、P0-03（服务端收口）、P0-17、P0-18、P0-19、P0-20、P0-21、P0-22、P0-23。
 /// </summary>
+[Xunit.Collection("ShopEngineStaticState")]
 public sealed class AuditWave1ServerStateTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
     private static readonly Lazy<List<BazaarServer.Data.MonsterTemplate>> Monsters =
-        new(() => MonsterPool.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.CreateMonstersCopy());
     private static readonly Lazy<LevelUpTable> LevelUps =
-        new(() => LevelUpTable.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.LevelUps);
     private static readonly Lazy<GameModeConfig> Mode =
-        new(() => GameModeConfig.Load(ResolveDataPath("GameData.db")));
+        new(() => TestInfrastructure.SharedGameDataFixture.Shared.Mode);
 
     private static string ResolveDataPath(string fileName)
-    {
-        for (string? dir = AppContext.BaseDirectory; dir != null; dir = Directory.GetParent(dir)?.FullName)
-        {
-            string candidate = Path.Combine(dir, "dist", "data", fileName);
-            if (File.Exists(candidate)) return candidate;
-        }
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static (RunState Run, RunEngine Engine) CreateStartedRun(
         EHero hero = EHero.Vanessa,

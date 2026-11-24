@@ -2,11 +2,12 @@
   'use strict';
 
   /**
-   * V14 创意工坊核心扩展模块：
-   * 1. 全量官方词缀可视化「句式积木拼装器」（46 触发器 × 43 动作链 TActionAnd × 10 目标 × 23 条件 × 11 数值源 × 131 VFX）；
+   * V15.4 创意工坊核心扩展模块：
+   * 1. 全量官方词缀可视化「句式积木拼装器」（46+ 触发器 × 43+ 动作链 TActionAnd × 10 目标 × 23 条件 × 11 数值源 × 133 VFX）；
    * 2. 原版 2,034+ 卡牌单条词缀一键「扒取」复用至新卡或原位魔改卡；
-   * 3. 卡牌自定义机制自动参数表单渲染（按机制 Schema 动态生成控件，支持新卡与原位补丁）；
-   * 4. 「开放机制工坊 Mechanic Lab」可视化编排 6 大通用管线钩子 + 18 种安全步骤流 + 20 场极限对抗沙盒压测。
+   * 3. 卡牌自定义机制自动参数表单、3D 实时计数角标（counterDisplays）与双宿主 13 附魔可视化编辑；
+   * 4. 「开放机制工坊 Mechanic Lab」可视化编排 10 大通用管线钩子 + 18 种安全步骤流 + 20 场极限对抗沙盒压测；
+   * 5. 扩展内容工坊（自定义野怪 Monsters / 玩法模式 Modes / 肉鸽突变词条 Mutators / 汉化覆盖 Localization）。
    */
 
   const B = () => window.WorkshopBridge;
@@ -20,9 +21,36 @@
       targetHost: 'card', // 'card' | 'patch'
       editKey: null, // null=new, string=overwrite existing key
       actions: [],
+      preservedExtra: null,
+      preservedPrereqs: null,
+      auraPreservedExtra: null,
+      auraPreservedPrereqs: null,
     },
     currentVanillaBlueprint: null,
   };
+
+  function readVfxOverrideKey(vfxConfig) {
+    if (!vfxConfig || typeof vfxConfig !== 'object') return '';
+    return vfxConfig.vfxOverrideKey ?? vfxConfig.vFXOverrideKey ?? vfxConfig.VFXOverrideKey ?? '';
+  }
+
+  function buildCamelVfxConfig(vfxKey, prevVfxConfig = null) {
+    if (!vfxKey) return undefined;
+    const prevShouldPlay = prevVfxConfig?.vfxShouldPlay ?? prevVfxConfig?.vFXShouldPlay ?? prevVfxConfig?.VFXShouldPlay;
+    const prevTakeover = prevVfxConfig?.vfxIsTakeover ?? prevVfxConfig?.vFXIsTakeover ?? prevVfxConfig?.VFXIsTakeover;
+    return {
+      vfxOverrideKey: vfxKey,
+      vfxShouldPlay: prevShouldPlay !== undefined ? Boolean(prevShouldPlay) : true,
+      vfxIsTakeover: prevTakeover !== undefined ? Boolean(prevTakeover) : false,
+    };
+  }
+
+  function safeNumAttr(v) {
+    if (B()?.safeNumAttr) return B().safeNumAttr(v);
+    if (v === null || v === undefined || v === '') return '';
+    const n = Number(v);
+    return Number.isFinite(n) ? String(n) : '';
+  }
 
   const TARGET_OPTIONS = [
     { value: 'OpponentPlayer', label: '敌方玩家' },
@@ -42,12 +70,13 @@
   ];
 
   const HOOK_SCOPE_ZH = {
-    SelfCard: '仅监听本卡自身',
-    OwnerPlayer: '监听己方玩家',
-    EnemyPlayer: '监听敌方玩家',
-    OwnerBoard: '监听己方全场卡牌',
-    EnemyBoard: '监听敌方全场卡牌',
-    Any: '监听双方全场',
+    SelfCard: '仅监听本卡自身 (SelfCard)',
+    OwnerPlayer: '监听己方玩家 (OwnerPlayer)',
+    EnemyPlayer: '监听敌方玩家 (EnemyPlayer)',
+    OwnerBoard: '监听己方全场卡牌 (OwnerBoard)',
+    EnemyBoard: '监听敌方全场卡牌 (EnemyBoard)',
+    Global: '监听全局双方 (Global)',
+    Any: '监听任意来源 (Any)',
   };
 
   const PLAYER_ACTIONS = new Set([
@@ -260,6 +289,7 @@
     $('abAuraTargetTag').innerHTML = tagOpts;
     $('abAuraAttr').innerHTML = attrs.map((a) => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.nameZh)}</option>`).join('')
       + tags.map((t) => `<option value="TAG:${escapeHtml(t.id)}">[标签] ${escapeHtml(t.nameZh)}</option>`).join('');
+    if ($('abAuraVfxKey')) $('abAuraVfxKey').innerHTML = renderVfxOptionsHtml($('abAuraVfxKey').value);
   }
 
   function makeDefaultActionRow(actionType = 'TActionPlayerDamage') {
@@ -383,6 +413,64 @@
     return undefined;
   }
 
+  function compilePrereqFromControls(prefix, preservedPrereqs) {
+    const pk = $(`${prefix}PrereqKind`)?.value || 'none';
+    if (pk === 'preserve' && Array.isArray(preservedPrereqs) && preservedPrereqs.length) {
+      return JSON.parse(JSON.stringify(preservedPrereqs));
+    }
+    if (pk === 'cardCount') {
+      const cTag = $(`${prefix}PrereqTag`)?.value || 'Weapon';
+      const cMin = parseInt($(`${prefix}PrereqMin`)?.value || '2', 10) || 1;
+      return [{
+        $type: 'TPrerequisiteCardCount',
+        subject: buildTargetRuleNode('AllAllies', cTag, ''),
+        comparison: 'GreaterThanOrEqual',
+        amount: cMin,
+      }];
+    }
+    if (pk === 'playerAttr') {
+      const pAttr = $(`${prefix}PrereqPlayerAttr`)?.value || 'Gold';
+      const pOp = $(`${prefix}PrereqPlayerOp`)?.value || 'GreaterThanOrEqual';
+      const pVal = parseFloat($(`${prefix}PrereqPlayerVal`)?.value || '20') || 0;
+      return [{
+        $type: 'TPrerequisitePlayer',
+        subject: {
+          $type: 'TTargetPlayerAbsolute',
+          targetMode: 'Player',
+          conditions: {
+            $type: 'TPlayerConditionalAttribute',
+            attributeType: pAttr,
+            comparisonOperator: pOp,
+            comparisonValue: { $type: 'TFixedValue', value: pVal },
+          },
+        },
+      }];
+    }
+    if (pk === 'run') {
+      const day = parseInt($(`${prefix}PrereqRunDay`)?.value || '5', 10) || 1;
+      const op = $(`${prefix}PrereqRunOp`)?.value || 'GreaterThanOrEqual';
+      return [{
+        $type: 'TPrerequisiteRun',
+        currentDay: day,
+        comparisonOperator: op,
+      }];
+    }
+    if (pk === 'cardAttrCmp') {
+      const attr1 = $(`${prefix}PrereqCmpAttr1`)?.value || 'DamageAmount';
+      const op = $(`${prefix}PrereqCmpOp`)?.value || 'GreaterThanOrEqual';
+      const attr2 = $(`${prefix}PrereqCmpAttr2`)?.value || 'ShieldApplyAmount';
+      return [{
+        $type: 'TPrerequisiteCardAttributeComparator',
+        subject: { $type: 'TTargetCardSelf' },
+        subjectOther: { $type: 'TTargetCardSelf' },
+        attribute: attr1,
+        attributeOther: attr2,
+        comparisonOperator: op,
+      }];
+    }
+    return undefined;
+  }
+
   function compileBuilderToRuleObject() {
     if (v14.builderState.mode === 'aura') {
       const actType = $('abAuraActionType').value;
@@ -408,10 +496,21 @@
         action.operation = op;
         action.value = buildValueRuleNode(valMode === 'cardAttr' ? 'cardAttr' : 'fixed', valInput);
       }
-      return {
-        activeIn: 'HandOnly',
+      const auraObj = Object.assign({}, v14.builderState.auraPreservedExtra || {}, {
+        activeIn: $('abAuraActiveIn')?.value || 'HandOnly',
         action,
-      };
+      });
+      const auraPrereqs = compilePrereqFromControls('abAura', v14.builderState.auraPreservedPrereqs);
+      if (auraPrereqs) auraObj.prerequisites = auraPrereqs;
+      else delete auraObj.prerequisites;
+
+      const auraVfx = $('abAuraVfxKey')?.value || '';
+      if (auraVfx) {
+        auraObj.vfxConfig = buildCamelVfxConfig(auraVfx, v14.builderState.auraPreservedExtra?.vfxConfig);
+      } else if (!auraVfx) {
+        delete auraObj.vfxConfig;
+      }
+      return auraObj;
     }
 
     // Ability 模式
@@ -441,36 +540,8 @@
       trigger = { $type: 'TTriggerOr', triggers: [trig1, trig2] };
     }
 
-    // 前置条件
-    let prerequisites;
-    const pk = $('abPrereqKind').value;
-    if (pk === 'cardCount') {
-      const cTag = $('abPrereqTag')?.value || 'Weapon';
-      const cMin = parseInt($('abPrereqMin')?.value || '2', 10) || 1;
-      prerequisites = [{
-        $type: 'TPrerequisiteCardCount',
-        subject: buildTargetRuleNode('AllAllies', cTag, ''),
-        comparison: 'GreaterThanOrEqual',
-        amount: cMin,
-      }];
-    } else if (pk === 'playerAttr') {
-      const pAttr = $('abPrereqPlayerAttr')?.value || 'Gold';
-      const pOp = $('abPrereqPlayerOp')?.value || 'GreaterThanOrEqual';
-      const pVal = parseFloat($('abPrereqPlayerVal')?.value || '20') || 0;
-      prerequisites = [{
-        $type: 'TPrerequisitePlayer',
-        subject: {
-          $type: 'TTargetPlayerAbsolute',
-          targetMode: 'Player',
-          conditions: {
-            $type: 'TPlayerConditionalAttribute',
-            attributeType: pAttr,
-            comparisonOperator: pOp,
-            comparisonValue: { $type: 'TFixedValue', value: pVal },
-          },
-        },
-      }];
-    }
+    // 前置条件（完整支持 4 种合法类型 + 复杂条件无损保留）
+    const prerequisites = compilePrereqFromControls('ab', v14.builderState.preservedPrereqs);
 
     // 动作链
     const builtActions = v14.builderState.actions.map((row) => {
@@ -496,16 +567,19 @@
       ? builtActions[0]
       : { $type: 'TActionAnd', actions: builtActions };
 
-    const ab = {
+    const ab = Object.assign({}, v14.builderState.preservedExtra || {}, {
       activeIn: $('abActiveIn').value || 'HandOnly',
       trigger,
       action: finalAction,
-    };
+    });
     if (prerequisites) ab.prerequisites = prerequisites;
+    else delete ab.prerequisites;
 
     const firstVfx = v14.builderState.actions.find((r) => r.vfxKey)?.vfxKey;
     if (firstVfx) {
-      ab.vfxConfig = { vFXOverrideKey: firstVfx, vFXShouldPlay: true, vFXIsTakeover: false };
+      ab.vfxConfig = buildCamelVfxConfig(firstVfx, v14.builderState.preservedExtra?.vfxConfig);
+    } else {
+      delete ab.vfxConfig;
     }
     return ab;
   }
@@ -668,28 +742,123 @@
     });
   }
 
-  function renderPrereqFields() {
-    const pk = $('abPrereqKind').value;
-    const box = $('abPrereqFields');
+  function renderPrereqFields(prefix = 'ab', initValues = null) {
+    const sel = $(`${prefix}PrereqKind`);
+    const box = $(`${prefix}PrereqFields`);
+    if (!sel || !box) return;
+    const pk = sel.value;
     if (pk === 'none') {
       box.classList.add('hidden');
       box.innerHTML = '';
       return;
     }
     box.classList.remove('hidden');
+    if (pk === 'preserve') {
+      const cnt = (prefix === 'ab' ? v14.builderState.preservedPrereqs : v14.builderState.auraPreservedPrereqs)?.length || 1;
+      box.innerHTML = `<div class="muted span-2">✅ 已无损保留原有 ${cnt} 条复杂前置条件（切换上方下拉菜单可覆盖修改）。</div>`;
+      return;
+    }
     if (pk === 'cardCount') {
       const tags = catalog().tags || [];
       box.innerHTML = `
-        <label class="field"><span>要求场上标签</span><select id="abPrereqTag">${tags.map((t) => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.nameZh)}</option>`).join('')}</select></label>
-        <label class="field"><span>最少数量 ≥</span><input type="number" id="abPrereqMin" value="2" min="1" max="10" /></label>
+        <label class="field"><span>要求场上标签</span><select id="${prefix}PrereqTag">${tags.map((t) => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.nameZh)}</option>`).join('')}</select></label>
+        <label class="field"><span>最少数量 ≥</span><input type="number" id="${prefix}PrereqMin" value="${escapeHtml(safeNumAttr(initValues?.min ?? 2))}" min="1" max="10" /></label>
       `;
-    } else {
+      if (initValues?.tag && $(`${prefix}PrereqTag`)) $(`${prefix}PrereqTag`).value = initValues.tag;
+    } else if (pk === 'playerAttr') {
+      const pAttrs = catalog().mechanicSchema?.playerAttributes || [
+        { id: 'Gold', nameZh: '金币 Gold' }, { id: 'Health', nameZh: '当前生命 Health' },
+        { id: 'Shield', nameZh: '当前护盾 Shield' }, { id: 'Income', nameZh: '收入 Income' },
+      ];
       box.innerHTML = `
-        <label class="field"><span>玩家属性</span><select id="abPrereqPlayerAttr"><option value="Gold">金币 Gold</option><option value="Health">当前生命 Health</option><option value="Shield">当前护盾 Shield</option><option value="Income">收入 Income</option></select></label>
-        <label class="field"><span>比较条件与数值</span><div class="inline-pair"><select id="abPrereqPlayerOp"><option value="GreaterThanOrEqual">≥</option><option value="LessThanOrEqual">≤</option></select><input type="number" id="abPrereqPlayerVal" value="20" /></div></label>
+        <label class="field"><span>玩家属性</span><select id="${prefix}PrereqPlayerAttr">${pAttrs.map((a) => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.nameZh)}</option>`).join('')}</select></label>
+        <label class="field"><span>比较条件与数值</span><div class="inline-pair"><select id="${prefix}PrereqPlayerOp"><option value="GreaterThanOrEqual">≥</option><option value="LessThanOrEqual">≤</option><option value="Equal">=</option></select><input type="number" id="${prefix}PrereqPlayerVal" value="${escapeHtml(safeNumAttr(initValues?.val ?? 20))}" /></div></label>
       `;
+      if (initValues?.attr && $(`${prefix}PrereqPlayerAttr`)) $(`${prefix}PrereqPlayerAttr`).value = initValues.attr;
+      if (initValues?.op && $(`${prefix}PrereqPlayerOp`)) $(`${prefix}PrereqPlayerOp`).value = initValues.op;
+    } else if (pk === 'run') {
+      box.innerHTML = `
+        <label class="field"><span>局内天数比较</span><select id="${prefix}PrereqRunOp"><option value="GreaterThanOrEqual">≥ 第 N 天</option><option value="LessThanOrEqual">≤ 第 N 天</option><option value="Equal">= 第 N 天</option></select></label>
+        <label class="field"><span>天数 (currentDay)</span><input type="number" id="${prefix}PrereqRunDay" value="${escapeHtml(safeNumAttr(initValues?.day ?? 5))}" min="1" max="99" /></label>
+      `;
+      if (initValues?.op && $(`${prefix}PrereqRunOp`)) $(`${prefix}PrereqRunOp`).value = initValues.op;
+    } else if (pk === 'cardAttrCmp') {
+      const attrs = catalog().attributes || [];
+      const opts = attrs.map((a) => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.nameZh)}</option>`).join('');
+      box.innerHTML = `
+        <label class="field"><span>属性 A</span><select id="${prefix}PrereqCmpAttr1">${opts}</select></label>
+        <label class="field"><span>比较符与属性 B</span><div class="inline-pair"><select id="${prefix}PrereqCmpOp"><option value="GreaterThanOrEqual">≥</option><option value="GreaterThan">&gt;</option><option value="LessThanOrEqual">≤</option><option value="Equal">=</option></select><select id="${prefix}PrereqCmpAttr2">${opts}</select></div></label>
+      `;
+      if (initValues?.attr1 && $(`${prefix}PrereqCmpAttr1`)) $(`${prefix}PrereqCmpAttr1`).value = initValues.attr1;
+      if (initValues?.op && $(`${prefix}PrereqCmpOp`)) $(`${prefix}PrereqCmpOp`).value = initValues.op;
+      if (initValues?.attr2 && $(`${prefix}PrereqCmpAttr2`)) $(`${prefix}PrereqCmpAttr2`).value = initValues.attr2;
     }
     box.querySelectorAll('input,select').forEach((el) => el.addEventListener('change', updateAffixBuilderPreview));
+  }
+
+  function restorePrereqToControls(prefix, prereqs) {
+    const sel = $(`${prefix}PrereqKind`);
+    if (!sel) return null;
+    const preserveOpt = sel.querySelector('option[value="preserve"]');
+    if (!Array.isArray(prereqs) || prereqs.length === 0) {
+      if (preserveOpt) preserveOpt.hidden = true;
+      sel.value = 'none';
+      renderPrereqFields(prefix);
+      return null;
+    }
+    if (prereqs.length === 1) {
+      const p = prereqs[0];
+      if (p?.$type === 'TPrerequisiteCardCount') {
+        if (preserveOpt) preserveOpt.hidden = true;
+        const tChoice = parseRuleNodeToTargetChoice(p.subject);
+        sel.value = 'cardCount';
+        renderPrereqFields(prefix, { tag: tChoice.targetTag || 'Weapon', min: p.amount ?? 2 });
+        return null;
+      }
+      if (p?.$type === 'TPrerequisitePlayer') {
+        if (preserveOpt) preserveOpt.hidden = true;
+        const cond = p.subject?.conditions;
+        const attr = cond?.attributeType || 'Gold';
+        const op = cond?.comparisonOperator || 'GreaterThanOrEqual';
+        const cv = typeof cond?.comparisonValue === 'number' ? cond.comparisonValue : (cond?.comparisonValue?.value ?? 20);
+        sel.value = 'playerAttr';
+        renderPrereqFields(prefix, { attr, op, val: cv });
+        return null;
+      }
+      if (p?.$type === 'TPrerequisiteRun') {
+        if (preserveOpt) preserveOpt.hidden = true;
+        sel.value = 'run';
+        renderPrereqFields(prefix, { day: p.currentDay ?? 5, op: p.comparisonOperator || 'GreaterThanOrEqual' });
+        return null;
+      }
+      if (p?.$type === 'TPrerequisiteCardAttributeComparator') {
+        if (preserveOpt) preserveOpt.hidden = true;
+        sel.value = 'cardAttrCmp';
+        renderPrereqFields(prefix, {
+          attr1: p.attribute || 'DamageAmount',
+          op: p.comparisonOperator || 'GreaterThanOrEqual',
+          attr2: p.attributeOther || 'ShieldApplyAmount',
+        });
+        return null;
+      }
+    }
+    // 多条或高级前置条件：无损保留，绝不重置为 none
+    const cloned = JSON.parse(JSON.stringify(prereqs));
+    if (prefix === 'ab') v14.builderState.preservedPrereqs = cloned;
+    else v14.builderState.auraPreservedPrereqs = cloned;
+    if (preserveOpt) preserveOpt.hidden = false;
+    sel.value = 'preserve';
+    renderPrereqFields(prefix);
+    return cloned;
+  }
+
+  function extractExtraFields(existing, handledKeys) {
+    if (!existing || typeof existing !== 'object') return null;
+    const extra = {};
+    Object.keys(existing).forEach((k) => {
+      if (!handledKeys.has(k)) extra[k] = JSON.parse(JSON.stringify(existing[k]));
+    });
+    return Object.keys(extra).length ? extra : null;
   }
 
   function openAffixBuilder(mode, editKey = null) {
@@ -702,6 +871,10 @@
     v14.builderState.mode = mode;
     v14.builderState.targetHost = hostInfo.host;
     v14.builderState.editKey = editKey;
+    v14.builderState.preservedExtra = null;
+    v14.builderState.preservedPrereqs = null;
+    v14.builderState.auraPreservedExtra = null;
+    v14.builderState.auraPreservedPrereqs = null;
 
     $('abAbilityModePane').classList.toggle('hidden', mode !== 'ability');
     $('abAuraModePane').classList.toggle('hidden', mode !== 'aura');
@@ -715,6 +888,7 @@
       const existing = editKey !== null ? getAbilitiesMap(hostInfo)[editKey] : null;
       $('abTriggerSearch').value = '';
       if (existing) {
+        v14.builderState.preservedExtra = extractExtraFields(existing, new Set(['id', 'trigger', 'activeIn', 'action', 'prerequisites']));
         const trig = existing.trigger || {};
         if (trig.$type === 'TTriggerOr' && Array.isArray(trig.triggers) && trig.triggers.length >= 2) {
           $('abUseOrTrigger').checked = true;
@@ -726,17 +900,22 @@
           $('abOrTriggerWrap').classList.add('hidden');
           $('abTriggerType').value = trig.$type || 'TTriggerOnCardFired';
         }
-        const subj = parseRuleNodeToTargetChoice(trig.subject || trig.triggers?.[0]?.subject);
+        const rawSubj = trig.subject || trig.triggers?.[0]?.subject;
+        const subj = parseRuleNodeToTargetChoice(rawSubj);
         const revMap = { SelfCard: 'Self', Neighbor: 'Neighbor', Left: 'Left', Right: 'Right', AllAllies: 'SelfHand', AllEnemies: 'EnemyHand' };
-        $('abTriggerSubjectMode').value = trig.subject ? (revMap[subj.targetMode] || 'Self') : 'None';
+        if (rawSubj?.targetSection === 'AllHands') {
+          $('abTriggerSubjectMode').value = 'AnyHand';
+        } else {
+          $('abTriggerSubjectMode').value = rawSubj ? (revMap[subj.targetMode] || 'Self') : 'None';
+        }
         $('abTriggerSubjectTag').value = subj.targetTag || '';
         $('abTriggerSubjectHiddenTag').value = subj.targetHiddenTag || '';
         $('abActiveIn').value = existing.activeIn || 'HandOnly';
-        $('abPrereqKind').value = 'none';
-        renderPrereqFields();
+        restorePrereqToControls('ab', existing.prerequisites);
         v14.builderState.actions = parseActionNodeToRows(existing.action);
-        if (existing.vfxConfig?.vFXOverrideKey && v14.builderState.actions[0]) {
-          v14.builderState.actions[0].vfxKey = existing.vfxConfig.vFXOverrideKey;
+        const existingVfx = readVfxOverrideKey(existing.vfxConfig);
+        if (existingVfx && v14.builderState.actions[0]) {
+          v14.builderState.actions[0].vfxKey = existingVfx;
         }
       } else {
         $('abUseOrTrigger').checked = false;
@@ -746,8 +925,7 @@
         $('abTriggerSubjectTag').value = '';
         $('abTriggerSubjectHiddenTag').value = '';
         $('abActiveIn').value = 'HandOnly';
-        $('abPrereqKind').value = 'none';
-        renderPrereqFields();
+        restorePrereqToControls('ab', null);
         v14.builderState.actions = [makeDefaultActionRow('TActionCardCharge')];
         v14.builderState.actions[0].targetMode = 'SelfCard';
       }
@@ -755,9 +933,21 @@
     } else {
       const existing = editKey !== null ? getAurasMap(hostInfo)[editKey] : null;
       if (existing?.action) {
+        v14.builderState.auraPreservedExtra = extractExtraFields(existing, new Set(['id', 'activeIn', 'action', 'prerequisites']));
         $('abAuraActionType').value = existing.action.$type || 'TAuraActionCardModifyAttribute';
+        const auraTgt = parseRuleNodeToTargetChoice(existing.action.target);
+        const revAuraTgt = {
+          SelfCard: 'Self', Neighbor: 'Neighbor', Left: 'Left', Right: 'Right',
+          AllAllies: 'SelfHand', AllEnemies: 'EnemyHand', SelfPlayer: 'PlayerSelf',
+        };
+        $('abAuraTargetMode').value = revAuraTgt[auraTgt.targetMode] || 'Self';
+        $('abAuraTargetTag').value = auraTgt.targetTag || '';
         $('abAuraOp').value = existing.action.operation || 'Add';
-        if (existing.action.attributeType) $('abAuraAttr').value = existing.action.attributeType;
+        if (existing.action.$type === 'TAuraActionCardAddTagsList' && existing.action.tags?.[0]) {
+          $('abAuraAttr').value = `TAG:${existing.action.tags[0]}`;
+        } else if (existing.action.attributeType) {
+          $('abAuraAttr').value = existing.action.attributeType;
+        }
         if (existing.action.value?.$type === 'TReferenceValueCardAttribute') {
           $('abAuraValMode').value = 'cardAttr';
           $('abAuraValInput').value = existing.action.value.attributeType || 'Custom_0';
@@ -765,6 +955,19 @@
           $('abAuraValMode').value = 'fixed';
           $('abAuraValInput').value = String(existing.action.value?.value ?? 10);
         }
+        if ($('abAuraActiveIn')) $('abAuraActiveIn').value = existing.activeIn || 'HandOnly';
+        if ($('abAuraVfxKey')) $('abAuraVfxKey').innerHTML = renderVfxOptionsHtml(readVfxOverrideKey(existing.vfxConfig));
+        restorePrereqToControls('abAura', existing.prerequisites);
+      } else {
+        $('abAuraActionType').value = 'TAuraActionCardModifyAttribute';
+        $('abAuraTargetMode').value = 'Self';
+        $('abAuraTargetTag').value = '';
+        $('abAuraOp').value = 'Add';
+        $('abAuraValMode').value = 'fixed';
+        $('abAuraValInput').value = '10';
+        if ($('abAuraActiveIn')) $('abAuraActiveIn').value = 'HandOnly';
+        if ($('abAuraVfxKey')) $('abAuraVfxKey').innerHTML = renderVfxOptionsHtml('');
+        restorePrereqToControls('abAura', null);
       }
     }
 
@@ -823,10 +1026,10 @@
     const needAttr = DEFAULT_ATTR_FOR_ACTION[actionNode.$type];
     if (needAttr && !actionNode.value) {
       const isDur = needAttr.endsWith('Amount') && (needAttr.startsWith('Haste') || needAttr.startsWith('Slow') || needAttr.startsWith('Freeze') || needAttr.startsWith('Charge'));
-      const defaults = isDur ? [1000, 1500, 2000, 3000] : [10, 20, 40, 80];
-      ['Bronze', 'Silver', 'Gold', 'Diamond'].forEach((t, i) => {
+      const defaults = isDur ? [1000, 1500, 2000, 3000, 3500] : [10, 20, 40, 80, 120];
+      (B().TIERS || ['Bronze', 'Silver', 'Gold', 'Diamond', 'Legendary']).forEach((t, i) => {
         if (card.tiers[t]?.attributes && card.tiers[t].attributes[needAttr] === undefined) {
-          card.tiers[t].attributes[needAttr] = defaults[i];
+          card.tiers[t].attributes[needAttr] = defaults[Math.min(i, defaults.length - 1)];
         }
       });
     }
@@ -920,9 +1123,9 @@
           cloned.id = newKey;
           map[newKey] = cloned;
 
-          // 如果目标为新卡，顺手把原版卡上对应的默认数值（如 ChargeAmount/HasteAmount/Custom_0）补进缺失项
+          // 如果目标为新卡，顺手把原版卡上对应的默认数值（如 ChargeAmount/HasteAmount/Custom_0）补进缺失项（覆盖全部 5 阶）
           if (hostInfo.host === 'card' && card.tiers && hostInfo.obj.tiers) {
-            ['Bronze', 'Silver', 'Gold', 'Diamond'].forEach((t) => {
+            (B().TIERS || ['Bronze', 'Silver', 'Gold', 'Diamond', 'Legendary']).forEach((t) => {
               const srcAttrs = card.tiers[t]?.attributes;
               const dstAttrs = hostInfo.obj.tiers[t]?.attributes;
               if (!srcAttrs || !dstAttrs) return;
@@ -1010,7 +1213,9 @@
         } else if (p.type === 'vfxKey') {
           ctrl = `<select data-mp-idx="${idx}" data-mp-key="${escapeHtml(p.key)}" data-mp-type="string">${renderVfxOptionsHtml(cur)}</select>`;
         } else if (p.type === 'int' || p.type === 'float') {
-          ctrl = `<input type="number" step="${p.type === 'float' ? '0.1' : '1'}" ${p.min != null ? `min="${p.min}"` : ''} ${p.max != null ? `max="${p.max}"` : ''} value="${escapeHtml(cur)}" data-mp-idx="${idx}" data-mp-key="${escapeHtml(p.key)}" data-mp-type="${p.type}" />`;
+          const minAttr = safeNumAttr(p.min);
+          const maxAttr = safeNumAttr(p.max);
+          ctrl = `<input type="number" step="${p.type === 'float' ? '0.1' : '1'}" ${minAttr !== '' ? `min="${escapeHtml(minAttr)}"` : ''} ${maxAttr !== '' ? `max="${escapeHtml(maxAttr)}"` : ''} value="${escapeHtml(safeNumAttr(cur))}" data-mp-idx="${idx}" data-mp-key="${escapeHtml(p.key)}" data-mp-type="${p.type}" />`;
         } else {
           ctrl = `<input type="text" value="${escapeHtml(cur)}" data-mp-idx="${idx}" data-mp-key="${escapeHtml(p.key)}" data-mp-type="string" />`;
         }
@@ -1251,9 +1456,88 @@
     $('meTooltipTpl').value = mech.tooltipTemplateZh || '';
     $('meDescZh').value = mech.descZh || '';
 
+    renderMechanicCounterDisplayEditor(mech);
     renderMechanicParamsEditor(mech);
     renderMechanicHooksEditor(mech);
     $('meRawJson').value = JSON.stringify(mech, null, 2);
+  }
+
+  function fillCounterDisplayEnums(syncSel, maxAttrSel, styleSel, vtSel, posSel, cur) {
+    const ms = catalog().mechanicSchema || {};
+    const cdAttrs = ms.counterDisplayAttributes || ['Custom_0', 'Custom_1', 'Custom_2', 'Custom_3', 'Custom_4', 'Custom_5', 'Custom_6', 'Custom_7', 'Custom_8', 'Counter', 'Ammo', 'AmmoMax', 'DamageAmount', 'ShieldApplyAmount', 'BurnApplyAmount', 'PoisonApplyAmount', 'HealAmount', 'RegenApplyAmount', 'CritChance', 'Multicast', 'CooldownMax'];
+    const styles = ms.counterDisplayStyles || [{ id: 'auto', nameZh: '自动 (auto)' }, { id: 'pips', nameZh: '格点 (pips)' }, { id: 'bar', nameZh: '进度条 (bar)' }, { id: 'gem', nameZh: '宝石 (gem)' }, { id: 'pill', nameZh: '胶囊 (pill)' }];
+    const vts = ms.counterDisplayValueTypes || [{ id: 'count', nameZh: '计数 (count)' }, { id: 'progress', nameZh: '进度比 (progress)' }, { id: 'percent', nameZh: '百分比 (percent)' }, { id: 'seconds', nameZh: '秒数 (seconds)' }, { id: 'multiplier', nameZh: '倍率 (multiplier)' }, { id: 'delta', nameZh: '增减 (delta)' }];
+    const poses = ms.counterDisplayPositions || [{ id: 'bottom', nameZh: '底部居中 (bottom)' }, { id: 'bottomRight', nameZh: '右下角 (bottomRight)' }, { id: 'topLeft', nameZh: '左上角 (topLeft)' }, { id: 'topRight', nameZh: '右上角 (topRight)' }];
+
+    if (syncSel) syncSel.innerHTML = cdAttrs.map((a) => `<option value="${escapeHtml(a)}" ${a === (cur?.syncAttribute || 'Custom_3') ? 'selected' : ''}>${escapeHtml(a)}</option>`).join('');
+    if (maxAttrSel) maxAttrSel.innerHTML = '<option value="">（无动态上限属性）</option>' + cdAttrs.map((a) => `<option value="${escapeHtml(a)}" ${a === (cur?.maxAttr || '') ? 'selected' : ''}>${escapeHtml(a)}</option>`).join('');
+    if (styleSel) styleSel.innerHTML = styles.map((s) => `<option value="${escapeHtml(s.id)}" ${s.id === (cur?.style || 'auto') ? 'selected' : ''}>${escapeHtml(s.nameZh)}</option>`).join('');
+    if (vtSel) vtSel.innerHTML = vts.map((v) => `<option value="${escapeHtml(v.id)}" ${v.id === (cur?.valueType || 'count') ? 'selected' : ''}>${escapeHtml(v.nameZh)}</option>`).join('');
+    if (posSel) posSel.innerHTML = poses.map((p) => `<option value="${escapeHtml(p.id)}" ${p.id === (cur?.position || 'bottom') ? 'selected' : ''}>${escapeHtml(p.nameZh)}</option>`).join('');
+  }
+
+  function renderMechanicCounterDisplayEditor(mech) {
+    const chk = $('meCdEnabled');
+    const box = $('meCounterDisplayFields');
+    if (!chk || !box) return;
+    const cd = mech.counterDisplay || null;
+    chk.checked = !!cd;
+    box.classList.toggle('hidden', !cd);
+    fillCounterDisplayEnums($('meCdSyncAttr'), $('meCdMaxAttr'), $('meCdStyle'), $('meCdValueType'), $('meCdPosition'), cd);
+    if (!cd) return;
+    $('meCdLabelZh').value = cd.labelZh || '';
+    $('meCdMaxParam').value = cd.maxParam || '';
+    $('meCdMaxConst').value = safeNumAttr(cd.maxConst);
+    $('meCdColorHex').value = cd.colorHex || '#F97316';
+    $('meCdUnit').value = cd.unit || '';
+    $('meCdFormat').value = cd.format || '';
+    $('meCdHideWhenZero').checked = !!cd.hideWhenZero;
+  }
+
+  function renderStepInlineControlsHtml(st, hi, si, mSchema) {
+    const targetModes = mSchema.targetModes || [{ id: 'Self', nameZh: '自身' }, { id: 'Adjacent', nameZh: '相邻' }, { id: 'AllAllies', nameZh: '全部友军' }, { id: 'OtherAllies', nameZh: '其余友军' }, { id: 'AllEnemies', nameZh: '全部敌军' }];
+    const statuses = mSchema.statuses || [{ id: 'Shield', nameZh: '护盾' }, { id: 'Burn', nameZh: '灼烧' }, { id: 'Poison', nameZh: '剧毒' }, { id: 'Heal', nameZh: '治疗' }, { id: 'Regen', nameZh: '再生' }, { id: 'Haste', nameZh: '加速' }, { id: 'Slow', nameZh: '减速' }, { id: 'Freeze', nameZh: '冻结' }, { id: 'Charge', nameZh: '充能' }];
+    const syncAttrs = mSchema.syncAttributes || ['Custom_0', 'Custom_1', 'Custom_2', 'Custom_3', 'Custom_4', 'Custom_5', 'Custom_6', 'Custom_7', 'Custom_8'];
+    const pAttrs = mSchema.playerAttributes || [{ id: 'HealthMax', nameZh: '生命上限' }, { id: 'PercentDamageReduction', nameZh: '减伤%' }, { id: 'Gold', nameZh: '金币' }];
+    const cardAttrs = catalog().attributes || [{ id: 'DamageAmount', nameZh: '伤害' }, { id: 'ShieldApplyAmount', nameZh: '护盾' }, { id: 'PercentCooldownReduction', nameZh: '冷却缩减%' }];
+    const ops = mSchema.stepOperations || [{ id: 'Add', nameZh: 'Add' }, { id: 'Subtract', nameZh: 'Subtract' }, { id: 'Set', nameZh: 'Set' }, { id: 'Multiply', nameZh: 'Multiply' }];
+    const attrsData = `data-hi="${hi}" data-si="${si}"`;
+    const parts = [];
+
+    if (st.op === 'ModifyCardAttribute' || st.op === 'QueuePostCombatModifyAttr') {
+      const modeVal = st.targetSpec?.mode || 'Self';
+      parts.push(`<label>目标<select data-sp="targetMode" ${attrsData}>${targetModes.map((tm) => `<option value="${escapeHtml(tm.id)}" ${tm.id === modeVal ? 'selected' : ''}>${escapeHtml(tm.nameZh)}</option>`).join('')}</select></label>`);
+      parts.push(`<label>属性<select data-sp="attribute" ${attrsData}>${cardAttrs.map((a) => `<option value="${escapeHtml(a.id)}" ${a.id === (st.attribute || 'DamageAmount') ? 'selected' : ''}>${escapeHtml(a.nameZh)}</option>`).join('')}</select></label>`);
+      parts.push(`<label>运算<select data-sp="operation" ${attrsData}>${ops.map((o) => `<option value="${escapeHtml(o.id)}" ${o.id === (st.operation || 'Add') ? 'selected' : ''}>${escapeHtml(o.id)}</option>`).join('')}</select></label>`);
+      if (st.op === 'ModifyCardAttribute') {
+        parts.push(`<label>时长<select data-sp="duration" ${attrsData}><option value="Combat" ${(st.duration || 'Combat') === 'Combat' ? 'selected' : ''}>Combat</option><option value="Permanent" ${st.duration === 'Permanent' ? 'selected' : ''}>Permanent</option></select></label>`);
+      }
+      parts.push(`<label title="默认关闭：严防给非武器/非对应产出卡牌误挂伤害红标；仅确需赋予新输出属性时勾选"><input type="checkbox" data-sp="grantIfMissing" ${attrsData} ${st.grantIfMissing ? 'checked' : ''} /> grantIfMissing（允许无此属性时赋予）</label>`);
+    } else if (st.op === 'ModifyPlayerAttribute') {
+      parts.push(`<label>玩家<select data-sp="playerTarget" ${attrsData}><option value="Self" ${(st.playerTarget || 'Self') === 'Self' ? 'selected' : ''}>Self</option><option value="Opponent" ${st.playerTarget === 'Opponent' ? 'selected' : ''}>Opponent</option></select></label>`);
+      parts.push(`<label>玩家属性<select data-sp="attribute" ${attrsData}>${pAttrs.map((a) => `<option value="${escapeHtml(a.id)}" ${a.id === (st.attribute || 'HealthMax') ? 'selected' : ''}>${escapeHtml(a.nameZh)}</option>`).join('')}</select></label>`);
+      parts.push(`<label>运算<select data-sp="operation" ${attrsData}>${ops.map((o) => `<option value="${escapeHtml(o.id)}" ${o.id === (st.operation || 'Add') ? 'selected' : ''}>${escapeHtml(o.id)}</option>`).join('')}</select></label>`);
+    } else if (st.op === 'ModifyCounter') {
+      parts.push(`<label>键<input type="text" data-sp="key" ${attrsData} value="${escapeHtml(st.key || 'counter_0')}" style="width:92px;" /></label>`);
+      parts.push(`<label>运算<select data-sp="operation" ${attrsData}>${ops.map((o) => `<option value="${escapeHtml(o.id)}" ${o.id === (st.operation || 'Add') ? 'selected' : ''}>${escapeHtml(o.id)}</option>`).join('')}</select></label>`);
+      parts.push(`<label>同步槽<select data-sp="syncAttribute" ${attrsData}><option value="">不投影</option>${syncAttrs.map((a) => `<option value="${escapeHtml(a)}" ${a === (st.syncAttribute || '') ? 'selected' : ''}>${escapeHtml(a)}</option>`).join('')}</select></label>`);
+    } else if (st.op === 'DealDamage') {
+      parts.push(`<label>目标<select data-sp="playerTarget" ${attrsData}><option value="Opponent" ${(st.playerTarget || 'Opponent') === 'Opponent' ? 'selected' : ''}>Opponent</option><option value="Self" ${st.playerTarget === 'Self' ? 'selected' : ''}>Self</option></select></label>`);
+      parts.push(`<label>特效<select data-sp="vfxKey" ${attrsData}>${renderVfxOptionsHtml(st.vfxKey || '')}</select></label>`);
+      parts.push(`<label><input type="checkbox" data-sp="bypassShield" ${attrsData} ${st.bypassShield ? 'checked' : ''} /> 穿盾</label>`);
+    } else if (st.op === 'ApplyStatus') {
+      parts.push(`<label>状态<select data-sp="status" ${attrsData}>${statuses.map((s) => `<option value="${escapeHtml(s.id)}" ${s.id === (st.status || 'Haste') ? 'selected' : ''}>${escapeHtml(s.nameZh)}</option>`).join('')}</select></label>`);
+      parts.push(`<label>目标<select data-sp="targetMode" ${attrsData}>${targetModes.map((tm) => `<option value="${escapeHtml(tm.id)}" ${tm.id === (st.targetSpec?.mode || 'Adjacent') ? 'selected' : ''}>${escapeHtml(tm.nameZh)}</option>`).join('')}</select></label>`);
+    } else if (st.op === 'ChangeCardState') {
+      parts.push(`<label>变更<select data-sp="changeKind" ${attrsData}><option value="Disable" ${(st.changeKind || 'Disable') === 'Disable' ? 'selected' : ''}>Disable</option><option value="Destroy" ${st.changeKind === 'Destroy' ? 'selected' : ''}>Destroy</option><option value="Repair" ${st.changeKind === 'Repair' ? 'selected' : ''}>Repair</option></select></label>`);
+      parts.push(`<label>目标<select data-sp="targetMode" ${attrsData}>${targetModes.map((tm) => `<option value="${escapeHtml(tm.id)}" ${tm.id === (st.targetSpec?.mode || 'Self') ? 'selected' : ''}>${escapeHtml(tm.nameZh)}</option>`).join('')}</select></label>`);
+      parts.push(`<label><input type="checkbox" data-sp="suppressNormalDestroyTriggers" ${attrsData} ${st.suppressNormalDestroyTriggers ? 'checked' : ''} /> 屏蔽常规摧毁联动</label>`);
+    } else if (st.op === 'ForceUseCard' || st.op === 'QueuePostCombatRemoveCard') {
+      parts.push(`<label>目标<select data-sp="targetMode" ${attrsData}>${targetModes.map((tm) => `<option value="${escapeHtml(tm.id)}" ${tm.id === (st.targetSpec?.mode || 'Self') ? 'selected' : ''}>${escapeHtml(tm.nameZh)}</option>`).join('')}</select></label>`);
+    }
+
+    const inlineHtml = parts.length ? `<div class="step-inline-grid">${parts.join('')}</div>` : '';
+    return `${inlineHtml}<code style="font-size:11px;color:#cbd5e1;word-break:break-all;margin-top:3px;">${escapeHtml(JSON.stringify(st))}</code>`;
   }
 
   function renderMechanicParamsEditor(mech) {
@@ -1312,10 +1596,13 @@
     const mSchema = catalog().mechanicSchema || {};
     const hooksList = mSchema.hooks || [];
     const opsList = mSchema.ops || [];
+    const scopeList = mSchema.hookScopes?.length
+      ? mSchema.hookScopes
+      : Object.entries(HOOK_SCOPE_ZH).map(([id, nameZh]) => ({ id, nameZh }));
     const box = $('meHooksList');
     mech.hooks = mech.hooks || [];
     if (!mech.hooks.length) {
-      box.innerHTML = '<div class="muted">暂无管线钩子，点击「+ 添加管线钩子」绑定 6 大通用拦截点之一。</div>';
+      box.innerHTML = '<div class="muted">暂无管线钩子，点击「+ 添加管线钩子」绑定 10 大通用拦截点之一。</div>';
       return;
     }
     box.innerHTML = mech.hooks.map((h, hi) => `
@@ -1334,9 +1621,9 @@
           <label class="field"><span>触发范围与单场次数上限</span>
             <div class="inline-pair">
               <select data-hf="scope" data-hi="${hi}">
-                ${['SelfCard', 'OwnerPlayer', 'EnemyPlayer', 'OwnerBoard', 'EnemyBoard', 'Any'].map((sc) => `<option value="${sc}" ${sc === (h.scope || 'SelfCard') ? 'selected' : ''}>${escapeHtml(HOOK_SCOPE_ZH[sc] || sc)}</option>`).join('')}
+                ${scopeList.map((sc) => `<option value="${escapeHtml(sc.id)}" ${sc.id === (h.scope || 'SelfCard') ? 'selected' : ''}>${escapeHtml(sc.nameZh || HOOK_SCOPE_ZH[sc.id] || sc.id)}</option>`).join('')}
               </select>
-              <input type="number" min="1" max="100" value="${escapeHtml(h.maxTriggersPerCombat ?? '')}" placeholder="不限次数" data-hf="maxTriggersPerCombat" data-hi="${hi}" style="width:92px;" />
+              <input type="number" min="1" max="200" value="${escapeHtml(safeNumAttr(h.maxTriggersPerCombat))}" placeholder="不限次数" data-hf="maxTriggersPerCombat" data-hi="${hi}" style="width:92px;" />
             </div>
           </label>
         </div>
@@ -1347,7 +1634,7 @@
                 ${opsList.map((op) => `<option value="${escapeHtml(op.id)}" ${op.id === st.op ? 'selected' : ''}>${escapeHtml(op.nameZh)}</option>`).join('')}
               </select>
               <div class="mech-step-fields">
-                <code style="font-size:11px;color:#cbd5e1;word-break:break-all;">${escapeHtml(JSON.stringify(st))}</code>
+                ${renderStepInlineControlsHtml(st, hi, si, mSchema)}
               </div>
               <button type="button" class="btn btn-danger btn-xs" data-rm-step="${hi}:${si}">删</button>
             </div>
@@ -1370,6 +1657,27 @@
         const hi = parseInt(el.dataset.hi, 10);
         const si = parseInt(el.dataset.si, 10);
         mech.hooks[hi].steps[si] = makeDefaultStepForOp(el.value);
+        B().markDirty(true);
+        renderMechanicEditor();
+      });
+    });
+    box.querySelectorAll('[data-sp]').forEach((el) => {
+      el.addEventListener('change', () => {
+        const hi = parseInt(el.dataset.hi, 10);
+        const si = parseInt(el.dataset.si, 10);
+        const sp = el.dataset.sp;
+        const step = mech.hooks[hi]?.steps?.[si];
+        if (!step) return;
+        if (sp === 'targetMode') {
+          step.targetSpec = Object.assign({}, step.targetSpec || {}, { mode: el.value });
+        } else if (sp === 'grantIfMissing' || sp === 'bypassShield' || sp === 'suppressNormalDestroyTriggers') {
+          step[sp] = !!el.checked;
+        } else if (sp === 'syncAttribute' || sp === 'vfxKey') {
+          if (el.value) step[sp] = el.value;
+          else delete step[sp];
+        } else {
+          step[sp] = el.value;
+        }
         B().markDirty(true);
         renderMechanicEditor();
       });
@@ -1403,18 +1711,21 @@
   function makeDefaultStepForOp(op) {
     switch (op) {
       case 'CancelHook': return { op: 'CancelHook' };
+      case 'Stop': return { op: 'Stop' };
       case 'ModifyHookAmount': return { op: 'ModifyHookAmount', operation: 'Multiply', value: { const: 0.5 } };
       case 'SetFlag': return { op: 'SetFlag', target: 'Self', flag: 'custom_flag' };
       case 'ClearFlag': return { op: 'ClearFlag', target: 'Self', flag: 'custom_flag' };
-      case 'ModifyCounter': return { op: 'ModifyCounter', target: 'Self', key: 'counter_0', operation: 'Add', value: { const: 1 }, syncAttribute: 'Custom_0' };
+      case 'ModifyCounter': return { op: 'ModifyCounter', target: 'Self', key: 'counter_0', operation: 'Add', value: { const: 1 }, syncAttribute: 'Custom_3' };
       case 'ApplyStatus': return { op: 'ApplyStatus', status: 'Haste', targetSpec: { mode: 'Adjacent' }, amount: { const: 1000 } };
-      case 'ModifyCardAttribute': return { op: 'ModifyCardAttribute', targetSpec: { mode: 'AllAllies' }, attribute: 'DamageAmount', operation: 'Add', value: { const: 10 }, duration: 'Combat' };
+      case 'ModifyCardAttribute': return { op: 'ModifyCardAttribute', targetSpec: { mode: 'AllAllies' }, attribute: 'DamageAmount', operation: 'Add', value: { const: 10 }, duration: 'Combat', grantIfMissing: false };
+      case 'ModifyPlayerAttribute': return { op: 'ModifyPlayerAttribute', playerTarget: 'Self', attribute: 'HealthMax', operation: 'Add', value: { const: 50 } };
       case 'ChangeCardState': return { op: 'ChangeCardState', targetSpec: { mode: 'Self' }, changeKind: 'Disable', reason: 'custom_state', suppressNormalDestroyTriggers: true };
+      case 'ForceUseCard': return { op: 'ForceUseCard', targetSpec: { mode: 'Adjacent' } };
       case 'EmitCustomEvent': return { op: 'EmitCustomEvent', eventName: 'my_custom_event', payloadValue: { const: 1 } };
       case 'Repeat': return { op: 'Repeat', count: { const: 3 }, intervalMs: { const: 150 }, steps: [{ op: 'DealDamage', playerTarget: 'Opponent', amount: { const: 10 } }] };
       case 'ScheduleDelayed': return { op: 'ScheduleDelayed', delayMs: { const: 2000 }, steps: [{ op: 'DealDamage', playerTarget: 'Opponent', amount: { const: 25 } }] };
       case 'QueuePostCombatRemoveCard': return { op: 'QueuePostCombatRemoveCard', targetSpec: { mode: 'Self', includeDisabled: true }, reason: 'shattered' };
-      case 'QueuePostCombatModifyAttr': return { op: 'QueuePostCombatModifyAttr', targetSpec: { mode: 'Self', includeDisabled: true }, attribute: 'DamageAmount', operation: 'Add', value: { const: 5 } };
+      case 'QueuePostCombatModifyAttr': return { op: 'QueuePostCombatModifyAttr', targetSpec: { mode: 'Self', includeDisabled: true }, attribute: 'DamageAmount', operation: 'Add', value: { const: 5 }, grantIfMissing: false };
       case 'If': return { op: 'If', condition: { hasFlag: 'custom_flag', flagTarget: 'Self' }, then: [{ op: 'CancelHook' }] };
       default: return { op: 'DealDamage', playerTarget: 'Opponent', amount: { const: 15 } };
     }
@@ -1479,11 +1790,16 @@
       updateAffixBuilderPreview();
     });
     $('abPrereqKind')?.addEventListener('change', () => {
-      renderPrereqFields();
+      renderPrereqFields('ab');
+      updateAffixBuilderPreview();
+    });
+    $('abAuraPrereqKind')?.addEventListener('change', () => {
+      renderPrereqFields('abAura');
       updateAffixBuilderPreview();
     });
     ['abTriggerType', 'abTriggerType2', 'abTriggerSubjectMode', 'abTriggerSubjectTag', 'abTriggerSubjectHiddenTag', 'abActiveIn',
-      'abAuraActionType', 'abAuraTargetMode', 'abAuraTargetTag', 'abAuraAttr', 'abAuraOp', 'abAuraValMode', 'abAuraValInput']
+      'abAuraActionType', 'abAuraTargetMode', 'abAuraTargetTag', 'abAuraAttr', 'abAuraOp', 'abAuraValMode', 'abAuraValInput',
+      'abAuraActiveIn', 'abAuraVfxKey']
       .forEach((id) => $(id)?.addEventListener('change', updateAffixBuilderPreview));
 
     // 原位补丁：一键载入原版能力 / 清空覆写
@@ -1604,25 +1920,198 @@
 
     $('btnStressTestMechanic')?.addEventListener('click', stressTestCurrentMechanic);
 
-    // 13 种官方附魔可视化按钮绑定
-    $('btnAutoGenAllEnchants')?.addEventListener('click', () => {
-      const card = B().state.workspace?.cards?.[B().state.selectedCardIdx];
-      if (!card) return;
-      autoGenerateAll13Enchantments(card);
+    // 机制级 counterDisplay 双向绑定
+    $('meCdEnabled')?.addEventListener('change', () => {
+      const ws = B().state.workspace;
+      const mech = ws && v14.selectedMechIdx >= 0 ? ws.mechanics[v14.selectedMechIdx] : null;
+      if (!mech) return;
+      if ($('meCdEnabled').checked) {
+        mech.counterDisplay = mech.counterDisplay || {
+          labelZh: '充能', syncAttribute: 'Custom_3', colorHex: '#F97316',
+          style: 'auto', valueType: 'count', position: 'bottom', hideWhenZero: false,
+        };
+      } else {
+        delete mech.counterDisplay;
+      }
       B().markDirty(true);
-      renderEnchantmentsEditor();
-      B().updateLivePreview(card);
-      B().toast('已按本卡属性智能生成全部 13 种官方附魔与中文说明！可在右侧「预览附魔」逐一查看。');
+      renderMechanicEditor();
     });
-    $('btnClearAllEnchants')?.addEventListener('click', () => {
-      const card = B().state.workspace?.cards?.[B().state.selectedCardIdx];
-      if (!card) return;
-      card.enchantments = {};
-      card.enchantTooltipsZh = {};
+    ['meCdLabelZh', 'meCdSyncAttr', 'meCdMaxParam', 'meCdMaxConst', 'meCdMaxAttr', 'meCdColorHex', 'meCdStyle', 'meCdValueType', 'meCdPosition', 'meCdUnit', 'meCdFormat', 'meCdHideWhenZero'].forEach((id) => {
+      $(id)?.addEventListener('change', () => {
+        const ws = B().state.workspace;
+        const mech = ws && v14.selectedMechIdx >= 0 ? ws.mechanics[v14.selectedMechIdx] : null;
+        if (!mech || !mech.counterDisplay) return;
+        const cd = mech.counterDisplay;
+        cd.labelZh = $('meCdLabelZh').value.trim();
+        cd.syncAttribute = $('meCdSyncAttr').value || 'Custom_3';
+        cd.maxParam = $('meCdMaxParam').value.trim() || undefined;
+        cd.maxConst = $('meCdMaxConst').value === '' ? undefined : parseInt($('meCdMaxConst').value, 10);
+        cd.maxAttr = $('meCdMaxAttr').value || undefined;
+        cd.colorHex = $('meCdColorHex').value.trim() || undefined;
+        cd.style = $('meCdStyle').value || 'auto';
+        cd.valueType = $('meCdValueType').value || 'count';
+        cd.position = $('meCdPosition').value || 'bottom';
+        cd.unit = $('meCdUnit').value.trim() || undefined;
+        cd.format = $('meCdFormat').value.trim() || undefined;
+        cd.hideWhenZero = !!$('meCdHideWhenZero').checked;
+        B().markDirty(true);
+        $('meRawJson').value = JSON.stringify(mech, null, 2);
+      });
+    });
+
+    // 卡牌/补丁级 counterDisplays 增删按钮
+    const addCounterDisplayForHost = () => {
+      const info = getActiveTargetHost();
+      if (!info) return;
+      const list = info.host === 'card'
+        ? (info.obj.counterDisplays = info.obj.counterDisplays || [])
+        : (info.obj.counterDisplaysOverride = info.obj.counterDisplaysOverride || []);
+      if (list.length >= 4) {
+        B().toast('单卡最多配置 4 个实时计数角标（counterDisplays）！', 'err');
+        return;
+      }
+      list.push({
+        labelZh: `计数 ${list.length + 1}`,
+        syncAttribute: `Custom_${Math.min(8, 3 + list.length)}`,
+        colorHex: '#F97316',
+        style: 'auto',
+        valueType: 'count',
+        position: 'bottom',
+        hideWhenZero: false,
+      });
+      B().markDirty(true);
+      renderHostCounterDisplaysEditor();
+      if (info.host === 'card') B().updateLivePreview(info.obj);
+      else B().updateLivePreviewFromPatch(info.obj);
+    };
+    $('btnAddCardCounterDisplay')?.addEventListener('click', addCounterDisplayForHost);
+    $('btnAddPatchCounterDisplay')?.addEventListener('click', addCounterDisplayForHost);
+
+    // 13 种官方附魔可视化按钮绑定（双宿主：新卡 + 原位补丁）
+    const autoGenEnchantsForHost = () => {
+      const info = getActiveTargetHost();
+      if (!info) return;
+      if (info.host === 'card') {
+        autoGenerateAll13Enchantments(info.obj);
+        B().updateLivePreview(info.obj);
+      } else {
+        const bp = B().state.vanillaBlueprintCache?.[info.obj.targetTemplateId];
+        autoGenerateAll13EnchantmentsForPatch(info.obj, bp?.card || null);
+        B().updateLivePreviewFromPatch(info.obj);
+      }
       B().markDirty(true);
       renderEnchantmentsEditor();
-      B().updateLivePreview(card);
-      B().toast('已清空本卡附魔配置。');
+      B().toast('已按卡牌属性智能生成全部 13 种官方附魔与中文说明！可在右侧「预览附魔」逐一查看。');
+    };
+    const clearEnchantsForHost = () => {
+      const info = getActiveTargetHost();
+      if (!info) return;
+      if (info.host === 'card') {
+        info.obj.enchantments = {};
+        info.obj.enchantTooltipsZh = {};
+        B().updateLivePreview(info.obj);
+      } else {
+        info.obj.enchantmentOverrides = {};
+        info.obj.enchantTooltipsZh = {};
+        B().updateLivePreviewFromPatch(info.obj);
+      }
+      B().markDirty(true);
+      renderEnchantmentsEditor();
+      B().toast('已清空附魔配置。');
+    };
+    $('btnAutoGenAllEnchants')?.addEventListener('click', autoGenEnchantsForHost);
+    $('btnClearAllEnchants')?.addEventListener('click', clearEnchantsForHost);
+    $('btnPeAutoGenAllEnchants')?.addEventListener('click', autoGenEnchantsForHost);
+    $('btnPeClearAllEnchants')?.addEventListener('click', clearEnchantsForHost);
+
+    // Tab 1 进阶内容工坊（野怪 / 模式 / 突变词条 / 汉化）子页签与按钮绑定
+    document.querySelectorAll('.extra-subtab').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const target = btn.dataset.extra;
+        document.querySelectorAll('.extra-subtab').forEach((b) => b.classList.toggle('active', b === btn));
+        document.querySelectorAll('.extra-pane').forEach((p) => p.classList.toggle('active', p.id === `extra-pane-${target}`));
+      });
+    });
+    $('btnAddMonster')?.addEventListener('click', () => {
+      const ws = B().state.workspace;
+      if (!ws) return;
+      ws.monsters = ws.monsters || [];
+      const seq = ws.monsters.length + 1;
+      ws.monsters.push({
+        id: `${ws.manifest.id}:monster_${seq}`,
+        internalName: `Custom Monster ${seq}`,
+        player: { attributes: { HealthMax: 200, Level: 3 }, hand: { unlockedSlots: 1023, items: [] }, skills: [] },
+      });
+      B().markDirty(true);
+      B().updateCounts();
+      renderExtraContentStudio();
+    });
+    $('btnAddMode')?.addEventListener('click', () => {
+      const ws = B().state.workspace;
+      if (!ws) return;
+      ws.modes = ws.modes || [];
+      const seq = ws.modes.length + 1;
+      ws.modes.push({
+        modeId: `${ws.manifest.id}:mode_${seq}`,
+        nameZh: `自定义玩法模式 #${seq}`,
+        descZh: '自定义规则模式',
+        basePreset: 'PureOfficial',
+        baseSpecialMode: 'Standard',
+        mutatorIds: [],
+        affectsGhostPool: false,
+      });
+      B().markDirty(true);
+      B().updateCounts();
+      renderExtraContentStudio();
+    });
+    $('btnAddMutator')?.addEventListener('click', () => {
+      const ws = B().state.workspace;
+      if (!ws) return;
+      ws.mutators = ws.mutators || [];
+      const seq = ws.mutators.length + 1;
+      ws.mutators.push({
+        id: `${ws.manifest.id}:mutator_${seq}`,
+        nameZh: `自定义突变词条 #${seq}`,
+        descriptionZh: '自定义肉鸽词条说明',
+        category: 'challenge',
+        difficultyDelta: 1,
+        scoreMultiplierDelta: 0.15,
+        isPositive: false,
+        targetHook: 'RunEngine',
+        enabledByDefault: false,
+        rules: {},
+      });
+      B().markDirty(true);
+      B().updateCounts();
+      renderExtraContentStudio();
+    });
+    $('btnApplyLocJson')?.addEventListener('click', () => {
+      const ws = B().state.workspace;
+      if (!ws) return;
+      try {
+        const raw = $('locRawJson').value.trim();
+        if (!raw) {
+          ws.localization = null;
+        } else {
+          const parsed = JSON.parse(raw);
+          parsed.schemaVersion = 1;
+          parsed.locale = $('locLocale')?.value.trim() || parsed.locale || 'zh-CN';
+          parsed.revision = $('locRevision')?.value.trim() || parsed.revision || '1.0.0';
+          ws.localization = parsed;
+        }
+        B().markDirty(true);
+        B().toast('已更新汉化覆盖词典！');
+      } catch (ex) {
+        B().toast(`汉化 JSON 语法错误：${ex.message}`, 'err');
+      }
+    });
+    $('btnClearLocOverlay')?.addEventListener('click', () => {
+      const ws = B().state.workspace;
+      if (!ws) return;
+      ws.localization = null;
+      B().markDirty(true);
+      renderExtraContentStudio();
+      B().toast('已清空本 Mod 汉化覆盖词典。');
     });
 
     // Tab 6 纯中文对话式 AI 提示词生成器
@@ -1764,9 +2253,17 @@
       });
     }
 
-    // 2) 原位改原版补丁：追加标签
+    // 2) 原位改原版补丁：覆盖英雄池与追加标签
     const patch = st.workspace && st.selectedPatchIdx >= 0 ? st.workspace.patches[st.selectedPatchIdx] : null;
     if (patch) {
+      renderPillGroup('peHeroPills', heroes, patch.heroes || [], (next) => {
+        patch.heroes = next.length ? next : null;
+        if ($('peHeroes')) $('peHeroes').value = next.join(', ');
+        B().markDirty(true);
+        renderAllPillPickers();
+        B().updateLivePreviewFromPatch(patch);
+      });
+
       renderPillGroup('peAddTagPills', tags, patch.addTags || [], (next) => {
         patch.addTags = next;
         if ($('peAddTags')) $('peAddTags').value = next.join(', ');
@@ -1786,6 +2283,258 @@
         renderAllPillPickers();
       }, { exclusiveValue: 'Common', fallbackValue: 'Common' });
     }
+
+    // 4) Manifest 前置依赖 Mod 多选药丸
+    if (st.workspace?.manifest) {
+      const selfId = st.workspace.manifest.id;
+      const otherMods = (st.mods || [])
+        .filter((m) => m.id && m.id !== selfId)
+        .map((m) => ({ id: m.id, nameZh: `${m.name || m.id} (${m.id})` }));
+      renderPillGroup('mfDepsPills', otherMods, st.workspace.manifest.dependencies || [], (next) => {
+        st.workspace.manifest.dependencies = next;
+        if ($('mfDependencies')) $('mfDependencies').value = next.join(', ');
+        B().markDirty(true);
+        renderAllPillPickers();
+      });
+    }
+  }
+
+  // ── 5b. 卡牌/补丁双宿主 counterDisplays 多徽章可视化编辑器 ─────────────────────
+  function renderHostCounterDisplaysEditor() {
+    const info = getActiveTargetHost();
+    if (!info) return;
+    const listEl = $(info.host === 'card' ? 'ceCounterDisplaysList' : 'peCounterDisplaysList');
+    if (!listEl) return;
+    const list = info.host === 'card' ? (info.obj.counterDisplays || []) : (info.obj.counterDisplaysOverride || []);
+    if (!list.length) {
+      listEl.innerHTML = '<div class="muted">暂无卡面实时计数角标（点击右上角「+ 添加计数角标」可配置最多 4 槽位 3D 角标）。</div>';
+      return;
+    }
+
+    const ms = catalog().mechanicSchema || {};
+    const cdAttrs = ms.counterDisplayAttributes || ['Custom_0', 'Custom_1', 'Custom_2', 'Custom_3', 'Custom_4', 'Custom_5', 'Custom_6', 'Custom_7', 'Custom_8', 'Counter', 'Ammo', 'AmmoMax', 'DamageAmount', 'ShieldApplyAmount', 'BurnApplyAmount', 'PoisonApplyAmount', 'HealAmount', 'RegenApplyAmount', 'CritChance', 'Multicast', 'CooldownMax'];
+    const styles = ms.counterDisplayStyles || [{ id: 'auto', nameZh: '自动 (auto)' }, { id: 'pips', nameZh: '格点 (pips)' }, { id: 'bar', nameZh: '进度条 (bar)' }, { id: 'gem', nameZh: '宝石 (gem)' }, { id: 'pill', nameZh: '胶囊 (pill)' }];
+    const vts = ms.counterDisplayValueTypes || [{ id: 'count', nameZh: '计数 (count)' }, { id: 'progress', nameZh: '进度比 (progress)' }, { id: 'percent', nameZh: '百分比 (percent)' }, { id: 'seconds', nameZh: '秒数 (seconds)' }, { id: 'multiplier', nameZh: '倍率 (multiplier)' }, { id: 'delta', nameZh: '增减 (delta)' }];
+    const poses = ms.counterDisplayPositions || [{ id: 'bottom', nameZh: '底部 (bottom)' }, { id: 'bottomRight', nameZh: '右下 (bottomRight)' }, { id: 'topLeft', nameZh: '左上 (topLeft)' }, { id: 'topRight', nameZh: '右上 (topRight)' }];
+
+    listEl.innerHTML = list.map((cd, i) => `
+      <div class="counter-item-card">
+        <div class="panel-header compact">
+          <strong>角标 #${i + 1}：${escapeHtml(cd.labelZh || cd.syncAttribute || 'Custom_3')}</strong>
+          <button type="button" class="btn btn-danger btn-xs" data-rm-cd="${i}">删除</button>
+        </div>
+        <div class="form-grid">
+          <label class="field"><span>中文短名</span><input type="text" data-cd-i="${i}" data-cd-f="labelZh" value="${escapeHtml(cd.labelZh || '')}" /></label>
+          <label class="field"><span>同步属性</span><select data-cd-i="${i}" data-cd-f="syncAttribute">${cdAttrs.map((a) => `<option value="${escapeHtml(a)}" ${a === (cd.syncAttribute || 'Custom_3') ? 'selected' : ''}>${escapeHtml(a)}</option>`).join('')}</select></label>
+          <label class="field"><span>固定上限 maxConst</span><input type="number" data-cd-i="${i}" data-cd-f="maxConst" value="${escapeHtml(safeNumAttr(cd.maxConst))}" placeholder="可选" /></label>
+          <label class="field"><span>动态上限属性 maxAttr</span><select data-cd-i="${i}" data-cd-f="maxAttr"><option value="">无</option>${cdAttrs.map((a) => `<option value="${escapeHtml(a)}" ${a === (cd.maxAttr || '') ? 'selected' : ''}>${escapeHtml(a)}</option>`).join('')}</select></label>
+          <label class="field"><span>样式 style</span><select data-cd-i="${i}" data-cd-f="style">${styles.map((s) => `<option value="${escapeHtml(s.id)}" ${s.id === (cd.style || 'auto') ? 'selected' : ''}>${escapeHtml(s.nameZh)}</option>`).join('')}</select></label>
+          <label class="field"><span>值型 valueType</span><select data-cd-i="${i}" data-cd-f="valueType">${vts.map((v) => `<option value="${escapeHtml(v.id)}" ${v.id === (cd.valueType || 'count') ? 'selected' : ''}>${escapeHtml(v.nameZh)}</option>`).join('')}</select></label>
+          <label class="field"><span>锚点 position</span><select data-cd-i="${i}" data-cd-f="position">${poses.map((p) => `<option value="${escapeHtml(p.id)}" ${p.id === (cd.position || 'bottom') ? 'selected' : ''}>${escapeHtml(p.nameZh)}</option>`).join('')}</select></label>
+          <label class="field"><span>主题色 / 单位</span>
+            <div class="inline-pair">
+              <input type="text" data-cd-i="${i}" data-cd-f="colorHex" value="${escapeHtml(cd.colorHex || '#F97316')}" placeholder="#F97316" />
+              <input type="text" data-cd-i="${i}" data-cd-f="unit" value="${escapeHtml(cd.unit || '')}" placeholder="单位" style="width:76px;" />
+            </div>
+          </label>
+          <label class="field span-2">
+            <label class="inline-check"><input type="checkbox" data-cd-i="${i}" data-cd-f="hideWhenZero" ${cd.hideWhenZero ? 'checked' : ''} /> 数值为 0 时隐藏角标（hideWhenZero）</label>
+          </label>
+        </div>
+      </div>
+    `).join('');
+
+    listEl.querySelectorAll('[data-cd-f]').forEach((el) => {
+      el.addEventListener('change', () => {
+        const i = parseInt(el.dataset.cdI, 10);
+        const f = el.dataset.cdF;
+        const item = list[i];
+        if (!item) return;
+        if (f === 'hideWhenZero') item[f] = !!el.checked;
+        else if (f === 'maxConst') item[f] = el.value === '' ? undefined : parseInt(el.value, 10);
+        else if (f === 'maxAttr' || f === 'unit' || f === 'colorHex') item[f] = el.value.trim() || undefined;
+        else item[f] = el.value.trim();
+        B().markDirty(true);
+        if (info.host === 'card') B().updateLivePreview(info.obj);
+        else B().updateLivePreviewFromPatch(info.obj);
+      });
+    });
+    listEl.querySelectorAll('[data-rm-cd]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        list.splice(parseInt(btn.dataset.rmCd, 10), 1);
+        B().markDirty(true);
+        renderHostCounterDisplaysEditor();
+        if (info.host === 'card') B().updateLivePreview(info.obj);
+        else B().updateLivePreviewFromPatch(info.obj);
+      });
+    });
+  }
+
+  // ── 5c. Tab 1 进阶内容工坊：Monsters / Modes / Mutators / Localization ─────────
+  function renderExtraContentStudio() {
+    const ws = B().state.workspace;
+    if (!ws) return;
+
+    // Monsters
+    const mBox = $('monstersStudioList');
+    if (mBox) {
+      const monsters = ws.monsters || [];
+      mBox.innerHTML = monsters.length
+        ? monsters.map((m, i) => `
+          <div class="counter-item-card">
+            <div class="panel-header compact">
+              <strong>野怪 #${i + 1}：${escapeHtml(m.internalName || m.id)}</strong>
+              <button type="button" class="btn btn-danger btn-xs" data-rm-monster="${i}">删除</button>
+            </div>
+            <div class="form-grid">
+              <label class="field"><span>野怪 ID</span><input type="text" data-mf-i="${i}" data-mf-f="id" value="${escapeHtml(m.id || '')}" /></label>
+              <label class="field"><span>名称（internalName）</span><input type="text" data-mf-i="${i}" data-mf-f="internalName" value="${escapeHtml(m.internalName || '')}" /></label>
+              <label class="field"><span>生命上限（HealthMax）</span><input type="number" data-mf-i="${i}" data-mf-f="healthMax" value="${escapeHtml(safeNumAttr(m.player?.attributes?.HealthMax ?? 200))}" /></label>
+              <label class="field"><span>等级（Level）</span><input type="number" data-mf-i="${i}" data-mf-f="level" value="${escapeHtml(safeNumAttr(m.player?.attributes?.Level ?? 1))}" /></label>
+              <label class="field span-2"><span>完整野怪 JSON（手牌 items / 技能 skills）</span><textarea rows="4" spellcheck="false" data-mf-json="${i}">${escapeHtml(JSON.stringify(m, null, 2))}</textarea></label>
+            </div>
+          </div>
+        `).join('')
+        : '<div class="empty-hint">暂无自定义野怪，点击「+ 新增野怪模板」添加。</div>';
+      mBox.querySelectorAll('[data-mf-f]').forEach((el) => {
+        el.addEventListener('change', () => {
+          const i = parseInt(el.dataset.mfI, 10);
+          const f = el.dataset.mfF;
+          const m = monsters[i];
+          if (!m) return;
+          m.player = m.player || { attributes: {}, hand: { unlockedSlots: 1023, items: [] }, skills: [] };
+          m.player.attributes = m.player.attributes || {};
+          if (f === 'healthMax') m.player.attributes.HealthMax = parseInt(el.value, 10) || 100;
+          else if (f === 'level') m.player.attributes.Level = parseInt(el.value, 10) || 1;
+          else m[f] = el.value.trim();
+          B().markDirty(true);
+          renderExtraContentStudio();
+        });
+      });
+      mBox.querySelectorAll('[data-mf-json]').forEach((ta) => {
+        ta.addEventListener('change', () => {
+          const i = parseInt(ta.dataset.mfJson, 10);
+          try {
+            monsters[i] = JSON.parse(ta.value);
+            B().markDirty(true);
+            renderExtraContentStudio();
+          } catch (ex) { B().toast(`野怪 JSON 语法错误：${ex.message}`, 'err'); }
+        });
+      });
+      mBox.querySelectorAll('[data-rm-monster]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          monsters.splice(parseInt(btn.dataset.rmMonster, 10), 1);
+          B().markDirty(true);
+          B().updateCounts();
+          renderExtraContentStudio();
+        });
+      });
+    }
+
+    // Modes
+    const mdBox = $('modesStudioList');
+    if (mdBox) {
+      const modes = ws.modes || [];
+      mdBox.innerHTML = modes.length
+        ? modes.map((md, i) => `
+          <div class="counter-item-card">
+            <div class="panel-header compact">
+              <strong>玩法模式 #${i + 1}：${escapeHtml(md.nameZh || md.modeId)}</strong>
+              <button type="button" class="btn btn-danger btn-xs" data-rm-mode="${i}">删除</button>
+            </div>
+            <div class="form-grid">
+              <label class="field"><span>模式 ID（modeId）</span><input type="text" data-md-i="${i}" data-md-f="modeId" value="${escapeHtml(md.modeId || '')}" /></label>
+              <label class="field"><span>中文名称</span><input type="text" data-md-i="${i}" data-md-f="nameZh" value="${escapeHtml(md.nameZh || '')}" /></label>
+              <label class="field span-2"><span>模式简介</span><input type="text" data-md-i="${i}" data-md-f="descZh" value="${escapeHtml(md.descZh || '')}" /></label>
+              <label class="field span-2"><span>完整模式 JSON（mutatorIds / ruleOverrides）</span><textarea rows="4" spellcheck="false" data-md-json="${i}">${escapeHtml(JSON.stringify(md, null, 2))}</textarea></label>
+            </div>
+          </div>
+        `).join('')
+        : '<div class="empty-hint">暂无自定义玩法模式，点击「+ 新增玩法模式」添加。</div>';
+      mdBox.querySelectorAll('[data-md-f]').forEach((el) => {
+        el.addEventListener('change', () => {
+          const i = parseInt(el.dataset.mdI, 10);
+          modes[i][el.dataset.mdF] = el.value.trim();
+          B().markDirty(true);
+          renderExtraContentStudio();
+        });
+      });
+      mdBox.querySelectorAll('[data-md-json]').forEach((ta) => {
+        ta.addEventListener('change', () => {
+          const i = parseInt(ta.dataset.mdJson, 10);
+          try {
+            modes[i] = JSON.parse(ta.value);
+            B().markDirty(true);
+            renderExtraContentStudio();
+          } catch (ex) { B().toast(`模式 JSON 语法错误：${ex.message}`, 'err'); }
+        });
+      });
+      mdBox.querySelectorAll('[data-rm-mode]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          modes.splice(parseInt(btn.dataset.rmMode, 10), 1);
+          B().markDirty(true);
+          B().updateCounts();
+          renderExtraContentStudio();
+        });
+      });
+    }
+
+    // Mutators
+    const mutBox = $('mutatorsStudioList');
+    if (mutBox) {
+      const mutators = ws.mutators || [];
+      mutBox.innerHTML = mutators.length
+        ? mutators.map((mt, i) => `
+          <div class="counter-item-card">
+            <div class="panel-header compact">
+              <strong>突变词条 #${i + 1}：${escapeHtml(mt.nameZh || mt.id)}</strong>
+              <button type="button" class="btn btn-danger btn-xs" data-rm-mutator="${i}">删除</button>
+            </div>
+            <div class="form-grid">
+              <label class="field"><span>词条 ID</span><input type="text" data-mt-i="${i}" data-mt-f="id" value="${escapeHtml(mt.id || '')}" /></label>
+              <label class="field"><span>中文名称</span><input type="text" data-mt-i="${i}" data-mt-f="nameZh" value="${escapeHtml(mt.nameZh || '')}" /></label>
+              <label class="field"><span>目标钩子 targetHook</span><select data-mt-i="${i}" data-mt-f="targetHook"><option value="RunEngine" ${(mt.targetHook || 'RunEngine') === 'RunEngine' ? 'selected' : ''}>RunEngine</option><option value="CombatSimulator" ${mt.targetHook === 'CombatSimulator' ? 'selected' : ''}>CombatSimulator</option></select></label>
+              <label class="field"><span>难度变化 difficultyDelta</span><input type="number" step="0.5" data-mt-i="${i}" data-mt-f="difficultyDelta" value="${escapeHtml(safeNumAttr(mt.difficultyDelta ?? 0))}" /></label>
+              <label class="field span-2"><span>说明（descriptionZh）</span><input type="text" data-mt-i="${i}" data-mt-f="descriptionZh" value="${escapeHtml(mt.descriptionZh || mt.descZh || '')}" /></label>
+              <label class="field span-2"><span>完整词条 JSON（含 rules 键值表）</span><textarea rows="4" spellcheck="false" data-mt-json="${i}">${escapeHtml(JSON.stringify(mt, null, 2))}</textarea></label>
+            </div>
+          </div>
+        `).join('')
+        : '<div class="empty-hint">暂无自定义肉鸽突变词条，点击「+ 新增肉鸽突变词条」添加。</div>';
+      mutBox.querySelectorAll('[data-mt-f]').forEach((el) => {
+        el.addEventListener('change', () => {
+          const i = parseInt(el.dataset.mtI, 10);
+          const f = el.dataset.mtF;
+          mutators[i][f] = f === 'difficultyDelta' ? (parseFloat(el.value) || 0) : el.value.trim();
+          B().markDirty(true);
+          renderExtraContentStudio();
+        });
+      });
+      mutBox.querySelectorAll('[data-mt-json]').forEach((ta) => {
+        ta.addEventListener('change', () => {
+          const i = parseInt(ta.dataset.mtJson, 10);
+          try {
+            mutators[i] = JSON.parse(ta.value);
+            B().markDirty(true);
+            renderExtraContentStudio();
+          } catch (ex) { B().toast(`突变词条 JSON 语法错误：${ex.message}`, 'err'); }
+        });
+      });
+      mutBox.querySelectorAll('[data-rm-mutator]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          mutators.splice(parseInt(btn.dataset.rmMutator, 10), 1);
+          B().markDirty(true);
+          B().updateCounts();
+          renderExtraContentStudio();
+        });
+      });
+    }
+
+    // Localization
+    const loc = ws.localization;
+    if ($('locLocale')) $('locLocale').value = loc?.locale || 'zh-CN';
+    if ($('locRevision')) $('locRevision').value = loc?.revision || '1.0.0';
+    if ($('locRawJson')) $('locRawJson').value = loc ? JSON.stringify(loc, null, 2) : '';
   }
 
   // ── 6. 13 种官方附魔可视化编辑器 & 一键智能生成 ──────────────────────────────
@@ -2041,45 +2790,72 @@
     });
   }
 
+  function autoGenerateAll13EnchantmentsForPatch(patch, baseCard) {
+    const enchList = catalog().enchantments || [];
+    patch.enchantmentOverrides = patch.enchantmentOverrides || {};
+    patch.enchantTooltipsZh = patch.enchantTooltipsZh || {};
+    const refCard = baseCard || { tiers: { Bronze: { attributes: patch.tierAttributeOverrides?.Bronze || {} } } };
+    enchList.forEach((e) => {
+      const preset = buildSmartEnchantmentPreset(e.id, refCard);
+      patch.enchantmentOverrides[e.id] = preset.data;
+      patch.enchantTooltipsZh[e.id] = [preset.tooltipZh];
+    });
+  }
+
   function renderEnchantmentsEditor() {
-    const pillsBox = $('ceEnchantPills');
-    const pane = $('ceEnchantEditorPane');
-    if (!pillsBox || !pane) return;
-    const st = B().state;
-    const card = st.workspace && st.selectedCardIdx >= 0 ? st.workspace.cards[st.selectedCardIdx] : null;
-    if (!card) {
-      pillsBox.innerHTML = '';
-      pane.classList.add('hidden');
+    const info = getActiveTargetHost();
+    const cePills = $('ceEnchantPills');
+    const cePane = $('ceEnchantEditorPane');
+    const pePills = $('peEnchantPills');
+    const pePane = $('peEnchantEditorPane');
+    if (!info) {
+      if (cePills) cePills.innerHTML = '';
+      if (cePane) cePane.classList.add('hidden');
+      if (pePills) pePills.innerHTML = '';
+      if (pePane) pePane.classList.add('hidden');
       return;
     }
 
+    const isCard = info.host === 'card';
+    const pillsBox = isCard ? cePills : pePills;
+    const pane = isCard ? cePane : pePane;
+    if (!pillsBox || !pane) return;
+
+    const st = B().state;
+    const targetObj = info.obj;
+    const enchMapKey = isCard ? 'enchantments' : 'enchantmentOverrides';
     const enchList = catalog().enchantments || [];
     if (!enchList.length) return;
     if (!enchList.some((e) => e.id === v14.selectedEnchantKey)) v14.selectedEnchantKey = enchList[0].id;
 
-    const configuredCount = enchList.filter((e) => Boolean(card.enchantments?.[e.id] || card.enchantTooltipsZh?.[e.id]?.length)).length;
+    const getMap = () => targetObj[enchMapKey] || {};
+    const configuredCount = enchList.filter((e) => Boolean(getMap()[e.id] || targetObj.enchantTooltipsZh?.[e.id]?.length)).length;
 
     pillsBox.innerHTML = enchList.map((e) => {
-      const hasData = Boolean(card.enchantments?.[e.id] || card.enchantTooltipsZh?.[e.id]?.length);
+      const hasData = Boolean(getMap()[e.id] || targetObj.enchantTooltipsZh?.[e.id]?.length);
       const isAct = e.id === v14.selectedEnchantKey;
       return `<button type="button" class="pill-btn ${hasData ? 'has-data' : ''} ${isAct ? 'active' : ''}" data-ench-key="${escapeHtml(e.id)}">${hasData ? '✓ ' : ''}${escapeHtml(e.nameZh)}</button>`;
     }).join('');
 
+    const refreshPreview = () => {
+      if (isCard) B().updateLivePreview(targetObj);
+      else B().updateLivePreviewFromPatch(targetObj);
+    };
+
     pillsBox.querySelectorAll('[data-ench-key]').forEach((btn) => {
       btn.addEventListener('click', () => {
         v14.selectedEnchantKey = btn.dataset.enchKey;
-        // 联动右侧附魔预览下拉框，所见即所得！
         st.previewEnchant = v14.selectedEnchantKey;
         if ($('previewEnchantSelect')) $('previewEnchantSelect').value = v14.selectedEnchantKey;
         renderEnchantmentsEditor();
-        B().updateLivePreview(card);
+        refreshPreview();
       });
     });
 
     const curKey = v14.selectedEnchantKey;
     const curMeta = enchList.find((e) => e.id === curKey) || { id: curKey, nameZh: curKey };
-    const curData = card.enchantments?.[curKey];
-    const curTips = card.enchantTooltipsZh?.[curKey] || [];
+    const curData = getMap()[curKey];
+    const curTips = targetObj.enchantTooltipsZh?.[curKey] || [];
     const summaryParts = [];
     if (curData?.attributes) {
       Object.entries(curData.attributes).forEach(([k, v]) => summaryParts.push(`属性 ${k} +${v}`));
@@ -2091,66 +2867,69 @@
       Object.values(curData.auras).forEach((au) => summaryParts.push(summarizeAffixZh('aura', au)));
     }
 
+    const idPfx = isCard ? 'ce' : 'pe';
     pane.classList.remove('hidden');
     pane.innerHTML = `
       <div class="panel-header compact">
         <div>
           <span class="badge ${curData ? 'badge-green' : 'badge-yellow'}">${curData ? '已配置' : '未配置'}</span>
           <strong style="margin-left:6px;">${escapeHtml(curMeta.nameZh)}</strong>
-          <small class="muted" style="margin-left:8px;">本卡已配置 ${configuredCount} / ${enchList.length} 种附魔</small>
+          <small class="muted" style="margin-left:8px;">已配置 ${configuredCount} / ${enchList.length} 种附魔</small>
         </div>
         <div class="btn-row">
-          <button type="button" class="btn btn-outline btn-xs" id="btnEnchAutoSingle">✨ 生成此附魔标准效果</button>
-          ${curData ? '<button type="button" class="btn btn-danger btn-xs" id="btnEnchRemoveSingle">移除此附魔</button>' : ''}
+          <button type="button" class="btn btn-outline btn-xs" id="btn${idPfx}EnchAutoSingle">✨ 生成此附魔标准效果</button>
+          ${curData ? `<button type="button" class="btn btn-danger btn-xs" id="btn${idPfx}EnchRemoveSingle">移除此附魔</button>` : ''}
         </div>
       </div>
       <div class="form-grid">
         <label class="field span-2">
           <span>附魔中文说明（局内获得该附魔后自动显示在卡面，支持 <code>{attr.DamageAmount}</code> 等变量）</span>
-          <input type="text" id="ceEnchTipInput" value="${escapeHtml(curTips.join('；'))}" placeholder="例如：触发时额外施加 6 层灼烧" />
+          <input type="text" id="${idPfx}EnchTipInput" value="${escapeHtml(curTips.join('；'))}" placeholder="例如：触发时额外施加 6 层灼烧" />
         </label>
       </div>
       <div class="muted" style="margin-top:6px;">实战生效规则：${escapeHtml(summaryParts.length ? summaryParts.join('；') : '尚未生成战斗效果，点击右上角「✨ 生成此附魔标准效果」即可立即生效！')}</div>
       <details class="advanced-json" style="margin-top:6px;">
         <summary>开发者代码视图（本附魔 JSON 规则）</summary>
-        <textarea id="ceEnchRawJson" rows="5" spellcheck="false">${escapeHtml(JSON.stringify(curData || {}, null, 2))}</textarea>
-        <button type="button" class="btn btn-outline btn-xs" id="btnEnchApplyJson" style="margin-top:4px;">应用附魔代码</button>
+        <textarea id="${idPfx}EnchRawJson" rows="5" spellcheck="false">${escapeHtml(JSON.stringify(curData || {}, null, 2))}</textarea>
+        <button type="button" class="btn btn-outline btn-xs" id="btn${idPfx}EnchApplyJson" style="margin-top:4px;">应用附魔代码</button>
       </details>
     `;
 
-    $('ceEnchTipInput')?.addEventListener('input', (e) => {
-      card.enchantTooltipsZh = card.enchantTooltipsZh || {};
+    $(`${idPfx}EnchTipInput`)?.addEventListener('input', (e) => {
+      targetObj.enchantTooltipsZh = targetObj.enchantTooltipsZh || {};
       const lines = e.target.value.split(/[；\n]/).map((s) => s.trim()).filter(Boolean);
-      if (lines.length) card.enchantTooltipsZh[curKey] = lines;
-      else delete card.enchantTooltipsZh[curKey];
+      if (lines.length) targetObj.enchantTooltipsZh[curKey] = lines;
+      else delete targetObj.enchantTooltipsZh[curKey];
       B().markDirty(true);
-      B().updateLivePreview(card);
+      refreshPreview();
     });
-    $('btnEnchAutoSingle')?.addEventListener('click', () => {
-      card.enchantments = card.enchantments || {};
-      card.enchantTooltipsZh = card.enchantTooltipsZh || {};
-      const preset = buildSmartEnchantmentPreset(curKey, card);
-      card.enchantments[curKey] = preset.data;
-      card.enchantTooltipsZh[curKey] = [preset.tooltipZh];
+    $(`btn${idPfx}EnchAutoSingle`)?.addEventListener('click', () => {
+      targetObj[enchMapKey] = targetObj[enchMapKey] || {};
+      targetObj.enchantTooltipsZh = targetObj.enchantTooltipsZh || {};
+      const refCard = isCard ? targetObj : (st.vanillaBlueprintCache?.[targetObj.targetTemplateId]?.card || { tiers: { Bronze: { attributes: targetObj.tierAttributeOverrides?.Bronze || {} } } });
+      const preset = buildSmartEnchantmentPreset(curKey, refCard);
+      targetObj[enchMapKey][curKey] = preset.data;
+      targetObj.enchantTooltipsZh[curKey] = [preset.tooltipZh];
       B().markDirty(true);
       renderEnchantmentsEditor();
-      B().updateLivePreview(card);
+      refreshPreview();
       B().toast(`已生成「${curMeta.nameZh}」附魔规则与中文说明！`);
     });
-    $('btnEnchRemoveSingle')?.addEventListener('click', () => {
-      if (card.enchantments) delete card.enchantments[curKey];
-      if (card.enchantTooltipsZh) delete card.enchantTooltipsZh[curKey];
+    $(`btn${idPfx}EnchRemoveSingle`)?.addEventListener('click', () => {
+      if (targetObj[enchMapKey]) delete targetObj[enchMapKey][curKey];
+      if (targetObj.enchantTooltipsZh) delete targetObj.enchantTooltipsZh[curKey];
       B().markDirty(true);
       renderEnchantmentsEditor();
-      B().updateLivePreview(card);
+      refreshPreview();
     });
-    $('btnEnchApplyJson')?.addEventListener('click', () => {
+    $(`btn${idPfx}EnchApplyJson`)?.addEventListener('click', () => {
       try {
-        const parsed = JSON.parse($('ceEnchRawJson').value);
-        card.enchantments = card.enchantments || {};
-        card.enchantments[curKey] = parsed;
+        const parsed = JSON.parse($(`${idPfx}EnchRawJson`).value);
+        targetObj[enchMapKey] = targetObj[enchMapKey] || {};
+        targetObj[enchMapKey][curKey] = parsed;
         B().markDirty(true);
         renderEnchantmentsEditor();
+        refreshPreview();
         B().toast(`已应用「${curMeta.nameZh}」附魔规则 JSON！`);
       } catch (ex) {
         B().toast(`附魔 JSON 语法错误：${ex.message}`, 'err');
@@ -2199,6 +2978,7 @@ ${idea ? `\n【我目前的初步想法】\n${idea}\n\n请基于这个初步想�
 
   window.WorkshopV14 = {
     summarizeAffixZh,
+    readVfxOverrideKey,
     openAffixEditorForActiveTarget: (kind, key) => openAffixBuilder(kind, key),
     openVanillaAffixExtractor,
     onReady: () => {
@@ -2208,8 +2988,10 @@ ${idea ? `\n【我目前的初步想法】\n${idea}\n\n请基于这个初步想�
       renderMechanicEditor();
       renderPatchAbilitiesSummary();
       renderCardAttachedMechanics();
+      renderHostCounterDisplaysEditor();
       renderAllPillPickers();
       renderEnchantmentsEditor();
+      renderExtraContentStudio();
       updateAiPromptPreview('interview');
     },
     onWorkspaceLoaded: () => {
@@ -2220,13 +3002,19 @@ ${idea ? `\n【我目前的初步想法】\n${idea}\n\n请基于这个初步想�
       renderMechanicEditor();
       renderPatchAbilitiesSummary();
       renderCardAttachedMechanics();
+      renderHostCounterDisplaysEditor();
       renderAllPillPickers();
       renderEnchantmentsEditor();
+      renderExtraContentStudio();
       updateAiPromptPreview('interview');
+    },
+    onModsListUpdated: () => {
+      renderAllPillPickers();
     },
     onCardOrPatchRendered: () => {
       renderPatchAbilitiesSummary();
       renderCardAttachedMechanics();
+      renderHostCounterDisplaysEditor();
       renderAllPillPickers();
       renderEnchantmentsEditor();
     },
@@ -2240,8 +3028,9 @@ ${idea ? `\n【我目前的初步想法】\n${idea}\n\n请基于这个初步想�
         renderMechanicEditor();
       } else if (tab === 'guide') {
         updateAiPromptPreview('interview');
-      } else if (tab === 'events') {
+      } else if (tab === 'events' || tab === 'overview') {
         renderAllPillPickers();
+        if (tab === 'overview') renderExtraContentStudio();
       }
     },
   };

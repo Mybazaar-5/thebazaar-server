@@ -71,7 +71,11 @@ public sealed record CombatReplayRecord(
     int DurationMs,
     int Seed,
     string SummaryJson,
-    byte[]? CombatSimMsgPack = null);
+    byte[]? CombatSimMsgPack = null,
+    string? TournamentSessionId = null,
+    string? OpponentAccountId = null,
+    bool IsDraw = false,
+    string? VisualBindingsJson = null);
 
 /// <summary>
 /// 特殊模式 / 每日挑战 / 无尽爬塔 / Boss 车轮战排行榜提交记录。
@@ -88,7 +92,11 @@ public sealed record RunLeaderboardSubmission(
     int Defeats,
     double ScoreMultiplier,
     string? MutatorsJson = null,
-    string? FinalBoardSummaryJson = null);
+    string? FinalBoardSummaryJson = null,
+    string? RunId = null,
+    int ElapsedSeconds = 0,
+    int Prestige = 0,
+    bool? IsFirstAttempt = null);
 
 /// <summary>
 /// 3. 战报回放、排行榜与系统播报统一写入器：Wave 3A 实现，Wave 3B 在战斗结算与终局时调用。

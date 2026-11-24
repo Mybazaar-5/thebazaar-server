@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://thebazaar-local.dev/schemas/bazaar-mod.schema.json",
-  "title": "TheBazaar V13.1 标准化 Mod 数据包统一 Schema",
-  "description": "面向 IDE 自动补全、tools/mod_sdk_cli.py 与 AI Skill 创作的工业级 JSON Schema（Draft 2020-12），覆盖 mod.json、custom_cards.json、vanilla_patches.json、custom_events.json 与权威 RuleNode 规则树。",
+  "title": "TheBazaar V15.4 标准化 Mod 数据包单一事实源 Schema",
+  "description": "面向 IDE 自动补全、Web 创意工坊、tools/mod_sdk_cli.py、Wave3A 契约反射单测与 AI Skill 的工业级 JSON Schema（Draft 2020-12），100% 对齐 BazaarCore V15.4 实码模型。",
   "type": "object",
   "$defs": {
     "GuidString": {
@@ -29,6 +29,10 @@
       "type": "string",
       "enum": ["Item", "Skill", "EventEncounter", "EncounterStep", "PedestalEncounter", "CombatEncounter"]
     },
+    "EventTypeEnum": {
+      "type": "string",
+      "enum": ["EventEncounter", "PedestalEncounter", "EncounterStep", "CombatEncounter"]
+    },
     "CardSizeEnum": {
       "type": "string",
       "enum": ["Small", "Medium", "Large"]
@@ -39,7 +43,154 @@
     },
     "HeroEnum": {
       "type": "string",
-      "enum": ["Common", "Vanessa", "Dooley", "Pygmalien", "Mak", "Karnok", "Jules", "Stelle", "Hero8"]
+      "enum": ["Common", "Vanessa", "Dooley", "Pygmalien", "Mak", "Karnok", "Jules", "Stelle", "Hero8"],
+      "description": "Common 仅代表中立/奇物店 Curio 专属池；8 位可游玩英雄分别为 Vanessa/Dooley/Pygmalien/Mak/Karnok/Jules/Stelle/Hero8。"
+    },
+    "VisualTargetEnum": {
+      "type": "string",
+      "enum": ["ItemArt", "SkillIcon", "EncounterPortrait"]
+    },
+    "MechanicHookEnum": {
+      "type": "string",
+      "enum": [
+        "OnFightStart",
+        "OnCardFired",
+        "BeforeDamage",
+        "BeforeStatusApply",
+        "BeforeCardStateChange",
+        "BeforeCardFire",
+        "AfterCardFire",
+        "OnCustomEvent",
+        "OnTriggerEvent",
+        "PostCombatCommit"
+      ]
+    },
+    "MechanicOpEnum": {
+      "type": "string",
+      "enum": [
+        "If",
+        "Repeat",
+        "ScheduleDelayed",
+        "CancelHook",
+        "ModifyHookAmount",
+        "Stop",
+        "SetFlag",
+        "ClearFlag",
+        "ModifyCounter",
+        "DealDamage",
+        "ApplyStatus",
+        "ModifyCardAttribute",
+        "ModifyPlayerAttribute",
+        "ChangeCardState",
+        "ForceUseCard",
+        "EmitCustomEvent",
+        "QueuePostCombatRemoveCard",
+        "QueuePostCombatModifyAttr"
+      ]
+    },
+    "MechanicParamTypeEnum": {
+      "type": "string",
+      "enum": ["int", "float", "string", "bool", "tag", "attribute", "targetMode", "vfxKey"]
+    },
+    "MechanicTargetModeEnum": {
+      "type": "string",
+      "enum": [
+        "Self",
+        "HookTarget",
+        "HookSource",
+        "AllAllies",
+        "OtherAllies",
+        "AllEnemies",
+        "Adjacent",
+        "Left",
+        "Right",
+        "LeftMostAlly",
+        "RightMostAlly",
+        "RandomAllies",
+        "RandomEnemies"
+      ]
+    },
+    "MechanicStatusEnum": {
+      "type": "string",
+      "enum": ["Shield", "Burn", "Poison", "Heal", "Regen", "Haste", "Slow", "Freeze", "Charge"]
+    },
+    "MechanicSyncAttributeEnum": {
+      "type": "string",
+      "enum": ["Custom_0", "Custom_1", "Custom_2", "Custom_3", "Custom_4", "Custom_5", "Custom_6", "Custom_7", "Custom_8"]
+    },
+    "MechanicScopeEnum": {
+      "type": "string",
+      "enum": ["SelfCard", "OwnerBoard", "EnemyBoard", "OwnerPlayer", "EnemyPlayer", "Global", "Any"]
+    },
+    "MechanicPlayerAttributeEnum": {
+      "type": "string",
+      "enum": [
+        "Health",
+        "HealthMax",
+        "Shield",
+        "Burn",
+        "Poison",
+        "HealthRegen",
+        "Regen",
+        "Rage",
+        "RageMax",
+        "Tempo",
+        "Joy",
+        "Gold",
+        "Income",
+        "PercentDamageReduction"
+      ]
+    },
+    "CounterDisplayAttributeEnum": {
+      "type": "string",
+      "enum": [
+        "Custom_0",
+        "Custom_1",
+        "Custom_2",
+        "Custom_3",
+        "Custom_4",
+        "Custom_5",
+        "Custom_6",
+        "Custom_7",
+        "Custom_8",
+        "Counter",
+        "Ammo",
+        "AmmoMax",
+        "DamageAmount",
+        "ShieldApplyAmount",
+        "BurnApplyAmount",
+        "PoisonApplyAmount",
+        "HealAmount",
+        "RegenApplyAmount",
+        "CritChance",
+        "Multicast",
+        "CooldownMax"
+      ]
+    },
+    "CounterDisplayStyleEnum": {
+      "type": "string",
+      "enum": ["auto", "pips", "bar", "gem", "pill"]
+    },
+    "CounterDisplayValueTypeEnum": {
+      "type": "string",
+      "enum": ["count", "progress", "percent", "seconds", "multiplier", "delta"]
+    },
+    "CounterDisplayPositionEnum": {
+      "type": "string",
+      "enum": ["bottom", "bottomRight", "topLeft", "topRight"]
+    },
+    "ModContentRoots": {
+      "type": "object",
+      "properties": {
+        "cards": { "$ref": "#/$defs/SafeRelativePath" },
+        "patches": { "$ref": "#/$defs/SafeRelativePath" },
+        "events": { "$ref": "#/$defs/SafeRelativePath" },
+        "modes": { "$ref": "#/$defs/SafeRelativePath" },
+        "mechanics": { "$ref": "#/$defs/SafeRelativePath" },
+        "localization": { "$ref": "#/$defs/SafeRelativePath" },
+        "assets": { "$ref": "#/$defs/SafeRelativePath" },
+        "artManifest": { "type": ["string", "null"] }
+      }
     },
     "ModManifest": {
       "type": "object",
@@ -49,12 +200,15 @@
         "schemaVersion": { "const": 1 },
         "id": { "$ref": "#/$defs/ModIdString" },
         "name": { "type": "string", "minLength": 1, "maxLength": 120 },
-        "displayNameZh": { "type": "string" },
-        "displayNameEn": { "type": "string" },
+        "displayNameZh": { "type": ["string", "null"] },
         "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+(-[a-zA-Z0-9.-]+)?$" },
         "author": { "type": "string" },
         "description": { "type": "string" },
-        "descriptionZh": { "type": "string" },
+        "descriptionZh": { "type": ["string", "null"] },
+        "coreApiVersion": { "type": "string" },
+        "minServerVersion": { "type": "string" },
+        "minLauncherVersion": { "type": "string" },
+        "minGameDataVersion": { "type": "string" },
         "scope": {
           "type": "string",
           "enum": ["singleplayer-only", "multiplayer-safe", "cosmetic-only"]
@@ -64,24 +218,43 @@
           "default": false,
           "description": "玩法 Mod 必须为 false，强制隔离标准天梯幽灵池。"
         },
-        "enabledByDefault": { "type": "boolean", "default": true },
-        "loadOrder": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 100 },
         "dependencies": {
           "type": "array",
           "items": { "$ref": "#/$defs/ModIdString" }
         },
-        "contentRoots": {
-          "type": "object",
-          "properties": {
-            "cards": { "$ref": "#/$defs/SafeRelativePath" },
-            "patches": { "$ref": "#/$defs/SafeRelativePath" },
-            "events": { "$ref": "#/$defs/SafeRelativePath" },
-            "modes": { "$ref": "#/$defs/SafeRelativePath" },
-            "localization": { "$ref": "#/$defs/SafeRelativePath" },
-            "assets": { "$ref": "#/$defs/SafeRelativePath" },
-            "artManifest": { "$ref": "#/$defs/SafeRelativePath" }
-          }
-        }
+        "enabledByDefault": { "type": "boolean", "default": true },
+        "loadOrder": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 100 },
+        "contentRoots": { "$ref": "#/$defs/ModContentRoots" }
+      }
+    },
+    "CustomCardArtRect": {
+      "type": "object",
+      "properties": {
+        "width": { "type": "integer", "minimum": 64, "maximum": 1024 },
+        "height": { "type": "integer", "minimum": 64, "maximum": 1024 },
+        "cropMode": { "type": "string", "enum": ["cover", "contain", "stretch"] }
+      }
+    },
+    "CustomCardArtSpec": {
+      "type": "object",
+      "properties": {
+        "logicalPath": { "type": ["string", "null"] },
+        "sha256": { "type": ["string", "null"] },
+        "width": { "type": ["integer", "null"] },
+        "height": { "type": ["integer", "null"] },
+        "cropMode": { "type": ["string", "null"] }
+      }
+    },
+    "CustomEventSchedule": {
+      "type": "object",
+      "properties": {
+        "minDay": { "type": ["integer", "null"], "minimum": 1, "maximum": 99 },
+        "maxDay": { "type": ["integer", "null"], "minimum": 1, "maximum": 99 },
+        "weight": { "type": ["number", "null"], "minimum": 0 },
+        "hours": { "type": ["array", "null"], "items": { "type": "integer", "minimum": 0, "maximum": 6 } },
+        "oncePerRun": { "type": "boolean" },
+        "chainOnly": { "type": "boolean" },
+        "difficultySlot": { "type": ["string", "null"], "enum": ["Bronze", "Silver", "Gold", "Any", null] }
       }
     },
     "AttributeMap": {
@@ -109,43 +282,159 @@
         "tooltipIds": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
       }
     },
+    "LocalizedText": {
+      "type": "object",
+      "properties": {
+        "key": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] }
+      }
+    },
+    "TooltipEntry": {
+      "type": "object",
+      "properties": {
+        "content": { "oneOf": [{ "$ref": "#/$defs/LocalizedText" }, { "type": "null" }] },
+        "tooltipType": { "type": ["string", "null"] },
+        "tooltipCondition": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "prerequisites": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } }
+      }
+    },
+    "LocalizationBlock": {
+      "type": "object",
+      "properties": {
+        "title": { "oneOf": [{ "$ref": "#/$defs/LocalizedText" }, { "type": "null" }] },
+        "description": { "oneOf": [{ "$ref": "#/$defs/LocalizedText" }, { "type": "null" }] },
+        "flavorText": { "oneOf": [{ "$ref": "#/$defs/LocalizedText" }, { "type": "null" }] },
+        "tooltips": { "type": ["array", "null"], "items": { "$ref": "#/$defs/TooltipEntry" } }
+      }
+    },
+    "VfxConfigData": {
+      "type": "object",
+      "description": "官方特效配置（规范统一使用 camelCase：vfxOverrideKey/vfxShouldPlay/vfxIsTakeover；后端同时兼容旧 PascalCase）。",
+      "properties": {
+        "vfxOverrideKey": { "type": ["string", "null"] },
+        "vfxShouldPlay": { "type": "boolean", "default": true },
+        "vfxIsTakeover": { "type": "boolean", "default": false }
+      }
+    },
+    "ValueModifierNode": {
+      "type": "object",
+      "properties": {
+        "modifyMode": { "type": ["string", "null"] },
+        "value": { "oneOf": [{ "type": "number" }, { "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "shouldRound": { "type": ["boolean", "null"] },
+        "multiplier": { "type": ["number", "null"] },
+        "addOffset": { "type": ["number", "null"] }
+      }
+    },
     "RuleNode": {
       "type": "object",
       "required": ["$type"],
       "properties": {
         "$type": {
           "type": "string",
-          "pattern": "^(T(Card|Trigger|Action|AuraAction|Target|FixedValue|RangeValue|ReferenceValue|CombatDuration|DeterminantDuration|VariableDuration|Prerequisite|PlayerConditional|RunConditional|Spawn|PedestalBehavior|Combatant)[A-Za-z0-9_]*|Constraint[A-Za-z0-9_]+|T(Action|Trigger)Mod_[A-Za-z0-9_]+)$"
+          "pattern": "^(T(Card|Trigger|Action|AuraAction|Target|FixedValue|RangeValue|ReferenceValue|CombatDuration|DeterminantDuration|VariableDuration|Prerequisite|PlayerConditional|RunConditional|Spawn|PedestalBehavior|Combatant|SelectionRequirement)[A-Za-z0-9_]*|Constraint[A-Za-z0-9_]+|T(Action|Trigger)Mod_[A-Za-z0-9_]+)$"
         },
-        "id": { "type": "string" },
-        "ids": { "type": "array", "items": { "type": "string" } },
-        "attributeType": { "type": "string" },
-        "operation": { "type": "string", "enum": ["Add", "Subtract", "Multiply", "Set"] },
-        "comparisonOperator": { "type": "string", "enum": ["Equal", "NotEqual", "GreaterThan", "GreaterThanOrEqual", "LessThan", "LessThanOrEqual"] },
-        "comparison": { "type": "string" },
-        "operator": { "type": "string" },
-        "targetMode": { "type": "string" },
-        "targetSection": { "type": "string" },
-        "origin": { "type": "string" },
-        "changeType": { "type": "string" },
-        "combatOutcome": { "type": "string" },
-        "amount": { "type": "number" },
-        "value": { "oneOf": [{ "type": "number" }, { "$ref": "#/$defs/RuleNode" }] },
-        "comparisonValue": { "oneOf": [{ "type": "number" }, { "$ref": "#/$defs/RuleNode" }] },
-        "target": { "$ref": "#/$defs/RuleNode" },
-        "subject": { "$ref": "#/$defs/RuleNode" },
-        "subjectOther": { "$ref": "#/$defs/RuleNode" },
-        "conditions": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } }] },
-        "actions": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
-        "triggers": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
-        "groups": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
-        "filters": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
-        "behaviors": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
-        "prerequisites": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
-        "spawnContext": { "$ref": "#/$defs/RuleNode" },
-        "limit": { "$ref": "#/$defs/RuleNode" },
-        "tags": { "type": "array", "items": { "type": "string" } },
-        "hiddenTags": { "type": "array", "items": { "type": "string" } }
+        "id": { "type": ["string", "null"] },
+        "ids": { "type": ["array", "null"], "items": { "type": "string" } },
+        "minValue": { "type": ["number", "null"] },
+        "maxValue": { "type": ["number", "null"] },
+        "defaultValue": { "type": ["number", "null"] },
+        "amount": { "type": ["number", "null"] },
+        "comparisonValue": { "oneOf": [{ "type": "number" }, { "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "comparisonAmount": { "type": ["number", "null"] },
+        "currentValue": { "oneOf": [{ "type": "number" }, { "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "previousValue": { "oneOf": [{ "type": "number" }, { "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "upgradeChance": { "type": ["number", "null"] },
+        "randomWeight": { "type": ["integer", "null"] },
+        "currentDay": { "type": ["integer", "null"] },
+        "currentHour": { "type": ["integer", "null"] },
+        "durationInMs": { "type": ["integer", "null"] },
+        "attributeType": { "type": ["string", "null"] },
+        "cardAttributeType": { "type": ["string", "null"] },
+        "attributeChanged": { "type": ["string", "null"] },
+        "attribute": { "type": ["string", "null"] },
+        "attributeOther": { "type": ["string", "null"] },
+        "playerAttributeType": { "type": ["string", "null"] },
+        "operation": { "type": ["string", "null"], "enum": ["Add", "Subtract", "Multiply", "Set", null] },
+        "comparisonOperator": { "type": ["string", "null"], "enum": ["Equal", "NotEqual", "GreaterThan", "GreaterThanOrEqual", "LessThan", "LessThanOrEqual", null] },
+        "comparison": { "type": ["string", "null"] },
+        "operator": { "type": ["string", "null"] },
+        "targetSection": { "type": ["string", "null"] },
+        "targetMode": { "type": ["string", "null"] },
+        "origin": { "type": ["string", "null"] },
+        "durationType": { "type": ["string", "null"] },
+        "changeType": { "type": ["string", "null"] },
+        "combatOutcome": { "type": ["string", "null"] },
+        "combatType": { "type": ["string", "null"] },
+        "selectionMethod": { "type": ["string", "null"] },
+        "rerollType": { "type": ["string", "null"] },
+        "spawnMode": { "type": ["string", "null"] },
+        "cardType": { "type": ["string", "null"] },
+        "enchantment": { "type": ["string", "null"] },
+        "upgradeToTier": { "type": ["string", "null"] },
+        "targetTier": { "type": ["string", "null"] },
+        "monsterTemplateId": { "type": ["string", "null"] },
+        "level": { "type": ["integer", "null"] },
+        "newLevel": { "type": ["integer", "null"] },
+        "ownerComparison": { "type": ["string", "null"] },
+        "triggerEffectOwner": { "type": ["string", "null"] },
+        "encounterId": { "type": ["string", "null"] },
+        "gameMode": { "type": ["string", "null"] },
+        "outcome": { "type": ["string", "null"] },
+        "isNot": { "type": ["boolean", "null"] },
+        "excludeSelf": { "type": ["boolean", "null"] },
+        "includeOrigin": { "type": ["boolean", "null"] },
+        "includeCommon": { "type": ["boolean", "null"] },
+        "isActive": { "type": ["boolean", "null"] },
+        "distinct": { "type": ["boolean", "null"] },
+        "isSameAsPlayerHero": { "type": ["boolean", "null"] },
+        "excludeFusion": { "type": ["boolean", "null"] },
+        "preventOverride": { "type": ["boolean", "null"] },
+        "inheritEnchantment": { "type": ["boolean", "null"] },
+        "allowDuplicates": { "type": ["boolean", "null"] },
+        "allowPlayerDuplicates": { "type": ["boolean", "null"] },
+        "forceNative": { "type": ["boolean", "null"] },
+        "ignoreHero": { "type": ["boolean", "null"] },
+        "ignoreTierTable": { "type": ["boolean", "null"] },
+        "inherits": { "type": ["boolean", "null"] },
+        "tags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "filterTags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "hiddenTags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "heroes": { "type": ["array", "null"], "items": { "type": "string" } },
+        "sizes": { "type": ["array", "null"], "items": { "type": "string" } },
+        "tiers": { "type": ["array", "null"], "items": { "type": "string" } },
+        "types": { "type": ["array", "null"], "items": { "type": "string" } },
+        "states": { "type": ["array", "null"], "items": { "type": "string" } },
+        "enchantments": {},
+        "playModes": { "type": ["array", "null"], "items": { "type": "string" } },
+        "gameModeIds": { "type": ["array", "null"], "items": { "type": "string" } },
+        "encounterIds": { "type": ["array", "null"], "items": { "type": "string" } },
+        "musicNote": {},
+        "value": { "oneOf": [{ "type": "number" }, { "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "referenceValue": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "target": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "targetPlayer": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "targetCount": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "source": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "subject": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "subjectOther": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "duration": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "cost": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "limit": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "spawnContext": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "constraints": {},
+        "selectionContextRules": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "modifier": { "oneOf": [{ "$ref": "#/$defs/ValueModifierNode" }, { "type": "null" }] },
+        "conditions": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } }, { "type": "null" }] },
+        "actions": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "triggers": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "groups": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "filters": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "behaviors": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "prerequisites": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "spawnCount": { "type": ["integer", "null"] },
+        "abilities": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" } },
+        "attributes": { "type": ["object", "null"], "additionalProperties": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] } }
       }
     },
     "AbilityDefinition": {
@@ -153,11 +442,16 @@
       "required": ["id", "trigger", "action"],
       "properties": {
         "id": { "type": "string" },
-        "trigger": { "$ref": "#/$defs/RuleNode" },
-        "activeIn": { "type": "string", "enum": ["HandOnly", "HandAndStash", "StashOnly", "Always"] },
-        "action": { "$ref": "#/$defs/RuleNode" },
-        "prerequisites": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } },
-        "priority": { "type": "string" }
+        "trigger": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "activeIn": { "type": ["string", "null"], "enum": ["HandOnly", "HandAndStash", "StashOnly", "Always", null] },
+        "worksIn": { "type": ["string", "null"] },
+        "action": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "prerequisites": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "priority": { "type": ["string", "null"] },
+        "internalName": { "type": ["string", "null"] },
+        "internalDescription": { "type": ["string", "null"] },
+        "translationKey": { "type": ["string", "null"] },
+        "vfxConfig": { "oneOf": [{ "$ref": "#/$defs/VfxConfigData" }, { "type": "null" }] }
       }
     },
     "AuraDefinition": {
@@ -165,9 +459,405 @@
       "required": ["id", "action"],
       "properties": {
         "id": { "type": "string" },
-        "activeIn": { "type": "string" },
-        "action": { "$ref": "#/$defs/RuleNode" },
-        "prerequisites": { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } }
+        "activeIn": { "type": ["string", "null"], "enum": ["HandOnly", "HandAndStash", "StashOnly", "Always", null] },
+        "worksIn": { "type": ["string", "null"] },
+        "action": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "prerequisites": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "internalName": { "type": ["string", "null"] },
+        "internalDescription": { "type": ["string", "null"] },
+        "translationKey": { "type": ["string", "null"] },
+        "vfxConfig": { "oneOf": [{ "$ref": "#/$defs/VfxConfigData" }, { "type": "null" }] }
+      }
+    },
+    "EnchantmentData": {
+      "type": "object",
+      "properties": {
+        "attributes": { "$ref": "#/$defs/AttributeMap" },
+        "abilities": { "type": "object", "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" } },
+        "auras": { "type": "object", "additionalProperties": { "$ref": "#/$defs/AuraDefinition" } },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "hiddenTags": { "type": "array", "items": { "type": "string" } },
+        "localization": { "oneOf": [{ "$ref": "#/$defs/LocalizationBlock" }, { "type": "null" }] },
+        "hasAbilities": { "type": "boolean" },
+        "hasAuras": { "type": "boolean" }
+      }
+    },
+    "QuestRepeatableData": {
+      "type": "object",
+      "properties": {
+        "prerequisites": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } }
+      }
+    },
+    "QuestUpdate": {
+      "type": "object",
+      "properties": {
+        "value": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "duration": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] }
+      }
+    },
+    "QuestReward": {
+      "type": "object",
+      "properties": {
+        "tiers": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/TierData" } },
+        "attributes": { "type": ["object", "null"], "additionalProperties": { "type": "number" } },
+        "abilities": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" } },
+        "auras": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AuraDefinition" } },
+        "tags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "hiddenTags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "localization": { "oneOf": [{ "$ref": "#/$defs/LocalizationBlock" }, { "type": "null" }] }
+      }
+    },
+    "QuestEntry": {
+      "type": "object",
+      "properties": {
+        "attributeType": { "type": "string" },
+        "prerequisites": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "trigger": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "target": { "type": "number" },
+        "update": { "oneOf": [{ "$ref": "#/$defs/QuestUpdate" }, { "type": "null" }] },
+        "reward": { "oneOf": [{ "$ref": "#/$defs/QuestReward" }, { "type": "null" }] },
+        "localization": { "oneOf": [{ "$ref": "#/$defs/LocalizationBlock" }, { "type": "null" }] },
+        "iconKeyOverride": { "type": ["string", "null"] },
+        "completionEffects": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" } }
+      }
+    },
+    "QuestDefinition": {
+      "type": "object",
+      "properties": {
+        "prerequisites": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } },
+        "repeatable": { "oneOf": [{ "$ref": "#/$defs/QuestRepeatableData" }, { "type": "null" }] },
+        "IsRepeatable": { "type": ["boolean", "null"] },
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/QuestEntry" } }
+      }
+    },
+    "RerollRulesData": {
+      "type": "object",
+      "properties": {
+        "costIncrease": { "type": ["integer", "null"] },
+        "costMax": { "type": ["integer", "null"] },
+        "resetCostOnExit": { "type": "boolean" },
+        "startingCost": { "type": ["integer", "null"] },
+        "maxRerolls": { "type": ["integer", "null"] },
+        "totalAllowedRerolls": { "type": ["integer", "null"] },
+        "rerollOnPurchase": { "type": ["boolean", "null"] }
+      }
+    },
+    "SelectionRulesData": {
+      "type": "object",
+      "properties": {
+        "canSelectMultiple": { "type": "boolean" },
+        "selectionIsFree": { "type": "boolean" },
+        "canExit": { "type": "boolean" },
+        "rerollRules": { "oneOf": [{ "$ref": "#/$defs/RerollRulesData" }, { "type": "null" }] },
+        "willAutoSellOnExit": { "type": "boolean" },
+        "nextEncounterOnExit": {},
+        "maxSelections": { "type": ["integer", "null"] }
+      }
+    },
+    "SelectionContextData": {
+      "type": "object",
+      "properties": {
+        "spawnContext": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "rules": { "oneOf": [{ "$ref": "#/$defs/SelectionRulesData" }, { "type": "null" }] }
+      }
+    },
+    "NextEncounterOption": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string" },
+        "weight": { "type": "number", "minimum": 0 },
+        "prerequisites": { "type": ["array", "null"], "items": { "$ref": "#/$defs/RuleNode" } }
+      }
+    },
+    "CombatRewardData": {
+      "type": "object",
+      "properties": {
+        "selectionContextRules": { "oneOf": [{ "$ref": "#/$defs/SelectionRulesData" }, { "type": "null" }] },
+        "spawnContext": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "goldReward": { "type": ["integer", "null"] },
+        "experienceReward": { "type": ["integer", "null"] }
+      }
+    },
+    "MechanicParameterDef": {
+      "type": "object",
+      "required": ["key", "labelZh", "type"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "labelZh": { "type": "string", "minLength": 1 },
+        "descZh": { "type": ["string", "null"] },
+        "type": { "$ref": "#/$defs/MechanicParamTypeEnum" },
+        "defaultValue": {},
+        "min": { "type": ["number", "null"] },
+        "max": { "type": ["number", "null"] },
+        "options": { "type": ["array", "null"], "items": { "type": "string" } }
+      }
+    },
+    "MechanicHookFilter": {
+      "type": "object",
+      "properties": {
+        "damageTypes": { "type": ["array", "null"], "items": { "type": "string" } },
+        "statusTypes": { "type": ["array", "null"], "items": { "$ref": "#/$defs/MechanicStatusEnum" } },
+        "changeKinds": { "type": ["array", "null"], "items": { "type": "string", "enum": ["Disable", "Destroy", "Repair"] } },
+        "triggerEventTypes": { "type": ["array", "null"], "items": { "type": "string" } },
+        "reasonEquals": { "type": ["string", "null"] },
+        "reasonNotEquals": { "type": ["string", "null"] },
+        "customEventName": { "type": ["string", "null"] },
+        "requireCardFlags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "forbidCardFlags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "requireCombatFlags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "forbidCombatFlags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "onlyWhenOwnerTarget": { "type": ["boolean", "null"] },
+        "onlyWhenSelfTarget": { "type": ["boolean", "null"] },
+        "onlyWhenSelfSource": { "type": ["boolean", "null"] },
+        "onlyWhenAdjacentSource": { "type": ["boolean", "null"] },
+        "includeDisabledSelf": { "type": ["boolean", "null"] }
+      }
+    },
+    "MechanicValueExpr": {
+      "type": "object",
+      "properties": {
+        "const": { "type": ["number", "null"] },
+        "param": { "type": ["string", "null"] },
+        "cardAttr": { "type": ["string", "null"] },
+        "counter": { "type": ["string", "null"] },
+        "playerAttr": { "type": ["string", "null"] },
+        "playerSide": { "type": ["string", "null"], "enum": ["Self", "Opponent", null] },
+        "hookField": { "type": ["string", "null"], "enum": ["Amount", "PayloadValue", "TimeMs", null] },
+        "source": { "type": ["string", "null"], "enum": ["Self", "HookSource", "HookTarget", "Combat", null] },
+        "scale": { "type": ["number", "null"] },
+        "offset": { "type": ["number", "null"] }
+      }
+    },
+    "MechanicCondition": {
+      "type": "object",
+      "properties": {
+        "all": { "type": ["array", "null"], "items": { "$ref": "#/$defs/MechanicCondition" } },
+        "any": { "type": ["array", "null"], "items": { "$ref": "#/$defs/MechanicCondition" } },
+        "not": { "oneOf": [{ "$ref": "#/$defs/MechanicCondition" }, { "type": "null" }] },
+        "hasFlag": { "type": ["string", "null"] },
+        "flagTarget": { "type": ["string", "null"], "enum": ["Self", "HookTarget", "HookSource", "Combat", null] },
+        "left": { "oneOf": [{ "$ref": "#/$defs/MechanicValueExpr" }, { "type": "null" }] },
+        "compare": { "type": ["string", "null"], "enum": ["Eq", "Neq", "Gt", "Gte", "Lt", "Lte", null] },
+        "right": { "oneOf": [{ "$ref": "#/$defs/MechanicValueExpr" }, { "type": "null" }] },
+        "cardHasTag": { "type": ["string", "null"] },
+        "cardHasHiddenTag": { "type": ["string", "null"] },
+        "cardTarget": { "type": ["string", "null"] },
+        "hookReasonEquals": { "type": ["string", "null"] },
+        "hookChangeKindEquals": { "type": ["string", "null"] },
+        "hookDamageTypeEquals": { "type": ["string", "null"] },
+        "paramBool": { "type": ["string", "null"] }
+      }
+    },
+    "MechanicTargetSpec": {
+      "type": "object",
+      "properties": {
+        "mode": { "$ref": "#/$defs/MechanicTargetModeEnum" },
+        "modeParam": { "type": ["string", "null"] },
+        "count": { "type": ["integer", "null"], "minimum": 1, "maximum": 10 },
+        "countParam": { "type": ["string", "null"] },
+        "requireTags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "requireTagParam": { "type": ["string", "null"] },
+        "requireHiddenTags": { "type": ["array", "null"], "items": { "type": "string" } },
+        "includeDisabled": { "type": "boolean" }
+      }
+    },
+    "MechanicStep": {
+      "type": "object",
+      "required": ["op"],
+      "properties": {
+        "op": { "$ref": "#/$defs/MechanicOpEnum" },
+        "condition": { "oneOf": [{ "$ref": "#/$defs/MechanicCondition" }, { "type": "null" }] },
+        "then": { "type": ["array", "null"], "items": { "$ref": "#/$defs/MechanicStep" } },
+        "else": { "type": ["array", "null"], "items": { "$ref": "#/$defs/MechanicStep" } },
+        "count": { "oneOf": [{ "$ref": "#/$defs/MechanicValueExpr" }, { "type": "null" }] },
+        "initialDelayMs": { "oneOf": [{ "$ref": "#/$defs/MechanicValueExpr" }, { "type": "null" }] },
+        "intervalMs": { "oneOf": [{ "$ref": "#/$defs/MechanicValueExpr" }, { "type": "null" }] },
+        "delayMs": { "oneOf": [{ "$ref": "#/$defs/MechanicValueExpr" }, { "type": "null" }] },
+        "steps": { "type": ["array", "null"], "items": { "$ref": "#/$defs/MechanicStep" } },
+        "operation": { "type": ["string", "null"], "enum": ["Add", "Subtract", "Set", "Multiply", null] },
+        "value": { "oneOf": [{ "$ref": "#/$defs/MechanicValueExpr" }, { "type": "null" }] },
+        "target": { "type": ["string", "null"], "enum": ["Self", "HookTarget", "HookSource", "Combat", null] },
+        "flag": { "type": ["string", "null"] },
+        "key": { "type": ["string", "null"] },
+        "syncAttribute": { "oneOf": [{ "$ref": "#/$defs/MechanicSyncAttributeEnum" }, { "type": "null" }] },
+        "playerTarget": { "type": ["string", "null"], "enum": ["Self", "Opponent", null] },
+        "amount": { "oneOf": [{ "$ref": "#/$defs/MechanicValueExpr" }, { "type": "null" }] },
+        "bypassShield": { "type": "boolean" },
+        "vfxKey": { "type": ["string", "null"] },
+        "vfxKeyParam": { "type": ["string", "null"] },
+        "status": { "oneOf": [{ "$ref": "#/$defs/MechanicStatusEnum" }, { "type": "null" }] },
+        "targetSpec": { "oneOf": [{ "$ref": "#/$defs/MechanicTargetSpec" }, { "type": "null" }] },
+        "attribute": { "type": ["string", "null"] },
+        "attributeParam": { "type": ["string", "null"] },
+        "duration": { "type": ["string", "null"], "enum": ["Combat", "Permanent", null] },
+        "grantIfMissing": { "type": "boolean", "default": false },
+        "changeKind": { "type": ["string", "null"], "enum": ["Disable", "Destroy", "Repair", null] },
+        "reason": { "type": ["string", "null"] },
+        "suppressNormalDestroyTriggers": { "type": "boolean" },
+        "eventName": { "type": ["string", "null"] },
+        "payloadValue": { "oneOf": [{ "$ref": "#/$defs/MechanicValueExpr" }, { "type": "null" }] }
+      }
+    },
+    "MechanicHookDefinition": {
+      "type": "object",
+      "required": ["hook", "steps"],
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "hook": { "$ref": "#/$defs/MechanicHookEnum" },
+        "scope": { "$ref": "#/$defs/MechanicScopeEnum" },
+        "filter": { "oneOf": [{ "$ref": "#/$defs/MechanicHookFilter" }, { "type": "null" }] },
+        "maxTriggersPerCombat": { "type": ["integer", "null"], "minimum": 1, "maximum": 200 },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/MechanicStep" } }
+      }
+    },
+    "MechanicCounterDisplay": {
+      "type": "object",
+      "properties": {
+        "labelZh": { "type": "string" },
+        "syncAttribute": { "$ref": "#/$defs/CounterDisplayAttributeEnum" },
+        "maxParam": { "type": ["string", "null"] },
+        "maxConst": { "type": ["integer", "null"] },
+        "maxAttr": { "oneOf": [{ "$ref": "#/$defs/CounterDisplayAttributeEnum" }, { "type": "null" }] },
+        "maxValue": { "type": ["integer", "null"], "description": "兼容别名，等价写入 maxConst。" },
+        "threshold": { "type": ["integer", "null"], "description": "兼容别名，等价写入 maxConst。" },
+        "colorHex": { "type": ["string", "null"] },
+        "color": { "type": ["string", "null"], "description": "兼容别名，等价写入 colorHex。" },
+        "hideWhenZero": { "type": "boolean" },
+        "style": { "oneOf": [{ "$ref": "#/$defs/CounterDisplayStyleEnum" }, { "type": "null" }] },
+        "valueType": { "oneOf": [{ "$ref": "#/$defs/CounterDisplayValueTypeEnum" }, { "type": "null" }] },
+        "format": { "type": ["string", "null"] },
+        "unit": { "type": ["string", "null"] },
+        "position": { "oneOf": [{ "$ref": "#/$defs/CounterDisplayPositionEnum" }, { "type": "null" }] }
+      }
+    },
+    "MechanicDefinition": {
+      "type": "object",
+      "required": ["id", "nameZh", "hooks"],
+      "properties": {
+        "id": { "$ref": "#/$defs/NamespacedIdString" },
+        "nameZh": { "type": "string", "minLength": 1 },
+        "descZh": { "type": "string" },
+        "categoryZh": { "type": "string" },
+        "version": { "type": "string" },
+        "author": { "type": ["string", "null"] },
+        "parameters": { "type": "array", "items": { "$ref": "#/$defs/MechanicParameterDef" } },
+        "tooltipTemplateZh": { "type": ["string", "null"] },
+        "counterDisplay": { "oneOf": [{ "$ref": "#/$defs/MechanicCounterDisplay" }, { "type": "null" }] },
+        "counterDisplays": { "type": ["array", "null"], "maxItems": 4, "items": { "$ref": "#/$defs/MechanicCounterDisplay" } },
+        "grantedAttributes": { "type": ["array", "null"], "items": { "type": "string" } },
+        "hooks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/MechanicHookDefinition" } }
+      }
+    },
+    "MechanicFile": {
+      "type": "object",
+      "required": ["schemaVersion", "modId", "mechanics"],
+      "properties": {
+        "$schema": { "type": "string" },
+        "schemaVersion": { "const": 1 },
+        "modId": { "$ref": "#/$defs/ModIdString" },
+        "mechanics": { "type": "array", "items": { "$ref": "#/$defs/MechanicDefinition" } }
+      }
+    },
+    "CardMechanicAttachment": {
+      "type": "object",
+      "required": ["mechanicId"],
+      "properties": {
+        "mechanicId": { "type": "string", "minLength": 1 },
+        "params": { "type": "object" },
+        "enabled": { "type": "boolean", "default": true }
+      }
+    },
+    "ResolvedCounterDisplay": {
+      "type": "object",
+      "properties": {
+        "labelZh": { "type": "string" },
+        "syncAttribute": { "$ref": "#/$defs/CounterDisplayAttributeEnum" },
+        "maxValue": { "type": ["integer", "null"] },
+        "maxAttr": { "oneOf": [{ "$ref": "#/$defs/CounterDisplayAttributeEnum" }, { "type": "null" }] },
+        "colorHex": { "type": ["string", "null"] },
+        "hideWhenZero": { "type": "boolean" },
+        "style": { "oneOf": [{ "$ref": "#/$defs/CounterDisplayStyleEnum" }, { "type": "null" }] },
+        "valueType": { "oneOf": [{ "$ref": "#/$defs/CounterDisplayValueTypeEnum" }, { "type": "null" }] },
+        "format": { "type": ["string", "null"] },
+        "unit": { "type": ["string", "null"] },
+        "position": { "oneOf": [{ "$ref": "#/$defs/CounterDisplayPositionEnum" }, { "type": "null" }] }
+      }
+    },
+    "ResolvedPreviewAttrOp": {
+      "type": "object",
+      "properties": {
+        "attribute": { "type": "string" },
+        "operation": { "type": "string" },
+        "value": { "type": "number" },
+        "sourceAttribute": { "type": ["string", "null"] },
+        "sourceMultiplier": { "type": ["number", "null"] },
+        "sourceAddOffset": { "type": ["number", "null"] }
+      }
+    },
+    "CustomMonsterLoadoutItemBinding": {
+      "type": "object",
+      "properties": {
+        "cardId": { "type": "string" },
+        "wireTemplateId": { "type": ["string", "null"] },
+        "size": { "$ref": "#/$defs/CardSizeEnum" },
+        "tier": { "$ref": "#/$defs/CardTierEnum" },
+        "enchantment": { "type": ["string", "null"] },
+        "titleZh": { "type": ["string", "null"] },
+        "titleEn": { "type": ["string", "null"] }
+      }
+    },
+    "CustomMonsterPreviewBinding": {
+      "type": "object",
+      "properties": {
+        "monsterId": { "type": "string" },
+        "nameZh": { "type": "string" },
+        "nameEn": { "type": ["string", "null"] },
+        "minDay": { "type": ["integer", "null"] },
+        "maxDay": { "type": ["integer", "null"] },
+        "difficultySlot": { "type": ["string", "null"] },
+        "level": { "type": "integer" },
+        "healthMax": { "type": "integer" },
+        "startingTier": { "$ref": "#/$defs/CardTierEnum" },
+        "rewardGold": { "type": "integer" },
+        "rewardXp": { "type": "integer" },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/CustomMonsterLoadoutItemBinding" } },
+        "skills": { "type": "array", "items": { "$ref": "#/$defs/CustomMonsterLoadoutItemBinding" } }
+      }
+    },
+    "CustomCardVisualBinding": {
+      "type": "object",
+      "properties": {
+        "instanceId": { "type": ["string", "null"] },
+        "customId": { "type": "string" },
+        "modId": { "type": "string" },
+        "baseVisualTemplateId": { "type": "string" },
+        "cardType": { "type": "string" },
+        "size": { "type": "string" },
+        "titleZh": { "type": "string" },
+        "descZh": { "type": "string" },
+        "activeTooltipsZh": { "type": "array", "items": { "type": "string" } },
+        "passiveTooltipsZh": { "type": "array", "items": { "type": "string" } },
+        "enchantTooltipsZh": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "customArtFile": { "type": ["string", "null"] },
+        "customArtSha256": { "type": ["string", "null"] },
+        "artRect": { "oneOf": [{ "$ref": "#/$defs/CustomCardArtRect" }, { "type": "null" }] },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "tierAttributes": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AttributeMap" } },
+        "enchantmentPreviewOps": { "type": ["object", "null"], "additionalProperties": { "type": "array", "items": { "$ref": "#/$defs/ResolvedPreviewAttrOp" } } },
+        "counterDisplays": { "type": ["array", "null"], "items": { "$ref": "#/$defs/ResolvedCounterDisplay" } },
+        "accentColor": { "type": ["string", "null"] },
+        "isPatchOverride": { "type": "boolean" },
+        "isCustomBorrowShell": { "type": "boolean" },
+        "titleEn": { "type": ["string", "null"] },
+        "descEn": { "type": ["string", "null"] },
+        "activeTooltipsEn": { "type": ["array", "null"], "items": { "type": "string" } },
+        "passiveTooltipsEn": { "type": ["array", "null"], "items": { "type": "string" } },
+        "enchantTooltipsEn": { "type": ["object", "null"], "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "visualTarget": { "$ref": "#/$defs/VisualTargetEnum" },
+        "customBgArtFile": { "type": ["string", "null"] },
+        "customBgArtSha256": { "type": ["string", "null"] },
+        "monsterPreview": { "oneOf": [{ "$ref": "#/$defs/CustomMonsterPreviewBinding" }, { "type": "null" }] }
       }
     },
     "CustomCardDefinition": {
@@ -187,26 +877,49 @@
         "tags": { "type": "array", "items": { "type": "string" } },
         "hiddenTags": { "type": "array", "items": { "type": "string" } },
         "titleZh": { "type": "string", "minLength": 1 },
-        "nameZh": { "type": "string", "minLength": 1 },
-        "titleEn": { "type": "string" },
+        "nameZh": { "type": ["string", "null"] },
+        "titleEn": { "type": ["string", "null"] },
+        "internalName": { "type": ["string", "null"] },
         "descZh": { "type": "string" },
+        "descEn": { "type": ["string", "null"] },
         "activeTooltipsZh": { "type": "array", "items": { "type": "string" } },
         "passiveTooltipsZh": { "type": "array", "items": { "type": "string" } },
         "enchantTooltipsZh": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
-        "customArtFile": { "$ref": "#/$defs/SafeRelativePath" },
-        "attributes": { "$ref": "#/$defs/AttributeMap" },
-        "tiers": {
-          "type": "object",
-          "additionalProperties": { "$ref": "#/$defs/TierData" }
-        },
-        "abilities": {
-          "type": "object",
-          "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" }
-        },
-        "auras": {
-          "type": "object",
-          "additionalProperties": { "$ref": "#/$defs/AuraDefinition" }
-        }
+        "activeTooltipsEn": { "type": ["array", "null"], "items": { "type": "string" } },
+        "passiveTooltipsEn": { "type": ["array", "null"], "items": { "type": "string" } },
+        "enchantTooltipsEn": { "type": ["object", "null"], "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "customArtFile": { "oneOf": [{ "$ref": "#/$defs/SafeRelativePath" }, { "type": "null" }] },
+        "customBgArtFile": { "oneOf": [{ "$ref": "#/$defs/SafeRelativePath" }, { "type": "null" }] },
+        "customArt": { "oneOf": [{ "$ref": "#/$defs/CustomCardArtSpec" }, { "type": "null" }] },
+        "artRect": { "oneOf": [{ "$ref": "#/$defs/CustomCardArtRect" }, { "type": "null" }] },
+        "accentColor": { "type": ["string", "null"] },
+        "attributes": { "oneOf": [{ "$ref": "#/$defs/AttributeMap" }, { "type": "null" }] },
+        "tiers": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/TierData" } },
+        "enchantments": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/EnchantmentData" } },
+        "abilities": { "type": "object", "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" } },
+        "auras": { "type": "object", "additionalProperties": { "$ref": "#/$defs/AuraDefinition" } },
+        "quests": { "type": ["array", "null"], "items": { "$ref": "#/$defs/QuestDefinition" } },
+        "customMechanics": { "type": ["array", "null"], "items": { "$ref": "#/$defs/CardMechanicAttachment" } },
+        "counterDisplays": { "type": ["array", "null"], "maxItems": 4, "items": { "$ref": "#/$defs/MechanicCounterDisplay" } },
+        "selectionContext": { "oneOf": [{ "$ref": "#/$defs/SelectionContextData" }, { "type": "null" }] },
+        "selectionRequirements": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "array", "items": { "$ref": "#/$defs/RuleNode" } }, { "type": "null" }] },
+        "selectionCriteria": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "nextEncounterOnSelection": { "type": ["array", "null"], "items": { "$ref": "#/$defs/NextEncounterOption" } },
+        "nextEventId": { "type": ["string", "null"] },
+        "combatantType": { "oneOf": [{ "$ref": "#/$defs/RuleNode" }, { "type": "null" }] },
+        "sandstormEnabled": { "type": ["boolean", "null"] },
+        "rewardCombatGold": { "type": ["integer", "null"] },
+        "rewardCombatXp": { "type": ["integer", "null"] },
+        "rewardVictory": { "oneOf": [{ "$ref": "#/$defs/CombatRewardData" }, { "type": "null" }] },
+        "rewardDefeat": { "oneOf": [{ "$ref": "#/$defs/CombatRewardData" }, { "type": "null" }] },
+        "boardOverride": { "type": ["string", "null"] },
+        "presentation": { "type": ["string", "null"] },
+        "weight": { "type": ["number", "null"], "minimum": 0 },
+        "minDay": { "type": ["integer", "null"], "minimum": 1, "maximum": 99 },
+        "maxDay": { "type": ["integer", "null"], "minimum": 1, "maximum": 99 },
+        "allowedHours": { "type": ["array", "null"], "items": { "type": "integer", "minimum": 0, "maximum": 6 } },
+        "isSingleSpawn": { "type": ["boolean", "null"] },
+        "difficultySlot": { "type": ["string", "null"], "enum": ["Bronze", "Silver", "Gold", "Any", null] }
       }
     },
     "CustomCardFile": {
@@ -224,21 +937,37 @@
       "required": ["targetTemplateId"],
       "properties": {
         "targetTemplateId": { "$ref": "#/$defs/GuidString" },
-        "note": { "type": "string" },
-        "startingTier": { "type": ["string", "null"] },
+        "note": { "type": ["string", "null"] },
+        "startingTier": { "oneOf": [{ "$ref": "#/$defs/CardTierEnum" }, { "type": "null" }] },
+        "spawningEligibility": { "type": ["string", "null"], "enum": ["Always", "GuidOnly", "Never", null] },
         "heroes": { "type": ["array", "null"], "items": { "$ref": "#/$defs/HeroEnum" } },
         "addTags": { "type": "array", "items": { "type": "string" } },
         "removeTags": { "type": "array", "items": { "type": "string" } },
+        "addHiddenTags": { "type": "array", "items": { "type": "string" } },
+        "removeHiddenTags": { "type": "array", "items": { "type": "string" } },
         "attributeOverrides": { "type": ["object", "null"], "additionalProperties": { "type": "number" } },
-        "tierAttributeOverrides": {
-          "type": ["object", "null"],
-          "additionalProperties": { "$ref": "#/$defs/AttributeMap" }
-        },
+        "tierAttributeOverrides": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AttributeMap" } },
+        "enchantmentOverrides": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/EnchantmentData" } },
         "abilitiesOverride": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" } },
         "aurasOverride": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/AuraDefinition" } },
+        "customMechanicsOverride": { "type": ["array", "null"], "items": { "$ref": "#/$defs/CardMechanicAttachment" } },
         "titleZh": { "type": ["string", "null"] },
+        "titleEn": { "type": ["string", "null"] },
         "descZh": { "type": ["string", "null"] },
-        "customArtFile": { "type": ["string", "null"] }
+        "descEn": { "type": ["string", "null"] },
+        "activeTooltipsZh": { "type": ["array", "null"], "items": { "type": "string" } },
+        "passiveTooltipsZh": { "type": ["array", "null"], "items": { "type": "string" } },
+        "enchantTooltipsZh": { "type": ["object", "null"], "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "activeTooltipsEn": { "type": ["array", "null"], "items": { "type": "string" } },
+        "passiveTooltipsEn": { "type": ["array", "null"], "items": { "type": "string" } },
+        "enchantTooltipsEn": { "type": ["object", "null"], "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "customArtFile": { "oneOf": [{ "$ref": "#/$defs/SafeRelativePath" }, { "type": "null" }] },
+        "customBgArtFile": { "oneOf": [{ "$ref": "#/$defs/SafeRelativePath" }, { "type": "null" }] },
+        "counterDisplaysOverride": { "type": ["array", "null"], "maxItems": 4, "items": { "$ref": "#/$defs/MechanicCounterDisplay" } },
+        "artRect": { "oneOf": [{ "$ref": "#/$defs/CustomCardArtRect" }, { "type": "null" }] },
+        "accentColor": { "type": ["string", "null"] },
+        "boardOverride": { "type": ["string", "null"] },
+        "presentation": { "type": ["string", "null"] }
       }
     },
     "CardPatchFile": {
@@ -258,15 +987,8 @@
           "properties": {
             "type": { "const": "EncounterStep" },
             "nextEncounterOnSelection": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "required": ["id"],
-                "properties": {
-                  "id": { "type": "string" },
-                  "weight": { "type": "number", "minimum": 0 }
-                }
-              }
+              "type": ["array", "null"],
+              "items": { "$ref": "#/$defs/NextEncounterOption" }
             }
           },
           "not": {
@@ -274,6 +996,64 @@
           }
         }
       ]
+    },
+    "MonsterCardEntry": {
+      "type": "object",
+      "required": ["templateId"],
+      "properties": {
+        "$type": { "type": ["string", "null"] },
+        "templateId": { "type": "string" },
+        "templateVersion": { "type": ["string", "null"] },
+        "instanceId": { "type": ["string", "null"] },
+        "socketId": { "type": ["string", "null"] },
+        "tier": { "$ref": "#/$defs/CardTierEnum" },
+        "enchantmentType": { "type": ["string", "null"] },
+        "attributes": { "type": ["object", "null"], "additionalProperties": { "type": "number" } }
+      }
+    },
+    "MonsterHandData": {
+      "type": "object",
+      "properties": {
+        "unlockedSlots": { "type": "integer", "minimum": 0, "maximum": 1023 },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/MonsterCardEntry" } }
+      }
+    },
+    "MonsterSocketInventoryData": {
+      "type": "object",
+      "properties": {
+        "effects": { "type": "array", "items": { "$ref": "#/$defs/MonsterCardEntry" } }
+      }
+    },
+    "MonsterPlayerData": {
+      "type": "object",
+      "properties": {
+        "attributes": { "type": "object", "additionalProperties": { "type": "number" } },
+        "hand": { "$ref": "#/$defs/MonsterHandData" },
+        "stash": { "oneOf": [{ "$ref": "#/$defs/MonsterHandData" }, { "type": "null" }] },
+        "skills": { "type": "array", "items": { "$ref": "#/$defs/MonsterCardEntry" } },
+        "socket": { "oneOf": [{ "$ref": "#/$defs/MonsterSocketInventoryData" }, { "type": "null" }] },
+        "socketEffects": { "type": "array", "items": { "$ref": "#/$defs/MonsterCardEntry" } }
+      }
+    },
+    "MonsterTemplate": {
+      "type": "object",
+      "required": ["id", "internalName", "player"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "type": ["string", "null"] },
+        "internalName": { "type": "string", "minLength": 1 },
+        "player": { "$ref": "#/$defs/MonsterPlayerData" }
+      }
+    },
+    "CustomMonsterFile": {
+      "type": "object",
+      "required": ["schemaVersion", "modId", "monsters"],
+      "properties": {
+        "$schema": { "type": "string" },
+        "schemaVersion": { "const": 1 },
+        "modId": { "$ref": "#/$defs/ModIdString" },
+        "monsters": { "type": "array", "items": { "$ref": "#/$defs/MonsterTemplate" } }
+      }
     },
     "CustomEventDefinition": {
       "type": "object",
@@ -283,18 +1063,33 @@
       },
       "properties": {
         "eventId": { "$ref": "#/$defs/NamespacedIdString" },
-        "eventType": { "type": "string", "enum": ["EventEncounter", "PedestalEncounter", "CombatEncounter"] },
+        "customId": { "type": ["string", "null"], "description": "兼容别名，等价写入 eventId。" },
+        "eventType": { "$ref": "#/$defs/EventTypeEnum" },
+        "type": { "type": ["string", "null"], "description": "兼容别名，等价写入 eventType。" },
         "baseVisualTemplateId": { "$ref": "#/$defs/GuidString" },
         "titleZh": { "type": "string", "minLength": 1 },
+        "titleEn": { "type": ["string", "null"] },
         "descZh": { "type": "string" },
+        "descEn": { "type": ["string", "null"] },
         "heroes": { "type": "array", "items": { "$ref": "#/$defs/HeroEnum" } },
+        "startingTier": { "oneOf": [{ "$ref": "#/$defs/CardTierEnum" }, { "type": "null" }] },
         "minDay": { "type": "integer", "minimum": 1, "maximum": 99 },
         "maxDay": { "type": "integer", "minimum": 1, "maximum": 99 },
         "weight": { "type": "number", "minimum": 0 },
-        "steps": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/EncounterStepDefinition" }
-        }
+        "hours": { "type": ["array", "null"], "items": { "type": "integer", "minimum": 0, "maximum": 6 }, "description": "允许出现的小时列表（与 C# [JsonPropertyName(\"hours\")] 精确对齐）。" },
+        "oncePerRun": { "type": "boolean" },
+        "chainOnly": { "type": "boolean" },
+        "difficultySlot": { "type": ["string", "null"], "enum": ["Bronze", "Silver", "Gold", "Any", null] },
+        "schedule": { "oneOf": [{ "$ref": "#/$defs/CustomEventSchedule" }, { "type": "null" }] },
+        "customArtFile": { "oneOf": [{ "$ref": "#/$defs/SafeRelativePath" }, { "type": "null" }] },
+        "customBgArtFile": { "oneOf": [{ "$ref": "#/$defs/SafeRelativePath" }, { "type": "null" }] },
+        "rewardCombatGold": { "type": ["integer", "null"] },
+        "rewardCombatXp": { "type": ["integer", "null"] },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/EncounterStepDefinition" } },
+        "nextEncounterIds": { "type": "array", "items": { "type": "string" } },
+        "combatMonster": { "oneOf": [{ "$ref": "#/$defs/MonsterTemplate" }, { "type": "null" }] },
+        "boardOverride": { "type": ["string", "null"] },
+        "presentation": { "type": ["string", "null"] }
       }
     },
     "CustomEventFile": {
@@ -305,6 +1100,116 @@
         "schemaVersion": { "const": 1 },
         "modId": { "$ref": "#/$defs/ModIdString" },
         "events": { "type": "array", "items": { "$ref": "#/$defs/CustomEventDefinition" } }
+      }
+    },
+    "CustomModeDefinition": {
+      "type": "object",
+      "required": ["modeId", "nameZh"],
+      "properties": {
+        "modeId": { "$ref": "#/$defs/NamespacedIdString" },
+        "nameZh": { "type": "string", "minLength": 1 },
+        "descZh": { "type": "string" },
+        "basePreset": { "oneOf": [{ "type": "string" }, { "type": "integer" }] },
+        "baseSpecialMode": { "oneOf": [{ "type": "string" }, { "type": "integer" }] },
+        "mutatorIds": { "type": "array", "items": { "type": "string" } },
+        "ruleOverrides": { "type": ["object", "null"] },
+        "affectsGhostPool": { "type": "boolean", "default": false }
+      }
+    },
+    "CustomModeFile": {
+      "type": "object",
+      "required": ["schemaVersion", "modId", "modes"],
+      "properties": {
+        "$schema": { "type": "string" },
+        "schemaVersion": { "const": 1 },
+        "modId": { "$ref": "#/$defs/ModIdString" },
+        "modes": { "type": "array", "items": { "$ref": "#/$defs/CustomModeDefinition" } }
+      }
+    },
+    "CustomMutatorDefinition": {
+      "type": "object",
+      "required": ["id", "nameZh"],
+      "properties": {
+        "id": { "$ref": "#/$defs/NamespacedIdString" },
+        "nameZh": { "type": "string", "minLength": 1 },
+        "nameEn": { "type": ["string", "null"] },
+        "descriptionZh": { "type": "string" },
+        "descZh": { "type": ["string", "null"], "description": "兼容别名，等价写入 descriptionZh。" },
+        "category": { "type": ["string", "null"] },
+        "conflictGroup": { "type": ["string", "null"] },
+        "difficultyDelta": { "type": "number" },
+        "scoreMultiplierDelta": { "type": ["number", "null"] },
+        "isPositive": { "type": ["boolean", "null"] },
+        "targetHook": { "type": ["string", "null"], "enum": ["RunEngine", "CombatSimulator", null] },
+        "enabledByDefault": { "type": "boolean" },
+        "rules": { "type": ["object", "null"] }
+      }
+    },
+    "CustomMutatorFile": {
+      "type": "object",
+      "required": ["schemaVersion", "modId", "mutators"],
+      "properties": {
+        "$schema": { "type": "string" },
+        "schemaVersion": { "const": 1 },
+        "modId": { "$ref": "#/$defs/ModIdString" },
+        "mutators": { "type": "array", "items": { "$ref": "#/$defs/CustomMutatorDefinition" } }
+      }
+    },
+    "CardLocalizationOverride": {
+      "type": "object",
+      "properties": {
+        "title": { "type": ["string", "null"] },
+        "description": { "type": ["string", "null"] },
+        "flavorText": { "type": ["string", "null"] },
+        "tooltips": { "type": ["object", "null"], "additionalProperties": { "type": "string" } },
+        "enchantments": { "type": ["object", "null"], "additionalProperties": { "type": "array", "items": { "type": "string" } } }
+      }
+    },
+    "UiExactOverlay": {
+      "type": "object",
+      "properties": {
+        "global": { "type": "object", "additionalProperties": { "type": "string" } },
+        "contexts": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": { "type": "string" } } }
+      }
+    },
+    "UiRegexOverlayRule": {
+      "type": "object",
+      "required": ["id", "pattern", "replacement"],
+      "properties": {
+        "id": { "type": "string" },
+        "pattern": { "type": "string" },
+        "replacement": { "type": "string" },
+        "scope": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "ServerMessageOverlay": {
+      "type": "object",
+      "properties": {
+        "exact": { "type": ["object", "null"], "additionalProperties": { "type": "string" } },
+        "regex": { "type": ["array", "null"], "items": { "$ref": "#/$defs/UiRegexOverlayRule" } }
+      }
+    },
+    "LocalizationOverlayDocument": {
+      "type": "object",
+      "properties": {
+        "$schema": { "type": "string" },
+        "schemaVersion": { "const": 1 },
+        "locale": { "type": "string", "default": "zh-CN" },
+        "revision": { "type": "string" },
+        "sha256": { "type": ["string", "null"] },
+        "minGameDataVersion": { "type": "string" },
+        "priority": { "type": "string" },
+        "hashOverrides": { "type": "object", "additionalProperties": { "type": "string" } },
+        "cardOverrides": { "type": "object", "additionalProperties": { "$ref": "#/$defs/CardLocalizationOverride" } },
+        "uiExact": { "$ref": "#/$defs/UiExactOverlay" },
+        "uiRegex": { "type": "array", "items": { "$ref": "#/$defs/UiRegexOverlayRule" } },
+        "uiExactOverrides": { "type": ["object", "null"], "additionalProperties": { "type": "string" } },
+        "uiContextOverrides": { "type": ["object", "null"], "additionalProperties": { "type": "object", "additionalProperties": { "type": "string" } } },
+        "uiRegexOverrides": { "type": ["array", "null"], "items": { "$ref": "#/$defs/UiRegexOverlayRule" } },
+        "serverMessageOverrides": { "oneOf": [{ "$ref": "#/$defs/ServerMessageOverlay" }, { "type": "null" }] },
+        "serverMessageExact": { "type": ["object", "null"], "additionalProperties": { "type": "string" } },
+        "serverMessageRegex": { "type": ["array", "null"], "items": { "$ref": "#/$defs/UiRegexOverlayRule" } },
+        "entries": { "type": ["object", "null"], "additionalProperties": { "type": "string" } }
       }
     }
   }

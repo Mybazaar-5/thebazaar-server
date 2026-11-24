@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using BazaarServer.Accounts;
@@ -48,12 +49,12 @@ public sealed class SocialAndReplayService : ISocialAndReplaySink
                 var root = doc.RootElement;
                 if (root.ValueKind == JsonValueKind.Object)
                 {
-                    if (TryGetProp(root, "p1Board", out var b1)) p1Board = b1.GetRawText();
-                    if (TryGetProp(root, "p2Board", out var b2)) p2Board = b2.GetRawText();
-                    if (TryGetProp(root, "modeId", out var m) && m.ValueKind == JsonValueKind.String) modeId = m.GetString() ?? "standard";
+                    if (TryGetProp(root, "p1Board", out var b1) || TryGetProp(root, "playerItems", out b1)) p1Board = b1.GetRawText();
+                    if (TryGetProp(root, "p2Board", out var b2) || TryGetProp(root, "opponentItems", out b2)) p2Board = b2.GetRawText();
+                    if ((TryGetProp(root, "modeId", out var m) || TryGetProp(root, "mode", out m)) && m.ValueKind == JsonValueKind.String) modeId = m.GetString() ?? "standard";
                     if (TryGetProp(root, "hour", out var hr) && hr.TryGetInt32(out int hv)) hour = hv;
-                    if (TryGetProp(root, "p1RemainingHp", out var h1) && h1.TryGetInt32(out int v1)) p1RemHp = v1;
-                    if (TryGetProp(root, "p2RemainingHp", out var h2) && h2.TryGetInt32(out int v2)) p2RemHp = v2;
+                    if ((TryGetProp(root, "p1RemainingHp", out var h1) || TryGetProp(root, "playerRemHp", out h1)) && h1.TryGetInt32(out int v1)) p1RemHp = v1;
+                    if ((TryGetProp(root, "p2RemainingHp", out var h2) || TryGetProp(root, "opponentRemHp", out h2)) && h2.TryGetInt32(out int v2)) p2RemHp = v2;
                     if (TryGetProp(root, "p1DamageDealt", out var d1) && d1.TryGetInt32(out int vd1)) p1Dmg = vd1;
                     if (TryGetProp(root, "p2DamageDealt", out var d2) && d2.TryGetInt32(out int vd2)) p2Dmg = vd2;
                 }
@@ -61,11 +62,14 @@ public sealed class SocialAndReplayService : ISocialAndReplaySink
             catch { }
         }
 
+        string p2Aid = string.IsNullOrWhiteSpace(record.OpponentAccountId) ? "" : NormalizeKey(record.OpponentAccountId);
+        string winnerSide = record.IsDraw ? "Draw" : (record.PlayerWon ? "Player1" : "Player2");
+
         _db.SaveReplay(new Persistence.ReplayRow(
             ReplayId: replayId,
             RunId: record.RunId ?? "",
             LobbyId: record.LobbyId ?? "",
-            TournamentSessionId: "",
+            TournamentSessionId: record.TournamentSessionId?.Trim() ?? "",
             ModeId: modeId,
             CombatType: string.IsNullOrWhiteSpace(record.CombatType) ? "PVP" : record.CombatType,
             Day: (int)Math.Max(1u, record.Day),
@@ -74,10 +78,10 @@ public sealed class SocialAndReplayService : ISocialAndReplaySink
             P1AccountId: NormalizeKey(record.PlayerAccountId),
             P1Username: record.PlayerUsername ?? "玩家",
             P1Hero: string.IsNullOrWhiteSpace(record.PlayerHero) ? "Vanessa" : record.PlayerHero,
-            P2AccountId: "",
+            P2AccountId: p2Aid,
             P2Username: string.IsNullOrWhiteSpace(record.OpponentName) ? "对手" : record.OpponentName,
             P2Hero: string.IsNullOrWhiteSpace(record.OpponentHero) ? "Vanessa" : record.OpponentHero,
-            WinnerSide: record.PlayerWon ? "Player1" : "Player2",
+            WinnerSide: winnerSide,
             DurationMs: Math.Max(0, record.DurationMs),
             P1RemainingHp: p1RemHp,
             P2RemainingHp: p2RemHp,
@@ -87,7 +91,8 @@ public sealed class SocialAndReplayService : ISocialAndReplaySink
             P2BoardJson: p2Board,
             TimelineSummaryJson: string.IsNullOrWhiteSpace(record.SummaryJson) ? "{}" : record.SummaryJson,
             HasCombatSimBlob: record.CombatSimMsgPack is { Length: > 0 },
-            CreatedAt: DateTime.UtcNow), record.CombatSimMsgPack);
+            CreatedAt: DateTime.UtcNow,
+            VisualBindingsJson: record.VisualBindingsJson ?? ""), record.CombatSimMsgPack);
 
         return replayId;
     }
@@ -101,8 +106,11 @@ public sealed class SocialAndReplayService : ISocialAndReplaySink
 
         string aid = NormalizeKey(submission.AccountId);
         string hero = string.IsNullOrWhiteSpace(submission.Hero) ? "Vanessa" : submission.Hero.Trim();
-        string runKey = $"lb_{modeKey}_{aid}_{DateTime.UtcNow:yyyyMMddHHmmssfff}";
-        string seasonOrDate = string.IsNullOrWhiteSpace(submission.SeasonOrDateKey) ? "all" : submission.SeasonOrDateKey.Trim();
+        // D6-P1-11：使用确定性 runKey（优先真 RunId，兜底确定性键），彻底废除 DateTime.UtcNow.Ticks 重复刷榜
+        string runKey = !string.IsNullOrWhiteSpace(submission.RunId)
+            ? submission.RunId.Trim()
+            : $"lb_{modeKey}_{aid}_{submission.DayReached}_{submission.Score}";
+        string rawSeasonOrDate = (submission.SeasonOrDateKey ?? "").Trim();
         int primaryBoardScore = Math.Max(0, submission.Score);
         int primaryMetric = modeKey is "endless" or "endless_tower"
             ? submission.DayReached
@@ -119,7 +127,10 @@ public sealed class SocialAndReplayService : ISocialAndReplaySink
                 break;
             case "daily":
             case "daily_challenge":
-                boardKeys.Add($"daily:{(seasonOrDate == "all" ? LeaderboardEndpoints.GetChinaTodayDateKey() : seasonOrDate)}");
+                string dKey = (string.IsNullOrWhiteSpace(rawSeasonOrDate) || rawSeasonOrDate.Equals("all", StringComparison.OrdinalIgnoreCase))
+                    ? LeaderboardEndpoints.GetChinaTodayDateKey()
+                    : rawSeasonOrDate;
+                boardKeys.Add($"daily:{dKey}");
                 break;
             case "boss_rush":
                 boardKeys.Add("boss_rush:all");
@@ -132,10 +143,20 @@ public sealed class SocialAndReplayService : ISocialAndReplaySink
                 boardKeys.Add("cross_hero:all");
                 break;
             case "tournament":
-                boardKeys.Add($"tournament:{(seasonOrDate == "all" ? "s2" : seasonOrDate)}");
+                string tSeason = (string.IsNullOrWhiteSpace(rawSeasonOrDate) ||
+                                  rawSeasonOrDate.Equals("all", StringComparison.OrdinalIgnoreCase) ||
+                                  rawSeasonOrDate.Equals("S1", StringComparison.OrdinalIgnoreCase))
+                    ? "s2"
+                    : rawSeasonOrDate.ToLowerInvariant();
+                boardKeys.Add($"tournament:{tSeason}");
                 break;
             default:
-                boardKeys.Add($"season:{(seasonOrDate == "all" ? "2" : seasonOrDate)}:ranked");
+                string rSeason = (string.IsNullOrWhiteSpace(rawSeasonOrDate) ||
+                                  rawSeasonOrDate.Equals("all", StringComparison.OrdinalIgnoreCase) ||
+                                  rawSeasonOrDate.Equals("S1", StringComparison.OrdinalIgnoreCase))
+                    ? "2"
+                    : rawSeasonOrDate;
+                boardKeys.Add($"season:{rSeason}:ranked");
                 break;
         }
 
@@ -153,12 +174,12 @@ public sealed class SocialAndReplayService : ISocialAndReplaySink
                 Score: primaryBoardScore,
                 PrimaryMetric: primaryMetric,
                 SecondaryMetric: submission.Victories,
-                ElapsedSeconds: 0,
+                ElapsedSeconds: Math.Max(0, submission.ElapsedSeconds),
                 DayReached: submission.DayReached,
                 Victories: submission.Victories,
                 Defeats: submission.Defeats,
-                Prestige: 0,
-                IsFirstAttempt: true,
+                Prestige: Math.Max(0, submission.Prestige),
+                IsFirstAttempt: submission.IsFirstAttempt ?? true,
                 MutatorsJson: string.IsNullOrWhiteSpace(submission.MutatorsJson) ? "[]" : submission.MutatorsJson,
                 SummaryBoardJson: string.IsNullOrWhiteSpace(submission.FinalBoardSummaryJson) ? "{}" : submission.FinalBoardSummaryJson,
                 AchievedAt: now));
@@ -255,6 +276,19 @@ public static class SocialEndpoints
     public const int MaxChatContentLength = 200;
     public const int RateLimitMaxMessages = 5;
     public const int RateLimitWindowMs = 10_000;
+    private const int MaxRateBucketEntries = 4096;
+
+    private static readonly string DynamicServerVersion = ResolveServerVersion();
+
+    private static string ResolveServerVersion()
+    {
+        var raw = typeof(SocialEndpoints).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+            ?? typeof(SocialEndpoints).Assembly.GetName().Version?.ToString(3)
+            ?? "15.4.0";
+        int plusIdx = raw.IndexOf('+');
+        return plusIdx > 0 ? raw[..plusIdx] : raw;
+    }
 
     private static readonly JsonSerializerOptions CamelJson = new()
     {
@@ -262,6 +296,26 @@ public static class SocialEndpoints
     };
 
     private static readonly ConcurrentDictionary<Guid, Queue<long>> ChatRateBuckets = new();
+
+    /// <summary>D8-P2-05：清理已过窗口期的空聊天限流桶，供定期维护任务与高水位溢出时复用。</summary>
+    public static int PurgeStaleRateBuckets()
+    {
+        long now = Environment.TickCount64;
+        int removed = 0;
+        foreach (var (aid, q) in ChatRateBuckets)
+        {
+            bool empty;
+            lock (q)
+            {
+                while (q.Count > 0 && now - q.Peek() > RateLimitWindowMs)
+                    q.Dequeue();
+                empty = q.Count == 0;
+            }
+            if (empty && ChatRateBuckets.TryRemove(aid, out _))
+                removed++;
+        }
+        return removed;
+    }
 
     public static void Map(WebApplication app)
     {
@@ -288,25 +342,51 @@ public static class SocialEndpoints
                 onlinePlayers = Math.Max(sessions.Count, accounts.CountOnlinePlayers()),
                 activeRuns = sessions.Count,
                 activeLobbies = lobbies.ActiveLobbyCount,
-                serverVersion = "15.4.0",
+                serverVersion = DynamicServerVersion,
                 protocolVersion = 2,
             }, CamelJson);
         });
 
-        // ── 通用聊天拉取（世界/房间/观战频道）────────────────────────────────
-        app.MapGet("/api/social/chat", (HttpContext ctx, LobbyStore lobbies, Persistence db) =>
+        // ── 通用聊天拉取（世界/房间/观战频道，私密/密码/邀请/缺失房强制成员鉴权）──
+        app.MapGet("/api/social/chat", (HttpContext ctx, AccountStore accounts, LobbyStore lobbies, Persistence db) =>
         {
             string channel = ctx.Request.Query["channel"].ToString().Trim().ToLowerInvariant();
             string lobbyIdOrCode = ctx.Request.Query["lobbyId"].ToString().Trim();
             long sinceId = long.TryParse(ctx.Request.Query["sinceId"], out long s) && s > 0 ? s : 0;
             int limit = int.TryParse(ctx.Request.Query["limit"], out int l) ? Math.Clamp(l, 1, 200) : 50;
 
-            var (channelType, channelId) = ResolveChannel(channel, lobbyIdOrCode, lobbies);
-            var rows = db.QueryChatMessages(channelType, channelId, sinceId, limit);
+            bool explicitLobbyChannel = channel is "lobby" or "spectate";
+            if (explicitLobbyChannel && string.IsNullOrWhiteSpace(lobbyIdOrCode))
+            {
+                return Results.Json(new
+                {
+                    error = "查询房间或观战聊天记录时必须指定 lobbyId。",
+                    code = "LOBBY_ID_REQUIRED",
+                }, CamelJson, statusCode: 400);
+            }
+
+            if (explicitLobbyChannel || (!string.IsNullOrWhiteSpace(lobbyIdOrCode) && !lobbyIdOrCode.Equals("global", StringComparison.OrdinalIgnoreCase)))
+            {
+                var denied = TryAuthorizeLobbyChannel(ctx, lobbyIdOrCode, isWrite: false, accounts, lobbies, out var lobby, out _);
+                if (denied != null)
+                    return denied.ToResult(CamelJson);
+
+                string channelType = channel == "spectate" ? "spectate" : "lobby";
+                string channelId = lobby!.LobbyId;
+                var lobbyRows = db.QueryChatMessages(channelType, channelId, sinceId, limit);
+                return Results.Json(new
+                {
+                    channelType,
+                    channelId,
+                    items = lobbyRows.Select(ToChatDto).ToArray(),
+                }, CamelJson);
+            }
+
+            var rows = db.QueryChatMessages("global", "global", sinceId, limit);
             return Results.Json(new
             {
-                channelType,
-                channelId,
+                channelType = "global",
+                channelId = "global",
                 items = rows.Select(ToChatDto).ToArray(),
             }, CamelJson);
         });
@@ -317,11 +397,23 @@ public static class SocialEndpoints
             return await HandlePostChatAsync(ctx, explicitLobbyId: null, accounts, lobbies, db, sseHub);
         });
 
-        // ── 房间专属聊天路由别名 ─────────────────────────────────────────────
-        app.MapGet("/api/lobbies/{id}/chat", (string id, HttpContext ctx, LobbyStore lobbies, Persistence db) =>
+        // ── 房间专属聊天路由别名（私密/密码/邀请/缺失房强制成员鉴权）─────────
+        app.MapGet("/api/lobbies/{id}/chat", (string id, HttpContext ctx, AccountStore accounts, LobbyStore lobbies, Persistence db) =>
         {
-            var lobby = lobbies.Get(id) ?? lobbies.GetByCode(id);
-            string channelId = lobby?.LobbyId ?? id.Trim();
+            if (string.IsNullOrWhiteSpace(id))
+            {
+                return Results.Json(new
+                {
+                    error = "查询房间聊天记录时必须指定房间 ID。",
+                    code = "LOBBY_ID_REQUIRED",
+                }, CamelJson, statusCode: 400);
+            }
+
+            var denied = TryAuthorizeLobbyChannel(ctx, id, isWrite: false, accounts, lobbies, out var lobby, out _);
+            if (denied != null)
+                return denied.ToResult(CamelJson);
+
+            string channelId = lobby!.LobbyId;
             string channel = ctx.Request.Query["channel"].ToString().Trim().ToLowerInvariant();
             string channelType = channel == "spectate" ? "spectate" : "lobby";
             long sinceId = long.TryParse(ctx.Request.Query["sinceId"], out long s) && s > 0 ? s : 0;
@@ -370,24 +462,53 @@ public static class SocialEndpoints
             else if (long.TryParse(ctx.Request.Query["sinceId"], out long qSince) && qSince > 0)
                 sinceId = qSince;
 
-            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: false);
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: false, allowLegacyUsernameFallback: false);
             string ownerKey = auth.Account != null
                 ? auth.Account.AccountId.ToString("N")
                 : $"anon:{ctx.Connection.RemoteIpAddress}";
 
             string topic;
             string? resolvedLobbyId = null;
-            if (scope == "lobby" || !string.IsNullOrWhiteSpace(lobbyParam))
+            if (!string.IsNullOrWhiteSpace(lobbyParam))
             {
-                var lobby = lobbies.Get(lobbyParam) ?? lobbies.GetByCode(lobbyParam)
-                    ?? (auth.Account != null ? lobbies.GetByMember(auth.Account.AccountId.ToString("N")) : null);
-                if (lobby == null)
+                // 显式指定 lobbyId 时严禁回退 lobbies.GetByMember(...)，防止错误/伪造房号静默串房
+                var denied = TryAuthorizeLobbyChannel(ctx, lobbyParam, isWrite: false, accounts, lobbies, out var lobby, out var caller);
+                if (denied != null)
                 {
-                    ctx.Response.StatusCode = 404;
-                    await ctx.Response.WriteAsJsonAsync(new { error = "未找到指定的房间社交频道。", code = "LOBBY_NOT_FOUND" }, ct);
+                    await denied.WriteAsync(ctx, ct);
                     return;
                 }
-                resolvedLobbyId = lobby.LobbyId;
+                if (caller != null)
+                    ownerKey = caller.AccountId.ToString("N");
+                resolvedLobbyId = lobby!.LobbyId;
+                topic = SseEventHub.SocialLobbyTopic(lobby.LobbyId);
+            }
+            else if (scope == "lobby")
+            {
+                // 仅在未指定 lobbyId 且 scope=lobby 时定位已认证本人的当前房间
+                if (!auth.IsAuthenticated || auth.Account == null)
+                {
+                    var unauth = new ChannelAuthDenial(401, "AUTH_REQUIRED", "订阅当前房间社交事件流前请先登录账号。");
+                    await unauth.WriteAsync(ctx, ct);
+                    return;
+                }
+
+                var myLobby = lobbies.GetByMember(auth.Account.AccountId.ToString("N"));
+                if (myLobby == null || myLobby.IsCancelled)
+                {
+                    var notFound = new ChannelAuthDenial(404, "LOBBY_NOT_FOUND", "您当前未加入任何活跃房间。");
+                    await notFound.WriteAsync(ctx, ct);
+                    return;
+                }
+
+                var denied = TryAuthorizeLobbyChannel(ctx, myLobby.LobbyId, isWrite: false, accounts, lobbies, out var lobby, out _);
+                if (denied != null)
+                {
+                    await denied.WriteAsync(ctx, ct);
+                    return;
+                }
+
+                resolvedLobbyId = lobby!.LobbyId;
                 topic = SseEventHub.SocialLobbyTopic(lobby.LobbyId);
             }
             else
@@ -451,6 +572,82 @@ public static class SocialEndpoints
         });
     }
 
+    private sealed record ChannelAuthDenial(int StatusCode, string Code, string Error)
+    {
+        public IResult ToResult(JsonSerializerOptions jsonOpts)
+            => Results.Json(new { error = Error, code = Code }, jsonOpts, statusCode: StatusCode);
+
+        public async Task WriteAsync(HttpContext ctx, CancellationToken ct)
+        {
+            ctx.Response.StatusCode = StatusCode;
+            await ctx.Response.WriteAsJsonAsync(new { error = Error, code = Code }, ct);
+        }
+    }
+
+    /// <summary>
+    /// 统一房间聊天/SSE 频道鉴权守卫（D6-P1-05）：
+    /// - 写操作：强制 Bearer 登录且必须为活跃房间成员（非成员返 403 LOBBY_CHAT_FORBIDDEN，缺失/取消返 404）；
+    /// - 读操作：公开无密非邀请活跃房允许只读；私密/密码/邀请房强制 Bearer 登录（禁用 X-Username 降级）且必须为成员；
+    /// - 不存在或已取消房间：强制 Bearer 登录（匿名返 401，已登录返 404），阻断历史私密房 lobbyId 匿名窃听。
+    /// </summary>
+    private static ChannelAuthDenial? TryAuthorizeLobbyChannel(
+        HttpContext ctx,
+        string? lobbyIdOrCode,
+        bool isWrite,
+        AccountStore accounts,
+        LobbyStore lobbies,
+        out LobbyStore.Lobby? lobby,
+        out AccountStore.Account? caller)
+    {
+        caller = null;
+        string cleanId = (lobbyIdOrCode ?? string.Empty).Trim();
+        lobby = string.IsNullOrEmpty(cleanId) ? null : (lobbies.Get(cleanId) ?? lobbies.GetByCode(cleanId));
+
+        bool isRestricted = lobby == null
+            || lobby.IsCancelled
+            || !lobby.IsPublic
+            || lobby.HasPassword
+            || lobby.IsInviteOnly;
+
+        if (isWrite)
+        {
+            var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true, allowLegacyUsernameFallback: false);
+            if (!auth.IsAuthenticated || auth.Account == null)
+                return new ChannelAuthDenial(auth.FailureStatusCode > 0 ? auth.FailureStatusCode : 401, auth.ErrorCode ?? "AUTH_REQUIRED", auth.ErrorMessageZh ?? "请先登录账号后再发言。");
+
+            caller = auth.Account;
+            if (lobby == null || lobby.IsCancelled)
+                return new ChannelAuthDenial(404, "LOBBY_NOT_FOUND", "目标聊天房间不存在或已解散。");
+
+            if (lobbies.FindMember(lobby, caller.AccountId.ToString("N")) == null)
+                return new ChannelAuthDenial(403, "LOBBY_CHAT_FORBIDDEN", "您不是该房间的成员，无权在此房间发言。");
+
+            return null;
+        }
+
+        // 只读公开无密非邀请活跃房放行（兼容大厅公开观战）
+        if (!isRestricted)
+        {
+            var optAuth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: false, allowLegacyUsernameFallback: false);
+            caller = optAuth.IsAuthenticated ? optAuth.Account : null;
+            return null;
+        }
+
+        // 私密/密码/邀请房或不存在/已归档房：一律先强制 Bearer 登录
+        var strictAuth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true, allowLegacyUsernameFallback: false);
+        if (!strictAuth.IsAuthenticated || strictAuth.Account == null)
+            return new ChannelAuthDenial(strictAuth.FailureStatusCode > 0 ? strictAuth.FailureStatusCode : 401, strictAuth.ErrorCode ?? "AUTH_REQUIRED", strictAuth.ErrorMessageZh ?? "访问受限房间聊天频道前请先登录账号。");
+
+        caller = strictAuth.Account;
+        if (lobby == null || lobby.IsCancelled)
+            return new ChannelAuthDenial(404, "LOBBY_NOT_FOUND", "目标房间不存在或已解散。");
+
+        if (lobbies.FindMember(lobby, caller.AccountId.ToString("N")) == null)
+            return new ChannelAuthDenial(403, "LOBBY_CHAT_FORBIDDEN", "该房间为受限房间，仅房间成员可查看聊天与实时事件流。");
+
+        return null;
+    }
+
     private static async Task<IResult> HandlePostChatAsync(
         HttpContext ctx,
         string? explicitLobbyId,
@@ -459,7 +656,7 @@ public static class SocialEndpoints
         Persistence db,
         SseEventHub sseHub)
     {
-        var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true);
+        var auth = AccountAuthResolver.Resolve(ctx, accounts, requireAuth: true, allowLegacyUsernameFallback: false);
         if (!auth.IsAuthenticated) return AccountAuthResolver.ErrorResult(auth, CamelJson);
         var acc = auth.Account!;
 
@@ -505,13 +702,32 @@ public static class SocialEndpoints
         if (string.IsNullOrWhiteSpace(clean))
             return Results.Json(new { error = "消息内容不能为空（且不允许仅包含非法标签字符）。", code = "EMPTY_CONTENT" }, CamelJson, statusCode: 400);
 
-        var (channelType, channelId) = ResolveChannel(channel, bodyLobbyId, lobbies);
-        if (channelType is "lobby" or "spectate")
+        string chNorm = (channel ?? "").Trim().ToLowerInvariant();
+        bool explicitLobbyChannel = chNorm is "lobby" or "spectate";
+        if (explicitLobbyChannel && string.IsNullOrWhiteSpace(bodyLobbyId))
         {
-            var lobby = lobbies.Get(channelId) ?? lobbies.GetByCode(channelId);
-            if (lobby == null || lobby.IsCancelled)
-                return Results.Json(new { error = "目标聊天房间不存在或已解散。", code = "LOBBY_NOT_FOUND" }, CamelJson, statusCode: 404);
-            channelId = lobby.LobbyId;
+            return Results.Json(new
+            {
+                error = "向房间或观战频道发送消息时必须指定 lobbyId。",
+                code = "LOBBY_ID_REQUIRED",
+            }, CamelJson, statusCode: 400);
+        }
+
+        string channelType;
+        string channelId;
+        if (explicitLobbyChannel || (!string.IsNullOrWhiteSpace(bodyLobbyId) && !bodyLobbyId.Equals("global", StringComparison.OrdinalIgnoreCase)))
+        {
+            var denied = TryAuthorizeLobbyChannel(ctx, bodyLobbyId, isWrite: true, accounts, lobbies, out var lobby, out _);
+            if (denied != null)
+                return denied.ToResult(CamelJson);
+
+            channelType = chNorm == "spectate" ? "spectate" : "lobby";
+            channelId = lobby!.LobbyId;
+        }
+        else
+        {
+            channelType = "global";
+            channelId = "global";
         }
 
         var row = db.InsertChatMessage(
@@ -530,21 +746,10 @@ public static class SocialEndpoints
         return Results.Json(dto, CamelJson);
     }
 
-    private static (string ChannelType, string ChannelId) ResolveChannel(string? channel, string? lobbyIdOrCode, LobbyStore lobbies)
-    {
-        string ch = (channel ?? "").Trim().ToLowerInvariant();
-        if (!string.IsNullOrWhiteSpace(lobbyIdOrCode) && !lobbyIdOrCode.Equals("global", StringComparison.OrdinalIgnoreCase))
-        {
-            var lobby = lobbies.Get(lobbyIdOrCode) ?? lobbies.GetByCode(lobbyIdOrCode);
-            string resolvedId = lobby?.LobbyId ?? lobbyIdOrCode.Trim();
-            string resolvedType = ch == "spectate" ? "spectate" : "lobby";
-            return (resolvedType, resolvedId);
-        }
-        return ("global", "global");
-    }
-
     private static bool CheckChatRateLimit(Guid accountId)
     {
+        if (ChatRateBuckets.Count >= MaxRateBucketEntries && !ChatRateBuckets.ContainsKey(accountId))
+            PurgeStaleRateBuckets();
         long now = Environment.TickCount64;
         var q = ChatRateBuckets.GetOrAdd(accountId, _ => new Queue<long>());
         lock (q)

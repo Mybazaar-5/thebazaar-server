@@ -220,19 +220,11 @@ public sealed class IniDocument
     }
 
     /// <summary>
-    /// 原子保存为无 BOM UTF-8 文件（先写 .tmp 再替换）。
+    /// 原子保存为无 BOM UTF-8 文件（D7-P2-05：经 AtomicFileWriter 唯一随机临时文件防碰撞替换）。
     /// </summary>
     public void SaveAtomic(string filePath)
     {
-        string? dir = Path.GetDirectoryName(filePath);
-        if (!string.IsNullOrWhiteSpace(dir))
-        {
-            Directory.CreateDirectory(dir);
-        }
-
-        string tmpPath = filePath + ".tmp";
-        File.WriteAllText(tmpPath, Serialize(), Utf8NoBom);
-        File.Move(tmpPath, filePath, overwrite: true);
+        AtomicFileWriter.WriteAllTextAtomic(filePath, Serialize(), Utf8NoBom);
     }
 
     private static string FormatKeyValue(string key, string value)

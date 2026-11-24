@@ -12,6 +12,8 @@
       "minDay": 2,
       "maxDay": 10,
       "weight": 5.0,
+      "hours": [1, 2, 3, 4],
+      "oncePerRun": true,
       "steps": [
         {
           "customId": "demo-forge:step_enter_inner_room",
@@ -74,6 +76,7 @@
       "minDay": 99,
       "maxDay": 99,
       "weight": 0.0,
+      "chainOnly": true,
       "steps": [
         {
           "customId": "demo-forge:step_claim_storm_kukri",

@@ -19,7 +19,8 @@ public sealed class QuickLaunchPage : UserControl
     private readonly GoldButton _btnLaunch;
     private readonly GoldButton _btnLocalServerToggle;
 
-    private readonly ServerModeCard _cardCloud;
+    private readonly HubPresetConfig _preset = HubPresetRegistry.Current;
+    private readonly ServerModeCard? _cardPresetRemote;
     private readonly ServerModeCard _cardLocal;
     private readonly ServerModeCard _cardCustom;
     private readonly ServerModeCard _cardOfficial;
@@ -39,7 +40,7 @@ public sealed class QuickLaunchPage : UserControl
     private readonly GoldToggleChip _chkUnlockAll;
 
     private readonly Dictionary<ServerMode, ServerProbeResult> _latestProbes = new();
-    private ServerMode _selectedMode = ServerMode.CloudTencent;
+    private ServerMode _selectedMode;
     private bool _standaloneRunning;
 
     public event Action? AutoLocateRequested;
@@ -124,7 +125,9 @@ public sealed class QuickLaunchPage : UserControl
             Margin = new Padding(0)
         };
         _pillHeroMode = new StatusPill { Height = 24, Margin = new Padding(0, 1, 8, 0) };
-        _pillHeroMode.SetState(PillTone.Gold, "远程自建服 (示例)", showDot: false, icon: HubIconKind.ServerCloud);
+        string defaultModeLabel = _preset.HasPresetRemote ? _preset.PresetRemoteName : "本地单机离线版";
+        HubIconKind defaultModeIcon = _preset.HasPresetRemote ? HubIconKind.ServerCloud : HubIconKind.ServerLocal;
+        _pillHeroMode.SetState(PillTone.Gold, defaultModeLabel, showDot: false, icon: defaultModeIcon);
 
         _pillHeroNet = new StatusPill { Height = 24, Margin = new Padding(0, 1, 8, 0) };
         _pillHeroNet.SetState(PillTone.Neutral, "正在探测节点...", showDot: true);
@@ -139,7 +142,9 @@ public sealed class QuickLaunchPage : UserControl
 
         _lblHeroTitle = new Label
         {
-            Text = "准备进入大巴扎 · 远程自建服",
+            Text = _preset.HasPresetRemote
+                ? $"准备进入大巴扎 · {_preset.PresetRemoteName}"
+                : "准备启动本地单机离线版",
             Font = HubTheme.FontHeroTitle,
             ForeColor = HubTheme.TextPrimary,
             Dock = DockStyle.Fill,
@@ -308,25 +313,22 @@ public sealed class QuickLaunchPage : UserControl
         srvHeader.Controls.Add(_btnRefreshPing, 1, 0);
         serverLayout.Controls.Add(srvHeader);
 
+        int colCount = _preset.HasPresetRemote ? 4 : 3;
         var cardsGrid = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
             Height = 114,
-            ColumnCount = 4,
+            ColumnCount = colCount,
             RowCount = 1,
             BackColor = Color.Transparent,
             Margin = new Padding(0)
         };
-        for (int i = 0; i < 4; i++)
+        float colWidth = 100f / colCount;
+        for (int i = 0; i < colCount; i++)
         {
-            cardsGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+            cardsGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, colWidth));
         }
 
-        _cardCloud = new ServerModeCard(ServerMode.CloudTencent, "远程自建服 (示例)", "请用「自定义服务器」填入你的自建服地址")
-        {
-            Dock = DockStyle.Fill,
-            Margin = new Padding(0, 0, 10, 0)
-        };
         _cardLocal = new ServerModeCard(ServerMode.LocalStandalone, "本地单机离线版", "127.0.0.1:8080 · 自动托管")
         {
             Dock = DockStyle.Fill,
@@ -344,15 +346,28 @@ public sealed class QuickLaunchPage : UserControl
         };
         _cardOfficial.SetProbeStatus(HubTheme.StatusBlue, "停用自建服补丁，直连官方");
 
-        _cardCloud.Click += (_, _) => SelectServerMode(ServerMode.CloudTencent, notify: true);
         _cardLocal.Click += (_, _) => SelectServerMode(ServerMode.LocalStandalone, notify: true);
         _cardCustom.Click += (_, _) => SelectServerMode(ServerMode.CustomServer, notify: true);
         _cardOfficial.Click += (_, _) => SelectServerMode(ServerMode.PureOfficial, notify: true);
 
-        cardsGrid.Controls.Add(_cardCloud, 0, 0);
-        cardsGrid.Controls.Add(_cardLocal, 1, 0);
-        cardsGrid.Controls.Add(_cardCustom, 2, 0);
-        cardsGrid.Controls.Add(_cardOfficial, 3, 0);
+        int colIdx = 0;
+        if (_preset.HasPresetRemote)
+        {
+            _cardPresetRemote = new ServerModeCard(
+                ServerMode.PresetRemote,
+                _preset.PresetRemoteName,
+                _preset.PresetRemoteSubtitle)
+            {
+                Dock = DockStyle.Fill,
+                Margin = new Padding(0, 0, 10, 0)
+            };
+            _cardPresetRemote.Click += (_, _) => SelectServerMode(ServerMode.PresetRemote, notify: true);
+            cardsGrid.Controls.Add(_cardPresetRemote, colIdx++, 0);
+        }
+
+        cardsGrid.Controls.Add(_cardLocal, colIdx++, 0);
+        cardsGrid.Controls.Add(_cardCustom, colIdx++, 0);
+        cardsGrid.Controls.Add(_cardOfficial, colIdx, 0);
         serverLayout.Controls.Add(cardsGrid);
 
         // 自定义服务器地址折叠行（仅选中自定义服务器时展开）
@@ -685,7 +700,7 @@ public sealed class QuickLaunchPage : UserControl
         scroll.Controls.Add(root);
         Controls.Add(scroll);
 
-        SelectServerMode(ServerMode.CloudTencent, notify: false);
+        SelectServerMode(_preset.DefaultMode, notify: false);
     }
 
     public ServerMode SelectedMode => _selectedMode;
@@ -774,8 +789,16 @@ public sealed class QuickLaunchPage : UserControl
 
     public void SelectServerMode(ServerMode mode, bool notify)
     {
+        if (mode == ServerMode.PresetRemote && !_preset.HasPresetRemote)
+        {
+            mode = ServerMode.LocalStandalone;
+        }
+
         _selectedMode = mode;
-        _cardCloud.Selected = mode == ServerMode.CloudTencent;
+        if (_cardPresetRemote != null)
+        {
+            _cardPresetRemote.Selected = mode == ServerMode.PresetRemote;
+        }
         _cardLocal.Selected = mode == ServerMode.LocalStandalone;
         _cardCustom.Selected = mode == ServerMode.CustomServer;
         _cardOfficial.Selected = mode == ServerMode.PureOfficial;
@@ -783,11 +806,11 @@ public sealed class QuickLaunchPage : UserControl
 
         (string modeLabel, HubIconKind icon, string heroTitle, string launchText) = mode switch
         {
-            ServerMode.LocalStandalone => (
-                "本地单机离线版",
-                HubIconKind.ServerLocal,
-                "准备启动本地单机离线版",
-                "启动本地单机服并进入游戏"),
+            ServerMode.PresetRemote when _preset.HasPresetRemote => (
+                _preset.PresetRemoteName,
+                HubIconKind.ServerCloud,
+                $"准备进入大巴扎 · {_preset.PresetRemoteName}",
+                "同步更新并启动游戏"),
             ServerMode.CustomServer => (
                 "自定义服务器",
                 HubIconKind.ServerCustom,
@@ -799,10 +822,10 @@ public sealed class QuickLaunchPage : UserControl
                 "准备以纯净官方原版启动",
                 "以纯净官方原版启动游戏"),
             _ => (
-                "远程自建服 (示例)",
-                HubIconKind.ServerCloud,
-                "准备进入大巴扎 · 远程自建服",
-                "同步更新并启动游戏")
+                "本地单机离线版",
+                HubIconKind.ServerLocal,
+                "准备启动本地单机离线版",
+                "启动本地单机服并进入游戏")
         };
 
         _pillHeroMode.SetState(mode == ServerMode.PureOfficial ? PillTone.Blue : PillTone.Gold, modeLabel, showDot: false, icon: icon);
@@ -823,7 +846,7 @@ public sealed class QuickLaunchPage : UserControl
 
         ServerModeCard? card = mode switch
         {
-            ServerMode.CloudTencent => _cardCloud,
+            ServerMode.PresetRemote => _cardPresetRemote,
             ServerMode.LocalStandalone => _cardLocal,
             ServerMode.CustomServer => _cardCustom,
             _ => null

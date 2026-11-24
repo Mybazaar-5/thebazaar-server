@@ -18,6 +18,7 @@ using Xunit;
 
 namespace BazaarCore.Tests;
 
+[Collection("GlobalStaticState")]
 public sealed class V8PerfPresetsTests
 {
     private static string NewTempDb(out string dir) { dir = Path.Combine(Path.GetTempPath(), "bazaar_v8_" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir); return Path.Combine(dir, "bazaar.db"); }

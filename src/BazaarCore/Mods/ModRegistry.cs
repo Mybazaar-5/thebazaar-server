@@ -10,12 +10,41 @@ using BazaarCore.Models;
 namespace BazaarCore.Mods;
 
 /// <summary>
+/// 不可变的单局/单注册表 Mod 运行时上下文快照（供 CombatSimulator、SandboxEngineService 与 W1-C RunEngine 透传，P0-17）：
+/// 所有字典与列表均不可变且永不为 null，支持按房/按局完全隔离，不再依赖全局静态 <see cref="ModRuntimeHooks"/>。
+/// </summary>
+public sealed record ModRuntimeContext(
+    FrozenDictionary<string, MechanicDefinition> MechanicsById,
+    FrozenDictionary<string, ICustomActionHandler> ActionHandlers,
+    FrozenDictionary<string, ICustomTriggerHandler> TriggerHandlers,
+    FrozenDictionary<string, IGameModeHook> ModeHooks,
+    IReadOnlyList<ICombatPipelineInterceptor> PipelineInterceptors,
+    FrozenDictionary<string, MutatorMetadata>? CustomMutatorsById = null,
+    FrozenDictionary<string, CustomModeDefinition>? CustomModesById = null)
+{
+    public FrozenDictionary<string, MutatorMetadata> EffectiveCustomMutatorsById =>
+        CustomMutatorsById ?? FrozenDictionary<string, MutatorMetadata>.Empty;
+
+    public FrozenDictionary<string, CustomModeDefinition> EffectiveCustomModesById =>
+        CustomModesById ?? FrozenDictionary<string, CustomModeDefinition>.Empty;
+
+    public static ModRuntimeContext Empty { get; } = new(
+        FrozenDictionary<string, MechanicDefinition>.Empty,
+        FrozenDictionary<string, ICustomActionHandler>.Empty,
+        FrozenDictionary<string, ICustomTriggerHandler>.Empty,
+        FrozenDictionary<string, IGameModeHook>.Empty,
+        Array.Empty<ICombatPipelineInterceptor>(),
+        FrozenDictionary<string, MutatorMetadata>.Empty,
+        FrozenDictionary<string, CustomModeDefinition>.Empty);
+}
+
+/// <summary>
 /// BazaarModKit 运行时注册表与热重载管理器：
 /// - 从 mods/ 目录或内存 ModPackage 集合扫描、拓扑校验并增量叠加至只读 <see cref="GameDataRepository"/> 不可变副本；
 /// - 原子切换与安全回滚（绝不破坏原版 BaseRepository）；
 /// - 合并四层中文词典（自动汇总 Mod 卡牌中文元数据 + localization/zh-CN.json）；
-/// - 同步自定义动作/触发器/模式钩子至 <see cref="ModRuntimeHooks"/>；
-/// - 导出供客户端增量同步的 <see cref="ModManifestDto"/>、资产 SHA-256 索引与实例级视觉绑定查询接口。
+/// - 仅当 <see cref="PublishesGlobalRuntimeHooks"/> 为 true 时同步发布至全局 <see cref="ModRuntimeHooks"/>，隔离/沙盒注册表严禁污染全局静态钩子；
+/// - 导出不可变 <see cref="ModRuntimeContext"/>、客户端增量同步 <see cref="ModManifestDto"/>、资产 SHA-256 索引与实例级视觉绑定查询接口。
 /// </summary>
 public sealed class ModRegistry : IModContentRegistry
 {
@@ -26,7 +55,7 @@ public sealed class ModRegistry : IModContentRegistry
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    private sealed class RegistrySnapshot
+    private sealed record RegistrySnapshot
     {
         public required GameDataRepository BaseRepository { get; init; }
         public required GameDataRepository ActiveRepository { get; init; }
@@ -34,7 +63,9 @@ public sealed class ModRegistry : IModContentRegistry
         public required IReadOnlyList<ModPackage> LoadedPackages { get; init; }
         public required ModLoadReport Report { get; init; }
         public required FrozenDictionary<string, CustomModeDefinition> CustomModesById { get; init; }
+        public required FrozenDictionary<string, MutatorMetadata> CustomMutatorsById { get; init; }
         public required FrozenDictionary<string, MechanicDefinition> MechanicsById { get; init; }
+        public required ModRuntimeContext RuntimeContext { get; init; }
         public required FrozenDictionary<string, CustomCardVisualBinding> VisualBindingsByCustomId { get; init; }
         public required FrozenDictionary<string, ModAssetEntry> AssetsBySha256 { get; init; }
         public required FrozenDictionary<string, ModAssetEntry> AssetsByModAndPath { get; init; }
@@ -44,6 +75,7 @@ public sealed class ModRegistry : IModContentRegistry
     }
 
     private readonly object _syncLock = new();
+    private readonly bool _publishGlobalRuntimeHooks;
     private readonly List<ICustomCardProvider> _cardProviders = new();
     private readonly List<ICustomActionHandler> _actionHandlers = new();
     private readonly List<ICustomTriggerHandler> _triggerHandlers = new();
@@ -56,12 +88,26 @@ public sealed class ModRegistry : IModContentRegistry
 
     public ModRegistry(
         GameDataRepository baseRepository,
-        IReadOnlySet<string>? validVisualWhitelist = null)
+        IReadOnlySet<string>? validVisualWhitelist = null,
+        bool publishGlobalRuntimeHooks = true)
     {
         ArgumentNullException.ThrowIfNull(baseRepository);
         _validVisualWhitelist = validVisualWhitelist;
+        _publishGlobalRuntimeHooks = publishGlobalRuntimeHooks;
         _snapshot = BuildEmptySnapshot(baseRepository, string.Empty);
     }
+
+    /// <summary>创建隔离沙盒/房间级注册表（<c>publishGlobalRuntimeHooks: false</c>，绝不读写全局静态 <see cref="ModRuntimeHooks"/>）。</summary>
+    public static ModRegistry CreateIsolated(
+        GameDataRepository baseRepository,
+        IReadOnlySet<string>? validVisualWhitelist = null)
+        => new(baseRepository, validVisualWhitelist, publishGlobalRuntimeHooks: false);
+
+    /// <summary>本注册表是否将机制与 C# 钩子发布到全局静态 <see cref="ModRuntimeHooks"/>（仅主服务器注册表为 true）。</summary>
+    public bool PublishesGlobalRuntimeHooks => _publishGlobalRuntimeHooks;
+
+    /// <summary>当前生效的不可变运行时钩子与声明式机制快照（推荐透传给 CombatSimulator，避免读取全局静态单例）。</summary>
+    public ModRuntimeContext RuntimeContext => _snapshot.RuntimeContext;
 
     /// <summary>未经 Mod 叠加的纯净基础只读数据仓库。</summary>
     public GameDataRepository BaseRepository => _snapshot.BaseRepository;
@@ -80,6 +126,9 @@ public sealed class ModRegistry : IModContentRegistry
 
     /// <summary>已注册的自定义游戏模式表。</summary>
     public IReadOnlyDictionary<string, CustomModeDefinition> CustomModesById => _snapshot.CustomModesById;
+
+    /// <summary>P0-22：已注册的自定义肉鸽突变词条表（来自全部已加载 Mod 的 modes/*mutator*.json）。</summary>
+    public IReadOnlyDictionary<string, MutatorMetadata> CustomMutatorsById => _snapshot.CustomMutatorsById;
 
     /// <summary>已注册的开放声明式沙盒自定义机制表（来自全部已加载 Mod 的 mechanics/*.json）。</summary>
     public IReadOnlyDictionary<string, MechanicDefinition> MechanicsById => _snapshot.MechanicsById;
@@ -134,13 +183,23 @@ public sealed class ModRegistry : IModContentRegistry
         lock (_syncLock) _pipelineInterceptors.Add(interceptor);
     }
 
-    /// <summary>将本注册表内登记的全部自定义动作/触发器/模式钩子/管线拦截器同步发布到全局 <see cref="ModRuntimeHooks"/>。</summary>
+    /// <summary>
+    /// 刷新本注册表不可变 <see cref="RuntimeContext"/>；
+    /// 仅当 <see cref="PublishesGlobalRuntimeHooks"/> 为 true 时同步发布到全局 <see cref="ModRuntimeHooks"/>。
+    /// </summary>
     public void ApplyRuntimeHooks()
     {
         lock (_syncLock)
         {
-            ModRuntimeHooks.SetHandlers(_actionHandlers, _triggerHandlers, _modeHooks, _pipelineInterceptors);
-            ModRuntimeHooks.SetMechanics(_snapshot.MechanicsById.Values);
+            var runtimeCtx = BuildRuntimeContextLocked(_snapshot.MechanicsById, _snapshot.CustomMutatorsById, _snapshot.CustomModesById);
+            _snapshot = _snapshot with { RuntimeContext = runtimeCtx };
+            if (_publishGlobalRuntimeHooks)
+            {
+                ModRuntimeHooks.SetHandlers(_actionHandlers, _triggerHandlers, BuildEffectiveModeHooksLocked(_snapshot.CustomModesById), _pipelineInterceptors);
+                ModRuntimeHooks.SetMechanics(_snapshot.MechanicsById.Values);
+                MutatorCatalog.ClearModMutators();
+                MutatorCatalog.RegisterModMutators(_snapshot.CustomMutatorsById.Values);
+            }
         }
     }
 
@@ -167,6 +226,119 @@ public sealed class ModRegistry : IModContentRegistry
         }
     }
 
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ModPackage, object> InitializedPackages = new();
+
+    /// <summary>
+    /// 线程安全地对尚未初始化的内存构造 <see cref="ModPackage"/> 执行一次性视觉绑定与哈希补全；
+    /// 对已初始化的共享包严禁再次调用破坏性的 <see cref="ModLoader.BuildVisualBindings"/>（其内部会就地 Clear() 字典）。
+    /// </summary>
+    private static void EnsurePackageVisualMetadataReady(ModPackage pkg)
+    {
+        if (pkg == null) return;
+        if (InitializedPackages.TryGetValue(pkg, out _))
+            return;
+
+        // ModLoader.LoadSinglePackage 已在单线程内完成 BuildVisualBindings 与 PackageHash 计算
+        if (!string.IsNullOrEmpty(pkg.PackageHash)
+            && (pkg.VisualBindingsByCustomId.Count > 0 || (pkg.Cards.Count == 0 && pkg.Events.Count == 0)))
+        {
+            InitializedPackages.TryAdd(pkg, pkg);
+            return;
+        }
+
+        lock (pkg)
+        {
+            if (InitializedPackages.TryGetValue(pkg, out _))
+                return;
+
+            if (pkg.VisualBindingsByCustomId.Count == 0
+                && (pkg.Cards.Count > 0 || pkg.Events.Count > 0 || pkg.Patches.Count > 0))
+            {
+                ModLoader.BuildVisualBindings(pkg);
+            }
+            if (string.IsNullOrEmpty(pkg.PackageHash))
+            {
+                pkg.PackageHash = ModLoader.ComputePackageHash(pkg);
+            }
+
+            InitializedPackages.TryAdd(pkg, pkg);
+        }
+    }
+
+    private static CustomCardVisualBinding CloneVisualBinding(CustomCardVisualBinding binding, CardTemplate? vanillaCard) => new()
+    {
+        InstanceId = binding.InstanceId,
+        CustomTemplateId = binding.CustomTemplateId,
+        ModId = binding.ModId,
+        BaseVisualTemplateId = vanillaCard?.Id ?? binding.BaseVisualTemplateId,
+        CardType = vanillaCard?.Type ?? binding.CardType,
+        Size = vanillaCard?.Size ?? binding.Size,
+        TitleZh = binding.TitleZh,
+        DescZh = binding.DescZh,
+        ActiveTooltipsZh = binding.ActiveTooltipsZh != null ? new List<string>(binding.ActiveTooltipsZh) : new List<string>(),
+        PassiveTooltipsZh = binding.PassiveTooltipsZh != null ? new List<string>(binding.PassiveTooltipsZh) : new List<string>(),
+        EnchantTooltipsZh = binding.EnchantTooltipsZh != null
+            ? binding.EnchantTooltipsZh.ToDictionary(
+                kv => kv.Key,
+                kv => new List<string>(kv.Value),
+                StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase),
+        CustomArtFile = binding.CustomArtFile,
+        CustomArtSha256 = binding.CustomArtSha256,
+        ArtRect = binding.ArtRect != null
+            ? new CustomCardArtRect { Width = binding.ArtRect.Width, Height = binding.ArtRect.Height, CropMode = binding.ArtRect.CropMode }
+            : null,
+        Tags = binding.Tags != null ? new List<string>(binding.Tags) : new List<string>(),
+        AccentColor = binding.AccentColor,
+        // 双审备忘 #2：同步深拷贝全部 11 个新增契约属性及子对象新字段
+        IsPatchOverride = binding.IsPatchOverride,
+        IsCustomBorrowShell = binding.IsCustomBorrowShell,
+        TitleEn = binding.TitleEn,
+        DescEn = binding.DescEn,
+        ActiveTooltipsEn = binding.ActiveTooltipsEn != null ? new List<string>(binding.ActiveTooltipsEn) : null,
+        PassiveTooltipsEn = binding.PassiveTooltipsEn != null ? new List<string>(binding.PassiveTooltipsEn) : null,
+        EnchantTooltipsEn = binding.EnchantTooltipsEn?.ToDictionary(
+            kv => kv.Key,
+            kv => new List<string>(kv.Value),
+            StringComparer.OrdinalIgnoreCase),
+        VisualTarget = string.IsNullOrWhiteSpace(binding.VisualTarget)
+            ? CustomCardVisualBinding.ResolveDefaultVisualTarget(vanillaCard?.Type ?? binding.CardType)
+            : binding.VisualTarget,
+        CustomBgArtFile = binding.CustomBgArtFile,
+        CustomBgArtSha256 = binding.CustomBgArtSha256,
+        MonsterPreview = binding.MonsterPreview?.Clone(),
+        TierAttributes = binding.TierAttributes?.ToDictionary(
+            kv => kv.Key,
+            kv => new Dictionary<string, double>(kv.Value, StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase),
+        EnchantmentPreviewOps = binding.EnchantmentPreviewOps?.ToDictionary(
+            kv => kv.Key,
+            kv => kv.Value.Select(op => new ResolvedPreviewAttrOp
+            {
+                Attribute = op.Attribute,
+                Operation = op.Operation,
+                Value = op.Value,
+                SourceAttribute = op.SourceAttribute,
+                SourceMultiplier = op.SourceMultiplier,
+                SourceAddOffset = op.SourceAddOffset
+            }).ToList(),
+            StringComparer.OrdinalIgnoreCase),
+        CounterDisplays = binding.CounterDisplays?.Select(cd => new ResolvedCounterDisplay
+        {
+            LabelZh = cd.LabelZh,
+            SyncAttribute = cd.SyncAttribute,
+            MaxValue = cd.MaxValue,
+            MaxAttr = cd.MaxAttr,
+            ColorHex = cd.ColorHex,
+            HideWhenZero = cd.HideWhenZero,
+            Style = cd.Style,
+            ValueType = cd.ValueType,
+            Format = cd.Format,
+            Unit = cd.Unit,
+            Position = cd.Position
+        }).ToList()
+    };
+
     /// <summary>
     /// 直接校验并原子加载一组内存构造的 <see cref="ModPackage"/>（适用于单元测试、热补丁或远程包注入）。
     /// </summary>
@@ -180,9 +352,7 @@ public sealed class ModRegistry : IModContentRegistry
         ArgumentNullException.ThrowIfNull(candidatePackages);
         for (int i = 0; i < candidatePackages.Count; i++)
         {
-            ModLoader.BuildVisualBindings(candidatePackages[i]);
-            if (string.IsNullOrEmpty(candidatePackages[i].PackageHash))
-                candidatePackages[i].PackageHash = ModLoader.ComputePackageHash(candidatePackages[i]);
+            EnsurePackageVisualMetadataReady(candidatePackages[i]);
         }
 
         lock (_syncLock)
@@ -212,14 +382,17 @@ public sealed class ModRegistry : IModContentRegistry
     }
 
     /// <summary>
-    /// 原子回滚到纯净基础数据仓库（移除所有 Mod 卡牌/野怪/模式/词典覆盖与全局自定义规则钩子）。
+    /// 原子回滚到纯净基础数据仓库（移除本注册表的 Mod 卡牌/野怪/模式/词典覆盖；仅主注册表同步清空全局自定义规则钩子）。
     /// </summary>
     public void RollbackToBase()
     {
         lock (_syncLock)
         {
             _snapshot = BuildEmptySnapshot(_snapshot.BaseRepository, _lastModsRoot ?? string.Empty);
-            ModRuntimeHooks.ClearAll();
+            if (_publishGlobalRuntimeHooks)
+            {
+                ModRuntimeHooks.ClearAll();
+            }
         }
     }
 
@@ -331,13 +504,15 @@ public sealed class ModRegistry : IModContentRegistry
             return report;
         }
 
-        // 汇总所有通过校验的 Mod 卡牌、原位补丁、野怪、模式、本地化与视觉绑定
+        // 汇总所有通过校验的 Mod 卡牌、原位补丁、野怪、模式、突变词条、本地化与视觉绑定
         var mergedCardsById = new Dictionary<string, CardTemplate>(StringComparer.OrdinalIgnoreCase);
         var mergedMonsters = new List<MonsterTemplate>();
         var modLocDocs = new List<LocalizationOverlayDocument>();
         var modesMap = new Dictionary<string, CustomModeDefinition>(StringComparer.OrdinalIgnoreCase);
+        var mutatorsMap = new Dictionary<string, MutatorMetadata>(StringComparer.OrdinalIgnoreCase);
         var mechanicsMap = new Dictionary<string, MechanicDefinition>(StringComparer.OrdinalIgnoreCase);
         var visualBindingsMap = new Dictionary<string, CustomCardVisualBinding>(StringComparer.OrdinalIgnoreCase);
+        var cardLevelDisplaysById = new Dictionary<string, List<MechanicCounterDisplay>>(StringComparer.OrdinalIgnoreCase);
         var assetsBySha = new Dictionary<string, ModAssetEntry>(StringComparer.OrdinalIgnoreCase);
         var assetsByModPath = new Dictionary<string, ModAssetEntry>(StringComparer.OrdinalIgnoreCase);
 
@@ -345,12 +520,15 @@ public sealed class ModRegistry : IModContentRegistry
         int totalEvents = 0;
         int totalPatches = 0;
 
+        // ── 阶段 1：按依赖拓扑序依次应用所有 Mod 的卡牌/字段级增量 Patch/事件/野怪/模式/词条/机制 ──
         foreach (var pkg in validOrdered)
         {
             string modId = pkg.Manifest.Id;
             report.LoadedModIdsInOrder.Add(modId);
 
-            if (pkg.Manifest.ForcesGhostPoolIsolation || pkg.Cards.Count > 0 || pkg.Patches.Count > 0 || pkg.Events.Count > 0 || pkg.Monsters.Count > 0)
+            if (pkg.Manifest.ForcesGhostPoolIsolation
+                || pkg.Cards.Count > 0 || pkg.Patches.Count > 0 || pkg.Events.Count > 0
+                || pkg.Monsters.Count > 0 || pkg.CustomMutators.Count > 0 || pkg.Mechanics.Count > 0)
                 forcesIsolation = true;
 
             var synthesizedLoc = BuildSynthesizedModLocalization(pkg);
@@ -366,6 +544,8 @@ public sealed class ModRegistry : IModContentRegistry
                     var tpl = cardDef.ToCardTemplate(baseVisual, modId);
                     mergedCardsById[tpl.Id] = tpl;
                 }
+                if (!string.IsNullOrWhiteSpace(cardDef.CustomId) && cardDef.CounterDisplays is { Count: > 0 })
+                    cardLevelDisplaysById[cardDef.CustomId.Trim()] = new List<MechanicCounterDisplay>(cardDef.CounterDisplays);
             }
 
             // 原位魔改原版卡补丁增量叠合（支持多 Mod 按拓扑顺序依次 Patch 同一原版卡）
@@ -381,6 +561,8 @@ public sealed class ModRegistry : IModContentRegistry
                     mergedCardsById[tid] = patch.ApplyToTemplate(sourceCard, modId);
                     totalPatches++;
                 }
+                if (patch.CounterDisplaysOverride is { Count: > 0 })
+                    cardLevelDisplaysById[tid] = new List<MechanicCounterDisplay>(patch.CounterDisplaysOverride);
             }
 
             // 事件、子步骤与内联野怪转换
@@ -413,12 +595,21 @@ public sealed class ModRegistry : IModContentRegistry
             foreach (var m in pkg.Monsters)
                 mergedMonsters.Add(m);
 
-            // 自定义模式
+            // 自定义模式（D3-P2-05：与 Gate #10 对齐，任何自定义模式一律强制幽灵池隔离，不因 AffectsGhostPool 放开）
             foreach (var mode in pkg.Modes)
             {
                 modesMap[mode.ModeId] = mode;
-                if (!mode.AffectsGhostPool)
+                forcesIsolation = true;
+            }
+
+            // P0-22：自定义肉鸽突变词条
+            foreach (var mut in pkg.CustomMutators)
+            {
+                if (mut != null && !string.IsNullOrWhiteSpace(mut.Id))
+                {
+                    mutatorsMap[mut.Id.Trim()] = mut;
                     forcesIsolation = true;
+                }
             }
 
             // V14 开放声明式沙盒机制定义
@@ -431,67 +622,85 @@ public sealed class ModRegistry : IModContentRegistry
                 }
             }
 
-            // 视觉绑定与资产索引（原位 Patch 若有视觉覆盖也一并补齐 CardType/Size）
-            foreach (var (cid, binding) in pkg.VisualBindingsByCustomId)
-            {
-                var resolved = binding;
-                if (baseRepo.GetCard(cid) is { } vanillaCard)
-                {
-                    resolved = new CustomCardVisualBinding
-                    {
-                        CustomTemplateId = binding.CustomTemplateId,
-                        ModId = binding.ModId,
-                        BaseVisualTemplateId = vanillaCard.Id,
-                        CardType = vanillaCard.Type,
-                        Size = vanillaCard.Size,
-                        TitleZh = binding.TitleZh,
-                        DescZh = binding.DescZh,
-                        ActiveTooltipsZh = binding.ActiveTooltipsZh,
-                        PassiveTooltipsZh = binding.PassiveTooltipsZh,
-                        EnchantTooltipsZh = binding.EnchantTooltipsZh,
-                        CustomArtFile = binding.CustomArtFile,
-                        CustomArtSha256 = binding.CustomArtSha256,
-                        ArtRect = binding.ArtRect,
-                        Tags = binding.Tags,
-                        AccentColor = binding.AccentColor
-                    };
-                }
-                if (mergedCardsById.TryGetValue(cid, out var mergedTpl))
-                {
-                    // 从最终合并后的卡牌模板补全五阶属性与附魔预览运算表，确保自定义卡与原位平衡补丁卡在详情预览 100% 准确
-                    var mergedTiers = BuildTierAttributesFromTemplate(mergedTpl);
-                    if (mergedTiers is { Count: > 0 })
-                        resolved.TierAttributes = mergedTiers;
-                    var mergedEnchOps = ExtractEnchantmentPreviewOps(mergedTpl.Enchantments);
-                    if (mergedEnchOps is { Count: > 0 })
-                        resolved.EnchantmentPreviewOps = mergedEnchOps;
-                }
-                var cardDef = pkg.Cards.FirstOrDefault(c => string.Equals(c.CustomId, cid, StringComparison.OrdinalIgnoreCase));
-                IReadOnlyList<CardMechanicAttachment>? mechs = mergedCardsById.TryGetValue(cid, out var mergedForMech)
-                    ? mergedForMech.CustomMechanics
-                    : null;
-                var displays = ResolveCounterDisplaysForCard(cardDef?.CounterDisplays, mechs, mechanicsMap);
-                if (displays.Count > 0)
-                    resolved.CounterDisplays = displays;
-                visualBindingsMap[cid] = resolved;
-            }
-
             foreach (var (logicalPath, asset) in pkg.AssetsByLogicalPath)
             {
                 if (!string.IsNullOrEmpty(asset.Sha256))
                     assetsBySha[asset.Sha256] = asset;
                 assetsByModPath[$"{modId}:{logicalPath}"] = asset;
             }
+
+            // P0-25：字段级增量合并视觉绑定（多 Mod 叠加 Patch 同一原版卡时保留前置 Mod 改写字段，绝不相互覆盖抹零）
+            foreach (var (cid, binding) in pkg.VisualBindingsByCustomId)
+            {
+                var vanillaCard = baseRepo.GetCard(cid);
+                if (binding.IsPatchOverride && visualBindingsMap.TryGetValue(cid, out var existingPatchBinding))
+                {
+                    MergePatchVisualBindingInPlace(existingPatchBinding, binding);
+                }
+                else
+                {
+                    visualBindingsMap[cid] = CloneVisualBinding(binding, vanillaCard);
+                }
+            }
         }
 
-        // 叠加通过 ICustomCardProvider 注册的扩展内容
+        // ── 阶段 2（P0-25）：在全部 Patch 与机制合并完毕后的最终态 CardTemplate 上统一重算五阶数值/附魔预览/计数器 ──
+        foreach (var (cid, resolved) in visualBindingsMap)
+        {
+            if (mergedCardsById.TryGetValue(cid, out var mergedTpl))
+            {
+                resolved.CardType = mergedTpl.Type;
+                resolved.Size = mergedTpl.Size;
+                resolved.VisualTarget = CustomCardVisualBinding.ResolveDefaultVisualTarget(mergedTpl.Type);
+                var mergedTiers = BuildTierAttributesFromTemplate(mergedTpl);
+                if (mergedTiers is { Count: > 0 })
+                    resolved.TierAttributes = mergedTiers;
+                var mergedEnchOps = ExtractEnchantmentPreviewOps(mergedTpl.Enchantments);
+                if (mergedEnchOps is { Count: > 0 })
+                    resolved.EnchantmentPreviewOps = mergedEnchOps;
+                if (mergedTpl.Tags is { Count: > 0 })
+                    resolved.Tags = new List<string>(mergedTpl.Tags);
+
+                cardLevelDisplaysById.TryGetValue(cid, out var explicitDisplays);
+                var displays = ResolveCounterDisplaysForCard(explicitDisplays, mergedTpl.CustomMechanics, mechanicsMap);
+                if (displays.Count > 0)
+                    resolved.CounterDisplays = displays;
+            }
+        }
+
+        // 叠加通过 ICustomCardProvider 注册的扩展内容（D3-P2-05：为自定义卡同步补齐视觉绑定，避免客户端断壳）
         if (_cardProviders.Count > 0)
         {
             forcesIsolation = true;
             foreach (var provider in _cardProviders)
             {
                 foreach (var c in provider.GetCustomCards(baseRepo))
-                    if (c != null && !string.IsNullOrWhiteSpace(c.Id)) mergedCardsById[c.Id] = c;
+                {
+                    if (c == null || string.IsNullOrWhiteSpace(c.Id)) continue;
+                    mergedCardsById[c.Id] = c;
+                    if (c.IsCustomModCard && !visualBindingsMap.ContainsKey(c.Id))
+                    {
+                        string baseVisualId = Guid.TryParse(c.Id, out _)
+                            ? c.Id
+                            : (baseRepo.CardsById.Values
+                                .FirstOrDefault(b => !b.IsCustomModCard &&
+                                                     string.Equals(b.Type, c.Type, StringComparison.OrdinalIgnoreCase) &&
+                                                     Guid.TryParse(b.Id, out _) &&
+                                                     (whitelist == null || whitelist.Contains(b.Id)))
+                                ?.Id ?? "5e17cfc3-25c0-4a74-8a33-07ee972e6f6e");
+                        visualBindingsMap[c.Id] = new CustomCardVisualBinding
+                        {
+                            CustomTemplateId = c.Id,
+                            ModId = string.IsNullOrWhiteSpace(c.CustomModOrigin) ? "provider" : c.CustomModOrigin!,
+                            CardType = string.IsNullOrWhiteSpace(c.Type) ? "Item" : c.Type,
+                            Size = string.IsNullOrWhiteSpace(c.Size) ? "Medium" : c.Size,
+                            BaseVisualTemplateId = baseVisualId,
+                            TitleZh = c.Localization?.Title?.Text ?? c.InternalName ?? c.Id,
+                            DescZh = c.InternalDescription ?? string.Empty,
+                            IsPatchOverride = false,
+                        };
+                    }
+                }
                 foreach (var m in provider.GetCustomMonsters(baseRepo))
                     if (m != null) mergedMonsters.Add(m);
 
@@ -531,6 +740,11 @@ public sealed class ModRegistry : IModContentRegistry
 
         var manifestDto = BuildManifestDtoInternal(validOrdered, assetsBySha, report, activeLoc.MergedOverlaySha256, visualHash);
 
+        var frozenMechanics = mechanicsMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+        var frozenMutators = mutatorsMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+        var frozenModes = modesMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+        var runtimeCtx = BuildRuntimeContextLocked(frozenMechanics, frozenMutators, frozenModes);
+
         _snapshot = new RegistrySnapshot
         {
             BaseRepository = baseRepo,
@@ -538,8 +752,10 @@ public sealed class ModRegistry : IModContentRegistry
             ActiveLocalization = activeLoc,
             LoadedPackages = validOrdered.AsReadOnly(),
             Report = report,
-            CustomModesById = modesMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
-            MechanicsById = mechanicsMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
+            CustomModesById = frozenModes,
+            CustomMutatorsById = frozenMutators,
+            MechanicsById = frozenMechanics,
+            RuntimeContext = runtimeCtx,
             VisualBindingsByCustomId = visualBindingsMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
             AssetsBySha256 = assetsBySha.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
             AssetsByModAndPath = assetsByModPath.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
@@ -548,9 +764,116 @@ public sealed class ModRegistry : IModContentRegistry
             ManifestDto = manifestDto
         };
 
-        ModRuntimeHooks.SetHandlers(_actionHandlers, _triggerHandlers, _modeHooks, _pipelineInterceptors);
-        ModRuntimeHooks.SetMechanics(mechanicsMap.Values);
+        if (_publishGlobalRuntimeHooks)
+        {
+            ModRuntimeHooks.SetHandlers(_actionHandlers, _triggerHandlers, BuildEffectiveModeHooksLocked(frozenModes), _pipelineInterceptors);
+            ModRuntimeHooks.SetMechanics(mechanicsMap.Values);
+            MutatorCatalog.ClearModMutators();
+            MutatorCatalog.RegisterModMutators(mutatorsMap.Values);
+        }
         return report;
+    }
+
+    private static void MergePatchVisualBindingInPlace(CustomCardVisualBinding target, CustomCardVisualBinding delta)
+    {
+        target.IsPatchOverride = true;
+        target.IsCustomBorrowShell = false;
+        if (!string.IsNullOrWhiteSpace(delta.ModId)) target.ModId = delta.ModId;
+        if (!string.IsNullOrWhiteSpace(delta.TitleZh)) target.TitleZh = delta.TitleZh;
+        if (!string.IsNullOrWhiteSpace(delta.TitleEn)) target.TitleEn = delta.TitleEn;
+        if (!string.IsNullOrWhiteSpace(delta.DescZh)) target.DescZh = delta.DescZh;
+        if (!string.IsNullOrWhiteSpace(delta.DescEn)) target.DescEn = delta.DescEn;
+        if (delta.ActiveTooltipsZh is { Count: > 0 }) target.ActiveTooltipsZh = new List<string>(delta.ActiveTooltipsZh);
+        if (delta.PassiveTooltipsZh is { Count: > 0 }) target.PassiveTooltipsZh = new List<string>(delta.PassiveTooltipsZh);
+        if (delta.EnchantTooltipsZh is { Count: > 0 })
+        {
+            foreach (var (k, v) in delta.EnchantTooltipsZh)
+                target.EnchantTooltipsZh[k] = new List<string>(v);
+        }
+        if (delta.ActiveTooltipsEn is { Count: > 0 }) target.ActiveTooltipsEn = new List<string>(delta.ActiveTooltipsEn);
+        if (delta.PassiveTooltipsEn is { Count: > 0 }) target.PassiveTooltipsEn = new List<string>(delta.PassiveTooltipsEn);
+        if (delta.EnchantTooltipsEn is { Count: > 0 })
+        {
+            target.EnchantTooltipsEn ??= new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (k, v) in delta.EnchantTooltipsEn)
+                target.EnchantTooltipsEn[k] = new List<string>(v);
+        }
+        if (!string.IsNullOrWhiteSpace(delta.CustomArtFile))
+        {
+            target.CustomArtFile = delta.CustomArtFile;
+            target.CustomArtSha256 = delta.CustomArtSha256;
+        }
+        if (!string.IsNullOrWhiteSpace(delta.CustomBgArtFile))
+        {
+            target.CustomBgArtFile = delta.CustomBgArtFile;
+            target.CustomBgArtSha256 = delta.CustomBgArtSha256;
+        }
+        if (delta.ArtRect != null)
+            target.ArtRect = new CustomCardArtRect { Width = delta.ArtRect.Width, Height = delta.ArtRect.Height, CropMode = delta.ArtRect.CropMode };
+        if (!string.IsNullOrWhiteSpace(delta.AccentColor)) target.AccentColor = delta.AccentColor;
+        if (delta.Tags is { Count: > 0 })
+        {
+            foreach (var t in delta.Tags)
+                if (!target.Tags.Contains(t, StringComparer.OrdinalIgnoreCase)) target.Tags.Add(t);
+        }
+        if (delta.CounterDisplays is { Count: > 0 })
+            target.CounterDisplays = new List<ResolvedCounterDisplay>(delta.CounterDisplays);
+    }
+
+    private IReadOnlyList<IGameModeHook> BuildEffectiveModeHooksLocked(IReadOnlyDictionary<string, CustomModeDefinition> modes)
+    {
+        var map = new Dictionary<string, IGameModeHook>(StringComparer.OrdinalIgnoreCase);
+        // 先装配 JSON 声明式 CustomModeDefinition 默认钩子，再由显式注册的 C# IGameModeHook 覆盖优先
+        foreach (var mode in modes.Values)
+        {
+            if (mode != null && !string.IsNullOrWhiteSpace(mode.ModeId))
+                map[mode.ModeId.Trim()] = new DeclarativeGameModeHook(mode);
+        }
+        foreach (var m in _modeHooks)
+        {
+            if (m != null && !string.IsNullOrWhiteSpace(m.ModeId))
+                map[m.ModeId.Trim()] = m;
+        }
+        return map.Values.ToArray();
+    }
+
+    private ModRuntimeContext BuildRuntimeContextLocked(
+        FrozenDictionary<string, MechanicDefinition> mechanicsById,
+        FrozenDictionary<string, MutatorMetadata> mutatorsById,
+        FrozenDictionary<string, CustomModeDefinition> modesById)
+    {
+        var actDict = new Dictionary<string, ICustomActionHandler>(StringComparer.Ordinal);
+        foreach (var h in _actionHandlers)
+        {
+            if (h != null && !string.IsNullOrWhiteSpace(h.ActionType) && h.ActionType.StartsWith("TActionMod_", StringComparison.Ordinal))
+                actDict[h.ActionType] = h;
+        }
+
+        var trgDict = new Dictionary<string, ICustomTriggerHandler>(StringComparer.Ordinal);
+        foreach (var h in _triggerHandlers)
+        {
+            if (h != null && !string.IsNullOrWhiteSpace(h.TriggerType) && h.TriggerType.StartsWith("TTriggerMod_", StringComparison.Ordinal))
+                trgDict[h.TriggerType] = h;
+        }
+
+        var modeDict = new Dictionary<string, IGameModeHook>(StringComparer.OrdinalIgnoreCase);
+        foreach (var m in BuildEffectiveModeHooksLocked(modesById))
+        {
+            modeDict[m.ModeId.Trim()] = m;
+        }
+
+        var interceptors = _pipelineInterceptors
+            .Where(p => p != null && !string.IsNullOrWhiteSpace(p.InterceptorId))
+            .ToArray();
+
+        return new ModRuntimeContext(
+            MechanicsById: mechanicsById,
+            ActionHandlers: actDict.Count > 0 ? actDict.ToFrozenDictionary(StringComparer.Ordinal) : FrozenDictionary<string, ICustomActionHandler>.Empty,
+            TriggerHandlers: trgDict.Count > 0 ? trgDict.ToFrozenDictionary(StringComparer.Ordinal) : FrozenDictionary<string, ICustomTriggerHandler>.Empty,
+            ModeHooks: modeDict.Count > 0 ? modeDict.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase) : FrozenDictionary<string, IGameModeHook>.Empty,
+            PipelineInterceptors: interceptors,
+            CustomMutatorsById: mutatorsById,
+            CustomModesById: modesById);
     }
 
     private static RegistrySnapshot BuildEmptySnapshot(GameDataRepository baseRepo, string sourceLabel)
@@ -581,7 +904,9 @@ public sealed class ModRegistry : IModContentRegistry
             LoadedPackages = Array.Empty<ModPackage>(),
             Report = report,
             CustomModesById = FrozenDictionary<string, CustomModeDefinition>.Empty,
+            CustomMutatorsById = FrozenDictionary<string, MutatorMetadata>.Empty,
             MechanicsById = FrozenDictionary<string, MechanicDefinition>.Empty,
+            RuntimeContext = ModRuntimeContext.Empty,
             VisualBindingsByCustomId = FrozenDictionary<string, CustomCardVisualBinding>.Empty,
             AssetsBySha256 = FrozenDictionary<string, ModAssetEntry>.Empty,
             AssetsByModAndPath = FrozenDictionary<string, ModAssetEntry>.Empty,
@@ -792,6 +1117,7 @@ public sealed class ModRegistry : IModContentRegistry
                 PackageHash = pkg.PackageHash,
                 CustomCardCount = pkg.VisualBindingsByCustomId.Count,
                 CustomModeCount = pkg.Modes.Count,
+                CustomMechanicCount = pkg.Mechanics.Count,
                 AssetCount = pkg.AssetsByLogicalPath.Count
             });
         }
@@ -817,26 +1143,35 @@ public sealed class ModRegistry : IModContentRegistry
         return dto;
     }
 
-    /// <summary>从合并后的卡牌模板构造完整五阶基础属性表（Bronze..Legendary），兼容全新自定义卡与原位平衡补丁卡。</summary>
+    /// <summary>D3-P1-01：从合并后的卡牌模板构造完整五阶基础属性表（先合入 core.Attributes 底表再从 StartingTier 起补齐至 Legendary）。</summary>
     internal static Dictionary<string, Dictionary<string, double>>? BuildTierAttributesFromTemplate(CardTemplate tpl)
     {
-        if (tpl?.Tiers == null || tpl.Tiers.Count == 0) return null;
+        if (tpl == null) return null;
+        bool hasTiers = tpl.Tiers is { Count: > 0 };
+        bool hasCoreAttrs = tpl.Attributes is { Count: > 0 };
+        if (!hasTiers && !hasCoreAttrs) return null;
+
         var res = new Dictionary<string, Dictionary<string, double>>(StringComparer.OrdinalIgnoreCase);
         var running = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        if (hasCoreAttrs)
+        {
+            foreach (var (k, v) in tpl.Attributes!)
+                running[k] = v;
+        }
         bool started = false;
+        string startTierNorm = string.IsNullOrWhiteSpace(tpl.StartingTier) ? "Bronze" : tpl.StartingTier.Trim();
         foreach (var tierName in new[] { "Bronze", "Silver", "Gold", "Diamond", "Legendary" })
         {
-            bool hasExplicit = tpl.Tiers.TryGetValue(tierName, out var td) && td != null;
-            if (hasExplicit)
-            {
+            TierData? td = null;
+            bool hasExplicit = hasTiers && tpl.Tiers!.TryGetValue(tierName, out td) && td != null;
+            if (hasExplicit || string.Equals(tierName, startTierNorm, StringComparison.OrdinalIgnoreCase))
                 started = true;
-                if (td!.Attributes != null)
-                {
-                    foreach (var (k, v) in td.Attributes)
-                        running[k] = v;
-                }
+            if (hasExplicit && td!.Attributes != null)
+            {
+                foreach (var (k, v) in td.Attributes)
+                    running[k] = v;
             }
-            if (started && running.Count > 0 && (hasExplicit || !tierName.Equals("Legendary", StringComparison.OrdinalIgnoreCase)))
+            if (started && running.Count > 0)
                 res[tierName] = new Dictionary<string, double>(running, StringComparer.OrdinalIgnoreCase);
         }
         return res.Count > 0 ? res : null;
@@ -888,6 +1223,8 @@ public sealed class ModRegistry : IModContentRegistry
                     string opName = string.IsNullOrWhiteSpace(act.Operation) ? "Add" : act.Operation!;
                     double? fixedNum = act.GetFixedNumericValue();
                     string? srcAttr = null;
+                    double? srcMult = null;
+                    double? srcAddOffset = null;
                     if (!fixedNum.HasValue)
                     {
                         var vn = act.GetValueNode(Data.GameDatabaseLoader.JsonOptions);
@@ -895,6 +1232,23 @@ public sealed class ModRegistry : IModContentRegistry
                         if (!fixedNum.HasValue && vn != null && !string.IsNullOrWhiteSpace(vn.AttributeType))
                         {
                             srcAttr = vn.AttributeType;
+                            // D3-P1-02：提取 ValueModifierNode 中的比例乘数与加偏移（如伤害转 50% 护盾 + 2）
+                            if (vn.Modifier != null)
+                            {
+                                double? modNum = vn.Modifier.Value?.GetFixedNumericValue();
+                                if (modNum.HasValue && double.IsFinite(modNum.Value))
+                                {
+                                    string mode = (vn.Modifier.ModifyMode ?? "Add").Trim();
+                                    if (mode.Equals("Multiply", StringComparison.OrdinalIgnoreCase))
+                                        srcMult = modNum.Value;
+                                    else if (mode.Equals("Divide", StringComparison.OrdinalIgnoreCase) && Math.Abs(modNum.Value) > 1e-9)
+                                        srcMult = 1.0 / modNum.Value;
+                                    else if (mode.Equals("Add", StringComparison.OrdinalIgnoreCase))
+                                        srcAddOffset = modNum.Value;
+                                    else if (mode.Equals("Subtract", StringComparison.OrdinalIgnoreCase))
+                                        srcAddOffset = -modNum.Value;
+                                }
+                            }
                         }
                     }
 
@@ -905,7 +1259,9 @@ public sealed class ModRegistry : IModContentRegistry
                             Attribute = act.AttributeType!,
                             Operation = opName,
                             Value = fixedNum ?? 0,
-                            SourceAttribute = srcAttr
+                            SourceAttribute = srcAttr,
+                            SourceMultiplier = srcMult,
+                            SourceAddOffset = srcAddOffset
                         });
                     }
                 }
@@ -936,6 +1292,7 @@ public sealed class ModRegistry : IModContentRegistry
         {
             foreach (var cd in cardLevelDisplays)
             {
+                if (list.Count >= 4) break;
                 if (cd == null || string.IsNullOrWhiteSpace(cd.SyncAttribute)) continue;
                 string slot = cd.SyncAttribute.Trim();
                 if (!usedSlots.Add(slot)) continue;
@@ -945,6 +1302,7 @@ public sealed class ModRegistry : IModContentRegistry
                     LabelZh = cd.LabelZh?.Trim() ?? string.Empty,
                     SyncAttribute = slot,
                     MaxValue = cd.MaxConst,
+                    MaxAttr = string.IsNullOrWhiteSpace(cd.MaxAttr) ? null : cd.MaxAttr!.Trim(),
                     ColorHex = string.IsNullOrWhiteSpace(cd.ColorHex) ? "#F97316" : cd.ColorHex!.Trim(),
                     HideWhenZero = cd.HideWhenZero,
                     Style = string.IsNullOrWhiteSpace(cd.Style) ? null : cd.Style!.Trim(),
@@ -956,37 +1314,48 @@ public sealed class ModRegistry : IModContentRegistry
             }
         }
 
-        if (attachments is null || attachments.Count == 0)
+        if (attachments is null || attachments.Count == 0 || list.Count >= 4)
             return list;
 
         foreach (var att in attachments)
         {
+            if (list.Count >= 4) break;
             if (att == null || !att.Enabled || string.IsNullOrWhiteSpace(att.MechanicId)) continue;
             if (!mechanicsMap.TryGetValue(att.MechanicId.Trim(), out var mech) || mech == null) continue;
 
-            if (mech.CounterDisplay != null && !string.IsNullOrWhiteSpace(mech.CounterDisplay.SyncAttribute))
+            // D3-P1-06：支持单机制多槽位 CounterDisplays（兼容旧单槽 CounterDisplay，最多保留 4 槽）
+            var mechDisplays = new List<MechanicCounterDisplay>();
+            if (mech.CounterDisplay != null) mechDisplays.Add(mech.CounterDisplay);
+            if (mech.CounterDisplays is { Count: > 0 }) mechDisplays.AddRange(mech.CounterDisplays);
+
+            if (mechDisplays.Count > 0)
             {
-                var cd = mech.CounterDisplay;
-                string slot = cd.SyncAttribute.Trim();
-                if (!usedSlots.Add(slot)) continue;
-
-                int? maxVal = cd.MaxConst;
-                if (!string.IsNullOrWhiteSpace(cd.MaxParam))
-                    maxVal = TryResolveMechanicIntParam(mech, att, cd.MaxParam!) ?? maxVal;
-
-                list.Add(new ResolvedCounterDisplay
+                foreach (var cd in mechDisplays)
                 {
-                    LabelZh = !string.IsNullOrWhiteSpace(cd.LabelZh) ? cd.LabelZh.Trim() : (mech.NameZh ?? "层数"),
-                    SyncAttribute = slot,
-                    MaxValue = maxVal,
-                    ColorHex = string.IsNullOrWhiteSpace(cd.ColorHex) ? "#F97316" : cd.ColorHex!.Trim(),
-                    HideWhenZero = cd.HideWhenZero,
-                    Style = string.IsNullOrWhiteSpace(cd.Style) ? null : cd.Style!.Trim(),
-                    ValueType = string.IsNullOrWhiteSpace(cd.ValueType) ? null : cd.ValueType!.Trim(),
-                    Format = string.IsNullOrWhiteSpace(cd.Format) ? null : cd.Format!.Trim(),
-                    Unit = string.IsNullOrWhiteSpace(cd.Unit) ? null : cd.Unit!.Trim(),
-                    Position = string.IsNullOrWhiteSpace(cd.Position) ? null : cd.Position!.Trim()
-                });
+                    if (list.Count >= 4) break;
+                    if (cd == null || string.IsNullOrWhiteSpace(cd.SyncAttribute)) continue;
+                    string slot = cd.SyncAttribute.Trim();
+                    if (!usedSlots.Add(slot)) continue;
+
+                    int? maxVal = cd.MaxConst;
+                    if (!string.IsNullOrWhiteSpace(cd.MaxParam))
+                        maxVal = TryResolveMechanicIntParam(mech, att, cd.MaxParam!) ?? maxVal;
+
+                    list.Add(new ResolvedCounterDisplay
+                    {
+                        LabelZh = !string.IsNullOrWhiteSpace(cd.LabelZh) ? cd.LabelZh.Trim() : (mech.NameZh ?? "层数"),
+                        SyncAttribute = slot,
+                        MaxValue = maxVal,
+                        MaxAttr = string.IsNullOrWhiteSpace(cd.MaxAttr) ? null : cd.MaxAttr!.Trim(),
+                        ColorHex = string.IsNullOrWhiteSpace(cd.ColorHex) ? "#F97316" : cd.ColorHex!.Trim(),
+                        HideWhenZero = cd.HideWhenZero,
+                        Style = string.IsNullOrWhiteSpace(cd.Style) ? null : cd.Style!.Trim(),
+                        ValueType = string.IsNullOrWhiteSpace(cd.ValueType) ? null : cd.ValueType!.Trim(),
+                        Format = string.IsNullOrWhiteSpace(cd.Format) ? null : cd.Format!.Trim(),
+                        Unit = string.IsNullOrWhiteSpace(cd.Unit) ? null : cd.Unit!.Trim(),
+                        Position = string.IsNullOrWhiteSpace(cd.Position) ? null : cd.Position!.Trim()
+                    });
+                }
                 continue;
             }
 

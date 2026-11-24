@@ -86,10 +86,14 @@ public static class AuraEngine
         Action<AuraFlyingTransition>? onFlyingTransition = null,
         Action<IReadOnlyList<AuraEffectTargetsSnapshot>>? onAuraSnapshot = null,
         IReadOnlyList<CardInstance>? externalAuraCards = null,
-        string? currentEncounterId = null)
+        string? currentEncounterId = null,
+        int timeMs = 0,
+        bool? sandstormActive = null,
+        Random? rng = null,
+        IReadOnlyCollection<string>? visitedEncounters = null)
     {
         List<AuraEffectTargetsSnapshot>? finalSnapshots = onAuraSnapshot != null ? new List<AuraEffectTargetsSnapshot>() : null;
-        var transitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards, finalSnapshots, externalAuraCards, currentEncounterId);
+        var transitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards, finalSnapshots, externalAuraCards, currentEncounterId, timeMs, sandstormActive, rng, visitedEncounters);
 
         if (scope == RuleScope.OutOfCombat)
         {
@@ -98,7 +102,7 @@ public static class AuraEngine
             if (anyAmmoChanged)
             {
                 finalSnapshots?.Clear();
-                var secondTransitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards, finalSnapshots, externalAuraCards, currentEncounterId);
+                var secondTransitions = RecalculateAurasInternal(p1, p2, scope, day, hour, repo, selectionCards, finalSnapshots, externalAuraCards, currentEncounterId, timeMs, sandstormActive, rng, visitedEncounters);
                 if (secondTransitions.Count > 0)
                 {
                     if (transitions.Count == 0)
@@ -161,13 +165,17 @@ public static class AuraEngine
             for (int i = 0; i < selectionCards.Count; i++)
             {
                 var c = selectionCards[i];
-                if (c.AuraAdd.Count > 0 || c.AuraMult.Count > 0 || c.AuraTags.Count > 0
-                    || c.EnchantmentAuraAdd.Count > 0 || c.EnchantmentAuraMult.Count > 0)
+                if (CardHasAppliedAura(c))
                     return true;
             }
         }
         return false;
     }
+
+    private static bool CardHasAppliedAura(CardInstance c)
+        => c.AuraAdd.Count > 0 || c.AuraMult.Count > 0 || c.AuraAdditiveMult.Count > 0
+        || c.AuraTags.Count > 0 || c.AuraRemovedTags.Count > 0
+        || c.EnchantmentAuraAdd.Count > 0 || c.EnchantmentAuraMult.Count > 0 || c.EnchantmentAuraAdditiveMult.Count > 0;
 
     private static bool SideHasAppliedAuraModifiers(PlayerState player)
     {
@@ -183,9 +191,7 @@ public static class AuraEngine
     {
         for (int i = 0; i < cards.Count; i++)
         {
-            var c = cards[i];
-            if (c.AuraAdd.Count > 0 || c.AuraMult.Count > 0 || c.AuraTags.Count > 0
-                || c.EnchantmentAuraAdd.Count > 0 || c.EnchantmentAuraMult.Count > 0)
+            if (CardHasAppliedAura(cards[i]))
                 return true;
         }
         return false;
@@ -213,7 +219,11 @@ public static class AuraEngine
         IReadOnlyList<CardInstance>? selectionCards = null,
         List<AuraEffectTargetsSnapshot>? snapshotSink = null,
         IReadOnlyList<CardInstance>? externalAuraCards = null,
-        string? currentEncounterId = null)
+        string? currentEncounterId = null,
+        int timeMs = 0,
+        bool? sandstormActive = null,
+        Random? rng = null,
+        IReadOnlyCollection<string>? visitedEncounters = null)
     {
         bool hasExternalAura = externalAuraCards != null && ListHasActiveAura(externalAuraCards);
         bool hasP1Aura = HasAnyActiveAura(p1) || hasExternalAura;
@@ -260,8 +270,8 @@ public static class AuraEngine
                 prevStaging.TrackSnapshots = trackSnapshots;
 
                 // Pass 1：收集 1 跳光环输出并提交
-                if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, selectionCards, externalAuraCards, currentEncounterId, flyingGranters, prevStaging);
-                if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, selectionCards, null, currentEncounterId, flyingGranters, prevStaging);
+                if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, selectionCards, externalAuraCards, currentEncounterId, timeMs, sandstormActive, rng, visitedEncounters, flyingGranters, prevStaging);
+                if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, selectionCards, null, currentEncounterId, timeMs, sandstormActive, rng, visitedEncounters, flyingGranters, prevStaging);
                 prevStaging.Commit();
                 finalCommittedStaging = prevStaging;
 
@@ -273,8 +283,8 @@ public static class AuraEngine
                         nextStaging.Clear();
                         nextStaging.TrackSnapshots = trackSnapshots;
                         flyingGranters?.Clear();
-                        if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, selectionCards, externalAuraCards, currentEncounterId, flyingGranters, nextStaging);
-                        if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, selectionCards, null, currentEncounterId, flyingGranters, nextStaging);
+                        if (hasP1Aura) ApplySideAuras(p1, p2, scope, day, hour, repo, p1.PlayerId, selectionCards, externalAuraCards, currentEncounterId, timeMs, sandstormActive, rng, visitedEncounters, flyingGranters, nextStaging);
+                        if (hasP2Aura && p2 != null) ApplySideAuras(p2, p1, scope, day, hour, repo, p1.PlayerId, selectionCards, null, currentEncounterId, timeMs, sandstormActive, rng, visitedEncounters, flyingGranters, nextStaging);
 
                         if (nextStaging.EqualsBuffer(prevStaging))
                             break;
@@ -313,7 +323,7 @@ public static class AuraEngine
         => ListHasFlyingAuraOrFlag(owner.Hand.Cards, scope)
         || ListHasFlyingAuraOrFlag(owner.Skills, scope)
         || ListHasFlyingAuraOrFlag(owner.SocketEffects, scope)
-        || (scope == RuleScope.InCombat && ListHasFlyingAuraOrFlag(owner.PlayerEffects, scope))
+        || ListHasFlyingAuraOrFlag(owner.PlayerEffects, scope)
         || ListHasFlyingAuraOrFlag(owner.Stash.Cards, scope);
 
     private static bool ListHasFlyingAuraOrFlag(IReadOnlyList<CardInstance> cards, RuleScope scope)
@@ -403,8 +413,7 @@ public static class AuraEngine
         for (int i = 0; i < selectionCards.Count; i++)
         {
             var c = selectionCards[i];
-            if (c.AuraAdd.Count > 0 || c.AuraMult.Count > 0 || c.AuraTags.Count > 0
-                || c.EnchantmentAuraAdd.Count > 0 || c.EnchantmentAuraMult.Count > 0)
+            if (CardHasAppliedAura(c))
                 c.ClearAuraModifiers();
         }
     }
@@ -414,8 +423,7 @@ public static class AuraEngine
         for (int i = 0; i < cards.Count; i++)
         {
             var c = cards[i];
-            if (c.AuraAdd.Count > 0 || c.AuraMult.Count > 0 || c.AuraTags.Count > 0
-                || c.EnchantmentAuraAdd.Count > 0 || c.EnchantmentAuraMult.Count > 0)
+            if (CardHasAppliedAura(c))
                 c.ClearAuraModifiers();
         }
     }
@@ -446,10 +454,11 @@ public static class AuraEngine
         public readonly List<(CardInstance Target, string Attr, string Op, double Value)> EnchCardAttrs = new(4);
         public readonly List<(PlayerState Target, string Attr, string Op, double Value)> PlayerAttrs = new(8);
         public readonly List<(CardInstance Target, string Tag)> CardTags = new(16);
+        public readonly List<(CardInstance Target, string Tag)> CardRemovedTags = new(8);
         public bool TrackSnapshots;
         private readonly Dictionary<(string SourceCardId, string AuraId), (HashSet<string> CardIds, HashSet<string> PlayerIds)> _auraTargets = new();
 
-        public bool IsEmpty => CardAttrs.Count == 0 && EnchCardAttrs.Count == 0 && PlayerAttrs.Count == 0 && CardTags.Count == 0;
+        public bool IsEmpty => CardAttrs.Count == 0 && EnchCardAttrs.Count == 0 && PlayerAttrs.Count == 0 && CardTags.Count == 0 && CardRemovedTags.Count == 0;
 
         public void Clear()
         {
@@ -457,6 +466,7 @@ public static class AuraEngine
             EnchCardAttrs.Clear();
             PlayerAttrs.Clear();
             CardTags.Clear();
+            CardRemovedTags.Clear();
             TrackSnapshots = false;
             if (_auraTargets.Count > 0) _auraTargets.Clear();
         }
@@ -501,7 +511,8 @@ public static class AuraEngine
             if (CardAttrs.Count != other.CardAttrs.Count
                 || EnchCardAttrs.Count != other.EnchCardAttrs.Count
                 || PlayerAttrs.Count != other.PlayerAttrs.Count
-                || CardTags.Count != other.CardTags.Count)
+                || CardTags.Count != other.CardTags.Count
+                || CardRemovedTags.Count != other.CardRemovedTags.Count)
                 return false;
 
             for (int i = 0; i < CardAttrs.Count; i++)
@@ -542,6 +553,14 @@ public static class AuraEngine
                     || !string.Equals(a.Tag, b.Tag, StringComparison.OrdinalIgnoreCase))
                     return false;
             }
+            for (int i = 0; i < CardRemovedTags.Count; i++)
+            {
+                var a = CardRemovedTags[i];
+                var b = other.CardRemovedTags[i];
+                if (!ReferenceEquals(a.Target, b.Target)
+                    || !string.Equals(a.Tag, b.Tag, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
             return true;
         }
 
@@ -565,8 +584,12 @@ public static class AuraEngine
             for (int i = 0; i < CardTags.Count; i++)
             {
                 var (t, tag) = CardTags[i];
-                if (t.AuraTags.Add(tag))
-                    t.MarkAttributeDirty();
+                t.ApplyAuraAddTag(tag);
+            }
+            for (int i = 0; i < CardRemovedTags.Count; i++)
+            {
+                var (t, tag) = CardRemovedTags[i];
+                t.ApplyAuraRemoveTag(tag);
             }
         }
     }
@@ -611,31 +634,57 @@ public static class AuraEngine
         IReadOnlyList<CardInstance>? selectionCards,
         IReadOnlyList<CardInstance>? externalAuraCards,
         string? currentEncounterId,
+        int timeMs,
+        bool? sandstormActive,
+        Random? rng,
+        IReadOnlyCollection<string>? visitedEncounters,
         Dictionary<CardInstance, CardInstance>? flyingGranters,
         AuraStagingBuffer staging)
     {
         bool hasExternal = externalAuraCards != null && ListHasActiveAura(externalAuraCards);
         if (!HasAnyActiveAura(owner) && !hasExternal) return;
 
-        var rng = new Random(0);
-        var baseCtx = new RuleExecutionContext(repo!, scope, owner, opponent, rng)
+        var effectiveRng = rng ?? new Random(0);
+        var baseCtx = new RuleExecutionContext(repo!, scope, owner, opponent, effectiveRng)
         {
             LocalPlayerId = localPlayerId,
             CurrentDay = day,
             CurrentHour = hour,
+            TimeMs = timeMs,
             CurrentEncounterId = currentEncounterId,
+            VisitedEncounterIds = visitedEncounters,
             SelectionCards = selectionCards
         };
+        if (sandstormActive.HasValue)
+            ValueAndConditionEvaluator.SetSandstormActive(baseCtx, sandstormActive.Value);
 
         ApplyCardListAuras(owner.Hand.Cards, inHand: true, scope, baseCtx, flyingGranters, staging);
         ApplyCardListAuras(owner.Skills, inHand: true, scope, baseCtx, flyingGranters, staging);
         ApplyCardListAuras(owner.SocketEffects, inHand: true, scope, baseCtx, flyingGranters, staging);
-        if (scope == RuleScope.InCombat && owner.PlayerEffects.Count > 0)
+        // D1-P1-06：移除 InCombat 专属限制，使局外 PlayerEffects 与战中共享统一光环管线
+        if (owner.PlayerEffects.Count > 0)
             ApplyCardListAuras(owner.PlayerEffects, inHand: true, scope, baseCtx, flyingGranters, staging);
         ApplyCardListAuras(owner.Stash.Cards, inHand: false, scope, baseCtx, flyingGranters, staging);
-        // 修复 P2-25：将局外活跃遭遇卡与外挂效果卡统一纳入 AuraEngine 主管线（共享 5-Pass 收敛、逐目标求值与 MarkAttributeDirty）
+        // 修复 P2-25 & D1-P1-06：局外活跃遭遇卡与外挂效果卡按对象引用去重后纳入主光环管线，防与 owner.PlayerEffects 重复执行
         if (hasExternal && externalAuraCards != null)
-            ApplyCardListAuras(externalAuraCards, inHand: true, scope, baseCtx, flyingGranters, staging);
+        {
+            if (owner.PlayerEffects.Count > 0)
+            {
+                var peSet = new HashSet<CardInstance>(owner.PlayerEffects, ReferenceEqualityComparer.Instance);
+                var dedup = new List<CardInstance>(externalAuraCards.Count);
+                for (int i = 0; i < externalAuraCards.Count; i++)
+                {
+                    if (!peSet.Contains(externalAuraCards[i]))
+                        dedup.Add(externalAuraCards[i]);
+                }
+                if (dedup.Count > 0)
+                    ApplyCardListAuras(dedup, inHand: true, scope, baseCtx, flyingGranters, staging);
+            }
+            else
+            {
+                ApplyCardListAuras(externalAuraCards, inHand: true, scope, baseCtx, flyingGranters, staging);
+            }
+        }
     }
 
     private static void ApplyCardListAuras(
@@ -680,7 +729,9 @@ public static class AuraEngine
         "TAuraActionCardModifyAttribute" or
         "TAuraActionPlayerModifyAttribute" or
         "TAuraActionCardAddTagsList" or
-        "TAuraActionCardAddTagsBySource";
+        "TAuraActionCardAddTagsBySource" or
+        "TAuraActionCardRemoveTagsList" or
+        "TAuraActionCardRemoveTagsBySource";
 
     private static void ApplyAuraAction(
         RuleNode action,
@@ -779,6 +830,43 @@ public static class AuraEngine
                 }
                 break;
             }
+            case "TAuraActionCardRemoveTagsList":
+            {
+                if (action.Tags == null || action.Tags.Count == 0) break;
+                var targets = TargetResolver.ResolveCards(action.Target, ctx);
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    var target = targets[i];
+                    staging.RecordCardTarget(sourceCard.InstanceId, auraId, target.InstanceId);
+                    for (int t = 0; t < action.Tags.Count; t++)
+                        staging.CardRemovedTags.Add((target, action.Tags[t]));
+                }
+                break;
+            }
+            case "TAuraActionCardRemoveTagsBySource":
+            {
+                var sources = action.Source != null ? TargetResolver.ResolveCards(action.Source, ctx) : [sourceCard];
+                var seenTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var tags = new List<string>(8);
+                for (int s = 0; s < sources.Count; s++)
+                {
+                    foreach (var tag in sources[s].GetAllTags())
+                    {
+                        if (seenTags.Add(tag))
+                            tags.Add(tag);
+                    }
+                }
+                if (tags.Count == 0) break;
+                var targets = TargetResolver.ResolveCards(action.Target, ctx);
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    var target = targets[i];
+                    staging.RecordCardTarget(sourceCard.InstanceId, auraId, target.InstanceId);
+                    for (int t = 0; t < tags.Count; t++)
+                        staging.CardRemovedTags.Add((target, tags[t]));
+                }
+                break;
+            }
             default:
                 RuleExecutionContext.NotifyUnknownRuleType(ctx, "TAuraAction", action.Type);
                 break;
@@ -786,9 +874,9 @@ public static class AuraEngine
     }
 
     /// <summary>
-    /// 校验光环在当前所在区域与规则作用域下是否生效：
-    /// 战斗阶段（InCombat）中背包（Stash）里的常规 HandAndStash 光环一律不向场上生效，
-    /// 仅保留显式标记为 StashOnly 的局内背包例外；局外（OutOfCombat）正常保留 HandAndStash 经济/商店光环。
+    /// D1-P1-10：校验光环在当前所在区域与规则作用域下是否生效：
+    /// 战斗阶段（InCombat）中背包（Stash）精确放行 StashOnly 与 HandAndStash（外层 IsWorksInMatch 已拦截 OutOfCombatOnly，
+    /// 且严禁放行 HandOnly），解封 525 条 HandAndStash 光环并对齐局外预览与战中结算。
     /// </summary>
     private static bool IsActiveInMatch(string? activeIn, bool inHand, RuleScope scope)
     {
@@ -796,7 +884,7 @@ public static class AuraEngine
             return activeIn != "StashOnly";
 
         if (scope == RuleScope.InCombat)
-            return activeIn == "StashOnly";
+            return activeIn == "StashOnly" || activeIn == "HandAndStash";
 
         return activeIn != "HandOnly";
     }

@@ -57,9 +57,11 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
     private readonly List<NativeWorkshopTabDescriptor> _workshopTabs = new();
     private int _nextDynamicSentinelId = 9100;
 
-    // 主大厅原生嵌入模式选择器与克隆按钮运行时引用（P2-41：热卸载时全量回收）
+    // 主大厅原生嵌入模式选择器与克隆按钮运行时引用（P2-41 & D4-P1-11：热卸载时全量回收并恢复原版布局与 SceneID）
     private GameObject _embeddedLobbyModeBarGo;
     private readonly List<GameObject> _clonedButtons = new();
+    private readonly List<WeakReference<FightMenuLayoutMemory>> _trackedFightMenuMemories = new();
+    private readonly List<WeakReference<IList>> _trackedNavDataLists = new();
     private readonly Dictionary<string, (Image Bg, Image Border, TextMeshProUGUI Label)> _lobbyModeChips = new(StringComparer.OrdinalIgnoreCase);
     private TextMeshProUGUI _lobbyModeHintText;
     private string _selectedQuickModeId = "classic";
@@ -104,7 +106,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 _lobbyModeChips.Clear();
             }
 
-            // P2-41：热卸载时销毁全部注入到 FightMenuDialog / OptionsDialogController 的克隆按钮，杜绝菜单留僵尸按钮
+            // P2-41 & D4-P1-11：热卸载时销毁全部注入按钮、还原 FightMenuDialog 原版布局并从左侧抽屉摘除哨兵 SceneID >= 9001
             for (int i = 0; i < _clonedButtons.Count; i++)
             {
                 var btnGo = _clonedButtons[i];
@@ -114,6 +116,59 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 }
             }
             _clonedButtons.Clear();
+
+            for (int i = _trackedFightMenuMemories.Count - 1; i >= 0; i--)
+            {
+                if (_trackedFightMenuMemories[i].TryGetTarget(out var mem) && mem != null && mem.Captured)
+                {
+                    try
+                    {
+                        var vlg = mem.GetComponent<VerticalLayoutGroup>();
+                        if (vlg != null)
+                        {
+                            vlg.spacing = mem.OriginalSpacing;
+                            vlg.padding.top = mem.OriginalPadTop;
+                            vlg.padding.bottom = mem.OriginalPadBottom;
+                        }
+                        if (mem.DialogRt != null && mem.OriginalDialogHeight > 10f)
+                        {
+                            mem.DialogRt.sizeDelta = new Vector2(mem.DialogRt.sizeDelta.x, mem.OriginalDialogHeight);
+                        }
+                        if (mem.transform is RectTransform cRt)
+                        {
+                            LayoutRebuilder.ForceRebuildLayoutImmediate(cRt);
+                        }
+                    }
+                    catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("NativeMenuEmbedModule:L142", diagEx); }
+                }
+            }
+            _trackedFightMenuMemories.Clear();
+
+            for (int i = _trackedNavDataLists.Count - 1; i >= 0; i--)
+            {
+                if (_trackedNavDataLists[i].TryGetTarget(out var list) && list != null)
+                {
+                    try
+                    {
+                        for (int k = list.Count - 1; k >= 0; k--)
+                        {
+                            object item = list[k];
+                            if (item == null) continue;
+                            Type dt = item.GetType();
+                            var sp = dt.GetProperty("Scene", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            var sf = dt.GetField("Scene", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                                ?? dt.GetField("_scene", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            int? sid = TryExtractTraversableSceneId(item, sp, sf);
+                            if (sid.HasValue && sid.Value >= 9001)
+                            {
+                                list.RemoveAt(k);
+                            }
+                        }
+                    }
+                    catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("NativeMenuEmbedModule:L168", diagEx); }
+                }
+            }
+            _trackedNavDataLists.Clear();
         });
     }
 
@@ -157,14 +212,15 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
 
     private void RegisterBuiltInEntries()
     {
-        // 主大厅 7 大模式与预设直达项
+        // 主大厅 8 大模式与预设直达项（D6-P1-01：拆分「每日挑战」与「肉鸽词条」为独立按钮）
         var builtInModes = new[]
         {
             new NativePlaymodeOptionDescriptor { Id = "classic", Title = "经典官方", Subtitle = "1:1 原版平衡", ModeId = "Standard", PresetId = "PureOfficial", Order = 10 },
             new NativePlaymodeOptionDescriptor { Id = "enhanced", Title = "爽玩增强", Subtitle = "高资源快成型", ModeId = "Standard", PresetId = "EnhancedFun", Order = 20 },
             new NativePlaymodeOptionDescriptor { Id = "endless_tower", Title = "无尽爬塔", Subtitle = "突破10胜冲99层", ModeId = "EndlessTower", PresetId = "PureOfficial", Order = 30 },
             new NativePlaymodeOptionDescriptor { Id = "cross_hero", Title = "跨职业混池", Subtitle = "8英雄大乱斗", ModeId = "CrossHeroMayhem", PresetId = "PureOfficial", Order = 40 },
-            new NativePlaymodeOptionDescriptor { Id = "mutator_daily", Title = "肉鸽词条/每日", Subtitle = "14词条与同种子", ModeId = "DailyChallenge", PresetId = "ExtremeRoguelike", Order = 50 },
+            new NativePlaymodeOptionDescriptor { Id = "daily_challenge", Title = "每日挑战", Subtitle = "全服同种子冲榜", ModeId = "DailyChallenge", PresetId = "PureOfficial", Order = 50 },
+            new NativePlaymodeOptionDescriptor { Id = "mutator_challenge", Title = "肉鸽词条", Subtitle = "极限词条自由配", ModeId = "MutatorChallenge", PresetId = "ExtremeRoguelike", Order = 55 },
             new NativePlaymodeOptionDescriptor { Id = "boss_rush", Title = "Boss车轮战", Subtitle = "10波传奇连战", ModeId = "BossRush", PresetId = "PureOfficial", Order = 60 },
             new NativePlaymodeOptionDescriptor { Id = "sandbox", Title = "沙盒实验室", Subtitle = "无限刷新自由测", ModeId = "SandboxLab", PresetId = "PureOfficial", Order = 70 },
         };
@@ -273,10 +329,11 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
     {
         if (string.Equals(modeId, "EndlessTower", StringComparison.OrdinalIgnoreCase)) return "endless_tower";
         if (string.Equals(modeId, "CrossHeroMayhem", StringComparison.OrdinalIgnoreCase)) return "cross_hero";
-        if (string.Equals(modeId, "MutatorChallenge", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(modeId, "DailyChallenge", StringComparison.OrdinalIgnoreCase)) return "mutator_daily";
+        if (string.Equals(modeId, "DailyChallenge", StringComparison.OrdinalIgnoreCase)) return "daily_challenge";
+        if (string.Equals(modeId, "MutatorChallenge", StringComparison.OrdinalIgnoreCase)) return "mutator_challenge";
         if (string.Equals(modeId, "BossRush", StringComparison.OrdinalIgnoreCase)) return "boss_rush";
         if (string.Equals(modeId, "SandboxLab", StringComparison.OrdinalIgnoreCase)) return "sandbox";
+        if (string.Equals(presetId, "ExtremeRoguelike", StringComparison.OrdinalIgnoreCase)) return "mutator_challenge";
         if (string.Equals(presetId, "EnhancedFun", StringComparison.OrdinalIgnoreCase)) return "enhanced";
         return "classic";
     }
@@ -521,7 +578,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 MainThreadDispatcher.Enqueue(() => Instance?.MountLobbyModeSelector(comp));
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("NativeMenuEmbedModule:L581", diagEx); }
     }
 
     private void MountLobbyModeSelector(Component playmodeAnchor)
@@ -540,20 +597,25 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 return;
             }
 
-            // 采集原版 Playmode 区域的 TMP 字体与材质，确保视觉 100% 统一
+            // D4-P1-11：优先使用含 CJK 回退链的字体防止中文按钮变豆腐块，并按父容器安全区宽度钳制，杜绝低分辨率/超宽屏裁切
             TMP_Text sampleTmp = playmodeAnchor.GetComponentInChildren<TMP_Text>(true);
-            TMP_FontAsset nativeFont = sampleTmp != null ? sampleTmp.font : CustomGameplayUI.Instance?.GetActiveUiFont();
+            TMP_FontAsset nativeFont = CustomGameplayUI.Instance?.GetActiveUiFont()
+                ?? (sampleTmp != null ? sampleTmp.font : null)
+                ?? TMP_Settings.defaultFontAsset;
 
             var barGo = new GameObject("BazaarNativeLobbyModeBar", typeof(RectTransform), typeof(Image), typeof(VerticalLayoutGroup));
             barGo.transform.SetParent(parent, worldPositionStays: false);
             _embeddedLobbyModeBarGo = barGo;
+
+            float availW = (parent is RectTransform prt && prt.rect.width > 240f) ? prt.rect.width : 1280f;
+            float clampedBarW = Mathf.Clamp(availW - 48f, 640f, 1040f);
 
             var rt = barGo.GetComponent<RectTransform>();
             rt.anchorMin = new Vector2(1f, 0f);
             rt.anchorMax = new Vector2(1f, 0f);
             rt.pivot = new Vector2(1f, 0f);
             rt.anchoredPosition = new Vector2(-24f, 8f);
-            rt.sizeDelta = new Vector2(940f, 76f);
+            rt.sizeDelta = new Vector2(clampedBarW, 76f);
 
             var bgImg = barGo.GetComponent<Image>();
             bgImg.color = new Color(0.07f, 0.06f, 0.10f, 0.90f);
@@ -734,12 +796,9 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
     {
         if (item == null) return null;
         const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-        // 真实数据模型：NavigationMenuController._data 直接存放 TraversableScenesSO+TraversableScene，字段名为 ID (SceneID)
+        // D4-P2-2：真实数据模型 TraversableScenesSO+TraversableScene 字段名为 ID (SceneID)，移除无效回退反射探测
         Type t = item.GetType();
-        object directId = t.GetField("ID", flags)?.GetValue(item)
-            ?? t.GetField("sceneID", flags)?.GetValue(item)
-            ?? t.GetProperty("ID", flags)?.GetValue(item)
-            ?? t.GetProperty("SceneID", flags)?.GetValue(item);
+        object directId = t.GetField("ID", flags)?.GetValue(item);
         if (directId != null)
         {
             return Convert.ToInt32(directId);
@@ -749,10 +808,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         object sceneObj = sceneProp?.GetValue(item) ?? sceneField?.GetValue(item);
         if (sceneObj != null)
         {
-            Type st = sceneObj.GetType();
-            object nestedId = st.GetField("ID", flags)?.GetValue(sceneObj)
-                ?? st.GetField("sceneID", flags)?.GetValue(sceneObj)
-                ?? st.GetProperty("SceneID", flags)?.GetValue(sceneObj);
+            object nestedId = sceneObj.GetType().GetField("ID", flags)?.GetValue(sceneObj);
             if (nestedId != null)
             {
                 return Convert.ToInt32(nestedId);
@@ -794,6 +850,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 if (sid.HasValue) existingIds.Add(sid.Value);
             }
 
+            bool addedAny = false;
             foreach (var entry in entries)
             {
                 if (existingIds.Contains(entry.SentinelSceneId)) continue;
@@ -802,13 +859,35 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 {
                     dataList.Add(sentinelItem);
                     existingIds.Add(entry.SentinelSceneId);
+                    addedAny = true;
                 }
+            }
+            if (addedAny)
+            {
+                Instance.TrackNavDataList(dataList);
             }
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogDebug("[NativeMenuEmbed] 左侧抽屉注入回退静默跳过: " + ex.Message);
         }
+    }
+
+    private void TrackNavDataList(IList dataList)
+    {
+        if (dataList == null) return;
+        for (int i = _trackedNavDataLists.Count - 1; i >= 0; i--)
+        {
+            if (!_trackedNavDataLists[i].TryGetTarget(out var target) || target == null)
+            {
+                _trackedNavDataLists.RemoveAt(i);
+            }
+            else if (ReferenceEquals(target, dataList))
+            {
+                return;
+            }
+        }
+        _trackedNavDataLists.Add(new WeakReference<IList>(dataList));
     }
 
     private static object TryCreateSentinelNavData(Type dataItemType, object templateData, NativeNavEntryDescriptor entry)
@@ -874,7 +953,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 return copy;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("NativeMenuEmbedModule:L956", diagEx); }
         return null;
     }
 
@@ -895,7 +974,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                 return false;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("NativeMenuEmbedModule:L977", diagEx); }
         return true;
     }
 
@@ -909,6 +988,24 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
         public int OriginalPadBottom;
         public float OriginalDialogHeight;
         public float OriginalContainerHeight;
+        public RectTransform DialogRt;
+    }
+
+    private void TrackFightMenuMemory(FightMenuLayoutMemory mem)
+    {
+        if (mem == null) return;
+        for (int i = _trackedFightMenuMemories.Count - 1; i >= 0; i--)
+        {
+            if (!_trackedFightMenuMemories[i].TryGetTarget(out var target) || target == null)
+            {
+                _trackedFightMenuMemories.RemoveAt(i);
+            }
+            else if (ReferenceEquals(target, mem))
+            {
+                return;
+            }
+        }
+        _trackedFightMenuMemories.Add(new WeakReference<FightMenuLayoutMemory>(mem));
     }
 
     private static void FightMenuDialogStartPostfix(Component __instance)
@@ -920,12 +1017,13 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
             // 绝不触碰右上角常驻齿轮（SettingButton），也绝不把大按钮纵向堆叠撑破原版鎏金外框。
             GameObject dialogRoot = _fightMenuDialogRootField?.GetValue(__instance) as GameObject;
             object rawBtn = _fightOptionsBtnField?.GetValue(__instance);
+            Component rawBtnComp = rawBtn as Component;
             Button templateBtn = (rawBtn as Button)
-                ?? (rawBtn as Component)?.GetComponentInChildren<Button>(true);
-            if (dialogRoot == null || templateBtn == null || templateBtn.transform.parent == null) return;
-            if (!templateBtn.transform.IsChildOf(dialogRoot.transform)) return;
+                ?? rawBtnComp?.GetComponentInChildren<Button>(true);
+            Transform container = rawBtnComp?.transform?.parent ?? templateBtn?.transform?.parent;
+            if (dialogRoot == null || templateBtn == null || container == null) return;
+            if (!container.IsChildOf(dialogRoot.transform) && !ReferenceEquals(container, dialogRoot.transform)) return;
 
-            Transform container = templateBtn.transform.parent;
             var vlg = container.GetComponent<VerticalLayoutGroup>();
             if (vlg == null && container.GetComponent<LayoutGroup>() == null)
             {
@@ -975,8 +1073,13 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                     mem.OriginalPadBottom = vlg.padding.bottom;
                 }
                 if (containerRt != null) mem.OriginalContainerHeight = containerRt.rect.height;
-                if (dialogRt != null) mem.OriginalDialogHeight = dialogRt.sizeDelta.y;
+                if (dialogRt != null)
+                {
+                    mem.OriginalDialogHeight = dialogRt.sizeDelta.y;
+                    mem.DialogRt = dialogRt;
+                }
             }
+            Instance.TrackFightMenuMemory(mem);
 
             // 若快捷栏已存在且按钮数未变，仅校准一次排布顺序与框内拟合后返回
             if (existingDock != null && existingDock.GetComponentsInChildren<Button>(true).Length == visibleButtons.Count)
@@ -1117,7 +1220,7 @@ internal sealed class NativeMenuEmbedModule : IBuiltInPatchModule, INativeUiHost
                                 dialogRoot.SetActive(false);
                             }
                         }
-                        catch { }
+                        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("NativeMenuEmbedModule:L1223", diagEx); }
                         captured.OnClick?.Invoke();
                     });
 

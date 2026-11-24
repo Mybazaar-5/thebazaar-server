@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using System.Text.Json;
 using BazaarCore.Combat;
 using BazaarCore.Data;
@@ -107,8 +109,8 @@ public sealed class ShopEngine
         RestoreActiveShelfDiscountsFromRun();
     }
 
-    /// <summary>P1-33：从 RunState.ActiveShelfDiscounts 恢复持久化折扣缓存（断点续玩与挂起栈弹栈恢复共用）。</summary>
-    internal void RestoreActiveShelfDiscountsFromRun()
+    /// <summary>P1-33 / D2-P1-14：从 RunState.ActiveShelfDiscounts 与显式 ActiveShelfOriginalPrices 恢复持久化折扣缓存（彻底消除反推 origPrice = discountedPrice + 1 失真）。</summary>
+    public void RestoreActiveShelfDiscountsFromRun()
     {
         _activeShelfDiscounts.Clear();
         if (_run.ActiveShelfDiscounts.Count == 0)
@@ -118,11 +120,33 @@ public sealed class ShopEngine
         {
             if (!_run.Cards.TryGetValue(instanceId, out var entry) || entry.Owner != null)
                 continue;
-            int origPrice = entry.CoreCard != null
-                ? Math.Max(discountedPrice + 1, RunState.ComputeCardBuyPrice(entry, entry.CoreCard, _repo.GameMode.StandardPrices))
-                : Math.Max(discountedPrice + 1, entry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, discountedPrice));
-            if (entry.Attributes.TryGetValue(ECardAttributeType.BuyPrice, out int curPrice) && curPrice > discountedPrice)
+
+            int origPrice;
+            if (_run.ActiveShelfOriginalPrices.TryGetValue(instanceId, out int recordedOrig) && recordedOrig > discountedPrice)
+            {
+                origPrice = recordedOrig;
+            }
+            else if (entry.CoreCard != null)
+            {
+                // 兼容历史旧快照（无 ActiveShelfOriginalPrices）：先暂拆 HourMult["BuyPrice"] 计算真实未打折原价，再无损放回
+                bool hadHourBuyMult = entry.CoreCard.HourMult.TryGetValue("BuyPrice", out double savedBuyMult);
+                if (hadHourBuyMult)
+                    entry.CoreCard.HourMult.Remove("BuyPrice");
+                int computedUnscaled = RunState.ComputeCardBuyPrice(entry, entry.CoreCard, _repo.GameMode.StandardPrices);
+                if (hadHourBuyMult)
+                    entry.CoreCard.HourMult["BuyPrice"] = savedBuyMult;
+                origPrice = Math.Max(discountedPrice + 1, computedUnscaled);
+            }
+            else
+            {
+                origPrice = Math.Max(discountedPrice + 1, entry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, discountedPrice));
+            }
+            if (!_run.ActiveShelfOriginalPrices.ContainsKey(instanceId) &&
+                entry.Attributes.TryGetValue(ECardAttributeType.BuyPrice, out int curPrice) && curPrice > discountedPrice)
+            {
                 origPrice = curPrice;
+            }
+
             int pct = origPrice > 0
                 ? Math.Clamp((int)Math.Round((1.0 - (double)discountedPrice / origPrice) * 100.0), 1, 99)
                 : MerchantItemDiscountPercent;
@@ -210,6 +234,14 @@ public sealed class ShopEngine
     private Guid ResolveWireTemplateGuid(string logicalTemplateId, out string? customCardId)
     {
         customCardId = null;
+        var poolTpl = _pool.Get(logicalTemplateId);
+        // P0-25：原位 Patch 卡绝不误判为借壳自定义卡，亦不递增 VisualBindingsRevision
+        if (poolTpl != null && poolTpl.IsPatchOverride)
+        {
+            if (Guid.TryParse(logicalTemplateId, out var patchDirect))
+                return patchDirect;
+        }
+
         string safeWireId = _pool.ResolveSafeWireTemplateId(logicalTemplateId);
         if (!string.Equals(safeWireId, logicalTemplateId, StringComparison.OrdinalIgnoreCase))
         {
@@ -223,9 +255,22 @@ public sealed class ShopEngine
         if (Guid.TryParse(logicalTemplateId, out var direct))
             return direct;
 
-        // 兜底：绝不抛出 FormatException，回落到安全原版物品 GUID
+        // D3-P2-07：按卡牌实际类型动态挑选有效原版白名单模板 GUID 兜底（防止自定义 Skill / EventEncounter 误借物品视觉壳）
         customCardId ??= logicalTemplateId;
         _run.VisualBindingsRevision++;
+        string? fallbackType = poolTpl?.Type ?? _repo.GetCard(logicalTemplateId)?.Type;
+        if (!string.IsNullOrWhiteSpace(fallbackType))
+        {
+            foreach (var cand in _pool.OfType(fallbackType))
+            {
+                if (!cand.IsCustomModCard &&
+                    _pool.IsAssetValid(cand.Id) &&
+                    Guid.TryParse(cand.Id, out var typedFallback))
+                {
+                    return typedFallback;
+                }
+            }
+        }
         return Guid.Parse("5e17cfc3-25c0-4a74-8a33-07ee972e6f6e");
     }
 
@@ -272,6 +317,10 @@ public sealed class ShopEngine
                 double mult = rules.ShopPriceMultiplier > 0 ? rules.ShopPriceMultiplier : 1.0;
                 if (rules.HasMutator(MutatorCatalog.ShopHalfOff))
                     mult *= 0.50;
+                // P0-22（合流胶水 #4）：叠乘自定义突变词条声明的商店物价倍率
+                var mutSummary = ResolveActiveMutatorSummary(rules);
+                if (Math.Abs(mutSummary.ShopPriceMultiplier - 1.0) > 1e-6)
+                    mult *= mutSummary.ShopPriceMultiplier;
                 if (Math.Abs(mult - 1.0) > 1e-6)
                 {
                     if (entry.CoreCard != null)
@@ -308,6 +357,38 @@ public sealed class ShopEngine
 
     /// <summary>可选外部注入的流派与遭遇分类索引；未设置且规则需要时按需懒构建。</summary>
     public CardArchetypeIndex? ArchetypeIndex { get; set; }
+
+    /// <summary>P0-22（合流胶水 #4）：可选局级 Mod 运行上下文（提供自定义词条规则汇总与 IGameModeHook）。</summary>
+    public BazaarCore.Mods.ModRuntimeContext? ModRuntimeContext { get; set; }
+
+    /// <summary>P0-22（合流胶水 #4）：可选服务端单局 Mod 上下文。</summary>
+    public BazaarServer.Mods.ServerModHost.RunModContext? RunModContext { get; set; }
+
+    /// <summary>P0-22（合流胶水 #4）：自定义模式钩子声明的首刷免费标记。</summary>
+    public bool CustomModeFreeFirstShopReroll { get; set; }
+
+    private CustomMutatorRuleSummary ResolveActiveMutatorSummary(CustomRunRuleSet? rules)
+    {
+        var eff = rules ?? ActiveRules ?? _run.CustomRules;
+        if (RunModContext != null)
+            return RunModContext.ResolveMutatorRuleSummary(eff);
+        return MutatorCatalog.ResolveRuleSummary(eff?.MutatorIds, ModRuntimeContext?.EffectiveCustomMutatorsById);
+    }
+
+    private BazaarCore.Mods.IGameModeHook? ResolveActiveGameModeHook(CustomRunRuleSet? rules)
+    {
+        var eff = rules ?? ActiveRules ?? _run.CustomRules;
+        string? modeId = !string.IsNullOrWhiteSpace(eff?.CustomModeId)
+            ? eff!.CustomModeId!.Trim()
+            : (eff != null && eff.SpecialModeId != ESpecialModeId.Standard ? eff.SpecialModeId.ToString() : null);
+        if (string.IsNullOrWhiteSpace(modeId))
+            return null;
+        if (RunModContext != null && RunModContext.TryGetGameModeHook(modeId, out var runHook) && runHook != null)
+            return runHook;
+        if (ModRuntimeContext?.ModeHooks != null && ModRuntimeContext.ModeHooks.TryGetValue(modeId, out var ctxHook))
+            return ctxHook;
+        return null;
+    }
 
     /// <summary>分页怪物战利品自选模式下当前缓存的全部页数据（未启用分页时为空）。</summary>
     public IReadOnlyList<IReadOnlyList<MonsterLootCandidate>> MonsterLootPages => _monsterLootPages;
@@ -360,6 +441,7 @@ public sealed class ShopEngine
         _run.SelectionSet.Clear();
         _activeShelfDiscounts.Clear();
         _run.ActiveShelfDiscounts.Clear();
+        _run.ActiveShelfOriginalPrices.Clear();
         if (clearMonsterLootPages)
         {
             // P1-33：清空货架时默认重置 CurrentMaxSelections 与 BaseRerollCost，防止上游多选上限泄漏至 LevelUp 或下一遭遇
@@ -373,7 +455,7 @@ public sealed class ShopEngine
         return events;
     }
 
-    private void RestoreMonsterLootPagesFromRun()
+    public void RestoreMonsterLootPagesFromRun()
     {
         if (_run.MonsterLootPages.Count == 0)
             return;
@@ -610,10 +692,10 @@ public sealed class ShopEngine
         uint hour = _run.Hour;
         _chances.CurrentDay = day;
 
-        // 当天或小时回退/重置时（例如跨天、restart 或单测反复重抽同一小时），自动清空当日已展示去重集
+        // D2-P1-13：仅跨天或小时真实回退时清空当日已展示去重集，同小时不推进/重抽绝不清空
         if (hour != 3 && hour != (uint)_repo.GameMode.HoursInADay)
         {
-            if (_run.OfferedDayEncounterDay != _run.Day || _run.Hour <= _run.OfferedDayEncounterLastHour)
+            if (_run.OfferedDayEncounterDay != _run.Day || _run.Hour < _run.OfferedDayEncounterLastHour)
             {
                 _run.ClearOfferedDayEncounters();
             }
@@ -733,8 +815,8 @@ public sealed class ShopEngine
             }
             else
             {
-                // Day 11+ 无尽/加时天数保留真实 day，避免被 NumberOfDays=10 截断导致 Lv12~15 后期野怪永不出场
-                picks = RollDayMatchedMonsters(Math.Max(1, day), 3, dailyVisited, bannedIds);
+                // Day 11+ 无尽/加时天数保留真实 day，避免被 NumberOfDays=10 截断导致 Lv12~15 后期野怪永不出场；D6-P1-10 透传 streamRng
+                picks = RollDayMatchedMonsters(Math.Max(1, day), 3, dailyVisited, bannedIds, streamRng);
             }
             foreach (var card in picks)
             {
@@ -1029,14 +1111,22 @@ public sealed class ShopEngine
                 ? middleEvents
                 : (nonMerchants.Count > 0 ? nonMerchants : GetNonMerchantFallbackPool());
 
+            // 动态排除解锁类遭遇（如卖盗贼徽章解锁 Thieves Guild）仅受当日实际访问 visitedTodayIds 约束，
+            // 不被自然发牌去重集 OfferedDayEncounterIds 阻塞，确保玩家再次消耗徽章/道具时可正常重召
             var prioritizedUnlocked = nonMerchants
                 .Where(e => unlockedExclusionIds.Contains(e.Id) &&
                             !_run.VisitedSingleSpawnEncounterIds.Contains(e.Id) &&
-                            (dailyVisited == null || !dailyVisited.Contains(e.Id)))
+                            (visitedTodayIds == null || !visitedTodayIds.Contains(e.Id)))
                 .ToList();
 
+            HashSet<string>? visitedTodaySet = visitedTodayIds switch
+            {
+                null => null,
+                HashSet<string> hs => hs,
+                _ => new HashSet<string>(visitedTodayIds, StringComparer.OrdinalIgnoreCase),
+            };
             CardPool.CardTemplate? midPick = prioritizedUnlocked.Count > 0
-                ? RollEmpiricalSlotEncounterWithDailyDedup(prioritizedUnlocked, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, dailyVisited, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
+                ? RollEmpiricalSlotEncounterWithDailyDedup(prioritizedUnlocked, maxDayTier, pickedIds, _run.VisitedSingleSpawnEncounterIds, visitedTodaySet, allowExceedDayCap: false, allowDailyFallback: false, weightFn, bannedIds, tierExemptIds, actualDay, isMerchantPool: false, streamRng)
                 : null;
             ECardType midPickType = ECardType.EventEncounter;
 
@@ -1051,7 +1141,7 @@ public sealed class ShopEngine
                 hour == 2 &&
                 (effectiveRules?.SpecialModeId == ESpecialModeId.BossRush ||
                  (effectiveRules?.SpecialModeId == ESpecialModeId.EndlessTower &&
-                  EndlessTowerScaler.Compute((int)day).IsMilestoneDay));
+                  EndlessTowerScaler.Compute((int)day, effectiveRules.EndlessMaxDay).IsMilestoneDay));
             bool skipRegularPedestalForAmplifiedAgent = !guaranteedPedestalHour && allowAmplifiedTravelAgent && travelAgentMult >= 4.0;
 
             if (midPick == null && (guaranteedPedestalHour || (actualDay >= 3 && !skipRegularPedestalForAmplifiedAgent)) && _run.SelectionSet.Count < targetChoiceCount)
@@ -1232,8 +1322,15 @@ public sealed class ShopEngine
         string? Variant,
         IReadOnlyDictionary<int, IReadOnlyList<ReplacementSetEntry>> Hours);
 
-    private static readonly Dictionary<string, ReplacementSetDefinition> ReplacementSetRegistry =
-        CreateDefaultReplacementSetRegistry();
+    // D2-P1-13：默认官方 5 集采用不可变 FrozenDictionary，动态扩展采用线程安全 ConcurrentDictionary，并支持按实例隔离覆盖表
+    private static readonly FrozenDictionary<string, ReplacementSetDefinition> DefaultReplacementSetRegistry =
+        CreateDefaultReplacementSetRegistry().ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly ConcurrentDictionary<string, ReplacementSetDefinition> DynamicReplacementSetRegistry =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>可选实例级替换遭遇集覆盖表（房间/单局隔离 Mod 优先查询，绝不污染全局注册表）。</summary>
+    public IReadOnlyDictionary<string, ReplacementSetDefinition>? InstanceReplacementSets { get; set; }
 
     private static Dictionary<string, ReplacementSetDefinition> CreateDefaultReplacementSetRegistry()
     {
@@ -1331,20 +1428,40 @@ public sealed class ShopEngine
 
     public static bool TryGetReplacementSet(string? setId, out ReplacementSetDefinition? definition)
     {
-        if (!string.IsNullOrWhiteSpace(setId) && ReplacementSetRegistry.TryGetValue(setId, out var def))
+        if (!string.IsNullOrWhiteSpace(setId))
         {
-            definition = def;
-            return true;
+            if (DynamicReplacementSetRegistry.TryGetValue(setId, out var dynDef))
+            {
+                definition = dynDef;
+                return true;
+            }
+            if (DefaultReplacementSetRegistry.TryGetValue(setId, out var def))
+            {
+                definition = def;
+                return true;
+            }
         }
         definition = null;
         return false;
     }
 
-    /// <summary>供 Mod/扩展注册自定义 NewSetIdOnExit 替换遭遇集。</summary>
+    public bool TryGetInstanceOrGlobalReplacementSet(string? setId, out ReplacementSetDefinition? definition)
+    {
+        if (!string.IsNullOrWhiteSpace(setId)
+            && InstanceReplacementSets != null
+            && InstanceReplacementSets.TryGetValue(setId, out var instDef))
+        {
+            definition = instDef;
+            return true;
+        }
+        return TryGetReplacementSet(setId, out definition);
+    }
+
+    /// <summary>供 Mod/扩展线程安全注册自定义 NewSetIdOnExit 替换遭遇集。</summary>
     public static void RegisterReplacementSet(ReplacementSetDefinition definition)
     {
         if (definition != null && !string.IsNullOrWhiteSpace(definition.SetId))
-            ReplacementSetRegistry[definition.SetId] = definition;
+            DynamicReplacementSetRegistry[definition.SetId] = definition;
     }
 
     /// <summary>向后兼容：由旧存档 ActiveExpeditionId + ActiveExpeditionVariant 推导对应的官方 ReplacementSetId。</summary>
@@ -1377,7 +1494,7 @@ public sealed class ShopEngine
             setId = TryResolveReplacementSetIdForExpedition(_run.ActiveExpeditionId, _run.ActiveExpeditionVariant);
         if (string.IsNullOrWhiteSpace(setId)) return false;
 
-        if (!TryGetReplacementSet(setId, out var repSet) || repSet == null)
+        if (!TryGetInstanceOrGlobalReplacementSet(setId, out var repSet) || repSet == null)
         {
             ExitReplacementSetAndResetBoardIfNeeded(events);
             return false;
@@ -1550,11 +1667,12 @@ public sealed class ShopEngine
         string? hero,
         bool allowAmplifiedTravelAgent = false)
     {
-        if (enc != null && (enc.ModMinDay.HasValue || enc.ModMaxDay.HasValue))
+        if (enc != null && (enc.ModMinDay.HasValue || enc.ModMaxDay.HasValue || enc.ModAllowedHours is { Length: > 0 }))
         {
-            // Mod 显式声明了天数窗时优先尊重 Mod 规则（既可收窄也可放宽，不与官方静态天数锁冲突）
+            // P0-24：Mod 显式声明了天数窗或允许小时列表时优先尊重 Mod 调度规则
             if (enc.ModMinDay.HasValue && day < enc.ModMinDay.Value) return false;
             if (enc.ModMaxDay.HasValue && day > enc.ModMaxDay.Value) return false;
+            if (enc.ModAllowedHours is { Length: > 0 } && !enc.ModAllowedHours.Contains(hour)) return false;
             return true;
         }
         return OfficialEncounterSchedule.IsWithinWindow(enc, day, hour, hero, allowAmplifiedTravelAgent);
@@ -1699,9 +1817,10 @@ public sealed class ShopEngine
         if (string.IsNullOrWhiteSpace(templateId)) return false;
         foreach (var entry in _run.Cards.Values)
         {
+            // D3-P1-10：始终按逻辑模板 ID（ResolveCoreTemplateId）比对，避免借壳自定义卡误拦原版底座卡
             if (entry.Owner == ECombatantId.Player &&
                 entry.Type == ECardType.Item &&
-                entry.TemplateId.ToString().Equals(templateId, StringComparison.OrdinalIgnoreCase))
+                RunState.ResolveCoreTemplateId(entry).Equals(templateId, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
@@ -2217,7 +2336,8 @@ public sealed class ShopEngine
             isReroll ? DailyChallengeSeedGenerator.StreamReroll : DailyChallengeSeedGenerator.StreamShop,
             isReroll ? _run.DailyRerollSequence : 0);
 
-        // 商店刷新策略扩展：沙盒无限免刷 / 血色黑市 0 金刷（消耗生命上限）/ 商店全折刷费减半 / BossRush Hour 1 首刷免费
+        // 商店刷新策略扩展：沙盒无限免刷 / 血色黑市 0 金刷（消耗生命上限）/ 商店全折刷费减半 / BossRush Hour 1 首刷免费 / P0-22 自定义词条与模式首刷免费
+        var customMutSummary = ResolveActiveMutatorSummary(effectiveCustomRules);
         if (!isReroll && isMerchant && effectiveCustomRules != null)
         {
             if (effectiveCustomRules.IsSandboxRun && effectiveCustomRules.SandboxFreeInfiniteReroll)
@@ -2233,7 +2353,9 @@ public sealed class ShopEngine
                 if (_run.RerollsRemaining == 0)
                     _run.RerollsRemaining = UnlimitedRerollsCount;
             }
-            else if (effectiveCustomRules.SpecialModeId == ESpecialModeId.BossRush && _run.Hour == 1)
+            else if ((effectiveCustomRules.SpecialModeId == ESpecialModeId.BossRush && _run.Hour == 1)
+                     || customMutSummary.FreeFirstShopReroll
+                     || CustomModeFreeFirstShopReroll)
             {
                 _run.BaseRerollCost = 0;
                 _run.RerollCost = 0;
@@ -2300,16 +2422,22 @@ public sealed class ShopEngine
                     ? spawnCountOverride.Value
                     : (int)Math.Round(ValueAndConditionEvaluator.EvaluateValue(spawnContext.Limit, ctx, 3));
                 if (limit <= 0) limit = 3;
+                // D6-P1-10 + D3-P1-10：先按 InstanceId 确定性排序再经 shelfRng Fisher-Yates 洗牌，并按逻辑模板 ID 解析自定义卡
                 var ownedItems = _run.Cards.Values
                     .Where(c => c.Owner == ECombatantId.Player &&
                                 c.Type == ECardType.Item &&
-                                _pool.IsAssetValid(c.TemplateId.ToString()))
-                    .OrderBy(_ => _rng.Next())
+                                _pool.IsAssetValid(RunState.ResolveCoreTemplateId(c)))
+                    .OrderBy(c => c.InstanceId, StringComparer.Ordinal)
                     .ToList();
+                for (int si = ownedItems.Count - 1; si > 0; si--)
+                {
+                    int sj = shelfRng.Next(si + 1);
+                    (ownedItems[si], ownedItems[sj]) = (ownedItems[sj], ownedItems[si]);
+                }
                 foreach (var src in ownedItems)
                 {
                     if (dealtList.Count >= limit) break;
-                    var srcCore = _repo.GetCard(src.TemplateId.ToString());
+                    var srcCore = _repo.GetCard(RunState.ResolveCoreTemplateId(src));
                     if (srcCore == null) continue;
                     var copyInst = new CardInstance(srcCore, ToCoreTier(src.Tier), src.Enchantment?.ToString());
                     int slotWidth = GetShelfSlotWidth(copyInst);
@@ -2469,17 +2597,101 @@ public sealed class ShopEngine
             }
         }
 
-        // 2c. 应用模式与词条修正（万物附魔 / 五折商店 / 预设物价倍率 / 沙盒 0 元商店）
+        // 2b-mod. P0-22（合流胶水 #4）：自定义突变词条 ExtraShopSlots 与 BoostModCardWeight（加权优先抽取合法商店商品，严守 10 格货架上限）
+        if (isMerchant && spawnCountOverride == null && customMutSummary.ExtraShopSlots > 0 && usedWidth < MaxShelfSlotWidth)
+        {
+            var extraPool = _pool.ShopItems(hero)
+                .Where(t => _pool.IsPlayerSpawnable(t, allowGuidOnly: false) && !usedTemplateIds.Contains(t.Id))
+                .ToList();
+            double modWeightBoost = Math.Clamp(customMutSummary.BoostModCardWeight, 0.1, 10.0);
+            for (int ex = 0; ex < customMutSummary.ExtraShopSlots && extraPool.Count > 0 && usedWidth < MaxShelfSlotWidth; ex++)
+            {
+                double totalW = 0.0;
+                for (int idx = 0; idx < extraPool.Count; idx++)
+                    totalW += extraPool[idx].IsCustomModCard ? modWeightBoost : 1.0;
+                double pickRoll = shelfRng.NextDouble() * Math.Max(1e-6, totalW);
+                double accW = 0.0;
+                var cand = extraPool[0];
+                for (int idx = 0; idx < extraPool.Count; idx++)
+                {
+                    accW += extraPool[idx].IsCustomModCard ? modWeightBoost : 1.0;
+                    if (pickRoll <= accW)
+                    {
+                        cand = extraPool[idx];
+                        break;
+                    }
+                }
+                extraPool.Remove(cand);
+                string tierStr = _chances.Roll(shelfRng, effectiveCustomRules?.ShopHighTierBonusPct ?? 0.0);
+                if (isPaidContext && IsZeroBuyPriceOrFreePackage(cand, _repo.GetCard(cand.Id), tierStr))
+                    continue;
+                int slotWidth = Math.Clamp((int)ParseSize(cand.Size), 1, 3);
+                if (usedWidth + slotWidth > MaxShelfSlotWidth) continue;
+                var entry = CreateItemCandidate(cand, ParseTier(tierStr), isFree: _run.SelectionRules.SelectionIsFree);
+                if (isPaidContext && entry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0) <= 0)
+                    continue;
+                usedTemplateIds.Add(cand.Id);
+                dealtList.Add(entry);
+                usedWidth += slotWidth;
+            }
+        }
+
+        // 2c. 应用模式与词条修正（万物附魔 / 五折商店 / 预设物价倍率 / 沙盒 0 元商店 / 自定义词条物价倍率）
         foreach (var entry in dealtList)
         {
             ApplyModeAndMutatorModifiersToEntry(entry, _run.SelectionRules.SelectionIsFree, isMerchant, shelfRng);
         }
 
-        // 3. 非免费商人单品 25%-off 绿标折扣掷骰（Reroll 时随 ClearShelf 重新独立掷骰；若交由 DB TTriggerOnEncounterCardsDealt 负责折扣则不叠加掷骰）
+        // 3. 非免费商人单品 25%-off 绿标折扣掷骰（Reroll 时随 ClearShelf 重新独立掷骰；D6-P1-10 透传 shelfRng）
         if (applySyntheticDiscounts && isMerchant && !_run.SelectionRules.SelectionIsFree && dealtList.Count > 0
             && !(effectiveCustomRules?.IsSandboxRun == true && effectiveCustomRules.SandboxZeroShopPrice))
         {
-            ApplyMerchantDiscounts(dealtList);
+            ApplyMerchantDiscounts(dealtList, shelfRng);
+        }
+
+        // 3b. P0-22（合流胶水 #4）：自定义模式 IGameModeHook.OnShopGenerated 回调（带异常隔离；允许观测或追加合法商店卡）
+        if (isMerchant)
+        {
+            var modeHook = ResolveActiveGameModeHook(effectiveCustomRules);
+            if (modeHook != null)
+            {
+                var offeredIds = dealtList.Select(RunState.ResolveCoreTemplateId).ToList();
+                int originalCount = offeredIds.Count;
+                try
+                {
+                    modeHook.OnShopGenerated(day, (int)_run.Hour, offeredIds);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ShopEngine] IGameModeHook({modeHook.ModeId}).OnShopGenerated failed: {ex.Message}");
+                }
+                if (offeredIds.Count > originalCount && usedWidth < MaxShelfSlotWidth)
+                {
+                    for (int ai = originalCount; ai < offeredIds.Count && usedWidth < MaxShelfSlotWidth; ai++)
+                    {
+                        string addId = offeredIds[ai];
+                        if (string.IsNullOrWhiteSpace(addId) || usedTemplateIds.Contains(addId)) continue;
+                        var addTpl = _pool.GetIfAssetValid(addId);
+                        if (addTpl == null || !_pool.IsPlayerSpawnable(addTpl, allowGuidOnly: false)) continue;
+
+                        bool isItem = string.Equals(addTpl.Type, "Item", StringComparison.OrdinalIgnoreCase);
+                        bool isSkill = string.Equals(addTpl.Type, "Skill", StringComparison.OrdinalIgnoreCase);
+                        if (!isItem && !isSkill) continue;
+
+                        int slotWidth = isSkill ? 2 : Math.Clamp((int)ParseSize(addTpl.Size), 1, 3);
+                        if (usedWidth + slotWidth > MaxShelfSlotWidth) continue;
+
+                        string addTier = _chances.Roll(shelfRng, effectiveCustomRules?.ShopHighTierBonusPct ?? 0.0);
+                        var addEntry = isSkill
+                            ? CreateSkillCandidate(addTpl, ParseTier(addTier), isFree: _run.SelectionRules.SelectionIsFree)
+                            : CreateItemCandidate(addTpl, ParseTier(addTier), isFree: _run.SelectionRules.SelectionIsFree);
+                        ApplyModeAndMutatorModifiersToEntry(addEntry, _run.SelectionRules.SelectionIsFree, isMerchant: true, shelfRng);
+                        usedTemplateIds.Add(addTpl.Id);
+                        dealtList.Add(addEntry);
+                        usedWidth += slotWidth;
+                    }
+                }
+            }
         }
 
         // 4. 免费发牌奇遇若因池空未产出任何卡，给予安全金币补偿并确保 CanExit=true 防止软锁
@@ -2561,6 +2773,7 @@ public sealed class ShopEngine
         {
             _activeShelfDiscounts.Remove(instanceId);
             _run.ActiveShelfDiscounts.Remove(instanceId);
+            _run.ActiveShelfOriginalPrices.Remove(instanceId);
         }
     }
 
@@ -2579,6 +2792,7 @@ public sealed class ShopEngine
             discountPct,
             mult);
         _run.ActiveShelfDiscounts[entry.InstanceId] = discountedBuyPrice;
+        _run.ActiveShelfOriginalPrices[entry.InstanceId] = originalBuyPrice;
     }
 
     internal Dictionary<string, ETier> BuildOwnedSkillMaxTiers(PlayerState? playerState = null)
@@ -2640,16 +2854,17 @@ public sealed class ShopEngine
         return Math.Max(1, (int)Math.Round(basePrice * multiplier));
     }
 
-    /// <summary>对非免费商人货架物品逐一按 MerchantItemDiscountChance (12%) 掷骰 25%-off 绿标折扣。</summary>
-    public List<MerchantDiscountInfo> ApplyMerchantDiscounts(IEnumerable<RunState.CardEntry> shelfEntries)
+    /// <summary>对非免费商人货架物品逐一按 MerchantItemDiscountChance (12%) 掷骰 25%-off 绿标折扣（D6-P1-10 支持透传确定性子流）。</summary>
+    public List<MerchantDiscountInfo> ApplyMerchantDiscounts(IEnumerable<RunState.CardEntry> shelfEntries, Random? rngOverride = null)
     {
+        var rng = rngOverride ?? _rng;
         var applied = new List<MerchantDiscountInfo>();
         foreach (var entry in shelfEntries)
         {
             if (entry.Type != ECardType.Item) continue;
             int basePrice = entry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0);
             if (basePrice <= 0) continue;
-            if (_rng.NextDouble() >= MerchantItemDiscountChance) continue;
+            if (rng.NextDouble() >= MerchantItemDiscountChance) continue;
 
             var info = ApplyMerchantItemDiscount(entry, MerchantItemDiscountPercent);
             if (info != null)
@@ -2687,6 +2902,7 @@ public sealed class ShopEngine
             multiplier);
         _activeShelfDiscounts[entry.InstanceId] = info;
         _run.ActiveShelfDiscounts[entry.InstanceId] = discountedPrice;
+        _run.ActiveShelfOriginalPrices[entry.InstanceId] = basePrice;
         return info;
     }
 
@@ -2860,14 +3076,15 @@ public sealed class ShopEngine
         bool allowDuplicates = (_run.SelectionRules.SelectionIsFree && _run.SelectionRules.CanSelectMultiple)
                             || HasAllowDuplicatesBehavior(rewardVictory?.SpawnContext);
         int usedWidth = 0;
+        var effectiveLootRules = ActiveRules ?? _run.CustomRules;
+        var lootRng = ResolveStreamRng(DailyChallengeSeedGenerator.StreamLoot);
 
         // 1. 若 RewardVictory.SpawnContext 存在，先使用 SpawnQueryEngine 结合野怪上下文候选池执行
         if (rewardVictory?.SpawnContext != null)
         {
             var queryPlayer = p1Core ?? BuildDummyQueryPlayer(_run.Hero.ToString(), (int)_run.Day);
             var monsterState = BuildMonsterLootPlayerState(monster);
-            var effectiveLootRules = ActiveRules ?? _run.CustomRules;
-            var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, monsterState, _rng)
+            var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, monsterState, lootRng)
             {
                 CurrentDay = (int)_run.Day,
                 CurrentHour = (int)_run.Hour,
@@ -2887,10 +3104,11 @@ public sealed class ShopEngine
                     !CanOfferOwnedSkill(inst.Template.Id, ParseTier(inst.Tier.ToString()), ownedSkills))
                     continue;
                 if (!allowDuplicates && !usedTemplateIds.Add(inst.Template.Id)) continue;
-                int slotWidth = GetShelfSlotWidth(inst);
-                if (usedWidth + slotWidth > MaxShelfSlotWidth) continue;
+                bool isItemLoot = string.Equals(inst.Template.Type, "Item", StringComparison.OrdinalIgnoreCase);
+                int slotWidth = isItemLoot ? GetShelfSlotWidth(inst) : 0;
+                if (isItemLoot && usedWidth + slotWidth > MaxShelfSlotWidth) continue;
                 dealtList.Add(CreateEntryFromCoreInstance(inst, _run.SelectionRules.SelectionIsFree));
-                usedWidth += slotWidth;
+                if (isItemLoot) usedWidth += slotWidth;
             }
         }
 
@@ -2901,7 +3119,7 @@ public sealed class ShopEngine
             return events;
         }
 
-        // 2. 从野怪完整战利品池（专属装备 + 专属圆形 Skill + 背包消耗品）抽取
+        // 2. 从野怪完整战利品池（专属装备 + 专属圆形 Skill + 背包消耗品）抽取（D6-P1-10 + D6-P1-14：统一流 RNG + 升阶/附魔/多件配置）
         if (dealtList.Count == 0 && monster != null)
         {
             var monsterCandidates = new List<(CardPool.CardTemplate Tpl, ETier Tier, string? Enchantment)>();
@@ -2917,28 +3135,44 @@ public sealed class ShopEngine
 
             if (monsterCandidates.Count > 0)
             {
-                var pick = monsterCandidates[_rng.Next(monsterCandidates.Count)];
-                RunState.CardEntry entry;
-                if (pick.Tpl.Type == "Skill")
+                int desiredCount = Math.Min(ResolveConfiguredMonsterLootMaxSelections(), monsterCandidates.Count);
+                var poolCopy = new List<(CardPool.CardTemplate Tpl, ETier Tier, string? Enchantment)>(monsterCandidates);
+                for (int k = 0; k < desiredCount && poolCopy.Count > 0; k++)
                 {
-                    entry = CreateSkillCandidate(pick.Tpl, pick.Tier, isFree: _run.SelectionRules.SelectionIsFree);
+                    int idx = lootRng.Next(poolCopy.Count);
+                    var rawPick = poolCopy[idx];
+                    poolCopy.RemoveAt(idx);
+                    var (finalTier, finalEnch) = ApplyMonsterLootModifiers(rawPick.Tpl, rawPick.Tier, rawPick.Enchantment, effectiveLootRules, lootRng);
+
+                    RunState.CardEntry entry;
+                    if (rawPick.Tpl.Type == "Skill")
+                    {
+                        entry = CreateSkillCandidate(rawPick.Tpl, finalTier, isFree: _run.SelectionRules.SelectionIsFree);
+                    }
+                    else
+                    {
+                        entry = CreateItemCandidate(rawPick.Tpl, finalTier, isFree: _run.SelectionRules.SelectionIsFree);
+                        ApplyOptionalEnchantment(entry, finalEnch);
+                    }
+                    int slotWidth = GetMonsterLootSlotCost(rawPick.Tpl);
+                    if (dealtList.Count > 0 && usedWidth + slotWidth > MaxShelfSlotWidth) break;
+                    dealtList.Add(entry);
+                    usedWidth += slotWidth;
                 }
-                else
-                {
-                    entry = CreateItemCandidate(pick.Tpl, pick.Tier, isFree: _run.SelectionRules.SelectionIsFree);
-                    ApplyOptionalEnchantment(entry, pick.Enchantment);
-                }
-                dealtList.Add(entry);
             }
         }
 
-        // 3. 极少数无怪物且无 SpawnContext 的降级情形，按天品质表兜底 1 张物品
+        // 3. 极少数无怪物且无 SpawnContext 的降级情形，按天品质表兜底物品（D6-P1-10 透传 lootRng + D6-P1-14 应用规则强化）
         if (dealtList.Count == 0)
         {
-            var fallback = _pool.RollShopItems(_run.Hero.ToString(), (int)_run.Day, 1, _chances);
+            int desiredFallback = Math.Max(1, ResolveConfiguredMonsterLootMaxSelections());
+            var fallback = _pool.RollShopItems(_run.Hero.ToString(), (int)_run.Day, desiredFallback, _chances, ownedMaxTiers: null, archetypeResolver: null, rules: effectiveLootRules, rngOverride: lootRng);
             foreach (var (tpl, tierStr) in fallback)
             {
-                dealtList.Add(CreateItemCandidate(tpl, ParseTier(tierStr), isFree: _run.SelectionRules.SelectionIsFree));
+                var (finalTier, finalEnch) = ApplyMonsterLootModifiers(tpl, ParseTier(tierStr), null, effectiveLootRules, lootRng);
+                var entry = CreateItemCandidate(tpl, finalTier, isFree: _run.SelectionRules.SelectionIsFree);
+                ApplyOptionalEnchantment(entry, finalEnch);
+                dealtList.Add(entry);
             }
         }
 
@@ -2996,7 +3230,8 @@ public sealed class ShopEngine
         var queryPlayer = p1Core ?? BuildDummyQueryPlayer(_run.Hero.ToString(), (int)_run.Day);
         var monsterState = BuildMonsterLootPlayerState(monster);
         var effectiveDefeatRules = ActiveRules ?? _run.CustomRules;
-        var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, monsterState, _rng)
+        var defeatLootRng = ResolveStreamRng(DailyChallengeSeedGenerator.StreamLoot);
+        var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, monsterState, defeatLootRng)
         {
             CurrentDay = (int)_run.Day,
             CurrentHour = (int)_run.Hour,
@@ -3023,10 +3258,11 @@ public sealed class ShopEngine
                 !CanOfferOwnedSkill(inst.Template.Id, ParseTier(inst.Tier.ToString()), ownedSkills))
                 continue;
             if (!allowDuplicates && !usedTemplateIds.Add(inst.Template.Id)) continue;
-            int slotWidth = GetShelfSlotWidth(inst);
-            if (usedWidth + slotWidth > MaxShelfSlotWidth) continue;
+            bool isItemLoot = string.Equals(inst.Template.Type, "Item", StringComparison.OrdinalIgnoreCase);
+            int slotWidth = isItemLoot ? GetShelfSlotWidth(inst) : 0;
+            if (isItemLoot && usedWidth + slotWidth > MaxShelfSlotWidth) continue;
             dealtList.Add(CreateEntryFromCoreInstance(inst, rulesData.SelectionIsFree));
-            usedWidth += slotWidth;
+            if (isItemLoot) usedWidth += slotWidth;
         }
 
         if (dealtList.Count == 0)
@@ -3076,10 +3312,12 @@ public sealed class ShopEngine
         if (combatEncounterTpl != null && string.IsNullOrEmpty(_run.CurrentEncounterId))
             _run.CurrentEncounterId = combatEncounterTpl.Id;
 
+        var effectiveRules = ActiveRules ?? _run.CustomRules;
+        var lootRng = ResolveStreamRng(DailyChallengeSeedGenerator.StreamLoot);
         var candidates = CollectPaginatedMonsterLootCandidates(monster, p1Core);
         if (candidates.Count == 0)
         {
-            var fallback = _pool.RollShopItems(_run.Hero.ToString(), (int)_run.Day, 1, _chances);
+            var fallback = _pool.RollShopItems(_run.Hero.ToString(), (int)_run.Day, 1, _chances, ownedMaxTiers: null, archetypeResolver: null, rules: effectiveRules, rngOverride: lootRng);
             foreach (var (tpl, tierStr) in fallback)
             {
                 candidates.Add(new MonsterLootCandidate(
@@ -3090,31 +3328,14 @@ public sealed class ShopEngine
             }
         }
 
-        var effectiveRules = ActiveRules ?? _run.CustomRules;
         int lootMaxSelections = ResolveConfiguredMonsterLootMaxSelections();
 
-        // 若启用掉落品阶加成（如 ExtremeRoguelike +1 阶）或万物附魔，自动强化战利品候选
-        int tierBonus = effectiveRules?.MonsterLootTierBonus ?? 0;
-        bool forceEnchant = effectiveRules?.HasMutator(MutatorCatalog.AllEnchanted) == true;
-        if (tierBonus > 0 || forceEnchant)
+        // 若启用掉落品阶加成（如 ExtremeRoguelike +1 阶）或万物附魔，经统一 ApplyMonsterLootModifiers 强化战利品候选
+        for (int i = 0; i < candidates.Count; i++)
         {
-            var lootRng = ResolveStreamRng(DailyChallengeSeedGenerator.StreamLoot);
-            for (int i = 0; i < candidates.Count; i++)
-            {
-                var c = candidates[i];
-                ETier upgradedTier = c.Tier;
-                if (tierBonus > 0)
-                {
-                    int nextIdx = Math.Min((int)ETier.Legendary, (int)c.Tier + tierBonus);
-                    upgradedTier = ClampTierForTemplate(c.Template, _repo.GetCard(c.Template.Id), (ETier)nextIdx);
-                }
-                string? ench = c.Enchantment;
-                if (forceEnchant && string.IsNullOrWhiteSpace(ench) && c.Template.Type == "Item")
-                {
-                    ench = PickRandomLegalEnchantment(_repo.GetCard(c.Template.Id), lootRng);
-                }
-                candidates[i] = c with { Tier = upgradedTier, Enchantment = ench };
-            }
+            var c = candidates[i];
+            var (upgradedTier, ench) = ApplyMonsterLootModifiers(c.Template, c.Tier, c.Enchantment, effectiveRules, lootRng);
+            candidates[i] = c with { Tier = upgradedTier, Enchantment = ench };
         }
 
         PackMonsterLootPages(candidates, _monsterLootPages);
@@ -3187,7 +3408,7 @@ public sealed class ShopEngine
         var result = matched.Take(count).ToList();
         if (result.Count < count)
         {
-            var fallback = RollDayMatchedMonsters(Math.Max(wave, 8), count, visitedTodayIds: null, bannedIds);
+            var fallback = RollDayMatchedMonsters(Math.Max(wave, 8), count, visitedTodayIds: null, bannedIds, rng);
             foreach (var fb in fallback)
             {
                 if (result.Count >= count) break;
@@ -3197,18 +3418,39 @@ public sealed class ShopEngine
         return result;
     }
 
+    private (ETier Tier, string? Enchantment) ApplyMonsterLootModifiers(
+        CardPool.CardTemplate tpl,
+        ETier baseTier,
+        string? baseEnchantment,
+        CustomRunRuleSet? effectiveRules,
+        Random lootRng)
+    {
+        ETier upgradedTier = baseTier;
+        int tierBonus = effectiveRules?.MonsterLootTierBonus ?? 0;
+        if (tierBonus > 0)
+        {
+            int nextIdx = Math.Min((int)ETier.Legendary, (int)baseTier + tierBonus);
+            upgradedTier = ClampTierForTemplate(tpl, _repo.GetCard(tpl.Id), (ETier)nextIdx);
+        }
+        string? ench = baseEnchantment;
+        bool forceEnchant = effectiveRules?.HasMutator(MutatorCatalog.AllEnchanted) == true;
+        if (forceEnchant && string.IsNullOrWhiteSpace(ench) && string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase))
+        {
+            ench = PickRandomLegalEnchantment(_repo.GetCard(tpl.Id), lootRng);
+        }
+        return (upgradedTier, ench);
+    }
+
     private int ResolveConfiguredMonsterLootMaxSelections()
     {
         var effectiveRules = ActiveRules ?? _run.CustomRules;
+        int bonusChoices = Math.Max(0, effectiveRules?.MonsterLootBonusChoices ?? 0);
+        // D6-P1-14：BossRush 基础选择数同样叠加 MonsterLootBonusChoices，避免自定义多选被吞
         if (effectiveRules?.SpecialModeId == ESpecialModeId.BossRush)
         {
-            return Math.Max(1, BossRushCatalog.GetWave(Math.Max(1, (int)_run.Day)).VictoryLootChoices);
+            return Math.Max(1, BossRushCatalog.GetWave(Math.Max(1, (int)_run.Day)).VictoryLootChoices) + bonusChoices;
         }
-        if (effectiveRules != null && effectiveRules.MonsterLootBonusChoices > 0)
-        {
-            return 1 + effectiveRules.MonsterLootBonusChoices;
-        }
-        return 1;
+        return 1 + bonusChoices;
     }
 
     /// <summary>当前分页怪物战利品池中是否仍有未领完的剩余候选卡。</summary>
@@ -3766,16 +4008,10 @@ public sealed class ShopEngine
         var clampedTier = SpawnQueryEngine.ClampToSupportedTier(inst.Template, inst.Tier);
         if (clampedTier != inst.Tier)
         {
-            var rebuilt = new CardInstance(inst.Template, clampedTier, inst.Enchantment)
-            {
-                StartSlot = inst.StartSlot,
-            };
-            foreach (var (k, v) in inst.PermanentAdd) rebuilt.PermanentAdd[k] = v;
-            foreach (var (k, v) in inst.PermanentMult) rebuilt.PermanentMult[k] = v;
-            foreach (var (k, v) in inst.DayAdd) rebuilt.DayAdd[k] = v;
-            foreach (var (k, v) in inst.DayMult) rebuilt.DayMult[k] = v;
-            foreach (var (k, v) in inst.HourAdd) rebuilt.HourAdd[k] = v;
-            foreach (var (k, v) in inst.HourMult) rebuilt.HourMult[k] = v;
+            // D2-P2-06：复用 CloneNonCombatState 完整保留 AdditiveMult / 标签增删集 / 附魔三层 / Quest 状态，再调整品阶
+            var rebuilt = inst.CloneNonCombatState(inst.InstanceId);
+            rebuilt.SetTier(clampedTier, isTemporary: false);
+            rebuilt.RefillAmmoToMax();
             inst = rebuilt;
         }
 
@@ -3852,7 +4088,7 @@ public sealed class ShopEngine
         if (needsLocalAuraPreview)
         {
             int origSlot = inst.StartSlot;
-            var preview = new PlayerState("shelf_preview", "shelf_preview", _run.Hero.ToString(), 250, 20, 0, 10)
+            var preview = new PlayerState("shelf_preview", "shelf_preview", _run.Hero.ToString(), GameDefaults.StartingHealth, GameDefaults.StartingPrestige, 0, 10)
             {
                 Day = (int)_run.Day,
                 Hour = (int)_run.Hour,
@@ -4305,8 +4541,9 @@ public sealed class ShopEngine
         int day,
         int count,
         ISet<string>? visitedTodayIds = null,
-        ISet<string>? bannedIds = null)
-        => OfficialDaySchedule.SelectDayMonsters(day, count, _pool, _repo, _rng, visitedTodayIds, bannedIds);
+        ISet<string>? bannedIds = null,
+        Random? rngOverride = null)
+        => OfficialDaySchedule.SelectDayMonsters(day, count, _pool, _repo, rngOverride ?? _rng, visitedTodayIds, bannedIds);
 
     private bool IsMerchantEncounter(CardPool.CardTemplate? tpl, BazaarCore.Models.CardTemplate? coreTpl = null)
     {
@@ -4320,13 +4557,14 @@ public sealed class ShopEngine
         IReadOnlyList<CardPool.CardTemplate> list,
         HashSet<string> used,
         Func<string, ulong>? archetypeResolver = null,
-        CustomRunRuleSet? rules = null)
+        CustomRunRuleSet? rules = null,
+        Random? rngOverride = null)
     {
         if (list.Count == 0) return null;
         var avail = list.Where(c => !used.Contains(c.Id)).ToList();
         if (avail.Count == 0) return null;
 
-        var pick = SpawnQueryEngine.PickWeightedByArchetype(avail, c => c.Id, _rng, archetypeResolver, rules)!;
+        var pick = SpawnQueryEngine.PickWeightedByArchetype(avail, c => c.Id, rngOverride ?? _rng, archetypeResolver, rules)!;
         used.Add(pick.Id);
         return pick;
     }
@@ -4334,9 +4572,9 @@ public sealed class ShopEngine
     private PlayerState BuildDummyQueryPlayer(string hero, int day)
     {
         EnsureRunExclusionSetInitialized();
-        int hpMax = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, 250);
-        int prestige = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, 20);
-        int gold = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 8);
+        int hpMax = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, GameDefaults.StartingHealth);
+        int prestige = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, GameDefaults.StartingPrestige);
+        int gold = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, GameDefaults.StartingGold);
         var ps = new PlayerState("query", "query", hero, hpMax, prestige, gold, 10)
         {
             Day = day,
@@ -4354,18 +4592,8 @@ public sealed class ShopEngine
         }
         ps.Hand.UnlockedMask = _run.UnlockedSlots;
         ps.Stash.UnlockedMask = 1023;
-        foreach (var (ak, av) in _run.PlayerAttributes)
-        {
-            string key = ak.ToString();
-            double baseVal = av;
-            double mult = _run.PlayerAuraMult.GetValueOrDefault(key, 1.0);
-            if (Math.Abs(mult) > 1e-6 && Math.Abs(mult - 1.0) > 1e-6)
-                baseVal /= mult;
-            baseVal -= _run.PlayerAuraAdd.GetValueOrDefault(key, 0.0);
-            ps.Attributes[key] = baseVal;
-        }
-        foreach (var (k, v) in _run.PlayerAuraAdd) ps.AuraAdd[k] = v;
-        foreach (var (k, v) in _run.PlayerAuraMult) ps.AuraMult[k] = v;
+        // D2-P1-08：使用单一共享正向分层装配器，装齐 Hour/Day/Aura 全部 9 层修饰字典，彻底消灭漏装限时层与反除归零
+        _run.ApplyLayeredPlayerStateTo(ps);
 
         foreach (var c in _run.Cards.Values
             .Where(c => c.Owner == ECombatantId.Player && c.CoreCard != null)
@@ -4477,7 +4705,7 @@ public sealed class ShopEngine
         _ => ECardSize.Medium,
     };
 
-    public static ETier ParseTier(string s) => s switch
+    public static ETier ParseTier(string? s) => s switch
     {
         "Silver" => ETier.Silver,
         "Gold" => ETier.Gold,

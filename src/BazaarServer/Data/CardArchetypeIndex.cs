@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using BazaarCore.Data;
 using BazaarCore.Models;
@@ -452,10 +453,75 @@ public sealed class CardArchetypeIndex
             return spawn.Groups.Any(g => (g.Filters ?? []).Any(f =>
                 f.Type == "TSpawnFilterQuery" &&
                 f.RawConstraintsElement.HasValue &&
-                (f.RawConstraintsElement.Value.ToString().Contains("\"Item\"", StringComparison.OrdinalIgnoreCase) ||
-                 f.RawConstraintsElement.Value.ToString().Contains("\"Skill\"", StringComparison.OrdinalIgnoreCase))));
+                (HasPositiveCardTypeConstraint(f.RawConstraintsElement.Value, "Item") ||
+                 HasPositiveCardTypeConstraint(f.RawConstraintsElement.Value, "Skill"))));
         }
 
+        return false;
+    }
+
+    /// <summary>
+    /// D2-P2-07：递归解析 Constraint AST（支持 TConstraintAnd / TConstraintOr / TConstraintCardType / ConstraintCardType 与 IsNot 翻转），
+    /// 仅当目标卡种在正向语义下被显式要求时返回 true，绝不把 `IsNot: true`（如排除 Skill 的物品商人）误判为正向约束。
+    /// </summary>
+    internal static bool HasPositiveCardTypeConstraint(JsonElement element, string targetCardType, bool inheritedNegated = false)
+        => HasPositiveCardTypeConstraintCore(element, targetCardType, inheritedNegated, depth: 0);
+
+    private static bool HasPositiveCardTypeConstraintCore(JsonElement element, string targetCardType, bool inheritedNegated, int depth)
+    {
+        if (depth > 16) return false;
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                if (HasPositiveCardTypeConstraintCore(item, targetCardType, inheritedNegated, depth + 1))
+                    return true;
+            }
+            return false;
+        }
+        if (element.ValueKind != JsonValueKind.Object)
+            return false;
+
+        bool localIsNot = false;
+        if (element.TryGetProperty("IsNot", out var isNotEl) && isNotEl.ValueKind == JsonValueKind.True)
+            localIsNot = true;
+        bool effectiveNegated = inheritedNegated ^ localIsNot;
+
+        string? typeDisc = null;
+        if (element.TryGetProperty("$type", out var tEl) && tEl.ValueKind == JsonValueKind.String)
+            typeDisc = tEl.GetString();
+
+        bool isCardTypeNode = !string.IsNullOrEmpty(typeDisc) &&
+            (typeDisc.Equals("TConstraintCardType", StringComparison.OrdinalIgnoreCase) ||
+             typeDisc.Equals("ConstraintCardType", StringComparison.OrdinalIgnoreCase));
+
+        if (isCardTypeNode)
+        {
+            if (effectiveNegated) return false;
+            if (element.TryGetProperty("Types", out var typesEl) && typesEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var t in typesEl.EnumerateArray())
+                {
+                    if (t.ValueKind == JsonValueKind.String &&
+                        string.Equals(t.GetString(), targetCardType, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+            if (element.TryGetProperty("CardType", out var ctEl) && ctEl.ValueKind == JsonValueKind.String &&
+                string.Equals(ctEl.GetString(), targetCardType, StringComparison.OrdinalIgnoreCase))
+                return true;
+            return false;
+        }
+
+        // 递归扫描复合逻辑容器（Constraints / Conditions / Constraint / Condition）
+        foreach (var propName in new[] { "Constraints", "Conditions", "Constraint", "Condition" })
+        {
+            if (element.TryGetProperty(propName, out var child) &&
+                HasPositiveCardTypeConstraintCore(child, targetCardType, effectiveNegated, depth + 1))
+            {
+                return true;
+            }
+        }
         return false;
     }
 
@@ -489,7 +555,7 @@ public sealed class CardArchetypeIndex
                 foreach (var f in grp.Filters)
                 {
                     if (f.RawConstraintsElement.HasValue &&
-                        f.RawConstraintsElement.Value.ToString().Contains("\"Skill\"", StringComparison.OrdinalIgnoreCase))
+                        HasPositiveCardTypeConstraint(f.RawConstraintsElement.Value, "Skill"))
                     {
                         return true;
                     }

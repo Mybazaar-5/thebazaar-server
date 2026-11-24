@@ -60,9 +60,6 @@ public static partial class ModValidator
         "$schema", "note", "comment", "baseVisualNote", "tier", "displayNameEn", "affectsStandardGhostPool"
     };
 
-    [GeneratedRegex("^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$|^[a-z0-9]{2}$", RegexOptions.CultureInvariant)]
-    private static partial Regex ModIdRegex();
-
     [GeneratedRegex(@"\{([^}]+)\}", RegexOptions.CultureInvariant)]
     private static partial Regex PlaceholderTokenRegex();
 
@@ -73,7 +70,7 @@ public static partial class ModValidator
     private static partial Regex TooltipLinkTagRegex();
 
     public static bool IsValidModId(string? modId)
-        => !string.IsNullOrWhiteSpace(modId) && ModIdRegex().IsMatch(modId.Trim());
+        => SafePathGuard.IsValidModId(modId);
 
     /// <summary>
     /// 校验并按依赖拓扑顺序排序全部候选 ModPackage（执行全部静态 8 闸门拦截，供 ModRegistry 装载与热重载调用）。
@@ -453,6 +450,9 @@ public static partial class ModValidator
         CheckSafeContentRoot(modId, "contentRoots.modes", roots.Modes, issues);
         CheckSafeContentRoot(modId, "contentRoots.localization", roots.Localization, issues);
         CheckSafeContentRoot(modId, "contentRoots.assets", roots.Assets, issues);
+        // D3-P2-08：Gate #1 补检 contentRoots.mechanics 与 contentRoots.artManifest，拦截目录穿越或绝对路径
+        CheckSafeContentRoot(modId, "contentRoots.mechanics", roots.Mechanics, issues);
+        CheckSafeContentRoot(modId, "contentRoots.artManifest", roots.ArtManifest, issues);
 
         void CheckCardSchema(CustomCardDefinition card)
         {
@@ -566,6 +566,98 @@ public static partial class ModValidator
                         issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "INVALID_TIER_KEY",
                             $"原位补丁 '{pid}' 包含非法品阶键 '{tk}'。", pid, GateId: 1));
                 }
+            }
+            ValidateCardCounterDisplays(modId, pid, patch.CounterDisplaysOverride, issues);
+        }
+
+        // D3-P1-06：校验卡牌级 CounterDisplays 槽位上限与同步属性白名单
+        foreach (var card in pkg.Cards)
+        {
+            string cid = string.IsNullOrWhiteSpace(card.CustomId) ? "<unnamed-card>" : card.CustomId.Trim();
+            ValidateCardCounterDisplays(modId, cid, card.CounterDisplays, issues);
+        }
+
+        // P0-22：将 CustomMutators 纳入 Gate #1/#4 合法性与参数边界校验
+        var seenMutatorIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var mut in pkg.CustomMutators)
+        {
+            if (mut == null || string.IsNullOrWhiteSpace(mut.Id))
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "MUTATOR_INVALID_ID",
+                    "自定义突变词条缺少合法 id。", GateId: 1));
+                continue;
+            }
+            string mid = mut.Id.Trim();
+            if (MutatorCatalog.ById.ContainsKey(mid))
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "MUTATOR_BUILTIN_CONFLICT",
+                    $"自定义突变词条 '{mid}' 与内置官方词条 ID 冲突。", mid, GateId: 2));
+            }
+            if (!seenMutatorIds.Add(mid))
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "MUTATOR_DUPLICATE_ID",
+                    $"Mod 内存在重复的自定义突变词条 ID '{mid}'。", mid, GateId: 2));
+            }
+
+            if (MutatorCatalog.TryReadRuleDouble(mut, "combatPeriodicIntervalMs", out double pInt) && pInt < 250)
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "MUTATOR_PARAM_OUT_OF_RANGE",
+                    $"自定义突变词条 '{mid}' 的 combatPeriodicIntervalMs={pInt} 过小（必须 >= 250ms 防每帧卡死）。", mid, GateId: 4));
+            }
+            if (MutatorCatalog.TryReadRuleDouble(mut, "combatPeriodicTriggerAfterMs", out double pAfter) && pAfter < 0)
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "MUTATOR_PARAM_OUT_OF_RANGE",
+                    $"自定义突变词条 '{mid}' 的 combatPeriodicTriggerAfterMs={pAfter} 不可为负。", mid, GateId: 4));
+            }
+            if (MutatorCatalog.TryReadRuleDouble(mut, "minCooldownFloorMs", out double minCd) && minCd < 500)
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "MUTATOR_PARAM_OUT_OF_RANGE",
+                    $"自定义突变词条 '{mid}' 的 minCooldownFloorMs={minCd} 低于安全下限 500ms。", mid, GateId: 4));
+            }
+            foreach (var multKey in new[] { "healthMultiplier", "monsterHealthMultiplier", "damageAndDotMultiplier", "shieldAndRegenMultiplier", "shopPriceMultiplier", "boostModCardWeight" })
+            {
+                if (MutatorCatalog.TryReadRuleDouble(mut, multKey, out double mv) && (mv < 0.1 || mv > 10.0))
+                {
+                    issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "MUTATOR_PARAM_OUT_OF_RANGE",
+                        $"自定义突变词条 '{mid}' 的倍率参数 {multKey}={mv} 超出安全区间 [0.1, 10.0]。", mid, GateId: 4));
+                }
+            }
+            foreach (var amtKey in new[] { "combatBothApplyBurn", "combatBothApplyPoison", "combatBothApplyDamage" })
+            {
+                if (MutatorCatalog.TryReadRuleDouble(mut, amtKey, out double av) && (av < 0 || av > 500))
+                {
+                    issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "MUTATOR_PARAM_OUT_OF_RANGE",
+                        $"自定义突变词条 '{mid}' 的周期参数 {amtKey}={av} 超出安全区间 [0, 500]。", mid, GateId: 4));
+                }
+            }
+        }
+    }
+
+    private static void ValidateCardCounterDisplays(
+        string modId,
+        string targetId,
+        IReadOnlyList<MechanicCounterDisplay>? displays,
+        List<ModValidationIssue> issues)
+    {
+        if (displays == null || displays.Count == 0) return;
+        if (displays.Count > 4)
+        {
+            issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "COUNTER_DISPLAY_TOO_MANY",
+                $"条目 '{targetId}' 声明了 {displays.Count} 个 counterDisplays 槽位，超过上限 4。", targetId, GateId: 1));
+        }
+        for (int i = 0; i < displays.Count; i++)
+        {
+            var cd = displays[i];
+            if (cd == null) continue;
+            if (string.IsNullOrWhiteSpace(cd.SyncAttribute) || !MechanicDefinition.AllowedCounterDisplayAttributes.Contains(cd.SyncAttribute.Trim()))
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "COUNTER_DISPLAY_INVALID_ATTR",
+                    $"条目 '{targetId}' counterDisplays[{i}].syncAttribute='{cd.SyncAttribute}' 不在合法白名单内。", targetId, GateId: 1));
+            }
+            if (!string.IsNullOrWhiteSpace(cd.MaxAttr) && !MechanicDefinition.AllowedCounterDisplayAttributes.Contains(cd.MaxAttr.Trim()))
+            {
+                issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "COUNTER_DISPLAY_INVALID_ATTR",
+                    $"条目 '{targetId}' counterDisplays[{i}].maxAttr='{cd.MaxAttr}' 不在合法白名单内。", targetId, GateId: 1));
             }
         }
     }
@@ -1270,18 +1362,133 @@ public static partial class ModValidator
         foreach (var c in pkg.Cards)
             ValidateCooldownAndSelfLoop(c.CustomId, c.Type, c.Attributes, c.Tiers, c.Abilities, c.Auras);
 
+        // D3-P2-02 & D3-P2-03：Gate #5 静态扫描自定义机制 AST（拦截无条件自循环与非法 VFX 键，VFX 白名单统一委托 CombatSimulator.IsValidVfxKey）
+        static void ScanMechanicStepsForSelfLoopAndVfx(
+            IReadOnlyList<MechanicStep>? steps,
+            string modId,
+            string mechId,
+            string hookName,
+            bool isSelfReentryHook,
+            bool insideGuardBranch,
+            bool hasHookMaxTriggers,
+            GameDataRepository baseRepo,
+            List<ModValidationIssue> sink,
+            int depth = 0)
+        {
+            if (steps == null || depth > 16) return;
+            for (int i = 0; i < steps.Count; i++)
+            {
+                var st = steps[i];
+                if (st == null) continue;
+                if (!string.IsNullOrWhiteSpace(st.VfxKey) && !BazaarCore.Combat.CombatSimulator.IsValidVfxKey(st.VfxKey, baseRepo))
+                {
+                    sink.Add(new ModValidationIssue(
+                        ModValidationSeverity.Error,
+                        modId,
+                        "MECHANIC_INVALID_VFX_KEY",
+                        $"机制 '{mechId}' 钩子 '{hookName}' 使用了不在官方 VFX 白名单内的特效键 '{st.VfxKey}'。",
+                        mechId,
+                        GateId: 5,
+                        FixHintZh: "请改用 ModRuleCatalog.OfficialVfxPresets 中的官方预设别名（如 Fireball/Cannonball/LaserRed）或 GameData.db 原生 Prefab 路径。"));
+                }
+
+                bool targetsSelf = st.TargetSpec == null
+                    || string.IsNullOrWhiteSpace(st.TargetSpec.Mode)
+                    || string.Equals(st.TargetSpec.Mode, "Self", StringComparison.OrdinalIgnoreCase);
+
+                if (isSelfReentryHook && !insideGuardBranch && !hasHookMaxTriggers && targetsSelf)
+                {
+                    bool isSelfForceUse = string.Equals(st.Op, "ForceUseCard", StringComparison.OrdinalIgnoreCase);
+                    bool isSelfCharge = string.Equals(st.Op, "ApplyStatus", StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(st.Status, "Charge", StringComparison.OrdinalIgnoreCase);
+                    if (isSelfForceUse || isSelfCharge)
+                    {
+                        sink.Add(new ModValidationIssue(
+                            ModValidationSeverity.Error,
+                            modId,
+                            "MECHANIC_SELF_LOOP_RISK",
+                            $"机制 '{mechId}' 在钩子 '{hookName}' 中对自身无条件执行 '{st.Op}'，存在无限递归自循环风险。",
+                            mechId,
+                            GateId: 5,
+                            FixHintZh: "请改作用于相邻/随机其他卡，或添加条件分支 / maxTriggersPerCombat 限次保护。"));
+                    }
+                }
+
+                if (st.Then != null)
+                    ScanMechanicStepsForSelfLoopAndVfx(st.Then, modId, mechId, hookName, isSelfReentryHook, insideGuardBranch: true, hasHookMaxTriggers, baseRepo, sink, depth + 1);
+                if (st.Else != null)
+                    ScanMechanicStepsForSelfLoopAndVfx(st.Else, modId, mechId, hookName, isSelfReentryHook, insideGuardBranch: true, hasHookMaxTriggers, baseRepo, sink, depth + 1);
+                if (st.Steps != null)
+                {
+                    bool nextGuard = insideGuardBranch || string.Equals(st.Op, "ScheduleDelayed", StringComparison.OrdinalIgnoreCase);
+                    ScanMechanicStepsForSelfLoopAndVfx(st.Steps, modId, mechId, hookName, isSelfReentryHook, nextGuard, hasHookMaxTriggers, baseRepo, sink, depth + 1);
+                }
+            }
+        }
+
+        foreach (var mech in pkg.Mechanics)
+        {
+            if (mech?.Hooks == null) continue;
+            string mid = string.IsNullOrWhiteSpace(mech.Id) ? "<empty-mechanic>" : mech.Id;
+            for (int hi = 0; hi < mech.Hooks.Count; hi++)
+            {
+                var hk = mech.Hooks[hi];
+                if (hk?.Steps == null) continue;
+                bool isSelfReentryHook = string.Equals(hk.Hook, "OnCardFired", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(hk.Hook, "AfterCardFire", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(hk.Hook, "OnCardCharged", StringComparison.OrdinalIgnoreCase);
+                bool hasCap = hk.MaxTriggersPerCombat is > 0;
+                ScanMechanicStepsForSelfLoopAndVfx(hk.Steps, modId, mid, hk.Hook, isSelfReentryHook, insideGuardBranch: false, hasCap, baseRepo, issues);
+            }
+        }
+
         foreach (var p in pkg.Patches)
         {
             var baseCard = baseRepo.GetCard(p.TargetTemplateId);
-            var fakeTiers = p.TierAttributeOverrides?.ToDictionary(
-                kv => kv.Key,
-                kv => new TierData { Attributes = kv.Value },
-                StringComparer.OrdinalIgnoreCase);
+            // P0-25：合并原版目标卡的基础属性与阶位属性，再叠加 Patch 覆写，避免仅改伤害/文本/附魔的主动武器 Patch 误报 COOLDOWN_MISSING，
+            // 同时仍能拦截 Patch 将 CooldownMax 改为非法低值或把秒当毫秒的错误。
+            var mergedTopAttrs = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            if (baseCard?.Attributes != null)
+            {
+                foreach (var (ak, av) in baseCard.Attributes)
+                    mergedTopAttrs[ak] = av;
+            }
+            if (p.AttributeOverrides != null)
+            {
+                foreach (var (ak, av) in p.AttributeOverrides)
+                    mergedTopAttrs[ak] = av;
+            }
+
+            var mergedTiers = new Dictionary<string, TierData>(StringComparer.OrdinalIgnoreCase);
+            if (baseCard?.Tiers != null)
+            {
+                foreach (var (tk, td) in baseCard.Tiers)
+                {
+                    mergedTiers[tk] = new TierData
+                    {
+                        Attributes = new Dictionary<string, double>(td.Attributes, StringComparer.OrdinalIgnoreCase)
+                    };
+                }
+            }
+            if (p.TierAttributeOverrides != null)
+            {
+                foreach (var (tk, attrs) in p.TierAttributeOverrides)
+                {
+                    if (!mergedTiers.TryGetValue(tk, out var td))
+                    {
+                        td = new TierData { Attributes = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase) };
+                        mergedTiers[tk] = td;
+                    }
+                    foreach (var (ak, av) in attrs)
+                        td.Attributes[ak] = av;
+                }
+            }
+
             ValidateCooldownAndSelfLoop(
                 p.TargetTemplateId,
                 baseCard?.Type ?? "Item",
-                p.AttributeOverrides,
-                fakeTiers,
+                mergedTopAttrs.Count > 0 ? mergedTopAttrs : null,
+                mergedTiers.Count > 0 ? mergedTiers : null,
                 p.AbilitiesOverride ?? baseCard?.Abilities,
                 p.AurasOverride ?? baseCard?.Auras);
         }
@@ -1821,15 +2028,21 @@ public static partial class ModValidator
             {
                 issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "ASSET_FORMAT_UNSUPPORTED_FOR_UNITY",
                     $"资产 '{asset.LogicalPath}' 为 WebP 格式；原版 Unity 客户端 ImageConversion.LoadImage 无法原生解码 WebP，会导致卡图静默失效。",
-                    asset.LogicalPath, GateId: 8, FixHintZh: "请将图片转换为标准 PNG 格式（或直接在 /workshop 网页端拖拽上传自动转 PNG）。"));
+                    asset.LogicalPath, GateId: 8, FixHintZh: "请将图片转换为标准 PNG（推荐透明图）或 JPG/JPEG 格式后重新打包（或直接在 /workshop 网页端拖拽上传自动转 PNG）。"));
                 continue;
             }
 
-            if (!string.Equals(asset.ContentType, "image/png", StringComparison.OrdinalIgnoreCase))
+            // P0-28（方案 A）：严格仅放行真实 PNG（.png）与真实 JPEG（.jpg/.jpeg）
+            bool isAllowedMime = string.Equals(asset.ContentType, "image/png", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(asset.ContentType, "image/jpeg", StringComparison.OrdinalIgnoreCase);
+            bool isAllowedExt = asset.LogicalPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+                || asset.LogicalPath.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase)
+                || asset.LogicalPath.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase);
+            if (!isAllowedMime || !isAllowedExt)
             {
                 issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "ASSET_MAGIC_INVALID",
-                    $"资产 '{asset.LogicalPath}' 不是合法的标准 PNG 文件（PNG 8 字节魔数校验失败）。",
-                    asset.LogicalPath, GateId: 8, FixHintZh: "请提供真实 PNG 图像（64~1024px，<= 2MB）。"));
+                    $"资产 '{asset.LogicalPath}' 不是合法的标准 PNG/JPEG 文件（魔数头校验失败，检测到 ContentType='{asset.ContentType}'）。",
+                    asset.LogicalPath, GateId: 8, FixHintZh: "请提供真实 PNG 或 JPG/JPEG 图像（64~1024px，<= 2MB），勿使用 WebP 或伪改后缀。"));
                 continue;
             }
 
@@ -1881,13 +2094,26 @@ public static partial class ModValidator
             }
         }
 
-        foreach (var c in pkg.Cards) CheckArtReference(c.CustomId, c.CustomArtFile);
+        foreach (var c in pkg.Cards)
+        {
+            CheckArtReference(c.CustomId, c.CustomArtFile);
+            CheckArtReference(c.CustomId, c.CustomBgArtFile);
+        }
         foreach (var ev in pkg.Events)
         {
             CheckArtReference(ev.EventId, ev.CustomArtFile);
-            foreach (var st in ev.Steps) CheckArtReference(st.CustomId, st.CustomArtFile);
+            CheckArtReference(ev.EventId, ev.CustomBgArtFile);
+            foreach (var st in ev.Steps)
+            {
+                CheckArtReference(st.CustomId, st.CustomArtFile);
+                CheckArtReference(st.CustomId, st.CustomBgArtFile);
+            }
         }
-        foreach (var p in pkg.Patches) CheckArtReference(p.TargetTemplateId, p.CustomArtFile);
+        foreach (var p in pkg.Patches)
+        {
+            CheckArtReference(p.TargetTemplateId, p.CustomArtFile);
+            CheckArtReference(p.TargetTemplateId, p.CustomBgArtFile);
+        }
     }
 
     private static void RunGate10IsolationAndInvariants(
@@ -1899,7 +2125,8 @@ public static partial class ModValidator
     {
         string modId = targetPkg.Manifest.Id;
         bool hasGameplayChange = targetPkg.Cards.Count > 0 || targetPkg.Patches.Count > 0
-            || targetPkg.Events.Count > 0 || targetPkg.Monsters.Count > 0 || targetPkg.Modes.Count > 0;
+            || targetPkg.Events.Count > 0 || targetPkg.Monsters.Count > 0 || targetPkg.Modes.Count > 0
+            || targetPkg.CustomMutators.Count > 0 || targetPkg.Mechanics.Count > 0;
 
         // 1. 幽灵池隔离验证
         if (hasGameplayChange && string.Equals(targetPkg.Manifest.Scope, "cosmetic-only", StringComparison.OrdinalIgnoreCase))
@@ -1916,8 +2143,8 @@ public static partial class ModValidator
                 GateId: 10, FixHintZh: "将 mod.json 中的 affectsGhostPool 设为 false。"));
         }
 
-        // 2. 隔离沙盒 ModRegistry 装入 -> 检查 UnknownRuleTypes / Wire 映射 / RollbackToBase 零残留
-        var sandbox = new ModRegistry(baseRepo, validVisualWhitelist);
+        // 2. 隔离沙盒 ModRegistry 装入（显式 CreateIsolated 禁触全局静态 ModRuntimeHooks）-> 检查 UnknownRuleTypes / Wire 映射 / RollbackToBase 零残留
+        var sandbox = ModRegistry.CreateIsolated(baseRepo, validVisualWhitelist);
         int baseCardCount = baseRepo.CardsById.Count;
 
         // 若目标包有声明依赖且在上下文中存在，一并装入沙盒以保证真实装载
@@ -1966,14 +2193,16 @@ public static partial class ModValidator
             }
         }
 
-        // 3. 回滚零残留校验（不影响外层真实服务状态：注意不清空全局 ModRuntimeHooks 如果外部已有注册，只校验沙盒自身状态归零）
+        // 3. 回滚零残留校验（sandbox 为 CreateIsolated，RollbackToBase 绝不清空全局 ModRuntimeHooks）
         sandbox.RollbackToBase();
         if (sandbox.ActiveRepository.CardsById.Count != baseCardCount
             || sandbox.LoadedPackages.Count != 0
-            || sandbox.VisualBindingsByCustomId.Count != 0)
+            || sandbox.VisualBindingsByCustomId.Count != 0
+            || sandbox.MechanicsById.Count != 0
+            || sandbox.RuntimeContext.MechanicsById.Count != 0)
         {
             issues.Add(new ModValidationIssue(ModValidationSeverity.Error, modId, "ROLLBACK_STATE_LEAK",
-                "执行 ModRegistry.RollbackToBase() 后仍有自定义卡或视觉绑定残留。", GateId: 10));
+                "执行 ModRegistry.RollbackToBase() 后仍有自定义卡、机制或视觉绑定残留。", GateId: 10));
         }
     }
 
@@ -2178,20 +2407,14 @@ public static partial class ModValidator
         return false;
     }
 
-    /// <summary>校验相对路径不含盘符、绝对根路径或 `..` 目录穿越段。</summary>
+    /// <summary>校验相对路径不含盘符、绝对根路径、Windows 保留设备名或 `..` 目录穿越段。</summary>
     public static bool IsSafeRelativePath(string? relativePath)
     {
         if (string.IsNullOrWhiteSpace(relativePath)) return false;
-        string normalized = NormalizeLogicalPath(relativePath);
-        if (Path.IsPathRooted(normalized) || normalized.StartsWith('/') || normalized.Contains(':'))
+        string trimmed = relativePath.Trim();
+        if (trimmed.StartsWith('/') || trimmed.StartsWith('\\') || Path.IsPathRooted(trimmed))
             return false;
-        var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        for (int i = 0; i < segments.Length; i++)
-        {
-            if (segments[i] == ".." || segments[i] == ".")
-                return false;
-        }
-        return segments.Length > 0;
+        return SafePathGuard.IsSafeRelativePath(SafePathGuard.NormalizeLogicalPath(trimmed));
     }
 
     public static string NormalizeLogicalPath(string path)
@@ -2218,33 +2441,78 @@ public static partial class ModValidator
             return width > 0 && height > 0;
         }
 
-        // WebP: RIFF....WEBP（识别出来交由 Gate #8 报 ASSET_FORMAT_UNSUPPORTED_FOR_UNITY，而非误判未知文件）
-        if (bytes.Length >= 30
+        // JPEG (P0-28 方案 A): SOI (FF D8 FF) + 段循环解析 SOF0/SOF1/SOF2/SOF3 提取大端宽高，防畸形 segLen < 2 死循环
+        if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
+        {
+            int pos = 2;
+            while (pos + 3 < bytes.Length)
+            {
+                if (bytes[pos] != 0xFF)
+                    break;
+                while (pos < bytes.Length && bytes[pos] == 0xFF)
+                    pos++;
+                if (pos >= bytes.Length)
+                    break;
+
+                byte marker = bytes[pos++];
+                // 无载荷标记（RST0..7 / SOI / EOI / TEM）
+                if (marker == 0xD9 || marker == 0xDA) // EOI 或 SOS（进入压缩流，SOF 必在之前）
+                    break;
+                if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD8))
+                    continue;
+
+                if (pos + 1 >= bytes.Length)
+                    break;
+                int segLen = (bytes[pos] << 8) | bytes[pos + 1];
+                if (segLen < 2 || pos + segLen > bytes.Length)
+                    break;
+
+                // SOF0(C0) / SOF1(C1) / SOF2(C2) / SOF3(C3) / SOF5..7 / SOF9..11 / SOF13..15
+                bool isSof = marker is 0xC0 or 0xC1 or 0xC2 or 0xC3 or 0xC5 or 0xC6 or 0xC7 or 0xC9 or 0xCA or 0xCB or 0xCD or 0xCE or 0xCF;
+                if (isSof && segLen >= 7 && pos + 6 < bytes.Length)
+                {
+                    height = (bytes[pos + 3] << 8) | bytes[pos + 4];
+                    width = (bytes[pos + 5] << 8) | bytes[pos + 6];
+                    contentType = "image/jpeg";
+                    return width > 0 && height > 0;
+                }
+
+                pos += segLen;
+            }
+            return false;
+        }
+
+        // WebP: RIFF....WEBP（12 字节即可命中魔数，识别出来交由 Gate #8 报 ASSET_FORMAT_UNSUPPORTED_FOR_UNITY，防伪改后缀漏检）
+        if (bytes.Length >= 12
             && bytes[0] == (byte)'R' && bytes[1] == (byte)'I' && bytes[2] == (byte)'F' && bytes[3] == (byte)'F'
             && bytes[8] == (byte)'W' && bytes[9] == (byte)'E' && bytes[10] == (byte)'B' && bytes[11] == (byte)'P')
         {
             contentType = "image/webp";
-            if (bytes[12] == (byte)'V' && bytes[13] == (byte)'P' && bytes[14] == (byte)'8' && bytes[15] == (byte)'X')
+            if (bytes.Length >= 30)
             {
-                width = 1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16));
-                height = 1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16));
-                return width > 0 && height > 0;
+                if (bytes[12] == (byte)'V' && bytes[13] == (byte)'P' && bytes[14] == (byte)'8' && bytes[15] == (byte)'X')
+                {
+                    width = 1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16));
+                    height = 1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16));
+                    return width > 0 && height > 0;
+                }
+                if (bytes[12] == (byte)'V' && bytes[13] == (byte)'P' && bytes[14] == (byte)'8' && bytes[15] == (byte)'L'
+                    && bytes[20] == 0x2F)
+                {
+                    uint bits = (uint)(bytes[21] | (bytes[22] << 8) | (bytes[23] << 16) | (bytes[24] << 24));
+                    width = (int)(bits & 0x3FFF) + 1;
+                    height = (int)((bits >> 14) & 0x3FFF) + 1;
+                    return width > 0 && height > 0;
+                }
+                if (bytes[12] == (byte)'V' && bytes[13] == (byte)'P' && bytes[14] == (byte)'8' && bytes[15] == (byte)' '
+                    && bytes[23] == 0x9D && bytes[24] == 0x01 && bytes[25] == 0x2A)
+                {
+                    width = (bytes[26] | (bytes[27] << 8)) & 0x3FFF;
+                    height = (bytes[28] | (bytes[29] << 8)) & 0x3FFF;
+                    return width > 0 && height > 0;
+                }
             }
-            if (bytes[12] == (byte)'V' && bytes[13] == (byte)'P' && bytes[14] == (byte)'8' && bytes[15] == (byte)'L'
-                && bytes[20] == 0x2F)
-            {
-                uint bits = (uint)(bytes[21] | (bytes[22] << 8) | (bytes[23] << 16) | (bytes[24] << 24));
-                width = (int)(bits & 0x3FFF) + 1;
-                height = (int)((bits >> 14) & 0x3FFF) + 1;
-                return width > 0 && height > 0;
-            }
-            if (bytes[12] == (byte)'V' && bytes[13] == (byte)'P' && bytes[14] == (byte)'8' && bytes[15] == (byte)' '
-                && bytes[23] == 0x9D && bytes[24] == 0x01 && bytes[25] == 0x2A)
-            {
-                width = (bytes[26] | (bytes[27] << 8)) & 0x3FFF;
-                height = (bytes[28] | (bytes[29] << 8)) & 0x3FFF;
-                return width > 0 && height > 0;
-            }
+            return false;
         }
 
         return false;

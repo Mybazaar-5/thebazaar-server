@@ -14,6 +14,7 @@ namespace BazaarHub.UI;
 /// </summary>
 public sealed class MainForm : Form
 {
+    private readonly HubPresetConfig _preset = HubPresetRegistry.Current;
     private readonly GameLocatorService _locator = new();
     private readonly LauncherConfigService _configService = new();
     private readonly ServerProbeService _probeService = new();
@@ -45,6 +46,7 @@ public sealed class MainForm : Form
     private readonly DiagnosticsPage _diagPage;
 
     private readonly Dictionary<ServerMode, ServerProbeResult> _probeResults = new();
+    private readonly CancellationTokenSource _formCts = new();
     private HubPreferences _preferences = new();
     private GameInstallInfo? _gameInstall;
     private bool _isLaunching;
@@ -52,6 +54,8 @@ public sealed class MainForm : Form
     private bool _isTogglingStandalone;
     private bool _communityModsLoadedOnce;
     private int _currentPageIndex = -1;
+
+    private bool IsClosingOrDisposed => _formCts.IsCancellationRequested || IsDisposed || Disposing;
 
     public MainForm()
     {
@@ -163,7 +167,7 @@ public sealed class MainForm : Form
 
         _lblSidebarMode = new Label
         {
-            Text = "模式：远程自建服",
+            Text = $"模式：{FormatModeName(_preset.DefaultMode)}",
             Font = HubTheme.FontSmallBold,
             ForeColor = HubTheme.GoldLight,
             BackColor = Color.Transparent,
@@ -366,10 +370,11 @@ public sealed class MainForm : Form
     {
         _standaloneHost.LifecycleMessage += msg =>
         {
+            if (IsClosingOrDisposed) return;
             AppendLog($"[托管] {msg}");
-            if (IsHandleCreated && !IsDisposed)
+            if (IsHandleCreated && !IsClosingOrDisposed)
             {
-                BeginInvoke(RefreshStandaloneStatusUi);
+                try { BeginInvoke(RefreshStandaloneStatusUi); } catch (ObjectDisposedException) { }
             }
         };
 
@@ -530,43 +535,73 @@ public sealed class MainForm : Form
 
     private async Task RefreshAllServerProbesAsync()
     {
+        if (IsClosingOrDisposed) return;
+        CancellationToken ct = _formCts.Token;
         _launchPage.SetProbingState(true);
         try
         {
             string customUrl = _launchPage.CustomServerUrl;
-            Task<ServerProbeResult> tCloud = _probeService.ProbeAsync(LauncherConstants.CloudTencentUrl);
-            Task<ServerProbeResult> tLocal = _probeService.ProbeAsync(LauncherConstants.LocalStandaloneUrl);
+            Task<ServerProbeResult>? tPreset = _preset.HasPresetRemote
+                ? _probeService.ProbeAsync(_preset.PresetRemoteUrl, ct)
+                : null;
+            Task<ServerProbeResult> tLocal = _probeService.ProbeAsync(LauncherConstants.LocalStandaloneUrl, ct);
             Task<ServerProbeResult> tCustom = string.IsNullOrWhiteSpace(customUrl)
                 ? Task.FromResult(new ServerProbeResult { StatusMessage = "未填写自定义地址" })
-                : _probeService.ProbeAsync(customUrl);
+                : _probeService.ProbeAsync(customUrl, ct);
 
-            await Task.WhenAll(tCloud, tLocal, tCustom);
+            if (tPreset != null)
+            {
+                await Task.WhenAll(tPreset, tLocal, tCustom);
+                if (IsClosingOrDisposed) return;
+                _probeResults[ServerMode.PresetRemote] = tPreset.Result;
+                _launchPage.UpdateServerProbeResult(ServerMode.PresetRemote, tPreset.Result);
+            }
+            else
+            {
+                await Task.WhenAll(tLocal, tCustom);
+                if (IsClosingOrDisposed) return;
+            }
 
-            _probeResults[ServerMode.CloudTencent] = tCloud.Result;
             _probeResults[ServerMode.LocalStandalone] = tLocal.Result;
             _probeResults[ServerMode.CustomServer] = tCustom.Result;
 
-            _launchPage.UpdateServerProbeResult(ServerMode.CloudTencent, tCloud.Result);
             _launchPage.UpdateServerProbeResult(ServerMode.LocalStandalone, tLocal.Result);
             _launchPage.UpdateServerProbeResult(ServerMode.CustomServer, tCustom.Result);
 
             UpdateGlobalStatusSummary();
-            AppendLog($"[测速] 远程自建服：{tCloud.Result.StatusMessage} ｜ 本地单机：{tLocal.Result.StatusMessage}");
+            if (tPreset != null)
+            {
+                AppendLog($"[测速] {_preset.PresetRemoteName}：{tPreset.Result.StatusMessage} ｜ 本地单机：{tLocal.Result.StatusMessage}");
+            }
+            else
+            {
+                AppendLog($"[测速] 本地单机：{tLocal.Result.StatusMessage} ｜ 自定义服：{tCustom.Result.StatusMessage}");
+            }
+        }
+        catch (OperationCanceledException) when (IsClosingOrDisposed)
+        {
         }
         catch (Exception ex)
         {
-            AppendLog($"[警告] 服务器测速异常：{ex.Message}");
+            if (!IsClosingOrDisposed)
+            {
+                AppendLog($"[警告] 服务器测速异常：{ex.Message}");
+            }
         }
         finally
         {
-            _launchPage.SetProbingState(false);
+            if (!IsClosingOrDisposed)
+            {
+                _launchPage.SetProbingState(false);
+            }
         }
     }
 
     private async Task ToggleStandaloneServerAsync()
     {
-        if (_isTogglingStandalone) return;
+        if (_isTogglingStandalone || IsClosingOrDisposed) return;
         _isTogglingStandalone = true;
+        CancellationToken ct = _formCts.Token;
         try
         {
             if (_standaloneHost.IsManagedServerRunning)
@@ -577,7 +612,8 @@ public sealed class MainForm : Form
             else
             {
                 _launchPage.SetLaunchBusy(false, "正在拉起本地单机服务端并等待 /healthz 就绪...", 40);
-                (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog);
+                (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog, ct);
+                if (IsClosingOrDisposed) return;
                 _launchPage.SetLaunchBusy(false, msg, ready ? 100 : 0);
                 if (!ready)
                 {
@@ -588,10 +624,16 @@ public sealed class MainForm : Form
             RefreshStandaloneStatusUi();
             await RefreshAllServerProbesAsync();
         }
+        catch (OperationCanceledException) when (IsClosingOrDisposed)
+        {
+        }
         catch (Exception ex)
         {
-            AppendLog($"[错误] 切换本地单机服失败：{ex.Message}");
-            MessageBox.Show(this, $"操作失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!IsClosingOrDisposed)
+            {
+                AppendLog($"[错误] 切换本地单机服失败：{ex.Message}");
+                MessageBox.Show(this, $"操作失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
         finally
         {
@@ -601,6 +643,7 @@ public sealed class MainForm : Form
 
     private void RefreshStandaloneStatusUi()
     {
+        if (IsClosingOrDisposed) return;
         _launchPage.SetStandaloneServerRunning(_standaloneHost.IsManagedServerRunning);
         UpdateGlobalStatusSummary();
     }
@@ -692,7 +735,8 @@ public sealed class MainForm : Form
             if (mode == ServerMode.LocalStandalone)
             {
                 _launchPage.SetLaunchBusy(true, "正在拉起本地单机服务端并等待 /healthz 就绪...", 20);
-                (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog);
+                (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog, _formCts.Token);
+                if (IsClosingOrDisposed) return;
                 RefreshStandaloneStatusUi();
                 if (!ready)
                 {
@@ -704,20 +748,106 @@ public sealed class MainForm : Form
 
             if (mode != ServerMode.PureOfficial && _launchPage.AutoSyncBeforeLaunch && !string.IsNullOrWhiteSpace(serverBase))
             {
-                _launchPage.SetLaunchBusy(true, "正在连接服务端执行 SHA-256 增量更新检查...", 35);
-                var progress = new Progress<SyncProgress>(p =>
+                while (true)
                 {
-                    int mapped = 35 + (int)(p.Percent * 0.5);
-                    _launchPage.SetLaunchBusy(true, p.Message, Math.Clamp(mapped, 35, 88));
-                });
+                    _launchPage.SetLaunchBusy(true, "正在连接服务端执行 SHA-256 增量更新检查...", 35);
+                    var progress = new Progress<SyncProgress>(p =>
+                    {
+                        if (IsClosingOrDisposed) return;
+                        int mapped = 35 + (int)(p.Percent * 0.5);
+                        _launchPage.SetLaunchBusy(true, p.Message, Math.Clamp(mapped, 35, 88));
+                    });
 
-                UpdateSyncReport syncReport = await _syncService.SyncAsync(
-                    gameDir,
-                    serverBase,
-                    applyDownloads: true,
-                    progress: progress,
-                    log: AppendLog);
-                _syncPage.RenderReport(syncReport);
+                    UpdateSyncReport syncReport = await _syncService.SyncAsync(
+                        gameDir,
+                        serverBase,
+                        applyDownloads: true,
+                        progress: progress,
+                        log: AppendLog,
+                        cancellationToken: _formCts.Token);
+                    if (IsClosingOrDisposed) return;
+                    _syncPage.RenderReport(syncReport);
+
+                    LaunchGateAction gate = LaunchSyncGate.Evaluate(syncReport);
+                    if (gate == LaunchGateAction.AllowLaunch)
+                    {
+                        break;
+                    }
+
+                    if (gate == LaunchGateAction.BlockRunningGame)
+                    {
+                        _launchPage.SetLaunchBusy(false, syncReport.SummaryMessage, 0);
+                        MessageBox.Show(
+                            this,
+                            "检测到《The Bazaar》客户端（TheBazaar.exe）正在运行，无法安全更新核心插件。\n\n请先完全关闭游戏窗口后再重新点击启动。",
+                            "核心更新已拦截（游戏运行中）",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                        return;
+                    }
+
+                    if (gate == LaunchGateAction.BlockCoreFailure)
+                    {
+                        _launchPage.SetLaunchBusy(false, "核心插件更新失败，已暂停启动等待确认。", 0);
+                        string detail = syncReport.Errors.Count > 0
+                            ? string.Join("\n• ", syncReport.Errors.Take(4))
+                            : syncReport.SummaryMessage;
+                        string rollbackNote = syncReport.RolledBackAtomicGroups.Count > 0
+                            ? $"\n\n已自动原子回滚组件组：{string.Join(", ", syncReport.RolledBackAtomicGroups)}（本地版本保持完整一致）。"
+                            : string.Empty;
+
+                        var btnCancel = new TaskDialogButton("取消启动（推荐）");
+                        var btnRetry = new TaskDialogButton("重新尝试同步");
+                        var btnIgnore = new TaskDialogButton("忽略风险，使用当前本地版本启动");
+
+                        var dlgPage = new TaskDialogPage
+                        {
+                            Caption = "核心插件更新失败 — 已阻断启动",
+                            Heading = "核心插件同步未成功，继续启动可能导致客户端与服务端不兼容",
+                            Text = $"失败原因：\n• {detail}{rollbackNote}",
+                            Icon = TaskDialogIcon.Warning,
+                            DefaultButton = btnCancel,
+                            AllowCancel = true,
+                            Buttons = { btnCancel, btnRetry, btnIgnore }
+                        };
+
+                        TaskDialogButton clicked = TaskDialog.ShowDialog(this, dlgPage);
+                        if (clicked == btnRetry)
+                        {
+                            AppendLog("[同步] 用户选择重新尝试同步核心插件...");
+                            continue;
+                        }
+
+                        if (clicked == btnIgnore)
+                        {
+                            AppendLog("[警告] 用户选择忽略核心插件同步失败风险，使用当前本地版本继续启动游戏。");
+                            break;
+                        }
+
+                        AppendLog("[同步] 用户已取消本次启动。");
+                        return;
+                    }
+
+                    if (gate == LaunchGateAction.WarnNonCoreFailure)
+                    {
+                        string detail = syncReport.Errors.Count > 0
+                            ? string.Join("\n• ", syncReport.Errors.Take(4))
+                            : syncReport.SummaryMessage;
+                        DialogResult choice = MessageBox.Show(
+                            this,
+                            $"部分非核心资源（Mod 贴图或汉化词典）同步失败，核心插件未受影响：\n• {detail}\n\n是否仍继续启动游戏？",
+                            "非核心资源同步警告",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Warning,
+                            MessageBoxDefaultButton.Button2);
+                        if (choice != DialogResult.Yes)
+                        {
+                            _launchPage.SetLaunchBusy(false, "已取消启动，可在「更新与 Mod 同步」页排查失败资源。", 0);
+                            return;
+                        }
+                        break;
+                    }
+                }
             }
 
             _launchPage.SetLaunchBusy(true, "正在启动《The Bazaar》客户端...", 95);
@@ -733,11 +863,17 @@ public sealed class MainForm : Form
             _launchPage.SetLaunchBusy(false, launchOk, 100);
             AppendLog($"[成功] {launchOk}");
         }
+        catch (OperationCanceledException) when (IsClosingOrDisposed)
+        {
+        }
         catch (Exception ex)
         {
-            AppendLog($"[错误] 启动游戏失败：{ex.Message}");
-            _launchPage.SetLaunchBusy(false, $"启动失败：{ex.Message}", 0);
-            MessageBox.Show(this, $"启动失败：{ex.Message}", "启动错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!IsClosingOrDisposed)
+            {
+                AppendLog($"[错误] 启动游戏失败：{ex.Message}");
+                _launchPage.SetLaunchBusy(false, $"启动失败：{ex.Message}", 0);
+                MessageBox.Show(this, $"启动失败：{ex.Message}", "启动错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
         finally
         {
@@ -748,7 +884,7 @@ public sealed class MainForm : Form
 
     private async Task RunManualSyncAsync(bool applyDownloads)
     {
-        if (_isSyncing) return;
+        if (_isSyncing || IsClosingOrDisposed) return;
         if (_gameInstall == null || !_gameInstall.IsValidGameInstall)
         {
             MessageBox.Show(this, "请先在「快速启动与选服」定位有效的游戏目录。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -758,7 +894,10 @@ public sealed class MainForm : Form
         string serverBase = LauncherConfigService.ResolveServerBase(_launchPage.SelectedMode, _launchPage.CustomServerUrl);
         if (string.IsNullOrWhiteSpace(serverBase))
         {
-            MessageBox.Show(this, "当前处于「纯净官方原版」模式，请先选择远程自建服、本地单机或自定义服务器再同步。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            string modeHint = _preset.HasPresetRemote
+                ? $"请先选择{_preset.PresetRemoteName}、本地单机或自定义服务器再同步。"
+                : "请先选择本地单机离线版或自定义服务器再同步。";
+            MessageBox.Show(this, $"当前处于「纯净官方原版」模式，{modeHint}", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -766,24 +905,38 @@ public sealed class MainForm : Form
         _syncPage.SetBusy(true, "正在连接服务端获取最新清单...", 10);
         try
         {
-            var progress = new Progress<SyncProgress>(p => _syncPage.SetBusy(true, p.Message, p.Percent));
+            var progress = new Progress<SyncProgress>(p =>
+            {
+                if (!IsClosingOrDisposed) _syncPage.SetBusy(true, p.Message, p.Percent);
+            });
             UpdateSyncReport report = await _syncService.SyncAsync(
                 _gameInstall.GameDirectory,
                 serverBase,
                 applyDownloads: applyDownloads,
                 progress: progress,
-                log: AppendLog);
+                log: AppendLog,
+                cancellationToken: _formCts.Token);
+            if (IsClosingOrDisposed) return;
             _syncPage.RenderReport(report);
+        }
+        catch (OperationCanceledException) when (IsClosingOrDisposed)
+        {
         }
         catch (Exception ex)
         {
-            AppendLog($"[错误] 同步异常：{ex.Message}");
-            _syncPage.SetBusy(false, $"同步失败：{ex.Message}", 0);
+            if (!IsClosingOrDisposed)
+            {
+                AppendLog($"[错误] 同步异常：{ex.Message}");
+                _syncPage.SetBusy(false, $"同步失败：{ex.Message}", 0);
+            }
         }
         finally
         {
             _isSyncing = false;
-            _syncPage.SetBusy(false, "同步流程已结束，可查看上方明细。", 100);
+            if (!IsClosingOrDisposed)
+            {
+                _syncPage.SetBusy(false, "同步流程已结束，可查看上方明细。", 100);
+            }
         }
     }
 
@@ -803,6 +956,7 @@ public sealed class MainForm : Form
 
     private async Task RefreshHubCommunityModsAsync()
     {
+        if (IsClosingOrDisposed) return;
         string? serverBase = ResolveServerBaseForCommunity(showWarningIfNone: false);
         if (string.IsNullOrWhiteSpace(serverBase))
         {
@@ -815,27 +969,38 @@ public sealed class MainForm : Form
         bool finalOk = true;
         try
         {
-            var (ok, mods, msg) = await _communityClient.FetchListAsync(serverBase, _launchPage.PlayerNameInput);
+            var (ok, mods, msg) = await _communityClient.FetchListAsync(serverBase, _launchPage.PlayerNameInput, _formCts.Token);
+            if (IsClosingOrDisposed) return;
             finalStatus = msg;
             finalOk = ok;
             _syncPage.RenderCommunityMods(mods, msg, ok);
             AppendLog($"[社区 Mod] {msg}");
         }
+        catch (OperationCanceledException) when (IsClosingOrDisposed)
+        {
+        }
         catch (Exception ex)
         {
-            finalStatus = $"拉取失败：{ex.Message}";
-            finalOk = false;
-            AppendLog($"[错误] 拉取社区 Mod 列表失败：{ex.Message}");
-            _syncPage.RenderCommunityMods(Array.Empty<HubCommunityModItem>(), finalStatus, false);
+            if (!IsClosingOrDisposed)
+            {
+                finalStatus = $"拉取失败：{ex.Message}";
+                finalOk = false;
+                AppendLog($"[错误] 拉取社区 Mod 列表失败：{ex.Message}");
+                _syncPage.RenderCommunityMods(Array.Empty<HubCommunityModItem>(), finalStatus, false);
+            }
         }
         finally
         {
-            _syncPage.SetBusy(false, finalStatus, finalOk ? 100 : 0);
+            if (!IsClosingOrDisposed)
+            {
+                _syncPage.SetBusy(false, finalStatus, finalOk ? 100 : 0);
+            }
         }
     }
 
     private async Task DownloadHubCommunityModAsync(string modId)
     {
+        if (IsClosingOrDisposed) return;
         if (_gameInstall == null || !_gameInstall.IsValidGameInstall)
         {
             MessageBox.Show(this, "请先在「快速启动与选服」定位有效的游戏目录。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -848,7 +1013,8 @@ public sealed class MainForm : Form
         _syncPage.SetBusy(true, $"正在下载 {modId} 到本地 BepInEx\\mods\\...", 40);
         try
         {
-            var (ok, msg, _) = await _communityClient.DownloadToLocalAsync(serverBase, modId, _gameInstall.GameDirectory);
+            var (ok, msg, _) = await _communityClient.DownloadToLocalAsync(serverBase, modId, _gameInstall.GameDirectory, _formCts.Token);
+            if (IsClosingOrDisposed) return;
             AppendLog($"[社区 Mod] 下载 {modId}：{msg}");
             if (ok)
             {
@@ -860,14 +1026,23 @@ public sealed class MainForm : Form
                 MessageBox.Show(this, msg, "下载失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
+        catch (OperationCanceledException) when (IsClosingOrDisposed)
+        {
+        }
         catch (Exception ex)
         {
-            AppendLog($"[错误] 下载 {modId} 异常：{ex.Message}");
-            MessageBox.Show(this, $"下载出错：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!IsClosingOrDisposed)
+            {
+                AppendLog($"[错误] 下载 {modId} 异常：{ex.Message}");
+                MessageBox.Show(this, $"下载出错：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
         finally
         {
-            _syncPage.SetBusy(false, "操作已完成。", 100);
+            if (!IsClosingOrDisposed)
+            {
+                _syncPage.SetBusy(false, "操作已完成。", 100);
+            }
         }
     }
 
@@ -904,7 +1079,8 @@ public sealed class MainForm : Form
             string playerName = string.IsNullOrWhiteSpace(_launchPage.PlayerNameInput)
                 ? Environment.UserName
                 : _launchPage.PlayerNameInput;
-            var (ok, msg) = await _communityClient.UploadModAsync(serverBase, targetPath, playerName);
+            var (ok, msg) = await _communityClient.UploadModAsync(serverBase, targetPath, playerName, _formCts.Token);
+            if (IsClosingOrDisposed) return;
             AppendLog($"[社区 Mod] 上传 {Path.GetFileName(targetPath)}：{msg}");
             if (ok)
             {
@@ -916,14 +1092,23 @@ public sealed class MainForm : Form
                 MessageBox.Show(this, msg, "上传未通过", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
+        catch (OperationCanceledException) when (IsClosingOrDisposed)
+        {
+        }
         catch (Exception ex)
         {
-            AppendLog($"[错误] 上传本地 Mod 异常：{ex.Message}");
-            MessageBox.Show(this, $"上传出错：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!IsClosingOrDisposed)
+            {
+                AppendLog($"[错误] 上传本地 Mod 异常：{ex.Message}");
+                MessageBox.Show(this, $"上传出错：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
         finally
         {
-            _syncPage.SetBusy(false, "操作已完成。", 100);
+            if (!IsClosingOrDisposed)
+            {
+                _syncPage.SetBusy(false, "操作已完成。", 100);
+            }
         }
     }
 
@@ -1013,12 +1198,14 @@ public sealed class MainForm : Form
         _diagPage.SetExportBusy(true);
         try
         {
-            var urls = new List<string>
+            var urls = new List<string>();
+            if (_preset.HasPresetRemote)
             {
-                LauncherConstants.CloudTencentUrl,
-                LauncherConstants.LocalStandaloneUrl
-            };
-            if (!string.IsNullOrWhiteSpace(_launchPage.CustomServerUrl))
+                urls.Add(_preset.PresetRemoteUrl);
+            }
+            urls.Add(LauncherConstants.LocalStandaloneUrl);
+            if (!string.IsNullOrWhiteSpace(_launchPage.CustomServerUrl) &&
+                !urls.Any(u => string.Equals(u, _launchPage.CustomServerUrl, StringComparison.OrdinalIgnoreCase)))
             {
                 urls.Add(_launchPage.CustomServerUrl);
             }
@@ -1028,18 +1215,29 @@ public sealed class MainForm : Form
                 _gameInstall?.GameDirectory,
                 urls,
                 _diagPage.GetAllLogsSnapshot(),
-                log: AppendLog);
+                log: AppendLog,
+                cancellationToken: _formCts.Token);
+            if (IsClosingOrDisposed) return;
 
             MessageBox.Show(this, $"排错诊断包已成功导出至：\n{path}", "导出成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
+        catch (OperationCanceledException) when (IsClosingOrDisposed)
+        {
+        }
         catch (Exception ex)
         {
-            AppendLog($"[错误] 导出诊断包失败：{ex.Message}");
-            MessageBox.Show(this, $"导出诊断包失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!IsClosingOrDisposed)
+            {
+                AppendLog($"[错误] 导出诊断包失败：{ex.Message}");
+                MessageBox.Show(this, $"导出诊断包失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
         finally
         {
-            _diagPage.SetExportBusy(false);
+            if (!IsClosingOrDisposed)
+            {
+                _diagPage.SetExportBusy(false);
+            }
         }
     }
 
@@ -1127,20 +1325,24 @@ public sealed class MainForm : Form
         }
     }
 
-    private void AppendLog(string message) => _diagPage.AppendLog(message);
-
-    private static string FormatModeName(ServerMode mode) => mode switch
+    private void AppendLog(string message)
     {
-        ServerMode.CloudTencent => "远程自建服 (示例)",
+        if (IsClosingOrDisposed) return;
+        _diagPage.AppendLog(message);
+    }
+
+    private string FormatModeName(ServerMode mode) => mode switch
+    {
+        ServerMode.PresetRemote => _preset.HasPresetRemote ? _preset.PresetRemoteName : "本地单机离线版",
         ServerMode.LocalStandalone => "本地单机离线版",
         ServerMode.CustomServer => "自定义服务器",
         ServerMode.PureOfficial => "纯净官方原版",
         _ => "未知模式"
     };
 
-    private static string FormatShortModeName(ServerMode mode) => mode switch
+    private string FormatShortModeName(ServerMode mode) => mode switch
     {
-        ServerMode.CloudTencent => "线上服",
+        ServerMode.PresetRemote => _preset.HasPresetRemote ? _preset.PresetRemoteShortName : "本地单机",
         ServerMode.LocalStandalone => "本地单机",
         ServerMode.CustomServer => "自定义服",
         ServerMode.PureOfficial => "官方原版",
@@ -1197,11 +1399,13 @@ public sealed class MainForm : Form
 
             if (mode == ServerMode.LocalStandalone)
             {
-                ServerProbeResult probe = await _probeService.ProbeAsync(LauncherConstants.LocalStandaloneUrl);
+                ServerProbeResult probe = await _probeService.ProbeAsync(LauncherConstants.LocalStandaloneUrl, _formCts.Token);
+                if (IsClosingOrDisposed) return;
                 if (!probe.IsOnline)
                 {
                     AppendLog("[工坊] 正在自动拉起本地单机服务端以承载 /workshop/ 创意工坊编辑器...");
-                    (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog);
+                    (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog, _formCts.Token);
+                    if (IsClosingOrDisposed) return;
                     RefreshStandaloneStatusUi();
                     if (!ready)
                     {
@@ -1215,10 +1419,16 @@ public sealed class MainForm : Form
             AppendLog($"[工坊] 正在浏览器打开创意工坊编辑器：{workshopUrl}");
             Process.Start(new ProcessStartInfo(workshopUrl) { UseShellExecute = true });
         }
+        catch (OperationCanceledException) when (IsClosingOrDisposed)
+        {
+        }
         catch (Exception ex)
         {
-            AppendLog($"[错误] 打开创意工坊编辑器失败：{ex.Message}");
-            MessageBox.Show(this, $"打开创意工坊编辑器失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!IsClosingOrDisposed)
+            {
+                AppendLog($"[错误] 打开创意工坊编辑器失败：{ex.Message}");
+                MessageBox.Show(this, $"打开创意工坊编辑器失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
     }
 
@@ -1287,11 +1497,44 @@ public sealed class MainForm : Form
 
     private void OnMainFormClosing(object? sender, FormClosingEventArgs e)
     {
+        // D7-P1-03：本地托管单机服运行中时弹出关窗确认，防止误关启动器导致正在进行的单机对局断线
+        if (e.CloseReason == CloseReason.UserClosing && _standaloneHost.IsManagedServerRunning)
+        {
+            bool gameRunning = UpdateSyncService.IsGameProcessRunning();
+            string warnBody = gameRunning
+                ? "检测到《The Bazaar》游戏进程与本启动器托管的本地单机服务端均正在运行！\n\n现在关闭启动器将立即优雅停止本地单机服务端并导致当前对局断线（存档将自动落盘保留）。\n\n确定要停止单机服务端并关闭启动器吗？"
+                : "本启动器托管的本地单机服务端仍在运行中。\n\n关闭启动器将优雅发送停止信号触发 SQLite WAL 刷盘保存存档并退出服务端。\n\n确定要停止服务端并关闭启动器吗？";
+
+            DialogResult choice = MessageBox.Show(
+                this,
+                warnBody,
+                "确认停止本地单机服务端并退出",
+                MessageBoxButtons.YesNo,
+                gameRunning ? MessageBoxIcon.Warning : MessageBoxIcon.Question,
+                MessageBoxDefaultButton.Button2);
+
+            if (choice != DialogResult.Yes)
+            {
+                e.Cancel = true;
+                return;
+            }
+        }
+
+        try
+        {
+            _formCts.Cancel();
+        }
+        catch
+        {
+            // 忽略窗体关闭时的取消竞态异常
+        }
+
         SavePreferencesQuietly();
         _toolTip.Dispose();
         _standaloneHost.Dispose();
         _probeService.Dispose();
         _syncService.Dispose();
         _communityClient.Dispose();
+        _formCts.Dispose();
     }
 }

@@ -23,6 +23,7 @@ namespace BazaarCore.Tests;
 /// <summary>
 /// Wave 7 社区 Mod 上传/下载、按房/单局隔离加载与锦标赛房间 Mod 同步回归测试。
 /// </summary>
+[Xunit.Collection("GlobalStaticState")]
 public sealed class CommunityModAndRoomSyncTests
 {
     private sealed record TestFixture(
@@ -39,38 +40,16 @@ public sealed class CommunityModAndRoomSyncTests
 
     private static TestFixture LoadFixture()
     {
-        var cur = new DirectoryInfo(AppContext.BaseDirectory);
-        string? repoRoot = null;
-        while (cur != null)
-        {
-            if (File.Exists(Path.Combine(cur.FullName, "Bazaar.sln")))
-            {
-                repoRoot = cur.FullName;
-                break;
-            }
-            cur = cur.Parent;
-        }
-        Assert.False(string.IsNullOrWhiteSpace(repoRoot), "未找到 Bazaar.sln 根目录");
-
-        string dataDir = Path.Combine(repoRoot!, "dist", "data");
-        string dbPath = Path.Combine(dataDir, "GameData.db");
-        string? zhPath = SteamPathResolver.ResolveZhCnTranslationPath(dataDir);
-        var baseRepo = GameDatabaseLoader.Load(dbPath, zhPath);
-
-        var wl = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        using (var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(dataDir, "valid_card_ids.json"), Encoding.UTF8)))
-        {
-            var arr = doc.RootElement.ValueKind == JsonValueKind.Array ? doc.RootElement : doc.RootElement.GetProperty("valid_ids");
-            foreach (var it in arr.EnumerateArray())
-                if (it.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(it.GetString()))
-                    wl.Add(it.GetString()!);
-        }
-
-        var pool = CardPool.Load(dbPath);
-        var monsters = MonsterPool.Load(dbPath);
-        var archetypes = CardArchetypeIndex.Build(pool, baseRepo);
-
-        return new TestFixture(repoRoot!, dataDir, dbPath, baseRepo, wl, pool, monsters, archetypes);
+        var shared = TestInfrastructure.SharedGameDataFixture.Shared;
+        return new TestFixture(
+            shared.RepoRoot,
+            shared.DataDir,
+            shared.DbPath,
+            shared.Repo,
+            shared.CreateValidCardIdsCopy(),
+            shared.CreateIsolatedCardPool(),
+            shared.CreateMonstersCopy(),
+            shared.ArchetypeIndex);
     }
 
     private static (string TempRoot, ServerModHost Host, CommunityModStore Store) CreateIsolatedHostAndStore(TestFixture fx)
@@ -480,6 +459,7 @@ public sealed class CommunityModAndRoomSyncTests
             byte[] zipBytes = BuildValidCommunityModZip(fx, modId);
 
             // 1. 使用 Uri.EscapeDataString 编码后的中文 X-Player-Name 上传 Mod（附 X-Forwarded-For 模拟非管理员远程玩家）
+            string zhSecret;
             using (var uploadReq = new HttpRequestMessage(HttpMethod.Post, "/api/community/mods/upload"))
             {
                 uploadReq.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
@@ -498,13 +478,16 @@ public sealed class CommunityModAndRoomSyncTests
                 using var doc = JsonDocument.Parse(uploadBody);
                 Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
                 Assert.Equal(zhAuthor, doc.RootElement.GetProperty("mod").GetProperty("uploaderName").GetString());
+                zhSecret = doc.RootElement.GetProperty("uploaderSecret").GetString() ?? "";
+                Assert.False(string.IsNullOrWhiteSpace(zhSecret));
             }
 
-            // 2. 以同一中文玩家名查询列表：确认 uploaderName 无乱码且识别为本人（canDelete == true）
+            // 2. 以同一中文玩家名 + 首次下发的 X-Uploader-Secret 查询列表：确认 uploaderName 无乱码且识别为本人（canDelete == true）
             using (var listReq = new HttpRequestMessage(HttpMethod.Get, "/api/community/mods"))
             {
                 listReq.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
                 listReq.Headers.TryAddWithoutValidation("X-Player-Name", Uri.EscapeDataString(zhAuthor));
+                listReq.Headers.TryAddWithoutValidation("X-Uploader-Secret", zhSecret);
 
                 using var listResp = await http.SendAsync(listReq);
                 string listBody = await listResp.Content.ReadAsStringAsync();
@@ -518,7 +501,7 @@ public sealed class CommunityModAndRoomSyncTests
                 Assert.True(matched.GetProperty("canDelete").GetBoolean());
             }
 
-            // 3. 另一位中文玩家尝试删除该 Mod：必须返回 403 拒绝越权删除
+            // 3. 另一位中文玩家或仅伪造同名 X-Player-Name（无 X-Uploader-Secret）尝试删除该 Mod：必须返回 403 拒绝越权删除
             using (var badDelReq = new HttpRequestMessage(HttpMethod.Delete, $"/api/community/mods/{modId}"))
             {
                 badDelReq.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
@@ -527,12 +510,21 @@ public sealed class CommunityModAndRoomSyncTests
                 using var badDelResp = await http.SendAsync(badDelReq);
                 Assert.Equal(HttpStatusCode.Forbidden, badDelResp.StatusCode);
             }
+            using (var spoofDelReq = new HttpRequestMessage(HttpMethod.Delete, $"/api/community/mods/{modId}"))
+            {
+                spoofDelReq.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
+                spoofDelReq.Headers.TryAddWithoutValidation("X-Player-Name", Uri.EscapeDataString(zhAuthor));
 
-            // 4. 上传者本人携带编码中文 X-Player-Name 删除 Mod：应返回 200 并彻底移除
+                using var spoofDelResp = await http.SendAsync(spoofDelReq);
+                Assert.Equal(HttpStatusCode.Forbidden, spoofDelResp.StatusCode);
+            }
+
+            // 4. 上传者本人携带编码中文 X-Player-Name + X-Uploader-Secret 删除 Mod：应返回 200 并彻底移除
             using (var delReq = new HttpRequestMessage(HttpMethod.Delete, $"/api/community/mods/{modId}"))
             {
                 delReq.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
                 delReq.Headers.TryAddWithoutValidation("X-Player-Name", Uri.EscapeDataString(zhAuthor));
+                delReq.Headers.TryAddWithoutValidation("X-Uploader-Secret", zhSecret);
 
                 using var delResp = await http.SendAsync(delReq);
                 string delBody = await delResp.Content.ReadAsStringAsync();
@@ -544,10 +536,11 @@ public sealed class CommunityModAndRoomSyncTests
             Assert.DoesNotContain(store.ListCatalog("acc_check", isAdmin: false),
                 m => string.Equals(m.ModId, modId, StringComparison.OrdinalIgnoreCase));
 
-            // 5. 回归确认纯 ASCII 玩家名 X-Player-Name 上传与删除完全保持兼容
+            // 5. 回归确认纯 ASCII 玩家名 X-Player-Name 上传（返回 uploaderSecret）与凭 Secret 删除完全保持兼容
             const string asciiModId = "test-ascii-header-mod";
             const string asciiAuthor = "Alice_01";
             byte[] asciiZip = BuildValidCommunityModZip(fx, asciiModId);
+            string asciiSecret;
 
             using (var asciiUpload = new HttpRequestMessage(HttpMethod.Post, "/api/community/mods/upload"))
             {
@@ -564,12 +557,15 @@ public sealed class CommunityModAndRoomSyncTests
                 Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
                 using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
                 Assert.Equal(asciiAuthor, doc.RootElement.GetProperty("mod").GetProperty("uploaderName").GetString());
+                asciiSecret = doc.RootElement.GetProperty("uploaderSecret").GetString() ?? "";
+                Assert.False(string.IsNullOrWhiteSpace(asciiSecret));
             }
 
             using (var asciiDel = new HttpRequestMessage(HttpMethod.Delete, $"/api/community/mods/{asciiModId}"))
             {
                 asciiDel.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
                 asciiDel.Headers.TryAddWithoutValidation("X-Player-Name", asciiAuthor);
+                asciiDel.Headers.TryAddWithoutValidation("X-Uploader-Secret", asciiSecret);
 
                 using var resp = await http.SendAsync(asciiDel);
                 Assert.Equal(HttpStatusCode.OK, resp.StatusCode);

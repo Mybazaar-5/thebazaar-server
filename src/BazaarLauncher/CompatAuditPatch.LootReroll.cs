@@ -222,7 +222,7 @@ internal static partial class CompatAuditPatch
                 __result = true;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.LootReroll:L225", diagEx); }
     }
 
     private static bool AppStateExecuteIfAllowedPrefix(object __instance, object __0, Func<bool> __1, ref bool __result)
@@ -235,7 +235,7 @@ internal static partial class CompatAuditPatch
                 return false;
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.LootReroll:L238", diagEx); }
         return true;
     }
 
@@ -259,7 +259,7 @@ internal static partial class CompatAuditPatch
                 _lrBbmHideButtonsMethod?.Invoke(combatBtns, null);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.LootReroll:L262", diagEx); }
     }
 
     private static void BoardManagerRevealButtonsPostfix(object __instance)
@@ -269,7 +269,7 @@ internal static partial class CompatAuditPatch
             if (__instance == null || !IsPaginatedLootRerollActive()) return;
             ActivateMerchantButtonsForPaginatedLoot(__instance);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.LootReroll:L272", diagEx); }
     }
 
     private static void BoardManagerShowReplayRecapPostfix(object __instance, bool show)
@@ -289,7 +289,7 @@ internal static partial class CompatAuditPatch
                 ActivateMerchantButtonsForPaginatedLoot(__instance);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.LootReroll:L292", diagEx); }
     }
 
     private static void ActivateMerchantButtonsForPaginatedLoot(object boardManager)
@@ -326,7 +326,7 @@ internal static partial class CompatAuditPatch
                 EnsureLootRerollButtonReady(__instance);
             }
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.LootReroll:L329", diagEx); }
     }
 
     private static void EnsureLootRerollButtonReady(object rerollBtn)
@@ -350,14 +350,14 @@ internal static partial class CompatAuditPatch
                             try { _lrRerollUpdateViewMethod?.Invoke(rerollBtn, null); }
                             finally { _lrUpdatingRerollView = false; }
                         }
-                        catch { }
+                        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.LootReroll:L353", diagEx); }
                     }), System.Threading.Tasks.TaskScheduler.Default);
                     return;
                 }
             }
             _lrRerollUpdateViewMethod?.Invoke(rerollBtn, null);
         }
-        catch { }
+        catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch.LootReroll:L360", diagEx); }
         finally
         {
             _lrUpdatingRerollView = false;

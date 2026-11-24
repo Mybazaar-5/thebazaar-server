@@ -13,6 +13,7 @@ namespace BazaarCore.Tests;
 /// Wave 1 Batch 1A（Core 战斗与属性底座）官方一致性回归测试：
 /// 覆盖 P0-01、P0-03、P0-04、P0-05、P0-06、P0-07、P0-08 及 P0-09/P0-10 Core 日志底座。
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class AuditWave1CoreTests
 {
     private const string ChillyCharlesId = "05c7cd54-75a3-4eae-9a1a-798c90b0db2d";
@@ -32,22 +33,8 @@ public sealed class AuditWave1CoreTests
     private const string LangxianId = "53099361-599f-4c1a-ad4a-d2fbb491b756";
     private const string TrailMarkersId = "a4281e9f-7889-4ac1-a140-9152ab54bc6b";
 
-    private static string ResolveDbPath()
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null)
-        {
-            var cand = Path.Combine(dir.FullName, "dist", "data", "GameData.db");
-            if (File.Exists(cand)) return cand;
-            dir = dir.Parent;
-        }
-        const string fallback = @"e:\thebazaar\dist\data\GameData.db";
-        if (File.Exists(fallback)) return fallback;
-        throw new FileNotFoundException("未找到测试用 GameData.db");
-    }
-
-    private static readonly Lazy<string> DbPath = new(ResolveDbPath);
-    private static readonly Lazy<GameDataRepository> SharedRepo = new(() => GameDatabaseLoader.Load(DbPath.Value));
+    private static readonly Lazy<string> DbPath = new(() => TestInfrastructure.SharedGameDataFixture.Shared.DbPath);
+    private static readonly Lazy<GameDataRepository> SharedRepo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
 
     private static RuleNode ParseNode(string json)
         => JsonSerializer.Deserialize<RuleNode>(json, GameDatabaseLoader.JsonOptions)

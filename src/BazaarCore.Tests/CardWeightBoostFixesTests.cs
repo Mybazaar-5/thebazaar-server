@@ -20,20 +20,14 @@ namespace BazaarCore.Tests;
 /// - 避让延伸 #1（P1-04）：ModModels（CustomCard / CustomEvent / CardPatch）透传 BoardOverride 与 Presentation；
 /// - 避让延伸 #2（P2-03）：ModValidator Gate 7 接入官方 136 条 tooltips 词条表校验 &lt;sprite&gt; / &lt;link&gt; 引用。
 /// </summary>
+[Xunit.Collection("GlobalStaticState")]
 public sealed class CardWeightBoostFixesTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
 
     private static string ResolveDataPath(string fileName)
-    {
-        for (string? dir = AppContext.BaseDirectory; dir != null; dir = Directory.GetParent(dir)?.FullName)
-        {
-            string candidate = Path.Combine(dir, "dist", "data", fileName);
-            if (File.Exists(candidate)) return candidate;
-        }
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static RunState NewRun(EHero hero = EHero.Vanessa, uint day = 1, uint hour = 1, CustomRunRuleSet? rules = null, int seed = 42) => new()
     {
@@ -444,7 +438,7 @@ public sealed class CardWeightBoostFixesTests
 
         // 注入叠加 CardPool 后，确认不会进入随机白昼池 HourlyEncounters，且天数窗门控生效
         var overlayRepo = CloneRepoWithExtras(baseRepo, [tpl]);
-        var overlayPool = CardPool.Load(ResolveDataPath("GameData.db"));
+        var overlayPool = TestInfrastructure.SharedGameDataFixture.Shared.CreateIsolatedCardPool();
         var bindings = new Dictionary<string, CustomCardVisualBinding>(StringComparer.OrdinalIgnoreCase)
         {
             [tpl.Id] = new CustomCardVisualBinding
@@ -535,7 +529,7 @@ public sealed class CardWeightBoostFixesTests
         lowTpl.SelectionContext = baseVisualEvent.SelectionContext;
 
         var overlayRepo = CloneRepoWithExtras(baseRepo, [highTpl, lowTpl]);
-        var overlayPool = CardPool.Load(ResolveDataPath("GameData.db"));
+        var overlayPool = TestInfrastructure.SharedGameDataFixture.Shared.CreateIsolatedCardPool();
         var bindings = new Dictionary<string, CustomCardVisualBinding>(StringComparer.OrdinalIgnoreCase)
         {
             [highTpl.Id] = new CustomCardVisualBinding
@@ -621,7 +615,7 @@ public sealed class CardWeightBoostFixesTests
 
         // 3. 注入 CardPool 后保持原值
         var overlayRepo = CloneRepoWithExtras(baseRepo, [evTpl]);
-        var overlayPool = CardPool.Load(ResolveDataPath("GameData.db"));
+        var overlayPool = TestInfrastructure.SharedGameDataFixture.Shared.CreateIsolatedCardPool();
         overlayPool.ApplyRepositoryOverlay(overlayRepo);
         var mapped = overlayPool.Get(evTpl.Id);
         Assert.NotNull(mapped);

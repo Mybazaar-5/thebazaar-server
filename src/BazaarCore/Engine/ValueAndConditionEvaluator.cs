@@ -87,9 +87,13 @@ public static class ValueAndConditionEvaluator
             ? (node.DefaultValue ?? 0)
             : node.Type switch
             {
-                "TReferenceValueCardAttribute" => GetCardAttr(targets[0], node.AttributeType ?? "Ammo", ctx, unscaled: false),
-                "TReferenceValueCardAttributeUnscaled" => GetCardAttr(targets[0], node.AttributeType ?? "Ammo", ctx, unscaled: true),
-                "TReferenceValueCardAttributeAggregate" => targets.Sum(c => GetCardAttr(c, node.AttributeType ?? "Ammo", ctx, unscaled: false)),
+                "TReferenceValueCardAttribute" => targets[0].HasAttribute(node.AttributeType ?? "Ammo")
+                    ? GetCardAttr(targets[0], node.AttributeType ?? "Ammo", ctx, unscaled: false)
+                    : (node.DefaultValue ?? 0),
+                "TReferenceValueCardAttributeUnscaled" => targets[0].HasAttribute(node.AttributeType ?? "Ammo")
+                    ? GetCardAttr(targets[0], node.AttributeType ?? "Ammo", ctx, unscaled: true)
+                    : (node.DefaultValue ?? 0),
+                "TReferenceValueCardAttributeAggregate" => targets.Sum(c => c.HasAttribute(node.AttributeType ?? "Ammo") ? GetCardAttr(c, node.AttributeType ?? "Ammo", ctx, unscaled: false) : 0),
                 "TReferenceValueCardCount" => targets.Count,
                 "TReferenceValueUniqueCardCount" => targets.Select(c => c.Template.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
                 "TReferenceValueCardTagCount" => CountTags(targets, node.Distinct ?? true),
@@ -120,8 +124,9 @@ public static class ValueAndConditionEvaluator
 
     private static double OfficialRound(float value)
     {
+        if (float.IsNaN(value)) return 0;
         if (value > 0f && value < 1f) return 1;
-        return (int)Math.Round(value, MidpointRounding.AwayFromZero);
+        return SafeMath.ToSafeInt(value, -SafeMath.DefaultCombatMax, SafeMath.DefaultCombatMax, MidpointRounding.AwayFromZero);
     }
 
     private static double EvaluateRangeValue(RuleNode node, RuleExecutionContext ctx)
@@ -188,11 +193,16 @@ public static class ValueAndConditionEvaluator
         {
             double sum = 0;
             for (int i = 0; i < cards.Count; i++)
-                sum += GetCardAttr(cards[i], attr, ctx, unscaled);
+            {
+                if (cards[i].HasAttribute(attr))
+                    sum += GetCardAttr(cards[i], attr, ctx, unscaled);
+            }
             return sum;
         }
 
-        return GetCardAttr(cards[0], attr, ctx, unscaled);
+        return cards[0].HasAttribute(attr)
+            ? GetCardAttr(cards[0], attr, ctx, unscaled)
+            : (node.DefaultValue ?? 0);
     }
 
     private static double EvaluatePlayerAttr(RuleNode node, RuleExecutionContext ctx, bool unscaled)
@@ -256,26 +266,12 @@ public static class ValueAndConditionEvaluator
 
     private static IEnumerable<string> EnumerateOfficialCardTags(CardInstance c)
     {
+        // D1-P1-02 (#124-5)：复用 CardInstance.GetAllTags() 逐层正/负标签叠算结果，再过滤为官方可见标签集合
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        void Collect(IEnumerable<string>? src)
+        foreach (var t in c.GetAllTags())
         {
-            if (src == null) return;
-            foreach (var t in src)
-            {
-                if (OfficialVisibleCardTags.Contains(t))
-                    seen.Add(t);
-            }
-        }
-
-        Collect(c.Template.Tags);
-        Collect(c.ExtraTags);
-        Collect(c.CombatTags);
-        Collect(c.AuraTags);
-        if (!string.IsNullOrEmpty(c.Enchantment) &&
-            c.Template.Enchantments != null &&
-            c.Template.Enchantments.TryGetValue(c.Enchantment, out var ench))
-        {
-            Collect(ench.Tags);
+            if (OfficialVisibleCardTags.Contains(t))
+                seen.Add(t);
         }
         return seen;
     }
@@ -498,6 +494,7 @@ public static class ValueAndConditionEvaluator
                 double bestVal = 0;
                 for (int i = 0; i < pairs.Count; i++)
                 {
+                    if (!pairs[i].Card.HasAttribute(attr)) continue;
                     double v = GetCardAttr(pairs[i].Card, attr, ctx);
                     if (bestIdx < 0 || v < bestVal)
                     {
@@ -563,10 +560,7 @@ public static class ValueAndConditionEvaluator
             "TCardConditionalTag" => MatchListOperator(cond.Tags, cond.Operator, t => OfficialVisibleCardTags.Contains(t) && card.HasTag(t)),
             "TCardConditionalHiddenTag" => MatchListOperator(cond.Tags ?? cond.HiddenTags, cond.Operator, t => card.HasHiddenTag(t)),
             "TCardConditionalId" => EvaluateCardIdCondition(cond, card),
-            "TCardConditionalAttribute" => Compare(
-                GetCardAttr(card, cond.Attribute ?? "Ammo", ctx),
-                cond.ComparisonOperator ?? cond.Comparison,
-                EvaluateCardConditionalComparisonValue(cond, card, ctx, 0)),
+            "TCardConditionalAttribute" => EvaluateCardAttributeCondition(cond, card, ctx),
             "TCardConditionalTier" => ApplyNegation(
                 cond.Tiers != null && cond.Tiers.Contains(card.Tier.ToString(), StringComparer.OrdinalIgnoreCase),
                 cond.IsNot),
@@ -599,6 +593,27 @@ public static class ValueAndConditionEvaluator
             "TCardConditionalSizeSmallest" => IsExtremeSize(card, owner, largest: false, ctx),
             _ => true
         };
+    }
+
+    private static bool EvaluateCardAttributeCondition(RuleNode cond, CardInstance card, RuleExecutionContext ctx)
+    {
+        var attr = cond.Attribute ?? "Ammo";
+        var op = cond.ComparisonOperator ?? cond.Comparison;
+        if (!card.HasAttribute(attr))
+        {
+            // 被动无冷却卡（未声明 CooldownMax 或 CooldownMax<=0）在显式判等 CooldownMax == 0 时按 0 匹配，
+            // 同时 <= N 与 TCardConditionalAttributeLowest(CooldownMax) 仍严格排除无冷却被动卡
+            if (attr.Equals("CooldownMax", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(op, "Equal", StringComparison.OrdinalIgnoreCase))
+            {
+                return Math.Abs(EvaluateCardConditionalComparisonValue(cond, card, ctx, 0)) < 1e-9;
+            }
+            return false;
+        }
+        return Compare(
+            GetCardAttr(card, attr, ctx),
+            op,
+            EvaluateCardConditionalComparisonValue(cond, card, ctx, 0));
     }
 
     private static bool EvaluateCardConditionList(List<RuleNode> list, CardInstance card, PlayerState owner, RuleExecutionContext ctx, bool requireAll)
@@ -977,12 +992,19 @@ public static class ValueAndConditionEvaluator
 
     private static bool EvaluateHasVisitedEncounter(RuleNode cond, RuleExecutionContext ctx)
     {
-        VisitedEncounterOverrides.TryGetValue(ctx, out var visited);
+        // D1-P1-06：优先读取 RuleExecutionContext.VisitedEncounterIds，再回退旧 ConditionalWeakTable
+        IReadOnlyCollection<string>? visited = ctx.VisitedEncounterIds;
+        if (visited == null && VisitedEncounterOverrides.TryGetValue(ctx, out var overrideSet))
+            visited = overrideSet;
         var list = cond.EncounterIds ?? (string.IsNullOrEmpty(cond.EncounterId) ? null : new List<string> { cond.EncounterId });
         return MatchListOperator(list, cond.Operator, id =>
         {
-            if (visited == null) return false;
-            if (visited.Contains(id)) return true;
+            if (visited == null || visited.Count == 0) return false;
+            if (visited is HashSet<string> hs && hs.Contains(id)) return true;
+            foreach (var v in visited)
+            {
+                if (string.Equals(v, id, StringComparison.OrdinalIgnoreCase)) return true;
+            }
             if (Guid.TryParse(id, out var g))
                 return visited.Any(v => Guid.TryParse(v, out var vg) && vg == g);
             return false;
@@ -1017,8 +1039,8 @@ public static class ValueAndConditionEvaluator
         "Alive" => !card.IsDestroyed && !card.IsDisabled,
         "Destroyed" => card.IsDestroyed,
         "Disabled" => !card.IsDestroyed && card.IsDisabled,
-        "Transformed" => card.IsDestroyed,
-        "Casting" => false,
+        "Transformed" => card.WasTransformed || !string.IsNullOrEmpty(card.TransformedFromInstanceId),
+        "Casting" => card.IsCasting,
         _ => false
     };
 
@@ -1129,6 +1151,7 @@ public static class ValueAndConditionEvaluator
             for (int i = 0; i < pool.Count; i++)
             {
                 var c = pool[i];
+                if (!c.HasAttribute(attr)) continue;
                 double v = GetCardAttr(c, attr, ctx);
                 if (best == null || v < bestVal)
                 {
@@ -1136,7 +1159,7 @@ public static class ValueAndConditionEvaluator
                     best = c;
                 }
             }
-            return ReferenceEquals(card, best);
+            return best != null && ReferenceEquals(card, best);
         }
     }
 

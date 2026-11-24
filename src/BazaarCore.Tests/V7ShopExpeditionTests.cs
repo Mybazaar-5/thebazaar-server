@@ -25,22 +25,14 @@ namespace BazaarCore.Tests;
 /// 4. [2.5, 2.6 & GuidOnly] MaxSelections 映射、空池免费发牌金币兜底与显式 GuidOnly 白名单（同时保持 Never 禁止）
 /// 5. [2.8] Travel Agent / 远征门票检测、房间映射与日初远征触发/消耗/选房辅助 API
 /// </summary>
+[Collection("ShopEngineStaticState")]
 public sealed class V7ShopExpeditionTests
 {
-    private static readonly Lazy<GameDataRepository> Repo = new(() => GameDatabaseLoader.Load());
-    private static readonly Lazy<CardPool> Pool = new(() => CardPool.Load(ResolveDataPath("GameData.db")));
+    private static readonly Lazy<GameDataRepository> Repo = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Repo);
+    private static readonly Lazy<CardPool> Pool = new(() => TestInfrastructure.SharedGameDataFixture.Shared.Pool);
 
     private static string ResolveDataPath(string fileName)
-    {
-        string? dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            string candidate = Path.Combine(dir, "dist", "data", fileName);
-            if (File.Exists(candidate)) return candidate;
-            dir = Directory.GetParent(dir)?.FullName;
-        }
-        return Path.Combine(@"e:\thebazaar\dist\data", fileName);
-    }
+        => TestInfrastructure.TestDataLocator.ResolveDataFile(fileName);
 
     private static GameDataRepository CreateRepoWithExtraCards(params CardTemplate[] extras)
     {
