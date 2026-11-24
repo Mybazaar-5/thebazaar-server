@@ -89,14 +89,41 @@ public sealed class WorkshopValidatorService
         List<string> TooltipsZh,
         string SearchHaystack);
 
+    private sealed record CachedDiskValidationEntry(
+        string ContentFingerprint,
+        string ModSetHash,
+        int Matches,
+        int Seed,
+        ModTenGateValidationReport Report,
+        DateTimeOffset CachedAtUtc);
+
     private readonly ServerModHost _modHost;
     private readonly SemaphoreSlim _validationThrottle = new(2, 2);
     // 按 modId 分片的磁盘目录写/切/读互斥锁；锁序 DAG 硬承诺：所有 _modHost.*Reload() 必须在释放本锁后执行
     private readonly ConcurrentDictionary<string, object> _modDirLocks = new(StringComparer.OrdinalIgnoreCase);
+    // P1-18：按 Mod 源码目录内容 SHA-256 + modSetHash 复用磁盘校验报告，避免每次 export 重复硬跑 20 场战斗模拟
+    private readonly ConcurrentDictionary<string, CachedDiskValidationEntry> _diskValidationCache = new(StringComparer.OrdinalIgnoreCase);
+    private long _exportValidationCacheHits;
+    private long _exportValidationCacheMisses;
     private readonly Lazy<List<BaseCardIndexEntry>> _baseCardIndex;
     private readonly Lazy<List<string>> _knownVfxKeys;
     private readonly Lazy<string> _cachedRuleCatalogJson;
     private readonly Lazy<string> _cachedRuleCatalogEtag;
+
+    /// <summary>P1-18：导出校验缓存命中次数（供诊断与自动化测试核验）。</summary>
+    public long ExportValidationCacheHits => Interlocked.Read(ref _exportValidationCacheHits);
+
+    /// <summary>P1-18：导出校验缓存未命中并执行实测校验的次数（供诊断与自动化测试核验）。</summary>
+    public long ExportValidationCacheMisses => Interlocked.Read(ref _exportValidationCacheMisses);
+
+    /// <summary>P1-18：主动失效指定 Mod（或全部）的磁盘校验缓存。</summary>
+    public void InvalidateValidationCache(string? modId = null)
+    {
+        if (string.IsNullOrWhiteSpace(modId))
+            _diskValidationCache.Clear();
+        else
+            _diskValidationCache.TryRemove(modId.Trim(), out _);
+    }
 
     private object GetModDirLock(string modId) => _modDirLocks.GetOrAdd(modId.Trim(), static _ => new object());
 
@@ -716,6 +743,7 @@ public sealed class WorkshopValidatorService
 
                 // 同卷隐藏目录原子切换事务（.tmp_ -> targetDir，旧目录临时移入 .bak_ 失败自动回滚）
                 AtomicSwapDirectory(stageDir, targetDir, modsRoot, modId);
+                InvalidateValidationCache(modId);
 
                 var issues = new List<ModValidationIssue>();
                 var loaded = ModLoader.LoadSinglePackage(targetDir, modId, issues);
@@ -776,6 +804,7 @@ public sealed class WorkshopValidatorService
             File.Move(tmpPath, destPath, overwrite: true);
 
             RebuildArtManifest(modDir, modId);
+            InvalidateValidationCache(modId);
         }
 
         return (true, null, new
@@ -865,7 +894,44 @@ public sealed class WorkshopValidatorService
 
         try
         {
-            return await Task.Run(() => RunValidationCore(modId, inMemoryDraft, matches, seed), ct).ConfigureAwait(false);
+            string? diskFingerprintBefore = null;
+            string? modSetHashBefore = null;
+            string? diskModDir = null;
+            if (inMemoryDraft == null && ModValidator.IsValidModId(modId))
+            {
+                diskModDir = ResolveSafeModDir(modId);
+                if (Directory.Exists(diskModDir))
+                {
+                    (diskFingerprintBefore, modSetHashBefore) = ComputeDiskValidationFingerprint(modId, diskModDir);
+                }
+            }
+
+            var report = await Task.Run(() => RunValidationCore(modId, inMemoryDraft, matches, seed), ct).ConfigureAwait(false);
+
+            // P1-18：磁盘校验完成后复核目录指纹未在校验期间漂移，再写入指纹缓存供后续 export 零模拟复用
+            if (inMemoryDraft == null
+                && report.Ok
+                && diskFingerprintBefore != null
+                && modSetHashBefore != null
+                && diskModDir != null
+                && Directory.Exists(diskModDir))
+            {
+                var (diskFingerprintAfter, modSetHashAfter) = ComputeDiskValidationFingerprint(modId, diskModDir);
+                if (string.Equals(diskFingerprintBefore, diskFingerprintAfter, StringComparison.Ordinal)
+                    && string.Equals(modSetHashBefore, modSetHashAfter, StringComparison.Ordinal))
+                {
+                    int effectiveMatches = Math.Clamp(matches, 1, 100);
+                    _diskValidationCache[modId.Trim()] = new CachedDiskValidationEntry(
+                        diskFingerprintAfter,
+                        modSetHashAfter,
+                        effectiveMatches,
+                        seed,
+                        report,
+                        DateTimeOffset.UtcNow);
+                }
+            }
+
+            return report;
         }
         finally
         {
@@ -1045,7 +1111,28 @@ public sealed class WorkshopValidatorService
         if (!Directory.Exists(modDir) || !File.Exists(Path.Combine(modDir, "mod.json")))
             return (false, 404, $"未找到 Mod '{modId}'。", null, null, null);
 
-        var validation = await ValidateAsync(modId, null, matches: 20, seed: 2026131, ct: ct).ConfigureAwait(false);
+        // P1-18：优先复用同源码目录 SHA-256 指纹与同 modSetHash 的最近一次校验报告，避免每次导出重复硬跑 20 场战斗模拟；
+        // 任何文件内容或上下文 Mod 集合变更都会立即产生新指纹导致缓存失效。
+        const int ExportMinMatches = 20;
+        const int ExportDefaultSeed = 2026131;
+        string cleanModId = modId.Trim();
+        var (currentFingerprint, currentModSetHash) = ComputeDiskValidationFingerprint(cleanModId, modDir);
+        ModTenGateValidationReport validation;
+        if (_diskValidationCache.TryGetValue(cleanModId, out var cachedValidation)
+            && string.Equals(cachedValidation.ContentFingerprint, currentFingerprint, StringComparison.Ordinal)
+            && string.Equals(cachedValidation.ModSetHash, currentModSetHash, StringComparison.Ordinal)
+            && cachedValidation.Matches >= ExportMinMatches
+            && cachedValidation.Seed == ExportDefaultSeed)
+        {
+            Interlocked.Increment(ref _exportValidationCacheHits);
+            validation = cachedValidation.Report;
+        }
+        else
+        {
+            Interlocked.Increment(ref _exportValidationCacheMisses);
+            validation = await ValidateAsync(cleanModId, null, matches: ExportMinMatches, seed: ExportDefaultSeed, ct: ct).ConfigureAwait(false);
+        }
+
         if (!validation.Passed && !allowDraft)
         {
             return (false, 422, $"导出已拦截：存在 {validation.ErrorCount} 个错误未修复（如需导出未完成草稿请显式传 ?allowDraft=true）。", null, null, validation);
@@ -1205,6 +1292,7 @@ public sealed class WorkshopValidatorService
             {
                 AtomicSwapDirectory(sameVolStage, targetDir, modsRoot, modId);
             }
+            InvalidateValidationCache(modId);
 
             // 释放目录锁后再通知 ServerModHost 重新扫描发现列表
             _modHost.Reload();
@@ -1239,10 +1327,81 @@ public sealed class WorkshopValidatorService
 
             Directory.Delete(modDir, recursive: true);
         }
+        InvalidateValidationCache(clean);
 
         // 释放目录锁后再通知 ServerModHost 移除状态并重载
         _modHost.RemoveModStateAndReload(clean);
         return (true, 200, null);
+    }
+
+    /// <summary>
+    /// P1-18：计算指定 Mod 磁盘目录的确定性内容指纹（覆盖全部有效源码/资产文件字节 SHA-256 及其他已发现 Mod 上下文哈希）与当前服务端 ModSetHash，
+    /// 保证任意文件内容或依赖集合变动都会在毫秒级立即触发导出校验缓存失效。
+    /// </summary>
+    internal (string ContentFingerprint, string ModSetHash) ComputeDiskValidationFingerprint(string modId, string modDir)
+    {
+        string cleanId = modId.Trim();
+        string modSetHash = _modHost.Registry.ComputeModSetHash();
+        using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+        void AppendUtf8(string text)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(text);
+            hasher.AppendData(bytes);
+        }
+
+        AppendUtf8("workshop-disk-validation:v1:");
+        AppendUtf8(cleanId);
+        AppendUtf8("|");
+
+        lock (GetModDirLock(cleanId))
+        {
+            if (Directory.Exists(modDir))
+            {
+                var files = Directory.GetFiles(modDir, "*.*", SearchOption.AllDirectories);
+                Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+                byte[] buf = new byte[16 * 1024];
+                foreach (var f in files)
+                {
+                    string rel = ModValidator.NormalizeLogicalPath(Path.GetRelativePath(modDir, f));
+                    if (rel.StartsWith('.') || rel.Contains("/.") || rel.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    string ext = Path.GetExtension(f);
+                    if (ForbiddenZipExtensions.Contains(ext))
+                        continue;
+
+                    AppendUtf8(rel);
+                    AppendUtf8("\0");
+                    using var fs = File.OpenRead(f);
+                    AppendUtf8(fs.Length.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    AppendUtf8("\0");
+                    int read;
+                    while ((read = fs.Read(buf, 0, buf.Length)) > 0)
+                    {
+                        hasher.AppendData(buf, 0, read);
+                    }
+                    AppendUtf8("\n");
+                }
+            }
+        }
+
+        // 同步纳入其他已发现 Mod 包的哈希（避免跨 Mod ID 碰撞或依赖包变动后沿用过期缓存）
+        AppendUtf8("|ctx:");
+        var otherCtx = _modHost.DiscoveredPackages
+            .Where(p => !string.Equals(p.Manifest.Id, cleanId, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(p => p.Manifest.Id, StringComparer.OrdinalIgnoreCase);
+        foreach (var p in otherCtx)
+        {
+            AppendUtf8(p.Manifest.Id);
+            AppendUtf8("@");
+            AppendUtf8(p.Manifest.Version);
+            AppendUtf8("=");
+            AppendUtf8(p.PackageHash ?? string.Empty);
+            AppendUtf8(";");
+        }
+
+        string contentFp = Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
+        return (contentFp, modSetHash);
     }
 
     // ── 内部工具 ──────────────────────────────────────────────────────────────

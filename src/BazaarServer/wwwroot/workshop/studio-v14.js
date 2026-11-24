@@ -2248,7 +2248,8 @@
 
     box.innerHTML = allItems.map((item) => {
       const active = selectedSet.has(item.id) ? 'active' : '';
-      return `<button type="button" class="pill-btn ${active}" data-pill-val="${escapeHtml(item.id)}">${escapeHtml(item.nameZh || item.id)}</button>`;
+      const tipAttr = item.descZh ? ` title="${escapeHtml(item.descZh)}"` : '';
+      return `<button type="button" class="pill-btn ${active}" data-pill-val="${escapeHtml(item.id)}"${tipAttr}>${escapeHtml(item.nameZh || item.id)}</button>`;
     }).join('');
 
     box.querySelectorAll('.pill-btn').forEach((btn) => {
@@ -2274,6 +2275,22 @@
   }
 
   const PLAYABLE_HERO_IDS = ['Vanessa', 'Dooley', 'Pygmalien', 'Mak', 'Karnok', 'Jules', 'Stelle', 'Hero8'];
+
+  // 奇遇事件语境专用英雄目录：Common 独立显示为「✨ 全英雄通用 (Common)」，不复用物品中立商店文案，底层值仍为 Common
+  function getEventHeroCatalog(cat) {
+    if (Array.isArray(cat?.eventHeroes) && cat.eventHeroes.length > 0) {
+      return cat.eventHeroes;
+    }
+    const src = Array.isArray(cat?.heroes) ? cat.heroes : [];
+    if (!src.length) {
+      return [{ id: 'Common', nameZh: '✨ 全英雄通用 (Common)', descZh: '任意英雄对局均可触发该奇遇（底层数据值仍保持 Common）' }];
+    }
+    return src.map((h) => (
+      h && h.id === 'Common'
+        ? { ...h, nameZh: '✨ 全英雄通用 (Common)', descZh: '任意英雄对局均可触发该奇遇（底层数据值仍保持 Common）' }
+        : h
+    ));
+  }
 
   function renderHeroPillGroup(containerId, heroesCatalog, selectedList, onToggle) {
     const box = $(containerId);
@@ -2370,10 +2387,11 @@
       });
     }
 
-    // 3) 奇遇事件：适用英雄
+    // 3) 奇遇事件：适用英雄（使用奇遇独立语境，Common 展示为「✨ 全英雄通用 (Common)」）
     const ev = st.workspace && st.selectedEventIdx >= 0 ? st.workspace.events[st.selectedEventIdx] : null;
     if (ev) {
-      renderPillGroup('evHeroPills', heroes, ev.heroes || ['Common'], (next) => {
+      const eventHeroes = getEventHeroCatalog(cat);
+      renderPillGroup('evHeroPills', eventHeroes, ev.heroes || ['Common'], (next) => {
         ev.heroes = next;
         if ($('evHeroes')) $('evHeroes').value = next.join(', ');
         B().markDirty(true);

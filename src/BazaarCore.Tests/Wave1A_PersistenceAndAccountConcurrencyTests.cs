@@ -377,7 +377,9 @@ public sealed class Wave1A_PersistenceAndAccountConcurrencyTests
                 {
                     barrier.Wait();
                     bool anyOk = false;
-                    for (int k = 0; k < 5; k++)
+                    // 每线程 2 次免密抢登（4 × 2 + 1 次 postNoPass = 9 < MaxFailedLoginsPerWindow = 10），
+                    // 既完整覆盖并发防劫持竞态，又避免 Release 高速执行下误触 10 次登录限流导致后续正确密码被拒
+                    for (int k = 0; k < 2; k++)
                     {
                         var r = store.LoginByNameWithSecret(freshUser, secret: null, allowAutoBindSecret: false);
                         if (r.Ok) anyOk = true;

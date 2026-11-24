@@ -2439,10 +2439,12 @@ public sealed class ShopEngine
                     if (dealtList.Count >= limit) break;
                     var srcCore = _repo.GetCard(RunState.ResolveCoreTemplateId(src));
                     if (srcCore == null) continue;
-                    var copyInst = new CardInstance(srcCore, ToCoreTier(src.Tier), src.Enchantment?.ToString());
+                    // P0-03：镜像候选卡透传同一 InstanceId，守护 CoreCard.InstanceId == entry.InstanceId 不变量
+                    string copyInstId = NewId("itm");
+                    var copyInst = new CardInstance(srcCore, ToCoreTier(src.Tier), src.Enchantment?.ToString(), copyInstId);
                     int slotWidth = GetShelfSlotWidth(copyInst);
                     if (usedWidth + slotWidth > MaxShelfSlotWidth) continue;
-                    var entry = CreateEntryFromCoreInstance(copyInst, _run.SelectionRules.SelectionIsFree);
+                    var entry = CreateEntryFromCoreInstance(copyInst, _run.SelectionRules.SelectionIsFree, explicitInstanceId: copyInstId);
                     if (isPaidContext && entry.Attributes.GetValueOrDefault(ECardAttributeType.BuyPrice, 0) <= 0)
                         continue;
                     dealtList.Add(entry);
@@ -3791,8 +3793,10 @@ public sealed class ShopEngine
             if (coreTpl != null)
             {
                 var effectiveCoreTier = SpawnQueryEngine.ClampToSupportedTier(coreTpl, rolledCoreTier);
-                var inst = new CardInstance(coreTpl, effectiveCoreTier);
-                var entry = CreateEntryFromCoreInstance(inst, isFree: true);
+                // P0-03：升级候选卡透传同一 InstanceId，杜绝 CoreCard 退化为随机 32 位 UUID
+                string instId = NewId(ResolveInstancePrefixForCardType(ParseCardType(coreTpl.Type)));
+                var inst = new CardInstance(coreTpl, effectiveCoreTier, null, instId);
+                var entry = CreateEntryFromCoreInstance(inst, isFree: true, explicitInstanceId: instId);
                 ApplyModeAndMutatorModifiersToEntry(entry, isFree: true, isMerchant: false, levelRng);
                 _run.Cards[entry.InstanceId] = entry;
                 _run.SelectionSet.Add(entry.InstanceId);
@@ -3901,11 +3905,13 @@ public sealed class ShopEngine
         var coreTpl = _repo.GetCard(tpl.Id);
         ETier effectiveTier = ClampTierForTemplate(tpl, coreTpl, tier);
         var coreTier = ToCoreTier(effectiveTier);
-        var coreCard = coreTpl != null ? new CardInstance(coreTpl, coreTier) : null;
+        // P0-03：先生成 InstanceId 并透传至 CardInstance，确保 entry.CoreCard.InstanceId == entry.InstanceId
+        string instId = NewId("skl");
+        var coreCard = coreTpl != null ? new CardInstance(coreTpl, coreTier, null, instId) : null;
         Guid wireGuid = ResolveWireTemplateGuid(tpl.Id, out string? customCardId);
         var entry = new RunState.CardEntry
         {
-            InstanceId = NewId("skl"),
+            InstanceId = instId,
             TemplateId = wireGuid,
             CustomCardId = customCardId,
             Type = ECardType.Skill,
@@ -3915,8 +3921,8 @@ public sealed class ShopEngine
             Socket = null,
             Section = null,
             IsFreeCandidate = isFree,
-            CoreCard = coreCard,
         };
+        entry.BindAlignedCoreCard(coreCard);
         RunState.PopulateMetaFromTemplate(entry, tpl, coreTpl);
         if (tpl.TierAttributes.TryGetValue(effectiveTier.ToString(), out var attrs) ||
             tpl.TierAttributes.TryGetValue(tpl.StartingTier, out attrs))
@@ -3926,9 +3932,9 @@ public sealed class ShopEngine
                     entry.Attributes[at] = kv.Value;
         }
 
-        if (coreCard != null)
+        if (entry.CoreCard != null)
         {
-            ApplyLocalShelfAuraAndSync(entry, coreCard, isFree);
+            ApplyLocalShelfAuraAndSync(entry, entry.CoreCard, isFree);
         }
         else
         {
@@ -3948,11 +3954,13 @@ public sealed class ShopEngine
         ECardSize size = ParseSize(tpl.Size);
         ETier effectiveTier = ClampTierForTemplate(tpl, coreTpl, tier);
         var coreTier = ToCoreTier(effectiveTier);
-        var coreCard = coreTpl != null ? new CardInstance(coreTpl, coreTier) : null;
+        // P0-03：先生成 InstanceId 并透传至 CardInstance，确保 entry.CoreCard.InstanceId == entry.InstanceId
+        string instId = NewId("itm");
+        var coreCard = coreTpl != null ? new CardInstance(coreTpl, coreTier, null, instId) : null;
         Guid wireGuid = ResolveWireTemplateGuid(tpl.Id, out string? customCardId);
         var entry = new RunState.CardEntry
         {
-            InstanceId = NewId("itm"),
+            InstanceId = instId,
             TemplateId = wireGuid,
             CustomCardId = customCardId,
             Type = ECardType.Item,
@@ -3962,8 +3970,8 @@ public sealed class ShopEngine
             Socket = null,
             Section = null,
             IsFreeCandidate = isFree,
-            CoreCard = coreCard,
         };
+        entry.BindAlignedCoreCard(coreCard);
         RunState.PopulateMetaFromTemplate(entry, tpl, coreTpl);
 
         string tierKey = effectiveTier.ToString();
@@ -3976,9 +3984,9 @@ public sealed class ShopEngine
                     entry.Attributes[at] = kv.Value;
         }
 
-        if (coreCard != null)
+        if (entry.CoreCard != null)
         {
-            ApplyLocalShelfAuraAndSync(entry, coreCard, isFree);
+            ApplyLocalShelfAuraAndSync(entry, entry.CoreCard, isFree);
         }
         else
         {
@@ -3998,41 +4006,63 @@ public sealed class ShopEngine
         return entry;
     }
 
+    private static string ResolveInstancePrefixForCardType(ECardType cardType) => cardType switch
+    {
+        ECardType.Skill => "skl",
+        ECardType.SocketEffect => "skt",
+        ECardType.EncounterStep => "stp",
+        ECardType.EventEncounter => "enc",
+        ECardType.PedestalEncounter => "ped",
+        ECardType.CombatEncounter => "cbt",
+        ECardType.PvpEncounter => "pvp",
+        _ => "itm",
+    };
+
     /// <summary>
     /// 根据 BazaarCore CardInstance 创建候选区 CardEntry，
     /// 严格钳制不支持的过低阶级（防止 StartingTier=Gold 的卡以 Bronze 实例化导致 Custom_0 等属性归零），
+    /// 强制对齐 CoreCard.InstanceId == entry.InstanceId（P0-03），
     /// 并保留模板真实 ECardType（禁止再把 EncounterStep / EventEncounter / PedestalEncounter / CombatEncounter 错标为 Item）。
     /// </summary>
-    public RunState.CardEntry CreateEntryFromCoreInstance(CardInstance inst, bool isFree)
+    public RunState.CardEntry CreateEntryFromCoreInstance(CardInstance inst, bool isFree, string? explicitInstanceId = null)
     {
+        var tpl = _pool.Get(inst.Template.Id);
+        ECardType cardType = ParseCardType(inst.Template.Type);
+        string prefix = ResolveInstancePrefixForCardType(cardType);
+        string instId = !string.IsNullOrWhiteSpace(explicitInstanceId) ? explicitInstanceId : NewId(prefix);
+
         var clampedTier = SpawnQueryEngine.ClampToSupportedTier(inst.Template, inst.Tier);
         if (clampedTier != inst.Tier)
         {
-            // D2-P2-06：复用 CloneNonCombatState 完整保留 AdditiveMult / 标签增删集 / 附魔三层 / Quest 状态，再调整品阶
-            var rebuilt = inst.CloneNonCombatState(inst.InstanceId);
+            // D2-P2-06 & P0-03：仅当必须钳制品阶时才克隆重建，同步复制源实例 BaseAttributes 中外部覆写键（如 Tiny）防丢属性
+            var rebuilt = inst.CloneNonCombatState(instId);
+            rebuilt.IsFlying = inst.IsFlying;
+            rebuilt.Heated = inst.Heated;
+            rebuilt.Chilled = inst.Chilled;
             rebuilt.SetTier(clampedTier, isTemporary: false);
+            foreach (var kv in inst.BaseAttributes)
+            {
+                if (!rebuilt.BaseAttributes.ContainsKey(kv.Key) ||
+                    string.Equals(kv.Key, "Tiny", StringComparison.OrdinalIgnoreCase))
+                {
+                    rebuilt.BaseAttributes[kv.Key] = kv.Value;
+                }
+            }
+            rebuilt.MarkAttributeDirty();
             rebuilt.RefillAmmoToMax();
             inst = rebuilt;
         }
+        else if (!string.Equals(inst.InstanceId, instId, StringComparison.Ordinal))
+        {
+            // P0-03：同阶时原地重签 InstanceId，既严格守护 CoreCard.InstanceId == entry.InstanceId，
+            // 又 100% 保持调用方对象引用与自定义覆写的 BaseAttributes（如 Tiny / BuyPrice）不分裂
+            inst.ReassignInstanceId(instId);
+        }
 
-        var tpl = _pool.Get(inst.Template.Id);
-        ECardType cardType = ParseCardType(inst.Template.Type);
         ETier tier = ParseTier(inst.Tier.ToString());
         ECardSize size = cardType == ECardType.Item
             ? ParseSize(inst.EffectiveSize.ToString())
             : ParseSize(inst.Template.Size);
-
-        string prefix = cardType switch
-        {
-            ECardType.Skill => "skl",
-            ECardType.SocketEffect => "skt",
-            ECardType.EncounterStep => "stp",
-            ECardType.EventEncounter => "enc",
-            ECardType.PedestalEncounter => "ped",
-            ECardType.CombatEncounter => "cbt",
-            ECardType.PvpEncounter => "pvp",
-            _ => "itm",
-        };
 
         EEnchantmentType? parsedEnchant = null;
         if (!string.IsNullOrEmpty(inst.Enchantment) &&
@@ -4044,7 +4074,7 @@ public sealed class ShopEngine
         Guid wireGuid = ResolveWireTemplateGuid(inst.Template.Id, out string? customCardId);
         var entry = new RunState.CardEntry
         {
-            InstanceId = NewId(prefix),
+            InstanceId = instId,
             TemplateId = wireGuid,
             CustomCardId = customCardId,
             Type = cardType,
@@ -4055,10 +4085,10 @@ public sealed class ShopEngine
             Socket = null,
             Section = null,
             IsFreeCandidate = isFree,
-            CoreCard = inst,
         };
-        RunState.PopulateMetaFromTemplate(entry, tpl, inst.Template);
-        ApplyLocalShelfAuraAndSync(entry, inst, isFree);
+        entry.BindAlignedCoreCard(inst);
+        RunState.PopulateMetaFromTemplate(entry, tpl, entry.CoreCard.Template);
+        ApplyLocalShelfAuraAndSync(entry, entry.CoreCard, isFree);
         return entry;
     }
 

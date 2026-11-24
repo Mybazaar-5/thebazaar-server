@@ -53,6 +53,9 @@ internal static partial class CompatAuditPatch
     private static FieldInfo _bmIsRevealingField;
     private static PropertyInfo _bmIsRevealingProp;
     private static FieldInfo _bmIsLoadingCollectiblesField;
+    private static FieldInfo _bmSkillsForPlayerPresField;
+    private static FieldInfo _bmSkillsForOpponentPresField;
+    private static int _spawnCardsQueueCleanedCount;
     private static PropertyInfo _dataCanWeDisplaySeqNodesProp;
     private static PropertyInfo _dataIsStorageOpenProp;
     private static MethodInfo _cardRemovalHasPendingMethod;
@@ -109,6 +112,7 @@ internal static partial class CompatAuditPatch
         Interlocked.Increment(ref _generalShelfWatchdogSeq);
         Interlocked.Increment(ref _opponentRevealSweepSeq);
         Interlocked.Increment(ref _resumeReconcileSeq);
+        CancelWave5Watchdogs();
     }
 
     private static void PatchUserFeedbackFixes(SafeHarmonyPatcher patcher)
@@ -168,6 +172,8 @@ internal static partial class CompatAuditPatch
                 _bmIsRevealingField = bmType.GetField("_isRevealing", instFlags);
                 _bmIsRevealingProp = bmType.GetProperty("IsRevealing", instFlags);
                 _bmIsLoadingCollectiblesField = bmType.GetField("_isLoadingCollectibles", instFlags);
+                _bmSkillsForPlayerPresField = bmType.GetField("skillsForPlayerPresentation", instFlags);
+                _bmSkillsForOpponentPresField = bmType.GetField("skillsForOpponentPresentation", instFlags);
 
                 // 1. 待删卡清理扩展至 Encounter / LevelUp / Loot / Pedestal（防止旧货架卡与新选项/商店卡错位重叠）
                 var pendingRemovalMethod = AccessTools.Method(bmType, "ProcessPendingRemovalBeforeChoiceLayout", new[] { typeof(bool) });
@@ -199,7 +205,7 @@ internal static partial class CompatAuditPatch
                         label: "UserFix.BoardManager.LayoutChoicesEvenlySpaced");
                 }
 
-                // 3. SpawnCards：Resume 期间强制走技能快照批量 Initialize，并在异步完成后触发对手/玩家显隐校验
+                // 3. SpawnCards：Resume 期间强制走技能快照批量 Initialize，并挂载 Finalizer 兜底清理 skillsForPlayerPresentation 与 IsUpdatingSkillBoard (P1-11)
                 foreach (var m in bmType.GetMethods(instFlags))
                 {
                     if (m.Name != "SpawnCards") continue;
@@ -209,7 +215,7 @@ internal static partial class CompatAuditPatch
                         _bmSpawnCardsMethod = m;
                         patcher.TryPatchMethod(m,
                             prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(BoardManagerSpawnCardsPrefix)),
-                            postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(BoardManagerSpawnCardsPostfix)),
+                            finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(BoardManagerSpawnCardsFinalizer)),
                             optional: true,
                             label: "UserFix.BoardManager.SpawnCards");
                         break;
@@ -891,27 +897,115 @@ internal static partial class CompatAuditPatch
         catch { }
     }
 
-    private static void BoardManagerSpawnCardsPostfix(object __instance, Task __result)
+    private static Exception BoardManagerSpawnCardsFinalizer(object __instance, Exception __exception, ref Task __result)
     {
-        if (__result == null) return;
         try
         {
-            __result.ContinueWith(_ =>
+            if (__exception != null)
             {
-                MainThreadDispatcher.Enqueue(() =>
-                {
-                    var dataState = GameInspector.GetDataCurrentState();
-                    if (GameInspector.GetMember(dataState, "StateName") is ERunState runState)
-                    {
-                        if (runState is ERunState.PVPCombat or ERunState.Combat)
-                        {
-                            EnsureOpponentCardsVisibleOnMain();
-                        }
-                    }
-                });
-            }, TaskScheduler.Default);
+                BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-11]: BoardManager.SpawnCards 同步异常，兜底清理技能待展现队列并复位 IsUpdatingSkillBoard: {__exception.Message}");
+                CleanupSpawnCardsSkillQueuesOnMain(__instance, forceResetSkillUpdating: true);
+                __result = Task.CompletedTask;
+                return null;
+            }
+
+            if (__result == null || __result.IsCompleted)
+            {
+                bool faulted = __result != null && (__result.IsFaulted || __result.IsCanceled);
+                CleanupSpawnCardsSkillQueuesOnMain(__instance, forceResetSkillUpdating: faulted);
+                RunPostSpawnCardsCombatOpponentSweep();
+                return null;
+            }
+
+            __result = WrapBoardManagerSpawnCardsTask(__result, __instance);
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.BoardManagerSpawnCardsFinalizer: " + ex.Message);
+        }
+        return __exception;
+    }
+
+    private static async Task WrapBoardManagerSpawnCardsTask(Task inner, object bm)
+    {
+        bool hadError = false;
+        try
+        {
+            await inner;
+        }
+        catch (OperationCanceledException)
+        {
+            hadError = true;
+            throw;
+        }
+        catch (Exception ex)
+        {
+            hadError = true;
+            BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-11]: BoardManager.SpawnCards 异步异常，兜底清理技能队列: {ex.GetType().Name}: {ex.Message}");
+            throw;
+        }
+        finally
+        {
+            MainThreadDispatcher.Enqueue(() =>
+            {
+                CleanupSpawnCardsSkillQueuesOnMain(bm, forceResetSkillUpdating: hadError);
+                RunPostSpawnCardsCombatOpponentSweep();
+            });
+        }
+    }
+
+    private static void RunPostSpawnCardsCombatOpponentSweep()
+    {
+        try
+        {
+            var dataState = GameInspector.GetDataCurrentState();
+            if (GameInspector.GetMember(dataState, "StateName") is ERunState runState
+                && runState is ERunState.PVPCombat or ERunState.Combat)
+            {
+                EnsureOpponentCardsVisibleOnMain();
+            }
         }
         catch { }
+    }
+
+    /// <summary>
+    /// P1-11 根治：确保 BoardManager.SpawnCards 异常或提前退出后必定清空 skillsForPlayerPresentation / skillsForOpponentPresentation
+    /// 并复位 IsUpdatingSkillBoard = false，彻底切断“遗留队列触发滚雪球克隆 7 个钻石技能分身”的恶性循环。
+    /// </summary>
+    private static void CleanupSpawnCardsSkillQueuesOnMain(object bm, bool forceResetSkillUpdating)
+    {
+        try
+        {
+            if (IsUnityObjectAlive(bm))
+            {
+                bool stillUpdating = _bmIsUpdatingBoardProp?.GetValue(bm) is bool ub && ub;
+                if (!stillUpdating || forceResetSkillUpdating)
+                {
+                    if (_bmSkillsForPlayerPresField?.GetValue(bm) is IList playerSkills && playerSkills.Count > 0)
+                    {
+                        int staleCount = playerSkills.Count;
+                        playerSkills.Clear();
+                        int cnt = Interlocked.Increment(ref _spawnCardsQueueCleanedCount);
+                        BazaarLauncherPlugin.Log?.LogWarning(
+                            $"CompatAuditPatch[P1-11]: SpawnCards 退出后残留 skillsForPlayerPresentation={staleCount}，已兜底清空防技能克隆爆炸 (count={cnt})");
+                    }
+                    if (_bmSkillsForOpponentPresField?.GetValue(bm) is IList oppSkills && oppSkills.Count > 0)
+                    {
+                        oppSkills.Clear();
+                    }
+                }
+            }
+
+            if (forceResetSkillUpdating || Volatile.Read(ref _activeSkillAddCount) <= 0)
+            {
+                ResetSkillBoardUpdatingFlag(GetStaticDataMember("PlayerSkillPresentationManager"));
+                ResetSkillBoardUpdatingFlag(GetStaticDataMember("OpponentSkillPresenationManager"));
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.CleanupSpawnCardsSkillQueuesOnMain: " + ex.Message);
+        }
     }
 
     private static void BoardManagerPlayRevealPostfix(Task __result)

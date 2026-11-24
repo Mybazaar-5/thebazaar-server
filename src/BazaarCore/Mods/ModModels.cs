@@ -346,6 +346,14 @@ public sealed class CustomCardDefinition
     [JsonPropertyName("enchantments")]
     public Dictionary<string, EnchantmentData>? Enchantments { get; set; }
 
+    /// <summary>P1-16：是否显式禁用默认标准附魔兼容集自动合成（true 时仅保留作者在 enchantments 中手写的附魔）。</summary>
+    [JsonPropertyName("disableAutoEnchantments")]
+    public bool DisableAutoEnchantments { get; set; }
+
+    /// <summary>P1-16：显式排除的标准附魔名称列表（如 ["Icy", "Toxic"]，大小写不敏感；无论是否自动合成均从有效附魔集中剔除）。</summary>
+    [JsonPropertyName("disabledEnchantments")]
+    public List<string>? DisabledEnchantments { get; set; }
+
     [JsonPropertyName("abilities")]
     public Dictionary<string, AbilityDefinition> Abilities { get; set; } = new();
 
@@ -590,7 +598,7 @@ public sealed class CustomCardDefinition
             },
             Attributes = Attributes != null ? new Dictionary<string, double>(Attributes, StringComparer.OrdinalIgnoreCase) : null,
             Tiers = clonedTiers,
-            Enchantments = Enchantments != null ? new Dictionary<string, EnchantmentData>(Enchantments, StringComparer.OrdinalIgnoreCase) : null,
+            Enchantments = ModDefaultEnchantmentSynthesizer.BuildEffectiveEnchantments(this, clonedTiers),
             Abilities = new Dictionary<string, AbilityDefinition>(Abilities),
             Auras = new Dictionary<string, AuraDefinition>(Auras),
             Quests = Quests != null ? new List<QuestDefinition>(Quests) : null,
@@ -1951,4 +1959,505 @@ public sealed class ModAssetDto
 
     [JsonPropertyName("contentType")]
     public string ContentType { get; set; } = "image/png";
+}
+
+/// <summary>
+/// P1-16（RC-MOD-ENCHANT-ELIGIBILITY）：自定义 Mod 物品通用标准附魔兼容集自动合成器。
+/// 当 Mod 作者未在自定义物品中手写全部标准附魔且未显式禁用自动合成时，
+/// 依据物品自身基础属性与标签（武器/伤害、护盾、灼烧、剧毒、回复、再生、冷却、暴击、尺寸等）
+/// 自动补全 13 种官方标准附魔兼容定义，使其开箱即兼容全部原版定向/随机附魔祭坛。
+/// </summary>
+public static class ModDefaultEnchantmentSynthesizer
+{
+    private static readonly JsonSerializerOptions CompactRuleJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
+    /// <summary>官方 13 种标准附魔名称列表（与 EEnchantmentType 与官方祭坛全量对齐）。</summary>
+    public static readonly IReadOnlyList<string> StandardEnchantmentNames =
+    [
+        "Obsidian", "Shielded", "Fiery", "Toxic", "Restorative", "Mossy",
+        "Deadly", "Heavy", "Icy", "Turbo", "Golden", "Radiant", "Shiny"
+    ];
+
+    /// <summary>
+    /// 依据自定义卡牌定义与已展开的品阶表构造最终有效附魔字典：
+    /// 1) 非 Item（Skill/Encounter/Step 等）不自动合成，原样透传；
+    /// 2) 优先完整保留作者在 <see cref="CustomCardDefinition.Enchantments"/> 中手写的定义；
+    /// 3) <see cref="CustomCardDefinition.DisabledEnchantments"/> 指定的附魔会被严格排除；
+    /// 4) 若 <see cref="CustomCardDefinition.DisableAutoEnchantments"/> 为 false，则按属性与标签补全缺失的标准附魔。
+    /// </summary>
+    public static Dictionary<string, EnchantmentData>? BuildEffectiveEnchantments(
+        CustomCardDefinition card,
+        Dictionary<string, TierData>? resolvedTiers)
+    {
+        ArgumentNullException.ThrowIfNull(card);
+
+        if (!string.Equals(card.Type, "Item", StringComparison.OrdinalIgnoreCase))
+        {
+            return card.Enchantments != null
+                ? new Dictionary<string, EnchantmentData>(card.Enchantments, StringComparer.OrdinalIgnoreCase)
+                : null;
+        }
+
+        var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (card.DisabledEnchantments is { Count: > 0 })
+        {
+            for (int i = 0; i < card.DisabledEnchantments.Count; i++)
+            {
+                string? raw = card.DisabledEnchantments[i];
+                if (!string.IsNullOrWhiteSpace(raw))
+                    excluded.Add(raw.Trim());
+            }
+        }
+
+        var result = new Dictionary<string, EnchantmentData>(StringComparer.OrdinalIgnoreCase);
+        if (card.Enchantments != null)
+        {
+            foreach (var (k, v) in card.Enchantments)
+            {
+                if (string.IsNullOrWhiteSpace(k) || v == null) continue;
+                string key = k.Trim();
+                if (excluded.Contains(key)) continue;
+                result[key] = v;
+            }
+        }
+
+        if (card.DisableAutoEnchantments)
+            return result.Count > 0 ? result : null;
+
+        // 汇总该物品跨顶层与全品阶的基础属性特征
+        var maxAttrs = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        static void MergeMaxAttrs(Dictionary<string, double> dst, Dictionary<string, double>? src)
+        {
+            if (src == null) return;
+            foreach (var (k, v) in src)
+            {
+                if (string.IsNullOrWhiteSpace(k) || !double.IsFinite(v)) continue;
+                if (!dst.TryGetValue(k, out double prev) || v > prev)
+                    dst[k] = v;
+            }
+        }
+
+        MergeMaxAttrs(maxAttrs, card.Attributes);
+        var tierSource = resolvedTiers ?? card.Tiers;
+        if (tierSource != null)
+        {
+            foreach (var td in tierSource.Values)
+                MergeMaxAttrs(maxAttrs, td?.Attributes);
+        }
+
+        bool HasAttrPos(string name) => maxAttrs.TryGetValue(name, out double v) && v > 0;
+        bool HasTag(string tag) => card.Tags.Any(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase));
+        bool HasHiddenTag(string tag) => card.HiddenTags.Any(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase));
+        bool HasActionType(string actionType) => card.Abilities.Values.Any(ab =>
+            ab?.Action != null && ContainsActionType(ab.Action, actionType));
+
+        bool hasFiredTrigger = card.Abilities.Values.Any(ab =>
+            ab?.Trigger != null && string.Equals(ab.Trigger.Type, "TTriggerOnCardFired", StringComparison.Ordinal));
+        bool hasCooldown = HasAttrPos("CooldownMax");
+        bool isActiveItem = hasCooldown || hasFiredTrigger;
+
+        bool hasDamage = HasAttrPos("DamageAmount") || HasTag("Weapon") || HasHiddenTag("Damage") || HasActionType("TActionPlayerDamage");
+        bool hasShield = HasAttrPos("ShieldApplyAmount") || HasHiddenTag("Shield") || HasActionType("TActionPlayerShieldApply");
+        bool hasBurn = HasAttrPos("BurnApplyAmount") || HasHiddenTag("Burn") || HasActionType("TActionPlayerBurnApply");
+        bool hasPoison = HasAttrPos("PoisonApplyAmount") || HasHiddenTag("Poison") || HasActionType("TActionPlayerPoisonApply");
+        bool hasHeal = HasAttrPos("HealAmount") || HasHiddenTag("Heal") || HasActionType("TActionPlayerHeal");
+        bool hasRegen = HasAttrPos("RegenApplyAmount") || HasHiddenTag("Regen") || HasActionType("TActionPlayerRegenApply");
+        bool hasCrit = maxAttrs.ContainsKey("CritChance") || HasHiddenTag("Crit");
+        bool canCrit = hasDamage || hasShield || hasBurn || hasPoison || hasHeal || hasRegen || hasCrit;
+
+        // 选取主输出参照属性用于跨系转换（高量级：Damage/Shield/Heal；低量级：Burn/Poison/Regen）
+        string? primaryAttr = null;
+        bool primaryIsHighMagnitude = true;
+        string primaryLabelZh = "主效果";
+        if (HasAttrPos("DamageAmount")) { primaryAttr = "DamageAmount"; primaryIsHighMagnitude = true; primaryLabelZh = "伤害"; }
+        else if (HasAttrPos("ShieldApplyAmount")) { primaryAttr = "ShieldApplyAmount"; primaryIsHighMagnitude = true; primaryLabelZh = "护盾"; }
+        else if (HasAttrPos("HealAmount")) { primaryAttr = "HealAmount"; primaryIsHighMagnitude = true; primaryLabelZh = "治疗"; }
+        else if (HasAttrPos("BurnApplyAmount")) { primaryAttr = "BurnApplyAmount"; primaryIsHighMagnitude = false; primaryLabelZh = "灼烧"; }
+        else if (HasAttrPos("PoisonApplyAmount")) { primaryAttr = "PoisonApplyAmount"; primaryIsHighMagnitude = false; primaryLabelZh = "剧毒"; }
+        else if (HasAttrPos("RegenApplyAmount")) { primaryAttr = "RegenApplyAmount"; primaryIsHighMagnitude = false; primaryLabelZh = "再生"; }
+
+        // 按物品尺寸计算减速/加速/冻结时长（与官方 Small/Medium/Large 附魔尺度对齐）
+        var sizeNorm = (card.Size ?? "Medium").Trim();
+        double slowHasteMs = sizeNorm.Equals("Small", StringComparison.OrdinalIgnoreCase)
+            ? 1000.0
+            : (sizeNorm.Equals("Large", StringComparison.OrdinalIgnoreCase) ? 3000.0 : 2000.0);
+        double freezeMs = sizeNorm.Equals("Small", StringComparison.OrdinalIgnoreCase)
+            ? 500.0
+            : (sizeNorm.Equals("Large", StringComparison.OrdinalIgnoreCase) ? 1500.0 : 1000.0);
+
+        void TryAdd(string name, Func<EnchantmentData> factory)
+        {
+            if (excluded.Contains(name) || result.ContainsKey(name))
+                return;
+            result[name] = factory();
+        }
+
+        // 1. Obsidian（黑曜石）：已有伤害则伤害翻倍，否则主动开火附带伤害
+        if (hasDamage)
+            TryAdd("Obsidian", () => BuildMultiplySelfAuraEnchant("DamageAmount", 2.0, ["DamageReference"], "此物品的伤害翻倍"));
+        else if (isActiveItem)
+            TryAdd("Obsidian", () => BuildActiveConversionEnchant(
+                "DamageAmount", "TActionPlayerDamage", "Opponent", null, ["Damage"],
+                primaryAttr, primaryIsHighMagnitude, targetIsHighMagnitude: true, fallbackFlat: 10.0,
+                primaryLabelZh, "伤害"));
+
+        // 2. Shielded（护盾）：已有护盾则护盾翻倍，否则主动开火附带护盾
+        if (hasShield)
+            TryAdd("Shielded", () => BuildMultiplySelfAuraEnchant("ShieldApplyAmount", 2.0, ["ShieldReference"], "此物品的护盾翻倍"));
+        else if (isActiveItem)
+            TryAdd("Shielded", () => BuildActiveConversionEnchant(
+                "ShieldApplyAmount", "TActionPlayerShieldApply", "Self", null, ["Shield"],
+                primaryAttr, primaryIsHighMagnitude, targetIsHighMagnitude: true, fallbackFlat: 10.0,
+                primaryLabelZh, "护盾"));
+
+        // 3. Fiery（炽焰）：已有灼烧则灼烧翻倍，否则主动开火施加灼烧
+        if (hasBurn)
+            TryAdd("Fiery", () => BuildMultiplySelfAuraEnchant("BurnApplyAmount", 2.0, ["BurnReference"], "此物品的灼烧翻倍"));
+        else if (isActiveItem)
+            TryAdd("Fiery", () => BuildActiveConversionEnchant(
+                "BurnApplyAmount", "TActionPlayerBurnApply", "Opponent", null, ["Burn"],
+                primaryAttr, primaryIsHighMagnitude, targetIsHighMagnitude: false, fallbackFlat: 2.0,
+                primaryLabelZh, "灼烧"));
+
+        // 4. Toxic（剧毒）：已有剧毒则剧毒翻倍，否则主动开火施加剧毒
+        if (hasPoison)
+            TryAdd("Toxic", () => BuildMultiplySelfAuraEnchant("PoisonApplyAmount", 2.0, ["PoisonReference"], "此物品的剧毒翻倍"));
+        else if (isActiveItem)
+            TryAdd("Toxic", () => BuildActiveConversionEnchant(
+                "PoisonApplyAmount", "TActionPlayerPoisonApply", "Opponent", null, ["Poison"],
+                primaryAttr, primaryIsHighMagnitude, targetIsHighMagnitude: false, fallbackFlat: 2.0,
+                primaryLabelZh, "剧毒"));
+
+        // 5. Restorative（回复）：已有治疗则治疗翻倍，否则主动开火附带治疗
+        if (hasHeal)
+            TryAdd("Restorative", () => BuildMultiplySelfAuraEnchant("HealAmount", 2.0, ["HealReference"], "此物品的治疗翻倍"));
+        else if (isActiveItem)
+            TryAdd("Restorative", () => BuildActiveConversionEnchant(
+                "HealAmount", "TActionPlayerHeal", "Self", null, ["Heal"],
+                primaryAttr, primaryIsHighMagnitude, targetIsHighMagnitude: true, fallbackFlat: 10.0,
+                primaryLabelZh, "治疗"));
+
+        // 6. Mossy（苔藓/再生）：已有再生则再生翻倍，否则主动开火获得再生（UntilEndOfCombat）
+        if (hasRegen)
+            TryAdd("Mossy", () => BuildMultiplySelfAuraEnchant("RegenApplyAmount", 2.0, ["RegenReference"], "此物品的再生翻倍"));
+        else if (isActiveItem)
+            TryAdd("Mossy", () => BuildActiveConversionEnchant(
+                "RegenApplyAmount", "TActionPlayerRegenApply", "Self",
+                new RuleNode { Type = "TDeterminantDuration", DurationType = "UntilEndOfCombat" },
+                ["Regen"], primaryAttr, primaryIsHighMagnitude, targetIsHighMagnitude: false, fallbackFlat: 2.0,
+                primaryLabelZh, "再生"));
+
+        // 7. Deadly（致命）：可暴击物品 +50% 暴击率
+        if (canCrit)
+            TryAdd("Deadly", () => BuildAddSelfAuraEnchant("CritChance", 50.0, ["Crit"], "此物品获得 +50% 暴击率"));
+
+        // 8. Heavy（沉重）：主动开火减速 1 件敌方有冷却物品
+        if (isActiveItem)
+            TryAdd("Heavy", () => BuildStatusControlEnchant(
+                "TActionCardSlow", "SlowTargets", "SlowAmount", slowHasteMs,
+                "OpponentHand", excludeSelf: false, ["Slow"],
+                $"使 1 件敌方物品减速 {slowHasteMs / 1000.0:0.#} 秒"));
+
+        // 9. Icy（冰霜）：主动开火冻结 1 件敌方有冷却物品
+        if (isActiveItem)
+            TryAdd("Icy", () => BuildStatusControlEnchant(
+                "TActionCardFreeze", "FreezeTargets", "FreezeAmount", freezeMs,
+                "OpponentHand", excludeSelf: false, ["Freeze"],
+                $"冻结 1 件敌方物品 {freezeMs / 1000.0:0.#} 秒"));
+
+        // 10. Turbo（涡轮）：主动开火加速 1 件友方其他有冷却物品
+        if (isActiveItem)
+            TryAdd("Turbo", () => BuildStatusControlEnchant(
+                "TActionCardHaste", "HasteTargets", "HasteAmount", slowHasteMs,
+                "SelfHand", excludeSelf: true, ["Haste"],
+                $"使 1 件其他友方物品加速 {slowHasteMs / 1000.0:0.#} 秒"));
+
+        // 11. Golden（黄金）：全物品通用双倍出售价值
+        TryAdd("Golden", () => BuildMultiplySelfAuraEnchant("SellPrice", 2.0, ["EconomyReference"], "此物品的价值翻倍"));
+
+        // 12. Radiant（辉光）：全物品通用免疫冻结、减速与摧毁
+        TryAdd("Radiant", () => new EnchantmentData
+        {
+            Attributes = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["PercentSlowReduction"] = 100.0,
+                ["PercentFreezeReduction"] = 100.0,
+                ["DestroyImmunity"] = 1.0
+            },
+            Localization = BuildSingleTooltipLoc("Passive", "免疫冻结、减速与摧毁"),
+            HasAbilities = false,
+            HasAuras = false
+        });
+
+        // 13. Shiny（闪亮）：主动开火物品获得 +1 多重施放
+        if (isActiveItem)
+            TryAdd("Shiny", () => BuildAddSelfAuraEnchant("Multicast", 1.0, [], "此物品获得 +1 多重施放"));
+
+        return result.Count > 0 ? result : null;
+    }
+
+    private static bool ContainsActionType(RuleNode node, string actionType, int depth = 0)
+    {
+        if (depth > 8) return false;
+        if (string.Equals(node.Type, actionType, StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (node.Actions is { Count: > 0 })
+        {
+            for (int i = 0; i < node.Actions.Count; i++)
+                if (ContainsActionType(node.Actions[i], actionType, depth + 1))
+                    return true;
+        }
+        return false;
+    }
+
+    private static RuleNode FixedVal(double v) => new()
+    {
+        Type = "TFixedValue",
+        RawValueNode = JsonSerializer.SerializeToElement(v)
+    };
+
+    private static JsonElement ToElement(RuleNode node)
+        => JsonSerializer.SerializeToElement(node, CompactRuleJsonOptions);
+
+    private static LocalizationBlock BuildSingleTooltipLoc(string tooltipType, string textZh) => new()
+    {
+        Tooltips =
+        [
+            new TooltipEntry
+            {
+                TooltipType = tooltipType,
+                Content = new LocalizedText
+                {
+                    Key = OverlayLocalizationStore.ComputeOfficialMd5Hash(textZh),
+                    Text = textZh
+                }
+            }
+        ]
+    };
+
+    private static EnchantmentData BuildMultiplySelfAuraEnchant(
+        string attr,
+        double multiplier,
+        List<string> hiddenTags,
+        string tooltipZh)
+    {
+        return new EnchantmentData
+        {
+            Auras = new Dictionary<string, AuraDefinition>
+            {
+                ["e1"] = new AuraDefinition
+                {
+                    Id = "e1",
+                    ActiveIn = "HandAndStash",
+                    WorksIn = "Anywhere",
+                    Action = new RuleNode
+                    {
+                        Type = "TAuraActionCardModifyAttribute",
+                        AttributeType = attr,
+                        Operation = "Multiply",
+                        RawValueNode = ToElement(FixedVal(multiplier)),
+                        Target = new RuleNode { Type = "TTargetCardSelf" }
+                    }
+                }
+            },
+            HiddenTags = hiddenTags,
+            Localization = BuildSingleTooltipLoc("Passive", tooltipZh),
+            HasAbilities = false,
+            HasAuras = true
+        };
+    }
+
+    private static EnchantmentData BuildAddSelfAuraEnchant(
+        string attr,
+        double delta,
+        List<string> hiddenTags,
+        string tooltipZh)
+    {
+        return new EnchantmentData
+        {
+            Auras = new Dictionary<string, AuraDefinition>
+            {
+                ["e1"] = new AuraDefinition
+                {
+                    Id = "e1",
+                    ActiveIn = "HandAndStash",
+                    WorksIn = "Anywhere",
+                    Action = new RuleNode
+                    {
+                        Type = "TAuraActionCardModifyAttribute",
+                        AttributeType = attr,
+                        Operation = "Add",
+                        RawValueNode = ToElement(FixedVal(delta)),
+                        Target = new RuleNode { Type = "TTargetCardSelf" }
+                    }
+                }
+            },
+            HiddenTags = hiddenTags,
+            Localization = BuildSingleTooltipLoc("Passive", tooltipZh),
+            HasAbilities = false,
+            HasAuras = true
+        };
+    }
+
+    private static EnchantmentData BuildActiveConversionEnchant(
+        string targetAttr,
+        string actionType,
+        string targetPlayerMode,
+        RuleNode? duration,
+        List<string> hiddenTags,
+        string? primaryAttr,
+        bool primaryIsHighMagnitude,
+        bool targetIsHighMagnitude,
+        double fallbackFlat,
+        string primaryLabelZh,
+        string targetLabelZh)
+    {
+        var ench = new EnchantmentData
+        {
+            // 对齐官方附魔契约与 P1-05 非光环存在性守卫：必须先声明基础附魔属性键，确保 Aura e2 合法写入且不污染原卡
+            Attributes = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+            {
+                [targetAttr] = primaryAttr != null ? 0.0 : fallbackFlat
+            },
+            Abilities = new Dictionary<string, AbilityDefinition>
+            {
+                ["e1"] = new AbilityDefinition
+                {
+                    Id = "e1",
+                    ActiveIn = "HandOnly",
+                    WorksIn = "Anywhere",
+                    Priority = "Medium",
+                    Trigger = new RuleNode { Type = "TTriggerOnCardFired" },
+                    Action = new RuleNode
+                    {
+                        Type = actionType,
+                        Duration = duration,
+                        Target = new RuleNode
+                        {
+                            Type = "TTargetPlayerRelative",
+                            TargetMode = targetPlayerMode
+                        }
+                    }
+                }
+            },
+            HiddenTags = hiddenTags,
+            HasAbilities = true,
+            HasAuras = false
+        };
+
+        string tooltipZh;
+        if (!string.IsNullOrEmpty(primaryAttr))
+        {
+            double scale = (primaryIsHighMagnitude, targetIsHighMagnitude) switch
+            {
+                (true, true) => 1.0,
+                (false, false) => 1.0,
+                (true, false) => 0.1,
+                (false, true) => 10.0
+            };
+
+            var refNode = new RuleNode
+            {
+                Type = "TReferenceValueCardAttribute",
+                AttributeType = primaryAttr,
+                Target = new RuleNode { Type = "TTargetCardSelf" },
+                Modifier = Math.Abs(scale - 1.0) > 1e-9
+                    ? new ValueModifierNode
+                    {
+                        ModifyMode = "Multiply",
+                        ShouldRound = true,
+                        Value = FixedVal(scale)
+                    }
+                    : null
+            };
+
+            ench.Auras["e2"] = new AuraDefinition
+            {
+                Id = "e2",
+                ActiveIn = "HandAndStash",
+                WorksIn = "Anywhere",
+                Action = new RuleNode
+                {
+                    Type = "TAuraActionCardModifyAttribute",
+                    AttributeType = targetAttr,
+                    Operation = "Add",
+                    RawValueNode = ToElement(refNode),
+                    Target = new RuleNode { Type = "TTargetCardSelf" }
+                }
+            };
+            ench.HasAuras = true;
+
+            tooltipZh = scale switch
+            {
+                < 0.5 => $"额外施加等同于此物品{primaryLabelZh} 10% 的{targetLabelZh}",
+                > 1.5 => $"额外触发等同于此物品{primaryLabelZh} {scale:0} 倍的{targetLabelZh}",
+                _ => $"额外触发等同于此物品{primaryLabelZh}的{targetLabelZh}"
+            };
+        }
+        else
+        {
+            tooltipZh = $"开火时额外施加 {fallbackFlat:0} 点{targetLabelZh}";
+        }
+
+        ench.Localization = BuildSingleTooltipLoc("Active", tooltipZh);
+        return ench;
+    }
+
+    private static EnchantmentData BuildStatusControlEnchant(
+        string actionType,
+        string targetsAttr,
+        string amountAttr,
+        double amountMs,
+        string targetSection,
+        bool excludeSelf,
+        List<string> hiddenTags,
+        string tooltipZh)
+    {
+        var cooldownCond = new RuleNode
+        {
+            Type = "TCardConditionalAttribute",
+            Attribute = "CooldownMax",
+            ComparisonOperator = "GreaterThan",
+            RawComparisonValueElement = ToElement(FixedVal(0.0))
+        };
+
+        return new EnchantmentData
+        {
+            Attributes = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+            {
+                [targetsAttr] = 1.0,
+                [amountAttr] = amountMs
+            },
+            Abilities = new Dictionary<string, AbilityDefinition>
+            {
+                ["e1"] = new AbilityDefinition
+                {
+                    Id = "e1",
+                    ActiveIn = "HandOnly",
+                    WorksIn = "Anywhere",
+                    Priority = "Medium",
+                    Trigger = new RuleNode { Type = "TTriggerOnCardFired" },
+                    Action = new RuleNode
+                    {
+                        Type = actionType,
+                        Target = new RuleNode
+                        {
+                            Type = "TTargetCardRandom",
+                            TargetSection = targetSection,
+                            ExcludeSelf = excludeSelf,
+                            RawConditionsElement = ToElement(cooldownCond)
+                        }
+                    }
+                }
+            },
+            HiddenTags = hiddenTags,
+            Localization = BuildSingleTooltipLoc("Active", tooltipZh),
+            HasAbilities = true,
+            HasAuras = false
+        };
+    }
 }

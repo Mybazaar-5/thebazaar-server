@@ -147,6 +147,13 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
     {
         "CooldownMax", "HasteAmount", "SlowAmount", "FreezeAmount", "ChargeAmount"
     };
+    // P3-06：允许按整倍/条件比例外推下一阶预览值的核心量级属性集合（排除售价/冷却/弹药/暴击/多重施放等离散或经济属性）
+    private static readonly HashSet<string> ScalableUpgradePreviewAttrNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "DamageAmount", "ShieldApplyAmount", "HealAmount",
+        "BurnApplyAmount", "PoisonApplyAmount", "RegenApplyAmount", "RageApplyAmount",
+        "HasteAmount", "SlowAmount", "FreezeAmount", "ChargeAmount", "Value"
+    };
     private static Type _tLocalizableTextType;
     private static ConstructorInfo _tLocCtor2;
     private static PropertyInfo _tLocTextProp;
@@ -185,8 +192,7 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
         InstallLocalizationPatches(Patcher);
         TournamentLocalizationPatch.Apply(Patcher);
         SubscribeNativeLocaleChanged();
-        BazaarLauncherPlugin.Log?.LogInfo(
-            $"[LocalizationOverlay] 四层中文词典引擎已激活 (Locale={CurrentLocale}, 条目={_overlayTotalEntries}, 补丁={Patcher.SucceededCount}/{Patcher.AttemptedCount})");
+        Patcher.LogSummary($"[LocalizationOverlay] 四层中文词典引擎已激活 (Locale={CurrentLocale}, 条目={_overlayTotalEntries})");
     }
 
     public void OnDisable()
@@ -1706,16 +1712,15 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             }
 
             bool isDur = DurationAttrNames.Contains(attrName);
-            double nextDisp = isDur ? nextRaw / 1000.0 : nextRaw;
             if (ov.TierAttributes.TryGetValue(curTier, out var curMap) && curMap != null && curMap.TryGetValue(attrName, out double curRaw))
             {
-                double curDisp = isDur ? curRaw / 1000.0 : curRaw;
-                double delta = __2 - curDisp;
-                __result = (float)Math.Max(0, nextDisp + delta);
+                double curEffectiveRaw = isDur ? __2 * 1000.0 : __2;
+                double nextEffectiveRaw = ComputeUpgradePreviewAttrValue(attrName, curEffectiveRaw, curRaw, nextRaw);
+                __result = (float)(isDur ? nextEffectiveRaw / 1000.0 : nextEffectiveRaw);
             }
             else
             {
-                __result = (float)nextDisp;
+                __result = (float)(isDur ? nextRaw / 1000.0 : nextRaw);
             }
         }
         catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("LocalizationOverlayModule:L1721", diagEx); }
@@ -2219,13 +2224,75 @@ internal sealed class LocalizationOverlayModule : IBuiltInPatchModule, ILocaliza
             {
                 double nextRaw = nextBaseRaw;
                 if (curBaseMap != null && curBaseMap.TryGetValue(attrName, out double curBaseRaw))
-                    nextRaw = Math.Max(0, nextBaseRaw + (curRaw - curBaseRaw));
+                    nextRaw = ComputeUpgradePreviewAttrValue(attrName, curRaw, curBaseRaw, nextBaseRaw);
                 string nextStr = FormatAttrNumber(attrName, nextRaw);
                 if (!string.Equals(curStr, nextStr, StringComparison.Ordinal))
                     return $"{curStr} → <color=#4ADE80>{nextStr}</color>";
             }
             return curStr;
         });
+    }
+
+    /// <summary>
+    /// P3-06：计算升级预览时的下一品阶属性值。
+    /// 当当前有效属性值相对基础模板值存在明确整倍（如 ≥20 金以太壁垒提灯 35->70 翻倍）或标准半整数条件缩放（0.5x/1.5x/2.5x）时，
+    /// 按当前缩放比例外推下一阶预览值（70 -> 140），否则保留基础差值叠加公式 nextBase + (cur - curBase)，避免误伤纯加法成长卡。
+    /// </summary>
+    internal static double ComputeUpgradePreviewAttrValue(string attrName, double curVal, double curBaseVal, double nextBaseVal)
+    {
+        double additive = Math.Max(0, nextBaseVal + (curVal - curBaseVal));
+        if (string.IsNullOrEmpty(attrName) || !ScalableUpgradePreviewAttrNames.Contains(attrName))
+        {
+            return additive;
+        }
+        if (curBaseVal <= 0 || nextBaseVal <= 0 || curVal <= 0)
+        {
+            return additive;
+        }
+        if (Math.Abs(curVal - curBaseVal) <= 1e-6 || Math.Abs(nextBaseVal - curBaseVal) <= 1e-6)
+        {
+            return additive;
+        }
+
+        double ratio = curVal / curBaseVal;
+        double scaleFactor = 0;
+
+        // 1. 精确整倍缩放（2x / 3x / 4x ...，如条件翻倍光环：35 -> 70；要求 curBase >= 5 避免极小基数加法偶合）
+        double nearestInt = Math.Round(ratio);
+        if (nearestInt >= 2.0 && nearestInt <= 16.0 && curBaseVal >= 5.0
+            && Math.Abs(curVal - curBaseVal * nearestInt) <= 1e-6)
+        {
+            scaleFactor = nearestInt;
+        }
+        else
+        {
+            // 2. 标准半整数条件比例缩放（0.5x / 1.5x / 2.5x ...，如 Shielded +50% 附魔，容忍服务端整数取整 0.5 误差）
+            double halfSteps = Math.Round(ratio * 2.0);
+            if (halfSteps >= 1.0 && halfSteps <= 16.0 && Math.Abs(halfSteps % 2.0) > 1e-6 && curBaseVal >= 10.0)
+            {
+                double candidate = halfSteps * 0.5;
+                double expected = curBaseVal * candidate;
+                if (Math.Abs(curVal - expected) <= 0.5001 && Math.Abs(ratio - candidate) <= 0.02)
+                {
+                    scaleFactor = candidate;
+                }
+            }
+        }
+
+        if (scaleFactor <= 0)
+        {
+            return additive;
+        }
+
+        double scaled = nextBaseVal * scaleFactor;
+        bool isDur = DurationAttrNames.Contains(attrName);
+        if (!isDur
+            && Math.Abs(curBaseVal - Math.Round(curBaseVal)) <= 1e-6
+            && Math.Abs(nextBaseVal - Math.Round(nextBaseVal)) <= 1e-6)
+        {
+            scaled = Math.Round(scaled, MidpointRounding.AwayFromZero);
+        }
+        return Math.Max(0, scaled);
     }
 
     private static void EnsureTLocalizableTextMeta()

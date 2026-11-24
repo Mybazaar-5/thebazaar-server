@@ -71,6 +71,21 @@ internal sealed partial class ModContentSyncClient
     private string _lastSyncSummary = "尚未同步";
     private DateTime _lastSyncUtc;
 
+    // P2-02：按端点路径缓存最近一次服务端 ETag（按服务器基址自动隔离），供 If-None-Match 命中 304 早退
+    private readonly Dictionary<string, string> _endpointEtags = new(StringComparer.OrdinalIgnoreCase);
+    private string _etagServerScope = string.Empty;
+    private int _lastManifestEnabledMods;
+    private int _lastManifestTotalModCount;
+    private int _lastManifestCustomContentCount;
+    private int _lastManifestVisualBindingCount;
+    private int _lastManifestDownloadedPngs;
+
+    // P2-02：按当前 visual bindings revision 记忆已确认的“原版壳卡”实例 ID，彻底消灭每 250ms 重复全量轮询
+    private readonly HashSet<string> _checkedVanillaInstances = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _pendingProbeInstanceIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _inFlightProbeInstanceIds = new(StringComparer.OrdinalIgnoreCase);
+    private string _checkedVanillaRev = string.Empty;
+
     internal static ModContentSyncClient Instance { get; } = new();
 
     internal string LastModSetHash => _lastModSetHash;
@@ -187,6 +202,100 @@ internal sealed partial class ModContentSyncClient
         });
     }
 
+    private void EnsureEtagScopeLocked()
+    {
+        string curBase = NameAuth.GetServerBaseUrl() ?? string.Empty;
+        if (!string.Equals(_etagServerScope, curBase, StringComparison.OrdinalIgnoreCase))
+        {
+            _etagServerScope = curBase;
+            _endpointEtags.Clear();
+            _checkedVanillaInstances.Clear();
+            _pendingProbeInstanceIds.Clear();
+            _inFlightProbeInstanceIds.Clear();
+            _checkedVanillaRev = string.Empty;
+        }
+    }
+
+    private string TryGetCachedEtag(string endpointKey)
+    {
+        if (string.IsNullOrWhiteSpace(endpointKey)) return null;
+        lock (_sync)
+        {
+            EnsureEtagScopeLocked();
+            return _endpointEtags.TryGetValue(endpointKey, out string etag) && !string.IsNullOrWhiteSpace(etag)
+                ? etag
+                : null;
+        }
+    }
+
+    private void StoreCachedEtag(string endpointKey, string etag)
+    {
+        if (string.IsNullOrWhiteSpace(endpointKey) || string.IsNullOrWhiteSpace(etag)) return;
+        lock (_sync)
+        {
+            EnsureEtagScopeLocked();
+            _endpointEtags[endpointKey] = etag.Trim();
+        }
+    }
+
+    private void ClearActiveBindingsEtagsLocked()
+    {
+        if (_endpointEtags.Count == 0) return;
+        var toRemove = new List<string>();
+        foreach (string key in _endpointEtags.Keys)
+        {
+            if (key.StartsWith("/api/mods/active-bindings", StringComparison.OrdinalIgnoreCase)
+                || key.StartsWith("/api/runs/", StringComparison.OrdinalIgnoreCase))
+            {
+                toRemove.Add(key);
+            }
+        }
+        for (int i = 0; i < toRemove.Count; i++)
+        {
+            _endpointEtags.Remove(toRemove[i]);
+        }
+    }
+
+    private void ConfirmProbedVanillaInstances(
+        List<string> probedSnapshot,
+        HashSet<string> boundInstanceIds,
+        string confirmedRev,
+        long expectedGeneration)
+    {
+        lock (_sync)
+        {
+            if (!IsSyncGenerationCurrent(expectedGeneration)) return;
+            EnsureEtagScopeLocked();
+
+            string effectiveRev = !string.IsNullOrWhiteSpace(confirmedRev) ? confirmedRev : _lastVisualBindingsRev;
+            if (string.IsNullOrWhiteSpace(effectiveRev))
+            {
+                return;
+            }
+
+            if (!string.Equals(_checkedVanillaRev, effectiveRev, StringComparison.Ordinal))
+            {
+                _checkedVanillaInstances.Clear();
+                _checkedVanillaRev = effectiveRev;
+            }
+
+            if (probedSnapshot == null || probedSnapshot.Count == 0) return;
+
+            if (_checkedVanillaInstances.Count > 2048)
+            {
+                _checkedVanillaInstances.Clear();
+            }
+
+            for (int i = 0; i < probedSnapshot.Count; i++)
+            {
+                string instId = probedSnapshot[i];
+                if (string.IsNullOrWhiteSpace(instId)) continue;
+                if (boundInstanceIds != null && boundInstanceIds.Contains(instId)) continue;
+                _checkedVanillaInstances.Add(instId);
+            }
+        }
+    }
+
     /// <summary>D3-P1-13：由常驻 CloudGuard 响应头感知 X-Visual-Bindings-Rev 变更，节流触发活跃绑定同步。</summary>
     internal void NotifyVisualBindingsRevObserved(string observedRev)
     {
@@ -202,7 +311,14 @@ internal sealed partial class ModContentSyncClient
         }
 
         Interlocked.Exchange(ref _lastRevSyncTickMs, nowMs);
-        _lastVisualBindingsRev = observedRev;
+        lock (_sync)
+        {
+            EnsureEtagScopeLocked();
+            _lastVisualBindingsRev = observedRev;
+            // revision 已推进，立即失效旧 revision 的原版壳卡记忆，避免遮蔽新产生的 Mod 实例绑定
+            _checkedVanillaInstances.Clear();
+            _checkedVanillaRev = string.Empty;
+        }
         TriggerActiveBindingsSyncInBackground();
     }
 
@@ -212,6 +328,7 @@ internal sealed partial class ModContentSyncClient
         bool hadAny;
         lock (_sync)
         {
+            EnsureEtagScopeLocked();
             hadAny = _syncedActiveBindingHandles.Count > 0
                 || _syncedReplayBindingHandles.Count > 0
                 || _activeDonorTemplateIds.Count > 0;
@@ -219,6 +336,11 @@ internal sealed partial class ModContentSyncClient
             DisposeHandlesLocked(_syncedReplayBindingHandles);
             _activeDonorTemplateIds.Clear();
             _lastVisualBindingsRev = string.Empty;
+            _checkedVanillaRev = string.Empty;
+            _checkedVanillaInstances.Clear();
+            _pendingProbeInstanceIds.Clear();
+            _inFlightProbeInstanceIds.Clear();
+            ClearActiveBindingsEtagsLocked();
             RebuildDonorTemplateIdsLocked();
         }
         if (hadAny)
@@ -271,12 +393,31 @@ internal sealed partial class ModContentSyncClient
     internal void NotifyUnboundInstanceSeen(string instanceId, string templateId)
     {
         if (string.IsNullOrEmpty(instanceId) || string.IsNullOrEmpty(templateId)) return;
-        bool isDonor;
         lock (_sync)
         {
-            isDonor = _donorTemplateIds.Contains(templateId);
+            EnsureEtagScopeLocked();
+            if (!_donorTemplateIds.Contains(templateId)) return;
+
+            // P2-02：同一 revision 下已经服务端确认的“原版壳卡”实例直接 O(1) 早退，避免每 250ms 反复轮询 active-bindings
+            if (!string.IsNullOrEmpty(_checkedVanillaRev)
+                && string.Equals(_checkedVanillaRev, _lastVisualBindingsRev, StringComparison.Ordinal)
+                && _checkedVanillaInstances.Contains(instanceId))
+            {
+                return;
+            }
+
+            // 同一实例若已在等待/在途探测队列中，无需重复入队触发多余轮询
+            if (_inFlightProbeInstanceIds.Contains(instanceId) || _pendingProbeInstanceIds.Contains(instanceId))
+            {
+                return;
+            }
+
+            if (_pendingProbeInstanceIds.Count >= 512)
+            {
+                _pendingProbeInstanceIds.Clear();
+            }
+            _pendingProbeInstanceIds.Add(instanceId);
         }
-        if (!isDonor) return;
 
         long nowMs = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
         long prevMs = Interlocked.Read(ref _lastAutoBindingsTickMs);
@@ -342,11 +483,36 @@ internal sealed partial class ModContentSyncClient
             return true;
         }
 
-        // 2. 拉取服务端 Mod 清单 /api/mods/manifest
-        var manifestResp = await NameAuth.GetJsonAsync("/api/mods/manifest", ct).ConfigureAwait(false);
+        // 2. 拉取服务端 Mod 清单 /api/mods/manifest（P2-02：携带 If-None-Match 命中 304 直接早退复用内存缓存）
+        const string manifestPath = "/api/mods/manifest";
+        bool hasCachedManifest;
+        lock (_sync)
+        {
+            EnsureEtagScopeLocked();
+            // 若曾因关闭 AcceptServerMods 触发 ClearSyncedServerMods() 清空内存句柄，则跳过旧 ETag 强制全量重建
+            hasCachedManifest = !string.IsNullOrEmpty(_lastModSetHash)
+                && _serverMods.Count == _lastManifestTotalModCount
+                && _customContents.Count == _lastManifestCustomContentCount
+                && (_lastManifestVisualBindingCount == 0 || _syncedVisualHandles.Count > 0 || _syncedCardTextHandles.Count > 0);
+        }
+        string manifestIfNoneMatch = (!forceRefresh && hasCachedManifest) ? TryGetCachedEtag(manifestPath) : null;
+        var manifestResp = await NameAuth.GetJsonAsync(manifestPath, ct, manifestIfNoneMatch).ConfigureAwait(false);
         if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return false;
 
-        if (manifestResp.Ok && !string.IsNullOrWhiteSpace(manifestResp.Body))
+        if (manifestResp.NotModified)
+        {
+            if (!string.IsNullOrWhiteSpace(manifestResp.ETag))
+            {
+                StoreCachedEtag(manifestPath, manifestResp.ETag);
+            }
+            lock (_sync)
+            {
+                enabledMods = _lastManifestEnabledMods;
+                bindingCount = _lastManifestVisualBindingCount;
+                downloadedPngs = _lastManifestDownloadedPngs;
+            }
+        }
+        else if (manifestResp.Ok && !string.IsNullOrWhiteSpace(manifestResp.Body))
         {
             var root = JObject.Parse(manifestResp.Body);
             string modSetHash = (string)(root["modSetHash"] ?? root["manifestHash"]) ?? string.Empty;
@@ -429,6 +595,11 @@ internal sealed partial class ModContentSyncClient
             ApplySyncedVisualAndTextHandles(newVisualBindings, newTextOverrides, isActiveBinding: false, capturedGen);
             bindingCount = newVisualBindings.Count;
 
+            if (!string.IsNullOrWhiteSpace(manifestResp.ETag))
+            {
+                StoreCachedEtag(manifestPath, manifestResp.ETag);
+            }
+
             lock (_sync)
             {
                 if (!IsSyncGenerationCurrent(capturedGen)) return false;
@@ -443,6 +614,11 @@ internal sealed partial class ModContentSyncClient
                 _globalDonorTemplateIds = donors;
                 RebuildDonorTemplateIdsLocked();
                 _lastModSetHash = modSetHash;
+                _lastManifestEnabledMods = enabledMods;
+                _lastManifestTotalModCount = parsedMods.Count;
+                _lastManifestCustomContentCount = parsedContents.Count;
+                _lastManifestVisualBindingCount = bindingCount;
+                _lastManifestDownloadedPngs = downloadedPngs;
             }
         }
 
@@ -495,79 +671,175 @@ internal sealed partial class ModContentSyncClient
         if (!string.IsNullOrWhiteSpace(accountId)) qp.Add("accountId=" + Uri.EscapeDataString(accountId.Trim()));
         string path = qp.Count > 0 ? "/api/mods/active-bindings?" + string.Join("&", qp) : "/api/mods/active-bindings";
 
-        var resp = await NameAuth.GetJsonAsync(path, ct).ConfigureAwait(false);
-        if (!resp.Ok && !string.IsNullOrWhiteSpace(runId))
-        {
-            resp = await NameAuth.GetJsonAsync($"/api/runs/{Uri.EscapeDataString(runId)}/visual-bindings", ct).ConfigureAwait(false);
-        }
-        if (!resp.Ok || string.IsNullOrWhiteSpace(resp.Body)) return;
-        if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return;
-
-        var root = JObject.Parse(resp.Body);
-        string rev = (string)(root["revision"] ?? root["visualBindingsRev"]);
-        if (!string.IsNullOrWhiteSpace(rev)) _lastVisualBindingsRev = rev;
-
-        var shaToPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var visuals = new List<CardVisualBinding>();
-        var texts = new List<CardTextOverride>();
-        var activeContents = new List<ServerCustomContentItem>();
-        var activeDonors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        // P0-18：同步解析 templateCatalog 更新 _activeDonorTemplateIds 并补充模板级绑定
-        JToken catalogToken = root["templateCatalog"] ?? root["templates"];
-        if (catalogToken is JObject catObj)
-        {
-            foreach (var prop in catObj.Properties())
-            {
-                if (prop.Value is not JObject bo) continue;
-                await ExtractBindingObjectAsync(bo, prop.Name, isActiveBinding: false, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
-            }
-        }
-        else if (catalogToken is JArray catArr)
-        {
-            foreach (var token in catArr)
-            {
-                if (token is not JObject bo) continue;
-                await ExtractBindingObjectAsync(bo, null, isActiveBinding: false, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
-            }
-        }
-
-        JToken mapToken = root["bindings"] ?? root["activeBindings"] ?? root;
-        if (mapToken is JObject mapObj)
-        {
-            foreach (var prop in mapObj.Properties())
-            {
-                if (prop.Value is not JObject bo) continue;
-                await ExtractBindingObjectAsync(bo, prop.Name, isActiveBinding: true, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
-            }
-        }
-        else if (mapToken is JArray arr)
-        {
-            foreach (var token in arr)
-            {
-                if (token is not JObject bo) continue;
-                await ExtractBindingObjectAsync(bo, null, isActiveBinding: true, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
-            }
-        }
-
-        if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return;
-
-        foreach (var item in activeContents)
-        {
-            if (!string.IsNullOrWhiteSpace(item.BaseVisualTemplateId))
-            {
-                activeDonors.Add(item.BaseVisualTemplateId.Trim());
-            }
-        }
-
+        bool isDefaultLocalQuery = qp.Count == 0;
+        List<string> probedSnapshot = null;
+        string revBeforeRequest;
+        bool hasActiveCacheState;
         lock (_sync)
         {
-            if (!IsSyncGenerationCurrent(capturedGen)) return;
-            _activeDonorTemplateIds = activeDonors;
-            RebuildDonorTemplateIdsLocked();
+            EnsureEtagScopeLocked();
+            revBeforeRequest = _lastVisualBindingsRev;
+            // 若 _lastVisualBindingsRev 为空（如刚回主菜单或 ClearSyncedServerMods 清空句柄），先清除旧活跃绑定 ETag 强制拉 200
+            hasActiveCacheState = !string.IsNullOrEmpty(revBeforeRequest);
+            if (!hasActiveCacheState)
+            {
+                ClearActiveBindingsEtagsLocked();
+            }
+
+            if (isDefaultLocalQuery && _pendingProbeInstanceIds.Count > 0)
+            {
+                probedSnapshot = new List<string>(_pendingProbeInstanceIds);
+                _pendingProbeInstanceIds.Clear();
+                for (int i = 0; i < probedSnapshot.Count; i++)
+                {
+                    _inFlightProbeInstanceIds.Add(probedSnapshot[i]);
+                }
+            }
         }
 
-        ApplySyncedVisualAndTextHandles(visuals, texts, isActiveBinding: true, capturedGen);
+        try
+        {
+            string primaryIfNoneMatch = hasActiveCacheState ? TryGetCachedEtag(path) : null;
+            var resp = await NameAuth.GetJsonAsync(path, ct, primaryIfNoneMatch).ConfigureAwait(false);
+            string usedPath = path;
+
+            if (resp.NotModified)
+            {
+                if (!string.IsNullOrWhiteSpace(resp.ETag))
+                {
+                    StoreCachedEtag(usedPath, resp.ETag);
+                }
+                if (isDefaultLocalQuery)
+                {
+                    ConfirmProbedVanillaInstances(probedSnapshot, null, revBeforeRequest, capturedGen);
+                }
+                // P2-02：HTTP 304 Not Modified 直接复用内存绑定缓存，零反序列化、零句柄重建、零主线程重绘
+                return;
+            }
+
+            if (!resp.Ok && !string.IsNullOrWhiteSpace(runId))
+            {
+                string fallbackPath = $"/api/runs/{Uri.EscapeDataString(runId)}/visual-bindings";
+                string fallbackIfNoneMatch = hasActiveCacheState ? TryGetCachedEtag(fallbackPath) : null;
+                resp = await NameAuth.GetJsonAsync(fallbackPath, ct, fallbackIfNoneMatch).ConfigureAwait(false);
+                usedPath = fallbackPath;
+                if (resp.NotModified)
+                {
+                    if (!string.IsNullOrWhiteSpace(resp.ETag))
+                    {
+                        StoreCachedEtag(usedPath, resp.ETag);
+                    }
+                    return;
+                }
+            }
+
+            if (!resp.Ok || string.IsNullOrWhiteSpace(resp.Body)) return;
+            if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return;
+
+            var root = JObject.Parse(resp.Body);
+            string rev = (string)(root["revision"] ?? root["visualBindingsRev"]);
+            if (!string.IsNullOrWhiteSpace(rev)) _lastVisualBindingsRev = rev;
+
+            var shaToPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var visuals = new List<CardVisualBinding>();
+            var texts = new List<CardTextOverride>();
+            var activeContents = new List<ServerCustomContentItem>();
+            var activeDonors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // P0-18：同步解析 templateCatalog 更新 _activeDonorTemplateIds 并补充模板级绑定
+            JToken catalogToken = root["templateCatalog"] ?? root["templates"];
+            if (catalogToken is JObject catObj)
+            {
+                foreach (var prop in catObj.Properties())
+                {
+                    if (prop.Value is not JObject bo) continue;
+                    await ExtractBindingObjectAsync(bo, prop.Name, isActiveBinding: false, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
+                }
+            }
+            else if (catalogToken is JArray catArr)
+            {
+                foreach (var token in catArr)
+                {
+                    if (token is not JObject bo) continue;
+                    await ExtractBindingObjectAsync(bo, null, isActiveBinding: false, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
+                }
+            }
+
+            JToken mapToken = root["bindings"] ?? root["activeBindings"] ?? root;
+            if (mapToken is JObject mapObj)
+            {
+                foreach (var prop in mapObj.Properties())
+                {
+                    if (prop.Value is not JObject bo) continue;
+                    await ExtractBindingObjectAsync(bo, prop.Name, isActiveBinding: true, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
+                }
+            }
+            else if (mapToken is JArray arr)
+            {
+                foreach (var token in arr)
+                {
+                    if (token is not JObject bo) continue;
+                    await ExtractBindingObjectAsync(bo, null, isActiveBinding: true, shaToPath, activeContents, visuals, texts, false, ct).ConfigureAwait(false);
+                }
+            }
+
+            if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return;
+
+            foreach (var item in activeContents)
+            {
+                if (!string.IsNullOrWhiteSpace(item.BaseVisualTemplateId))
+                {
+                    activeDonors.Add(item.BaseVisualTemplateId.Trim());
+                }
+            }
+
+            lock (_sync)
+            {
+                if (!IsSyncGenerationCurrent(capturedGen)) return;
+                _activeDonorTemplateIds = activeDonors;
+                RebuildDonorTemplateIdsLocked();
+            }
+
+            ApplySyncedVisualAndTextHandles(visuals, texts, isActiveBinding: true, capturedGen);
+
+            if (!string.IsNullOrWhiteSpace(resp.ETag))
+            {
+                StoreCachedEtag(usedPath, resp.ETag);
+            }
+
+            if (isDefaultLocalQuery)
+            {
+                var boundIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < visuals.Count; i++)
+                {
+                    if (!string.IsNullOrWhiteSpace(visuals[i].InstanceId))
+                    {
+                        boundIds.Add(visuals[i].InstanceId);
+                    }
+                }
+                for (int i = 0; i < texts.Count; i++)
+                {
+                    if (!string.IsNullOrWhiteSpace(texts[i].InstanceId))
+                    {
+                        boundIds.Add(texts[i].InstanceId);
+                    }
+                }
+                ConfirmProbedVanillaInstances(probedSnapshot, boundIds, rev, capturedGen);
+            }
+        }
+        finally
+        {
+            if (probedSnapshot != null && probedSnapshot.Count > 0)
+            {
+                lock (_sync)
+                {
+                    for (int i = 0; i < probedSnapshot.Count; i++)
+                    {
+                        _inFlightProbeInstanceIds.Remove(probedSnapshot[i]);
+                    }
+                }
+            }
+        }
     }
 
     /// <summary>P0-26：消费战报回放记录内嵌的 visualBindings / visualBindingsJson 快照，以独立句柄组还原历史卡图与双语文案。</summary>
@@ -663,16 +935,47 @@ internal sealed partial class ModContentSyncClient
 
     private async Task SyncLocalizationOverlayAsync(bool forceRefresh, long capturedGen, CancellationToken ct)
     {
-        var resp = await NameAuth.GetJsonAsync("/api/localization/overlay", ct).ConfigureAwait(false);
+        const string primaryPath = "/api/localization/overlay";
+        const string fallbackPath = "/api/localization/zh-overlay?locale=zh-CN";
+
+        // P2-02：非强制刷新且本地已同步过词典时携带 If-None-Match；收到 304 直接早退零写盘零重载
+        bool canUseEtag = !forceRefresh && !string.IsNullOrEmpty(_lastOverlaySha256);
+        string primaryIfNoneMatch = canUseEtag ? TryGetCachedEtag(primaryPath) : null;
+        var resp = await NameAuth.GetJsonAsync(primaryPath, ct, primaryIfNoneMatch).ConfigureAwait(false);
+        string usedPath = primaryPath;
+
+        if (resp.NotModified)
+        {
+            if (!string.IsNullOrWhiteSpace(resp.ETag))
+            {
+                StoreCachedEtag(usedPath, resp.ETag);
+            }
+            return;
+        }
+
         if (!resp.Ok)
         {
-            resp = await NameAuth.GetJsonAsync("/api/localization/zh-overlay?locale=zh-CN", ct).ConfigureAwait(false);
+            string fallbackIfNoneMatch = canUseEtag ? TryGetCachedEtag(fallbackPath) : null;
+            resp = await NameAuth.GetJsonAsync(fallbackPath, ct, fallbackIfNoneMatch).ConfigureAwait(false);
+            usedPath = fallbackPath;
+            if (resp.NotModified)
+            {
+                if (!string.IsNullOrWhiteSpace(resp.ETag))
+                {
+                    StoreCachedEtag(usedPath, resp.ETag);
+                }
+                return;
+            }
         }
 
         if (ct.IsCancellationRequested || !IsSyncGenerationCurrent(capturedGen)) return;
 
         if (resp.Ok && !string.IsNullOrWhiteSpace(resp.Body))
         {
+            if (!string.IsNullOrWhiteSpace(resp.ETag))
+            {
+                StoreCachedEtag(usedPath, resp.ETag);
+            }
             try
             {
                 string sha = ComputeSha256Hex(Encoding.UTF8.GetBytes(resp.Body));

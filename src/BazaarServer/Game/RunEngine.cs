@@ -331,6 +331,7 @@ public sealed class RunEngine
         _runEnded = false;
         ClearTrackedPlayerTempModifiers(clearHour: true, clearDay: true, clearAura: true);
 
+        _run.OpponentHero = null;
         _run.OpponentAttributes = RunState.CreateDefaultCombatantAttributes(100, 100, gold: 0, income: 5);
 
         o.Events.Add(new GameSimEventPlayerInitialized
@@ -348,7 +349,13 @@ public sealed class RunEngine
         if (IsTournamentRun())
             _run.PlayerAttributes[EPlayerAttributeType.Custom_11] = 1;
 
-        GrantStarterPresets(_run.CustomRules, o.Events);
+        // P1-10（RC-JULES-START-SPAWN-DEALT-MIX）：
+        // 先在独立 preInitEvents 缓冲区结算开局预设物/技能（StartingItems/StartingSkills/GoldenStart）
+        // 以及官方英雄开局固有实体/初始插座（Jules 烤炉、Hero8 音符等），令其实体先行落盘到 _run.Cards（随前置 GameStateSync 落地）；
+        // 非实体生成类事件（ExperienceGained/SocketsUnlocked 等）仍留入主事件流，
+        // 而实体生成事件绝不与随后首条 Choice/LevelUp 交互包的 CardDealt 同包混发，彻底杜绝 same_batch_spawned_and_dealt_in_choice 与 GetCardContainerBounds 越界崩溃。
+        var preInitEvents = new List<IGameSimEvent>();
+        GrantStarterPresets(_run.CustomRules, preInitEvents);
 
         // 先派发开局生命周期触发（Q45：先注入官方开局 PlayerEffect 以触发 Jules 冰火插座 15d06ad8 等），
         // 确保所有开局属性与经验变动全部结算后再决定首屏状态，避免同帧先发 Choice 遭遇再立刻销毁切 LevelUp 导致客户端残留僵尸事件！
@@ -359,7 +366,35 @@ public sealed class RunEngine
             includeTournamentMode: false,
             includeHeroRunStartSpawners: true);
         var startBatch = OutOfCombatController.OnRunStarted(p1Core, _repo, _rng);
-        ApplyOutOfCombatBatch(p1Core, startBatch, o.Events, syncBoardDiffs: false);
+        ApplyOutOfCombatBatch(p1Core, startBatch, preInitEvents, syncBoardDiffs: false);
+
+        var preInitSpawnedIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var ev in preInitEvents)
+        {
+            if (ev is GameSimEventCardSpawned sp && !string.IsNullOrEmpty(sp.InstanceId))
+                preInitSpawnedIds.Add(sp.InstanceId);
+        }
+
+        var preInitSpawnEvents = new List<IGameSimEvent>();
+        foreach (var ev in preInitEvents)
+        {
+            bool isPreInitEntitySpawnEvent = ev is GameSimEventCardSpawned
+                || (ev is GameSimEventPlayerSkillEquipped sk && preInitSpawnedIds.Contains(sk.InstanceId))
+                || (ev is GameSimEventCardMoved mv && preInitSpawnedIds.Contains(mv.InstanceId));
+            if (isPreInitEntitySpawnEvent)
+                preInitSpawnEvents.Add(ev);
+            else
+                o.Events.Add(ev);
+        }
+
+        if (preInitSpawnEvents.Count > 0)
+        {
+            // 留存一份纯粹的前置初始化快照（仅含初始实体生成，不含 Choice CardDealt），供需要分段消费的调用方或测试核验
+            var preInitFrameEvents = new List<IGameSimEvent>(o.Events.Count + preInitSpawnEvents.Count);
+            preInitFrameEvents.AddRange(o.Events);
+            preInitFrameEvents.AddRange(preInitSpawnEvents);
+            o.PreSplitGameSim = _run.BuildFullGameSim(preInitFrameEvents);
+        }
 
         if (_run.PendingLevelUp)
         {
@@ -384,7 +419,16 @@ public sealed class RunEngine
             TriggerOnEncounterEnteredAndDealt(_run.CurrentEncounterId, o.Events);
         }
 
-        ReconcileAndVerifyBoardInvariants("StartRun", o.DirtyCardIds, o.Events);
+        // 若首包未产出任何 CardDealt（极端空池兜底），仍保留前置生成事件；否则严禁与 CardDealt 同包混发
+        bool hasDealtInStart = o.Events.Any(e => e is GameSimEventCardDealt);
+        if (preInitSpawnEvents.Count > 0 && !hasDealtInStart)
+        {
+            o.Events.AddRange(preInitSpawnEvents);
+            o.PreSplitGameSim = null;
+        }
+
+        var startAuditEvents = hasDealtInStart ? new List<IGameSimEvent>() : o.Events;
+        ReconcileAndVerifyBoardInvariants("StartRun", o.DirtyCardIds, startAuditEvents);
         _run.RngSeed = _rng.Next(1, int.MaxValue);
         _run.RefreshImmutableRulesSnapshot(GetEffectiveCustomMutators());
         _run.PublishPublicSummary();
@@ -643,7 +687,15 @@ public sealed class RunEngine
         {
             foreach (var spec in rules.StartingItems)
             {
-                var ci = TryCreatePresetCoreCard(spec, instanceId: null, allowEnchantment: true);
+                // P0-03：预设开局物品构造时即透传服务端前缀 InstanceId，彻底避免 CoreCard 退化为随机 32 位 UUID
+                var presetTpl = !string.IsNullOrWhiteSpace(spec?.TemplateId) ? _repo.GetCard(spec.TemplateId) : null;
+                string presetPrefix = ShopEngine.ParseCardType(presetTpl?.Type) switch
+                {
+                    ECardType.Skill => "skl",
+                    ECardType.SocketEffect => "skt",
+                    _ => "itm",
+                };
+                var ci = TryCreatePresetCoreCard(spec, instanceId: _shop.NewId(presetPrefix), allowEnchantment: true);
                 if (ci == null) continue;
                 RegisterSpawnedCoreCard(ci, EInventorySection.Hand, preferredSlot: -1, emitSpawnEvent: true, events);
                 grantedAny = true;
@@ -664,7 +716,8 @@ public sealed class RunEngine
                 string normId = spec?.TemplateId?.Trim() ?? "";
                 if (string.IsNullOrEmpty(normId) || !grantedSkillIds.Add(normId))
                     continue;
-                var ci = TryCreatePresetCoreCard(spec!, instanceId: null, allowEnchantment: false);
+                // P0-03：预设技能构造时即透传服务端前缀 InstanceId
+                var ci = TryCreatePresetCoreCard(spec!, instanceId: _shop.NewId("skl"), allowEnchantment: false);
                 if (ci == null) continue;
                 grantedSkillIds.Add(ci.Template.Id);
                 RegisterSpawnedCoreCard(ci, null, preferredSlot: -1, emitSpawnEvent: true, events);
@@ -697,7 +750,9 @@ public sealed class RunEngine
                 var coreTpl = _repo.GetCard(pick.Id);
                 if (coreTpl == null) continue;
                 var tier = SpawnQueryEngine.ClampToSupportedTier(coreTpl, CardTier.Gold);
-                var ci = new CardInstance(coreTpl, tier, null, null);
+                // P0-03：全金开局物品强制透传唯一 InstanceId，杜绝 CoreCard 随机 UUID 割裂
+                string instId = _shop.NewId("itm");
+                var ci = new CardInstance(coreTpl, tier, null, instId);
                 RegisterSpawnedCoreCard(ci, EInventorySection.Hand, preferredSlot: -1, emitSpawnEvent: true, events);
                 grantedAny = true;
             }
@@ -720,7 +775,9 @@ public sealed class RunEngine
                 if (coreTpl != null)
                 {
                     var tier = SpawnQueryEngine.ClampToSupportedTier(coreTpl, CardTier.Gold);
-                    var ci = new CardInstance(coreTpl, tier, null, null);
+                    // P0-03：全金开局技能强制透传唯一 InstanceId，杜绝 CoreCard 随机 UUID 割裂
+                    string instId = _shop.NewId("skl");
+                    var ci = new CardInstance(coreTpl, tier, null, instId);
                     RegisterSpawnedCoreCard(ci, null, preferredSlot: -1, emitSpawnEvent: true, events);
                     grantedAny = true;
                 }
@@ -1561,6 +1618,9 @@ public sealed class RunEngine
     {
         if (entry.CoreCard != null)
         {
+            // P0-03：原地重签自愈历史存档或外部构造导致的 CoreCard.InstanceId != CardEntry.InstanceId 割裂，同时保持网格与引用一致
+            if (!entry.HasAlignedCoreCardId)
+                entry.BindAlignedCoreCard(entry.CoreCard);
             if (entry.Socket.HasValue && entry.Type is ECardType.Item or ECardType.SocketEffect)
                 entry.CoreCard.StartSlot = (int)entry.Socket.Value;
             return entry.CoreCard;
@@ -2078,11 +2138,11 @@ public sealed class RunEngine
             StartSelectionDone = true;
             if (_run.PendingLevelUp)
             {
-                PushChoiceAndEnterLevelUp(o.Events);
+                ExecutePostActionTransitionWithSplit(o, next => PushChoiceAndEnterLevelUp(next.Events));
                 return o;
             }
             _run.SelectionsMadeInCurrentContext = 0;
-            o.Events.AddRange(DealHourEncountersAndClearActive());
+            ExecutePostActionTransitionWithSplit(o, next => next.Events.AddRange(DealHourEncountersAndClearActive()));
             return o;
         }
 
@@ -2091,7 +2151,8 @@ public sealed class RunEngine
             FlushPendingEncounterExitXp(o.Events);
             _run.CurrentEncounterCoreCard = null;
             o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: false));
-            AdvanceAfterSubState(o);
+            // P1-11 & P1-12：隔离 LevelUp 选技（PlayerSkillEquipped）与跨小时（RunHourChanged->6）+ Choice CardDealt，消除 10.1s 时钟锁死
+            ExecutePostActionTransitionWithSplit(o, AdvanceAfterSubState);
             return o;
         }
 
@@ -2111,7 +2172,7 @@ public sealed class RunEngine
             ApplyWillAutoSellOnExitIfNeeded(o.Events);
             ClearPendingExpeditionAfterLootIfNeeded(o.Events);
             o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: false));
-            AdvanceAfterSubState(o);
+            ExecutePostActionTransitionWithSplit(o, AdvanceAfterSubState);
             return o;
         }
 
@@ -2126,7 +2187,7 @@ public sealed class RunEngine
             Guid? nextOnExit = _run.SelectionRules.NextEncounterOnExit;
             bool hasNextEnc = nextOnExit is Guid ng && ng != Guid.Empty && (_pool.IsAssetValid(ng.ToString()) || _repo.GetCard(ng.ToString()) != null);
             o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: hasNextEnc));
-            ExitEncounterOrAdvance(o, nextOnExit, exitingRootId, exitingStepId);
+            ExecutePostActionTransitionWithSplit(o, next => ExitEncounterOrAdvance(next, nextOnExit, exitingRootId, exitingStepId));
             return o;
         }
 
@@ -2545,7 +2606,8 @@ public sealed class RunEngine
         {
             FlushPendingEncounterExitXp(o.Events);
             _run.CurrentEncounterCoreCard = null;
-            TransitionToEncounterById(stepResult.NextEncounterId, o);
+            // P1-11：若本步赐技/生卡（CardSpawned）且下一跳会发卡（CardDealt），拆包隔离避免客户端并发重入
+            ExecutePostActionTransitionWithSplit(o, next => TransitionToEncounterById(stepResult.NextEncounterId, next));
             return o;
         }
 
@@ -2590,11 +2652,11 @@ public sealed class RunEngine
             StartSelectionDone = true;
             if (_run.PendingLevelUp)
             {
-                PushChoiceAndEnterLevelUp(o.Events);
+                ExecutePostActionTransitionWithSplit(o, next => PushChoiceAndEnterLevelUp(next.Events));
                 return o;
             }
             _run.SelectionsMadeInCurrentContext = 0;
-            o.Events.AddRange(DealHourEncountersAndClearActive());
+            ExecutePostActionTransitionWithSplit(o, next => next.Events.AddRange(DealHourEncountersAndClearActive()));
             return o;
         }
 
@@ -2612,12 +2674,15 @@ public sealed class RunEngine
                 ResetBoardOverrideIfNeeded(o.Events);
             _run.CurrentEncounterCoreCard = null;
             o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: false));
-            AdvanceAfterSubState(o);
+            // P1-11（BUG-V1B-02）：升级步骤赐技（如 Inspired by Karnok）产生 CardSpawned(Skill) + PlayerSkillEquipped，
+            // 严禁与后续 Choice CardDealt 同包混发，统一拆为两条独立 NetMessageGameSim 杜绝技能栏 7 分身爆炸
+            ExecutePostActionTransitionWithSplit(o, AdvanceAfterSubState);
             return o;
         }
 
         string? exitingStepId = _run.CurrentEncounterId;
         string? exitingRootId = _run.ParentEncounterTemplateId ?? exitingStepId;
+        bool isExitingFates = IsFatesEncounter(exitingRootId) || IsFatesEncounter(exitingStepId);
         TriggerOnEncounterExited(_run.CurrentEncounterId, o.Events);
         ApplyWillAutoSellOnExitIfNeeded(o.Events);
         FlushPendingEncounterExitXp(o.Events);
@@ -2626,23 +2691,109 @@ public sealed class RunEngine
         _run.CurrentEncounterCoreCard = null;
         o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: false));
 
+        // P1-12（RC-HOUR6-FATES-LEVELUP-CLOCK-LOCK）：Fates 在 Hour >= HoursInADay（Hour == 6）结算获得 XP 触发升级时，
+        // 严禁在 Hour == 6 当场消费 PendingLevelUp 进入 LevelUp，改为先完成跨天（Day+1, Hour=1）再于新日首态安全消费！
+        if (isExitingFates && _run.Hour >= (uint)_mode.HoursInADay && _run.SuspendedStates.Count == 0)
+        {
+            ExecutePostActionTransitionWithSplit(o, next => AdvanceHourOrDay(next.Events, justCompletedPvp: true));
+            return o;
+        }
+
         if (stepResult.ShouldProgressHour && ShouldProgressHourOnExit(exitingRootId, exitingStepId))
         {
             if (_run.SuspendedStates.Count > 0 || _run.PendingLevelUp)
             {
-                AdvanceAfterSubState(o);
+                ExecutePostActionTransitionWithSplit(o, AdvanceAfterSubState);
             }
             else
             {
                 // 若即将进入下一小时且经验已满足升级：AdvanceHour 内部会在新小时扣收入/经验后压栈 Choice 并切入 LevelUp
-                AdvanceHour(o);
+                ExecutePostActionTransitionWithSplit(o, AdvanceHour);
             }
             return o;
         }
 
         // ShouldProgressHour == false（如 Thieves Guild / 免费瞬时事件且无下一跳）→ 不消耗小时数，原地重开当前小时 Choice
-        HandleNoHourProgressEncounterExit(o, exitingRootId, exitingStepId);
+        ExecutePostActionTransitionWithSplit(o, next => HandleNoHourProgressEncounterExit(next, exitingRootId, exitingStepId));
         return o;
+    }
+
+    private bool IsFatesEncounter(string? encId)
+    {
+        if (string.IsNullOrWhiteSpace(encId)) return false;
+        string fatesTemplateId = !string.IsNullOrWhiteSpace(_mode.FatesTemplateId)
+            ? _mode.FatesTemplateId
+            : "aef5e7d8-ea0b-4e7e-8f3d-6e7ba492fa10";
+        return string.Equals(encId, fatesTemplateId, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(encId, "aef5e7d8-ea0b-4e7e-8f3d-6e7ba492fa10", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// P1-11 &amp; P1-12：拆包隔离守卫。
+    /// 当命令前半段已发射 CardSpawned（如升级/奇遇赐技、离场赐技）或 PlayerSkillEquipped，
+    /// 且后半段状态推进将下发 CardDealt（含 Choice 遭遇发牌或跨小时 RunHourChanged + CardDealt）时，
+    /// 复用 PreSplitGameSim + SecondaryGameSimEvents 拆分为两条独立 NetMessageGameSim：
+    /// 1) 阻断 BoardManager.SpawnCards 在 OnCardSpawned 与 OnCardDealt 同帧并发重入导致的技能栏克隆爆炸（P1-11）；
+    /// 2) 阻断 LevelUp 选技（PlayerSkillEquipped）与跨小时（RunHourChanged->6）+ CardDealt 混包引发的 10.1s 时钟锁死（P1-12）。
+    /// </summary>
+    private void ExecutePostActionTransitionWithSplit(Outcome o, Action<Outcome> transitionAction)
+    {
+        bool hasPreCardSpawned = o.Events.Any(e => e is GameSimEventCardSpawned);
+        bool hasPreSkillEquipped = o.Events.Any(e => e is GameSimEventPlayerSkillEquipped);
+        if ((!hasPreCardSpawned && !hasPreSkillEquipped) || o.PreSplitGameSim != null)
+        {
+            transitionAction(o);
+            return;
+        }
+
+        var preExtraCards = o.ExtraSimCards.Count > 0 ? o.ExtraSimCards : null;
+        var preSplitSnapshot = _run.BuildFullGameSim(o.Events, preExtraCards);
+
+        var nextOutcome = new Outcome();
+        transitionAction(nextOutcome);
+
+        // 若后半段直接进入真实三段式战斗（CombatSpawnSim/Combat/CombatDespawnSim），保留完整战斗序列不拆散
+        if (nextOutcome.CombatSpawnSim != null || nextOutcome.Combat != null || nextOutcome.CombatDespawnSim != null)
+        {
+            o.Events.AddRange(nextOutcome.Events);
+            o.CombatSpawnSim = nextOutcome.CombatSpawnSim;
+            o.Combat = nextOutcome.Combat;
+            o.CombatDespawnSim = nextOutcome.CombatDespawnSim;
+            foreach (string id in nextOutcome.DirtyCardIds) o.DirtyCardIds.Add(id);
+            if (nextOutcome.ExtraSimCards.Count > 0) o.ExtraSimCards.AddRange(nextOutcome.ExtraSimCards);
+            o.ForceStateSync |= nextOutcome.ForceStateSync;
+            o.AppendStateSyncAtTail |= nextOutcome.AppendStateSyncAtTail;
+            return;
+        }
+
+        bool nextHasCardDealt = nextOutcome.Events.Any(e => e is GameSimEventCardDealt);
+        bool nextHasHourOrDayAdvance = nextOutcome.Events.Any(e =>
+            e is GameSimEventRunHourChanged or GameSimEventRunDayChanged);
+        bool nextEndsInChoice = _run.State == ERunState.Choice;
+
+        bool shouldSplit = nextOutcome.Events.Count > 0 && (
+            // P1-11：凡前置含 CardSpawned 且后段含 CardDealt 一律拆包，彻底禁止同包混发
+            (hasPreCardSpawned && nextHasCardDealt)
+            // P1-12：凡前置含 PlayerSkillEquipped 且后段跨小时/跨天发牌或切回 Choice 发牌一律拆包
+            || (hasPreSkillEquipped && nextHasCardDealt && (nextHasHourOrDayAdvance || nextEndsInChoice)));
+
+        if (shouldSplit)
+        {
+            o.PreSplitGameSim = preSplitSnapshot;
+            o.SecondaryGameSimEvents = nextOutcome.Events;
+            foreach (string id in nextOutcome.DirtyCardIds) o.DirtyCardIds.Add(id);
+            if (nextOutcome.ExtraSimCards.Count > 0) o.ExtraSimCards.AddRange(nextOutcome.ExtraSimCards);
+            o.ForceStateSync |= nextOutcome.ForceStateSync;
+            o.AppendStateSyncAtTail |= nextOutcome.AppendStateSyncAtTail;
+        }
+        else
+        {
+            o.Events.AddRange(nextOutcome.Events);
+            foreach (string id in nextOutcome.DirtyCardIds) o.DirtyCardIds.Add(id);
+            if (nextOutcome.ExtraSimCards.Count > 0) o.ExtraSimCards.AddRange(nextOutcome.ExtraSimCards);
+            o.ForceStateSync |= nextOutcome.ForceStateSync;
+            o.AppendStateSyncAtTail |= nextOutcome.AppendStateSyncAtTail;
+        }
     }
 
     // ── 刷新 / 离开状态 ─────────────────────────────────────────────────────
@@ -2833,7 +2984,15 @@ public sealed class RunEngine
 
         bool hasNextEnc = nextOnExit is Guid ng && ng != Guid.Empty && (_pool.IsAssetValid(ng.ToString()) || _repo.GetCard(ng.ToString()) != null);
         o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: hasNextEnc));
-        ExitEncounterOrAdvance(o, nextOnExit, exitingRootId, exitingEncId);
+        bool isExitingFates = IsFatesEncounter(exitingRootId) || IsFatesEncounter(exitingEncId);
+        if (!hasNextEnc && isExitingFates && _run.Hour >= (uint)_mode.HoursInADay && _run.SuspendedStates.Count == 0)
+        {
+            // P1-12：从 Fates 退出且处于 Hour >= HoursInADay 时先完成跨天（Day+1, Hour=1），绝不在 Hour == 6 直接进入 LevelUp
+            ExecutePostActionTransitionWithSplit(o, next => AdvanceHourOrDay(next.Events, justCompletedPvp: true));
+            return o;
+        }
+        // P1-11：若 TriggerOnEncounterExited 赐予了新技能/新卡，拆包隔离 CardSpawned 与下一阶段 CardDealt
+        ExecutePostActionTransitionWithSplit(o, next => ExitEncounterOrAdvance(next, nextOnExit, exitingRootId, exitingEncId));
         return o;
     }
 
@@ -2922,6 +3081,13 @@ public sealed class RunEngine
 
         if (_run.PendingLevelUp)
         {
+            // P1-12：若已处于 Hour >= HoursInADay 且已完成当日 PvP（或刚结束 Fates），严禁在 Hour == 6 进入 LevelUp，改为先跨天至 Day+1 Hour 1
+            if (_run.Hour >= (uint)_mode.HoursInADay &&
+                (HasCompletedPvpForCurrentDay() || !RequiresPvpOnDay(_run.Day) || IsFatesEncounter(rootEncId) || IsFatesEncounter(currentEncId)))
+            {
+                AdvanceHourOrDay(o.Events, justCompletedPvp: true);
+                return;
+            }
             // 先压入空 Choice 快照再进入升级：升级完成后回到当前小时重新发牌，绝不误跨下一小时
             PushChoiceAndEnterLevelUp(o.Events);
             return;
@@ -3275,6 +3441,10 @@ public sealed class RunEngine
             Console.WriteLine($"[RunEngine] PVE Match Day={_run.Day}: vs {p2Core.DisplayName} (mode={_run.CustomRules.SpecialModeId}, HP={p2Core.HealthMax}, items={p2Core.Hand.Cards.Count})");
         }
 
+        // P3-08：统一剔除敌方（野怪/BossRush/镜像）中 SpawningEligibility=="Never" 且 ArtKey 为空的官方调试技能，根治客户端空路径加载报错
+        if (p2Core.Skills.RemoveAll(s => MonsterPool.IsBlockedDebugOrBlankArtSkill(s.Template)) > 0)
+            p2Core.PrepareForCombat();
+
         // 统一保障敌方（PvP 镜像与野怪）所有上阵物品/技能/槽位效果具备唯一 InstanceId，
         // 避免同模板多实例或外部传入重复键在战斗模拟及构表阶段发生碰撞；同时严禁任何 Encounter 卡混入 oppEntries。
         EnsureUniqueOpponentCardIds(p2Core);
@@ -3618,6 +3788,7 @@ public sealed class RunEngine
         ERunState combatState = isPvp ? ERunState.PVPCombat : ERunState.Combat;
         _run.State = combatState;
         _run.CurrentPvpOpponent = pvpInfo;
+        _run.OpponentHero = pvpInfo?.Hero ?? EHero.Common;
         _run.OpponentAttributes = RunState.CreateDefaultCombatantAttributes(
             p2Core.HealthMax, p2Core.HealthMax,
             prestige: pvpInfo?.Prestige ?? 20,
@@ -3637,16 +3808,45 @@ public sealed class RunEngine
         }
         _run.OpponentAttributes[EPlayerAttributeType.HealthMax] = p2Core.HealthMax;
         _run.OpponentAttributes[EPlayerAttributeType.Health] = p2Core.HealthMax;
-        // Wave 4A #5：同步开战首帧静态上限（RageMax / EnragedDurationMax / TempoGainCooldownMax）到 CombatSpawnSim，
-        // 保证客户端开战前即拥有与首帧快照一致的初始上限，彻底避免依赖首帧虚假差分。
+
+        // P1-03（RC-COMBAT-SPAWN-HP-MULT-MISSING）+ Wave 4A #5：
+        // 优先以 Timeline[0] 扣除 TimeMs==0 瞬发事件后的开战初值（经 DailyChallenge titan_vitality ×2.5 / glass_cannon / EndlessTower / Mod 倍率缩放）
+        // 同步双方 Health / HealthMax 与静态上限（RageMax / EnragedDurationMax / TempoGainCooldownMax），
+        // 其中玩家侧仅覆写 CombatSpawnSim 快照，严禁污染 _run.PlayerAttributes / BasePlayerAttributes（确保战后回店还原局外原值）。
+        bool flipTimelinePerspective = isSymmetricHumanPvp && !selfIsCanonicalP1;
+        int? combatSpawnPlayerMaxHp = null;
+        int? combatSpawnPlayerHp = null;
         if (result.Timeline.Count > 0)
         {
-            var t0 = result.Timeline[0];
-            _run.OpponentAttributes[EPlayerAttributeType.RageMax] = t0.P2RageMax;
-            if (t0.P2EnragedDurationMax > 0)
-                _run.OpponentAttributes[EPlayerAttributeType.EnragedDurationMax] = t0.P2EnragedDurationMax;
-            if (t0.P2TempoGainCooldownMax > 0)
-                _run.OpponentAttributes[EPlayerAttributeType.TempoGainCooldownMax] = t0.P2TempoGainCooldownMax;
+            var initialBaseline = CombatSimConverter.CreateInitialPlayerBaseline(result.Timeline[0], result.Events);
+            int selfInitMaxHp = flipTimelinePerspective ? initialBaseline.P2MaxHp : initialBaseline.P1MaxHp;
+            int selfInitHp = flipTimelinePerspective ? initialBaseline.P2Hp : initialBaseline.P1Hp;
+            int oppInitMaxHp = flipTimelinePerspective ? initialBaseline.P1MaxHp : initialBaseline.P2MaxHp;
+            int oppInitHp = flipTimelinePerspective ? initialBaseline.P1Hp : initialBaseline.P2Hp;
+            int oppInitRageMax = flipTimelinePerspective ? initialBaseline.P1RageMax : initialBaseline.P2RageMax;
+            int oppInitEnragedDurMax = flipTimelinePerspective ? initialBaseline.P1EnragedDurationMax : initialBaseline.P2EnragedDurationMax;
+            int oppInitTempoCdMax = flipTimelinePerspective ? initialBaseline.P1TempoGainCooldownMax : initialBaseline.P2TempoGainCooldownMax;
+
+            if (oppInitMaxHp > 0)
+            {
+                _run.OpponentAttributes[EPlayerAttributeType.HealthMax] = oppInitMaxHp;
+                _run.OpponentAttributes[EPlayerAttributeType.Health] = oppInitHp > 0
+                    ? Math.Min(oppInitHp, oppInitMaxHp)
+                    : oppInitMaxHp;
+            }
+            if (selfInitMaxHp > 0)
+            {
+                combatSpawnPlayerMaxHp = selfInitMaxHp;
+                combatSpawnPlayerHp = selfInitHp > 0
+                    ? Math.Min(selfInitHp, selfInitMaxHp)
+                    : selfInitMaxHp;
+            }
+
+            _run.OpponentAttributes[EPlayerAttributeType.RageMax] = oppInitRageMax;
+            if (oppInitEnragedDurMax > 0)
+                _run.OpponentAttributes[EPlayerAttributeType.EnragedDurationMax] = oppInitEnragedDurMax;
+            if (oppInitTempoCdMax > 0)
+                _run.OpponentAttributes[EPlayerAttributeType.TempoGainCooldownMax] = oppInitTempoCdMax;
         }
 
         var spawnEvents = new List<IGameSimEvent>(o.Events);
@@ -3668,6 +3868,11 @@ public sealed class RunEngine
                 oe.Socket));
         }
         o.CombatSpawnSim = _run.BuildFullGameSim(spawnEvents, oppEntries, pvpInfo);
+        if (combatSpawnPlayerMaxHp is int scaledPlayerMaxHp && scaledPlayerMaxHp > 0 && o.CombatSpawnSim.Player?.Attributes != null)
+        {
+            o.CombatSpawnSim.Player.Attributes[EPlayerAttributeType.HealthMax] = scaledPlayerMaxHp;
+            o.CombatSpawnSim.Player.Attributes[EPlayerAttributeType.Health] = combatSpawnPlayerHp ?? scaledPlayerMaxHp;
+        }
 
         // 6. 构造第 2 条消息：CombatSim（同步真人 PvP 复用唯一规范模拟与严格镜像缓存；其余战斗常规转换）
         if (prebuiltSymmetricSim != null)
@@ -3724,9 +3929,10 @@ public sealed class RunEngine
         foreach (var oe in oppEntries)
             despawnEvents.Add(new GameSimEventCardDisposed(oe.InstanceId, ECardDisposalReason.Cleared));
 
-        _run.PendingPvpGhost = null;
-        _run.CurrentPvpOpponent = null;
-        _run.OpponentAttributes = RunState.CreateDefaultCombatantAttributes(100, 100, gold: 0, income: 5);
+        // P1-09（RC-PVP-DESPAWN-OPP-HP-RESET）：
+        // 战后清场同步清空 OpponentHero、CurrentPvpOpponent、PendingPvpGhost 与非战斗态对手实体属性，
+        // 严禁再将 OpponentAttributes 重置为 100/100 下发至客户端引爆全英雄「最大生命值 -300~-4600」虚假飘字。
+        _run.ClearNonCombatOpponentState();
 
         // 7a. 战后永久状态回写（P0-40：严格传入持 _run.Cards[*].CoreCard 活引用的 p1Core；canonicalP2 走独立槽位并剥离 "opp_" 前缀）
         bool syncAsCanonicalP2 = isSymmetricHumanPvp && !selfIsCanonicalP1;
@@ -3950,7 +4156,7 @@ public sealed class RunEngine
                     }
                     // #1 空战利品兜底：绝不停留在空 Loot 货架卡死，立刻销毁怪物头像卡并顺畅进入升级/恢复挂起栈/下一小时
                     ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
-                    if (_run.PendingLevelUp)
+                    if (_run.PendingLevelUp && (_run.Hour < (uint)_mode.HoursInADay || _run.SuspendedStates.Count > 0))
                         ConsumeNextPendingLevelUpToEvents(despawnEvents);
                     else if (_run.SuspendedStates.Count > 0)
                         AdvanceAfterSubStateToEvents(despawnEvents);
@@ -4002,7 +4208,9 @@ public sealed class RunEngine
                         ResetBoardOverrideIfNeeded(despawnEvents);
                     }
 
-                    if (_run.PendingLevelUp)
+                    // P1-12：若刚结束 Hour == 6 PvP 且战后获得升级经验，严禁在 Hour == 6 当场进入 LevelUp，
+                    // 先走 AdvanceHourOrDay 跨天至 Day+1 Hour 1，再由新日首态安全消费 PendingLevelUp
+                    if (_run.PendingLevelUp && !(isPvp || (_run.Hour >= (uint)_mode.HoursInADay && _run.SuspendedStates.Count == 0)))
                     {
                         ActivateEncounterCard(null, selectedCard: null, despawnEvents, emitPurchaseIfSelected: false);
                         ConsumeNextPendingLevelUpToEvents(despawnEvents);
@@ -4271,6 +4479,8 @@ public sealed class RunEngine
 
             if (entry.Type == ECardType.Skill)
             {
+                // P3-08：兜底拦截 Never + 空 ArtKey 调试技能，避免异常存档或外部注入进入玩家技能栏
+                if (MonsterPool.IsBlockedDebugOrBlankArtSkill(ci.Template)) continue;
                 ps.Skills.Add(ci);
             }
             else if (entry.Type == ECardType.SocketEffect)
@@ -6006,6 +6216,18 @@ public sealed class RunEngine
 
     private void ConsumeNextPendingLevelUpToEvents(List<IGameSimEvent> events)
     {
+        // P1-12（RC-HOUR6-FATES-LEVELUP-CLOCK-LOCK）：
+        // 若当前已处于 Hour >= HoursInADay（Hour == 6）且非 Hour 6 Choice 桌面卖卡压栈场景（SuspendedStates 为空）
+        // 且当日 PvP 已结算（含 Fates 结算与战后升级）或当日无需 PvP，严禁在 Hour == 6 当场消费 PendingLevelUp；
+        // 先推进跨天至 Day+1 Hour 1，再由 AdvanceHourOrDay 末尾在新日首态安全进入 LevelUp。
+        if (_run.Hour >= (uint)_mode.HoursInADay
+            && _run.SuspendedStates.Count == 0
+            && (HasCompletedPvpForCurrentDay() || !RequiresPvpOnDay(_run.Day) || IsFatesEncounter(_run.CurrentEncounterId)))
+        {
+            AdvanceHourOrDay(events, justCompletedPvp: true);
+            return;
+        }
+
         // P2-34：统一在所有进入 LevelUp 入口（含非栈式、战后与连升多级）成对发射 InterruptStateEntered；
         // 连升多级（当前已在 LevelUp 态）先发上一级 Exited 再发下一级 Entered，确保中断事件流严格对称。
         if (_run.State == ERunState.LevelUp)
@@ -6026,9 +6248,10 @@ public sealed class RunEngine
             _run.GainedHourXpThisHour = true;
             _run.GainedAdvanceHourXpThisHour = true;
         }
-        _run.PendingPvpGhost = null;
-        _run.CurrentPvpOpponent = null;
-        _run.OpponentAttributes = RunState.CreateDefaultCombatantAttributes(100, 100, gold: 0, income: 5);
+        // P1-09（RC-PVP-DESPAWN-OPP-HP-RESET）：
+        // 战后清场同步清空 OpponentHero、CurrentPvpOpponent、PendingPvpGhost 与非战斗态对手实体属性，
+        // 严禁再将 OpponentAttributes 重置为 100/100 下发至客户端引爆全英雄「最大生命值 -300~-4600」虚假飘字。
+        _run.ClearNonCombatOpponentState();
 
         var oppIds = _run.Cards.Values
             .Where(c => c.Owner == ECombatantId.Opponent)
@@ -6299,8 +6522,10 @@ public sealed class RunEngine
 
             if (pa == EPlayerAttributeType.HealthMax && delta > 0)
             {
+                // P2-03：通过 SetBasePlayerAttribute 同步更新 BasePlayerAttributes["Health"]，
+                // 避免后续 SyncPlayerAttributesFromCore / ApplyLayeredPlayerStateTo 用旧基底覆盖致商店残血（如 Knee Brace 550/650）
                 int curHpBefore = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, oldInt);
-                _run.PlayerAttributes[EPlayerAttributeType.Health] = Math.Min(newInt, curHpBefore + delta);
+                _run.SetBasePlayerAttribute(EPlayerAttributeType.Health, Math.Min(newInt, curHpBefore + delta));
             }
 
             if (pa == EPlayerAttributeType.Gold && delta > 0 &&
@@ -6315,13 +6540,15 @@ public sealed class RunEngine
                 events.Add(new GameSimEventPlayerPrestigeChanged(delta));
         }
 
-        // 确保 Health 不越界超出最新 HealthMax（不覆盖外部独立写入且合法的血量值）
+        // 确保 Health 不越界超出最新 HealthMax（同步收敛至 SetBasePlayerAttribute 保持基底一致）
         int curMaxHp = Math.Max(1, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, ps.HealthMax));
         int curHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, ps.CurrentHealth);
         int clampedHp = Math.Clamp(curHp, 0, curMaxHp);
-        if (_run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, clampedHp) != clampedHp)
+        if (_run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, clampedHp) != clampedHp ||
+            !_run.BasePlayerAttributes.TryGetValue("Health", out double baseHpNow) ||
+            Math.Abs(baseHpNow - clampedHp) > 1e-6)
         {
-            _run.PlayerAttributes[EPlayerAttributeType.Health] = clampedHp;
+            _run.SetBasePlayerAttribute(EPlayerAttributeType.Health, clampedHp);
         }
 
         if (levelsGainedDirectly > 0)
@@ -6607,7 +6834,8 @@ public sealed class RunEngine
                 hpInc = _levelUps.MaxLevel > 0 ? _levelUps.HealthIncreaseFor(_levelUps.MaxLevel) : 150;
             int nextMaxHp = _run.AdjustBasePlayerAttribute(EPlayerAttributeType.HealthMax, hpInc, minBase: 1);
             int curHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, nextMaxHp);
-            _run.PlayerAttributes[EPlayerAttributeType.Health] = Math.Min(nextMaxHp, curHp + hpInc);
+            // P2-03：直接升级加血同步收敛至 SetBasePlayerAttribute，保持 BasePlayerAttributes["Health"] 一致
+            _run.SetBasePlayerAttribute(EPlayerAttributeType.Health, Math.Min(nextMaxHp, curHp + hpInc));
 
             _run.PendingLevelUps++;
             ushort beforeDirectUnlock = _run.UnlockedSlots;
@@ -6927,15 +7155,16 @@ public sealed class RunEngine
             SyncLayeredPlayerAttributesFromCore(p1Core, prevLayeredKeys);
         }
 
-        // 统一按有效 HealthMax 净增量校准当前血量（覆盖永久与 Day/Hour 层血上限增量，并钳制 <= HealthMax）
+        // 统一按有效 HealthMax 净增量校准当前血量（覆盖永久与 Day/Hour 层血上限增量，并同步收敛至 SetBasePlayerAttribute）
         int nextEffectiveHealthMax = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, prevEffectiveHealthMax);
         int effectiveMaxHpDiff = nextEffectiveHealthMax - prevEffectiveHealthMax;
         if (effectiveMaxHpDiff != 0)
         {
             int curHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, prevEffectiveHealthMax);
-            _run.PlayerAttributes[EPlayerAttributeType.Health] = effectiveMaxHpDiff > 0
+            int targetHp = effectiveMaxHpDiff > 0
                 ? Math.Min(nextEffectiveHealthMax, curHp + effectiveMaxHpDiff)
                 : Math.Min(curHp, nextEffectiveHealthMax);
+            _run.SetBasePlayerAttribute(EPlayerAttributeType.Health, targetHp);
         }
 
         if (xpToGrant > 0)
@@ -7079,8 +7308,8 @@ public sealed class RunEngine
             Owner = ECombatantId.Player,
             Section = actualSection,
             Socket = actualSocket,
-            CoreCard = core,
         };
+        entry.BindAlignedCoreCard(core);
         RunState.PopulateMetaFromTemplate(entry, _pool.Get(core.Template.Id), core.Template);
         _run.SyncEntryFromCoreCardAndDiff(entry, _repo.GameMode.StandardPrices, emitAuraRefreshEvent: false);
 
@@ -7315,13 +7544,20 @@ public sealed class RunEngine
             _run.LastDerivedPlayerAttributes[pa] = eff;
         }
 
-        // 确保 Health 不越界超出最新有效 HealthMax
+        // 确保 Health 不越界超出最新有效 HealthMax，并保持 BasePlayerAttributes["Health"] 同步
         int syncedMaxHp = Math.Max(1, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, _mode.StartingHealth));
         int syncedHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, syncedMaxHp);
         int clampedHp = Math.Clamp(syncedHp, 0, syncedMaxHp);
-        if (clampedHp != syncedHp)
-            _run.PlayerAttributes[EPlayerAttributeType.Health] = clampedHp;
-        _run.LastDerivedPlayerAttributes[EPlayerAttributeType.Health] = clampedHp;
+        if (clampedHp != syncedHp ||
+            !_run.BasePlayerAttributes.TryGetValue("Health", out double syncedBaseHp) ||
+            Math.Abs(syncedBaseHp - clampedHp) > 1e-6)
+        {
+            _run.SetBasePlayerAttribute(EPlayerAttributeType.Health, clampedHp);
+        }
+        else
+        {
+            _run.LastDerivedPlayerAttributes[EPlayerAttributeType.Health] = clampedHp;
+        }
     }
 
     private static bool IsPersistentSyncPlayerAttribute(EPlayerAttributeType pa, string key)
@@ -7365,9 +7601,16 @@ public sealed class RunEngine
         int curMaxHp = Math.Max(1, _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, _mode.StartingHealth));
         int curHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, curMaxHp);
         int clampedHp = Math.Clamp(curHp, 0, curMaxHp);
-        if (clampedHp != curHp)
-            _run.PlayerAttributes[EPlayerAttributeType.Health] = clampedHp;
-        _run.LastDerivedPlayerAttributes[EPlayerAttributeType.Health] = clampedHp;
+        if (clampedHp != curHp ||
+            !_run.BasePlayerAttributes.TryGetValue("Health", out double layeredBaseHp) ||
+            Math.Abs(layeredBaseHp - clampedHp) > 1e-6)
+        {
+            _run.SetBasePlayerAttribute(EPlayerAttributeType.Health, clampedHp);
+        }
+        else
+        {
+            _run.LastDerivedPlayerAttributes[EPlayerAttributeType.Health] = clampedHp;
+        }
     }
 
     private void ClearTrackedPlayerTempModifiers(bool clearHour, bool clearDay, bool clearAura = false)
@@ -8418,10 +8661,15 @@ public sealed class RunEngine
         {
             var rng = new Random(seed ^ 0x51A7F3);
             var existingIds = new HashSet<string>(bossPlayer.Skills.Select(s => s.Template.Id), StringComparer.OrdinalIgnoreCase);
+            // P3-08：严格过滤 SpawningEligibility=="Never"、空 ArtKey 与 [DEBUG]/TEST 技能，根治 BossRush 对阵 Void Golem 等刷出空路径技能
             var skillCandidates = _repo.CardsById.Values
                 .Where(c => string.Equals(c.Type, "Skill", StringComparison.OrdinalIgnoreCase) &&
                             !existingIds.Contains(c.Id) &&
-                            !c.InternalName.Contains("TEST", StringComparison.OrdinalIgnoreCase))
+                            !MonsterPool.IsBlockedDebugOrBlankArtSkill(c) &&
+                            !string.Equals(c.SpawningEligibility, "Never", StringComparison.OrdinalIgnoreCase) &&
+                            !string.IsNullOrWhiteSpace(c.ArtKey) &&
+                            !c.InternalName.Contains("TEST", StringComparison.OrdinalIgnoreCase) &&
+                            !c.InternalName.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase))
                 .ToList();
             for (int i = 0; i < waveCfg.BonusReinforceSkills && skillCandidates.Count > 0; i++)
             {
@@ -8916,6 +9164,8 @@ public sealed class RunEngine
                 var ci = TryCreatePresetCoreCard(spec, $"ai_skl_{skillSeq++}", allowEnchantment: false);
                 if (ci == null || !string.Equals(ci.Template.Type, "Skill", StringComparison.OrdinalIgnoreCase))
                     continue;
+                if (MonsterPool.IsBlockedDebugOrBlankArtSkill(ci.Template))
+                    continue;
                 p2Core.Skills.Add(ci);
                 mutated = true;
             }
@@ -9098,17 +9348,39 @@ public sealed class RunEngine
                 ? rec.OriginalCardInstanceId[stripSimIdPrefix.Length..]
                 : rec.OriginalCardInstanceId;
 
-            _run.Cards.TryGetValue(localOrigId, out var origEntry);
-            ECardType cardType = origEntry?.Type ?? ShopEngine.ParseCardType(rec.OriginalCardType);
-            string wireTplId = origEntry != null
-                ? origEntry.TemplateId.ToString()
-                : ResolveSafeWireGuid(rec.OriginalTemplateId, cardType).ToString();
-            EInventorySection? section = origEntry?.Section ?? ParseSection(rec.OriginalSection);
-            EContainerSocketId? socket = origEntry?.Socket
+            if (!_run.Cards.TryGetValue(localOrigId, out var origEntry))
+            {
+                // P0-03 双保险反查：按 CoreCard.InstanceId 反查真实 CardEntry，彻底消除 UUID 割裂导致的查空与错 ID 透传
+                origEntry = _run.Cards.Values.FirstOrDefault(c =>
+                    c.CoreCard != null &&
+                    string.Equals(c.CoreCard.InstanceId, localOrigId, StringComparison.Ordinal));
+                if (origEntry == null && rec.OriginalSlot is >= 0 and <= 9 && !string.IsNullOrEmpty(rec.OriginalTemplateId))
+                {
+                    EInventorySection? origSec = ParseSection(rec.OriginalSection);
+                    EContainerSocketId origSock = (EContainerSocketId)rec.OriginalSlot;
+                    origEntry = _run.Cards.Values.FirstOrDefault(c =>
+                        c.Owner == ECombatantId.Player &&
+                        c.Section == origSec &&
+                        c.Socket == origSock &&
+                        string.Equals(RunState.ResolveCoreTemplateId(c), rec.OriginalTemplateId, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+
+            if (origEntry == null)
+            {
+                // P0-03：若原卡在 _run.Cards 中已不存在（绝不透传未知 ID 诱发下游构造 Size=0 空壳崩毁客户端）
+                Console.WriteLine($"[RunEngine][WARN] EmitPostCombatTemporaryTransformRevertsWithOwner skipped unresolved original card id={localOrigId}, tpl={rec.OriginalTemplateId}");
+                continue;
+            }
+
+            ECardType cardType = origEntry.Type;
+            string wireTplId = origEntry.TemplateId.ToString();
+            EInventorySection? section = origEntry.Section ?? ParseSection(rec.OriginalSection);
+            EContainerSocketId? socket = origEntry.Socket
                 ?? (rec.OriginalSlot is >= 0 and <= 9 ? (EContainerSocketId)rec.OriginalSlot : null);
 
             var origTransform = new SimEventCardTransformation(
-                origEntry?.InstanceId ?? localOrigId,
+                origEntry.InstanceId,
                 wireTplId,
                 cardType,
                 ECombatantId.Player,
@@ -9120,11 +9392,7 @@ public sealed class RunEngine
                 : new List<string>();
 
             despawnEvents.Add(new GameSimEventCardTransformReverted(origTransform, transformedIds));
-
-            if (origEntry != null)
-            {
-                dirtyCardIds.Add(origEntry.InstanceId);
-            }
+            dirtyCardIds.Add(origEntry.InstanceId);
         }
     }
 
@@ -9226,10 +9494,12 @@ public sealed class RunEngine
         int nextMax = _run.AdjustBasePlayerAttribute(EPlayerAttributeType.HealthMax, delta, minBase: 1);
         if (clampHealth)
         {
+            // P2-03：统一收敛为 SetBasePlayerAttribute，确保 BasePlayerAttributes["Health"] 同步更新
             int curHp = _run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Health, nextMax);
-            _run.PlayerAttributes[EPlayerAttributeType.Health] = delta > 0
+            int targetHp = delta > 0
                 ? Math.Min(nextMax, curHp + delta)
                 : Math.Min(curHp, nextMax);
+            _run.SetBasePlayerAttribute(EPlayerAttributeType.Health, targetHp);
         }
 
         if (nextMax != prevMax)

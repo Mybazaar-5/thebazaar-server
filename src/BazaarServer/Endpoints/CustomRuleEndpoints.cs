@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using BazaarCore.Engine;
@@ -16,6 +17,12 @@ namespace BazaarServer.Endpoints;
 /// </summary>
 public static class CustomRuleEndpoints
 {
+    /// <summary>P1-15：UTF-8 URL 编码（Uri.EscapeDataString）用户名请求头，纯 ASCII 安全传输任意中文/非 ASCII 账号名。</summary>
+    public const string UsernameUtf8Header = "X-Bazaar-Username-Utf8";
+
+    /// <summary>P1-15：UTF-8 Base64/Base64Url 编码用户名请求头，纯 ASCII 安全传输任意中文/非 ASCII 账号名。</summary>
+    public const string UsernameBase64Header = "X-Username-B64";
+
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true,
@@ -385,6 +392,8 @@ public static class CustomRuleEndpoints
                     tendencyLocked = true,
                     canLockNow = false,
                     selectedArchetypeMask = 0UL,
+                    isCustomRuleRun = false,
+                    customRules = (CustomRunRuleSet?)null,
                 }, JsonOpts);
             }
 
@@ -401,6 +410,8 @@ public static class CustomRuleEndpoints
                     tendencyLocked = true,
                     canLockNow = false,
                     selectedArchetypeMask = 0UL,
+                    isCustomRuleRun = false,
+                    customRules = (CustomRunRuleSet?)null,
                 }, JsonOpts);
             }
 
@@ -416,24 +427,30 @@ public static class CustomRuleEndpoints
                         tendencyLocked = true,
                         canLockNow = false,
                         selectedArchetypeMask = 0UL,
+                        isCustomRuleRun = false,
+                        customRules = (CustomRunRuleSet?)null,
                     }, JsonOpts);
                 }
 
                 bool canLock = handle.Engine.CanLockOpeningTendency;
+                // P1-15：向后兼容增补当前活跃对局（含 SQLite 冷重启恢复态）的 customRules 作为局内 HUD 唯一权威事实源
+                var activeRules = handle.Run.CustomRules ?? new CustomRunRuleSet();
                 return Results.Json(new
                 {
                     hasActiveRun = true,
                     runId = handle.Run.RunId,
                     playMode = handle.Run.PlayMode.ToString(),
-                    specialModeId = handle.Run.CustomRules.SpecialModeId.ToString(),
+                    specialModeId = activeRules.SpecialModeId.ToString(),
                     hero = handle.Run.Hero.ToString(),
                     day = handle.Run.Day,
                     hour = handle.Run.Hour,
                     state = handle.Run.State.ToString(),
-                    allowTendencySelection = handle.Run.CustomRules?.AllowTendencySelection ?? true,
+                    allowTendencySelection = activeRules.AllowTendencySelection,
                     tendencyLocked = !canLock,
                     canLockNow = canLock,
-                    selectedArchetypeMask = handle.Run.CustomRules?.SelectedArchetypeMask ?? 0UL,
+                    selectedArchetypeMask = activeRules.SelectedArchetypeMask,
+                    isCustomRuleRun = handle.Run.IsCustomRuleRun,
+                    customRules = activeRules,
                 }, JsonOpts);
             }
             finally
@@ -457,6 +474,8 @@ public static class CustomRuleEndpoints
                     tendencyLocked = true,
                     canLockNow = false,
                     selectedArchetypeMask = 0UL,
+                    isCustomRuleRun = false,
+                    customRules = (CustomRunRuleSet?)null,
                     hint = "Use POST to lock opening tendency",
                 }, JsonOpts);
             }
@@ -474,6 +493,8 @@ public static class CustomRuleEndpoints
                     tendencyLocked = true,
                     canLockNow = false,
                     selectedArchetypeMask = 0UL,
+                    isCustomRuleRun = false,
+                    customRules = (CustomRunRuleSet?)null,
                     hint = "Use POST to lock opening tendency",
                 }, JsonOpts);
             }
@@ -490,25 +511,30 @@ public static class CustomRuleEndpoints
                         tendencyLocked = true,
                         canLockNow = false,
                         selectedArchetypeMask = 0UL,
+                        isCustomRuleRun = false,
+                        customRules = (CustomRunRuleSet?)null,
                         hint = "Use POST to lock opening tendency",
                     }, JsonOpts);
                 }
 
                 bool canLock = handle.Engine.CanLockOpeningTendency;
+                var activeRules = handle.Run.CustomRules ?? new CustomRunRuleSet();
                 return Results.Json(new
                 {
                     hasActiveRun = true,
                     runId = handle.Run.RunId,
                     playMode = handle.Run.PlayMode.ToString(),
-                    specialModeId = handle.Run.CustomRules.SpecialModeId.ToString(),
+                    specialModeId = activeRules.SpecialModeId.ToString(),
                     hero = handle.Run.Hero.ToString(),
                     day = handle.Run.Day,
                     hour = handle.Run.Hour,
                     state = handle.Run.State.ToString(),
-                    allowTendencySelection = handle.Run.CustomRules?.AllowTendencySelection ?? true,
+                    allowTendencySelection = activeRules.AllowTendencySelection,
                     tendencyLocked = !canLock,
                     canLockNow = canLock,
-                    selectedArchetypeMask = handle.Run.CustomRules?.SelectedArchetypeMask ?? 0UL,
+                    selectedArchetypeMask = activeRules.SelectedArchetypeMask,
+                    isCustomRuleRun = handle.Run.IsCustomRuleRun,
+                    customRules = activeRules,
                     hint = "Use POST to lock opening tendency",
                 }, JsonOpts);
             }
@@ -829,7 +855,128 @@ public static class CustomRuleEndpoints
     }
 
     /// <summary>
-    /// 按 Bearer Token -> X-Account-Id (aid) -> X-Username (uid) -> guest 顺序解析账号标识。
+    /// P1-15：从 HTTP 请求头解析并解码用户名（支持 UTF-8 URL 编码与 Base64 编码，彻底兼容非 ASCII 中文账号名）。
+    /// 优先级：X-Bazaar-Username-Utf8 -> X-Username-B64 -> X-Username-Utf8 -> X-Username -> uid。
+    /// </summary>
+    public static string? ResolveUsernameFromHeaders(HttpContext ctx)
+    {
+        if (ctx == null) return null;
+        var headers = ctx.Request.Headers;
+
+        string? decoded = TryDecodePercentUtf8(headers[UsernameUtf8Header].ToString());
+        if (!string.IsNullOrEmpty(decoded))
+            return decoded;
+
+        decoded = TryDecodeBase64Utf8(headers[UsernameBase64Header].ToString());
+        if (!string.IsNullOrEmpty(decoded))
+            return decoded;
+
+        decoded = TryDecodePercentUtf8(headers["X-Username-Utf8"].ToString());
+        if (!string.IsNullOrEmpty(decoded))
+            return decoded;
+
+        decoded = TryDecodePercentUtf8(headers["X-Username"].ToString());
+        if (!string.IsNullOrEmpty(decoded))
+            return decoded;
+
+        decoded = TryDecodePercentUtf8(headers["uid"].ToString());
+        if (!string.IsNullOrEmpty(decoded))
+            return decoded;
+
+        return null;
+    }
+
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    private static string? TryDecodePercentUtf8(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        string trimmed = raw.Trim();
+        if (!trimmed.Contains('%'))
+            return trimmed;
+
+        try
+        {
+            // 严格 RFC3986 %XX 字节流解析：任意非法百分号转义或无效 UTF-8 字节序列立即返回 null，
+            // 确保降级回落到后续合法候选用户名头，绝不原样透传 "%FF%FE" 误建脏账号
+            var bytes = new List<byte>(trimmed.Length);
+            int i = 0;
+            while (i < trimmed.Length)
+            {
+                char ch = trimmed[i];
+                if (ch == '%')
+                {
+                    if (i + 2 >= trimmed.Length
+                        || !TryParseHexNibble(trimmed[i + 1], out int hi)
+                        || !TryParseHexNibble(trimmed[i + 2], out int lo))
+                    {
+                        return null;
+                    }
+
+                    bytes.Add((byte)((hi << 4) | lo));
+                    i += 3;
+                }
+                else if (ch <= 0x7F)
+                {
+                    bytes.Add((byte)ch);
+                    i++;
+                }
+                else
+                {
+                    int start = i;
+                    while (i < trimmed.Length && trimmed[i] != '%' && trimmed[i] > 0x7F)
+                        i++;
+                    bytes.AddRange(StrictUtf8.GetBytes(trimmed.Substring(start, i - start)));
+                }
+            }
+
+            string decoded = StrictUtf8.GetString(bytes.ToArray()).Trim();
+            return string.IsNullOrWhiteSpace(decoded) ? null : decoded;
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static bool TryParseHexNibble(char c, out int value)
+    {
+        if (c >= '0' && c <= '9') { value = c - '0'; return true; }
+        if (c >= 'a' && c <= 'f') { value = c - 'a' + 10; return true; }
+        if (c >= 'A' && c <= 'F') { value = c - 'A' + 10; return true; }
+        value = 0;
+        return false;
+    }
+
+    private static string? TryDecodeBase64Utf8(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        string trimmed = raw.Trim();
+        // 同时兼容标准 Base64 与 Base64Url（- / _ 及省略尾部 = 填充）
+        string normalized = trimmed.Replace('-', '+').Replace('_', '/');
+        int mod = normalized.Length % 4;
+        if (mod == 2) normalized += "==";
+        else if (mod == 3) normalized += "=";
+        else if (mod == 1) return null;
+
+        try
+        {
+            byte[] bytes = Convert.FromBase64String(normalized);
+            string decoded = StrictUtf8.GetString(bytes).Trim();
+            return string.IsNullOrWhiteSpace(decoded) ? null : decoded;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 按 Bearer Token -> X-Account-Id (aid) -> UTF-8/URL/Base64 用户名头（X-Bazaar-Username-Utf8 / X-Username-B64 / X-Username-Utf8 / X-Username / uid）-> guest 顺序解析账号标识。
     /// </summary>
     public static string ResolveAccountId(HttpContext ctx, AccountStore accounts)
     {
@@ -849,10 +996,7 @@ public static class CustomRuleEndpoints
                 return byId.AccountId.ToString("D");
         }
 
-        string rawUsername = ctx.Request.Headers["X-Username"].ToString().Trim();
-        if (string.IsNullOrEmpty(rawUsername))
-            rawUsername = ctx.Request.Headers["uid"].ToString().Trim();
-
+        string? rawUsername = ResolveUsernameFromHeaders(ctx);
         if (!string.IsNullOrEmpty(rawUsername))
         {
             var byName = accounts.FindByUsername(rawUsername) ?? accounts.GetOrCreateByName(rawUsername);

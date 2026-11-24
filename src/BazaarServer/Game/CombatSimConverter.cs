@@ -27,6 +27,12 @@ public static class CombatSimConverter
     /// </summary>
     public const string KarnokBeastFormPortraitArtKey = "a416f9477a147134cb1274f1c402bcd6";
 
+    /// <summary>
+    /// 官方 GameData.db 中战中获得金币动作（Concealed Dagger / Pickpocket 等）使用的原生飞币爆裂弹道 VFX 键（P1-07）。
+    /// 当战中 TActionPlayerModifyAttribute 正向增加 Gold 且原技能未显式配置 VFXOverrideKey 时作为标准飞币兜底特效。
+    /// </summary>
+    public const string OfficialCoinBurstVfxKey = "Assets/TheBazaar/Projectiles/Gold/Projectile_CoinBurst_PV.prefab";
+
     private static readonly ECardAttributeType[] SyncedCustomAttrs =
     [
         ECardAttributeType.Custom_0,
@@ -45,6 +51,12 @@ public static class CombatSimConverter
         public RunState.CardEntry Entry { get; set; } = null!;
         public string? CoreTemplateId { get; set; }
         public ECombatantId Owner { get; init; }
+        /// <summary>战前权威基线属性快照（P1-04：用于末帧对比删除战中动态新增键与复原临时修改键）。</summary>
+        public Dictionary<ECardAttributeType, int> InitialAttributes { get; } = new();
+        /// <summary>战中已同步的任务进度等持久属性键（防止无 PostCombatPermanentSync 合成场景误清）。</summary>
+        public HashSet<ECardAttributeType> RuntimePersistentAttributes { get; } = new();
+        /// <summary>标识该渲染状态是否源自战中动态变形新产物。</summary>
+        public bool IsRuntimeTransformed { get; init; }
         public Dictionary<ECardAttributeType, int> PrevAttributes { get; } = new();
         public HashSet<ECardAttributeType> PrevExtraAttrKeys { get; } = new();
         public HashSet<ECardTag> PrevTags { get; } = new();
@@ -372,7 +384,9 @@ public static class CombatSimConverter
         int pveXpReceived = 0,
         bool? isDrawOverride = null,
         Func<string, Guid?>? resolveWireTemplateGuid = null,
-        Action<string, string, Guid>? onRuntimeCardTransformed = null)
+        Action<string, string, Guid>? onRuntimeCardTransformed = null,
+        int? spawnP1MaxHp = null,
+        int? spawnP2MaxHp = null)
     {
         bool effectiveIsDraw = isDrawOverride ?? result.IsDraw;
         bool playerWon = string.Equals(result.WinnerPlayerId, "player", StringComparison.OrdinalIgnoreCase);
@@ -398,10 +412,12 @@ public static class CombatSimConverter
         int oppMaxHp = timeline.Count > 0 ? Math.Max(1, timeline[0].P2MaxHp) : 100;
         var rewardTracker = BuildRewardTracker(sim, oppMaxHp, result.Player2RemainingHp, pveGoldReceived, pveXpReceived);
 
-        // Wave 4A #5：首帧玩家基线全字段对齐 firstSnap，并依据 TimeMs == 0 的开战瞬发事件精确回推开战前基线，
-        // 既彻底消除 RageMax/EnragedDurationMax/TempoGainCooldownMax/先天 HealthRegen 等首帧虚假差分，
-        // 又完整保留 TTriggerOnFightStarted 瞬发护盾/灼烧/剧毒/再生/怒气/狂暴/节拍/喜悦的真实跳数。
-        CombatTickState? prevSnap = timeline.Count > 0 ? CreateInitialPlayerBaseline(timeline[0], result.Events) : null;
+        // Wave 4A #5 + P1-03：首帧玩家基线默认严格对齐 firstSnap（包含 CombatSpawnSim 同步后的倍率血量 P1MaxHp/P2MaxHp），
+        // 并依据 TimeMs == 0 的开战瞬发事件精确回推开战前基线；若外部调用方显式传入未乘倍的 spawnP1MaxHp/spawnP2MaxHp，
+        // 则在 Frame 0 自动发射权威 HealthMax/Health 校准更新。
+        CombatTickState? prevSnap = timeline.Count > 0
+            ? CreateInitialPlayerBaseline(timeline[0], result.Events, spawnP1MaxHp, spawnP2MaxHp)
+            : null;
         var prevQuestProgress = new Dictionary<(string CardId, int GroupIdx, int EntryIdx), int>();
         var questCompletedCount = new Dictionary<string, int>(StringComparer.Ordinal);
         var itemActionCredits = new Dictionary<(int TimeMs, string CardInstanceId, EActionCommandType ActionType), int>();
@@ -409,6 +425,7 @@ public static class CombatSimConverter
         sim.VfxKeys ??= new List<string>();
         sim.VfxKeys.Clear();
         var firedInFrame = new HashSet<CardRenderState>();
+        var playerAttrModifiedInFrame = new HashSet<(int TimeMs, string CardInstanceId)>();
         var passiveUseRecorded = new HashSet<(int TimeMs, string CardInstanceId, string ChainKey)>();
         bool sandstormCountdownEmitted = false;
         bool sandstormStartedEmitted = false;
@@ -428,8 +445,11 @@ public static class CombatSimConverter
                 tlIdx++;
             CombatTickState? curSnap = tlIdx < timeline.Count ? timeline[tlIdx] : prevSnap;
 
-            // 预扫描落在本帧窗口内的 CardFired 事件，用于确保冷却重置帧精确发回 CooldownMax 以触发客户端 reset 特效
+            // 预扫描落在本帧窗口内的 CardFired 与 PlayerAttributeModified 事件：
+            // 1) CardFired 用于确保冷却重置帧精确发回 CooldownMax 触发客户端 reset 特效；
+            // 2) PlayerAttributeModified 用于让纯 PlayerModifyAttribute 卡跳过 CardFired 阶段的无目标盲发，交由结构化事件发射精准目标与飞币 VFX。
             firedInFrame.Clear();
+            playerAttrModifiedInFrame.Clear();
             for (int scanIdx = evIdx; scanIdx < events.Count && (isLastFrame || events[scanIdx].TimeMs <= frameEndMs); scanIdx++)
             {
                 var scanEv = events[scanIdx];
@@ -437,6 +457,11 @@ public static class CombatSimConverter
                     TryResolveCard(cardEntryByCoreId, scanEv.SourceCardInstanceId, out var firedState))
                 {
                     firedInFrame.Add(firedState);
+                }
+                else if (scanEv.Type == CombatEventType.PlayerAttributeModified &&
+                    TryResolveCard(cardEntryByCoreId, scanEv.SourceCardInstanceId, out var modSrcState))
+                {
+                    playerAttrModifiedInFrame.Add((scanEv.TimeMs, modSrcState.Entry.InstanceId));
                 }
             }
 
@@ -490,11 +515,14 @@ public static class CombatSimConverter
                     ev,
                     f,
                     evIdx,
+                    isLastFrame,
+                    curSnap,
                     repo,
                     cardEntryByCoreId,
                     prevQuestProgress,
                     questCompletedCount,
                     itemActionCredits,
+                    playerAttrModifiedInFrame,
                     passiveUseRecorded,
                     vfxKeyMap,
                     simHealthState,
@@ -511,12 +539,13 @@ public static class CombatSimConverter
                 EnsureHealthAttributeSynced(frame.OpponentUpdates, prevSnap.P2Hp, curSnap.P2Hp);
             }
 
-            // 3. 最后一帧：先将战斗内临时状态（Freeze/Slow/Haste/Flying/Heated/Chilled）归零并回满弹药，
-            //    严格置于 CombatSimEventCombatantDied 之前，彻底修复 #6/#27 客户端在 CombatantDied 截断导致飞行/冰冻特效永不收尾！
+            // 3. 最后一帧：在 CombatSimEventCombatantDied 触发前完成全量战后清理（P1-04）：
+            //    先归位瞬态视觉状态（关闭冰冻/飞行特效），再对战前不存在的战中动态新增属性发射 CombatSimEventCardAttributeDeleted，
+            //    并对战前存在但被临时改动的非永久属性复原至战前基线值（完整保留真正的永久/当日/本小时战中成长属性）。
             if (isLastFrame)
             {
                 EmitCrossedMonsterRewards(frame, rewardTracker, result.Player2RemainingHp, forceFlushRemaining: true);
-                EmitPostCombatCleanupIntoFrame(frame, cardEntryByCoreId);
+                EmitPostCombatCleanupIntoFrame(frame, cardEntryByCoreId, result, repo);
 
                 if (effectiveIsDraw)
                 {
@@ -570,15 +599,23 @@ public static class CombatSimConverter
     }
 
     /// <summary>
-    /// 在 <see cref="CombatSimEventCombatantDied"/> 触发前将本场所有修改过的瞬态状态（冰冻/减速/急速/飞行/冷热/弹药）
-    /// 直接归零并写入末帧 CardUpdates（延迟分配，仅对确实有变动的卡牌创建更新包）。
+    /// 在 <see cref="CombatSimEventCombatantDied"/> 触发前完成全量战后属性清理（P1-04）：
+    /// 1) 先将冰冻/减速/急速/飞行/冷热等瞬态视觉特效属性归位，确保客户端特效优雅收尾（兼容 #6/#27）；
+    /// 2) 对比每张卡的战前权威基线快照 <see cref="CardRenderState.InitialAttributes"/> 与战中非永久属性：
+    ///    - 对战前不存在、战中动态新增（for the fight / UntilEndOfCombat）的属性键，一律发射
+    ///      <see cref="CombatSimEventCardAttributeDeleted"/> 彻底从客户端 <c>Card.Attributes</c> 删键（连 :0 都不残留）；
+    ///    - 对战前已存在但被战中临时改动的非永久属性键，发射属性复原更新回到战前基线值；
+    ///    - 对 <see cref="CombatResult.PostCombatPermanentSync"/> / 任务进度确认的真正永久/当日/本小时战中成长属性完整保留，绝不误清。
     /// </summary>
     private static void EmitPostCombatCleanupIntoFrame(
         CombatSimFrame targetFrame,
-        Dictionary<string, CardRenderState> cardEntryByCoreId)
+        Dictionary<string, CardRenderState> cardEntryByCoreId,
+        CombatResult result,
+        GameDataRepository repo)
     {
         if (cardEntryByCoreId.Count == 0) return;
 
+        var persistentAttrsByCardId = BuildPostCombatPersistentAttributesMap(result, repo);
         var visited = new HashSet<CardRenderState>(ReferenceEqualityComparer.Instance);
 
         foreach (var state in cardEntryByCoreId.Values)
@@ -590,24 +627,252 @@ public static class CombatSimConverter
             CombatSimCardUpdate? cu = targetFrame.CardUpdates.TryGetValue(cardId, out var existing) ? existing : null;
             bool hasUpdate = cu != null;
 
-            int outFlying = entry.Attributes.GetValueOrDefault(ECardAttributeType.Flying, 0) > 0 ? 1 : 0;
-            int outHeated = entry.Attributes.GetValueOrDefault(ECardAttributeType.Heated, 0) > 0 ? 1 : 0;
-            int outChilled = entry.Attributes.GetValueOrDefault(ECardAttributeType.Chilled, 0) > 0 ? 1 : 0;
+            // Step 1：先让 6 个瞬态战斗视觉特效属性归位（在 CombatSimHandler 同帧顺序中 CardUpdates 先于 Events 执行，
+            // 可先触发 CardAttributeChanged 关闭冰冻/飞行/冷热特效，随后若战前不存在该键再由 CardAttributeDeleted 彻底删键）
+            int outFreeze = state.InitialAttributes.GetValueOrDefault(ECardAttributeType.Freeze, 0);
+            int outSlow = state.InitialAttributes.GetValueOrDefault(ECardAttributeType.Slow, 0);
+            int outHaste = state.InitialAttributes.GetValueOrDefault(ECardAttributeType.Haste, 0);
+            int outFlying = state.InitialAttributes.GetValueOrDefault(ECardAttributeType.Flying, 0) > 0 ? 1 : 0;
+            int outHeated = state.InitialAttributes.GetValueOrDefault(ECardAttributeType.Heated, 0) > 0 ? 1 : 0;
+            int outChilled = state.InitialAttributes.GetValueOrDefault(ECardAttributeType.Chilled, 0) > 0 ? 1 : 0;
 
-            EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Freeze, 0, ref hasUpdate);
-            EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Slow, 0, ref hasUpdate);
-            EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Haste, 0, ref hasUpdate);
+            EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Freeze, outFreeze, ref hasUpdate);
+            EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Slow, outSlow, ref hasUpdate);
+            EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Haste, outHaste, ref hasUpdate);
             EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Flying, outFlying, ref hasUpdate);
             EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Heated, outHeated, ref hasUpdate);
             EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Chilled, outChilled, ref hasUpdate);
 
-            int targetAmmoMax = state.PrevAttributes.GetValueOrDefault(ECardAttributeType.AmmoMax, 0);
-            if (targetAmmoMax > 0)
-                EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Ammo, targetAmmoMax, ref hasUpdate);
+            // 战中动态变形产物卡：仅收尾瞬态状态键并删除临时战中态键（临时变形将在 DespawnMessage 中销毁，永久变形由 DespawnMessage 权威落盘）
+            if (state.IsRuntimeTransformed)
+            {
+                ECardAttributeType[] transientKeys =
+                [
+                    ECardAttributeType.Cooldown,
+                    ECardAttributeType.Freeze,
+                    ECardAttributeType.Slow,
+                    ECardAttributeType.Haste,
+                    ECardAttributeType.Flying,
+                    ECardAttributeType.Heated,
+                    ECardAttributeType.Chilled,
+                ];
+                foreach (var tAttr in transientKeys)
+                {
+                    if (state.PrevAttributes.ContainsKey(tAttr) && !state.InitialAttributes.ContainsKey(tAttr))
+                    {
+                        targetFrame.Events.Add(new CombatSimEventCardAttributeDeleted
+                        {
+                            InstanceId = cardId,
+                            AttributeType = tAttr,
+                        });
+                        state.PrevAttributes.Remove(tAttr);
+                    }
+                }
+
+                int trAmmoMax = state.PrevAttributes.GetValueOrDefault(ECardAttributeType.AmmoMax, 0);
+                if (trAmmoMax > 0)
+                    EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Ammo, trAmmoMax, ref hasUpdate);
+
+                if (hasUpdate && cu != null)
+                    targetFrame.CardUpdates[cardId] = cu;
+                continue;
+            }
+
+            // 汇总本卡受保护的永久/当日/本小时战中成长属性集合
+            HashSet<ECardAttributeType>? persistentAttrs = ResolvePersistentAttributesForCard(state, persistentAttrsByCardId);
+
+            // Step 2：处理 AmmoMax / Ammo（若 AmmoMax 非永久且战前存在则先复原，有效弹药上限 > 0 时回满弹药）
+            bool ammoMaxPersistent = persistentAttrs != null && persistentAttrs.Contains(ECardAttributeType.AmmoMax);
+            if (!ammoMaxPersistent && state.InitialAttributes.TryGetValue(ECardAttributeType.AmmoMax, out int initAmmoMax))
+            {
+                EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.AmmoMax, initAmmoMax, ref hasUpdate);
+            }
+            int effectiveAmmoMax = (ammoMaxPersistent || state.InitialAttributes.ContainsKey(ECardAttributeType.AmmoMax))
+                ? state.PrevAttributes.GetValueOrDefault(ECardAttributeType.AmmoMax, 0)
+                : 0;
+            if (effectiveAmmoMax > 0)
+            {
+                int targetAmmo = state.InitialAttributes.TryGetValue(ECardAttributeType.Ammo, out int initAmmo) && !ammoMaxPersistent
+                    ? initAmmo
+                    : effectiveAmmoMax;
+                EmitAttrIfChangedLazy(state, cardId, ref cu, ECardAttributeType.Ammo, targetAmmo, ref hasUpdate);
+            }
+
+            // Step 3：逐键比对 state.PrevAttributes 与战前基线 InitialAttributes（按枚举值升序保证确定性输出）
+            var trackedKeys = state.PrevAttributes.Keys.ToList();
+            trackedKeys.Sort();
+            for (int i = 0; i < trackedKeys.Count; i++)
+            {
+                var attr = trackedKeys[i];
+
+                // 已在 Step 2 回满的有效弹药不再删键或二次改写
+                if (attr == ECardAttributeType.Ammo && effectiveAmmoMax > 0)
+                    continue;
+
+                // 真正的永久/当日/本小时战中成长属性（以及任务进度）完整保留，绝不误删或回滚
+                if (persistentAttrs != null && persistentAttrs.Contains(attr))
+                    continue;
+
+                if (!state.InitialAttributes.TryGetValue(attr, out int baselineVal))
+                {
+                    // 战前不存在、战中动态新增的临时属性键（含 BurnApplyAmount/DamageAmount/CritChance/Counter/FlatCooldownReduction/Cooldown/Freeze 等）：
+                    // 发射官方原生 CombatSimEventCardAttributeDeleted，从客户端 Card.Attributes 彻底删除该键
+                    targetFrame.Events.Add(new CombatSimEventCardAttributeDeleted
+                    {
+                        InstanceId = cardId,
+                        AttributeType = attr,
+                    });
+                    state.PrevAttributes.Remove(attr);
+                }
+                else if (state.PrevAttributes.TryGetValue(attr, out int curVal) && curVal != baselineVal)
+                {
+                    // 战前已存在但被战中临时修改的非永久属性键：复原回战前基线值
+                    EmitAttrIfChangedLazy(state, cardId, ref cu, attr, baselineVal, ref hasUpdate);
+                }
+            }
 
             if (hasUpdate && cu != null)
                 targetFrame.CardUpdates[cardId] = cu;
         }
+    }
+
+    /// <summary>
+    /// 从 <see cref="CombatResult.PostCombatPermanentSync"/> 与 <see cref="CombatResult.PostCombatPermanentSyncP2"/>
+    /// 提取每张卡在战中真正发生过的非瞬态（Permanent / UntilEndOfDay / UntilEndOfHour / Quest / 永久升阶与附魔）变更属性集合，
+    /// 供末帧清理跳过保护，避免误删或误回滚永久战中成长属性。
+    /// </summary>
+    private static Dictionary<string, HashSet<ECardAttributeType>> BuildPostCombatPersistentAttributesMap(
+        CombatResult result,
+        GameDataRepository repo)
+    {
+        var map = new Dictionary<string, HashSet<ECardAttributeType>>(StringComparer.Ordinal);
+
+        void CollectFromSync(PostCombatPermanentSyncResult? sync)
+        {
+            if (sync?.UpdatedCards == null || sync.UpdatedCards.Count == 0) return;
+
+            for (int i = 0; i < sync.UpdatedCards.Count; i++)
+            {
+                var delta = sync.UpdatedCards[i];
+                var attrs = new HashSet<ECardAttributeType>();
+
+                static void AddParsedAttrKeys(IEnumerable<string>? keys, HashSet<ECardAttributeType> sink)
+                {
+                    if (keys == null) return;
+                    foreach (string raw in keys)
+                    {
+                        if (string.IsNullOrWhiteSpace(raw)) continue;
+                        if (Enum.TryParse<ECardAttributeType>(raw.Trim(), ignoreCase: true, out var parsed))
+                        {
+                            sink.Add(parsed);
+                            if (parsed is ECardAttributeType.FlatCooldownReduction or ECardAttributeType.PercentCooldownReduction)
+                                sink.Add(ECardAttributeType.CooldownMax);
+                        }
+                    }
+                }
+
+                AddParsedAttrKeys(delta.PermanentAddChanges.Keys, attrs);
+                AddParsedAttrKeys(delta.PermanentMultChanges.Keys, attrs);
+                AddParsedAttrKeys(delta.DayAddChanges.Keys, attrs);
+                AddParsedAttrKeys(delta.DayMultChanges.Keys, attrs);
+                AddParsedAttrKeys(delta.HourAddChanges.Keys, attrs);
+                AddParsedAttrKeys(delta.HourMultChanges.Keys, attrs);
+                AddParsedAttrKeys(delta.UpdatedQuestProgress.Keys, attrs);
+
+                if (delta.NewlyCompletedQuests.Count > 0)
+                    attrs.Add(ECardAttributeType.QuestCompletedCount);
+
+                // 永久/当日/本小时附魔变更：保留新附魔自带的属性键
+                if (delta.EnchantmentChanged || delta.DayEnchantmentChanged || delta.HourEnchantmentChanged)
+                {
+                    string? activeEnch = delta.NewHourEnchantment ?? delta.NewDayEnchantment ?? delta.NewEnchantment;
+                    var tpl = delta.SourceCard?.Template;
+                    if (!string.IsNullOrWhiteSpace(activeEnch) && tpl?.Enchantments != null &&
+                        tpl.Enchantments.TryGetValue(activeEnch, out var enchData) && enchData != null)
+                    {
+                        AddParsedAttrKeys(enchData.Attributes?.Keys, attrs);
+                        if (enchData.Auras != null)
+                        {
+                            foreach (var aura in enchData.Auras.Values)
+                            {
+                                string? auraAttr = aura.Action?.AttributeType;
+                                if (!string.IsNullOrWhiteSpace(auraAttr) &&
+                                    Enum.TryParse<ECardAttributeType>(auraAttr.Trim(), ignoreCase: true, out var parsedAuraAttr))
+                                {
+                                    attrs.Add(parsedAuraAttr);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 永久升阶：保留新阶模板属性键，防止把升阶后提升的数值回滚回旧阶
+                if (delta.TierChanged && delta.SourceCard?.Template != null)
+                {
+                    var tierAttrs = new Dictionary<ECardAttributeType, int>();
+                    ETier targetTier = delta.NewTier.HasValue
+                        ? (ETier)(int)delta.NewTier.Value
+                        : (ETier)(int)delta.SourceCard.Tier;
+                    PopulateTemplateAttributesForTier(tierAttrs, delta.SourceCard.Template, targetTier);
+                    foreach (var k in tierAttrs.Keys)
+                        attrs.Add(k);
+                }
+
+                // 纯瞬态战斗状态键绝不作为持久属性保护
+                attrs.Remove(ECardAttributeType.Cooldown);
+                attrs.Remove(ECardAttributeType.Freeze);
+                attrs.Remove(ECardAttributeType.Slow);
+                attrs.Remove(ECardAttributeType.Haste);
+
+                if (attrs.Count == 0) continue;
+
+                void BindCardKey(string? id)
+                {
+                    if (string.IsNullOrWhiteSpace(id)) return;
+                    if (!map.TryGetValue(id, out var existingSet))
+                    {
+                        map[id] = new HashSet<ECardAttributeType>(attrs);
+                    }
+                    else
+                    {
+                        foreach (var a in attrs) existingSet.Add(a);
+                    }
+                }
+
+                BindCardKey(delta.InstanceId);
+                BindCardKey(delta.SourceCard?.InstanceId);
+            }
+        }
+
+        CollectFromSync(result.PostCombatPermanentSync);
+        CollectFromSync(result.PostCombatPermanentSyncP2);
+        return map;
+    }
+
+    private static HashSet<ECardAttributeType>? ResolvePersistentAttributesForCard(
+        CardRenderState state,
+        Dictionary<string, HashSet<ECardAttributeType>> persistentAttrsByCardId)
+    {
+        HashSet<ECardAttributeType>? merged = null;
+
+        void MergeByKey(string? key)
+        {
+            if (string.IsNullOrWhiteSpace(key)) return;
+            if (!persistentAttrsByCardId.TryGetValue(key, out var set)) return;
+            merged ??= new HashSet<ECardAttributeType>();
+            foreach (var a in set) merged.Add(a);
+        }
+
+        MergeByKey(state.Entry.InstanceId);
+        MergeByKey(state.Entry.CoreCard?.InstanceId);
+
+        if (state.RuntimePersistentAttributes.Count > 0)
+        {
+            merged ??= new HashSet<ECardAttributeType>();
+            foreach (var a in state.RuntimePersistentAttributes) merged.Add(a);
+        }
+
+        return merged;
     }
 
     private static void RegisterBoardCards(
@@ -635,6 +900,7 @@ public static class CombatSimConverter
             };
             foreach (var kv in e.Attributes)
             {
+                state.InitialAttributes[kv.Key] = kv.Value;
                 state.PrevAttributes[kv.Key] = kv.Value;
             }
 
@@ -669,7 +935,9 @@ public static class CombatSimConverter
 
     public static CombatTickState CreateInitialPlayerBaseline(
         CombatTickState firstSnap,
-        IReadOnlyList<CombatEvent>? events = null)
+        IReadOnlyList<CombatEvent>? events = null,
+        int? spawnP1MaxHp = null,
+        int? spawnP2MaxHp = null)
     {
         // 仅对 TimeMs == 0 实际发生过的开战瞬发事件逆推开战前基线；无 TimeMs == 0 变更的字段全部严格对齐 firstSnap，彻底消灭首帧虚假差分。
         int p1ShieldDelta = 0, p2ShieldDelta = 0;
@@ -679,6 +947,7 @@ public static class CombatSimConverter
         int p1RageDelta = 0, p2RageDelta = 0;
         int p1TempoDelta = 0, p2TempoDelta = 0;
         int p1JoyDelta = 0, p2JoyDelta = 0;
+        int p1MaxHpDelta = 0, p2MaxHpDelta = 0;
         int p1HpNetDelta = 0, p2HpNetDelta = 0;
         bool p1EnragedAtStart = false, p2EnragedAtStart = false;
         bool p1HasStartHpChange = false, p2HasStartHpChange = false;
@@ -728,6 +997,24 @@ public static class CombatSimConverter
                     case CombatEventType.PlayerJoyApplied:
                         if (isP1) p1JoyDelta += amt; else p2JoyDelta += amt;
                         break;
+                    case CombatEventType.PlayerAttributeModified:
+                        {
+                            // P1-03 / P1-07：若开战 TimeMs == 0 即触发最大生命值修改，逆推其开战前基线
+                            int signedDelta = ev.TryGetPlayerAttributeModification(out string attrName, out double prevAttr, out double curAttr)
+                                ? (int)Math.Round(curAttr - prevAttr, MidpointRounding.AwayFromZero)
+                                : (int)Math.Round(ev.Value, MidpointRounding.AwayFromZero);
+                            string effectiveAttr = !string.IsNullOrWhiteSpace(attrName) ? attrName : (ev.PlayerAttributeName ?? string.Empty);
+                            if (string.Equals(effectiveAttr, "HealthMax", StringComparison.OrdinalIgnoreCase) && signedDelta != 0)
+                            {
+                                if (isP1) p1MaxHpDelta += signedDelta; else p2MaxHpDelta += signedDelta;
+                            }
+                            else if (string.Equals(effectiveAttr, "Health", StringComparison.OrdinalIgnoreCase) && signedDelta != 0)
+                            {
+                                if (isP1) { p1HpNetDelta += signedDelta; p1HasStartHpChange = true; }
+                                else { p2HpNetDelta += signedDelta; p2HasStartHpChange = true; }
+                            }
+                            break;
+                        }
                     case CombatEventType.DamageApplied:
                         {
                             int hpDmg = ev.HpDamage > 0 ? ev.HpDamage : (ev.ShieldAbsorbed > 0 ? 0 : amt);
@@ -757,18 +1044,32 @@ public static class CombatSimConverter
             }
         }
 
+        // P1-03：若调用方未显式传入开战前未乘倍的 spawnP1MaxHp/spawnP2MaxHp，则严格对齐 firstSnap（扣除 TimeMs==0 变更），
+        // 与 RunEngine 在 CombatSpawnSim 写入的倍率后 P1MaxHp/P2MaxHp 100% 一致且零首帧虚假差分；
+        // 若调用方显式传入了与 firstSnap 不同的开战基线（如外部回放/沙盒路径），则由 Frame 0 自动发射权威 HealthMax/Health 校准。
+        int p1InitMaxHp = spawnP1MaxHp.HasValue && spawnP1MaxHp.Value > 0
+            ? spawnP1MaxHp.Value
+            : Math.Max(1, firstSnap.P1MaxHp - p1MaxHpDelta);
+        int p2InitMaxHp = spawnP2MaxHp.HasValue && spawnP2MaxHp.Value > 0
+            ? spawnP2MaxHp.Value
+            : Math.Max(1, firstSnap.P2MaxHp - p2MaxHpDelta);
+
         int p1InitHp = p1HasStartHpChange
-            ? Math.Clamp(firstSnap.P1Hp - p1HpNetDelta, 0, Math.Max(firstSnap.P1MaxHp, firstSnap.P1Hp))
-            : firstSnap.P1Hp;
+            ? Math.Clamp(firstSnap.P1Hp - p1HpNetDelta, 0, Math.Max(p1InitMaxHp, firstSnap.P1Hp))
+            : (spawnP1MaxHp.HasValue && spawnP1MaxHp.Value > 0 && spawnP1MaxHp.Value != firstSnap.P1MaxHp
+                ? spawnP1MaxHp.Value
+                : firstSnap.P1Hp);
         int p2InitHp = p2HasStartHpChange
-            ? Math.Clamp(firstSnap.P2Hp - p2HpNetDelta, 0, Math.Max(firstSnap.P2MaxHp, firstSnap.P2Hp))
-            : firstSnap.P2Hp;
+            ? Math.Clamp(firstSnap.P2Hp - p2HpNetDelta, 0, Math.Max(p2InitMaxHp, firstSnap.P2Hp))
+            : (spawnP2MaxHp.HasValue && spawnP2MaxHp.Value > 0 && spawnP2MaxHp.Value != firstSnap.P2MaxHp
+                ? spawnP2MaxHp.Value
+                : firstSnap.P2Hp);
 
         return new CombatTickState
         {
             TimeMs = 0,
             P1Hp = p1InitHp,
-            P1MaxHp = firstSnap.P1MaxHp,
+            P1MaxHp = p1InitMaxHp,
             P1Shield = Math.Max(0, firstSnap.P1Shield - p1ShieldDelta),
             P1Burn = Math.Max(0, firstSnap.P1Burn - p1BurnDelta),
             P1Poison = Math.Max(0, firstSnap.P1Poison - p1PoisonDelta),
@@ -783,7 +1084,7 @@ public static class CombatSimConverter
             P1Joy = Math.Max(0, firstSnap.P1Joy - p1JoyDelta),
             P1PortraitIndex = p1EnragedAtStart ? 0 : firstSnap.P1PortraitIndex,
             P2Hp = p2InitHp,
-            P2MaxHp = firstSnap.P2MaxHp,
+            P2MaxHp = p2InitMaxHp,
             P2Shield = Math.Max(0, firstSnap.P2Shield - p2ShieldDelta),
             P2Burn = Math.Max(0, firstSnap.P2Burn - p2BurnDelta),
             P2Poison = Math.Max(0, firstSnap.P2Poison - p2PoisonDelta),
@@ -1064,11 +1365,14 @@ public static class CombatSimConverter
         CombatEvent ev,
         int frameIndex,
         int eventSeq,
+        bool isLastFrame,
+        CombatTickState? curSnap,
         GameDataRepository repo,
         Dictionary<string, CardRenderState> cardEntryByCoreId,
         Dictionary<(string CardId, int GroupIdx, int EntryIdx), int> prevQuestProgress,
         Dictionary<string, int> questCompletedCount,
         Dictionary<(int TimeMs, string CardInstanceId, EActionCommandType ActionType), int> itemActionCredits,
+        HashSet<(int TimeMs, string CardInstanceId)> playerAttrModifiedInFrame,
         HashSet<(int TimeMs, string CardInstanceId, string ChainKey)> passiveUseRecorded,
         Dictionary<string, int> vfxKeyMap,
         FrameCombatantState simHealthState,
@@ -1090,6 +1394,12 @@ public static class CombatSimConverter
 
                     // 若主动作是卡指卡类型但 CardFired 未携带目标卡，跳过空目标 EffectExecuted（交由后续 Haste/Slow/Freeze 等事件发射真实 EffectTargetCard）
                     if (IsCardTargetedAction(act) && !TryResolveCard(cardEntryByCoreId, ev.TargetCardInstanceId, out _))
+                        break;
+
+                    // P1-07：若主动作是 PlayerModifyAttribute 且同一时间点存在同源卡的结构化 PlayerAttributeModified 事件，
+                    // 跳过 CardFired 阶段的无属性盲发，交由 PlayerAttributeModified 精准发射目标阵营与飞币 VFX，杜绝同次触发重复发 2 条动作事件
+                    if (act == EActionCommandType.PlayerModifyAttribute &&
+                        playerAttrModifiedInFrame.Contains((ev.TimeMs, srcMeta.Entry.InstanceId)))
                         break;
 
                     IEffectTarget target = ResolveCardFiredTarget(ev, act, srcMeta, cardEntryByCoreId);
@@ -1333,7 +1643,7 @@ public static class CombatSimConverter
                 break;
 
             case CombatEventType.CardTransformed:
-                HandleCardTransformedEvent(sim, frame, ev, frameIndex, eventSeq, repo, cardEntryByCoreId, passiveUseRecorded, vfxKeyMap, sim.VfxKeys, resolveWireTemplateGuid, onRuntimeCardTransformed);
+                HandleCardTransformedEvent(sim, frame, ev, frameIndex, eventSeq, isLastFrame, curSnap, repo, cardEntryByCoreId, passiveUseRecorded, vfxKeyMap, sim.VfxKeys, resolveWireTemplateGuid, onRuntimeCardTransformed);
                 break;
 
             case CombatEventType.CardTransformReverted:
@@ -1398,6 +1708,22 @@ public static class CombatSimConverter
                     var targetSide = ParseCombatantSide(ev.TargetPlayerId);
                     EmitActionExecutionIfNeeded(sim, frame, ev, tpRemSrc, frameIndex, eventSeq, repo, cardEntryByCoreId, EActionCommandType.PlayerTempoRemove, new EffectTargetPlayer { Target = targetSide }, itemActionCredits, passiveUseRecorded, vfxKeyMap, sim.VfxKeys);
                 }
+                break;
+
+            case CombatEventType.PlayerAttributeModified:
+                HandlePlayerAttributeModifiedEvent(
+                    sim,
+                    frame,
+                    ev,
+                    frameIndex,
+                    eventSeq,
+                    hasTimelineSnap: curSnap != null,
+                    repo,
+                    cardEntryByCoreId,
+                    itemActionCredits,
+                    passiveUseRecorded,
+                    vfxKeyMap,
+                    sim.VfxKeys);
                 break;
 
             case CombatEventType.ActionCostSpent:
@@ -1686,6 +2012,145 @@ public static class CombatSimConverter
         TryRecordPassiveUseCount(sim, ev, srcMeta, passiveUseRecorded);
     }
 
+    private static void HandlePlayerAttributeModifiedEvent(
+        CombatSim sim,
+        CombatSimFrame frame,
+        CombatEvent ev,
+        int frameIndex,
+        int eventSeq,
+        bool hasTimelineSnap,
+        GameDataRepository repo,
+        Dictionary<string, CardRenderState> cardEntryByCoreId,
+        Dictionary<(int TimeMs, string CardInstanceId, EActionCommandType ActionType), int> itemActionCredits,
+        HashSet<(int TimeMs, string CardInstanceId, string ChainKey)> passiveUseRecorded,
+        Dictionary<string, int> vfxKeyMap,
+        List<string> vfxKeys)
+    {
+        bool hasTriple = ev.TryGetPlayerAttributeModification(out string attrName, out double prevVal, out double curVal);
+        if (!hasTriple)
+        {
+            attrName = ev.PlayerAttributeName ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(attrName)) return;
+            prevVal = 0;
+            curVal = ev.Value;
+        }
+
+        double rawDelta = hasTriple ? (curVal - prevVal) : ev.Value;
+        if (Math.Abs(rawDelta) <= 1e-6) return;
+
+        var targetSide = ParseCombatantSide(ev.TargetPlayerId);
+        int prevInt = (int)Math.Round(prevVal, MidpointRounding.AwayFromZero);
+        int curInt = (int)Math.Round(curVal, MidpointRounding.AwayFromZero);
+
+        // 1. 将玩家属性变化（如 Gold / Income / Prestige / Experience / Level 等）写入本帧 PlayerUpdates / OpponentUpdates，
+        //    驱动客户端 CombatSimHandler.ProcessPlayerUpdate -> Data.Run.Player.Update + Events.PlayerAttributeChanged -> BankToyController 实时入账飘字。
+        if (Enum.TryParse<EPlayerAttributeType>(attrName, ignoreCase: true, out var playerAttrType))
+        {
+            CombatSimPlayerUpdate targetUpdate;
+            if (targetSide == ECombatantId.Player)
+            {
+                frame.PlayerUpdates ??= new CombatSimPlayerUpdate();
+                targetUpdate = frame.PlayerUpdates;
+            }
+            else
+            {
+                frame.OpponentUpdates ??= new CombatSimPlayerUpdate();
+                targetUpdate = frame.OpponentUpdates;
+            }
+
+            bool isTimelineTracked = IsTimelineTrackedPlayerAttribute(playerAttrType);
+            if (targetUpdate.Attributes.TryGetValue(playerAttrType, out var existingAttr))
+            {
+                // 同帧内多次修改非 Timeline 追踪属性（或无 Timeline 的纯合成场景），保留首前值并推进到最新终值；
+                // 当存在权威 Timeline 快照时，Timeline 已追踪属性（如 HealthMax / Health / Shield）一律以 BuildPlayerUpdate 为唯一权威源。
+                if (!isTimelineTracked || !hasTimelineSnap)
+                {
+                    existingAttr.CurrentValue = curInt;
+                }
+            }
+            else if (!isTimelineTracked || (!hasTimelineSnap && prevInt != curInt))
+            {
+                targetUpdate.Attributes[playerAttrType] = new CombatSimPlayerAttributeUpdate
+                {
+                    AttributeType = playerAttrType,
+                    PreviousValue = prevInt,
+                    CurrentValue = curInt,
+                };
+            }
+        }
+
+        // 2. 发射标准 CombatSimEventEffectExecuted(ActionType = PlayerModifyAttribute, Target = EffectTargetPlayer)，
+        //    使客户端战斗审计完整记录该动作；若为战中生金（Gold 正向增量）且源技能未配置自定义 VFX，自动回退官方飞币爆裂弹道 VFX。
+        if (TryResolveCard(cardEntryByCoreId, ev.SourceCardInstanceId, out var srcMeta))
+        {
+            string? effectiveVfxOverride = ev.VfxKeyOverride;
+            if (string.IsNullOrWhiteSpace(effectiveVfxOverride)
+                && string.Equals(attrName, "Gold", StringComparison.OrdinalIgnoreCase)
+                && rawDelta > 0)
+            {
+                var tpl = ResolveTemplateForCard(repo, srcMeta);
+                string effectId = ResolveEffectId(ev, tpl);
+                int? existingVfx = ResolveVfxIndex(repo, tpl, effectId, srcMeta.Entry.Enchantment, vfxKeyMap, vfxKeys);
+                if (!existingVfx.HasValue)
+                {
+                    effectiveVfxOverride = OfficialCoinBurstVfxKey;
+                }
+            }
+
+            var effectiveEv = string.Equals(effectiveVfxOverride, ev.VfxKeyOverride, StringComparison.Ordinal)
+                ? ev
+                : new CombatEvent
+                {
+                    TimeMs = ev.TimeMs,
+                    Type = ev.Type,
+                    SourcePlayerId = ev.SourcePlayerId,
+                    TargetPlayerId = ev.TargetPlayerId,
+                    SourceCardInstanceId = ev.SourceCardInstanceId,
+                    TriggerSourceCardInstanceId = ev.TriggerSourceCardInstanceId,
+                    TargetCardInstanceId = ev.TargetCardInstanceId,
+                    Value = ev.Value,
+                    Detail = ev.Detail,
+                    AbilityId = ev.AbilityId,
+                    ActionType = ev.ActionType,
+                    IsSkillSource = ev.IsSkillSource,
+                    ExecutionContextId = ev.ExecutionContextId,
+                    VfxKeyOverride = effectiveVfxOverride,
+                };
+
+            EmitActionExecutionIfNeeded(
+                sim,
+                frame,
+                effectiveEv,
+                srcMeta,
+                frameIndex,
+                eventSeq,
+                repo,
+                cardEntryByCoreId,
+                EActionCommandType.PlayerModifyAttribute,
+                new EffectTargetPlayer { Target = targetSide },
+                itemActionCredits,
+                passiveUseRecorded,
+                vfxKeyMap,
+                vfxKeys);
+        }
+    }
+
+    private static bool IsTimelineTrackedPlayerAttribute(EPlayerAttributeType attr) => attr is
+        EPlayerAttributeType.Health or
+        EPlayerAttributeType.HealthMax or
+        EPlayerAttributeType.Shield or
+        EPlayerAttributeType.Burn or
+        EPlayerAttributeType.Poison or
+        EPlayerAttributeType.HealthRegen or
+        EPlayerAttributeType.Rage or
+        EPlayerAttributeType.RageMax or
+        EPlayerAttributeType.Enraged or
+        EPlayerAttributeType.EnragedDuration or
+        EPlayerAttributeType.EnragedDurationMax or
+        EPlayerAttributeType.Tempo or
+        EPlayerAttributeType.TempoGainCooldownMax or
+        EPlayerAttributeType.Joy;
+
     private static void HandleCardUpgradedEvent(
         CombatSim sim,
         CombatSimFrame frame,
@@ -1927,6 +2392,8 @@ public static class CombatSimConverter
         CombatEvent ev,
         int frameIndex,
         int eventSeq,
+        bool isLastFrame,
+        CombatTickState? curSnap,
         GameDataRepository repo,
         Dictionary<string, CardRenderState> cardEntryByCoreId,
         HashSet<(int TimeMs, string CardInstanceId, string ChainKey)> passiveUseRecorded,
@@ -2018,6 +2485,13 @@ public static class CombatSimConverter
         ECardType newCardType = ParseCoreCardType(newTpl?.Type, origMeta.Entry.Type);
         ECardSize newSize = newTpl != null ? ParseCoreCardSize(newTpl.Size) : origMeta.Entry.Size;
         ETier newTier = origMeta.Entry.Tier;
+        if (newTpl != null &&
+            !string.IsNullOrWhiteSpace(newTpl.StartingTier) &&
+            Enum.TryParse<ETier>(newTpl.StartingTier, ignoreCase: true, out var minStartTier) &&
+            newTier < minStartTier)
+        {
+            newTier = minStartTier;
+        }
 
         var newEntry = new RunState.CardEntry
         {
@@ -2039,9 +2513,13 @@ public static class CombatSimConverter
             Entry = newEntry,
             CoreTemplateId = newCoreTemplateId,
             Owner = origMeta.Owner,
+            IsRuntimeTransformed = true,
         };
         foreach (var kv in newEntry.Attributes)
+        {
+            newState.InitialAttributes[kv.Key] = kv.Value;
             newState.PrevAttributes[kv.Key] = kv.Value;
+        }
 
         cardEntryByCoreId[newProtoInstId] = newState;
         if (!string.IsNullOrEmpty(coreReplacementId))
@@ -2096,6 +2574,39 @@ public static class CombatSimConverter
         }
         frame.CardUpdates[newInstIdObj] = newCardUpdate;
 
+        // P1-08（RC-COMBAT-TRANSFORM-FRAME-ORDER）：
+        // 因同一帧内先执行了全盘 ApplyCardFrameDiff 后才执行本变形事件注册 newState，
+        // 必须在此立即按当帧快照 curSnap.Cards 对新变形卡补跑一次完整属性快照 diff（含实时光环计算后的
+        // PoisonApplyAmount / Cooldown / CooldownMax / Multicast / SellPrice / CustomAttrs / Tags 等），
+        // 彻底消除 Virus 等战中变形新卡首帧毒伤与冷却归 0。
+        CardCooldownFrame? transformedCf = FindCardFrameForTransformedCard(curSnap, newProtoInstId, coreReplacementId);
+        if (transformedCf != null)
+        {
+            ApplyCardFrameDiff(
+                frame,
+                newState,
+                transformedCf,
+                frameIndex,
+                isFirstFrame: true,
+                isLastFrame: isLastFrame,
+                firedThisFrame: false);
+        }
+        else if (newEntry.Attributes.TryGetValue(ECardAttributeType.CooldownMax, out int fallbackCdMax)
+                 && fallbackCdMax > 0
+                 && !newCardUpdate.Attributes.ContainsKey(ECardAttributeType.Cooldown))
+        {
+            // 无快照兜底路径（如精简合成时间轴）：至少补齐满额初始 Cooldown，避免新变形卡首帧缺冷却进度条
+            newCardUpdate.Attributes[ECardAttributeType.Cooldown] = new CombatSimCardAttributeUpdate
+            {
+                AttributeType = ECardAttributeType.Cooldown,
+                PreviousValue = fallbackCdMax,
+                CurrentValue = fallbackCdMax,
+            };
+            newState.PrevAttributes[ECardAttributeType.Cooldown] = fallbackCdMax;
+            newState.LastEmittedCdFrame = frameIndex;
+            newState.LastEmittedCdValue = fallbackCdMax;
+        }
+
         frame.Events.Add(new CombatSimEventCardTransformed(
             execCtxId,
             origInstStr,
@@ -2109,6 +2620,27 @@ public static class CombatSimConverter
                     origMeta.Entry.Section,
                     origMeta.Entry.Socket),
             }));
+    }
+
+    private static CardCooldownFrame? FindCardFrameForTransformedCard(
+        CombatTickState? curSnap,
+        string newProtoInstId,
+        string? coreReplacementId)
+    {
+        if (curSnap?.Cards == null || curSnap.Cards.Count == 0)
+            return null;
+
+        for (int i = 0; i < curSnap.Cards.Count; i++)
+        {
+            var cf = curSnap.Cards[i];
+            if (string.Equals(cf.InstanceId, newProtoInstId, StringComparison.Ordinal)
+                || (!string.IsNullOrEmpty(coreReplacementId)
+                    && string.Equals(cf.InstanceId, coreReplacementId, StringComparison.Ordinal)))
+            {
+                return cf;
+            }
+        }
+        return null;
     }
 
     private static void HandleQuestUpdatedEvent(
@@ -2128,7 +2660,8 @@ public static class CombatSimConverter
         int newVal = parsedNew ?? Math.Max(oldVal, (int)Math.Round(ev.Value));
         prevQuestProgress[progressKey] = newVal;
 
-        // 同步更新卡面 Quest_N 属性，确保客户端 Tooltip 与完成判定读取到最新进度
+        // 同步更新卡面 Quest_N 属性，确保客户端 Tooltip 与完成判定读取到最新进度（并记为持久属性，战末不误清）
+        state.RuntimePersistentAttributes.Add(questAttrType);
         var cardId = new InstanceId(state.Entry.InstanceId);
         CombatSimCardUpdate? cu = GetOrCreateCardUpdate(frame, cardId);
         bool hasAttrUpdate = true;
@@ -2176,6 +2709,8 @@ public static class CombatSimConverter
         int nextCompleted = questCompletedCount.GetValueOrDefault(state.Entry.InstanceId, 0) + 1;
         questCompletedCount[state.Entry.InstanceId] = nextCompleted;
 
+        state.RuntimePersistentAttributes.Add(questAttrType);
+        state.RuntimePersistentAttributes.Add(ECardAttributeType.QuestCompletedCount);
         var cardId = new InstanceId(state.Entry.InstanceId);
         CombatSimCardUpdate? cu = GetOrCreateCardUpdate(frame, cardId);
         bool hasAttrUpdate = true;
@@ -2611,7 +3146,8 @@ public static class CombatSimConverter
                 if (!string.IsNullOrWhiteSpace(official))
                     set.Add(official.Trim());
             }
-            // 补充公开别名表中内置于 ModRuleCatalog 的额外官方键（不触碰 ModRuleCatalog.cs）
+            // 补充公开别名表中内置于 ModRuleCatalog 的额外官方键及官方原生飞币特效键（不触碰 ModRuleCatalog.cs）
+            set.Add(OfficialCoinBurstVfxKey);
             foreach (string extraAlias in new[] { "FireClaw", "Slash" })
             {
                 string? official = ModRuleCatalog.ResolveOfficialVfxKey(extraAlias);
@@ -2798,6 +3334,12 @@ public static class CombatSimConverter
         if (!string.IsNullOrEmpty(ev.TargetPlayerId))
         {
             return new EffectTargetPlayer { Target = ParseCombatantSide(ev.TargetPlayerId) };
+        }
+
+        // PlayerModifyAttribute 若事件未显式标注 TargetPlayerId，默认作用于施放方自身（如战中生金/加收入/提上限）
+        if (act == EActionCommandType.PlayerModifyAttribute)
+        {
+            return new EffectTargetPlayer { Target = srcMeta.Owner };
         }
 
         return new EffectTargetPlayer { Target = oppSide };

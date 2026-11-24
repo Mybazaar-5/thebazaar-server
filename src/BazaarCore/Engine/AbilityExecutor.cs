@@ -1295,13 +1295,33 @@ public static class AbilityExecutor
                             target.ModifyAttribute(attr, op, val, durationTarget);
                         }
                         double cur = target.GetAttribute(attr);
-                        ctx.LastAttributeChangeDelta = cur - prev;
+                        double delta = cur - prev;
+                        ctx.LastAttributeChangeDelta = delta;
                         if (isTimedCombat)
                         {
                             if (timedTokenId > 0)
                                 ctx.OnTimedPlayerAttributeModifierWithTokenApplied!.Invoke(target, attr, op, val, timedDurationMs, timedTokenId);
                             else
                                 ctx.OnTimedPlayerAttributeModifierApplied?.Invoke(target, attr, op, val, timedDurationMs);
+                        }
+                        // P1-07：补发结构化玩家属性变更战斗事件（携带属性名、变化前后值、净增量及来源卡/目标玩家），供回放转换器驱动飞币 VFX 与战斗审计
+                        if (Math.Abs(delta) > 1e-6)
+                        {
+                            ctx.EmitCombatEvent?.Invoke(new CombatEvent
+                            {
+                                TimeMs = ctx.TimeMs,
+                                Type = CombatEventType.PlayerAttributeModified,
+                                SourcePlayerId = ctx.SelfPlayer.PlayerId,
+                                TargetPlayerId = target.PlayerId,
+                                SourceCardInstanceId = sourceCard.InstanceId,
+                                TriggerSourceCardInstanceId = ctx.ActiveExecution.TriggerSourceCardInstanceId ?? sourceCard.InstanceId,
+                                Value = delta,
+                                Detail = CombatEvent.FormatPlayerAttributeModifiedDetail(attr, prev, cur),
+                                AbilityId = ctx.ActiveExecution.AbilityId,
+                                ActionType = action.Type,
+                                ExecutionContextId = ctx.ActiveExecution.ExecutionContextId,
+                                IsSkillSource = sourceCard.Template.Type == "Skill"
+                            });
                         }
                         DispatchDetailed(ctx, "TTriggerOnPlayerAttributeChanged", ctx.SelfPlayer, sourceCard, null, target, attr, prev, cur);
                     }
@@ -1318,6 +1338,7 @@ public static class AbilityExecutor
                     if (double.IsNaN(sharedVal) || double.IsInfinity(sharedVal)) sharedVal = 0;
                     var attr = action.ResolveCardAttributeName("DamageAmount");
                     var op = action.Operation ?? "Add";
+                    bool requireExistingOutputAttr = CardInstance.RequiresExistingOutputAttribute(action.Target, attr, op);
                     var durationTarget = ResolveDurationTarget(action.Duration, ctx.Scope);
                     bool isTimedCombat = ctx.Scope == RuleScope.InCombat
                                          && action.Duration?.Type == "TCombatDuration"
@@ -1325,6 +1346,9 @@ public static class AbilityExecutor
                     int timedDurationMs = isTimedCombat ? Math.Max(1, action.Duration!.DurationInMs ?? 1000) : 0;
                     foreach (var card in ResolveActionTargets(action.Target, ctx, targetCount))
                     {
+                        // P1-06：无条件非自身输出量级行动（如 Sweeper Drone / Airplane Glue / Sharpen）跳过不具备对应基础属性的卡牌，防止污染非武器/非灼烧卡
+                        if (requireExistingOutputAttr && !card.HasNonAuraAttribute(attr))
+                            continue;
                         double val;
                         if (perTargetEval)
                         {

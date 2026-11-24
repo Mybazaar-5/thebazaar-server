@@ -642,14 +642,18 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    // ── 3.5 SkillPresentationManager：重复 TemplateId 防锁盘 + 索引复位 + 贴图备份保护 (P1-44) ──
+    // ── 3.5 SkillPresentationManager：重复 TemplateId/InstanceId 幂等判重防克隆爆炸 + 索引复位 + 贴图备份保护 (P1-44 / P1-11) ──
 
     private static FieldInfo _spmSkillProxyLookupField;
+    private static FieldInfo _spmSkillListField;
+    private static MethodInfo _spmUpdateCardMethod;
     private static FieldInfo _spmCurrentSkillEntryIndexField;
     private static PropertyInfo _spmIsUpdatingSkillBoardProp;
     private static MethodInfo _spmIsUpdatingSkillBoardSetter;
     private static FieldInfo _spmIsUpdatingSkillBoardBackingField;
     private static FieldInfo _spmTempBoardTextureField;
+    private static int _activeSkillAddCount;
+    private static int _skillDuplicateSkippedCount;
     [ThreadStatic] private static Stack<bool> _spmSkipOrAlreadyUpdatingStack;
 
     private static void PatchSkillPresentationManager(SafeHarmonyPatcher patcher)
@@ -660,6 +664,7 @@ internal static partial class CompatAuditPatch
             if (spmType == null) return;
 
             _spmSkillProxyLookupField = spmType.GetField("_skillProxyLookup", BindingFlags.NonPublic | BindingFlags.Instance);
+            _spmSkillListField = spmType.GetField("_skillList", BindingFlags.NonPublic | BindingFlags.Instance);
             _spmCurrentSkillEntryIndexField = spmType.GetField("_currentSkillEntryIndex", BindingFlags.NonPublic | BindingFlags.Instance);
             _spmIsUpdatingSkillBoardProp = spmType.GetProperty("IsUpdatingSkillBoard", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             _spmIsUpdatingSkillBoardSetter = _spmIsUpdatingSkillBoardProp?.GetSetMethod(nonPublic: true);
@@ -667,6 +672,9 @@ internal static partial class CompatAuditPatch
             _spmTempBoardTextureField = spmType.GetField("_tempBoardTexture", BindingFlags.NonPublic | BindingFlags.Instance);
 
             var cardType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.Card");
+            _spmUpdateCardMethod = cardType != null
+                ? AccessTools.Method(spmType, "UpdateCard", new[] { cardType })
+                : AccessTools.Method(spmType, "UpdateCard");
             var addMethod = cardType != null
                 ? AccessTools.Method(spmType, "Add", new[] { cardType, typeof(bool) })
                 : AccessTools.Method(spmType, "Add");
@@ -785,13 +793,65 @@ internal static partial class CompatAuditPatch
                 return false;
             }
 
-            if (GameInspector.GetMember(card, "TemplateId") is Guid tplId
-                && tplId != Guid.Empty
-                && _spmSkillProxyLookupField?.GetValue(__instance) is IDictionary lookup
-                && lookup.Contains(tplId))
+            Guid tplId = GameInspector.GetMember(card, "TemplateId") is Guid g ? g : Guid.Empty;
+            string instIdStr = GameInspector.GetMember(card, "InstanceId")?.ToString() ?? "";
+
+            // P1-11：幂等判重（同时核验 _skillProxyLookup[TemplateId] 与 _skillList 中的 InstanceId/TemplateId），
+            // 同键已存在则安全跳过或原地更新，彻底杜绝先实例化挂载再抛 ArgumentException 引发技能分身爆炸
+            object existingProxy = null;
+            if (tplId != Guid.Empty && _spmSkillProxyLookupField?.GetValue(__instance) is IDictionary lookup && lookup.Contains(tplId))
             {
+                existingProxy = lookup[tplId];
+            }
+
+            if (existingProxy == null && _spmSkillListField?.GetValue(__instance) is IList skillList)
+            {
+                for (int i = 0; i < skillList.Count; i++)
+                {
+                    var item = skillList[i];
+                    if (item == null || (item is UnityEngine.Object iuo && iuo == null)) continue;
+                    string itemInstId = GameInspector.GetMember(item, "InstanceId")?.ToString() ?? "";
+                    if (!string.IsNullOrEmpty(instIdStr) && string.Equals(itemInstId, instIdStr, StringComparison.Ordinal))
+                    {
+                        existingProxy = item;
+                        break;
+                    }
+                    var proxyCard = GameInspector.GetMember(item, "Card");
+                    if (tplId != Guid.Empty && GameInspector.GetMember(proxyCard, "TemplateId") is Guid pt && pt == tplId)
+                    {
+                        existingProxy = item;
+                        break;
+                    }
+                }
+            }
+
+            if (existingProxy != null || (tplId != Guid.Empty && _spmSkillProxyLookupField?.GetValue(__instance) is IDictionary lkp2 && lkp2.Contains(tplId)))
+            {
+                int dupCnt = Interlocked.Increment(ref _skillDuplicateSkippedCount);
                 BazaarLauncherPlugin.Log?.LogWarning(
-                    $"CompatAuditPatch[P1-44]: 拦截重复 TemplateId ({tplId}) 进入 SkillPresentationManager.Add，避免 ArgumentException 锁死 IsUpdatingSkillBoard");
+                    $"CompatAuditPatch[P1-11]: 幂等拦截重复技能进入 SkillPresentationManager.Add (tpl={tplId}, inst={instIdStr}, count={dupCnt})，防止重复键异常与技能分身克隆");
+
+                // 若同技能品阶已变化且当前技能栏空闲，安全走 UpdateCard 刷新视觉而不触发重复 Add
+                bool tierChanged = existingProxy != null
+                    && !(existingProxy is UnityEngine.Object euo && euo == null)
+                    && GameInspector.GetMember(card, "Tier") is ETier newTier
+                    && GameInspector.GetMember(existingProxy, "Tier") is ETier oldTier
+                    && newTier != oldTier;
+                if (tierChanged && !IsSkillBoardUpdating(__instance) && _spmUpdateCardMethod != null)
+                {
+                    try
+                    {
+                        if (_spmUpdateCardMethod.Invoke(__instance, new[] { card }) is Task updTask)
+                        {
+                            __result = WrapSafeSkillUpdateTask(updTask, __instance);
+                            skipOrAlreadyUpdating = true;
+                            (_spmSkipOrAlreadyUpdatingStack ??= new Stack<bool>(2)).Push(skipOrAlreadyUpdating);
+                            return false;
+                        }
+                    }
+                    catch { }
+                }
+
                 skipOrAlreadyUpdating = true;
                 __result = Task.CompletedTask;
                 (_spmSkipOrAlreadyUpdatingStack ??= new Stack<bool>(2)).Push(skipOrAlreadyUpdating);
@@ -805,8 +865,28 @@ internal static partial class CompatAuditPatch
             BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.SkillPresentationAddPrefix: " + ex.Message);
         }
 
+        if (!skipOrAlreadyUpdating)
+        {
+            Interlocked.Increment(ref _activeSkillAddCount);
+        }
         (_spmSkipOrAlreadyUpdatingStack ??= new Stack<bool>(2)).Push(skipOrAlreadyUpdating);
         return true;
+    }
+
+    private static async Task WrapSafeSkillUpdateTask(Task inner, object spm)
+    {
+        try
+        {
+            await inner;
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-11]: 重复技能转 UpdateCard 异常已拦截: {ex.Message}");
+        }
+        finally
+        {
+            PostToMainThread(() => ResetSkillBoardUpdatingFlag(spm));
+        }
     }
 
     private static Exception SkillPresentationAddFinalizer(object __instance, Exception __exception, ref Task __result)
@@ -822,7 +902,8 @@ internal static partial class CompatAuditPatch
 
         if (__exception != null)
         {
-            BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-44]: SkillPresentationManager.Add 同步异常已兜底归零 IsUpdatingSkillBoard: {__exception.Message}");
+            DecrementActiveSkillAddCount();
+            BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-11]: SkillPresentationManager.Add 同步异常已兜底归零 IsUpdatingSkillBoard: {__exception.Message}");
             ResetSkillBoardUpdatingFlag(__instance);
             __result = Task.CompletedTask;
             return null;
@@ -830,6 +911,7 @@ internal static partial class CompatAuditPatch
 
         if (__result == null)
         {
+            DecrementActiveSkillAddCount();
             ResetSkillBoardUpdatingFlag(__instance);
             __result = Task.CompletedTask;
             return null;
@@ -837,10 +919,11 @@ internal static partial class CompatAuditPatch
 
         if (__result.IsCompleted)
         {
+            DecrementActiveSkillAddCount();
             if (__result.IsFaulted)
             {
                 var innerEx = __result.Exception?.GetBaseException();
-                BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-44]: SkillPresentationManager.Add 同步 Fault 已兜底归零 IsUpdatingSkillBoard: {innerEx?.Message}");
+                BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-11]: SkillPresentationManager.Add 同步 Fault 已兜底归零 IsUpdatingSkillBoard: {innerEx?.Message}");
                 __result = Task.CompletedTask;
             }
             ResetSkillBoardUpdatingFlag(__instance);
@@ -851,6 +934,14 @@ internal static partial class CompatAuditPatch
         return null;
     }
 
+    private static void DecrementActiveSkillAddCount()
+    {
+        if (Interlocked.Decrement(ref _activeSkillAddCount) < 0)
+        {
+            Interlocked.Exchange(ref _activeSkillAddCount, 0);
+        }
+    }
+
     private static async Task WrapSkillPresentationAddTask(Task inner, object spm)
     {
         try
@@ -859,10 +950,11 @@ internal static partial class CompatAuditPatch
         }
         catch (Exception ex)
         {
-            BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-44]: SkillPresentationManager.Add 异步异常已拦截并归零 IsUpdatingSkillBoard: {ex.GetType().Name}: {ex.Message}");
+            BazaarLauncherPlugin.Log?.LogWarning($"CompatAuditPatch[P1-11]: SkillPresentationManager.Add 异步异常已拦截并归零 IsUpdatingSkillBoard: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
+            DecrementActiveSkillAddCount();
             PostToMainThread(() => ResetSkillBoardUpdatingFlag(spm));
         }
     }
@@ -1616,29 +1708,159 @@ internal static partial class CompatAuditPatch
         return null;
     }
 
-    // ── 8. BaseCardRevealAnimationDriver.GetCardContainerBounds：空集合防越界 ──
+    // ── 8. BaseCardRevealAnimationDriver.GetCardBounds / GetCardContainerBounds：P2-05 失活/零体积/单轴过薄包围盒防护 ──
+
+    private static Type _revealColliderType;
+    private static PropertyInfo _revealColliderEnabledProp;
+    private static PropertyInfo _revealColliderBoundsProp;
+    private static readonly Bounds SafeFallbackRevealBounds = new Bounds(Vector3.zero, new Vector3(1f, 1f, 0.2f));
+    private const float MinValidBoundsAxis = 0.05f;
+    private const float DegenerateAxisEpsilon = 1e-4f;
 
     private static void PatchCardRevealAnimationDriver(SafeHarmonyPatcher patcher)
     {
         try
         {
-            var t = GameInspector.FindTypeSafe("TheBazaar.Game.Cards.Animation.BaseCardRevealAnimationDriver");
-            if (t == null) return;
-
-            var m = AccessTools.Method(t, "GetCardContainerBounds", new[] { typeof(List<Bounds>) })
-                    ?? AccessTools.Method(t, "GetCardContainerBounds");
-            if (m != null)
+            _revealColliderType = AccessTools.TypeByName("UnityEngine.Collider");
+            if (_revealColliderType != null)
             {
-                patcher.TryPatchMethod(m,
+                _revealColliderEnabledProp = _revealColliderType.GetProperty("enabled", BindingFlags.Public | BindingFlags.Instance);
+                _revealColliderBoundsProp = _revealColliderType.GetProperty("bounds", BindingFlags.Public | BindingFlags.Instance);
+            }
+
+            var t = GameInspector.FindTypeSafe("TheBazaar.Game.Cards.Animation.BaseCardRevealAnimationDriver");
+            if (t != null)
+            {
+                // P2-05：过滤失活、禁用、零体积与单轴过薄 Collider
+                var getCardBounds = AccessTools.Method(t, "GetCardBounds", new[] { typeof(GameObject) });
+                if (getCardBounds != null && _revealColliderType != null && _revealColliderBoundsProp != null)
+                {
+                    patcher.TryPatchMethod(getCardBounds,
+                        prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(GetCardBoundsPrefix)),
+                        optional: true,
+                        label: "Compat.GameSim.BaseCardRevealAnimationDriver.GetCardBounds");
+                }
+
+                var m = AccessTools.Method(t, "GetCardContainerBounds", new[] { typeof(List<Bounds>) })
+                        ?? AccessTools.Method(t, "GetCardContainerBounds");
+                if (m != null)
+                {
+                    patcher.TryPatchMethod(m,
+                        prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(GetCardContainerBoundsPrefix)),
+                        finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(GetCardContainerBoundsFinalizer)),
+                        optional: true,
+                        label: "Compat.GameSim.BaseCardRevealAnimationDriver.GetCardContainerBounds");
+                }
+            }
+
+            // 同步加固静态 AnimationDriver.GetCardContainerBounds（CardFusionAnimationDriver 复用路径）
+            var animDriverType = GameInspector.FindTypeSafe("TheBazaar.Game.Cards.Animation.AnimationDriver");
+            var animGetContainerBounds = animDriverType == null
+                ? null
+                : AccessTools.Method(animDriverType, "GetCardContainerBounds", new[] { typeof(List<Bounds>) });
+            if (animGetContainerBounds != null)
+            {
+                patcher.TryPatchMethod(animGetContainerBounds,
                     prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(GetCardContainerBoundsPrefix)),
                     finalizer: AccessTools.Method(typeof(CompatAuditPatch), nameof(GetCardContainerBoundsFinalizer)),
                     optional: true,
-                    label: "Compat.GameSim.BaseCardRevealAnimationDriver.GetCardContainerBounds");
+                    label: "Compat.GameSim.AnimationDriver.GetCardContainerBounds");
             }
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.BaseCardRevealAnimationDriver: " + ex.Message);
+        }
+    }
+
+    private static bool IsFiniteVector3(Vector3 v)
+        => !float.IsNaN(v.x) && !float.IsNaN(v.y) && !float.IsNaN(v.z)
+           && !float.IsInfinity(v.x) && !float.IsInfinity(v.y) && !float.IsInfinity(v.z);
+
+    private static int CountPositiveAxes(Vector3 size)
+    {
+        int n = 0;
+        if (size.x > DegenerateAxisEpsilon) n++;
+        if (size.y > DegenerateAxisEpsilon) n++;
+        if (size.z > DegenerateAxisEpsilon) n++;
+        return n;
+    }
+
+    /// <summary>确保容器包围盒至少两轴大于 0 且数值有限，防止 BoundsExtensions.NormalizePointWithin 抛 ArgumentException 打断 PlayableGraph.Destroy。</summary>
+    private static Bounds EnsureSafeNonZeroContainerBounds(Bounds candidate)
+    {
+        Vector3 center = IsFiniteVector3(candidate.center) ? candidate.center : Vector3.zero;
+        Vector3 size = IsFiniteVector3(candidate.size) ? candidate.size : Vector3.zero;
+        if (CountPositiveAxes(size) >= 2)
+        {
+            return new Bounds(center, size);
+        }
+
+        Vector3 padded = new Vector3(
+            size.x > DegenerateAxisEpsilon ? size.x : MinValidBoundsAxis,
+            size.y > DegenerateAxisEpsilon ? size.y : MinValidBoundsAxis,
+            size.z > DegenerateAxisEpsilon ? size.z : MinValidBoundsAxis);
+        return new Bounds(center, padded);
+    }
+
+    private static bool GetCardBoundsPrefix(GameObject itemController, ref Bounds? __result)
+    {
+        try
+        {
+            if (itemController == null || !itemController.activeInHierarchy || _revealColliderType == null || _revealColliderBoundsProp == null)
+            {
+                __result = null;
+                return false;
+            }
+
+            var colliders = itemController.GetComponentsInChildren(_revealColliderType, false);
+            if (colliders == null || colliders.Length == 0)
+            {
+                __result = null;
+                return false;
+            }
+
+            Bounds? thinFallback = null;
+            for (int i = 0; i < colliders.Length; i++)
+            {
+                var col = colliders[i];
+                if (col == null || !col.gameObject.activeInHierarchy) continue;
+                if (_revealColliderEnabledProp != null && _revealColliderEnabledProp.GetValue(col) is bool en && !en) continue;
+
+                if (_revealColliderBoundsProp.GetValue(col) is not Bounds b) continue;
+                if (!IsFiniteVector3(b.center) || !IsFiniteVector3(b.size)) continue;
+                if (b.size.sqrMagnitude <= 1e-6f) continue;
+
+                int axes = CountPositiveAxes(b.size);
+                if (axes >= 2)
+                {
+                    __result = b;
+                    return false;
+                }
+                if (axes >= 1 && !thinFallback.HasValue)
+                {
+                    thinFallback = EnsureSafeNonZeroContainerBounds(b);
+                }
+            }
+
+            if (thinFallback.HasValue)
+            {
+                __result = thinFallback;
+                return false;
+            }
+
+            // 若活跃卡牌的所有子碰撞体均处于禁用/零体积状态，返回以卡牌位置为中心的安全非零包围盒，
+            // 防止 PrepareCardTransformations 产出空列表导致 CreateGraph 无 RootPlayable 进而触发 GetRootPlayable(0) 越界
+            Vector3 fallbackCenter = IsFiniteVector3(itemController.transform.position)
+                ? itemController.transform.position
+                : Vector3.zero;
+            __result = new Bounds(fallbackCenter, SafeFallbackRevealBounds.size);
+            Interlocked.Increment(ref _suppressedRevealBoundsCount);
+            return false;
+        }
+        catch
+        {
+            return true;
         }
     }
 
@@ -1652,17 +1874,79 @@ internal static partial class CompatAuditPatch
                 if (cnt <= 3 || cnt % 25 == 0)
                 {
                     BazaarLauncherPlugin.Log?.LogInfo(
-                        $"CompatAuditPatch: skipped empty BaseCardRevealAnimationDriver.GetCardContainerBounds (count={cnt})");
+                        $"CompatAuditPatch[P2-05]: empty GetCardContainerBounds fallback to safe non-zero Bounds (count={cnt})");
                 }
-                __result = new Bounds(Vector3.zero, Vector3.zero);
+                __result = SafeFallbackRevealBounds;
                 return false;
             }
+
+            bool hasValid = false;
+            Vector3 minV = Vector3.zero;
+            Vector3 maxV = Vector3.zero;
+            Vector3 fallbackCenterSum = Vector3.zero;
+            int fallbackCenterCount = 0;
+
+            for (int i = 0; i < bounds.Count; i++)
+            {
+                Bounds b = bounds[i];
+                if (IsFiniteVector3(b.center))
+                {
+                    fallbackCenterSum += b.center;
+                    fallbackCenterCount++;
+                }
+                if (!IsFiniteVector3(b.center) || !IsFiniteVector3(b.size)) continue;
+                // 过滤零体积 / 失活碰撞体产生的退化包围盒
+                if (b.size.sqrMagnitude <= 1e-6f) continue;
+
+                if (!hasValid)
+                {
+                    minV = b.min;
+                    maxV = b.max;
+                    hasValid = true;
+                }
+                else
+                {
+                    minV = Vector3.Min(minV, b.min);
+                    maxV = Vector3.Max(maxV, b.max);
+                }
+            }
+
+            if (!hasValid)
+            {
+                int cnt = Interlocked.Increment(ref _suppressedRevealBoundsCount);
+                if (cnt <= 3 || cnt % 25 == 0)
+                {
+                    BazaarLauncherPlugin.Log?.LogInfo(
+                        $"CompatAuditPatch[P2-05]: all degenerate zero-volume bounds filtered, returning safe non-zero Bounds (count={cnt})");
+                }
+                Vector3 center = fallbackCenterCount > 0 ? (fallbackCenterSum / fallbackCenterCount) : Vector3.zero;
+                __result = new Bounds(center, SafeFallbackRevealBounds.size);
+                return false;
+            }
+
+            Bounds aggregated = new Bounds();
+            aggregated.SetMinMax(minV, maxV);
+            if (CountPositiveAxes(aggregated.size) < 2)
+            {
+                int cnt = Interlocked.Increment(ref _suppressedRevealBoundsCount);
+                if (cnt <= 3 || cnt % 25 == 0)
+                {
+                    BazaarLauncherPlugin.Log?.LogInfo(
+                        $"CompatAuditPatch[P2-05]: padded thin single-axis containerBounds {aggregated.size} -> safe non-zero Bounds (count={cnt})");
+                }
+                __result = EnsureSafeNonZeroContainerBounds(aggregated);
+                return false;
+            }
+
+            __result = aggregated;
+            return false;
         }
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.GetCardContainerBoundsPrefix: " + ex.Message);
+            __result = SafeFallbackRevealBounds;
+            return false;
         }
-        return true;
     }
 
     private static Exception GetCardContainerBoundsFinalizer(Exception __exception, ref Bounds __result)
@@ -1673,9 +1957,13 @@ internal static partial class CompatAuditPatch
             if (cnt <= 3 || cnt % 25 == 0)
             {
                 BazaarLauncherPlugin.Log?.LogWarning(
-                    $"CompatAuditPatch: suppressed BaseCardRevealAnimationDriver.GetCardContainerBounds {__exception.GetType().Name} (count={cnt}): {__exception.Message}");
+                    $"CompatAuditPatch[P2-05]: suppressed GetCardContainerBounds {__exception.GetType().Name} -> safe non-zero Bounds (count={cnt}): {__exception.Message}");
             }
-            __result = new Bounds(Vector3.zero, Vector3.zero);
+            __result = SafeFallbackRevealBounds;
+        }
+        else if (CountPositiveAxes(__result.size) < 2)
+        {
+            __result = EnsureSafeNonZeroContainerBounds(__result);
         }
         return null;
     }

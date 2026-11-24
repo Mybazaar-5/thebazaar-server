@@ -302,7 +302,7 @@ public sealed class AuditWave1ServerStateTests
             Error = new NetMessageError(null, EResponseErrorType.NotAllowed, "rejected"),
         };
 
-        // 交互态拒单：必须包装 NetMessageAggregate([Error, GameStateSync])，GameStateSync 居尾且后无 GameSim
+        // 交互态拒单（非祭坛命令）：必须包装 NetMessageAggregate([Error, GameStateSync])，GameStateSync 居尾且后无 GameSim
         run.State = ERunState.Encounter;
         INetCommand[] optimisticCmds =
         [
@@ -310,7 +310,6 @@ public sealed class AuditWave1ServerStateTests
             new MoveItemCommand { InstanceId = new InstanceId("x"), Section = EInventorySection.Hand },
             new SellCardCommand { InstanceId = new InstanceId("x") },
             new SelectSkillCommand { InstanceId = new InstanceId("x") },
-            new CommitToPedestalCommand { InstanceId = new InstanceId("x") },
             new SelectEncounterCommand { InstanceId = new InstanceId("x") },
             new ExitCurrentStateCommand(),
             new RerollCommand(),
@@ -329,8 +328,15 @@ public sealed class AuditWave1ServerStateTests
             Assert.DoesNotContain(agg.Messages, m => m is NetMessageGameSim);
         }
 
-        // Combat / PVPCombat / EndRunVictory / EndRunDefeat 态拒单：不得附带 GameStateSync
-        foreach (var blockedState in new[] { ERunState.Combat, ERunState.PVPCombat, ERunState.EndRunVictory, ERunState.EndRunDefeat })
+        // Wave5A P0-01/P0-02：CommitToPedestalCommand 拒单（即便当前已切至 Encounter）绝不附发 GameStateSync
+        var pedCmdReply = GameServerEndpoints.BuildCommandReply(
+            new CommitToPedestalCommand { InstanceId = new InstanceId("x") },
+            run, errOutcome, run.State, isOwnedSelectMove: false, isFirstAfterReestablish: false,
+            out _, out _);
+        Assert.IsType<NetMessageError>(pedCmdReply);
+
+        // Combat / PVPCombat / EndRunVictory / EndRunDefeat / Pedestal 态拒单：不得附带 GameStateSync
+        foreach (var blockedState in new[] { ERunState.Combat, ERunState.PVPCombat, ERunState.EndRunVictory, ERunState.EndRunDefeat, ERunState.Pedestal })
         {
             run.State = blockedState;
             var reply = GameServerEndpoints.BuildCommandReply(

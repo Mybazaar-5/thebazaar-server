@@ -84,6 +84,18 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     private static Type _skillControllerType;
     private static Type _skillProxyRendererType;
     private static MethodInfo _skillUpdateIconMethod;
+    private static MethodInfo _skillProxyUpdateIconMethod;
+    private static PropertyInfo _skillProxyCardProp;
+    private static MethodInfo _skillProxyCardSetter;
+    private static MethodInfo _skillProxyTierSetter;
+    private static FieldInfo _skillProxyTooltipDataField;
+    private static MethodInfo _skillProxyLoadCurrentFrameMethod;
+    private static FieldInfo _skillProxyCurrentTierFrameField;
+    private static FieldInfo _skillProxyTierParentField;
+    private static FieldInfo _skillProxyDefaultTexField;
+    private static PropertyInfo _skillCtrlCardDataProp;
+    private static FieldInfo _skillCtrlCurrentFrameField;
+    private static MethodInfo _createCardTooltipDataMethod;
     private static FieldInfo _previewItemMaterialField;
     private static FieldInfo _previewCardDataField;
     private static FieldInfo _previewClientCardField;
@@ -103,7 +115,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
     private static PropertyInfo _dataRunProp;
     private static PropertyInfo _dataEntitiesProp;
     private static MethodInfo _dataGetStaticMethod;
-    private static FieldInfo _boardManagerIsRecapOpenField;
     private static PropertyInfo _boardManagerIsRecapOpenProp;
 
     private static readonly int BaseMapPropId = Shader.PropertyToID("_BaseMap");
@@ -136,8 +147,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         InstallFourRenderPipelinePatches(Patcher);
         InstallFusionAndMonsterPreviewPatches(Patcher);
         SubscribeLifecycleEvents();
-        BazaarLauncherPlugin.Log?.LogInfo(
-            $"[CustomVisual] 4 大 PNG 渲染通路 + 融合隔离 + 野怪预览拦截已就绪 (成功={Patcher.SucceededCount}/{Patcher.AttemptedCount})");
+        Patcher.LogSummary("[CustomVisual] 4 大 PNG 渲染通路 + 融合隔离 + 野怪预览拦截已就绪");
     }
 
     public void OnDisable()
@@ -420,13 +430,26 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     if (ag == null || ag.HostController == null) continue;
                     visited.Add(ag.HostController.GetInstanceID());
 
-                    if (!ag.HasContext && _itemVisualsControllerType != null && _itemVisualsControllerType.IsInstanceOfType(ag.HostController))
+                    if (!ag.HasContext)
                     {
-                        object liveCard = ResolveLiveCardFromVisuals(ag.HostController);
-                        if (liveCard != null)
+                        if (_itemVisualsControllerType != null && _itemVisualsControllerType.IsInstanceOfType(ag.HostController))
                         {
-                            ag.BoundCardObj = liveCard;
-                            ag.SetContext(BuildQueryFromCard(liveCard, CardVisualTarget.ItemArt));
+                            object liveCard = ResolveLiveCardFromVisuals(ag.HostController);
+                            if (liveCard != null)
+                            {
+                                ag.BoundCardObj = liveCard;
+                                ag.SetContext(BuildQueryFromCard(liveCard, CardVisualTarget.ItemArt));
+                            }
+                        }
+                        else if ((_skillProxyRendererType != null && _skillProxyRendererType.IsInstanceOfType(ag.HostController))
+                            || (_skillControllerType != null && _skillControllerType.IsInstanceOfType(ag.HostController)))
+                        {
+                            object liveCard = ResolveLiveCardFromSkillHost(ag.HostController);
+                            if (liveCard != null)
+                            {
+                                ag.BoundCardObj = liveCard;
+                                ag.SetContext(BuildQueryFromCard(liveCard, CardVisualTarget.SkillIcon));
+                            }
                         }
                     }
 
@@ -451,6 +474,16 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     }
                     else if (ag.LastQuery.Target == CardVisualTarget.SkillIcon)
                     {
+                        object liveCard = ResolveLiveCardFromSkillHost(host);
+                        if (liveCard != null)
+                        {
+                            var liveQuery = BuildQueryFromCard(liveCard, CardVisualTarget.SkillIcon);
+                            if (!ag.MatchesQuery(in liveQuery))
+                            {
+                                ag.BoundCardObj = liveCard;
+                                ag.SetContext(liveQuery);
+                            }
+                        }
                         TryApplySkillVisual(host, ag, ag.Epoch, triggerSyncIfMissing: false);
                     }
                     else if (ag.LastQuery.Target == CardVisualTarget.EncounterPortrait)
@@ -497,10 +530,53 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                     }
                 }
             }
+
+            // P1-01：同步扫描全场景 SkillProxyRenderer 与 SkillController（含非激活对象），彻底消除开局预设与重连后技能贴图遗漏
+            ReapplyMissingSkillAgentsOnMainThread(_skillProxyRendererType, visited);
+            ReapplyMissingSkillAgentsOnMainThread(_skillControllerType, visited);
         }
         catch (Exception ex)
         {
             LogHookErrorThrottled(nameof(ReapplyActiveVisualsOnMainThread), ex);
+        }
+    }
+
+    /// <summary>P1-01：兜底扫描尚未挂载视觉代理或处于非激活态的技能代理/技能控制器并补刷自定义图标与徽章。</summary>
+    private void ReapplyMissingSkillAgentsOnMainThread(Type skillHostType, HashSet<int> visited)
+    {
+        if (skillHostType == null) return;
+        var skillObjs = UnityEngine.Object.FindObjectsByType(
+            skillHostType,
+            FindObjectsInactive.Include,
+            FindObjectsSortMode.None);
+        if (skillObjs == null) return;
+
+        var l10n = LocalizationOverlayModule.Instance;
+        for (int i = 0; i < skillObjs.Length; i++)
+        {
+            if (skillObjs[i] is not Component skillComp || skillComp == null) continue;
+            if (!visited.Add(skillComp.GetInstanceID())) continue;
+
+            object liveCard = ResolveLiveCardFromSkillHost(skillComp);
+            if (liveCard == null) continue;
+            var q = BuildQueryFromCard(liveCard, CardVisualTarget.SkillIcon);
+            bool hasVisual = TryResolveVisual(in q, out _);
+            bool hasBadge = l10n != null
+                && l10n.TryResolveCardMetadata(q.InstanceId, q.CustomCardId, q.TemplateId, out var ov)
+                && ov?.CounterDisplays != null && ov.CounterDisplays.Length > 0;
+            if (!hasVisual && !hasBadge) continue;
+
+            var ag = GetOrAddAgent(skillComp);
+            ag.HostController = skillComp;
+            ag.BoundCardObj = liveCard;
+            if (!ag.HasContext || !ag.MatchesQuery(in q))
+            {
+                ag.SetContext(q);
+            }
+            if (hasVisual)
+            {
+                TryApplySkillVisual(skillComp, ag, ag.Epoch, triggerSyncIfMissing: false);
+            }
         }
     }
 
@@ -595,8 +671,8 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         var boardMgrType = GameInspector.FindTypeSafe("BoardManager", "TheBazaar.BoardManager");
         if (boardMgrType != null)
         {
+            // P2-01：BoardManager.IsRecapViewOpen 为官方自动属性，移除无效的 _isRecapViewOpen 私有字段查找以消除 HarmonyX 启动告警
             _boardManagerIsRecapOpenProp = AccessTools.Property(boardMgrType, "IsRecapViewOpen");
-            _boardManagerIsRecapOpenField = AccessTools.Field(boardMgrType, "_isRecapViewOpen");
             patcher.TryPatch(
                 boardMgrType,
                 "HideRecapView",
@@ -612,6 +688,8 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         if (skillCtrlType != null)
         {
             _skillUpdateIconMethod = AccessTools.Method(skillCtrlType, "UpdateSkillIcon", new[] { typeof(Texture) });
+            _skillCtrlCardDataProp = AccessTools.Property(skillCtrlType, "CardData");
+            _skillCtrlCurrentFrameField = AccessTools.Field(skillCtrlType, "_currentFrame");
             patcher.TryPatch(
                 skillCtrlType,
                 "Setup",
@@ -643,12 +721,13 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         _skillIconUpdaterType = GameInspector.FindTypeSafe("SkillIconUpdater", "TheBazaar.SkillIconUpdater");
         if (_skillIconUpdaterType != null)
         {
-            // P0-23：直接挂钩 SkillIconUpdater.UpdateSkillIconMaterial(Texture) 落盘瞬间替换自定义图并留原版快照
+            // P0-23 + P1-01：挂钩 SkillIconUpdater.UpdateSkillIconMaterial(Texture) 落盘瞬间替换并追加 Postfix 延迟贴图补刷
             patcher.TryPatch(
                 _skillIconUpdaterType,
                 "UpdateSkillIconMaterial",
                 new[] { typeof(Texture) },
                 prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillIconUpdaterMaterialPrefix)),
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillIconUpdaterMaterialPostfix)),
                 optional: true,
                 label: "Visual.P2.SkillIconUpdater.UpdateSkillIconMaterial");
         }
@@ -657,9 +736,30 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         _skillProxyRendererType = skillProxyType;
         if (skillProxyType != null)
         {
+            var skillCardArgType = GameInspector.FindTypeSafe("BazaarGameClient.Domain.Models.Cards.Card");
+            var skillTierArgType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Core.Types.ETier");
+            var tooltipDataTypeForSkill = GameInspector.FindTypeSafe("TheBazaar.Tooltips.CardTooltipData");
+
+            _skillProxyUpdateIconMethod = AccessTools.Method(skillProxyType, "UpdateSkillIcon", new[] { typeof(Texture) });
+            _skillProxyCardProp = AccessTools.Property(skillProxyType, "Card");
+            _skillProxyCardSetter = _skillProxyCardProp?.GetSetMethod(nonPublic: true);
+            _skillProxyTierSetter = AccessTools.Property(skillProxyType, "Tier")?.GetSetMethod(nonPublic: true);
+            _skillProxyTooltipDataField = AccessTools.Field(skillProxyType, "_tooltipData");
+            _skillProxyLoadCurrentFrameMethod = skillTierArgType != null
+                ? AccessTools.Method(skillProxyType, "LoadCurrentFrame", new[] { skillTierArgType })
+                : AccessTools.Method(skillProxyType, "LoadCurrentFrame");
+            _skillProxyCurrentTierFrameField = AccessTools.Field(skillProxyType, "_currentTierFrame");
+            _skillProxyTierParentField = AccessTools.Field(skillProxyType, "_tierParentTransform");
+            _skillProxyDefaultTexField = AccessTools.Field(skillProxyType, "_skillIconDefaultTexture");
+            _createCardTooltipDataMethod = (tooltipDataTypeForSkill != null && skillCardArgType != null)
+                ? AccessTools.Method(tooltipDataTypeForSkill, "CreateCardTooltipData", new[] { skillCardArgType })
+                : null;
+
+            // P3-08 + P1-01：Prefix 对空/空白 ArtKey 做静默安全回退防刷屏，Postfix 绑定视觉代理上下文
             patcher.TryPatch(
                 skillProxyType,
                 "Initialize",
+                prefix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillProxyInitializePrefix)),
                 postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillProxyInitializePostfix)),
                 optional: true,
                 label: "Visual.P2.SkillProxyRenderer.Initialize");
@@ -670,6 +770,14 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillUpdateIconPostfix)),
                 optional: true,
                 label: "Visual.P2.SkillProxyRenderer.UpdateSkillIcon");
+            // P1-01：升阶重建 _currentTierFrame 后于 UpdateCard Task 落地补刷自定义技能图标
+            patcher.TryPatch(
+                skillProxyType,
+                "UpdateCard",
+                skillCardArgType != null ? new[] { skillCardArgType, typeof(bool) } : null,
+                postfix: AccessTools.Method(typeof(CustomContentVisualModule), nameof(SkillProxyUpdateCardPostfix)),
+                optional: true,
+                label: "Visual.P2.SkillProxyRenderer.UpdateCard");
         }
 
         // 通路 3：2D UI 预览 (CardPreviewBase 4 参 SetUp / CardPreviewItem / CardPreviewSkill / CardPreviewEncounter)
@@ -868,7 +976,8 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
 
         var boardRendererType = GameInspector.FindTypeSafe("TheBazaar.UI.Tooltips.MonsterBoardRenderer");
-        var tMonsterType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Monsters.TMonster", "BazaarGameShared.Domain.Cards.Encounter.TMonster");
+        // P2-01：对齐官方 BazaarGameShared.Domain.Players.TMonster，实现 BuildDisplay(TMonster, CardTooltipData) 精确签名匹配
+        var tMonsterType = GameInspector.FindTypeSafe("BazaarGameShared.Domain.Players.TMonster");
         if (boardRendererType != null && tooltipDataType != null)
         {
             _monsterBoardViewField = AccessTools.Field(boardRendererType, "_view");
@@ -972,7 +1081,8 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
 
     // ── P0-21 野怪悬停自定义预览回调 ─────────────────────────────────────────
 
-    private static void GetPveEncounterLevelPostfix(object __instance, ref int __result)
+    // P2-01：官方 CardTooltipData.GetPVEEncounterLevel() 返回类型为 uint，修正 ref uint __result 使补丁 100% 生效
+    private static void GetPveEncounterLevelPostfix(object __instance, ref uint __result)
     {
         try
         {
@@ -980,7 +1090,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             if (LocalizationOverlayModule.TryExtractCardMetadata(__instance, out var ov, out _)
                 && ov?.MonsterPreview != null && ov.MonsterPreview.Level > 0)
             {
-                __result = ov.MonsterPreview.Level;
+                __result = (uint)ov.MonsterPreview.Level;
             }
         }
         catch (Exception ex)
@@ -1445,7 +1555,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         {
             if (__instance == null) return;
             if (_boardManagerIsRecapOpenProp?.GetValue(__instance) is bool bp) __state = bp;
-            else if (_boardManagerIsRecapOpenField?.GetValue(__instance) is bool bf) __state = bf;
         }
         catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L1450", diagEx); }
     }
@@ -1457,7 +1566,6 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             if (!__state || __instance == null) return;
             bool nowOpen = false;
             if (_boardManagerIsRecapOpenProp?.GetValue(__instance) is bool bp) nowOpen = bp;
-            else if (_boardManagerIsRecapOpenField?.GetValue(__instance) is bool bf) nowOpen = bf;
             if (nowOpen) return;
 
             var agents = UnityEngine.Object.FindObjectsByType<CardVisualOverrideAgent>(FindObjectsInactive.Include, FindObjectsSortMode.None);
@@ -1601,7 +1709,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
-    // ── 通路 2 回调：3D 技能圆牌（P0-23 落盘瞬间拦截 + P0-29 Prefix 还原）─────
+    // ── 通路 2 回调：3D 技能圆牌（P0-23 落盘瞬间拦截 + P1-01 4 连修 + P3-08 空 ArtKey 兜底 + P0-29 Prefix 还原）─────
 
     private static void SkillIconUpdaterMaterialPrefix(Component __instance, ref Texture __0)
     {
@@ -1611,12 +1719,15 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
 
             Component host = FindSkillHostForUpdater(__instance);
             if (host == null) return;
-            var agent = host.GetComponent<CardVisualOverrideAgent>();
+
+            var agent = EnsureSkillAgentForHost(host);
             if (agent == null) return;
 
             if (!_inModSkillIconApply)
             {
                 agent.SaveOriginalSkillTexture(__instance, __0);
+                // 原版重新写入贴图前失效旧已应用标记，确保后续补刷判定准确
+                agent.InvalidateSkillAppliedMarker();
             }
 
             if (_inModSkillIconApply || !agent.HasContext || agent.LastQuery.Target != CardVisualTarget.SkillIcon)
@@ -1626,6 +1737,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 return;
 
             uint capturedEpoch = agent.Epoch;
+            int updaterId = __instance.GetInstanceID();
             Texture syncTex = null;
             bool finishedSync = false;
 
@@ -1646,12 +1758,17 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                         // 缓存已热命中：同步在落盘瞬间零延迟替换 ref Texture __0
                         syncTex = lease.Asset.Texture;
                         agent.TakePrimaryLease(ref lease);
+                        agent.MarkSkillApplied(updaterId, binding.LocalImagePath);
+                        agent.PendingSkillApply = false;
                     }
                     else
                     {
-                        // 异步加载完成回主线程：在防重入标记下补调 UpdateSkillIconMaterial
+                        // 异步加载完成回主线程：先提取纹理再转移租约所有权（TakePrimaryLease 会置空 lease），在防重入标记下补调 UpdateSkillIconMaterial
+                        Texture asyncTex = lease.Asset.Texture;
+                        ApplySkillIconToUpdaterSafe(__instance, asyncTex);
                         agent.TakePrimaryLease(ref lease);
-                        ApplySkillIconToUpdaterSafe(__instance, lease.Asset.Texture);
+                        agent.MarkSkillApplied(updaterId, binding.LocalImagePath);
+                        agent.PendingSkillApply = false;
                     }
                 }
                 catch (Exception ex)
@@ -1676,20 +1793,119 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
+    /// <summary>
+    /// P1-01：SkillIconUpdater.UpdateSkillIconMaterial 落盘 Postfix。
+    /// 兜底捕获 SkillProxyRenderer.Initialize 异步装帧完成后的首次落盘时机，补刷未落盘或挂起的自定义技能贴图。
+    /// </summary>
+    private static void SkillIconUpdaterMaterialPostfix(Component __instance, bool __result)
+    {
+        try
+        {
+            if (!__result || __instance == null || _inModSkillIconApply || Instance == null) return;
+
+            Component host = FindSkillHostForUpdater(__instance);
+            if (host == null) return;
+
+            var agent = EnsureSkillAgentForHost(host);
+            if (agent == null || !agent.HasContext || agent.LastQuery.Target != CardVisualTarget.SkillIcon)
+                return;
+
+            if (Instance.TryResolveVisual(agent.LastQuery, out var binding) && binding != null)
+            {
+                if (!agent.PendingSkillApply && agent.IsSkillAppliedTo(__instance.GetInstanceID(), binding.LocalImagePath))
+                {
+                    return;
+                }
+                TryApplySkillVisual(host, agent, agent.Epoch, triggerSyncIfMissing: false);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(SkillIconUpdaterMaterialPostfix), ex);
+        }
+    }
+
     private static Component FindSkillHostForUpdater(Component updater)
     {
         if (updater == null) return null;
+        // P1-01：全部补齐 includeInactive: true，覆盖 SkillPresentationManager.Initialize/Add 的 SetActive(false) 窗口
         if (_skillControllerType != null)
         {
-            var sc = updater.GetComponentInParent(_skillControllerType);
+            var sc = updater.GetComponentInParent(_skillControllerType, includeInactive: true);
             if (sc != null) return sc;
         }
         if (_skillProxyRendererType != null)
         {
-            var sp = updater.GetComponentInParent(_skillProxyRendererType);
+            var sp = updater.GetComponentInParent(_skillProxyRendererType, includeInactive: true);
             if (sp != null) return sp;
         }
-        return updater.GetComponentInParent<CardVisualOverrideAgent>()?.HostController;
+        var ag = updater.GetComponentInParent<CardVisualOverrideAgent>(includeInactive: true);
+        if (ag != null && ag.HostController != null)
+        {
+            return ag.HostController;
+        }
+
+        // 兜底：沿 Transform.parent 手动向上遍历，防止极端失活层级漏检
+        Transform cur = updater.transform;
+        while (cur != null)
+        {
+            if (_skillControllerType != null)
+            {
+                var sc = cur.GetComponent(_skillControllerType);
+                if (sc != null) return sc;
+            }
+            if (_skillProxyRendererType != null)
+            {
+                var sp = cur.GetComponent(_skillProxyRendererType);
+                if (sp != null) return sp;
+            }
+            var curAg = cur.GetComponent<CardVisualOverrideAgent>();
+            if (curAg != null && curAg.HostController != null)
+            {
+                return curAg.HostController;
+            }
+            cur = cur.parent;
+        }
+        return null;
+    }
+
+    private static object ResolveLiveCardFromSkillHost(Component skillComp)
+    {
+        if (skillComp == null) return null;
+        try
+        {
+            if (_skillProxyRendererType != null && _skillProxyRendererType.IsInstanceOfType(skillComp))
+            {
+                return SafeGetPropertyValue(_skillProxyCardProp, skillComp);
+            }
+            if (_skillControllerType != null && _skillControllerType.IsInstanceOfType(skillComp))
+            {
+                return SafeGetPropertyValue(_skillCtrlCardDataProp, skillComp);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+        return null;
+    }
+
+    private static CardVisualOverrideAgent EnsureSkillAgentForHost(Component host)
+    {
+        if (host == null) return null;
+        var agent = host.GetComponent<CardVisualOverrideAgent>();
+        if (agent == null || !agent.HasContext)
+        {
+            object liveCard = ResolveLiveCardFromSkillHost(host);
+            if (liveCard != null)
+            {
+                agent = GetOrAddAgent(host);
+                agent.HostController = host;
+                agent.BoundCardObj = liveCard;
+                agent.SetContext(BuildQueryFromCard(liveCard, CardVisualTarget.SkillIcon));
+            }
+        }
+        return agent;
     }
 
     private static void ApplySkillIconToUpdaterSafe(Component updater, Texture tex)
@@ -1717,8 +1933,35 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         try
         {
             if (__instance == null) return;
-            var ag = __instance.GetComponent<CardVisualOverrideAgent>();
+            var ag = EnsureSkillAgentForHost(__instance);
             ag?.MarkBadgeDirty();
+
+            // P1-01：装帧落地触发 UpdateSkillIcon 后除刷新徽章外，同步执行自定义贴图补刷
+            if (!_inModSkillIconApply && Instance != null && ag != null && ag.HasContext && ag.LastQuery.Target == CardVisualTarget.SkillIcon)
+            {
+                if (Instance.TryResolveVisual(ag.LastQuery, out var binding) && binding != null)
+                {
+                    var updater = _skillIconUpdaterType != null
+                        ? __instance.GetComponentInChildren(_skillIconUpdaterType, true)
+                        : null;
+                    int updaterId = updater != null ? updater.GetInstanceID() : 0;
+                    if (ag.PendingSkillApply || updaterId == 0 || !ag.IsSkillAppliedTo(updaterId, binding.LocalImagePath))
+                    {
+                        TryApplySkillVisual(__instance, ag, ag.Epoch, triggerSyncIfMissing: false);
+                    }
+                }
+                else
+                {
+                    if (ag.HasAppliedCustomSkill)
+                    {
+                        TryApplySkillVisual(__instance, ag, ag.Epoch, triggerSyncIfMissing: false);
+                    }
+                    else if (!string.IsNullOrEmpty(ag.LastQuery.InstanceId))
+                    {
+                        ModContentSyncClient.Instance?.NotifyUnboundInstanceSeen(ag.LastQuery.InstanceId, ag.LastQuery.TemplateId);
+                    }
+                }
+            }
         }
         catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L1711", diagEx); }
     }
@@ -1765,6 +2008,99 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         }
     }
 
+    /// <summary>
+    /// P3-08（客户端兜底）：拦截 SkillProxyRenderer.Initialize 中空/空白或 "Invalid" ArtKey，
+    /// 跳过 Addressables 空键寻址与刷屏错误日志，改用默认占位图标（有 Mod 视觉绑定时由钩子无缝替换）。
+    /// </summary>
+    private static bool SkillProxyInitializePrefix(Component __instance, object __0, object __1, string __2, bool __3)
+    {
+        try
+        {
+            if (__instance == null) return true;
+            bool isBlankArtKey = string.IsNullOrWhiteSpace(__2)
+                || string.Equals(__2.Trim(), "Invalid", StringComparison.OrdinalIgnoreCase);
+            if (!isBlankArtKey) return true;
+
+            if (_skillProxyCardSetter == null
+                || _skillProxyTierSetter == null
+                || _skillProxyTooltipDataField == null
+                || _skillProxyLoadCurrentFrameMethod == null
+                || _skillProxyCurrentTierFrameField == null
+                || _skillProxyTierParentField == null
+                || _skillProxyDefaultTexField == null
+                || _skillProxyUpdateIconMethod == null)
+            {
+                return true;
+            }
+
+            _skillProxyCardSetter.Invoke(__instance, new[] { __0 });
+            _skillProxyTierSetter.Invoke(__instance, new[] { __1 });
+            if (_createCardTooltipDataMethod != null && __0 != null)
+            {
+                object tooltipData = _createCardTooltipDataMethod.Invoke(null, new[] { __0 });
+                _skillProxyTooltipDataField.SetValue(__instance, tooltipData);
+            }
+
+            _ = CompleteBlankArtKeySkillProxyInitAsync(__instance, __1, __3);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(SkillProxyInitializePrefix), ex);
+            return true;
+        }
+    }
+
+    private static async Task CompleteBlankArtKeySkillProxyInitAsync(Component proxyComp, object tierObj, bool aboveBoard)
+    {
+        try
+        {
+            if (proxyComp == null) return;
+            var frameTask = _skillProxyLoadCurrentFrameMethod?.Invoke(proxyComp, new[] { tierObj }) as Task<GameObject>;
+            if (frameTask == null) return;
+
+            GameObject frame = await frameTask;
+            if (proxyComp == null || frame == null) return;
+
+            _skillProxyCurrentTierFrameField?.SetValue(proxyComp, frame);
+            Transform parentTf = _skillProxyTierParentField?.GetValue(proxyComp) as Transform;
+            if (parentTf != null)
+            {
+                frame.transform.SetParent(parentTf);
+            }
+            frame.transform.SetLocalPositionAndRotation(Vector3.zero, Quaternion.identity);
+            frame.transform.localScale = Vector3.one;
+
+            Texture defaultTex = _skillProxyDefaultTexField?.GetValue(proxyComp) as Texture;
+            _skillProxyUpdateIconMethod?.Invoke(proxyComp, new object[] { defaultTex });
+
+            int newLayer = LayerMask.NameToLayer(aboveBoard ? "AboveBoard" : "Default");
+            if (newLayer >= 0)
+            {
+                SetLayerRecursive(proxyComp.gameObject, newLayer);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(CompleteBlankArtKeySkillProxyInitAsync), ex);
+        }
+    }
+
+    private static void SetLayerRecursive(GameObject root, int newLayer)
+    {
+        if (root == null) return;
+        root.layer = newLayer;
+        Transform tf = root.transform;
+        for (int i = 0; i < tf.childCount; i++)
+        {
+            Transform child = tf.GetChild(i);
+            if (child != null)
+            {
+                SetLayerRecursive(child.gameObject, newLayer);
+            }
+        }
+    }
+
     private static void SkillProxyInitializePostfix(Component __instance, object __0)
     {
         try
@@ -1774,6 +2110,18 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         catch (Exception ex)
         {
             LogHookErrorThrottled(nameof(SkillProxyInitializePostfix), ex);
+        }
+    }
+
+    private static void SkillProxyUpdateCardPostfix(Component __instance, object __0, Task __result)
+    {
+        try
+        {
+            ScheduleSkillVisual(__instance, __0, __result);
+        }
+        catch (Exception ex)
+        {
+            LogHookErrorThrottled(nameof(SkillProxyUpdateCardPostfix), ex);
         }
     }
 
@@ -1807,12 +2155,22 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             var query = agent.LastQuery;
             if (!Instance.TryResolveVisual(query, out var binding) || binding == null)
             {
+                agent.PendingSkillApply = false;
                 agent.RestoreOriginalSkillTextureIfApplied();
                 if (triggerSyncIfMissing && !string.IsNullOrEmpty(query.InstanceId))
                 {
                     ModContentSyncClient.Instance?.NotifyUnboundInstanceSeen(query.InstanceId, query.TemplateId);
                 }
                 return;
+            }
+
+            if (_skillIconUpdaterType != null)
+            {
+                var curUpdater = skillComp.GetComponentInChildren(_skillIconUpdaterType, true);
+                if (curUpdater != null && !agent.PendingSkillApply && agent.IsSkillAppliedTo(curUpdater.GetInstanceID(), binding.LocalImagePath))
+                {
+                    return;
+                }
             }
 
             CardTextureCache.Instance.AcquireTextureAsync(binding.LocalImagePath, binding.ContentSha256, incomingLease =>
@@ -1834,12 +2192,51 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                         {
                             ApplySkillIconToUpdaterSafe(updater, lease.Asset.Texture);
                             agent.TakePrimaryLease(ref lease);
+                            agent.MarkSkillApplied(updater.GetInstanceID(), binding.LocalImagePath);
+                            agent.PendingSkillApply = false;
                             return;
                         }
                     }
 
+                    // 区分 SkillProxyRenderer 与 SkillController，确认当前帧对象已就绪再调 UpdateSkillIcon，避免异步装帧前 NRE
+                    if (_skillProxyRendererType != null && _skillProxyRendererType.IsInstanceOfType(skillComp))
+                    {
+                        var tierFrame = _skillProxyCurrentTierFrameField?.GetValue(skillComp) as GameObject;
+                        if (tierFrame != null && _skillProxyUpdateIconMethod != null)
+                        {
+                            bool prev = _inModSkillIconApply;
+                            _inModSkillIconApply = true;
+                            try
+                            {
+                                _skillProxyUpdateIconMethod.Invoke(skillComp, new object[] { lease.Asset.Texture });
+                            }
+                            finally
+                            {
+                                _inModSkillIconApply = prev;
+                            }
+                            var frameUpdater = _skillIconUpdaterType != null
+                                ? tierFrame.GetComponent(_skillIconUpdaterType)
+                                : null;
+                            agent.TakePrimaryLease(ref lease);
+                            agent.MarkSkillApplied(frameUpdater != null ? frameUpdater.GetInstanceID() : skillComp.GetInstanceID(), binding.LocalImagePath);
+                            agent.PendingSkillApply = false;
+                            return;
+                        }
+
+                        // P1-01：_currentTierFrame 仍在异步加载中，标记待装帧补刷，由 UpdateSkillIconMaterial/UpdateSkillIcon Postfix 或 OnEnable 接力消费
+                        agent.PendingSkillApply = true;
+                        return;
+                    }
+
                     if (_skillUpdateIconMethod != null && _skillUpdateIconMethod.DeclaringType.IsInstanceOfType(skillComp))
                     {
+                        var ctrlFrame = _skillCtrlCurrentFrameField?.GetValue(skillComp) as GameObject;
+                        if (ctrlFrame == null)
+                        {
+                            agent.PendingSkillApply = true;
+                            return;
+                        }
+
                         bool prev = _inModSkillIconApply;
                         _inModSkillIconApply = true;
                         try
@@ -1850,7 +2247,12 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                         {
                             _inModSkillIconApply = prev;
                         }
+                        var frameUpdater = _skillIconUpdaterType != null
+                            ? ctrlFrame.GetComponent(_skillIconUpdaterType)
+                            : null;
                         agent.TakePrimaryLease(ref lease);
+                        agent.MarkSkillApplied(frameUpdater != null ? frameUpdater.GetInstanceID() : skillComp.GetInstanceID(), binding.LocalImagePath);
+                        agent.PendingSkillApply = false;
                     }
                 }
                 catch (Exception ex)
@@ -2598,10 +3000,13 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         private Task _pendingTypedSetupTask;
         private readonly CardMechanismBadgeView _badgeView = new();
 
-        // 管线 2（技能）快照
+        // 管线 2（技能）快照与落盘追踪
         private Component _skillUpdaterRef;
         private Texture _originalSkillTex;
         private bool _hasOriginalSkillTex;
+        private int _lastAppliedSkillUpdaterId;
+        private string _lastAppliedSkillImagePath;
+        private bool _hasAppliedCustomSkillTex;
 
         // 管线 3（2D 预览）快照
         private RawImage _previewRawImageRef;
@@ -2629,6 +3034,8 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
         public object BoundCardObj { get; set; }
         public bool IsRecapPooledHost { get; private set; }
         public bool IsPreviewPooledHost { get; private set; }
+        public bool PendingSkillApply { get; set; }
+        public bool HasAppliedCustomSkill => _hasAppliedCustomSkillTex;
 
         public bool IsTypedSetupInFlight =>
             _inTypedSetupSyncEntry || (_pendingTypedSetupTask != null && !_pendingTypedSetupTask.IsCompleted);
@@ -2642,7 +3049,7 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             }
             if (_recapItemVisualControllerType != null
                 && (_recapItemVisualControllerType.IsInstanceOfType(host)
-                    || host.GetComponentInParent(_recapItemVisualControllerType) != null))
+                    || host.GetComponentInParent(_recapItemVisualControllerType, includeInactive: true) != null))
             {
                 IsRecapPooledHost = true;
             }
@@ -2713,15 +3120,40 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _hasOriginalSkillTex = true;
         }
 
+        public bool IsSkillAppliedTo(int updaterInstanceId, string imagePath)
+        {
+            return _hasAppliedCustomSkillTex
+                && updaterInstanceId != 0
+                && _lastAppliedSkillUpdaterId == updaterInstanceId
+                && string.Equals(_lastAppliedSkillImagePath, imagePath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public void MarkSkillApplied(int updaterInstanceId, string imagePath)
+        {
+            _lastAppliedSkillUpdaterId = updaterInstanceId;
+            _lastAppliedSkillImagePath = imagePath;
+            _hasAppliedCustomSkillTex = true;
+        }
+
+        public void InvalidateSkillAppliedMarker()
+        {
+            _lastAppliedSkillUpdaterId = 0;
+            _lastAppliedSkillImagePath = null;
+        }
+
         public void RestoreOriginalSkillTextureIfApplied()
         {
-            if (_hasOriginalSkillTex && _skillUpdaterRef != null && _originalSkillTex != null)
+            if (_hasAppliedCustomSkillTex && _hasOriginalSkillTex && _skillUpdaterRef != null && _originalSkillTex != null)
             {
                 try { ApplySkillIconToUpdaterSafe(_skillUpdaterRef, _originalSkillTex); } catch { }
             }
             _hasOriginalSkillTex = false;
             _originalSkillTex = null;
             _skillUpdaterRef = null;
+            _lastAppliedSkillUpdaterId = 0;
+            _lastAppliedSkillImagePath = null;
+            _hasAppliedCustomSkillTex = false;
+            PendingSkillApply = false;
             ReleaseBoundEntries();
         }
 
@@ -2852,6 +3284,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _lastAppliedImagePath = null;
             _originalMatSnapshot = null;
             _hasOriginalSkillTex = false;
+            _lastAppliedSkillUpdaterId = 0;
+            _lastAppliedSkillImagePath = null;
+            _hasAppliedCustomSkillTex = false;
+            PendingSkillApply = false;
             _hasOriginalPreviewRawTex = false;
             _hasOriginalPreviewSprite = false;
             _hasOrigEncPortrait = false;
@@ -2873,6 +3309,10 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
             _hasOriginalSkillTex = false;
             _originalSkillTex = null;
             _skillUpdaterRef = null;
+            _lastAppliedSkillUpdaterId = 0;
+            _lastAppliedSkillImagePath = null;
+            _hasAppliedCustomSkillTex = false;
+            PendingSkillApply = false;
             _hasOriginalPreviewRawTex = false;
             _originalPreviewRawTex = null;
             _previewRawImageRef = null;
@@ -2958,6 +3398,15 @@ internal sealed class CustomContentVisualModule : IBuiltInPatchModule, ICardVisu
                 }
             }
             catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CustomContentVisualModule:L2912", diagEx); }
+        }
+
+        private void OnEnable()
+        {
+            // P1-01：当技能代理结束 SkillPresentationManager.Add 的 SetActive(false) 窗口恢复激活时，若存在挂起贴图立即补刷
+            if (HasContext && LastQuery.Target == CardVisualTarget.SkillIcon && PendingSkillApply && HostController != null)
+            {
+                TryApplySkillVisual(HostController, this, _epoch, triggerSyncIfMissing: false);
+            }
         }
 
         private void OnDisable()

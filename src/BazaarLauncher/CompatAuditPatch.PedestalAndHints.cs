@@ -59,6 +59,13 @@ internal static partial class CompatAuditPatch
     private static readonly HashSet<int> _cleaningUpPresentationIds = new();
     private static int _uiRefreshGeneration;
 
+    // P1-13：祭坛升级视觉品阶一致性校验句柄（ItemVisualsController.currentTier vs CardData.Tier）
+    private static string _lastPedestalUpgradedCardId;
+    private static int _pedestalVisualTierFixedCount;
+    private static PropertyInfo _itemCtrlVisualsProp;
+    private static FieldInfo _itemCtrlVisualsField;
+    private static FieldInfo _ivcCurrentTierField;
+
     // P2-32：Mod 链式祭坛（Pedestal -> Pedestal/Encounter）在 AppState.SetState 前写回有效下一跳 CurrentEncounterId
     private static PropertyInfo _dataCurrentEncounterIdProp;
     private static MethodInfo _bmTryLoadCurrentEncounterSoMethod;
@@ -157,6 +164,17 @@ internal static partial class CompatAuditPatch
                 postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(PedestalUpgradeOrEnchantPostfix)),
                 optional: true,
                 label: "PedestalState.HandleCardEnchantmentEvent"))
+            {
+                _pedestalHintsPatchedCount++;
+            }
+
+            // P1-13：PedestalState.CompleteTransition 收尾后核验视觉品阶与 CardData.Tier 是否一致
+            var mCompleteTrans = AccessTools.Method(pedType, "CompleteTransition", Type.EmptyTypes);
+            if (mCompleteTrans != null && patcher.TryPatchMethod(
+                mCompleteTrans,
+                postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(PedestalCompleteTransitionPostfix)),
+                optional: true,
+                label: "PedestalState.CompleteTransition"))
             {
                 _pedestalHintsPatchedCount++;
             }
@@ -360,8 +378,20 @@ internal static partial class CompatAuditPatch
                 if (_bmRemovePresMethod != null && patcher.TryPatchMethod(
                     _bmRemovePresMethod,
                     prefix: AccessTools.Method(typeof(CompatAuditPatch), nameof(RemoveBoardStatePresentationPrefix)),
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(RemoveBoardStatePresentationPostfix)),
                     optional: true,
                     label: "BoardManager.RemoveBoardStatePresentation"))
+                {
+                    _pedestalHintsPatchedCount++;
+                }
+
+                // P1-13：当 PedestalState 中 BoardStatePresentation == null 时，BoardManager.OnCardUpgradedHandler 会跳过 UpdateCard()，此处补兜底刷新
+                var onCardUpgraded = AccessTools.Method(bmType, "OnCardUpgradedHandler", new[] { typeof(GameSimEventCardUpgraded) });
+                if (onCardUpgraded != null && patcher.TryPatchMethod(
+                    onCardUpgraded,
+                    postfix: AccessTools.Method(typeof(CompatAuditPatch), nameof(BoardManagerOnCardUpgradedPostfix)),
+                    optional: true,
+                    label: "BoardManager.OnCardUpgradedHandler"))
                 {
                     _pedestalHintsPatchedCount++;
                 }
@@ -795,6 +825,8 @@ internal static partial class CompatAuditPatch
             {
                 _wasInUpgradePedestal = false;
                 ExitAllUpgradePreviewsSafely();
+                // P1-13：切离祭坛时核验目标及玩家物品 3D 视觉品阶（uiTier）与 CardData.Tier 是否一致
+                ReconcilePedestalUpgradedItemVisuals(_lastPedestalUpgradedCardId, "BoardManager.OnStateChanged:LeavePedestal", scanAllPlayerItems: true);
             }
 
             if ((wasPedestal || _wasInAnyPedestal || _pedestalVerifyNonPedestalExit) && !nowPedestalContext)
@@ -811,23 +843,36 @@ internal static partial class CompatAuditPatch
                 {
                     ClearStaleBoardManagerEncounterAssetSo(__instance);
                 }
-                // P1-42：切离祭坛时优先走原生 RemoveBoardStatePresentation -> CleanUp()（带 1.8s 看门狗），不再同帧硬销毁打断蓝图清理
+                // P0-02：离开祭坛切入其他态时兜底清扫孤儿 3D 祭坛对象并确保退出升级预览高光
+                ExitAllUpgradePreviewsSafely();
                 CleanupStalePedestalBoardPresentation(__instance, "OnStateChanged", forceImmediate: false, allowWhileInPedestalState: false);
+                var keepOnLeave = GetBoardStatePresentationObj(__instance);
+                SweepOrphanPedestalPresentationsInScene(
+                    keepOnLeave != null && !IsTrackedOrPedestalPresentation(keepOnLeave) ? keepOnLeave : null,
+                    forceBypassThrottle: true);
                 SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
             }
-            else if (curStateName is "ChoiceState" or "CombatState" or "PVPCombatState" or "LootState")
+            else if (curStateName is "EncounterState" or "ChoiceState" or "CombatState" or "PVPCombatState" or "LootState")
             {
-                // 任何时候切入三选一/战斗/战利品且无激活遭遇 ID，兜底清理陈旧 _encounterAssetDataSO 与残余中台对象
-                if (!HasActiveCurrentEncounterId())
+                // P0-02：进入 Encounter/Choice/Combat/Loot 等非祭坛态时，统一清扫孤儿 3D 祭坛 GameObject 并执行 ExitUpgradePreview()
+                if (!nowPedestalContext)
                 {
-                    ClearStaleBoardManagerEncounterAssetSo(__instance);
+                    ExitAllUpgradePreviewsSafely();
+                    if (!HasActiveCurrentEncounterId())
+                    {
+                        ClearStaleBoardManagerEncounterAssetSo(__instance);
+                    }
+                    var curPres = GetBoardStatePresentationObj(__instance);
+                    if (curPres != null && (IsTrackedOrPedestalPresentation(curPres) || curStateName is "ChoiceState" or "CombatState" or "PVPCombatState" or "LootState"))
+                    {
+                        CleanupStalePedestalBoardPresentation(__instance, "OnStateChanged:" + curStateName, forceImmediate: false, allowWhileInPedestalState: false);
+                    }
+                    var keepPres = GetBoardStatePresentationObj(__instance);
+                    SweepOrphanPedestalPresentationsInScene(
+                        keepPres != null && !IsTrackedOrPedestalPresentation(keepPres) ? keepPres : null,
+                        forceBypassThrottle: true);
+                    SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
                 }
-                var curPres = GetBoardStatePresentationObj(__instance);
-                if (curPres != null && !IsInPedestalContext())
-                {
-                    CleanupStalePedestalBoardPresentation(__instance, "OnStateChanged:" + curStateName, forceImmediate: false, allowWhileInPedestalState: false);
-                }
-                SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
             }
         }
         catch (Exception ex)
@@ -1137,23 +1182,29 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    private static bool LoadBoardStatePresentationPrefix(object __instance, ref Task __result)
+    private static bool LoadBoardStatePresentationPrefix(object __instance, ref Task __result, out object __state)
     {
+        __state = null;
         if (__instance == null || (__instance is UnityEngine.Object bmUo && bmUo == null)) return true;
         try
         {
+            // P0-02：捕获加载前的原 BoardStatePresentation 局部引用，防止 LoadBoardStatePresentation 内 await CleanUp() 并发覆写漏毁旧 3D 祭坛
+            __state = GetBoardStatePresentationObj(__instance);
+
             // V13.2 修复问题 #4：无激活遭遇 ID（例如刚退出附魔/升级台回到 ChoiceState）时，立即清掉陈旧 _encounterAssetDataSO
             // 与残留 BoardStatePresentation，阻止把上一跳的附魔/升级台再次加载到中间 3 格！
             if (!HasActiveCurrentEncounterId())
             {
                 ClearStaleBoardManagerEncounterAssetSo(__instance);
-                var curPres = GetBoardStatePresentationObj(__instance);
+                var curPres = __state;
                 bool isLoading = _bmIsBoardStatePresLoadingProp?.GetValue(__instance) is bool b && b;
                 if (curPres != null || isLoading)
                 {
                     CleanupStalePedestalBoardPresentation(__instance, "LoadBoardStatePresentationPrefix:NoEncounter", forceImmediate: false, allowWhileInPedestalState: false);
                 }
+                SweepOrphanPedestalPresentationsInScene(null, forceBypassThrottle: true);
                 SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
+                __state = null;
                 __result = Task.CompletedTask;
                 return false;
             }
@@ -1165,12 +1216,12 @@ internal static partial class CompatAuditPatch
         return true;
     }
 
-    private static void LoadBoardStatePresentationPostfix(object __instance, ref Task __result)
+    private static void LoadBoardStatePresentationPostfix(object __instance, object __state, ref Task __result)
     {
         try
         {
             if (__instance == null || (__instance is UnityEngine.Object uo && uo == null) || __result == null) return;
-            __result = WrapBoardPresentationCheckTask(__result, __instance, "LoadBoardStatePresentation");
+            __result = WrapBoardPresentationCheckTask(__result, __instance, "LoadBoardStatePresentation", __state);
         }
         catch (Exception ex)
         {
@@ -1183,7 +1234,7 @@ internal static partial class CompatAuditPatch
         try
         {
             if (__instance == null || (__instance is UnityEngine.Object uo && uo == null) || __result == null) return;
-            __result = WrapBoardPresentationCheckTask(__result, __instance, "ReconcilePresentationAfterStateSync");
+            __result = WrapBoardPresentationCheckTask(__result, __instance, "ReconcilePresentationAfterStateSync", capturedOldPres: null);
         }
         catch (Exception ex)
         {
@@ -1191,7 +1242,7 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    private static async Task WrapBoardPresentationCheckTask(Task inner, object boardManager, string sourceTag)
+    private static async Task WrapBoardPresentationCheckTask(Task inner, object boardManager, string sourceTag, object capturedOldPres = null)
     {
         try
         {
@@ -1207,6 +1258,19 @@ internal static partial class CompatAuditPatch
                         return;
 
                     var curPres = GetBoardStatePresentationObj(boardManager);
+
+                    // P0-02：若加载前捕获的旧 3D 祭坛已被新实例覆写却仍存活在场景中，立即兜底销毁避免孤儿滞留
+                    if (capturedOldPres != null
+                        && IsUnityObjectAlive(capturedOldPres)
+                        && !ReferenceEquals(capturedOldPres, curPres)
+                        && (IsTrackedOrPedestalPresentation(capturedOldPres) || !IsInPedestalContext()))
+                    {
+                        if (ShortCircuitAndDestroyPresentation(capturedOldPres))
+                        {
+                            Interlocked.Increment(ref _pedestalPresentationCleanedCount);
+                        }
+                    }
+
                     if (IsInPedestalContext())
                     {
                         _wasInAnyPedestal = true;
@@ -1218,8 +1282,14 @@ internal static partial class CompatAuditPatch
                     }
                     else
                     {
-                        // 已切换到非基座状态（如 Encounter/Choice/葵仙子商店），二层兜底清理一切残留基座或未替换卷轴
+                        // P0-02：同步恢复/切换至非祭坛态后，兜底清理一切残留孤儿 3D 祭坛并执行 ExitUpgradePreview()
                         CleanupStalePedestalBoardPresentation(boardManager, sourceTag, forceImmediate: false, allowWhileInPedestalState: false);
+                        var keepPres = GetBoardStatePresentationObj(boardManager);
+                        SweepOrphanPedestalPresentationsInScene(
+                            keepPres != null && !IsTrackedOrPedestalPresentation(keepPres) ? keepPres : null,
+                            forceBypassThrottle: true);
+                        SweepOrphanPedestalChildrenUnderOpponentAnchor(boardManager);
+                        ExitAllUpgradePreviewsSafely();
                     }
                 }
                 catch (Exception ex)
@@ -1230,8 +1300,9 @@ internal static partial class CompatAuditPatch
         }
     }
 
-    private static bool RemoveBoardStatePresentationPrefix(object __instance, ref Task __result)
+    private static bool RemoveBoardStatePresentationPrefix(object __instance, ref Task __result, out object __state)
     {
+        __state = null;
         if (__instance == null || (__instance is UnityEngine.Object bmUo && bmUo == null)) return true;
         try
         {
@@ -1244,22 +1315,26 @@ internal static partial class CompatAuditPatch
             var curPres = GetBoardStatePresentationObj(__instance);
             bool inPedestalCtx = IsInPedestalContext();
 
-            // P1-42：不再拦截活跃 BoardStatePresentation 的原生 RemoveBoardStatePresentation()！
-            // 原生方法会安全调用 InvalidateBoardStatePresentationLoadRequests -> await BoardStatePresentation.CleanUp()（已挂载 1.8s 看门狗）-> Destroy -> 置空引用；
-            // 仅对已失活或空呈现场景顺带清扫残留孤立祭坛对象，避免同帧硬销毁打断 Visual Scripting 蓝图成对恢复 DialogOpen/EnableMovement。
+            // P0-02：在 await CleanUp() 前捕获原 BoardStatePresentation 局部引用，彻底避免并发覆写/置空导致官方第 927 行 Destroy 漏毁旧 3D 祭坛！
+            __state = curPres;
+
             if (curPres == null)
             {
                 _pendingPedestalExitAbort = false;
-                if (!inPedestalCtx && _pedestalVerifyNonPedestalExit)
+                if (!inPedestalCtx)
                 {
-                    SweepOrphanPedestalPresentationsInScene(null);
+                    SweepOrphanPedestalPresentationsInScene(null, forceBypassThrottle: true);
                     SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
+                    ExitAllUpgradePreviewsSafely();
                 }
             }
             else if (curPres is Component curComp && curComp.gameObject != null && !curComp.gameObject.activeInHierarchy)
             {
                 CleanupStalePedestalBoardPresentation(__instance, "RemoveBoardStatePresentationPrefix:Inactive", forceImmediate: true, allowWhileInPedestalState: true);
+                SweepOrphanPedestalPresentationsInScene(null, forceBypassThrottle: true);
                 SweepOrphanPedestalChildrenUnderOpponentAnchor(__instance);
+                if (!inPedestalCtx) ExitAllUpgradePreviewsSafely();
+                __state = null;
                 __result = Task.CompletedTask;
                 return false;
             }
@@ -1269,6 +1344,81 @@ internal static partial class CompatAuditPatch
         {
             BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.RemoveBoardStatePresentationPrefix: " + ex.Message);
             return true;
+        }
+    }
+
+    private static void RemoveBoardStatePresentationPostfix(object __instance, object __state, ref Task __result)
+    {
+        try
+        {
+            if (__state == null) return;
+            if (__result == null || __result.IsCompleted)
+            {
+                EnsureCapturedPresentationDestroyedOnMain(__instance, __state, "RemoveBoardStatePresentation:Sync");
+                return;
+            }
+            __result = WrapRemoveBoardStatePresentationTask(__result, __instance, __state);
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.RemoveBoardStatePresentationPostfix: " + ex.Message);
+        }
+    }
+
+    private static async Task WrapRemoveBoardStatePresentationTask(Task inner, object boardManager, object capturedPres)
+    {
+        try
+        {
+            await inner;
+        }
+        finally
+        {
+            PostToMainThread(() => EnsureCapturedPresentationDestroyedOnMain(boardManager, capturedPres, "RemoveBoardStatePresentation:Async"));
+        }
+    }
+
+    /// <summary>
+    /// P0-02 根治：RemoveBoardStatePresentation 的 await CleanUp() 结束后，无论属性 BoardStatePresentation 是否已被并发置空或覆写，
+    /// 均依据事前捕获的局部引用 capturedPres 强制销毁旧 3D 祭坛 GameObject 并清理升级预览高光。
+    /// </summary>
+    private static void EnsureCapturedPresentationDestroyedOnMain(object boardManager, object capturedPres, string reason)
+    {
+        try
+        {
+            if (capturedPres != null && IsUnityObjectAlive(capturedPres))
+            {
+                bool bmAlive = IsUnityObjectAlive(boardManager);
+                object curPres = bmAlive ? GetBoardStatePresentationObj(boardManager) : null;
+                if (bmAlive && ReferenceEquals(curPres, capturedPres))
+                {
+                    _bmBoardStatePresProp?.SetValue(boardManager, null);
+                    _bmIsBoardStatePresLoadingProp?.SetValue(boardManager, false);
+                }
+
+                if (ShortCircuitAndDestroyPresentation(capturedPres))
+                {
+                    int cnt = Interlocked.Increment(ref _pedestalPresentationCleanedCount);
+                    BazaarLauncherPlugin.Log?.LogWarning(
+                        $"CompatAuditPatch[P0-02]: {reason} 捕获旧 BoardStatePresentation 局部引用在 CleanUp 后仍存活，已强制销毁防孤儿滞留 (count={cnt})");
+                }
+            }
+
+            if (!IsInPedestalContext())
+            {
+                object keepPres = IsUnityObjectAlive(boardManager) ? GetBoardStatePresentationObj(boardManager) : null;
+                SweepOrphanPedestalPresentationsInScene(
+                    keepPres != null && !IsTrackedOrPedestalPresentation(keepPres) ? keepPres : null,
+                    forceBypassThrottle: true);
+                if (IsUnityObjectAlive(boardManager))
+                {
+                    SweepOrphanPedestalChildrenUnderOpponentAnchor(boardManager);
+                }
+                ExitAllUpgradePreviewsSafely();
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.EnsureCapturedPresentationDestroyedOnMain: " + ex.Message);
         }
     }
 
@@ -1403,6 +1553,7 @@ internal static partial class CompatAuditPatch
         _lastRecoveredPedestalAt = -100f;
         _pendingChainedPedestalEncounterId = Guid.Empty;
         _pendingChainedPedestalUntil = 0f;
+        _lastPedestalUpgradedCardId = null;
         Interlocked.Increment(ref _uiRefreshGeneration);
 
         // 4+ 个拖拽/售卖区悬停去重静态字段
@@ -1415,27 +1566,28 @@ internal static partial class CompatAuditPatch
         ResetShowCardHintDedupeCache();
     }
 
-    private static void SweepOrphanPedestalPresentationsInScene(object validKeepPres)
+    private static void SweepOrphanPedestalPresentationsInScene(object validKeepPres, bool forceBypassThrottle = false)
     {
         try
         {
             if (_bspType == null) return;
 
-            // P1-27：切板过场（BoardTransitionController.IsTransitioning == true）期间完全避让，严禁触碰场景中的切板演出实例
-            if (IsBoardTransitioning())
+            bool isBoardTransitioning = IsBoardTransitioning();
+            // P1-27：切板过场期间非强制扫描直接避让；强制扫描模式下仍仅清理明确具备祭坛特征或已登记祭坛的孤儿实例，绝不触碰切板演出实例
+            if (isBoardTransitioning && !forceBypassThrottle)
                 return;
 
-            // P1-27：无已追踪祭坛实例时 O(1) 短路，绝不在 keepId == 0 时无差别扫描并销毁未登记 BoardStatePresentation
+            // P0-02：常规热路径无已追踪祭坛时 O(1) 短路；在进入 Encounter/Choice/Combat 或 Reconcile 后强制扫描兜底未登记孤儿 3D 祭坛
             bool hasTrackedPedestals;
             lock (_pedestalPresLock)
             {
                 hasTrackedPedestals = _pedestalPresentationIds.Count > 0;
             }
-            if (!hasTrackedPedestals)
+            if (!hasTrackedPedestals && !forceBypassThrottle)
                 return;
 
             float now = Time.unscaledTime;
-            if (validKeepPres == null && now - _lastOrphanPedestalSweepTime < 0.35f)
+            if (!forceBypassThrottle && validKeepPres == null && now - _lastOrphanPedestalSweepTime < 0.35f)
             {
                 return;
             }
@@ -1445,6 +1597,7 @@ internal static partial class CompatAuditPatch
             if (found == null || found.Length == 0) return;
 
             int keepId = validKeepPres is Component keepComp && keepComp != null ? keepComp.GetInstanceID() : 0;
+            bool inPedestalCtx = IsInPedestalContext();
             foreach (var obj in found)
             {
                 if (obj == null || (obj is UnityEngine.Object uo && uo == null)) continue;
@@ -1455,8 +1608,9 @@ internal static partial class CompatAuditPatch
                 // P1-42：正在走原生 CleanUp() + 1.8s 看门狗优雅退出的实例不提前强拆
                 if (IsPresentationCleaningUp(id)) continue;
 
-                // P1-27：仅清理 _pedestalPresentationIds 中明确已追踪的祭坛实例，彻底杜绝误杀 BoardTransitionController 切板实例
-                if (IsTrackedPedestalPresentationId(id))
+                bool isTracked = IsTrackedPedestalPresentationId(id);
+                bool hasPedestalFeat = !inPedestalCtx && HasPedestalFeature(obj);
+                if (isTracked || (forceBypassThrottle && hasPedestalFeat))
                 {
                     if (ShortCircuitAndDestroyPresentation(obj))
                     {
@@ -1842,7 +1996,11 @@ internal static partial class CompatAuditPatch
         {
             if (!string.IsNullOrEmpty(__state))
             {
+                _lastPedestalUpgradedCardId = __state;
                 ForceRefreshItemControllerUi(__state);
+                // P1-13：祭坛升级动画正常结束窗口（600ms）与 6s 超时收尾窗口（6200ms）各做一次视觉阶一致性核验，
+                // 防止祭坛蓝图延迟置位 blockVisualUpdates 或未触发 UpdateCard 导致 3D 边框/伤害/卖价冻结在旧阶
+                SchedulePedestalVisualTierReconcile(__state, 600, 6200);
             }
 
             // P2-15 (O-1)：将基座演出完成与战斗倍速 CombatPatch.SpeedOverride 解耦，仅在显式请求快进提交时才跳过祭坛演出，
@@ -1860,6 +2018,184 @@ internal static partial class CompatAuditPatch
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.PedestalPostfix: " + ex.Message);
+        }
+    }
+
+    private static void PedestalCompleteTransitionPostfix()
+    {
+        try
+        {
+            string targetId = _lastPedestalUpgradedCardId;
+            PostToMainThread(() => ReconcilePedestalUpgradedItemVisuals(targetId, "PedestalState.CompleteTransition", scanAllPlayerItems: true));
+            SchedulePedestalVisualTierReconcile(targetId, 200);
+        }
+        catch { }
+    }
+
+    private static void BoardManagerOnCardUpgradedPostfix(object __instance, GameSimEventCardUpgraded data)
+    {
+        try
+        {
+            if (data == null || string.IsNullOrEmpty(data.InstanceId)) return;
+            _lastPedestalUpgradedCardId = data.InstanceId;
+
+            // P1-13：若处于 PedestalState 且 BoardStatePresentation 缺失（BoardManager.cs:3770 分支全跳过），立即兜底刷新目标 ItemController
+            bool inPedestal = IsInPedestalContext();
+            if (inPedestal && GetBoardStatePresentationObj(__instance) == null)
+            {
+                string cardId = data.InstanceId;
+                PostToMainThread(() => ForceRefreshItemControllerUi(cardId));
+                SchedulePedestalVisualTierReconcile(cardId, 250, 1200);
+            }
+            else if (inPedestal)
+            {
+                SchedulePedestalVisualTierReconcile(data.InstanceId, 800, 6200);
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.BoardManagerOnCardUpgradedPostfix: " + ex.Message);
+        }
+    }
+
+    private static void SchedulePedestalVisualTierReconcile(string targetCardId, params int[] delaysMs)
+    {
+        if (delaysMs == null || delaysMs.Length == 0) return;
+        try
+        {
+            int gen = Volatile.Read(ref _uiRefreshGeneration);
+            for (int i = 0; i < delaysMs.Length; i++)
+            {
+                int delay = delaysMs[i];
+                _ = Task.Delay(delay).ContinueWith(_ =>
+                {
+                    if (gen != Volatile.Read(ref _uiRefreshGeneration)) return;
+                    MainThreadDispatcher.Enqueue(() =>
+                    {
+                        if (gen != Volatile.Read(ref _uiRefreshGeneration)) return;
+                        ReconcilePedestalUpgradedItemVisuals(targetCardId, $"PedestalTimeoutReconcile({delay}ms)", scanAllPlayerItems: true);
+                    });
+                }, TaskScheduler.Default);
+            }
+        }
+        catch { }
+    }
+
+    private static bool TryGetItemControllerUiTier(object itemCtrl, out ETier? uiTier)
+    {
+        uiTier = null;
+        if (itemCtrl == null || (itemCtrl is UnityEngine.Object uo && uo == null)) return false;
+        try
+        {
+            var t = itemCtrl.GetType();
+            if (_itemCtrlVisualsProp == null || !_itemCtrlVisualsProp.DeclaringType.IsInstanceOfType(itemCtrl))
+            {
+                _itemCtrlVisualsProp = t.GetProperty("VisualsController", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            }
+            object visuals = _itemCtrlVisualsProp?.GetValue(itemCtrl);
+            if (visuals == null)
+            {
+                if (_itemCtrlVisualsField == null || !_itemCtrlVisualsField.DeclaringType.IsInstanceOfType(itemCtrl))
+                {
+                    _itemCtrlVisualsField = FindFieldInHierarchy(t, "visualsController");
+                }
+                visuals = _itemCtrlVisualsField?.GetValue(itemCtrl);
+            }
+            if (visuals == null || (visuals is UnityEngine.Object vuo && vuo == null)) return false;
+
+            if (_ivcCurrentTierField == null || !_ivcCurrentTierField.DeclaringType.IsInstanceOfType(visuals))
+            {
+                _ivcCurrentTierField = visuals.GetType().GetField("currentTier", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+            }
+            if (_ivcCurrentTierField == null) return false;
+
+            object rawTier = _ivcCurrentTierField.GetValue(visuals);
+            if (rawTier is ETier et)
+            {
+                uiTier = et;
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// P1-13（RC-PEDESTAL-VISUAL-UPDATE-DROPPED）：检测玩家 ItemController 的视觉阶（ItemVisualsController.currentTier）
+    /// 与逻辑阶（CardData.Tier）是否一致；若不一致则解除视觉锁定并强制调用 UpdateCard() 刷新 3D 边框、伤害与卖价。
+    /// </summary>
+    private static void ReconcilePedestalUpgradedItemVisuals(string preferredInstanceId, string reason, bool scanAllPlayerItems = true)
+    {
+        try
+        {
+            var run = GameInspector.GetDataRun();
+            var player = run != null ? GameInspector.GetMember(run, "Player") : null;
+            var lookup = GameInspector.GetDataLookup();
+            if (player == null || lookup == null) return;
+
+            int refreshed = 0;
+
+            void CheckAndRefreshController(object ctrl, object cardData)
+            {
+                if (ctrl == null || (ctrl is UnityEngine.Object cuo && cuo == null)) return;
+                if (!string.Equals(ctrl.GetType().Name, "ItemController", StringComparison.Ordinal)) return;
+                if (cardData == null) cardData = GameInspector.GetMember(ctrl, "CardData");
+                if (cardData == null) return;
+                if (GameInspector.GetMember(cardData, "Tier") is not ETier logicalTier) return;
+
+                if (!TryGetItemControllerUiTier(ctrl, out ETier? uiTier)) return;
+                if (uiTier.HasValue && uiTier.Value == logicalTier) return;
+
+                string iid = GameInspector.GetMember(cardData, "InstanceId")?.ToString() ?? "";
+                if (IsItemAnimatorBusyWithPlayableGraph(ctrl))
+                {
+                    if (!string.IsNullOrEmpty(iid))
+                    {
+                        int gen = Volatile.Read(ref _uiRefreshGeneration);
+                        _ = DeferForceRefreshItemControllerUiAsync(iid, gen);
+                    }
+                    return;
+                }
+
+                ApplyItemControllerUiRefreshNow(ctrl);
+                refreshed++;
+                Interlocked.Increment(ref _pedestalVisualTierFixedCount);
+                BazaarLauncherPlugin.Log?.LogInfo(
+                    $"CompatAuditPatch[P1-13]: 检测到 ItemController 视觉阶滞后 (card={iid}, uiTier={uiTier?.ToString() ?? "null"}, logicalTier={logicalTier}, reason={reason})，已强制调用 UpdateCard()");
+            }
+
+            if (!string.IsNullOrEmpty(preferredInstanceId))
+            {
+                var targetCtrl = ResolveLiveCardControllerForUiRefresh(preferredInstanceId);
+                if (targetCtrl != null)
+                {
+                    CheckAndRefreshController(targetCtrl, null);
+                }
+            }
+
+            if (scanAllPlayerItems && GameInspector.GetMember(lookup, "CardControllerDictionary") is IDictionary dict)
+            {
+                foreach (DictionaryEntry kv in dict)
+                {
+                    var cardObj = kv.Key;
+                    var ctrl = kv.Value;
+                    if (cardObj == null || ctrl == null) continue;
+                    if (!ReferenceEquals(GameInspector.GetMember(cardObj, "Owner"), player)) continue;
+                    if (GameInspector.GetMember(cardObj, "Type") is not ECardType ct || ct != ECardType.Item) continue;
+                    CheckAndRefreshController(ctrl, cardObj);
+                }
+            }
+
+            if (refreshed > 0 && !IsInPedestalContext())
+            {
+                _lastPedestalUpgradedCardId = null;
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CompatAuditPatch.ReconcilePedestalUpgradedItemVisuals: " + ex.Message);
         }
     }
 
@@ -2571,6 +2907,8 @@ internal static partial class CompatAuditPatch
             }
             // P2-16：离开 PedestalState 时无论挂起追踪是否已被变形事件提前清空，均兜底归零 IsProcessingUpgradeOrFuseOrEnchant
             ClearBoardUpgradeOrFuseOrEnchantProcessing();
+            // P1-13：切出祭坛时兜底核验所有玩家 ItemController 的 uiTier 与 CardData.Tier 一致性，缺失刷新则强调 UpdateCard()
+            ReconcilePedestalUpgradedItemVisuals(_lastPedestalUpgradedCardId, "PedestalState.OnExit", scanAllPlayerItems: true);
         }
         catch { }
     }

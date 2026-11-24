@@ -410,7 +410,13 @@
     }
     syncTokenBoxVisibility(res.data);
     const vfxCnt = res.data.vfxKeyCount ?? 133;
-    $('metaStatsText').textContent = `原版库 ${res.data.baseCardCount} 张（白名单 ${res.data.whitelistedCardCount} 张 · ${vfxCnt} 特效） · 已启用 ${res.data.enabledMods} 个 Mod`;
+    // 使用不换行空格连接「个 Mod」，配合独立副标题行避免窄横屏出现孤词折行
+    const statsEl = $('metaStatsText');
+    if (statsEl) {
+      const statsText = `原版库 ${res.data.baseCardCount} 张（白名单 ${res.data.whitelistedCardCount} 张 · ${vfxCnt} 特效） · 已启用 ${res.data.enabledMods}\u00A0个\u00A0Mod`;
+      statsEl.textContent = statsText;
+      statsEl.title = statsText;
+    }
   }
 
   async function loadRuleCatalog() {
@@ -458,7 +464,7 @@
   function renderModList() {
     const box = $('modListContainer');
     if (!state.mods.length) {
-      box.innerHTML = '<div class="empty-hint">mods/ 目录暂无 Mod，点击右上角「+ 新建空白 Mod」立即开始！</div>';
+      box.innerHTML = '<div class="empty-hint">mods/ 目录暂无扩展包，点击右上角「+ 新建空白扩展包」立即开始！</div>';
       return;
     }
     box.innerHTML = state.mods.map((m) => {
@@ -640,9 +646,9 @@
         </div>
         <div class="bcr-sub">${escapeHtml(heroNames || '全英雄通用')}${tagNames ? ` · ${escapeHtml(tagNames)}` : ''}</div>
         <div class="bcr-actions">
-          <button class="btn btn-gold btn-xs" data-act="clone" data-id="${escapeHtml(c.templateId)}">📋 复制为新卡</button>
-          <button class="btn btn-outline btn-xs" data-act="patch" data-id="${escapeHtml(c.templateId)}">🔧 直接改原版</button>
-          <button class="btn btn-subtle btn-xs" data-act="extract" data-id="${escapeHtml(c.templateId)}" title="查看并把这张原版卡的某条效果直接复制到正在编辑的卡牌里">🧲 提取效果</button>
+          <button type="button" class="btn btn-gold btn-xs" data-act="clone" data-id="${escapeHtml(c.templateId)}">📋 复制为新卡</button>
+          <button type="button" class="btn btn-outline btn-xs" data-act="patch" data-id="${escapeHtml(c.templateId)}">🔧 直接改原版</button>
+          <button type="button" class="btn btn-subtle btn-xs" data-act="extract" data-id="${escapeHtml(c.templateId)}" title="查看并把这张原版卡的某条效果直接复制到正在编辑的卡牌里">🧲 提取效果</button>
         </div>
       </div>
     `;
@@ -1624,7 +1630,12 @@
     readManifestForm();
     const modId = state.workspace.manifest.id || state.currentModId || 'draft-mod';
     switchTab('validate');
-    $('valSummaryBanner').textContent = '⏳ 正在隔离沙盒中执行 10 道防 Bug 铁闸 + 50 场真实 CombatSimulator 压测，请稍候...';
+    const summaryEl = $('valSummaryBanner');
+    if (summaryEl) {
+      summaryEl.textContent = '⏳ 正在隔离沙盒中执行 10 道防 Bug 铁闸 + 50 场真实 CombatSimulator 压测，请稍候...';
+      summaryEl.style.color = '';
+      summaryEl.classList.remove('is-pass', 'is-fail');
+    }
     $('gatesGrid').innerHTML = '<div class="empty-hint">压测引擎运行中...</div>';
 
     const payload = useInMemoryDraft ? { draft: state.workspace, matches: 50, seed: 2026131 } : { matches: 50, seed: 2026131 };
@@ -1642,8 +1653,14 @@
   }
 
   function renderValidationReport(rep) {
-    $('valSummaryBanner').textContent = `${rep.passed ? '✅' : '❌'} ${rep.summaryZh}（总耗时 ${rep.totalDurationMs}ms）`;
-    $('valSummaryBanner').style.color = rep.passed ? 'var(--status-green)' : 'var(--status-red)';
+    // 体检摘要独立于 .panel-header 下方全宽展示，避免长文案挤压顶部 3 按钮折行
+    const summaryEl = $('valSummaryBanner');
+    if (summaryEl) {
+      summaryEl.textContent = `${rep.passed ? '✅' : '❌'} ${rep.summaryZh}（总耗时 ${rep.totalDurationMs}ms）`;
+      summaryEl.style.color = rep.passed ? 'var(--status-green)' : 'var(--status-red)';
+      summaryEl.classList.toggle('is-pass', !!rep.passed);
+      summaryEl.classList.toggle('is-fail', !rep.passed);
+    }
     $('btnPublishReload').disabled = !(rep.passed && state.meta?.canWrite);
 
     const sr = rep.combatStressReport;

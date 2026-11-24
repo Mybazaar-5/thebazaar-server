@@ -896,6 +896,8 @@
         "attributes": { "oneOf": [{ "$ref": "#/$defs/AttributeMap" }, { "type": "null" }] },
         "tiers": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/TierData" } },
         "enchantments": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/EnchantmentData" } },
+        "disableAutoEnchantments": { "type": "boolean" },
+        "disabledEnchantments": { "type": ["array", "null"], "items": { "type": "string" } },
         "abilities": { "type": "object", "additionalProperties": { "$ref": "#/$defs/AbilityDefinition" } },
         "auras": { "type": "object", "additionalProperties": { "$ref": "#/$defs/AuraDefinition" } },
         "quests": { "type": ["array", "null"], "items": { "$ref": "#/$defs/QuestDefinition" } },

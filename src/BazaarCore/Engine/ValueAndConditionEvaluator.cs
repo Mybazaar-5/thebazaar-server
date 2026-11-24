@@ -577,9 +577,12 @@ public static class ValueAndConditionEvaluator
             "TCardConditionalHasEnchantment" => ApplyNegation(
                 EvaluateHasEnchantment(cond, card),
                 cond.IsNot),
-            "TCardConditionalEnchantmentEligible" => !string.IsNullOrEmpty(cond.Enchantment)
+            "TCardConditionalEnchantmentEligible" => ApplyNegation(
+                !string.IsNullOrEmpty(cond.Enchantment)
                 && card.Template.Enchantments != null
-                && card.Template.Enchantments.ContainsKey(cond.Enchantment),
+                && (card.Template.Enchantments.ContainsKey(cond.Enchantment)
+                    || card.Template.Enchantments.Keys.Any(k => string.Equals(k, cond.Enchantment, StringComparison.OrdinalIgnoreCase))),
+                cond.IsNot),
             "TCardConditionalHero" => MatchListOperator(
                 cond.Heroes,
                 cond.Operator,

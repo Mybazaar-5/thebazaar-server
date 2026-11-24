@@ -368,6 +368,37 @@ public sealed class ModRegistry : IModContentRegistry
     }
 
     /// <summary>
+    /// P1-18：供 <see cref="ModValidator"/> Gate #10 隔离校验沙盒复用已构建的轻量 Overlay 仓库，
+    /// 避免与 Gate #9 重复全量克隆 <see cref="GameDataRepository"/> 及冗余复制全量本地化词典（绝不污染共享底库）。
+    /// </summary>
+    internal ModLoadReport LoadPackagesForValidationSandbox(
+        IReadOnlyList<ModPackage> candidatePackages,
+        string sourceLabel,
+        GameDataRepository baseRepo,
+        IReadOnlySet<string>? validVisualWhitelist,
+        GameDataRepository? prebuiltOverlayRepo)
+    {
+        ArgumentNullException.ThrowIfNull(candidatePackages);
+        for (int i = 0; i < candidatePackages.Count; i++)
+        {
+            EnsurePackageVisualMetadataReady(candidatePackages[i]);
+        }
+
+        lock (_syncLock)
+        {
+            return CommitCandidatePackagesLocked(
+                candidatePackages,
+                Array.Empty<ModValidationIssue>(),
+                sourceLabel,
+                baseRepo,
+                validVisualWhitelist,
+                keepPreviousOnError: false,
+                prebuiltOverlayRepo: prebuiltOverlayRepo,
+                reuseBaseLocalizationWhenPossible: true);
+        }
+    }
+
+    /// <summary>
     /// 热重载最近一次加载的 mods 目录；若设置 <paramref name="keepPreviousOnError"/> 为 true 且存在错误则自动保留旧的健康快照。
     /// </summary>
     public ModLoadReport Reload(bool keepPreviousOnError = true)
@@ -464,7 +495,9 @@ public sealed class ModRegistry : IModContentRegistry
         string sourceLabel,
         GameDataRepository baseRepo,
         IReadOnlySet<string>? whitelist,
-        bool keepPreviousOnError)
+        bool keepPreviousOnError,
+        GameDataRepository? prebuiltOverlayRepo = null,
+        bool reuseBaseLocalizationWhenPossible = false)
     {
         _validVisualWhitelist = whitelist;
 
@@ -658,6 +691,23 @@ public sealed class ModRegistry : IModContentRegistry
                 var mergedEnchOps = ExtractEnchantmentPreviewOps(mergedTpl.Enchantments);
                 if (mergedEnchOps is { Count: > 0 })
                     resolved.EnchantmentPreviewOps = mergedEnchOps;
+                if (mergedTpl.Enchantments is { Count: > 0 })
+                {
+                    foreach (var (enchKey, enchData) in mergedTpl.Enchantments)
+                    {
+                        if (string.IsNullOrWhiteSpace(enchKey) || enchData?.Localization?.Tooltips is not { Count: > 0 })
+                            continue;
+                        if (resolved.EnchantTooltipsZh.ContainsKey(enchKey))
+                            continue;
+                        var tips = enchData.Localization.Tooltips
+                            .Select(t => t?.Content?.Text)
+                            .Where(t => !string.IsNullOrWhiteSpace(t))
+                            .Select(t => t!.Trim())
+                            .ToList();
+                        if (tips.Count > 0)
+                            resolved.EnchantTooltipsZh[enchKey] = tips;
+                    }
+                }
                 if (mergedTpl.Tags is { Count: > 0 })
                     resolved.Tags = new List<string>(mergedTpl.Tags);
 
@@ -717,13 +767,25 @@ public sealed class ModRegistry : IModContentRegistry
 
         var mergedCards = mergedCardsById.Values.ToList();
 
-        // 构建或派生四层外挂本地化存储
-        OverlayLocalizationStore activeLoc = CreateDerivedLocalizationStore(baseRepo.Localization, modLocDocs);
+        // 构建或派生四层外挂本地化存储（校验沙盒复用只读底库词典，避免无谓复制 10,000+ 词条）
+        OverlayLocalizationStore activeLoc = (reuseBaseLocalizationWhenPossible && baseRepo.Localization is OverlayLocalizationStore sharedBaseLoc)
+            ? sharedBaseLoc
+            : CreateDerivedLocalizationStore(baseRepo.Localization, modLocDocs);
 
-        // 基于纯净 BaseRepository 派生不可变 ActiveRepository 副本
-        GameDataRepository activeRepo = (mergedCards.Count > 0 || mergedMonsters.Count > 0 || modLocDocs.Count > 0)
-            ? baseRepo.CreateWithOverlay(mergedCards, mergedMonsters, activeLoc)
-            : baseRepo;
+        // 基于纯净 BaseRepository 派生不可变 ActiveRepository（优先复用校验沙盒共享轻量 Overlay，并零拷贝共享只读元表）
+        GameDataRepository activeRepo;
+        if (mergedCards.Count == 0 && mergedMonsters.Count == 0 && ReferenceEquals(activeLoc, baseRepo.Localization))
+        {
+            activeRepo = baseRepo;
+        }
+        else if (prebuiltOverlayRepo != null && validOrdered.Count == candidates.Count && _cardProviders.Count == 0)
+        {
+            activeRepo = prebuiltOverlayRepo;
+        }
+        else
+        {
+            activeRepo = ModValidator.BuildLightweightOverlayRepository(baseRepo, mergedCards, mergedMonsters, activeLoc);
+        }
 
         string modSetHash = ComputeCombinedModSetHash(validOrdered);
         var (visualJson, visualHash) = SerializeVisualCatalog(visualBindingsMap);
@@ -878,7 +940,10 @@ public sealed class ModRegistry : IModContentRegistry
 
     private static RegistrySnapshot BuildEmptySnapshot(GameDataRepository baseRepo, string sourceLabel)
     {
-        var activeLoc = CreateDerivedLocalizationStore(baseRepo.Localization, null);
+        // P1-18：空快照（无任何 Mod 叠加）直接只读共享底库 OverlayLocalizationStore，避免 CreateIsolated/RollbackToBase 重复复制全量词典
+        var activeLoc = baseRepo.Localization is OverlayLocalizationStore existingBaseLoc
+            ? existingBaseLoc
+            : CreateDerivedLocalizationStore(baseRepo.Localization, null);
         var report = new ModLoadReport
         {
             LoadedAtUtc = DateTimeOffset.UtcNow,

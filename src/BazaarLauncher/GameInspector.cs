@@ -9,6 +9,7 @@ using System.Reflection;
 using BazaarGameShared.Domain.Core.Types;
 using HarmonyLib;
 using UnityEngine;
+using UnityEngine.Playables;
 using UnityEngine.Profiling;
 using UnityEngine.SceneManagement;
 
@@ -30,6 +31,7 @@ internal static class GameInspector
     private static readonly ConcurrentDictionary<Type, Func<object, object>> _templateMethodGetters = new();
     private static readonly ConcurrentDictionary<Type, Func<object, object>> _enchantmentMethodGetters = new();
     private static readonly ConcurrentDictionary<Type, Func<object, bool>> _hasCardsPendingRemovalGetters = new();
+    private static readonly ConcurrentDictionary<Type, Func<object, bool>> _cardsForRevealAvailableGetters = new();
     private static readonly ConcurrentDictionary<string, Type> _safeTypeCache = new(StringComparer.Ordinal);
 
     private static bool _handlesInitialized;
@@ -41,6 +43,8 @@ internal static class GameInspector
     private static Type _mainMenuControllerType;
     private static Type _itemCardType;
     private static Type _socketEffectType;
+    private static Type _cardControllerType;
+    private static Type _searchOpponentTransitionType;
 
     // 核心静态属性/字段预编译委托
     private static Func<object> _getDataRun;
@@ -52,6 +56,8 @@ internal static class GameInspector
     private static Func<object> _getDataPlayerHealthBar;
     private static Func<object> _getDataCardRemoval;
     private static Func<object> _getDataTransitionIn;
+    private static Func<object> _getDataTransitionOut;
+    private static Func<object> _getDataNewDayTransition;
     private static Func<object> _getDataCurrentEncounterId;
     private static Func<object> _getDataCurrentEncounterController;
     private static Func<object> _getDataSimPvpOpponent;
@@ -64,7 +70,11 @@ internal static class GameInspector
     private static Func<object> _getAppGameStateHandler;
 
     private static Func<object> _getBoardManagerSingleton;
+    private static Func<object, bool> _bmHasCardsToReveal;
+    private static Func<object, bool> _bmIsBoardPresentationReady;
     private static Func<object> _getSceneLoaderTransitioning;
+    private static Func<object> _getCardCtrlAnyDragging;
+    private static Func<object> _getSearchOpponentInTransition;
     private static Func<object> _getCmdInstance;
     private static Func<object, object, object> _getCardControllerDelegate;
 
@@ -93,6 +103,8 @@ internal static class GameInspector
         _mainMenuControllerType = FindTypeSafe("TheBazaar.UI.Menu.MainMenuController");
         _itemCardType = FindTypeSafe("BazaarGameClient.Domain.Models.Cards.ItemCard");
         _socketEffectType = FindTypeSafe("BazaarGameClient.Domain.Models.Cards.SocketEffect");
+        _cardControllerType = FindTypeSafe("CardController", "TheBazaar.CardController");
+        _searchOpponentTransitionType = FindTypeSafe("SearchOpponentTransition", "TheBazaar.SearchOpponentTransition");
 
         if (_dataType != null)
         {
@@ -105,6 +117,8 @@ internal static class GameInspector
             _getDataPlayerHealthBar = CompileStaticGetter(_dataType, "PlayerHealthBar");
             _getDataCardRemoval = CompileStaticGetter(_dataType, "CardRemoval");
             _getDataTransitionIn = CompileStaticGetter(_dataType, "TransitionIn");
+            _getDataTransitionOut = CompileStaticGetter(_dataType, "TransitionOut");
+            _getDataNewDayTransition = CompileStaticGetter(_dataType, "NewDayTransitionController");
             _getDataCurrentEncounterId = CompileStaticGetter(_dataType, "CurrentEncounterId");
             _getDataCurrentEncounterController = CompileStaticGetter(_dataType, "CurrentEncounterController");
             _getDataSimPvpOpponent = CompileStaticGetter(_dataType, "SimPvpOpponent");
@@ -123,11 +137,23 @@ internal static class GameInspector
         if (_boardManagerType != null)
         {
             _getBoardManagerSingleton = CompileStaticGetterIncludingBase(_boardManagerType, "Instance");
+            _bmHasCardsToReveal = BuildZeroArgBoolMethod(_boardManagerType, "HasCardsToReveal");
+            _bmIsBoardPresentationReady = BuildZeroArgBoolMethod(_boardManagerType, "IsBoardPresentationReady");
         }
 
         if (_sceneLoaderType != null)
         {
             _getSceneLoaderTransitioning = CompileStaticGetter(_sceneLoaderType, "IsTransitioning");
+        }
+
+        if (_cardControllerType != null)
+        {
+            _getCardCtrlAnyDragging = CompileStaticGetter(_cardControllerType, "IsAnyCardDragging");
+        }
+
+        if (_searchOpponentTransitionType != null)
+        {
+            _getSearchOpponentInTransition = CompileStaticGetter(_searchOpponentTransitionType, "IsInTransition");
         }
 
         if (_cmdType != null)
@@ -338,9 +364,68 @@ internal static class GameInspector
             return true;
         }
 
+        if (IsSceneTransitioning())
+        {
+            reason = "sceneTransitioning";
+            return true;
+        }
+
+        if (SafeInvoke(_getSearchOpponentInTransition) is bool oppTrans && oppTrans)
+        {
+            reason = "searchOpponentTransition";
+            return true;
+        }
+
+        // P3-04：跨日过场遮罩（TheBazaar.Data.NewDayTransitionController -> NewDayTransitionController.IsActive）
+        var newDayCtrl = SafeInvoke(_getDataNewDayTransition);
+        if (IsUnityAlive(newDayCtrl) && GetMember(newDayCtrl, "IsActive") is bool ndActive && ndActive)
+        {
+            reason = "newDayTransition";
+            return true;
+        }
+
+        // P3-05：清板/退店延迟动画门控（含 ClearBoardTriggerComponent 600ms 延迟与 ClearPortrait 窗口）与入场过渡序列
+        var transOut = SafeInvoke(_getDataTransitionOut);
+        if (IsUnityAlive(transOut) && GetMember(transOut, "IsProcessing") is bool tOutBusy && tOutBusy)
+        {
+            reason = "transitionOut";
+            return true;
+        }
+
+        var transIn = SafeInvoke(_getDataTransitionIn);
+        if (IsUnityAlive(transIn) && GetMember(transIn, "IsProcessing") is bool tInBusy && tInBusy)
+        {
+            reason = "transitionIn";
+            return true;
+        }
+
+        // P1-14 / P2-06 / P2-07：待移除卡牌队列（Data.CardRemoval.HasCardsPendingRemoval）
+        if (HasCardsPendingRemoval())
+        {
+            reason = "cardsPendingRemoval";
+            return true;
+        }
+
+        var curAppState = GetCurrentAppState();
+        string curAppStateName = curAppState?.GetType().Name ?? "";
+
+        // P1-13 / P0-01：祭坛正在等待升级/附魔展示动画 _animationCompleted 期间视为忙碌，防止过早放行重复提交
+        if (string.Equals(curAppStateName, "PedestalState", StringComparison.Ordinal)
+            && GetMember(curAppState, "CanHandleCurrentUpgradeMessage") is bool pedHandling && pedHandling
+            && GetMember(curAppState, "_animationCompleted") is bool pedDone && !pedDone)
+        {
+            reason = "pedestalAnimating";
+            return true;
+        }
+
         var bm = GetBoardManagerCached();
         if (bm != null)
         {
+            if (GetMember(bm, "IsInitialized") is bool bmInit && !bmInit)
+            {
+                reason = "boardInitializing";
+                return true;
+            }
             if (GetMember(bm, "IsUpdatingBoard") is bool updBoard && updBoard)
             {
                 reason = "updatingBoard";
@@ -356,16 +441,221 @@ internal static class GameInspector
                 reason = "storageMoving";
                 return true;
             }
+
+            // P1-14 / P2-06 / P2-07：发牌、生成、移除与翻牌动画队列门控（对齐 BoardManager 官方字段）
+            if (GetMember(bm, "_cardsBeingDealt") is bool beingDealt && beingDealt)
+            {
+                reason = "cardsBeingDealt";
+                return true;
+            }
+            if (GetMember(bm, "_cardsBeingSpawned") is bool beingSpawned && beingSpawned)
+            {
+                reason = "cardsBeingSpawned";
+                return true;
+            }
+            if (GetMember(bm, "_isRemovingCards") is bool removingCards && removingCards)
+            {
+                reason = "removingCards";
+                return true;
+            }
+            if (GetMember(bm, "_isRevealing") is bool revealing && revealing)
+            {
+                reason = "revealing";
+                return true;
+            }
+            if (HasBoardCardsToReveal(bm))
+            {
+                reason = "cardsToReveal";
+                return true;
+            }
+
+            // P2-09：融合与升级展示动画（BoardManager 状态位 + 3 路 CardFusionAnimationDriver PlayableGraph 活跃态）
+            if (GetMember(bm, "IsPlayingUpgradeOrFuseAnimation") is bool upgFuseAnim && upgFuseAnim)
+            {
+                reason = "upgradeOrFuseAnim";
+                return true;
+            }
+            if (GetMember(bm, "IsProcessingUpgradeOrFuseOrEnchant") is bool upgFuseProc && upgFuseProc)
+            {
+                reason = "upgradeOrFuseOrEnchant";
+                return true;
+            }
+            if (IsAnyCardFusionDriverActive(bm))
+            {
+                reason = "cardFusionAnim";
+                return true;
+            }
+
+            // 附魔展示动画（BoardManager._enchantManager.IsEnchanting）
+            var enchantMgr = GetMember(bm, "_enchantManager");
+            if (IsUnityAlive(enchantMgr) && GetMember(enchantMgr, "IsEnchanting") is bool enchanting && enchanting)
+            {
+                reason = "enchanting";
+                return true;
+            }
+
+            // 切板过渡动画（BoardManager._boardTransition.IsTransitioning）
+            var boardTrans = GetMember(bm, "_boardTransition");
+            if (boardTrans != null && GetMember(boardTrans, "IsTransitioning") is bool boardTransBusy && boardTransBusy)
+            {
+                reason = "boardTransition";
+                return true;
+            }
+
+            // 棋盘呈现层加载/更新/就绪态（BoardManager.isUpdatingPresentation / IsBoardPresentationReady）
+            if (GetMember(bm, "isUpdatingPresentation") is bool updPres && updPres)
+            {
+                reason = "updatingPresentation";
+                return true;
+            }
+            if (!IsBoardPresentationReady(bm))
+            {
+                reason = "presentationNotReady";
+                return true;
+            }
+            if (GetMember(bm, "IsBoardFlipped") is bool boardFlipped && boardFlipped)
+            {
+                reason = "boardFlipped";
+                return true;
+            }
         }
 
-        if (IsSceneTransitioning())
+        if (SafeInvoke(_getAppBlockInput) is bool blockInput && blockInput)
         {
-            reason = "sceneTransitioning";
+            reason = "blockInput";
+            return true;
+        }
+
+        if (SafeInvoke(_getCardCtrlAnyDragging) is bool dragging && dragging)
+        {
+            reason = "cardDragging";
+            return true;
+        }
+
+        // P3-05 全面兜底对齐官方 BoardManager.AllowInteractionIgnoringSimHandlers：
+        // 官方属性内部硬编码 !IsCombatState() && !(CurrentState is ReplayState)，
+        // 因此仅在交互态下执行此兜底对齐，既覆盖全部未知官方交互锁，又避免阻断战斗推进或 ReplayState 退场。
+        if (bm != null
+            && IsInteractiveBoardAppState(curAppStateName)
+            && GetMember(bm, "AllowInteractionIgnoringSimHandlers") is bool allowInter
+            && !allowInter)
+        {
+            reason = "allowInteractionBlocked";
             return true;
         }
 
         reason = null;
         return false;
+    }
+
+    private static bool IsUnityAlive(object obj)
+    {
+        if (obj == null) return false;
+        if (obj is UnityEngine.Object uo) return uo != null;
+        return true;
+    }
+
+    private static bool IsInteractiveBoardAppState(string appStateName)
+    {
+        return appStateName is "ChoiceState"
+            or "EncounterState"
+            or "PedestalState"
+            or "LootState"
+            or "LevelUpState"
+            or "TournamentPvpChoiceState";
+    }
+
+    private static bool HasBoardCardsToReveal(object bm)
+    {
+        if (bm == null) return false;
+        if (_bmHasCardsToReveal != null)
+        {
+            try
+            {
+                return _bmHasCardsToReveal(bm);
+            }
+            catch
+            {
+                // 极端初始化窗口若有某一路动画控制器尚未装配导致原生方法抛 NRE，逐路安全降级检测
+            }
+        }
+
+        // 逐路核查 5 路 BaseCardBoardAnimationController 与 2 个待呈现列表（严格对齐 BoardManager.HasCardsToReveal）
+        if (IsRevealControllerPending(GetMember(bm, "skillItemBoardAnimationController"))) return true;
+        if (IsRevealControllerPending(GetMember(bm, "cardItemBoardAnimationController"))) return true;
+        if (IsRevealControllerPending(GetMember(bm, "encounterItemBoardAnimationController"))) return true;
+        if (IsRevealControllerPending(GetMember(bm, "rewardItemBoardAnimationController"))) return true;
+        if (IsRevealControllerPending(GetMember(bm, "socketEffectsAnimationController"))) return true;
+        if (GetMember(bm, "skillsForPlayerPresentation") is ICollection skPres && skPres.Count > 0) return true;
+        if (GetMember(bm, "_playerCardsOnBoard") is ICollection pBoard && pBoard.Count > 0) return true;
+        return false;
+    }
+
+    private static bool IsRevealControllerPending(object animCtrl)
+    {
+        if (!IsUnityAlive(animCtrl)) return false;
+        try
+        {
+            var fn = _cardsForRevealAvailableGetters.GetOrAdd(
+                animCtrl.GetType(),
+                t => BuildZeroArgBoolMethod(t, "CardsForRevealAvailable") ?? (_ => false));
+            return fn(animCtrl);
+        }
+        catch
+        {
+            return GetMember(animCtrl, "_cardsForReveal") is ICollection col && col.Count > 0;
+        }
+    }
+
+    private static bool IsBoardPresentationReady(object bm)
+    {
+        if (bm == null) return true;
+        if (_bmIsBoardPresentationReady != null)
+        {
+            try { return _bmIsBoardPresentationReady(bm); }
+            catch { }
+        }
+
+        if (GetMember(bm, "IsBoardStatePresentationLoading") is bool loading && loading)
+            return false;
+        var pres = GetMember(bm, "BoardStatePresentation");
+        if (IsUnityAlive(pres) && GetMember(pres, "IsInitialized") is bool presInit && !presInit)
+            return false;
+        return true;
+    }
+
+    private static bool IsAnyCardFusionDriverActive(object bm)
+    {
+        if (bm == null) return false;
+        return IsCardFusionDriverActive(GetMember(bm, "cardFusionToBoardSelectedAnimationDriver"))
+               || IsCardFusionDriverActive(GetMember(bm, "cardFusionToBoardFusedAnimationDriver"))
+               || IsCardFusionDriverActive(GetMember(bm, "cardFusionToStashAnimationDriver"));
+    }
+
+    private static bool IsCardFusionDriverActive(object driver)
+    {
+        if (driver == null) return false;
+        try
+        {
+            var graphObj = GetMember(driver, "_playableGraph");
+            if (graphObj is not PlayableGraph graph || !graph.IsValid())
+                return false;
+
+            int rootCount = graph.GetRootPlayableCount();
+            if (rootCount <= 0)
+                return graph.IsPlaying();
+
+            for (int i = 0; i < rootCount; i++)
+            {
+                if (!graph.GetRootPlayable(i).IsDone())
+                    return true;
+            }
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     internal static Dictionary<string, object> GetPerfSnapshot()
@@ -1065,7 +1355,7 @@ internal static class GameInspector
         return string.Equals(card.GetType().Name, "ItemCard", StringComparison.Ordinal);
     }
 
-    private static Dictionary<string, object> DescribePedestalState(string currentEncounterId)
+    internal static Dictionary<string, object> DescribePedestalState(string currentEncounterId)
     {
         try
         {
@@ -1173,7 +1463,7 @@ internal static class GameInspector
         if (cname is "TCardConditionalHasEnchantment" or "TCardConditionalEnchantmentEligible")
         {
             hasEnchantCond = true;
-            if (string.IsNullOrEmpty(targetEnchantment) && cname == "TCardConditionalHasEnchantment")
+            if (string.IsNullOrEmpty(targetEnchantment))
             {
                 targetEnchantment = GetMember(criteria, "Enchantment")?.ToString();
             }
@@ -1294,6 +1584,23 @@ internal static class GameInspector
         catch
         {
             return o => m.Invoke(o, null);
+        }
+    }
+
+    private static Func<object, bool> BuildZeroArgBoolMethod(Type type, string methodName)
+    {
+        if (type == null || string.IsNullOrEmpty(methodName)) return null;
+        var m = type.GetMethod(methodName, AnyInstance, null, Type.EmptyTypes, null);
+        if (m == null || m.ReturnType != typeof(bool)) return null;
+        try
+        {
+            var param = Expression.Parameter(typeof(object), "obj");
+            var call = Expression.Call(Expression.Convert(param, m.DeclaringType ?? type), m);
+            return Expression.Lambda<Func<object, bool>>(call, param).Compile();
+        }
+        catch
+        {
+            return o => m.Invoke(o, null) is bool b && b;
         }
     }
 

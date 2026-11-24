@@ -62,21 +62,25 @@ code, pre { font-family: "Cascadia Code", "Consolas", monospace; }
 .token-box.token-box-collapsed { display: none; }
 .token-box input { width: 150px; padding: 5px 8px; font-size: 12px; }
 
-/* Tab 栏 */
+/* Tab 栏（显式禁用纵向溢出并以负底边距贴边，彻底消除双分辨率白色原生纵向滚动条） */
 .tabbar {
   display: flex; gap: 6px; padding: 10px 22px 0; background: rgba(9, 20, 36, 0.85);
-  border-bottom: 1px solid var(--border-subtle); overflow-x: auto;
+  border-bottom: 1px solid var(--border-subtle); overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: thin; scrollbar-color: rgba(216, 164, 68, 0.35) transparent;
 }
+.tabbar::-webkit-scrollbar { height: 5px; }
+.tabbar::-webkit-scrollbar-track { background: transparent; }
+.tabbar::-webkit-scrollbar-thumb { background: rgba(216, 164, 68, 0.35); border-radius: 99px; }
 .tab-btn {
   display: flex; align-items: center; gap: 8px; padding: 10px 16px;
   background: transparent; color: var(--text-secondary); border: 1px solid transparent;
   border-bottom: none; border-radius: 10px 10px 0 0; cursor: pointer; font-weight: 600;
-  transition: all 0.15s ease; white-space: nowrap;
+  transition: all 0.15s ease; white-space: nowrap; flex-shrink: 0;
 }
 .tab-btn:hover { color: var(--gold-light); background: rgba(216, 164, 68, 0.08); }
 .tab-btn.active {
   background: var(--bg-panel); color: var(--gold-light);
-  border-color: var(--border-strong); position: relative; top: 1px;
+  border-color: var(--border-strong); position: relative; top: 0; margin-bottom: -1px;
 }
 .tab-num {
   width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center;
@@ -94,16 +98,32 @@ code, pre { font-family: "Cascadia Code", "Consolas", monospace; }
   border: 1px solid var(--border-subtle); border-radius: var(--radius);
   padding: 16px; box-shadow: var(--shadow);
 }
-.panel-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+/* 面板标题栏：左侧标题区允许收缩省略，右侧操作按钮组禁止被长摘要挤压折行 */
+.panel-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  flex-wrap: wrap; gap: 8px 12px; margin-bottom: 14px;
+}
 .panel-header.compact { margin-bottom: 10px; align-items: center; }
+.panel-header.panel-header-tight { margin-bottom: 6px; align-items: center; }
+.panel-header > :first-child { min-width: 0; flex: 1 1 auto; }
+.panel-header > .btn-row { flex-shrink: 0; max-width: 100%; }
 .panel-header h2 { font-size: 16px; color: var(--gold-light); }
+.panel-subtitle { margin: 0 0 12px; line-height: 1.5; word-break: break-word; }
+.val-summary-banner {
+  margin: 0 0 14px; padding: 8px 12px; border-radius: 8px;
+  background: rgba(9, 21, 36, 0.72); border: 1px solid rgba(159, 179, 200, 0.18);
+}
+.val-summary-banner.is-pass { border-color: rgba(56, 211, 153, 0.42); background: rgba(56, 211, 153, 0.08); }
+.val-summary-banner.is-fail { border-color: rgba(242, 95, 109, 0.45); background: rgba(242, 95, 109, 0.08); }
 
 /* 网格布局 */
 .grid-two-col { display: grid; grid-template-columns: 1fr 1.15fr; gap: 16px; }
+.grid-two-col > * { min-width: 0; }
 .grid-two-col.narrow-left { grid-template-columns: 320px 1fr; }
-.three-col-studio { display: grid; grid-template-columns: 330px 1fr 310px; gap: 14px; align-items: start; }
+.three-col-studio { display: grid; grid-template-columns: 356px minmax(0, 1fr) 316px; gap: 14px; align-items: start; }
+.three-col-studio > * { min-width: 0; }
 
-/* 表单与按钮 */
+/* 表单与按钮（双列字段底部对齐，彻底消除长 label 折行造成的输入框基线错位） */
 input[type="text"], input[type="number"], input[type="password"], select, textarea {
   width: 100%; background: var(--bg-input); color: var(--text-primary);
   border: 1px solid rgba(159, 179, 200, 0.25); border-radius: 7px;
@@ -111,9 +131,9 @@ input[type="text"], input[type="number"], input[type="password"], select, textar
 }
 input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-shadow: 0 0 0 2px rgba(216, 164, 68, 0.18); }
 
-.form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 12px; }
-.field { display: flex; flex-direction: column; gap: 4px; }
-.field > span { font-size: 12px; color: var(--text-secondary); }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; align-items: stretch; }
+.field { display: flex; flex-direction: column; justify-content: flex-end; gap: 4px; min-width: 0; }
+.field > span { font-size: 12px; color: var(--text-secondary); line-height: 1.4; }
 .field.span-2 { grid-column: span 2; }
 .inline-pair { display: flex; align-items: center; gap: 8px; }
 
@@ -168,17 +188,19 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-
   background: rgba(56, 211, 153, 0.09); border: 1px solid rgba(56, 211, 153, 0.32);
   font-size: 12.5px; color: #c9f7e4;
 }
-.summary-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 14px; }
-.metric-chip { background: var(--bg-input); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 8px 10px; text-align: center; }
-.metric-chip span { display: block; font-size: 11.5px; color: var(--text-secondary); }
+/* Tab 1 统计网格：宽屏固定 6 列，窄横屏通过媒体查询切换 3×2 / 2×3，彻底消除 5+1 孤卡行 */
+.summary-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin-top: 14px; }
+.metric-chip { background: var(--bg-input); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 8px 6px; text-align: center; min-width: 0; }
+.metric-chip span { display: block; font-size: 11.5px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .metric-chip strong { font-size: 18px; color: var(--gold-light); }
 .panel-footer-actions { display: flex; justify-content: space-between; margin-top: 16px; gap: 10px; }
 
-/* Tab 2 卡牌工作室 */
-.subtab-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px; }
+/* Tab 2 卡牌工作室（切换键不拆字 + 原版卡操作行防裁切 + 细暗色滚动条） */
+.subtab-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .subtab {
-  padding: 7px 8px; border-radius: 7px; border: 1px solid var(--border-subtle);
-  background: var(--bg-input); color: var(--text-secondary); cursor: pointer; font-weight: 600; font-size: 12.5px;
+  flex: 1 1 auto; padding: 7px 8px; border-radius: 7px; border: 1px solid var(--border-subtle);
+  background: var(--bg-input); color: var(--text-secondary); cursor: pointer; font-weight: 600;
+  font-size: 12px; white-space: nowrap; text-align: center;
 }
 .subtab.active { background: rgba(216, 164, 68, 0.18); color: var(--gold-light); border-color: var(--gold-main); }
 .subpanel { display: none; }
@@ -186,7 +208,14 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-
 .search-stack { display: flex; flex-direction: column; gap: 6px; }
 .filter-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px; }
 .search-meta { font-size: 12px; color: var(--text-secondary); margin: 8px 0 6px; }
-.scroll-list { max-height: 580px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding-right: 2px; }
+.scroll-list {
+  max-height: 580px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;
+  padding-right: 4px; scrollbar-gutter: stable;
+  scrollbar-width: thin; scrollbar-color: rgba(216, 164, 68, 0.32) transparent;
+}
+.scroll-list::-webkit-scrollbar { width: 6px; }
+.scroll-list::-webkit-scrollbar-track { background: transparent; }
+.scroll-list::-webkit-scrollbar-thumb { background: rgba(216, 164, 68, 0.32); border-radius: 99px; }
 .scroll-list.compact { max-height: 250px; }
 
 .base-card-row {
@@ -195,9 +224,10 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-
 }
 .base-card-row:hover { border-color: var(--border-strong); }
 .bcr-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
-.bcr-title { font-weight: 700; color: var(--text-primary); font-size: 13px; }
+.bcr-title { font-weight: 700; color: var(--text-primary); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bcr-sub { font-size: 11.5px; color: var(--text-muted); }
-.bcr-actions { display: flex; gap: 5px; margin-top: 2px; }
+.bcr-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.bcr-actions .btn-xs { padding: 3px 6px; font-size: 11px; flex: 0 1 auto; }
 
 .mine-section-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 12.5px; color: var(--gold-light); }
 .mine-row {
@@ -206,7 +236,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-
 }
 .mine-row.active { border-color: var(--gold-light); background: rgba(216, 164, 68, 0.14); }
 
-.mode-pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 700; }
+.mode-pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 700; white-space: nowrap; flex-shrink: 0; }
 .mode-new { background: rgba(56, 211, 153, 0.18); color: var(--status-green); border: 1px solid rgba(56, 211, 153, 0.45); }
 .mode-patch { background: rgba(91, 184, 255, 0.18); color: var(--status-blue); border: 1px solid rgba(91, 184, 255, 0.45); }
 
@@ -234,11 +264,14 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-
 }
 .advanced-json summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
 
-/* 实时鎏金卡牌预览 */
-.tier-switcher { display: flex; gap: 4px; }
+/* 实时鎏金卡牌预览（标题不拆字、品阶圆点整组换行，消除「预/览」单字折行） */
+.studio-col-right .panel-header.compact { flex-wrap: wrap; gap: 6px 8px; }
+.studio-col-right .panel-header.compact h2 { white-space: nowrap; font-size: 15px; flex: 0 0 auto; }
+.tier-switcher { display: flex; gap: 4px; flex-wrap: nowrap; flex-shrink: 0; }
 .tier-dot {
   width: 26px; height: 26px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2);
-  background: var(--bg-input); color: var(--text-secondary); font-size: 11.5px; cursor: pointer; font-weight: 700;
+  background: var(--bg-input); color: var(--text-secondary); font-size: 11.5px; cursor: pointer;
+  font-weight: 700; flex-shrink: 0; white-space: nowrap;
 }
 .tier-dot.active { border-color: var(--gold-light); color: var(--bg-deep); background: var(--gold-light); }
 
@@ -529,9 +562,13 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-
 .extra-subtab.active { background: rgba(216, 164, 68, 0.2); color: var(--gold-light); border-color: var(--gold-main); }
 .extra-pane { display: none; }
 .extra-pane.active { display: block; }
-.summary-strip { grid-template-columns: repeat(auto-fit, minmax(98px, 1fr)); }
 
-/* 窄横屏与紧凑视口适配（1280px / 1024px 彻底防 6 号标签右缘截断与顶栏挤压） */
+/* Tab 1 统计卡片确定性断点：宽屏 6 列，窄横屏（含 1280×720）整齐 3×2，彻底消除 5+1 孤卡行 */
+@media (max-width: 1440px) {
+  .summary-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* 窄横屏与紧凑视口适配（1280px / 1024px 彻底防 6 号标签右缘截断、顶栏挤压与 Tab 2 按钮裁切） */
 @media (max-width: 1360px) {
   .topbar { padding: 9px 14px; gap: 10px; flex-wrap: wrap; }
   .brand { min-width: 0; }
@@ -540,6 +577,11 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-
   .tabbar { padding: 8px 14px 0; gap: 4px; }
   .tab-btn { padding: 8px 11px; gap: 6px; font-size: 13px; }
   .tab-num { width: 18px; height: 18px; font-size: 10.5px; }
+  .main-content { padding: 14px 16px 28px; }
+  .card-panel { padding: 14px; }
+  .three-col-studio { grid-template-columns: 344px minmax(0, 1fr) 298px; gap: 12px; }
+  .studio-col-right .panel-header.compact h2 { font-size: 14.5px; }
+  .studio-col-right .tier-dot { width: 25px; height: 25px; font-size: 11px; }
 }
 
 @media (max-width: 1180px) {
@@ -547,6 +589,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-
   .tabbar {
     flex-wrap: wrap;
     overflow-x: visible;
+    overflow-y: visible;
     padding: 8px 12px 6px;
     gap: 6px;
   }
@@ -559,9 +602,14 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-main); box-
   }
   .tab-btn.active {
     top: 0;
+    margin-bottom: 0;
     border-bottom-color: var(--border-strong);
   }
   .three-col-studio, .grid-two-col, .grid-two-col.narrow-left, .gates-grid { grid-template-columns: 1fr; }
   .stress-kpis { grid-template-columns: repeat(2, 1fr); }
   .mech-step-row { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 720px) {
+  .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

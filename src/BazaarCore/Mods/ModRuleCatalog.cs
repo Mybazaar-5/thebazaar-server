@@ -250,11 +250,20 @@ public static class ModRuleCatalog
             enchantments = EnchantmentNames.All.Select(e => new CatalogItem(e, EnchantmentNames.GetChineseName(e), $"附魔类型 {e}", true)).ToList(),
             tags = GetCommonTags(),
             hiddenTags = GetCommonHiddenTags(),
+            // 物品/技能商店语境：Common 仅表示 Curio 等中立/奇物店专属池，不出现在杰杰等常规英雄商店
             heroes = new[] { HeroNames.Common }.Concat(HeroNames.PlayableHeroes).Select(h =>
             {
                 var p = HeroNames.GetHeroProfile(h);
                 if (string.Equals(h, HeroNames.Common, StringComparison.OrdinalIgnoreCase))
                     return new CatalogItem(h, "中立/奇物店专属 (Common)", "仅在 Curio 等中立商店池刷出，不会出现在杰杰等常规英雄商店", false);
+                return new CatalogItem(h, p.DisplayName, p.Summary, true);
+            }).ToList(),
+            // 奇遇事件语境：Common 表示任意英雄对局均可触发该奇遇，独立文案与物品中立商店语境解耦
+            eventHeroes = new[] { HeroNames.Common }.Concat(HeroNames.PlayableHeroes).Select(h =>
+            {
+                var p = HeroNames.GetHeroProfile(h);
+                if (string.Equals(h, HeroNames.Common, StringComparison.OrdinalIgnoreCase))
+                    return new CatalogItem(h, "✨ 全英雄通用 (Common)", "任意英雄对局均可触发该奇遇（底层数据值仍保持 Common）", true);
                 return new CatalogItem(h, p.DisplayName, p.Summary, true);
             }).ToList(),
             sizes = new[]

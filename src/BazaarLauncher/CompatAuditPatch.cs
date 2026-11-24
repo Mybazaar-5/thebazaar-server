@@ -184,6 +184,16 @@ internal static partial class CompatAuditPatch
         ["opponentCardsForceShown"] = Volatile.Read(ref _opponentCardsForceShownCount),
         ["resumeCardsRecovered"] = Volatile.Read(ref _resumeCardsRecoveredCount),
         ["resumeSkillsRecovered"] = Volatile.Read(ref _resumeSkillsRecoveredCount),
+        ["pedestalVisualTierFixed"] = Volatile.Read(ref _pedestalVisualTierFixedCount),
+        ["skillDuplicateSkipped"] = Volatile.Read(ref _skillDuplicateSkippedCount),
+        ["spawnCardsQueueCleaned"] = Volatile.Read(ref _spawnCardsQueueCleanedCount),
+        ["w5HandVisibilityRecovered"] = Volatile.Read(ref _w5HandVisibilityRecoveredCount),
+        ["w5RevealQueueSnapshots"] = Volatile.Read(ref _w5RevealQueueSnapshotCount),
+        ["w5RevealFaceUpRestored"] = Volatile.Read(ref _w5RevealFaceUpRestoredCount),
+        ["w5SceneUnloadNreGuarded"] = Volatile.Read(ref _w5SceneUnloadNreGuardedCount),
+        ["w5FusionAbortedOnCombat"] = Volatile.Read(ref _w5FusionAbortedOnCombatCount),
+        ["w5MovedHandReactivated"] = Volatile.Read(ref _w5MovedHandReactivatedCount),
+        ["w5EncounterPortraitRecovered"] = Volatile.Read(ref _w5EncounterPortraitRecoveredCount),
     };
 
     /// <summary>P2-15 (H-1~H-6)：低频记录客户端防御兜底命中诊断日志（第 1、5 次及每 25 次输出），便于验证服务端修完后零触发。</summary>
@@ -202,9 +212,11 @@ internal static partial class CompatAuditPatch
         _gameSimApplied = false;
         _applied = false;
         Interlocked.Exchange(ref _gameSimPatchedCount, 0);
+        Interlocked.Exchange(ref _activeSkillAddCount, 0);
         _lastTriggeredPvpSnapshot = default;
         Interlocked.Increment(ref _gameSimVersion);
         CancelPendingRunScopedWatchdogs();
+        ClearWave5StabilityRunCaches();
         TryUnsubscribeSceneCleanupIfIdle();
     }
 
@@ -226,6 +238,8 @@ internal static partial class CompatAuditPatch
         Interlocked.Exchange(ref _encounterPatchedCount, 0);
         ClearParentEncounterCache("ResetEncounterAssetAppliedFlag");
         ClearEndOfRunChallengeGuards();
+        Interlocked.Increment(ref _w5EncounterPortraitSeq);
+        _w5RecoveringEncounterPortrait = false;
         TryUnsubscribeSceneCleanupIfIdle();
     }
 
@@ -275,6 +289,8 @@ internal static partial class CompatAuditPatch
             ClearParentEncounterCache(reason);
             ClearEndOfRunChallengeGuards();
             ClearCardQuestSubscribedGroups(reason);
+            ClearWave5StabilityRunCaches();
+            Interlocked.Exchange(ref _activeSkillAddCount, 0);
         }
         catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CompatAuditPatch:L279", diagEx); }
     }
@@ -305,6 +321,7 @@ internal static partial class CompatAuditPatch
         PatchDataApplySimPvpOpponent(patcher);
         PatchTransitionInHour6Guard(patcher);
         PatchUserFeedbackFixes(patcher);
+        PatchWave5Stability(patcher);
         Interlocked.Exchange(ref _gameSimPatchedCount, Math.Max(0, patcher.SucceededCount - before));
     }
 
@@ -346,6 +363,7 @@ internal static partial class CompatAuditPatch
         PatchPrizePassChallengesGuard(patcher);
         PatchEndOfRunChallengesGuard(patcher);
         PatchLootPaginatedReroll(patcher);
+        PatchWave5EncounterPortraitGuard(patcher);
         Interlocked.Exchange(ref _encounterPatchedCount, Math.Max(0, patcher.SucceededCount - before));
     }
 

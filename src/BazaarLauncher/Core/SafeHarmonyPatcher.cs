@@ -71,6 +71,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
     private readonly string _ownerModId;
     private readonly object _sync = new();
     private readonly List<string> _diagnosticNotes = new();
+    private readonly List<string> _failedLabels = new();
     private int _attempted;
     private int _succeeded;
     private int _degraded;
@@ -86,12 +87,66 @@ internal sealed class SafeHarmonyPatcher : IDisposable
     internal int AttemptedCount => Volatile.Read(ref _attempted);
     internal int SucceededCount => Volatile.Read(ref _succeeded);
     internal int DegradedCount => Volatile.Read(ref _degraded);
+    internal int FailedCount => Math.Max(0, AttemptedCount - SucceededCount);
 
     internal IReadOnlyList<string> GetDiagnosticNotesSnapshot()
     {
         lock (_sync)
         {
             return _diagnosticNotes.ToArray();
+        }
+    }
+
+    /// <summary>返回所有未安装成功（含可选跳过与降级）的补丁标签快照，杜绝纯数字黑盒。</summary>
+    internal IReadOnlyList<string> GetFailedLabelsSnapshot()
+    {
+        lock (_sync)
+        {
+            return _failedLabels.ToArray();
+        }
+    }
+
+    /// <summary>
+    /// 格式化补丁安装汇总文本：全部成功时输出 "成功=N/N"，存在任何失败项时明文附带失败的 patch label 清单。
+    /// </summary>
+    internal string FormatSummary(bool includeReasons = false)
+    {
+        int succeeded = SucceededCount;
+        int attempted = AttemptedCount;
+        string[] failedLabels;
+        string[] notes;
+        lock (_sync)
+        {
+            failedLabels = _failedLabels.ToArray();
+            notes = includeReasons ? _diagnosticNotes.ToArray() : Array.Empty<string>();
+        }
+
+        if (failedLabels.Length == 0 && succeeded >= attempted)
+        {
+            return $"成功={succeeded}/{attempted}";
+        }
+
+        string labelList = failedLabels.Length > 0 ? string.Join(", ", failedLabels) : "<unknown>";
+        if (includeReasons && notes.Length > 0)
+        {
+            return $"成功={succeeded}/{attempted}, 失败=[{labelList}], 明细=[{string.Join("; ", notes)}]";
+        }
+        return $"成功={succeeded}/{attempted}, 失败=[{labelList}]";
+    }
+
+    /// <summary>
+    /// 输出补丁汇总日志：全成功时记录 Info；只要存在任何失败项，即使用 Warning 明文打印失败的 patch label 清单与诊断明细。
+    /// </summary>
+    internal void LogSummary(string prefix)
+    {
+        string head = string.IsNullOrWhiteSpace(prefix) ? $"[SafeHarmony:{_ownerModId}] 补丁汇总" : prefix;
+        if (FailedCount > 0 || GetFailedLabelsSnapshot().Count > 0)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"{head} ({FormatSummary(includeReasons: true)})");
+        }
+        else
+        {
+            BazaarLauncherPlugin.Log?.LogInfo($"{head} ({FormatSummary(includeReasons: false)})");
         }
     }
 
@@ -229,11 +284,12 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         }
 
         // 静态预检 2 & 3：校验 __result 兼容性和 ___field 私有字段存在性
+        // 一旦目标方法已存在但钩子签名/字段不兼容，无论 optional 是否为 true 都强制输出 Warning，避免死码静默潜伏
         if (!ValidateHookMethod(target, prefix, "Prefix", out string err)
             || !ValidateHookMethod(target, postfix, "Postfix", out err)
             || !ValidateHookMethod(target, finalizer, "Finalizer", out err))
         {
-            RecordDegraded(tag, err, optional);
+            RecordDegraded(tag, err, optional, forceWarning: true);
             return false;
         }
 
@@ -249,7 +305,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         }
         catch (Exception ex)
         {
-            RecordDegraded(tag, $"Harmony.Patch 失败: {ex.GetType().Name}: {ex.Message}", optional);
+            RecordDegraded(tag, $"Harmony.Patch 失败: {ex.GetType().Name}: {ex.Message}", optional, forceWarning: true);
             return false;
         }
     }
@@ -272,7 +328,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
             return false;
         }
 
-        PropertyInfo prop = AccessTools.Property(t, propertyName);
+        PropertyInfo prop = FindPropertyInHierarchy(t, propertyName);
         MethodInfo getter = prop?.GetGetMethod(nonPublic: true);
         if (getter == null)
         {
@@ -283,6 +339,67 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         return TryPatchMethodCore(getter, prefix: prefix, postfix: postfix, finalizer: null, prefixPriority: Priority.Normal, postfixPriority: Priority.Normal, optional: optional, label: $"{typeName}.get_{propertyName}", countAttempt: false);
     }
 
+    private const BindingFlags DeclaredAnyFlags =
+        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+
+    /// <summary>
+    /// 使用纯 BCL 反射沿继承链查找精确参数签名匹配的方法，避免在非 Unity 测试宿主中触发 Unity-Mono 版 AccessTools 静态构造异常。
+    /// </summary>
+    private static MethodInfo FindExactMethodInHierarchy(Type targetType, string methodName, Type[] parameterTypes)
+    {
+        if (targetType == null || string.IsNullOrEmpty(methodName) || parameterTypes == null) return null;
+
+        Type cur = targetType;
+        while (cur != null)
+        {
+            foreach (MethodInfo m in cur.GetMethods(DeclaredAnyFlags))
+            {
+                if (m.Name != methodName || m.IsGenericMethodDefinition) continue;
+                var ps = m.GetParameters();
+                if (ps.Length != parameterTypes.Length) continue;
+
+                bool allMatch = true;
+                for (int i = 0; i < ps.Length; i++)
+                {
+                    if (ps[i].ParameterType != parameterTypes[i])
+                    {
+                        allMatch = false;
+                        break;
+                    }
+                }
+                if (allMatch) return m;
+            }
+            cur = cur.BaseType;
+        }
+        return null;
+    }
+
+    private static PropertyInfo FindPropertyInHierarchy(Type targetType, string propertyName)
+    {
+        if (targetType == null || string.IsNullOrEmpty(propertyName)) return null;
+        Type cur = targetType;
+        while (cur != null)
+        {
+            PropertyInfo prop = cur.GetProperty(propertyName, DeclaredAnyFlags);
+            if (prop != null) return prop;
+            cur = cur.BaseType;
+        }
+        return null;
+    }
+
+    private static FieldInfo FindFieldInHierarchy(Type targetType, string fieldName)
+    {
+        if (targetType == null || string.IsNullOrEmpty(fieldName)) return null;
+        Type cur = targetType;
+        while (cur != null)
+        {
+            FieldInfo field = cur.GetField(fieldName, DeclaredAnyFlags);
+            if (field != null) return field;
+            cur = cur.BaseType;
+        }
+        return null;
+    }
+
     /// <summary>
     /// 预检解析目标方法：若存在多重载且未指定参数类型，记录告警避免盲匹配冲突。
     /// </summary>
@@ -291,7 +408,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         error = string.Empty;
         if (parameterTypes != null)
         {
-            MethodInfo exact = AccessTools.Method(targetType, methodName, parameterTypes);
+            MethodInfo exact = FindExactMethodInHierarchy(targetType, methodName, parameterTypes);
             if (exact == null)
             {
                 error = $"精确签名不匹配: {targetType.FullName}.{methodName}({FormatTypeList(parameterTypes)})";
@@ -299,12 +416,11 @@ internal sealed class SafeHarmonyPatcher : IDisposable
             return exact;
         }
 
-        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
         var matched = new List<MethodInfo>(2);
         Type cur = targetType;
         while (cur != null && cur != typeof(object))
         {
-            foreach (MethodInfo m in cur.GetMethods(flags))
+            foreach (MethodInfo m in cur.GetMethods(DeclaredAnyFlags))
             {
                 if (m.Name == methodName && !m.IsGenericMethodDefinition)
                 {
@@ -317,13 +433,18 @@ internal sealed class SafeHarmonyPatcher : IDisposable
 
         if (matched.Count == 0)
         {
-            MethodInfo fallback = AccessTools.Method(targetType, methodName);
-            if (fallback == null)
+            foreach (MethodInfo m in typeof(object).GetMethods(DeclaredAnyFlags))
+            {
+                if (m.Name == methodName && !m.IsGenericMethodDefinition)
+                {
+                    matched.Add(m);
+                }
+            }
+            if (matched.Count == 0)
             {
                 error = $"方法不存在: {targetType.FullName}.{methodName}";
                 return null;
             }
-            return fallback;
         }
 
         if (matched.Count > 1)
@@ -378,7 +499,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
             else if (name.StartsWith("___", StringComparison.Ordinal) && name.Length > 3 && declaring != null)
             {
                 string fieldName = name.Substring(3);
-                FieldInfo field = AccessTools.Field(declaring, fieldName);
+                FieldInfo field = FindFieldInHierarchy(declaring, fieldName);
                 if (field == null)
                 {
                     error = $"{role} 引用的私有字段不存在: {declaring.FullName}.{fieldName}";
@@ -390,23 +511,28 @@ internal sealed class SafeHarmonyPatcher : IDisposable
         return true;
     }
 
-    private void RecordDegraded(string tag, string reason, bool optional)
+    private void RecordDegraded(string tag, string reason, bool optional, bool forceWarning = false)
     {
         if (!optional)
         {
             Interlocked.Increment(ref _degraded);
         }
 
-        string entry = $"[{(optional ? "可选跳过" : "降级")}] {tag} -> {reason}";
+        string safeTag = string.IsNullOrWhiteSpace(tag) ? "<unnamed>" : tag;
+        string entry = $"[{(optional ? "可选跳过" : "降级")}] {safeTag} -> {reason}";
         lock (_sync)
         {
             if (_diagnosticNotes.Count < 64)
             {
                 _diagnosticNotes.Add(entry);
             }
+            if (_failedLabels.Count < 64)
+            {
+                _failedLabels.Add(safeTag);
+            }
         }
 
-        if (optional)
+        if (optional && !forceWarning)
         {
             BazaarLauncherPlugin.Log?.LogDebug($"[SafeHarmony:{_ownerModId}] {entry}");
         }
@@ -430,6 +556,7 @@ internal sealed class SafeHarmonyPatcher : IDisposable
     /// <summary>卸载当前 Patcher 挂载的全部补丁。</summary>
     public void UnpatchAll()
     {
+        if (SucceededCount <= 0) return;
         try
         {
             _harmony.UnpatchSelf();

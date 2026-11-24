@@ -28,6 +28,30 @@ internal static class NameAuth
     private static volatile string _currentAccessToken;
     private static volatile bool _ignoreGameCachedAuthUntilRelogin;
     private static int _accountIdFetchInFlight;
+    private static int _authGeneration;
+
+    /// <summary>P1-15：与服务端 CustomRuleEndpoints.UsernameUtf8Header 严格对齐的 UTF-8 URL 编码用户名主请求头。</summary>
+    internal const string UsernameUtf8Header = "X-Bazaar-Username-Utf8";
+
+    /// <summary>P1-15：自建服登录/鉴权成功后通过 EventBus 广播的账号就绪事件（主线程安全封送）。</summary>
+    internal readonly struct AuthSucceededEvent
+    {
+        public readonly string AccountId;
+        public readonly string Username;
+        public readonly int Generation;
+
+        public AuthSucceededEvent(string accountId, string username, int generation)
+        {
+            AccountId = accountId ?? string.Empty;
+            Username = username ?? string.Empty;
+            Generation = generation;
+        }
+    }
+
+    internal static int AuthGeneration => Volatile.Read(ref _authGeneration);
+
+    /// <summary>P1-15：供无 EventBus 场景或显式订阅使用的静态鉴权成功回调。</summary>
+    internal static event Action<AuthSucceededEvent> AuthSucceeded;
 
     private static Type _cachedAuthResultType;
     private static Type _cachedLoginResponseType;
@@ -39,6 +63,10 @@ internal static class NameAuth
         public int StatusCode { get; init; }
         public string Body { get; init; } = string.Empty;
         public string Error { get; init; } = string.Empty;
+        /// <summary>P2-02：服务端响应的 ETag 头原值（用于后续 If-None-Match 协商缓存）。</summary>
+        public string ETag { get; init; } = string.Empty;
+        /// <summary>P2-02：是否命中 HTTP 304 Not Modified（命中时可直接复用本地缓存、零反序列化）。</summary>
+        public bool NotModified { get; init; }
     }
 
     internal static string CurrentUsername
@@ -172,8 +200,12 @@ internal static class NameAuth
         string user = CurrentUsername;
         if (!string.IsNullOrWhiteSpace(user))
         {
-            string headerVal = IsPureAscii(user) ? user : Uri.EscapeDataString(user);
+            string encodedUser = Uri.EscapeDataString(user);
+            string headerVal = IsPureAscii(user) ? user : encodedUser;
             try { req.Headers.TryAddWithoutValidation("X-Username", headerVal); } catch { }
+            // P1-15：同步附带纯 ASCII URL 编码的 UTF-8 用户名主头，确保非 ASCII 中文账号名（如「破风」）
+            // 在冷启动未拿到 Bearer Token 前也能被服务端 CustomRuleEndpoints.ResolveAccountId 精确解析而不回退 guest
+            try { req.Headers.TryAddWithoutValidation(UsernameUtf8Header, encodedUser); } catch { }
         }
 
         string token = CurrentAccessToken;
@@ -183,10 +215,56 @@ internal static class NameAuth
         }
     }
 
+    private static void NotifyAuthSucceeded(string accountId, string username)
+    {
+        int gen = Interlocked.Increment(ref _authGeneration);
+        var evt = new AuthSucceededEvent(
+            string.IsNullOrWhiteSpace(accountId) ? CurrentAccountId : accountId,
+            string.IsNullOrWhiteSpace(username) ? CurrentUsername : username,
+            gen);
+        try
+        {
+            BazaarLauncherPlugin.Host?.EventBus.Publish(evt);
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("[NameAuth] 发布 AuthSucceededEvent 失败: " + ex.Message);
+        }
+        try
+        {
+            AuthSucceeded?.Invoke(evt);
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("[NameAuth] 调用 AuthSucceeded 静态事件失败: " + ex.Message);
+        }
+    }
+
+    private static void TryExtractIdentityFromLoginJson(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return;
+        try
+        {
+            var obj = JObject.Parse(json);
+            string aid = NormalizeAccountId((string)(obj["accountId"] ?? obj["AccountId"] ?? obj["id"] ?? obj["Id"]));
+            if (!string.IsNullOrWhiteSpace(aid) && aid != "00000000000000000000000000000000")
+            {
+                _currentAccountId = aid;
+            }
+            string uname = (string)(obj["username"] ?? obj["Username"] ?? obj["userName"] ?? obj["UserName"]);
+            if (!string.IsNullOrWhiteSpace(uname))
+            {
+                _currentUsername = uname;
+            }
+        }
+        catch { }
+    }
+
     internal static async Task EnsureAccountIdentityAsync(CancellationToken ct = default)
     {
         if (!_ignoreGameCachedAuthUntilRelogin && !string.IsNullOrWhiteSpace(CurrentAccountId)) return;
         if (Interlocked.CompareExchange(ref _accountIdFetchInFlight, 1, 0) != 0) return;
+        bool reloginSucceeded = false;
         try
         {
             string baseUrl = GetServerBaseUrl();
@@ -216,6 +294,7 @@ internal static class NameAuth
                         {
                             _currentAccessToken = newTok;
                             _ignoreGameCachedAuthUntilRelogin = false;
+                            reloginSucceeded = true;
                             TrySyncNativeAccessTokenProvider(newTok, string.Empty, DateTime.UtcNow.AddHours(12));
                         }
                         if (!string.IsNullOrWhiteSpace(newAid) && newAid != "00000000000000000000000000000000") _currentAccountId = newAid;
@@ -249,10 +328,18 @@ internal static class NameAuth
         {
             Interlocked.Exchange(ref _accountIdFetchInFlight, 0);
         }
+
+        if (reloginSucceeded)
+        {
+            NotifyAuthSucceeded(_currentAccountId, _currentUsername);
+        }
     }
 
-    internal static Task<HttpJsonResponse> GetJsonAsync(string relativePath, CancellationToken ct = default)
-        => SendJsonAsync(HttpMethod.Get, relativePath, null, ct);
+    internal static Task<HttpJsonResponse> GetJsonAsync(
+        string relativePath,
+        CancellationToken ct = default,
+        string ifNoneMatch = null)
+        => SendJsonAsync(HttpMethod.Get, relativePath, null, ct, ifNoneMatch);
 
     internal static Task<HttpJsonResponse> PostJsonAsync(string relativePath, object payload = null, CancellationToken ct = default)
         => SendJsonAsync(HttpMethod.Post, relativePath, payload, ct);
@@ -264,7 +351,11 @@ internal static class NameAuth
         => SendJsonAsync(HttpMethod.Delete, relativePath, null, ct);
 
     internal static async Task<HttpJsonResponse> SendJsonAsync(
-        HttpMethod method, string relativePath, object payload = null, CancellationToken ct = default)
+        HttpMethod method,
+        string relativePath,
+        object payload = null,
+        CancellationToken ct = default,
+        string ifNoneMatch = null)
     {
         string baseUrl = GetServerBaseUrl();
         if (string.IsNullOrWhiteSpace(baseUrl))
@@ -285,6 +376,12 @@ internal static class NameAuth
             using var req = new HttpRequestMessage(method, url);
             ApplyAuthHeaders(req);
 
+            // P2-02：按需附加 If-None-Match 条件请求头，使服务端 ETag 协商缓存命中 304 Not Modified
+            if (!string.IsNullOrWhiteSpace(ifNoneMatch))
+            {
+                try { req.Headers.TryAddWithoutValidation("If-None-Match", ifNoneMatch.Trim()); } catch { }
+            }
+
             if (payload != null)
             {
                 string jsonBody = payload as string ?? JsonConvert.SerializeObject(payload);
@@ -296,17 +393,23 @@ internal static class NameAuth
             }
 
             using var resp = await HttpClientHub.SharedClient.SendAsync(req, linked.Token).ConfigureAwait(false);
-            string body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
-            if (!resp.IsSuccessStatusCode)
+            int statusCode = (int)resp.StatusCode;
+            bool notModified = resp.StatusCode == HttpStatusCode.NotModified;
+            string responseEtag = ExtractETagHeader(resp);
+            string body = notModified
+                ? string.Empty
+                : (resp.Content != null ? await resp.Content.ReadAsStringAsync().ConfigureAwait(false) : string.Empty);
+
+            if (!resp.IsSuccessStatusCode && !notModified)
             {
                 var actualMethod = resp.RequestMessage?.Method ?? method;
                 var actualUri = resp.RequestMessage?.RequestUri?.ToString() ?? url;
                 if (actualMethod != method)
                 {
                     BazaarLauncherPlugin.Log?.LogWarning(
-                        $"[NameAuth] 检测到 HTTP 重定向降级：{method} -> {actualMethod} ({actualUri})，状态码={(int)resp.StatusCode}");
+                        $"[NameAuth] 检测到 HTTP 重定向降级：{method} -> {actualMethod} ({actualUri})，状态码={statusCode}");
                 }
-                else if ((int)resp.StatusCode == 405)
+                else if (statusCode == 405)
                 {
                     BazaarLauncherPlugin.Log?.LogWarning(
                         $"[NameAuth] HTTP 405 Method Not Allowed：{actualMethod} {actualUri}");
@@ -315,9 +418,11 @@ internal static class NameAuth
             return new HttpJsonResponse
             {
                 Ok = resp.IsSuccessStatusCode,
-                StatusCode = (int)resp.StatusCode,
+                NotModified = notModified,
+                StatusCode = statusCode,
+                ETag = responseEtag,
                 Body = body ?? string.Empty,
-                Error = resp.IsSuccessStatusCode ? string.Empty : FormatFriendlyHttpError((int)resp.StatusCode, body),
+                Error = (resp.IsSuccessStatusCode || notModified) ? string.Empty : FormatFriendlyHttpError(statusCode, body),
             };
         }
         catch (OperationCanceledException)
@@ -338,6 +443,30 @@ internal static class NameAuth
                 Error = "网络连接失败：" + ex.Message,
             };
         }
+    }
+
+    private static string ExtractETagHeader(HttpResponseMessage resp)
+    {
+        if (resp?.Headers == null) return string.Empty;
+        try
+        {
+            if (resp.Headers.ETag != null)
+            {
+                return resp.Headers.ETag.ToString();
+            }
+            if (resp.Headers.TryGetValues("ETag", out var values))
+            {
+                foreach (string val in values)
+                {
+                    if (!string.IsNullOrWhiteSpace(val))
+                    {
+                        return val.Trim();
+                    }
+                }
+            }
+        }
+        catch { }
+        return string.Empty;
     }
 
     private static string FormatFriendlyHttpError(int statusCode, string body)
@@ -564,8 +693,10 @@ internal static class NameAuth
             return BuildError("TN-PARSE", "解析自建服登录响应失败");
         }
 
+        bool dispatchedPostAuthSync = false;
         try
         {
+            TryExtractIdentityFromLoginJson(json);
             string tok = AccessTools.Property(loginResponseType, "AccessToken")?.GetValue(loginResponse)?.ToString();
             string refreshTok = AccessTools.Property(loginResponseType, "RefreshToken")?.GetValue(loginResponse)?.ToString();
             if (!string.IsNullOrWhiteSpace(tok))
@@ -573,9 +704,12 @@ internal static class NameAuth
                 _currentAccessToken = tok;
                 _ignoreGameCachedAuthUntilRelogin = false;
                 TrySyncNativeAccessTokenProvider(tok, refreshTok ?? string.Empty, DateTime.UtcNow.AddHours(12));
+                dispatchedPostAuthSync = true;
                 _ = Task.Run(async () =>
                 {
                     await EnsureAccountIdentityAsync(HttpClientHub.ShutdownToken).ConfigureAwait(false);
+                    // P1-15：账号身份与 Token 均已落定，立刻通知 CustomGameplayUI 等订阅者重拉个人与活跃对局规则
+                    NotifyAuthSucceeded(_currentAccountId, _currentUsername);
                     ModContentSyncClient.Instance.TriggerFullSyncInBackground(forceDownload: false);
                 });
             }
@@ -583,6 +717,11 @@ internal static class NameAuth
         catch (Exception ex)
         {
             BazaarLauncherPlugin.Log?.LogWarning("[NameAuth] 登录响应 Token 同步异常: " + ex.Message);
+        }
+
+        if (!dispatchedPostAuthSync)
+        {
+            NotifyAuthSucceeded(_currentAccountId, _currentUsername);
         }
 
         BazaarLauncherPlugin.Log?.LogInfo("NameAuth: 自建服登录成功，已启动 Mod 与词典缓存同步");

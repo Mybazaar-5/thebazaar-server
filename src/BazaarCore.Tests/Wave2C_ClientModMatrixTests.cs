@@ -106,18 +106,15 @@ public sealed class Wave2CLauncherAssemblyFixture : IDisposable
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .ToArray();
 
-        _alc = new AssemblyLoadContext($"Wave2C_Launcher_{Guid.NewGuid():N}", isCollectible: true);
+        // 使用非可卸载上下文（isCollectible: false），避免多测试类并行执行期间 Dispose/Unload 撞碎并发 GetAssemblies() 扫描
+        _alc = new AssemblyLoadContext($"Wave2C_Launcher_{Guid.NewGuid():N}", isCollectible: false);
         _alc.Resolving += (ctx, asmName) =>
         {
-            // 与主默认上下文共享 Newtonsoft.Json / BazaarGameShared，避免类型身份不一致
+            // 与主默认上下文共享 Newtonsoft.Json / BazaarGameShared，避免类型身份不一致与重复落盘
             if (string.Equals(asmName.Name, "Newtonsoft.Json", StringComparison.OrdinalIgnoreCase))
                 return typeof(JObject).Assembly;
             if (string.Equals(asmName.Name, "BazaarGameShared", StringComparison.OrdinalIgnoreCase))
-            {
-                var sharedAsm = AppDomain.CurrentDomain.GetAssemblies()
-                    .FirstOrDefault(a => string.Equals(a.GetName().Name, "BazaarGameShared", StringComparison.OrdinalIgnoreCase));
-                if (sharedAsm != null) return sharedAsm;
-            }
+                return typeof(BazaarGameShared.Domain.Core.Types.EHero).Assembly;
 
             foreach (string dir in probeDirs)
             {
@@ -125,8 +122,15 @@ public sealed class Wave2CLauncherAssemblyFixture : IDisposable
                 string cand = Path.Combine(dir, asmName.Name + ".dll");
                 if (File.Exists(cand))
                 {
-                    using var depMs = new MemoryStream(File.ReadAllBytes(cand));
-                    return ctx.LoadFromStream(depMs);
+                    try
+                    {
+                        using var depMs = new MemoryStream(File.ReadAllBytes(cand));
+                        return ctx.LoadFromStream(depMs);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        return null;
+                    }
                 }
             }
             return null;
@@ -229,7 +233,10 @@ public sealed class Wave2CLauncherAssemblyFixture : IDisposable
 
     public void Dispose()
     {
-        try { _alc.Unload(); } catch { }
+        if (_alc.IsCollectible)
+        {
+            try { _alc.Unload(); } catch { }
+        }
         if (!string.IsNullOrWhiteSpace(_tempBuildRoot))
         {
             try { if (Directory.Exists(_tempBuildRoot)) Directory.Delete(_tempBuildRoot, recursive: true); } catch { }

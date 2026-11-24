@@ -807,11 +807,27 @@ public sealed class RunState
     /// <summary>是否已用 GameMode.ExclusionSet 初始化过本局运行期 ExclusionSet（兼容旧快照不重复覆盖动态移除项）。</summary>
     public bool ExclusionSetInitialized { get; set; }
 
-    /// <summary>当前对战对手属性（非战斗状态也填充完整默认键，避免 HealthBarController 与 BankToyController 缺键或残留 +99 占位）。</summary>
+    /// <summary>当前对战对手属性（战斗态有效；非战斗态与战后清场由 ClearNonCombatOpponentState 清理，且非战斗态协议包不再下发）。</summary>
     public Dictionary<EPlayerAttributeType, int> OpponentAttributes { get; set; } =
         CreateDefaultCombatantAttributes(hp: 100, hpMax: 100, prestige: 20, level: 1, gold: 0, income: 5);
 
+    /// <summary>P1-09：当前战斗对手英雄（仅战斗态有效；非战斗态与战后清场置空）。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public EHero? OpponentHero { get; set; }
+
     public SimPvpOpponent CurrentPvpOpponent { get; set; }
+
+    /// <summary>
+    /// P1-09：战后清场同步清空对手英雄、PvP 对手摘要与非战斗态对手实体属性，
+    /// 避免后续协议包或状态快照残留战中对手血量/英雄信息。
+    /// </summary>
+    public void ClearNonCombatOpponentState()
+    {
+        OpponentHero = null;
+        PendingPvpGhost = null;
+        CurrentPvpOpponent = null;
+        OpponentAttributes.Clear();
+    }
 
     /// <summary>牌库与场面上已存在的卡：instanceId → 卡快照信息。</summary>
     public Dictionary<string, CardEntry> Cards { get; } = new();
@@ -849,6 +865,38 @@ public sealed class RunState
         /// <summary>对应的 BazaarCore 运行时实例（用于手牌网格占位及确定性战斗结算）。</summary>
         [System.Diagnostics.CodeAnalysis.AllowNull]
         public CardInstance CoreCard { get; set; } = default!;
+
+        /// <summary>P0-03：校验已绑定 CoreCard.InstanceId 是否与 CardEntry.InstanceId 严格一致。</summary>
+        [System.Text.Json.Serialization.JsonIgnore]
+        public bool HasAlignedCoreCardId =>
+            CoreCard == null ||
+            string.IsNullOrEmpty(InstanceId) ||
+            string.Equals(CoreCard.InstanceId, InstanceId, StringComparison.Ordinal);
+
+        /// <summary>
+        /// P0-03：安全绑定 CoreCard 并强制守护 entry.CoreCard.InstanceId == entry.InstanceId 不变量；
+        /// 若传入 CoreCard 携带随机 UUID 导致割裂，则调用 ReassignInstanceId 原地对齐为本条目 InstanceId，
+        /// 100% 保持原对象引用、网格引用与自定义覆写的 BaseAttributes（如 Tiny）不丢失。
+        /// </summary>
+        public void BindAlignedCoreCard(CardInstance? core)
+        {
+            if (core == null)
+            {
+                CoreCard = null;
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(InstanceId) &&
+                !string.Equals(core.InstanceId, InstanceId, StringComparison.Ordinal))
+            {
+                core.ReassignInstanceId(InstanceId);
+            }
+            CoreCard = core;
+
+            System.Diagnostics.Debug.Assert(
+                HasAlignedCoreCardId,
+                $"CardEntry.CoreCard.InstanceId ({CoreCard?.InstanceId}) 必须与 CardEntry.InstanceId ({InstanceId}) 严格一致");
+        }
     }
 
     /// <summary>累加指定玩家整型属性（用于追踪 Custom_3..Custom_11 等官方全局计数，同步维护 BasePlayerAttributes）。</summary>
@@ -1100,6 +1148,23 @@ public sealed class RunState
         TournamentSessionId = TournamentSessionId,
     };
 
+    /// <summary>
+    /// P1-09：构造下发至客户端的 Opponent 增量更新。
+    /// 仅在活跃战斗态（Combat / PVPCombat）下发对手属性；CombatDespawnSim 与所有非战斗态包一律返回 null，
+    /// 令官方客户端 DataExtensions.Update(null) 安全早退，彻底根治退战重置 100/100 导致的虚假「最大生命值 -300~-4600」飘字。
+    /// </summary>
+    private SimUpdatePlayer? BuildWireOpponentUpdate()
+    {
+        if (State is not (ERunState.Combat or ERunState.PVPCombat))
+            return null;
+
+        return new SimUpdatePlayer
+        {
+            CombatantId = ECombatantId.Opponent,
+            Attributes = new Dictionary<EPlayerAttributeType, int>(OpponentAttributes),
+        };
+    }
+
     public GameSim BuildFullGameSim(
         IEnumerable<IGameSimEvent> events = null,
         IEnumerable<CardEntry> extraSpawnCards = null,
@@ -1113,11 +1178,7 @@ public sealed class RunState
                 CombatantId = ECombatantId.Player,
                 Attributes = new Dictionary<EPlayerAttributeType, int>(PlayerAttributes),
             },
-            Opponent = new SimUpdatePlayer
-            {
-                CombatantId = ECombatantId.Opponent,
-                Attributes = new Dictionary<EPlayerAttributeType, int>(OpponentAttributes),
-            },
+            Opponent = BuildWireOpponentUpdate(),
             Run = new SimUpdateRun
             {
                 Day = Day,
@@ -1229,11 +1290,7 @@ public sealed class RunState
                 CombatantId = ECombatantId.Player,
                 Attributes = new Dictionary<EPlayerAttributeType, int>(PlayerAttributes),
             },
-            Opponent = new SimUpdatePlayer
-            {
-                CombatantId = ECombatantId.Opponent,
-                Attributes = new Dictionary<EPlayerAttributeType, int>(OpponentAttributes),
-            },
+            Opponent = BuildWireOpponentUpdate(),
             Run = new SimUpdateRun
             {
                 Day = Day,
@@ -1298,20 +1355,82 @@ public sealed class RunState
         return sim;
     }
 
+    private static ECardSize ResolveFallbackWireCardSize(ECardType cardType)
+        => cardType is ECardType.Skill or ECardType.SocketEffect ? ECardSize.Small : ECardSize.Medium;
+
+    private CardEntry? FindCardEntryByInstanceOrCoreId(string instanceId)
+    {
+        if (string.IsNullOrEmpty(instanceId)) return null;
+        if (Cards.TryGetValue(instanceId, out var direct))
+            return direct;
+        foreach (var ce in Cards.Values)
+        {
+            if (ce.CoreCard != null && string.Equals(ce.CoreCard.InstanceId, instanceId, StringComparison.Ordinal))
+                return ce;
+        }
+        return null;
+    }
+
+    private void SanitizeZeroSizeSimCards(GameSim sim)
+    {
+        if (sim.Cards == null || sim.Cards.Count == 0) return;
+
+        // P0-03 最终出包铁闸：严禁任何 SimUpdateCard 携带 Size == 0 / null 下发给客户端（避免 AssetLoader.InstantiateItemCard(size=0) 崩溃）
+        List<string>? badKeys = null;
+        foreach (var kv in sim.Cards)
+        {
+            var sc = kv.Value;
+            if (sc == null)
+            {
+                badKeys ??= new List<string>();
+                badKeys.Add(kv.Key);
+                continue;
+            }
+            if (!sc.Size.HasValue || (int)sc.Size.Value == 0)
+            {
+                var live = FindCardEntryByInstanceOrCoreId(kv.Key);
+                if (live != null && (int)live.Size != 0)
+                {
+                    sc.Size = live.Size;
+                    sc.Tier ??= live.Tier;
+                    sc.State = live.State;
+                }
+                else
+                {
+                    sc.Size = ECardSize.Medium;
+                    sc.Tier ??= ETier.Bronze;
+                    if (sc.State == default)
+                        sc.State = ECardState.Alive;
+                }
+            }
+        }
+        if (badKeys != null)
+        {
+            foreach (string k in badKeys)
+                sim.Cards.Remove(k);
+        }
+    }
+
     /// <summary>
-    /// Wave 4A #1 反向审计服务端发包硬不变量守卫（根治裸客户端 H-2 / H-4 / H-5a / P1-44）：
+    /// Wave 4A #1 + Wave 5A P0-03 反向审计服务端发包硬不变量守卫（根治裸客户端 H-2 / H-4 / H-5a / P1-44 / Size=0 空壳崩溃）：
     /// 1) H-2：剔除对同包已 CardSpawned 或 CardDisposed 实体发出的冗余 CardMoved，防止客户端 OnCardMoved 抛 KeyNotFoundException 或瞬移残影；
-    /// 2) H-4：确保 CardTransformed 与 CardTransformReverted 引用的新/原实体在 sim.Cards 中全部存在，防止 simUpdates[id] 缺键崩解；
+    /// 2) H-4 &amp; P0-03：确保 CardTransformed 与 CardTransformReverted 引用的新/原实体在 sim.Cards 中全部具备合法非零 Size 与完整属性；
+    ///    查无实体的孤儿 CardTransformReverted 直接丢弃，彻底禁止伪造 Size=0/Tier=Bronze/Attributes={} 崩溃空壳；
     /// 3) H-5a：剔除孤立 PlayerSkillEquipped（目标卡既不在 sim.Cards 也不在 run.Cards，或同帧已被销毁且未重生），并为现存技能补齐 sim.Cards；
     /// 4) P1-44：同一玩家同一 TemplateId 在单包内禁止重复 CardSpawned + PlayerSkillEquipped 导致重复技能叠层与客户端异常。
     /// </summary>
     internal void SanitizeWireEventsAndCards(GameSim sim)
     {
-        if (sim.Events.Count == 0) return;
+        if (sim.Events.Count == 0)
+        {
+            SanitizeZeroSizeSimCards(sim);
+            return;
+        }
 
         var spawnedIds = new HashSet<string>(StringComparer.Ordinal);
         var spawnedMetaById = new Dictionary<string, (ECombatantId Owner, string TemplateId)>(StringComparer.Ordinal);
         var disposedIds = new HashSet<string>(StringComparer.Ordinal);
+        var dropIndices = new HashSet<int>();
         for (int i = 0; i < sim.Events.Count; i++)
         {
             switch (sim.Events[i])
@@ -1326,7 +1445,7 @@ public sealed class RunState
             }
         }
 
-        // H-4：先补齐所有变形/还原事件目标卡在 sim.Cards 中的缺失条目
+        // H-4 & P0-03：先补齐所有变形/还原事件目标卡在 sim.Cards 中的缺失条目，严禁构造 Size == 0 空壳
         for (int i = 0; i < sim.Events.Count; i++)
         {
             switch (sim.Events[i])
@@ -1339,12 +1458,16 @@ public sealed class RunState
                             if (tc == null || string.IsNullOrEmpty(tc.InstanceId)) continue;
                             if (!sim.Cards.ContainsKey(tc.InstanceId))
                             {
-                                if (Cards.TryGetValue(tc.InstanceId, out var ce))
+                                var ce = FindCardEntryByInstanceOrCoreId(tc.InstanceId);
+                                if (ce != null)
                                     sim.Cards[tc.InstanceId] = RunSnapshotSerializer.ToSimCard(ce, clearPendingForceSync: false, omitPlacement: false);
                                 else
                                     sim.Cards[tc.InstanceId] = new SimUpdateCard
                                     {
                                         InstanceId = tc.InstanceId,
+                                        Size = ResolveFallbackWireCardSize(tc.Type),
+                                        Tier = ETier.Bronze,
+                                        State = ECardState.Alive,
                                         Placement = new CardDeltaPlacement
                                         {
                                             Owner = tc.CombatantId,
@@ -1356,29 +1479,46 @@ public sealed class RunState
                         }
                     }
                     if (!string.IsNullOrEmpty(tr.OriginalInstanceId)
-                        && !sim.Cards.ContainsKey(tr.OriginalInstanceId)
-                        && Cards.TryGetValue(tr.OriginalInstanceId, out var origEntry))
+                        && !sim.Cards.ContainsKey(tr.OriginalInstanceId))
                     {
-                        sim.Cards[tr.OriginalInstanceId] = RunSnapshotSerializer.ToSimCard(origEntry, clearPendingForceSync: false, omitPlacement: false);
+                        var origEntry = FindCardEntryByInstanceOrCoreId(tr.OriginalInstanceId);
+                        if (origEntry != null)
+                            sim.Cards[tr.OriginalInstanceId] = RunSnapshotSerializer.ToSimCard(origEntry, clearPendingForceSync: false, omitPlacement: false);
                     }
                     break;
 
                 case GameSimEventCardTransformReverted rev when rev.OriginalCard != null && !string.IsNullOrEmpty(rev.OriginalCard.InstanceId):
-                    if (!sim.Cards.ContainsKey(rev.OriginalCard.InstanceId))
+                    if (!sim.Cards.TryGetValue(rev.OriginalCard.InstanceId, out var existingSimCard)
+                        || existingSimCard == null
+                        || !existingSimCard.Size.HasValue
+                        || (int)existingSimCard.Size.Value == 0)
                     {
-                        if (Cards.TryGetValue(rev.OriginalCard.InstanceId, out var revEntry))
-                            sim.Cards[rev.OriginalCard.InstanceId] = RunSnapshotSerializer.ToSimCard(revEntry, clearPendingForceSync: false, omitPlacement: false);
-                        else
-                            sim.Cards[rev.OriginalCard.InstanceId] = new SimUpdateCard
+                        var revEntry = FindCardEntryByInstanceOrCoreId(rev.OriginalCard.InstanceId);
+                        if (revEntry != null)
+                        {
+                            // 若通过 CoreCard.InstanceId 反查命中真实 CardEntry，重写事件指向真实 InstanceId 并下发完整 SimUpdateCard
+                            if (!string.Equals(revEntry.InstanceId, rev.OriginalCard.InstanceId, StringComparison.Ordinal))
                             {
-                                InstanceId = rev.OriginalCard.InstanceId,
-                                Placement = new CardDeltaPlacement
-                                {
-                                    Owner = rev.OriginalCard.CombatantId,
-                                    Section = rev.OriginalCard.Section,
-                                    Socket = rev.OriginalCard.Socket,
-                                },
-                            };
+                                sim.Cards.Remove(rev.OriginalCard.InstanceId);
+                                var repairedOrig = new SimEventCardTransformation(
+                                    revEntry.InstanceId,
+                                    revEntry.TemplateId.ToString(),
+                                    revEntry.Type,
+                                    revEntry.Owner ?? rev.OriginalCard.CombatantId,
+                                    revEntry.Section ?? rev.OriginalCard.Section,
+                                    revEntry.Socket ?? rev.OriginalCard.Socket);
+                                sim.Events[i] = new GameSimEventCardTransformReverted(
+                                    repairedOrig,
+                                    rev.TransformedCardInstanceIds ?? new List<string>());
+                            }
+                            sim.Cards[revEntry.InstanceId] = RunSnapshotSerializer.ToSimCard(revEntry, clearPendingForceSync: false, omitPlacement: false);
+                        }
+                        else
+                        {
+                            // P0-03：绝对禁止伪造 Size == 0 / Tier == Bronze / Attributes == {} 崩溃空壳，丢弃该条孤儿还原事件
+                            sim.Cards.Remove(rev.OriginalCard.InstanceId);
+                            dropIndices.Add(i);
+                        }
                     }
                     break;
             }
@@ -1388,7 +1528,6 @@ public sealed class RunState
         var seenSkillInstanceIds = new HashSet<string>(StringComparer.Ordinal);
         var seenSkillOwnerTemplates = new HashSet<(ECombatantId Owner, string TemplateId)>();
         var duplicateSpawnSkillIds = new HashSet<string>(StringComparer.Ordinal);
-        var dropIndices = new HashSet<int>();
 
         for (int i = 0; i < sim.Events.Count; i++)
         {
@@ -1473,6 +1612,8 @@ public sealed class RunState
             sim.Events.Clear();
             sim.Events.AddRange(filtered);
         }
+
+        SanitizeZeroSizeSimCards(sim);
     }
 
     /// <summary>

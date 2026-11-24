@@ -9,10 +9,20 @@ namespace BazaarCore.Runtime;
 /// </summary>
 public sealed class CardInstance
 {
-    public string InstanceId { get; }
+    public string InstanceId { get; private set; }
     public CardTemplate Template { get; }
     public CardTier Tier { get; private set; }
     public string? Enchantment { get; private set; }
+
+    /// <summary>
+    /// 原地重绑定卡牌实例 ID（供 ShopEngine / RunState 对齐前缀 InstanceId 时保持同一对象引用且不丢失外部覆写的 BaseAttributes，P0-03）。
+    /// </summary>
+    public void ReassignInstanceId(string newInstanceId)
+    {
+        if (string.IsNullOrWhiteSpace(newInstanceId))
+            throw new ArgumentException("newInstanceId 不能为空。", nameof(newInstanceId));
+        InstanceId = newInstanceId;
+    }
 
     /// <summary>非战斗临时状态下的永久品质（用于区分战斗内临时升阶与永久升阶）。</summary>
     public CardTier PermanentTier { get; private set; }
@@ -97,6 +107,58 @@ public sealed class CardInstance
         "ReloadAmount", "ReloadTargets", "FlyingTargets", "ForceUseTargets",
         "UpgradeTargets", "DestroyTargets", "DisableTargets", "EnchantTargets", "TransformTargets"
     };
+
+    /// <summary>
+    /// 输出/效果量级属性集合（P1-05 / P1-06）：
+    /// 仅当目标卡牌本身已拥有该输出能力（非光环层存在该属性键）时，才允许被无条件（Conditions == null）、非自身定向（非 TTargetCardSelf）且非 Set 的光环或行动修改；
+    /// 通用状态/效用属性（如 Heated/Chilled/Flying/Tiny/SellPrice/BuyPrice/PercentCooldownReduction/FlatCooldownReduction/CritChance/Ammo/AmmoMax/Multicast/Lifesteal/DestroyImmunity 等）明确排除在外，始终放行。
+    /// </summary>
+    public static readonly IReadOnlySet<string> OutputMagnitudeAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "DamageAmount",
+        "ShieldApplyAmount",
+        "BurnApplyAmount",
+        "PoisonApplyAmount",
+        "HealAmount",
+        "RegenApplyAmount",
+        "RageApplyAmount",
+        "JoyApplyAmount",
+        "HasteAmount",
+        "SlowAmount",
+        "FreezeAmount",
+        "ChargeAmount",
+        "BurnRemoveAmount",
+        "PoisonRemoveAmount",
+        "TempoApplyAmount",
+        "TempoRemoveAmount",
+        "ReloadAmount"
+    };
+
+    /// <summary>判断指定属性名是否属于要求目标卡已具备对应基础属性的输出量级属性（P1-05 / P1-06）。</summary>
+    public static bool IsOutputMagnitudeAttribute(string? attr)
+        => !string.IsNullOrEmpty(attr) && OutputMagnitudeAttributes.Contains(attr);
+
+    /// <summary>
+    /// 判断一次卡牌属性修改（光环或行动）是否必须受「目标卡原本已拥有该非光环属性」存在性守卫约束（P1-05 / P1-06）。
+    /// 豁免场景：
+    /// 1) 非输出量级属性（如 Heated/Chilled/SellPrice/PercentCooldownReduction/CritChance/Ammo/Multicast/Lifesteal 等通用状态或效用属性）；
+    /// 2) 显式赋值操作（Set）；
+    /// 3) 显式自身定向修饰（TTargetCardSelf，包含全部附魔自光环与自身公式光环）；
+    /// 4) 目标节点带有显式筛选条件（Target.Conditions != null）。
+    /// </summary>
+    public static bool RequiresExistingOutputAttribute(RuleNode? target, string? attr, string? operation)
+    {
+        if (!IsOutputMagnitudeAttribute(attr))
+            return false;
+        if (string.Equals(operation, "Set", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (target == null || string.Equals(target.Type, "TTargetCardSelf", StringComparison.Ordinal))
+            return false;
+        if (target.GetSingleCondition(GameDatabaseLoader.JsonOptions) != null
+            || target.GetConditionList(GameDatabaseLoader.JsonOptions).Count > 0)
+            return false;
+        return true;
+    }
 
     /// <summary>局内永久属性修正（商店/事件/卖牌/永久成长）。</summary>
     public Dictionary<string, double> PermanentAdd { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -617,6 +679,28 @@ public sealed class CardInstance
         || EnchantmentAuraAdd.ContainsKey(attr)
         || EnchantmentAuraMult.ContainsKey(attr)
         || EnchantmentAuraAdditiveMult.ContainsKey(attr);
+
+    /// <summary>
+    /// 判断指定属性键是否存在于该卡牌任一非光环属性层（BaseAttributes、EnchantmentBaseAttributes 及 Permanent/Hour/Day/Combat 各层）。
+    /// 刻意排除 AuraAdd/AuraMult/AuraAdditiveMult 及 EnchantmentAura*，避免无条件光环或行动为不具备该能力的卡牌凭空新建输出量级属性（P1-05 / P1-06）。
+    /// </summary>
+    public bool HasNonAuraAttribute(string attr)
+        => !string.IsNullOrEmpty(attr)
+        && (BaseAttributes.ContainsKey(attr)
+            || EnchantmentBaseAttributes.ContainsKey(attr)
+            || PermanentAdd.ContainsKey(attr)
+            || PermanentMult.ContainsKey(attr)
+            || PermanentAdditiveMult.ContainsKey(attr)
+            || HourAdd.ContainsKey(attr)
+            || HourMult.ContainsKey(attr)
+            || HourAdditiveMult.ContainsKey(attr)
+            || DayAdd.ContainsKey(attr)
+            || DayMult.ContainsKey(attr)
+            || DayAdditiveMult.ContainsKey(attr)
+            || CombatAdd.ContainsKey(attr)
+            || CombatMult.ContainsKey(attr)
+            || CombatAdditiveMult.ContainsKey(attr)
+            || CombatZeroMultCount.ContainsKey(attr));
 
     public void SetTier(CardTier newTier) => SetTier(newTier, isTemporary: false);
 
@@ -1215,7 +1299,9 @@ public sealed class CardInstance
                 var flatRed = SafeMath.ClampFinite(GetAttributeRaw("FlatCooldownReduction"), -SafeMath.DefaultCombatMax, SafeMath.DefaultCombatMax, 0.0);
                 var pctRed = SafeMath.ClampFinite(GetAttributeRaw("PercentCooldownReduction"), -200.0, 90.0, 0.0);
                 double floorMs = SafeMath.ClampFinite(minCooldownFloorMs, 0.0, SafeMath.DefaultCombatMax, 1000.0);
-                value = SafeMath.ClampFinite((value - flatRed) * (1.0 - pctRed / 100.0), floorMs, SafeMath.DefaultCombatMax, floorMs);
+                // P1-04：使用整数百分比缩放并 Math.Round 舍入至整数毫秒，根除 5001ms / 4001ms 1ms 浮点精度毛刺
+                double scaledCooldownMs = Math.Round((value - flatRed) * (100.0 - pctRed) / 100.0, MidpointRounding.AwayFromZero);
+                value = SafeMath.ClampFinite(scaledCooldownMs, floorMs, SafeMath.DefaultCombatMax, floorMs);
             }
         }
         else if (c0 is 'T' or 't' && value > 0 && attr.Equals("TempoCost", StringComparison.OrdinalIgnoreCase))

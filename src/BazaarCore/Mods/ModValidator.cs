@@ -137,6 +137,43 @@ public static partial class ModValidator
         "永久", "本局", "跨场", "permanently", "permanent", "for the rest of the run"
     ];
 
+    // P1-07：官方 BazaarGameShared.dll ECardAttributeType 全量白名单（92 项）；
+    // 协议层序列化为 Dictionary<ECardAttributeType, int> 时，不在此集合且非 Custom_N 的自定义键会被静默丢弃。
+    private static readonly HashSet<string> OfficialCardAttributeTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Ammo", "AmmoMax", "BurnApplyAmount", "BurnCrit", "BurnRemoveAmount",
+        "BuyPrice", "ChargeAmount", "ChargeTargets", "Chilled", "Cooldown",
+        "CooldownDisabled", "CooldownMax", "Counter", "CritChance",
+        "Custom_0", "Custom_1", "Custom_2", "Custom_3", "Custom_4",
+        "Custom_5", "Custom_6", "Custom_7", "Custom_8",
+        "DamageAmount", "DamageCrit", "DestroyImmunity", "DestroyTargets", "DisableTargets",
+        "EnchantRemoveTargets", "EnchantTargets", "FlatCooldownReduction", "FlatTempoCostReduction",
+        "Flying", "FlyingTargets", "ForceUseTargets", "Freeze", "FreezeAmount", "FreezeTargets",
+        "Haste", "HasteAmount", "HasteTargets", "HealAmount", "HealCrit", "Heated",
+        "JoyApplyAmount", "JoyCrit", "JoyRemoveAmount", "Lifesteal", "Multicast",
+        "PercentChargeReduction", "PercentCooldownReduction", "PercentFreezeReduction",
+        "PercentHasteReduction", "PercentSlowReduction", "PercentTempoCostReduction",
+        "PoisonApplyAmount", "PoisonCrit", "PoisonRemoveAmount",
+        "Quest_1", "Quest_2", "Quest_3", "Quest_4", "Quest_5", "Quest_6",
+        "Quest_7", "Quest_8", "Quest_9", "Quest_10", "Quest_11", "Quest_12",
+        "QuestCompletedCount", "RageApplyAmount", "RageRemoveAmount",
+        "RegenApplyAmount", "RegenCrit", "RegenRemoveAmount", "ReloadAmount", "ReloadTargets",
+        "RepairTargets", "SellPrice", "ShieldApplyAmount", "ShieldCrit", "ShieldRemoveAmount",
+        "Slow", "SlowAmount", "SlowTargets", "TempoApplyAmount", "TempoCost", "TempoRemoveAmount",
+        "Tiny", "TransformTargets", "UpgradeTargets"
+    };
+
+    [GeneratedRegex(@"^Custom_\d+$", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    private static partial Regex CustomAttributeKeyRegex();
+
+    /// <summary>P1-07：判断卡牌属性键是否为官方 ECardAttributeType 枚举成员或标准 Custom_N 扩展槽位。</summary>
+    public static bool IsOfficialOrCustomCardAttributeKey(string? attrKey)
+    {
+        if (string.IsNullOrWhiteSpace(attrKey)) return false;
+        string trimmed = attrKey.Trim();
+        return OfficialCardAttributeTypes.Contains(trimmed) || CustomAttributeKeyRegex().IsMatch(trimmed);
+    }
+
     [GeneratedRegex(@"\{([^}]+)\}", RegexOptions.CultureInvariant)]
     private static partial Regex PlaceholderTokenRegex();
 
@@ -442,9 +479,23 @@ public static partial class ModValidator
         }
         else
         {
-            // 构建隔离 Overlay 用于 Gate #9（即使某条静态规则如 Gate #7 缺文案有 Error，只要能构建隔离 Overlay 仍继续跑战斗体检帮助作者一次定位全部问题）
+            // 构建隔离 Overlay 用于 Gate #9 与 Gate #10 共享复用（P1-18：消除整份 GameDataRepository 双克隆）
             bool canBuildOverlay = gates.Take(3).All(g => g.Status != "FAIL")
                 && gates[3].Status != "FAIL"; // Gate #4 含非法 $type 时不应硬跑
+
+            // 提前按依赖收集与本包同组的前置依赖包，保证 Gate #9 与 Gate #10 共享同一份只读底库 + 轻量 Overlay
+            var dependencyPackages = new List<ModPackage>();
+            if (targetPkg.Manifest.Dependencies is { Count: > 0 })
+            {
+                var neededDepIds = new HashSet<string>(targetPkg.Manifest.Dependencies, StringComparer.OrdinalIgnoreCase);
+                foreach (var p in otherPackages)
+                {
+                    if (neededDepIds.Contains(p.Manifest.Id))
+                        dependencyPackages.Add(p);
+                }
+            }
+
+            GameDataRepository? sharedOverlayRepo = null;
 
             // Gate #9: 50 场真实 CombatSimulator 沙盒压力体检
             if (!canBuildOverlay)
@@ -467,14 +518,14 @@ public static partial class ModValidator
             {
                 gates.Add(ExecuteGate(9, "combat_simulator_stress", "闸门 9：50 场真实 CombatSimulator 压力体检", list =>
                 {
-                    var overlayRepo = BuildIsolatedOverlayForPackage(targetPkg, baseRepo);
+                    sharedOverlayRepo = BuildIsolatedOverlayForPackage(targetPkg, baseRepo, dependencyPackages);
                     var candidateMechs = new Dictionary<string, MechanicDefinition>(StringComparer.OrdinalIgnoreCase);
                     foreach (var op in otherPackages)
                         foreach (var om in op.Mechanics)
                             if (!string.IsNullOrWhiteSpace(om.Id)) candidateMechs[om.Id.Trim()] = om;
                     foreach (var tm in targetPkg.Mechanics)
                         if (!string.IsNullOrWhiteSpace(tm.Id)) candidateMechs[tm.Id.Trim()] = tm;
-                    var (sr, simIssues) = ModCombatStressTester.RunStressTest(targetPkg, overlayRepo, combatMatches, combatSeed, candidateMechs);
+                    var (sr, simIssues) = ModCombatStressTester.RunStressTest(targetPkg, sharedOverlayRepo, combatMatches, combatSeed, candidateMechs);
                     stressReport = sr;
                     list.AddRange(simIssues);
                 }));
@@ -483,7 +534,7 @@ public static partial class ModValidator
             // Gate #10: 幽灵池隔离 + UnknownRuleTypes == 0 + 安全 wire 映射 + RollbackToBase 零残留
             gates.Add(ExecuteGate(10, "isolation_and_regression_invariants", "闸门 10：幽灵池隔离、未知规则归零与回滚零残留", list =>
             {
-                RunGate10IsolationAndInvariants(targetPkg, otherPackages, baseRepo, validVisualWhitelist, list);
+                RunGate10IsolationAndInvariants(targetPkg, dependencyPackages, baseRepo, validVisualWhitelist, sharedOverlayRepo, list);
             }));
         }
 
@@ -1111,13 +1162,31 @@ public static partial class ModValidator
 
         // V14 开放自定义沙盒机制静态审计与卡牌引用检查（所有静态问题归入闸门 #4）
         var knownMechanicIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var knownMechanicsById = new Dictionary<string, MechanicDefinition>(StringComparer.OrdinalIgnoreCase);
         var globalMechs = ModRuntimeHooks.GetRegisteredMechanics();
         if (globalMechs != null)
-            foreach (var k in globalMechs.Keys) knownMechanicIds.Add(k);
+        {
+            foreach (var (k, v) in globalMechs)
+            {
+                knownMechanicIds.Add(k);
+                if (v != null) knownMechanicsById[k] = v;
+            }
+        }
         if (contextPackages != null)
+        {
             foreach (var cp in contextPackages)
+            {
                 foreach (var cm in cp.Mechanics)
-                    if (!string.IsNullOrWhiteSpace(cm.Id)) knownMechanicIds.Add(cm.Id.Trim());
+                {
+                    if (!string.IsNullOrWhiteSpace(cm.Id))
+                    {
+                        string tid = cm.Id.Trim();
+                        knownMechanicIds.Add(tid);
+                        knownMechanicsById[tid] = cm;
+                    }
+                }
+            }
+        }
 
         var localMechIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (int mi = 0; mi < pkg.Mechanics.Count; mi++)
@@ -1139,6 +1208,7 @@ public static partial class ModValidator
                         $"Mod 内存在重复的自定义机制 ID '{trimmed}'。", trimmed, GateId: 4));
                 }
                 knownMechanicIds.Add(trimmed);
+                knownMechanicsById[trimmed] = mech;
             }
         }
 
@@ -1160,8 +1230,377 @@ public static partial class ModValidator
             }
         }
 
-        foreach (var c in pkg.Cards) CheckAttachments(c.CustomId, c.CustomMechanics);
-        foreach (var p in pkg.Patches) CheckAttachments(p.TargetTemplateId, p.CustomMechanicsOverride);
+        foreach (var c in pkg.Cards)
+        {
+            CheckAttachments(c.CustomId, c.CustomMechanics);
+            // P1-17：检测随等阶变化但未被 abilities/auras/机制引用的孤立 Custom_N（防止光环硬编码不随阶缩放）
+            CheckOrphanScalingCustomAttributes(modId, c, knownMechanicsById, jsonOpts, issues);
+            // P1-07：检测非官方 ECardAttributeType 且非 Custom_N 的自定义属性键（协议层会被丢弃）
+            CheckNonOfficialCardAttributeKeys(modId, c.CustomId, c.Attributes, c.Tiers, issues);
+        }
+        foreach (var ev in pkg.Events)
+        {
+            var evCard = ev.ToCardDefinition();
+            CheckNonOfficialCardAttributeKeys(modId, evCard.CustomId, evCard.Attributes, evCard.Tiers, issues);
+            foreach (var st in ev.Steps)
+            {
+                CheckOrphanScalingCustomAttributes(modId, st, knownMechanicsById, jsonOpts, issues);
+                CheckNonOfficialCardAttributeKeys(modId, st.CustomId, st.Attributes, st.Tiers, issues);
+            }
+        }
+        foreach (var p in pkg.Patches)
+        {
+            CheckAttachments(p.TargetTemplateId, p.CustomMechanicsOverride);
+            CheckNonOfficialPatchAttributeKeys(modId, p.TargetTemplateId, p.AttributeOverrides, p.TierAttributeOverrides, issues);
+        }
+    }
+
+    // ── P1-17：孤立随阶缩放 Custom_N 静态体检（Warning） ─────────────────────
+
+    private static void CheckOrphanScalingCustomAttributes(
+        string modId,
+        CustomCardDefinition card,
+        IReadOnlyDictionary<string, MechanicDefinition> knownMechanicsById,
+        JsonSerializerOptions jsonOpts,
+        List<ModValidationIssue> issues)
+    {
+        if (card.Tiers == null || card.Tiers.Count < 2)
+            return;
+
+        string cid = string.IsNullOrWhiteSpace(card.CustomId) ? "<unnamed>" : card.CustomId.Trim();
+
+        // 统计各 Custom_N 在不同品阶中的数值序列
+        var customSeries = new Dictionary<string, List<(string Tier, double Value)>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (tierKey, td) in card.Tiers)
+        {
+            if (td?.Attributes == null) continue;
+            foreach (var (attrKey, val) in td.Attributes)
+            {
+                if (string.IsNullOrWhiteSpace(attrKey)) continue;
+                string cleanKey = attrKey.Trim();
+                if (!CustomAttributeKeyRegex().IsMatch(cleanKey)) continue;
+                if (!customSeries.TryGetValue(cleanKey, out var series))
+                {
+                    series = new List<(string, double)>();
+                    customSeries[cleanKey] = series;
+                }
+                series.Add((tierKey, val));
+            }
+        }
+
+        if (customSeries.Count == 0)
+            return;
+
+        // 筛出数值随等阶发生变化的 Custom_N
+        var scalingCustomAttrs = new List<(string AttrKey, List<(string Tier, double Value)> Series)>();
+        foreach (var (attrKey, series) in customSeries)
+        {
+            if (series.Count < 2) continue;
+            double first = series[0].Value;
+            bool varies = false;
+            for (int i = 1; i < series.Count; i++)
+            {
+                if (Math.Abs(series[i].Value - first) > 1e-9)
+                {
+                    varies = true;
+                    break;
+                }
+            }
+            if (varies)
+                scalingCustomAttrs.Add((attrKey, series));
+        }
+
+        if (scalingCustomAttrs.Count == 0)
+            return;
+
+        // 收集该卡全部规则节点、计数器与自定义机制引用到的属性名
+        var referencedAttrs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void CollectFromRuleNode(RuleNode? node, int depth = 0)
+        {
+            if (node == null || depth > 24) return;
+            if (!string.IsNullOrWhiteSpace(node.AttributeType)) referencedAttrs.Add(node.AttributeType.Trim());
+            if (!string.IsNullOrWhiteSpace(node.Attribute)) referencedAttrs.Add(node.Attribute.Trim());
+            if (!string.IsNullOrWhiteSpace(node.CardAttributeType)) referencedAttrs.Add(node.CardAttributeType.Trim());
+            if (!string.IsNullOrWhiteSpace(node.AttributeChanged)) referencedAttrs.Add(node.AttributeChanged.Trim());
+            if (!string.IsNullOrWhiteSpace(node.AttributeOther)) referencedAttrs.Add(node.AttributeOther.Trim());
+
+            CollectFromRuleNode(node.ReferenceValue, depth + 1);
+            CollectFromRuleNode(node.Target, depth + 1);
+            CollectFromRuleNode(node.TargetPlayer, depth + 1);
+            CollectFromRuleNode(node.TargetCount, depth + 1);
+            CollectFromRuleNode(node.Source, depth + 1);
+            CollectFromRuleNode(node.Subject, depth + 1);
+            CollectFromRuleNode(node.SubjectOther, depth + 1);
+            CollectFromRuleNode(node.Duration, depth + 1);
+            CollectFromRuleNode(node.Cost, depth + 1);
+            CollectFromRuleNode(node.Limit, depth + 1);
+            CollectFromRuleNode(node.SpawnContext, depth + 1);
+            CollectFromRuleNode(node.SelectionContextRules, depth + 1);
+            CollectFromRuleNode(node.Modifier?.Value, depth + 1);
+
+            if (node.Actions != null) foreach (var c in node.Actions) CollectFromRuleNode(c, depth + 1);
+            if (node.Triggers != null) foreach (var c in node.Triggers) CollectFromRuleNode(c, depth + 1);
+            if (node.Groups != null) foreach (var c in node.Groups) CollectFromRuleNode(c, depth + 1);
+            if (node.Filters != null) foreach (var c in node.Filters) CollectFromRuleNode(c, depth + 1);
+            if (node.Behaviors != null) foreach (var c in node.Behaviors) CollectFromRuleNode(c, depth + 1);
+            if (node.Prerequisites != null) foreach (var c in node.Prerequisites) CollectFromRuleNode(c, depth + 1);
+            if (node.Attributes != null) foreach (var kv in node.Attributes) CollectFromRuleNode(kv.Value, depth + 1);
+
+            try { CollectFromRuleNode(node.GetValueNode(jsonOpts), depth + 1); } catch { }
+            try { CollectFromRuleNode(node.GetComparisonValueNode(jsonOpts), depth + 1); } catch { }
+            try
+            {
+                var conds = node.GetConditionList(jsonOpts);
+                if (conds != null) foreach (var c in conds) CollectFromRuleNode(c, depth + 1);
+            }
+            catch { }
+            try
+            {
+                var constrs = node.GetConstraintList(jsonOpts);
+                if (constrs != null) foreach (var c in constrs) CollectFromRuleNode(c, depth + 1);
+            }
+            catch { }
+        }
+
+        void CollectFromAbilities(Dictionary<string, AbilityDefinition>? map)
+        {
+            if (map == null) return;
+            foreach (var ab in map.Values)
+            {
+                if (ab == null) continue;
+                CollectFromRuleNode(ab.Trigger);
+                CollectFromRuleNode(ab.Action);
+                if (ab.Prerequisites != null)
+                    foreach (var pr in ab.Prerequisites) CollectFromRuleNode(pr);
+            }
+        }
+
+        void CollectFromAuras(Dictionary<string, AuraDefinition>? map)
+        {
+            if (map == null) return;
+            foreach (var au in map.Values)
+            {
+                if (au == null) continue;
+                CollectFromRuleNode(au.Action);
+                if (au.Prerequisites != null)
+                    foreach (var pr in au.Prerequisites) CollectFromRuleNode(pr);
+            }
+        }
+
+        CollectFromAbilities(card.Abilities);
+        CollectFromAuras(card.Auras);
+
+        if (card.Enchantments != null)
+        {
+            foreach (var ed in card.Enchantments.Values)
+            {
+                if (ed == null) continue;
+                CollectFromAbilities(ed.Abilities);
+                CollectFromAuras(ed.Auras);
+            }
+        }
+
+        if (card.Quests != null)
+        {
+            foreach (var q in card.Quests)
+            {
+                if (q == null) continue;
+                if (q.Prerequisites != null)
+                    foreach (var pr in q.Prerequisites) CollectFromRuleNode(pr);
+                foreach (var qe in q.Entries)
+                {
+                    if (qe == null) continue;
+                    if (!string.IsNullOrWhiteSpace(qe.AttributeType)) referencedAttrs.Add(qe.AttributeType.Trim());
+                    CollectFromRuleNode(qe.Trigger);
+                    CollectFromRuleNode(qe.Update?.Value);
+                    if (qe.Prerequisites != null)
+                        foreach (var pr in qe.Prerequisites) CollectFromRuleNode(pr);
+                    if (qe.Reward != null)
+                    {
+                        CollectFromAbilities(qe.Reward.Abilities);
+                        CollectFromAuras(qe.Reward.Auras);
+                    }
+                    CollectFromAbilities(qe.CompletionEffects);
+                }
+            }
+        }
+
+        if (card.CounterDisplays is { Count: > 0 })
+        {
+            foreach (var cd in card.CounterDisplays)
+            {
+                if (cd == null) continue;
+                if (!string.IsNullOrWhiteSpace(cd.SyncAttribute)) referencedAttrs.Add(cd.SyncAttribute.Trim());
+                if (!string.IsNullOrWhiteSpace(cd.MaxAttr)) referencedAttrs.Add(cd.MaxAttr.Trim());
+            }
+        }
+
+        void CollectFromMechanicExpr(MechanicValueExpr? expr)
+        {
+            if (expr != null && !string.IsNullOrWhiteSpace(expr.CardAttr))
+                referencedAttrs.Add(expr.CardAttr.Trim());
+        }
+
+        void CollectFromMechanicCond(MechanicCondition? cond, int depth = 0)
+        {
+            if (cond == null || depth > 16) return;
+            CollectFromMechanicExpr(cond.Left);
+            CollectFromMechanicExpr(cond.Right);
+            CollectFromMechanicCond(cond.Not, depth + 1);
+            if (cond.All != null) foreach (var c in cond.All) CollectFromMechanicCond(c, depth + 1);
+            if (cond.Any != null) foreach (var c in cond.Any) CollectFromMechanicCond(c, depth + 1);
+        }
+
+        void CollectFromMechanicSteps(List<MechanicStep>? steps, int depth = 0)
+        {
+            if (steps == null || depth > 16) return;
+            for (int i = 0; i < steps.Count; i++)
+            {
+                var st = steps[i];
+                if (st == null) continue;
+                if (!string.IsNullOrWhiteSpace(st.SyncAttribute)) referencedAttrs.Add(st.SyncAttribute.Trim());
+                if (!string.IsNullOrWhiteSpace(st.Attribute)) referencedAttrs.Add(st.Attribute.Trim());
+                CollectFromMechanicExpr(st.Value);
+                CollectFromMechanicExpr(st.Amount);
+                CollectFromMechanicExpr(st.Count);
+                CollectFromMechanicExpr(st.InitialDelayMs);
+                CollectFromMechanicExpr(st.IntervalMs);
+                CollectFromMechanicExpr(st.DelayMs);
+                CollectFromMechanicCond(st.Condition);
+                CollectFromMechanicSteps(st.Then, depth + 1);
+                CollectFromMechanicSteps(st.Else, depth + 1);
+                CollectFromMechanicSteps(st.Steps, depth + 1);
+            }
+        }
+
+        if (card.CustomMechanics is { Count: > 0 })
+        {
+            foreach (var att in card.CustomMechanics)
+            {
+                if (att == null || !att.Enabled) continue;
+                if (att.Params != null)
+                {
+                    foreach (var pVal in att.Params.Values)
+                    {
+                        if (pVal.ValueKind == JsonValueKind.String)
+                        {
+                            string? sv = pVal.GetString();
+                            if (!string.IsNullOrWhiteSpace(sv)) referencedAttrs.Add(sv.Trim());
+                        }
+                    }
+                }
+                if (!string.IsNullOrWhiteSpace(att.MechanicId)
+                    && knownMechanicsById.TryGetValue(att.MechanicId.Trim(), out var mechDef))
+                {
+                    if (!string.IsNullOrWhiteSpace(mechDef.CounterDisplay?.SyncAttribute))
+                        referencedAttrs.Add(mechDef.CounterDisplay!.SyncAttribute!.Trim());
+                    if (!string.IsNullOrWhiteSpace(mechDef.CounterDisplay?.MaxAttr))
+                        referencedAttrs.Add(mechDef.CounterDisplay!.MaxAttr!.Trim());
+                    if (mechDef.Hooks != null)
+                    {
+                        foreach (var hk in mechDef.Hooks)
+                            CollectFromMechanicSteps(hk?.Steps);
+                    }
+                }
+            }
+        }
+
+        foreach (var (attrKey, series) in scalingCustomAttrs)
+        {
+            if (referencedAttrs.Contains(attrKey))
+                continue;
+
+            string tierSummary = string.Join(" / ", series.Select(s => $"{s.Tier}={s.Value:0.##}"));
+            issues.Add(new ModValidationIssue(
+                ModValidationSeverity.Warning,
+                modId,
+                "ORPHAN_SCALING_CUSTOM_ATTRIBUTE",
+                $"卡牌 '{cid}' 的 '{attrKey}' 在各品阶间数值递增变化（{tierSummary}），但 abilities / auras / 自定义机制中从未引用该属性，升级时实际效果可能被硬编码锁死而未随等阶缩放。",
+                cid,
+                GateId: 4,
+                FixHintZh: $"请在对应光环或技能的 value/modifier 中通过 TReferenceValueCardAttribute(attributeType: \"{attrKey}\", target: TTargetCardSelf) 引用该属性，替换固定 TFixedValue。"));
+        }
+    }
+
+    // ── P1-07：非官方 ECardAttributeType 且非 Custom_N 自定义属性键体检（Warning） ──
+
+    private static void CheckNonOfficialCardAttributeKeys(
+        string modId,
+        string? cardId,
+        Dictionary<string, double>? topAttrs,
+        Dictionary<string, TierData>? tiers,
+        List<ModValidationIssue> issues)
+    {
+        string cid = string.IsNullOrWhiteSpace(cardId) ? "<unnamed>" : cardId.Trim();
+        var flagged = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void InspectBag(Dictionary<string, double>? bag)
+        {
+            if (bag == null) return;
+            foreach (var rawKey in bag.Keys)
+            {
+                if (string.IsNullOrWhiteSpace(rawKey)) continue;
+                string key = rawKey.Trim();
+                if (IsOfficialOrCustomCardAttributeKey(key) || !flagged.Add(key))
+                    continue;
+
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Warning,
+                    modId,
+                    "NON_OFFICIAL_CARD_ATTRIBUTE_KEY",
+                    $"卡牌 '{cid}' 使用了非官方 ECardAttributeType 且非 Custom_N 的自定义属性键 '{key}'（网络协议序列化为 ECardAttributeType 枚举时会丢弃该键，客户端运行时字典无法读取）。",
+                    cid,
+                    GateId: 4,
+                    FixHintZh: $"建议将 '{key}' 替换为官方标准属性名或官方内置通用槽位 Custom_0 ~ Custom_8，并同步更新规则引用与文案占位符。"));
+            }
+        }
+
+        InspectBag(topAttrs);
+        if (tiers != null)
+        {
+            foreach (var td in tiers.Values)
+                InspectBag(td?.Attributes);
+        }
+    }
+
+    private static void CheckNonOfficialPatchAttributeKeys(
+        string modId,
+        string? targetTemplateId,
+        Dictionary<string, double>? attrOverrides,
+        Dictionary<string, Dictionary<string, double>>? tierAttrOverrides,
+        List<ModValidationIssue> issues)
+    {
+        string pid = string.IsNullOrWhiteSpace(targetTemplateId) ? "<patch>" : targetTemplateId.Trim();
+        var flagged = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void InspectBag(Dictionary<string, double>? bag)
+        {
+            if (bag == null) return;
+            foreach (var rawKey in bag.Keys)
+            {
+                if (string.IsNullOrWhiteSpace(rawKey)) continue;
+                string key = rawKey.Trim();
+                if (IsOfficialOrCustomCardAttributeKey(key) || !flagged.Add(key))
+                    continue;
+
+                issues.Add(new ModValidationIssue(
+                    ModValidationSeverity.Warning,
+                    modId,
+                    "NON_OFFICIAL_CARD_ATTRIBUTE_KEY",
+                    $"原位补丁 '{pid}' 使用了非官方 ECardAttributeType 且非 Custom_N 的自定义属性键 '{key}'（网络协议序列化时会被丢弃）。",
+                    pid,
+                    GateId: 4,
+                    FixHintZh: $"建议将 '{key}' 替换为官方标准属性名或 Custom_0 ~ Custom_8 槽位。"));
+            }
+        }
+
+        InspectBag(attrOverrides);
+        if (tierAttrOverrides != null)
+        {
+            foreach (var bag in tierAttrOverrides.Values)
+                InspectBag(bag);
+        }
     }
 
     private static void CheckPrerequisites(
@@ -2391,9 +2830,10 @@ public static partial class ModValidator
 
     private static void RunGate10IsolationAndInvariants(
         ModPackage targetPkg,
-        List<ModPackage> otherPackages,
+        List<ModPackage> dependencyPackages,
         GameDataRepository baseRepo,
         IReadOnlySet<string>? validVisualWhitelist,
+        GameDataRepository? sharedOverlayRepo,
         List<ModValidationIssue> issues)
     {
         string modId = targetPkg.Manifest.Id;
@@ -2416,20 +2856,21 @@ public static partial class ModValidator
                 GateId: 10, FixHintZh: "将 mod.json 中的 affectsGhostPool 设为 false。"));
         }
 
-        // 2. 隔离沙盒 ModRegistry 装入（显式 CreateIsolated 禁触全局静态 ModRuntimeHooks）-> 检查 UnknownRuleTypes / Wire 映射 / RollbackToBase 零残留
+        // 2. 隔离沙盒 ModRegistry 装入（显式 CreateIsolated 禁触全局静态 ModRuntimeHooks，并复用共享只读底库 + 轻量 Overlay）
         var sandbox = ModRegistry.CreateIsolated(baseRepo, validVisualWhitelist);
         int baseCardCount = baseRepo.CardsById.Count;
 
         // 若目标包有声明依赖且在上下文中存在，一并装入沙盒以保证真实装载
-        var loadSet = new List<ModPackage>();
-        var neededDeps = new HashSet<string>(targetPkg.Manifest.Dependencies ?? [], StringComparer.OrdinalIgnoreCase);
-        foreach (var p in otherPackages)
-        {
-            if (neededDeps.Contains(p.Manifest.Id)) loadSet.Add(p);
-        }
+        var loadSet = new List<ModPackage>(dependencyPackages.Count + 1);
+        loadSet.AddRange(dependencyPackages);
         loadSet.Add(targetPkg);
 
-        var loadReport = sandbox.LoadPackages(loadSet, "<gate10-sandbox>", baseRepo, validVisualWhitelist, keepPreviousOnError: false);
+        var loadReport = sandbox.LoadPackagesForValidationSandbox(
+            loadSet,
+            "<gate10-sandbox>",
+            baseRepo,
+            validVisualWhitelist,
+            prebuiltOverlayRepo: sharedOverlayRepo);
 
         if (hasGameplayChange && loadReport.LoadedModIdsInOrder.Contains(modId, StringComparer.OrdinalIgnoreCase))
         {
@@ -2466,9 +2907,10 @@ public static partial class ModValidator
             }
         }
 
-        // 3. 回滚零残留校验（sandbox 为 CreateIsolated，RollbackToBase 绝不清空全局 ModRuntimeHooks）
+        // 3. 回滚零残留校验（sandbox 为 CreateIsolated，RollbackToBase 绝不清空全局 ModRuntimeHooks，且必须回到原始共享底库引用）
         sandbox.RollbackToBase();
-        if (sandbox.ActiveRepository.CardsById.Count != baseCardCount
+        if (!ReferenceEquals(sandbox.ActiveRepository, baseRepo)
+            || sandbox.ActiveRepository.CardsById.Count != baseCardCount
             || sandbox.LoadedPackages.Count != 0
             || sandbox.VisualBindingsByCustomId.Count != 0
             || sandbox.MechanicsById.Count != 0
@@ -2479,42 +2921,143 @@ public static partial class ModValidator
         }
     }
 
-    private static GameDataRepository BuildIsolatedOverlayForPackage(ModPackage pkg, GameDataRepository baseRepo)
+    /// <summary>
+    /// P1-18：基于只读共享底库 <paramref name="baseRepo"/> 构建轻量隔离叠加仓库（仅增量合并卡牌与野怪，
+    /// 零拷贝共享只读元表 LevelUps/TooltipGlossary/Challenges/Collectibles/Seasons/TooltipSymbols，绝不污染底库且并发安全）。
+    /// </summary>
+    public static GameDataRepository BuildLightweightOverlayRepository(
+        GameDataRepository baseRepo,
+        IReadOnlyCollection<CardTemplate>? additionalCards = null,
+        IReadOnlyCollection<MonsterTemplate>? additionalMonsters = null,
+        ILocalizationStore? localizationOverride = null)
     {
-        var merged = new Dictionary<string, CardTemplate>(StringComparer.OrdinalIgnoreCase);
-        string modId = pkg.Manifest.Id;
+        ArgumentNullException.ThrowIfNull(baseRepo);
 
-        foreach (var c in pkg.Cards)
+        bool hasCards = additionalCards is { Count: > 0 };
+        bool hasMonsters = additionalMonsters is { Count: > 0 };
+        bool hasLocOverride = localizationOverride != null && !ReferenceEquals(localizationOverride, baseRepo.Localization);
+        if (!hasCards && !hasMonsters && !hasLocOverride)
+            return baseRepo;
+
+        // 仅在存在新增/覆盖卡牌时拷贝 CardsById，否则零拷贝复用只读底库字典（GameDataRepository 全链路不修改该字典）
+        Dictionary<string, CardTemplate> effectiveCards;
+        if (hasCards)
         {
-            var baseTpl = baseRepo.GetCard(c.BaseVisualTemplateId);
-            if (baseTpl != null)
-                merged[c.CustomId] = c.ToCardTemplate(baseTpl, modId);
-        }
-        foreach (var p in pkg.Patches)
-        {
-            var baseTpl = baseRepo.GetCard(p.TargetTemplateId);
-            if (baseTpl != null)
-                merged[p.TargetTemplateId] = p.ApplyToTemplate(baseTpl, modId);
-        }
-        foreach (var ev in pkg.Events)
-        {
-            var evDef = ev.ToCardDefinition();
-            var evBase = baseRepo.GetCard(evDef.BaseVisualTemplateId);
-            if (evBase != null) merged[evDef.CustomId] = evDef.ToCardTemplate(evBase, modId);
-            foreach (var st in ev.Steps)
+            effectiveCards = new Dictionary<string, CardTemplate>(baseRepo.CardsById, StringComparer.OrdinalIgnoreCase);
+            foreach (var card in additionalCards!)
             {
-                var stBase = baseRepo.GetCard(st.BaseVisualTemplateId);
-                if (stBase != null) merged[st.CustomId] = st.ToCardTemplate(stBase, modId);
+                if (card == null || string.IsNullOrWhiteSpace(card.Id)) continue;
+                GameDatabaseLoader.PrecompileCardTemplateRules(card);
+                effectiveCards[card.Id] = card;
             }
         }
+        else
+        {
+            effectiveCards = baseRepo.CardsById as Dictionary<string, CardTemplate>
+                ?? new Dictionary<string, CardTemplate>(baseRepo.CardsById, StringComparer.OrdinalIgnoreCase);
+        }
 
-        var monsters = new List<MonsterTemplate>(pkg.Monsters);
-        foreach (var ev in pkg.Events)
-            if (ev.CombatMonster != null) monsters.Add(ev.CombatMonster);
+        // 仅在存在新增野怪时拷贝 MonstersById，否则零拷贝复用只读底库字典
+        Dictionary<string, MonsterTemplate> effectiveMonsters;
+        if (hasMonsters)
+        {
+            effectiveMonsters = new Dictionary<string, MonsterTemplate>(baseRepo.MonstersById, StringComparer.OrdinalIgnoreCase);
+            foreach (var m in additionalMonsters!)
+            {
+                if (m == null || string.IsNullOrWhiteSpace(m.Id)) continue;
+                effectiveMonsters[m.Id] = m;
+            }
+        }
+        else
+        {
+            effectiveMonsters = baseRepo.MonstersById as Dictionary<string, MonsterTemplate>
+                ?? new Dictionary<string, MonsterTemplate>(baseRepo.MonstersById, StringComparer.OrdinalIgnoreCase);
+        }
 
-        return (merged.Count > 0 || monsters.Count > 0)
-            ? baseRepo.CreateWithOverlay(merged.Values, monsters)
-            : baseRepo;
+        // 零拷贝共享底库只读元表（绝不对其进行任何写操作）
+        var levelUps = baseRepo.LevelUps as Dictionary<int, LevelUpTemplate>
+            ?? new Dictionary<int, LevelUpTemplate>(baseRepo.LevelUps);
+        var tooltipGlossary = baseRepo.TooltipGlossary as Dictionary<string, string>
+            ?? new Dictionary<string, string>(baseRepo.TooltipGlossary, StringComparer.OrdinalIgnoreCase);
+        var observedRules = baseRepo.ObservedRuleTypes as HashSet<string>
+            ?? new HashSet<string>(baseRepo.ObservedRuleTypes, StringComparer.Ordinal);
+        var unknownRules = baseRepo.UnknownRuleTypes as HashSet<string>
+            ?? new HashSet<string>(baseRepo.UnknownRuleTypes, StringComparer.Ordinal);
+        var challenges = baseRepo.ChallengesById as Dictionary<string, ChallengeTemplate>
+            ?? new Dictionary<string, ChallengeTemplate>(baseRepo.ChallengesById, StringComparer.OrdinalIgnoreCase);
+        var collectibles = baseRepo.CollectiblesById as Dictionary<string, CollectibleTemplate>
+            ?? new Dictionary<string, CollectibleTemplate>(baseRepo.CollectiblesById, StringComparer.OrdinalIgnoreCase);
+        var seasons = baseRepo.SeasonsById as Dictionary<int, SeasonTemplate>
+            ?? new Dictionary<int, SeasonTemplate>(baseRepo.SeasonsById);
+        var tooltipSymbols = baseRepo.TooltipSymbolsById as Dictionary<string, TooltipSymbolTemplate>
+            ?? new Dictionary<string, TooltipSymbolTemplate>(baseRepo.TooltipSymbolsById, StringComparer.OrdinalIgnoreCase);
+
+        return new GameDataRepository(
+            baseRepo.SourceZipPath,
+            baseRepo.GameMode,
+            effectiveCards,
+            effectiveMonsters,
+            levelUps,
+            tooltipGlossary,
+            observedRules,
+            unknownRules,
+            localizationOverride ?? baseRepo.Localization,
+            baseRepo.SourceDataPath,
+            challenges,
+            collectibles,
+            seasons,
+            tooltipSymbols);
+    }
+
+    internal static GameDataRepository BuildIsolatedOverlayForPackage(
+        ModPackage pkg,
+        GameDataRepository baseRepo,
+        IReadOnlyList<ModPackage>? dependencyPackages = null)
+    {
+        var merged = new Dictionary<string, CardTemplate>(StringComparer.OrdinalIgnoreCase);
+        var monsters = new List<MonsterTemplate>();
+
+        void MergePackage(ModPackage current)
+        {
+            string curModId = current.Manifest.Id;
+            foreach (var c in current.Cards)
+            {
+                var baseTpl = baseRepo.GetCard(c.BaseVisualTemplateId);
+                if (baseTpl != null)
+                    merged[c.CustomId] = c.ToCardTemplate(baseTpl, curModId);
+            }
+            foreach (var p in current.Patches)
+            {
+                if (string.IsNullOrWhiteSpace(p.TargetTemplateId)) continue;
+                string tid = p.TargetTemplateId.Trim();
+                var srcTpl = merged.TryGetValue(tid, out var alreadyPatched) ? alreadyPatched : baseRepo.GetCard(tid);
+                if (srcTpl != null)
+                    merged[tid] = p.ApplyToTemplate(srcTpl, curModId);
+            }
+            foreach (var ev in current.Events)
+            {
+                var evDef = ev.ToCardDefinition();
+                var evBase = baseRepo.GetCard(evDef.BaseVisualTemplateId);
+                if (evBase != null) merged[evDef.CustomId] = evDef.ToCardTemplate(evBase, curModId);
+                foreach (var st in ev.Steps)
+                {
+                    var stBase = baseRepo.GetCard(st.BaseVisualTemplateId);
+                    if (stBase != null) merged[st.CustomId] = st.ToCardTemplate(stBase, curModId);
+                }
+                if (ev.CombatMonster != null) monsters.Add(ev.CombatMonster);
+            }
+            if (current.Monsters.Count > 0)
+                monsters.AddRange(current.Monsters);
+        }
+
+        if (dependencyPackages is { Count: > 0 })
+        {
+            for (int i = 0; i < dependencyPackages.Count; i++)
+                MergePackage(dependencyPackages[i]);
+        }
+        MergePackage(pkg);
+
+        return BuildLightweightOverlayRepository(baseRepo, merged.Values, monsters);
     }
 
     private static List<ModPackage> TopologicalSort(

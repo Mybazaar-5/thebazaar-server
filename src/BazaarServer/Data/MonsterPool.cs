@@ -77,6 +77,55 @@ public static class MonsterPool
             || name.Contains("Big Bad Wolf", StringComparison.OrdinalIgnoreCase);
     }
 
+    // P3-08：官方 GameData.db 已知 Never + 空 ArtKey 调试/占位技能 ID 集合（含非 [DEBUG] 命名的遗留占位卡 Virulent Research）
+    private static readonly HashSet<string> OfficialKnownBlankArtPlaceholderSkillIds = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "11f9bd3f-4868-4554-bef9-ed19f685ad15", // [DEBUG] Tempo Cooldown Reduction
+        "4ab58b91-0aab-48fd-9812-58a3fb2c93ed", // [DEBUG] TempoCostReduction
+        "cc822ee3-0c6c-4ff9-9883-d451a27d433a", // [DEBUG] Rage Extender
+        "d562bfda-d926-44da-9e64-95ce81e3e6a9", // SkillCard - Speed
+        "e78b1599-ca80-47b0-b386-04ae403994d5", // Virulent Research
+    };
+
+    /// <summary>
+    /// P3-08（RC-OFFICIAL-BLANK-SKILL-ARTKEY）：精准判断技能模板是否为应被服务端过滤的官方空图调试/占位技能
+    /// （Type=="Skill"、ArtKey 为空，且属于 [DEBUG] / "SkillCard -" 占位命名或官方已知空图占位技能如 Virulent Research），
+    /// 绝不误杀玩家已持有或测试/Mod 显式挂载的普通合成技能。
+    /// </summary>
+    public static bool IsBlockedDebugOrBlankArtSkill(BazaarCore.Models.CardTemplate? tpl)
+    {
+        if (tpl == null) return true;
+        if (!string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (!string.IsNullOrWhiteSpace(tpl.ArtKey))
+            return false;
+
+        string name = tpl.InternalName ?? string.Empty;
+        if (name.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        bool isNever = string.Equals(tpl.SpawningEligibility, "Never", StringComparison.OrdinalIgnoreCase);
+        if (!isNever)
+            return false;
+
+        if (name.StartsWith("SkillCard -", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (!string.IsNullOrWhiteSpace(tpl.Id) && OfficialKnownBlankArtPlaceholderSkillIds.Contains(tpl.Id.Trim()))
+            return true;
+        if (string.Equals(name.Trim(), "Virulent Research", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
+    }
+
+    /// <summary>P3-08：按模板 ID 查询仓库并判断是否为应过滤的空 ArtKey 调试技能。</summary>
+    public static bool IsBlockedDebugOrBlankArtSkill(string? templateId, GameDataRepository? repo)
+    {
+        if (string.IsNullOrWhiteSpace(templateId) || repo == null) return false;
+        var tpl = repo.GetCard(templateId);
+        return tpl != null && IsBlockedDebugOrBlankArtSkill(tpl);
+    }
+
     /// <summary>
     /// 判断独立 MonsterTemplate 是否为可实战野怪（排除 20HP/10000HP 等占位怪与调试名）。
     /// </summary>
@@ -372,7 +421,7 @@ public static class MonsterPool
                     allPlayerAttrs[kv.Key] = (int)Math.Round(kv.Value);
             }
 
-            static List<MonsterTemplate.MonsterItem> MapEntries(IReadOnlyList<MonsterCardEntry>? src)
+            List<MonsterTemplate.MonsterItem> MapEntries(IReadOnlyList<MonsterCardEntry>? src, bool filterBlockedSkills = false)
             {
                 var res = new List<MonsterTemplate.MonsterItem>(src?.Count ?? 0);
                 if (src == null) return res;
@@ -380,6 +429,7 @@ public static class MonsterPool
                 {
                     var it = src[i];
                     if (it == null || string.IsNullOrWhiteSpace(it.TemplateId)) continue;
+                    if (filterBlockedSkills && IsBlockedDebugOrBlankArtSkill(it.TemplateId, repo)) continue;
                     var itemAttrs = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                     if (it.Attributes != null)
                     {
@@ -407,7 +457,7 @@ public static class MonsterPool
                 Level = allPlayerAttrs.GetValueOrDefault("Level", 1),
                 Attributes = allPlayerAttrs,
                 Items = MapEntries(core.Player?.Hand?.Items),
-                Skills = MapEntries(core.Player?.Skills),
+                Skills = MapEntries(core.Player?.Skills, filterBlockedSkills: true),
                 StashItems = MapEntries(core.Player?.Stash?.Items),
                 SocketEffects = MapEntries(core.Player?.GetEffectiveSocketEffects()),
             });

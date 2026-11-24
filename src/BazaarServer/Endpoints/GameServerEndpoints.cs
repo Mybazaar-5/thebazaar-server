@@ -237,8 +237,10 @@ public static class GameServerEndpoints
     }
 
     /// <summary>
-    /// P0-17 &amp; P0-21：判断命令拒单是否需要在响应末尾附加 NetMessageGameStateSync 强制对齐客户端乐观盘面。
-    /// 战斗态（Combat/PVPCombat）与终局态（EndRun*/Shutdown）绝不附加 GameStateSync。
+    /// P0-17、P0-21 &amp; Wave5A P0-01/P0-02：判断命令拒单是否需要在响应末尾附加 NetMessageGameStateSync 强制对齐客户端乐观盘面。
+    /// 战斗态（Combat/PVPCombat）、终局态（EndRun*/Shutdown）以及活跃祭坛态（Pedestal）绝不附加 GameStateSync；
+    /// 同时 CommitToPedestalCommand 拒单（含服务端已切离 Pedestal 但客户端仍在播 6s 退场/CleanUp 的重复提交）仅返回轻量 Error，
+    /// 避免向活跃祭坛展示状态机注入全量同步炸弹触发 10s+10s 连环硬锁死与孤儿 3D 遮罩。
     /// </summary>
     public static bool ShouldAttachStateSyncOnCommandError(
         INetCommand cmd,
@@ -246,7 +248,14 @@ public static class GameServerEndpoints
         bool isFirstAfterReestablish = false)
     {
         if (currentState is ERunState.Combat or ERunState.PVPCombat
-            or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown)
+            or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown
+            or ERunState.Pedestal)
+        {
+            return false;
+        }
+
+        // P0-01 & P0-02：校验拒单或过时重复的 CommitToPedestalCommand 一律不附发重型 GameStateSync
+        if (cmd is CommitToPedestalCommand)
         {
             return false;
         }
@@ -258,7 +267,6 @@ public static class GameServerEndpoints
             or MoveItemCommand
             or SellCardCommand
             or SelectSkillCommand
-            or CommitToPedestalCommand
             or SelectEncounterCommand
             or ExitCurrentStateCommand
             or RerollCommand;

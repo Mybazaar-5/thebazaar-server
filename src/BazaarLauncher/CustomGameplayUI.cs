@@ -64,6 +64,14 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     private ulong _activeRunLockedMask;
     private string _activeRunFetchedId = "";
     private bool _activeRunFetchInFlight;
+    // P1-15：当前活跃对局的服务端权威规则快照（由 GET /custom-rules/me/active-run-tendency 下发），
+    // 作为局内右上角规则 HUD 的唯一权威事实源，彻底隔离大厅可变 _normalRules
+    private CustomRunRuleSet _activeRunRules;
+    private bool _activeRunIsCustomRuleRun;
+    private int _rulesFetchSeq;
+    private int _activeRunFetchSeq;
+    private int _lastSyncedAuthGeneration;
+    private float _nextActiveRunRetryTime;
     private string _lastOpeningPromptedRunId = "";
     private float _nextViewportCheckTime;
     private bool _tendencySyncPending;
@@ -186,6 +194,8 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                     if (_isOpen && _activeTab == UiTab.Workshop) RefreshWorkshopTabUi();
                 });
             }));
+            // P1-15：监听 NameAuth 登录/鉴权成功事件，立即重拉已认证账号的个人规则与活跃局权威规则，根治冷启动抢跑拿 guest 默认规则
+            _eventSubscriptions.Add(bus.Subscribe<NameAuth.AuthSucceededEvent>(OnNameAuthSucceeded));
         }
     }
 
@@ -250,6 +260,11 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         _nextViewportCheckTime = 0f;
         _activeRunId = "";
         _activeRunFetchedId = "";
+        _activeRunRules = null;
+        _activeRunIsCustomRuleRun = false;
+        _activeRunFetchSeq++;
+        _activeRunFetchInFlight = false;
+        _nextActiveRunRetryTime = 0f;
         _activeRunTendencyLocked = false;
         _activeRunAllowTendency = true;
         _ui.RefreshNativeAssetsIfNeeded(forceRescan: false);
@@ -266,6 +281,13 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         if (!_pendingUpdates.IsEmpty)
         {
             DrainPendingUpdates();
+        }
+
+        // P1-15：兜底感知在 Awake 订阅前或无 EventBus 环境下完成的鉴权升级，确保必重拉真实账号规则
+        int curAuthGen = NameAuth.AuthGeneration;
+        if (curAuthGen > _lastSyncedAuthGeneration)
+        {
+            HandleAuthReadySync(curAuthGen, NameAuth.CurrentUsername);
         }
 
         float now = Time.unscaledTime;
@@ -364,8 +386,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             if (inRun)
             {
                 bool isTourneyRun = IsActiveRunTournamentMode();
-                var runRules = ResolveInRunDisplayRules(isTourneyRun);
-                return SummarizeRules(runRules, isTourneyRun).ActiveCount;
+                return SummarizeInRunDisplayRules(isTourneyRun).ActiveCount;
             }
 
             bool isTourneyContext = _isOpen ? (_activeTab == UiTab.Tournament) : IsTournamentUiContext();
@@ -465,10 +486,20 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
     {
         DrainPendingUpdates();
         bool inCombat = IsInActiveCombatPlayback();
-        bool inMainMenu = GameInspector.IsMainMenuSceneName(GameInspector.GetActiveSceneName());
+        string activeScene = GameInspector.GetActiveSceneName();
+        bool inMainMenu = GameInspector.IsMainMenuSceneName(activeScene);
+        bool inRun = !inMainMenu && GameInspector.IsActiveInRunState(activeScene, GameInspector.GetAppStateName());
         bool isTourneyContext = _isOpen ? (_activeTab == UiTab.Tournament) : IsTournamentUiContext();
-        var activeRules = isTourneyContext ? ResolveHudDisplayRules(true) : _normalRules;
-        var sum = SummarizeRules(activeRules, isTourneyContext);
+        RuleActivationSummary sum;
+        if (inRun && !_isOpen)
+        {
+            sum = SummarizeInRunDisplayRules(IsActiveRunTournamentMode());
+        }
+        else
+        {
+            var activeRules = isTourneyContext ? ResolveHudDisplayRules(true) : _normalRules;
+            sum = SummarizeRules(activeRules, isTourneyContext);
+        }
         var presetStore = TournamentPresetStore.LoadSnapshot();
         var hudVis = GetHudVisibilityForDriver();
 
@@ -497,6 +528,8 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             isCustomActive = sum.IsCustomActive,
             activeRuleCount = sum.ActiveCount,
             activeRuleSummary = sum.SummaryText,
+            hasActiveRunRules = _activeRunRules != null,
+            isCustomRuleRun = _activeRunIsCustomRuleRun,
             tournamentPresetsPath = TournamentPresetStore.FilePath,
             hasLastTournamentRules = presetStore.LastTournamentRules != null,
             presetNames = presetStore.Presets.Select(p => p.Name).ToList(),
@@ -595,11 +628,44 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
 
     // ── 后台网络读写（严禁阻塞主线程） ──────────────────────────────────────
 
-    private void StartInitialBackgroundFetch()
+    /// <summary>P1-15：收到 NameAuth 登录/鉴权成功事件后，强制以真实账号身份重拉个人规则与活跃局权威规则。</summary>
+    private void OnNameAuthSucceeded(NameAuth.AuthSucceededEvent evt)
     {
-        if (_initialFetchStarted && _isBusy) return;
+        HandleAuthReadySync(evt.Generation, evt.Username);
+    }
+
+    private void HandleAuthReadySync(int authGeneration, string username)
+    {
+        if (authGeneration <= _lastSyncedAuthGeneration) return;
+        _lastSyncedAuthGeneration = authGeneration;
+        BazaarLauncherPlugin.Log?.LogInfo(
+            $"[CustomGameplayUI] 鉴权就绪（user={username ?? string.Empty}, gen={authGeneration}），立即重同步个人规则与活跃局规则");
+
+        // 1. 强制重拉 /custom-rules/me（覆盖登录前 Start() 抢跑可能拿到的 guest 默认规则，且不被旧 _isBusy 阻塞）
+        StartInitialBackgroundFetch(forceRefreshAfterAuth: true);
+        // 2. 立即同步拉取 /custom-rules/me/active-run-tendency（获取当前活跃局 SQLite 权威规则 _activeRunRules）
+        ForceRefreshActiveRunRulesAfterAuth();
+    }
+
+    private void ForceRefreshActiveRunRulesAfterAuth()
+    {
+        string activeScene = GameInspector.GetActiveSceneName();
+        bool inMainMenu = GameInspector.IsMainMenuSceneName(activeScene);
+        bool inRun = !inMainMenu && GameInspector.IsActiveInRunState(activeScene, GameInspector.GetAppStateName());
+        string runKey = inRun ? ReadCurrentRunWindowInfo(out _, out _, out _) : string.Empty;
+
+        _activeRunFetchedId = inRun ? runKey : string.Empty;
+        _nextActiveRunRetryTime = 0f;
+        FetchActiveRunTendencyStateAsync(runKey, force: true);
+    }
+
+    private void StartInitialBackgroundFetch(bool forceRefreshAfterAuth = false)
+    {
+        if (!forceRefreshAfterAuth && _initialFetchStarted && _isBusy) return;
         _initialFetchStarted = true;
         _isBusy = true;
+        int mySeq = ++_rulesFetchSeq;
+        int capturedAuthGen = NameAuth.AuthGeneration;
         SetStatus("正在同步私服规则目录与当前配置...", isError: false);
 
         Task.Run(async () =>
@@ -628,7 +694,13 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
 
                 _pendingUpdates.Enqueue(() =>
                 {
+                    // P1-15：丢弃已被更新一次（如鉴权成功后触发）的过期规则响应，防止登录前 guest 响应后到反向覆写
+                    if (mySeq != _rulesFetchSeq) return;
                     _isBusy = false;
+                    if (capturedAuthGen > _lastSyncedAuthGeneration)
+                    {
+                        _lastSyncedAuthGeneration = capturedAuthGen;
+                    }
                     if (parsedCatalog != null)
                     {
                         ApplyCatalog(parsedCatalog);
@@ -684,6 +756,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             {
                 _pendingUpdates.Enqueue(() =>
                 {
+                    if (mySeq != _rulesFetchSeq) return;
                     _isBusy = false;
                     SetStatus("同步异常：" + Truncate(ex.Message, 64), isError: true);
                     RefreshStatusBarUi();
@@ -1072,6 +1145,11 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
 
                     _activeRunId = "";
                     _activeRunFetchedId = "";
+                    _activeRunRules = null;
+                    _activeRunIsCustomRuleRun = false;
+                    _activeRunFetchSeq++;
+                    _activeRunFetchInFlight = false;
+                    _nextActiveRunRetryTime = 0f;
                     _activeRunTendencyLocked = false;
                     _showPreRunPrompt = false;
                     CompatAuditPatch.RefreshActiveMainMenuUiFromData();
@@ -1146,10 +1224,11 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         });
     }
 
-    private void FetchActiveRunTendencyStateAsync(string observedRunKey)
+    private void FetchActiveRunTendencyStateAsync(string observedRunKey, bool force = false)
     {
-        if (_activeRunFetchInFlight) return;
+        if (!force && _activeRunFetchInFlight) return;
         _activeRunFetchInFlight = true;
+        int mySeq = ++_activeRunFetchSeq;
 
         Task.Run(async () =>
         {
@@ -1159,7 +1238,14 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 var resp = await NameAuth.GetJsonAsync("/custom-rules/me/active-run-tendency").ConfigureAwait(false);
                 if (!resp.Ok || string.IsNullOrWhiteSpace(resp.Body))
                 {
-                    _pendingUpdates.Enqueue(() => { _activeRunFetchInFlight = false; });
+                    _pendingUpdates.Enqueue(() =>
+                    {
+                        if (mySeq != _activeRunFetchSeq) return;
+                        _activeRunFetchInFlight = false;
+                        // 网络瞬态失败时释放 _activeRunFetchedId 并在短退避后允许重试，避免整局永久失步
+                        _activeRunFetchedId = "";
+                        _nextActiveRunRetryTime = Time.unscaledTime + 3.0f;
+                    });
                     return;
                 }
 
@@ -1173,16 +1259,51 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 uint day = (uint?)obj["day"] ?? 1u;
                 uint hour = (uint?)obj["hour"] ?? 1u;
                 string stateName = (string)obj["state"] ?? "";
+                bool srvIsCustomRuleRun = (bool?)obj["isCustomRuleRun"] ?? false;
+
+                // P1-15：严格对齐服务端契约，解析 GET /custom-rules/me/active-run-tendency 下发的权威 customRules
+                CustomRunRuleSet parsedActiveRunRules = null;
+                if (hasRun
+                    && obj.TryGetValue("customRules", StringComparison.OrdinalIgnoreCase, out JToken activeRulesTok)
+                    && activeRulesTok is JObject activeRulesObj)
+                {
+                    parsedActiveRunRules = TryDeserializeRules(activeRulesObj.ToString());
+                    if (parsedActiveRunRules != null)
+                    {
+                        parsedActiveRunRules.NormalizeBounds();
+                    }
+                }
 
                 _pendingUpdates.Enqueue(() =>
                 {
+                    if (mySeq != _activeRunFetchSeq) return;
                     _activeRunFetchInFlight = false;
-                    if (!hasRun) return;
+                    if (!hasRun)
+                    {
+                        // 无活跃局时清空权威活跃局规则缓存，避免跨局残留
+                        _activeRunRules = null;
+                        _activeRunIsCustomRuleRun = false;
+                        _activeRunId = "";
+                        if (!string.IsNullOrEmpty(observedRunKey))
+                        {
+                            _activeRunFetchedId = "";
+                            _nextActiveRunRetryTime = Time.unscaledTime + 2.0f;
+                        }
+                        RefreshHudOverlays(force: true);
+                        return;
+                    }
 
                     _activeRunId = srvRunId;
                     _activeRunAllowTendency = allowSel;
                     _activeRunLockedMask = srvMask;
                     _activeRunTendencyLocked = locked || !canLockNow;
+                    _activeRunRules = parsedActiveRunRules;
+                    _activeRunIsCustomRuleRun = srvIsCustomRuleRun;
+                    if (_activeRunRules != null)
+                    {
+                        _activeRunRules.AllowTendencySelection = allowSel;
+                        _activeRunRules.SelectedArchetypeMask = allowSel ? srvMask : 0UL;
+                    }
 
                     if (allowSel)
                     {
@@ -1196,8 +1317,9 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                         && string.Equals(stateName, "Choice", StringComparison.OrdinalIgnoreCase)
                         && !IsInActiveCombatPlayback();
 
+                    bool promptTendency = _activeRunRules?.PromptTendencyBeforeRun ?? _normalRules.PromptTendencyBeforeRun;
                     if (stillOpening
-                        && _normalRules.PromptTendencyBeforeRun
+                        && promptTendency
                         && CombatPatch.SpeedOverride <= 0.1f
                         && !string.Equals(_lastOpeningPromptedRunId, srvRunId, StringComparison.OrdinalIgnoreCase))
                     {
@@ -1211,7 +1333,13 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             }
             catch
             {
-                _pendingUpdates.Enqueue(() => { _activeRunFetchInFlight = false; });
+                _pendingUpdates.Enqueue(() =>
+                {
+                    if (mySeq != _activeRunFetchSeq) return;
+                    _activeRunFetchInFlight = false;
+                    _activeRunFetchedId = "";
+                    _nextActiveRunRetryTime = Time.unscaledTime + 3.0f;
+                });
             }
         });
     }
@@ -1272,6 +1400,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 {
                     _activeRunLockedMask = srvMask;
                     _normalRules.SelectedArchetypeMask = srvMask;
+                    if (_activeRunRules != null) _activeRunRules.SelectedArchetypeMask = srvMask;
                     int cnt = CountBits(srvMask);
                     SetStatus(cnt > 0
                         ? $"本局流派倾向已永久锁定（已选 {cnt} 项），对局途中不可再修改。"
@@ -1284,6 +1413,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                     {
                         _activeRunLockedMask = srvMask;
                         _normalRules.SelectedArchetypeMask = srvMask;
+                        if (_activeRunRules != null) _activeRunRules.SelectedArchetypeMask = srvMask;
                     }
                     SetStatus("流派倾向已锁定，禁止途中修改：" + Truncate(errMsg, 56), isError: true);
                 }

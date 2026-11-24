@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.Json.Serialization;
 using BazaarCore.Models;
 using BazaarCore.Runtime;
 
@@ -50,7 +52,9 @@ public enum CombatEventType
     PlayerTempoRemoved,
     ActionCostSpent,
     /// <summary>战内光环目标集增量生效/撤销（P1-09）。</summary>
-    AuraExecuted
+    AuraExecuted,
+    /// <summary>战内玩家属性被修改（如 TActionPlayerModifyAttribute 修改 Gold / Income / HealthMax 等，P1-07）。</summary>
+    PlayerAttributeModified
 }
 
 /// <summary>
@@ -111,6 +115,76 @@ public sealed class CombatEvent
     public int Player2Shield { get; init; }
     public int Player2Burn { get; init; }
     public int Player2Poison { get; init; }
+
+    /// <summary>
+    /// 构造 <see cref="CombatEventType.PlayerAttributeModified"/> 的结构化 <see cref="Detail"/> 载荷（格式：属性名|变化前值|变化后值）。
+    /// 复用 <see cref="Detail"/> 原生透传字段，确保经 CombatSimulator.Emit 复制与序列化后完整保留变化前后值。
+    /// </summary>
+    public static string FormatPlayerAttributeModifiedDetail(string attributeName, double previousValue, double currentValue)
+        => string.Concat(
+            attributeName,
+            "|",
+            previousValue.ToString("G17", CultureInfo.InvariantCulture),
+            "|",
+            currentValue.ToString("G17", CultureInfo.InvariantCulture));
+
+    /// <summary>
+    /// 解析 <see cref="CombatEventType.PlayerAttributeModified"/> 的结构化三元组（属性名、变化前值、变化后值）。
+    /// </summary>
+    public bool TryGetPlayerAttributeModification(out string attributeName, out double previousValue, out double currentValue)
+    {
+        attributeName = string.Empty;
+        previousValue = 0;
+        currentValue = 0;
+        if (Type != CombatEventType.PlayerAttributeModified || string.IsNullOrWhiteSpace(Detail))
+            return false;
+
+        int firstSep = Detail.IndexOf('|');
+        if (firstSep <= 0)
+            return false;
+        int secondSep = Detail.IndexOf('|', firstSep + 1);
+        if (secondSep <= firstSep + 1 || secondSep >= Detail.Length - 1)
+            return false;
+
+        var attrSpan = Detail.AsSpan(0, firstSep).Trim();
+        var prevSpan = Detail.AsSpan(firstSep + 1, secondSep - firstSep - 1);
+        var curSpan = Detail.AsSpan(secondSep + 1);
+        if (attrSpan.IsEmpty)
+            return false;
+        if (!double.TryParse(prevSpan, NumberStyles.Float, CultureInfo.InvariantCulture, out previousValue)
+            || !double.IsFinite(previousValue))
+            return false;
+        if (!double.TryParse(curSpan, NumberStyles.Float, CultureInfo.InvariantCulture, out currentValue)
+            || !double.IsFinite(currentValue))
+            return false;
+
+        attributeName = attrSpan.ToString();
+        return true;
+    }
+
+    /// <summary>玩家属性修改事件的属性名（兼容「属性名|前值|后值」与纯「属性名」两种 Detail 形态）。</summary>
+    [JsonIgnore]
+    public string? PlayerAttributeName
+    {
+        get
+        {
+            if (Type != CombatEventType.PlayerAttributeModified || string.IsNullOrWhiteSpace(Detail))
+                return null;
+            int sep = Detail.IndexOf('|');
+            var raw = (sep >= 0 ? Detail[..sep] : Detail).Trim();
+            return raw.Length > 0 ? raw : null;
+        }
+    }
+
+    /// <summary>玩家属性修改事件的变化前值（不可解析时返回 null）。</summary>
+    [JsonIgnore]
+    public double? PlayerAttributePreviousValue
+        => TryGetPlayerAttributeModification(out _, out var prev, out _) ? prev : null;
+
+    /// <summary>玩家属性修改事件的变化后值（不可解析时返回 null）。</summary>
+    [JsonIgnore]
+    public double? PlayerAttributeCurrentValue
+        => TryGetPlayerAttributeModification(out _, out _, out var cur) ? cur : null;
 }
 
 public sealed class CardCooldownFrame

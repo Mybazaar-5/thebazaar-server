@@ -38,7 +38,26 @@ internal static class CombatPatch
     private static float _manualUiSpeed;
     private static float _baseFixedDeltaTime = -1f;
     private static volatile bool _replayReadyToExit;
+    private static volatile bool _replayExitRequested;
+    private static int _replaySpawnGeneration;
+    private static int _replaySpawningCount;
     private static float _replayEnteredAt;
+    private static FieldInfo _replayExitRequestedField;
+    private static Type _endBattleDialogType;
+    private static PropertyInfo _endBattleDialogInstanceProp;
+    private static MethodInfo _endBattleDialogResetMethod;
+    private static FieldInfo _endBattleDialogIsAnimatingField;
+    private static FieldInfo _endBattleDialogIsInTransitionField;
+    private static FieldInfo _endBattleDialogBannerTextField;
+    private static FieldInfo _endBattleDialogVictoryBannerField;
+    private static FieldInfo _endBattleDialogDefeatBannerField;
+    private static FieldInfo _endBattleDialogAnimNotifyField;
+    private static MethodInfo _endBattleDialogOnAnimCompleteMethod;
+    private static EventInfo _animNotifyEventInfo;
+    private static MethodInfo _bmRemoveCardFromAnimQueuesMethod;
+    private static MethodInfo _lookupGetCardControllerMethod;
+    private static MethodInfo _lookupRemoveCardControllerMethod;
+    private static MethodInfo _oppSpmRemoveSkillsMethod;
     private static Type _gameServiceManagerType;
     private static PropertyInfo _gameServiceManagerInstanceProp;
     private static FieldInfo _finalBlowCurrentStateField;
@@ -294,6 +313,10 @@ internal static class CombatPatch
         _applied = false;
         _inSimulateLoop = false;
         _currentFramesLeft = -1;
+        _replayReadyToExit = false;
+        _replayExitRequested = false;
+        Interlocked.Increment(ref _replaySpawnGeneration);
+        Interlocked.Exchange(ref _replaySpawningCount, 0);
         _lastLiveCombatWinner = null;
         _lastLiveCombatMessageId = null;
         _lastLiveCombatWasPvp = false;
@@ -1123,13 +1146,19 @@ internal static class CombatPatch
         catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1118", diagEx); }
     }
 
-    // ── 5. ReplayState 自动退出回放机制 ──────────────────────────────────────
+    // ── 5. ReplayState 自动退出回放、重生竞态守卫 (P1-02) 与胜负横幅复位 (P2-04) ──
+
+    /// <summary>供外部查询当前是否正处于 ReplayState.SpawnCombatCards 异步重生窗口。</summary>
+    internal static bool IsReplaySpawningCombatCards => Volatile.Read(ref _replaySpawningCount) > 0;
+
     private static void PatchReplayAutoExit(SafeHarmonyPatcher patcher)
     {
         try
         {
             var replayType = AccessTools.TypeByName("TheBazaar.ReplayState");
             if (replayType == null) return;
+
+            _replayExitRequestedField = replayType.GetField("_exitRequested", BindingFlags.NonPublic | BindingFlags.Instance);
 
             var onEnter = AccessTools.Method(replayType, "OnEnter");
             if (onEnter != null)
@@ -1150,7 +1179,56 @@ internal static class CombatPatch
                     optional: true,
                     label: "ReplayState.UpdateVictoriesAndPrestige");
             }
-            BazaarLauncherPlugin.Log.LogInfo("Patched ReplayState (safe autoExitReplay hook)");
+
+            // P1-02：拦截 ReplayState.SpawnCombatCards(ECombatantId, bool)，退回放或非 ReplayState 时短路并清扫残留敌卡
+            var spawnCombatCards = AccessTools.Method(replayType, "SpawnCombatCards", new[] { typeof(ECombatantId), typeof(bool) });
+            if (spawnCombatCards != null)
+            {
+                patcher.TryPatchMethod(
+                    spawnCombatCards,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(ReplaySpawnCombatCardsPrefix)),
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(ReplaySpawnCombatCardsPostfix)),
+                    optional: true,
+                    label: "ReplayState.SpawnCombatCards");
+            }
+
+            // P1-02：拦截 ApplyCardCombatAttributes，避免退回放后残余任务以 triggerChangeEvent=false 覆写战前脏属性
+            var applyCombatAttrs = AccessTools.Method(replayType, "ApplyCardCombatAttributes", Type.EmptyTypes);
+            if (applyCombatAttrs != null)
+            {
+                patcher.TryPatchMethod(
+                    applyCombatAttrs,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(ReplayApplyCardCombatAttributesPrefix)),
+                    optional: true,
+                    label: "ReplayState.ApplyCardCombatAttributes");
+            }
+
+            // P1-02 & P2-04：ReplayState.Exit 标记退场并立即复位胜负横幅、排程清理残留敌卡
+            var exitMethod = AccessTools.Method(replayType, "Exit", Type.EmptyTypes);
+            if (exitMethod != null)
+            {
+                patcher.TryPatchMethod(
+                    exitMethod,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(ReplayExitPrefix)),
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(ReplayExitPostfix)),
+                    optional: true,
+                    label: "ReplayState.Exit");
+            }
+
+            // P1-02 & P2-04：BoardManager.ForceExitReplayState 同样标记退场并复位胜负横幅
+            var bmType = GameInspector.FindTypeSafe("BoardManager");
+            var forceExit = bmType == null ? null : AccessTools.Method(bmType, "ForceExitReplayState", Type.EmptyTypes);
+            if (forceExit != null)
+            {
+                patcher.TryPatchMethod(
+                    forceExit,
+                    prefix: AccessTools.Method(typeof(CombatPatch), nameof(ForceExitReplayStatePrefix)),
+                    postfix: AccessTools.Method(typeof(CombatPatch), nameof(ForceExitReplayStatePostfix)),
+                    optional: true,
+                    label: "BoardManager.ForceExitReplayState");
+            }
+
+            BazaarLauncherPlugin.Log.LogInfo("Patched ReplayState (autoExitReplay + P1-02 spawn race guard + P2-04 EndBattleDialog reset)");
         }
         catch (Exception ex)
         {
@@ -1163,7 +1241,9 @@ internal static class CombatPatch
         try
         {
             _replayReadyToExit = false;
+            _replayExitRequested = false;
             _replayEnteredAt = Time.realtimeSinceStartup;
+            Interlocked.Increment(ref _replaySpawnGeneration);
         }
         catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1163", diagEx); }
     }
@@ -1174,11 +1254,372 @@ internal static class CombatPatch
         catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1169", diagEx); }
     }
 
-    /// <summary>由 GameDriver.Update 每帧调用：在战后数据更新且看板/动画空闲时自动退出 ReplayState。</summary>
+    private static bool ShouldAbortReplaySpawn(object replayStateInstance)
+    {
+        if (_replayExitRequested) return true;
+        if (replayStateInstance != null && _replayExitRequestedField?.GetValue(replayStateInstance) is bool exitReq && exitReq)
+            return true;
+
+        var curState = GameInspector.GetCurrentAppState();
+        if (curState == null || !string.Equals(curState.GetType().Name, "ReplayState", StringComparison.Ordinal))
+            return true;
+
+        if (replayStateInstance != null && !ReferenceEquals(curState, replayStateInstance))
+            return true;
+
+        return false;
+    }
+
+    private static bool ReplaySpawnCombatCardsPrefix(object __instance, ECombatantId combatantId, ref Task __result, out int __state)
+    {
+        __state = 0;
+        try
+        {
+            if (ShouldAbortReplaySpawn(__instance))
+            {
+                __result = Task.CompletedTask;
+                if (combatantId == ECombatantId.Opponent)
+                {
+                    MainThreadDispatcher.Enqueue(() => CleanupResidualOpponentGhostEntitiesAndControllers("ReplaySpawnCombatCardsPrefixAbort"));
+                }
+                return false;
+            }
+
+            int gen = Volatile.Read(ref _replaySpawnGeneration);
+            if (gen <= 0) gen = 1;
+            Interlocked.Increment(ref _replaySpawningCount);
+            __state = gen;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CombatPatch.ReplaySpawnCombatCardsPrefix: " + ex.Message);
+            return true;
+        }
+    }
+
+    private static void ReplaySpawnCombatCardsPostfix(object __instance, ECombatantId combatantId, int __state, ref Task __result)
+    {
+        if (__state == 0) return;
+
+        if (__result == null || __result.IsCompleted)
+        {
+            if (Interlocked.Decrement(ref _replaySpawningCount) < 0)
+            {
+                Interlocked.Exchange(ref _replaySpawningCount, 0);
+            }
+            if (ShouldAbortReplaySpawn(__instance) || Volatile.Read(ref _replaySpawnGeneration) != __state)
+            {
+                MainThreadDispatcher.Enqueue(() => CleanupResidualOpponentGhostEntitiesAndControllers("ReplaySpawnSyncRace:" + combatantId));
+            }
+            return;
+        }
+
+        __result = WrapReplaySpawnCombatCardsTask(__result, __instance, combatantId, __state);
+    }
+
+    private static async Task WrapReplaySpawnCombatCardsTask(Task inner, object replayInstance, ECombatantId combatantId, int expectedGen)
+    {
+        try
+        {
+            await inner;
+        }
+        finally
+        {
+            if (Interlocked.Decrement(ref _replaySpawningCount) < 0)
+            {
+                Interlocked.Exchange(ref _replaySpawningCount, 0);
+            }
+
+            if (ShouldAbortReplaySpawn(replayInstance) || Volatile.Read(ref _replaySpawnGeneration) != expectedGen)
+            {
+                MainThreadDispatcher.Enqueue(() => CleanupResidualOpponentGhostEntitiesAndControllers("ReplaySpawnAsyncRace:" + combatantId));
+            }
+        }
+    }
+
+    private static bool ReplayApplyCardCombatAttributesPrefix(object __instance)
+    {
+        try
+        {
+            if (ShouldAbortReplaySpawn(__instance))
+            {
+                return false;
+            }
+        }
+        catch { }
+        return true;
+    }
+
+    private static void ReplayExitPrefix()
+    {
+        _replayExitRequested = true;
+        Interlocked.Increment(ref _replaySpawnGeneration);
+    }
+
+    private static void ReplayExitPostfix()
+    {
+        ResetEndBattleDialogBannerSafely("ReplayState.Exit");
+        SchedulePostReplayOpponentGhostCleanup("ReplayState.Exit");
+    }
+
+    private static void ForceExitReplayStatePrefix()
+    {
+        _replayExitRequested = true;
+        Interlocked.Increment(ref _replaySpawnGeneration);
+    }
+
+    private static void ForceExitReplayStatePostfix()
+    {
+        ResetEndBattleDialogBannerSafely("BoardManager.ForceExitReplayState");
+        SchedulePostReplayOpponentGhostCleanup("BoardManager.ForceExitReplayState");
+    }
+
+    private static void SchedulePostReplayOpponentGhostCleanup(string reason)
+    {
+        try
+        {
+            MainThreadDispatcher.Enqueue(() => CleanupResidualOpponentGhostEntitiesAndControllers(reason + ":Immediate"));
+            _ = Task.Delay(180).ContinueWith(_ =>
+            {
+                MainThreadDispatcher.Enqueue(() => CleanupResidualOpponentGhostEntitiesAndControllers(reason + ":Delayed"));
+            }, TaskScheduler.Default);
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// P1-02：在已退出回放与战斗状态后，清扫因 ReplayState.SpawnCombatCards 异步竞态残留在 Data.Entities、
+    /// 棋盘 3D 控制器与对手技能栏的幽灵敌方卡牌与技能对象，彻底杜绝前场敌牌穿透叠压后续商店。
+    /// </summary>
+    private static void CleanupResidualOpponentGhostEntitiesAndControllers(string reason)
+    {
+        try
+        {
+            var curAppState = GameInspector.GetCurrentAppState();
+            string appStateName = curAppState?.GetType().Name ?? "";
+            if (appStateName is "CombatState" or "PVPCombatState" or "ReplayState")
+                return;
+
+            var dataState = GameInspector.GetDataCurrentState();
+            if (GameInspector.GetMember(dataState, "StateName") is ERunState runState
+                && runState is ERunState.Combat or ERunState.PVPCombat)
+            {
+                return;
+            }
+
+            var run = GameInspector.GetDataRun();
+            var opponent = run != null ? GameInspector.GetMember(run, "Opponent") : null;
+            var entities = GameInspector.GetDataEntities();
+            if (opponent == null || entities == null) return;
+
+            var residualCards = new List<(object Key, object Card)>();
+            foreach (DictionaryEntry kv in entities)
+            {
+                var card = kv.Value;
+                if (card == null) continue;
+                var owner = GameInspector.GetMember(card, "Owner");
+                if (!ReferenceEquals(owner, opponent)) continue;
+
+                // 仅清理归属 Opponent 的物品/技能/插座卡，绝不触碰 Owner == null 的商店或奇遇遭遇卡
+                if (card is BazaarGameShared.Domain.Cards.ICard ic
+                    && ic.Type is ECardType.Item or ECardType.Skill or ECardType.SocketEffect)
+                {
+                    residualCards.Add((kv.Key, card));
+                }
+            }
+
+            if (residualCards.Count == 0) return;
+
+            var bm = GameInspector.GetBoardManagerCached();
+            var lookup = GameInspector.GetDataLookup();
+            var dataType = GameInspector.FindTypeSafe("TheBazaar.Data");
+            var cardToBoardTarget = dataType?.GetProperty("CardControllerToBoardTarget", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null) as IDictionary;
+            var cardToSockets = dataType?.GetProperty("CardControllerToSocketTransforms", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null) as IDictionary;
+            var cardRemoval = dataType?.GetProperty("CardRemoval", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+            var removeFromCardRemoval = cardRemoval?.GetType().GetMethod("RemoveCard", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            if (bm != null && _bmRemoveCardFromAnimQueuesMethod == null)
+            {
+                _bmRemoveCardFromAnimQueuesMethod = bm.GetType().GetMethod("RemoveCardFromAnimationQueues", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            }
+            if (lookup != null)
+            {
+                _lookupGetCardControllerMethod ??= lookup.GetType().GetMethod("GetCardController", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                _lookupRemoveCardControllerMethod ??= lookup.GetType().GetMethod("RemoveCardController", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            }
+
+            // 同步清理对手 Hand / Skills 容器中的残留引用（Player.Skills 在客户端为 List<SkillCard>/集合而非字典）
+            var oppHandContainer = GameInspector.GetMember(GameInspector.GetMember(opponent, "Hand"), "Container");
+            var oppHandRemove = oppHandContainer?.GetType().GetMethod("Remove", BindingFlags.Public | BindingFlags.Instance);
+            var oppSkillsObj = GameInspector.GetMember(opponent, "Skills");
+            var oppSkillsDict = oppSkillsObj as IDictionary;
+            var oppSkillsList = oppSkillsObj as IList;
+            var oppSkillsRemoveM = (oppSkillsDict == null && oppSkillsList == null)
+                ? oppSkillsObj?.GetType().GetMethod("Remove", BindingFlags.Public | BindingFlags.Instance)
+                : null;
+
+            bool hadResidualSkill = false;
+            int destroyedCtrls = 0;
+            for (int i = 0; i < residualCards.Count; i++)
+            {
+                var (key, card) = residualCards[i];
+                if (card is BazaarGameShared.Domain.Cards.ICard ic && ic.Type == ECardType.Skill)
+                {
+                    hadResidualSkill = true;
+                }
+
+                if (lookup != null && _lookupGetCardControllerMethod != null)
+                {
+                    var ctrl = _lookupGetCardControllerMethod.Invoke(lookup, new[] { card });
+                    if (ctrl != null && !(ctrl is UnityEngine.Object uo && uo == null))
+                    {
+                        try { _bmRemoveCardFromAnimQueuesMethod?.Invoke(bm, new[] { ctrl }); } catch { }
+                        try { cardToBoardTarget?.Remove(ctrl); } catch { }
+                        try { cardToSockets?.Remove(ctrl); } catch { }
+                        try { _lookupRemoveCardControllerMethod?.Invoke(lookup, new[] { card }); } catch { }
+                        try
+                        {
+                            ctrl.GetType().GetMethod("Cleanup", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, Type.EmptyTypes, null)?.Invoke(ctrl, null);
+                        }
+                        catch { }
+                        if (ctrl is Component comp && comp != null && comp.gameObject != null)
+                        {
+                            if (comp.gameObject.activeSelf) comp.gameObject.SetActive(false);
+                            UnityEngine.Object.Destroy(comp.gameObject);
+                            destroyedCtrls++;
+                        }
+                    }
+                }
+
+                try { removeFromCardRemoval?.Invoke(cardRemoval, new[] { card }); } catch { }
+                try
+                {
+                    if (oppHandRemove != null && oppHandRemove.GetParameters().Length == 1 && oppHandRemove.GetParameters()[0].ParameterType.IsInstanceOfType(card))
+                    {
+                        oppHandRemove.Invoke(oppHandContainer, new[] { card });
+                    }
+                }
+                catch { }
+                try
+                {
+                    if (oppSkillsDict != null) oppSkillsDict.Remove(key);
+                    else if (oppSkillsList != null) oppSkillsList.Remove(card);
+                    else if (oppSkillsRemoveM != null && oppSkillsRemoveM.GetParameters().Length == 1 && oppSkillsRemoveM.GetParameters()[0].ParameterType.IsInstanceOfType(card))
+                        oppSkillsRemoveM.Invoke(oppSkillsObj, new[] { card });
+                }
+                catch { }
+                try { entities.Remove(key); } catch { }
+            }
+
+            if (hadResidualSkill && dataType != null)
+            {
+                var oppSpm = dataType.GetProperty("OpponentSkillPresenationManager", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+                if (oppSpm != null && !(oppSpm is UnityEngine.Object ospUo && ospUo == null))
+                {
+                    _oppSpmRemoveSkillsMethod ??= oppSpm.GetType().GetMethod("RemoveSkills", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, Type.EmptyTypes, null);
+                    try { _oppSpmRemoveSkillsMethod?.Invoke(oppSpm, null); } catch { }
+                }
+            }
+
+            BazaarLauncherPlugin.Log?.LogWarning(
+                $"CombatPatch[P1-02]: 已清理退回放竞态残留敌方幽灵实体 {residualCards.Count} 个（销毁 3D 控制器 {destroyedCtrls} 个, reason={reason}, appState={appStateName}）");
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning("CombatPatch.CleanupResidualOpponentGhostEntitiesAndControllers: " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// P2-04：安全调用 EndBattleDialog.Instance.Reset() 并停止正在播放的延迟胜负横幅，
+    /// 防止提前/快退回放后巨幅「胜利！」「落败」横幅跨状态漂浮遮盖后续升级/商店/祭坛画面。
+    /// </summary>
+    internal static void ResetEndBattleDialogBannerSafely(string reason)
+    {
+        try
+        {
+            _endBattleDialogType ??= AccessTools.TypeByName("EndBattleDialog")
+                ?? GameInspector.FindTypeSafe("EndBattleDialog", "TheBazaar.EndBattleDialog");
+            if (_endBattleDialogType == null) return;
+
+            _endBattleDialogInstanceProp ??= _endBattleDialogType.GetProperty(
+                "Instance",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.FlattenHierarchy);
+            var inst = _endBattleDialogInstanceProp?.GetValue(null);
+            if (inst == null || (inst is UnityEngine.Object uo && uo == null)) return;
+
+            const BindingFlags anyInst = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            _endBattleDialogResetMethod ??= _endBattleDialogType.GetMethod("Reset", anyInst, null, Type.EmptyTypes, null);
+            _endBattleDialogIsAnimatingField ??= _endBattleDialogType.GetField("_isAnimating", anyInst);
+            _endBattleDialogIsInTransitionField ??= _endBattleDialogType.GetField("isInTransition", anyInst);
+            _endBattleDialogBannerTextField ??= _endBattleDialogType.GetField("bannerText", anyInst);
+            _endBattleDialogVictoryBannerField ??= _endBattleDialogType.GetField("victoryBanner", anyInst);
+            _endBattleDialogDefeatBannerField ??= _endBattleDialogType.GetField("defeatBanner", anyInst);
+            _endBattleDialogAnimNotifyField ??= _endBattleDialogType.GetField("_bannerAnimComplete", anyInst);
+            _endBattleDialogOnAnimCompleteMethod ??= _endBattleDialogType.GetMethod("OnBannerAnimComplete", anyInst, null, new[] { typeof(string) }, null);
+
+            // 解除动画完成回调并终止 WaitUntil(() => !_isAnimating) 等待，确保横幅立刻收起且不阻塞后续流程
+            try
+            {
+                var notifyObj = _endBattleDialogAnimNotifyField?.GetValue(inst);
+                if (notifyObj != null && !(notifyObj is UnityEngine.Object nuo && nuo == null) && _endBattleDialogOnAnimCompleteMethod != null)
+                {
+                    _animNotifyEventInfo ??= notifyObj.GetType().GetEvent("Notify", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (_animNotifyEventInfo != null)
+                    {
+                        var del = Delegate.CreateDelegate(_animNotifyEventInfo.EventHandlerType, inst, _endBattleDialogOnAnimCompleteMethod, throwOnBindFailure: false);
+                        if (del != null)
+                        {
+                            _animNotifyEventInfo.RemoveEventHandler(notifyObj, del);
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            _endBattleDialogIsAnimatingField?.SetValue(inst, false);
+            _endBattleDialogIsInTransitionField?.SetValue(inst, false);
+
+            var bannerText = _endBattleDialogBannerTextField?.GetValue(inst) as TMP_Text;
+            var victoryBanner = _endBattleDialogVictoryBannerField?.GetValue(inst) as Component;
+            var defeatBanner = _endBattleDialogDefeatBannerField?.GetValue(inst) as Component;
+
+            bool allComponentsAlive = bannerText != null && victoryBanner != null && defeatBanner != null;
+            if (allComponentsAlive && _endBattleDialogResetMethod != null)
+            {
+                _endBattleDialogResetMethod.Invoke(inst, null);
+            }
+            else
+            {
+                if (bannerText != null)
+                {
+                    Color c = bannerText.color;
+                    c.a = 0f;
+                    bannerText.color = c;
+                }
+                if (victoryBanner != null && victoryBanner.gameObject != null && victoryBanner.gameObject.activeSelf)
+                {
+                    victoryBanner.gameObject.SetActive(false);
+                }
+                if (defeatBanner != null && defeatBanner.gameObject != null && defeatBanner.gameObject.activeSelf)
+                {
+                    defeatBanner.gameObject.SetActive(false);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            BazaarLauncherPlugin.Log?.LogWarning($"CombatPatch.ResetEndBattleDialogBannerSafely({reason}): {ex.Message}");
+        }
+    }
+
+    /// <summary>由 GameDriver.Update 每帧调用：在战后数据更新、回放重生结束且看板/动画空闲时自动退出 ReplayState。</summary>
     internal static void TryAutoExitReplayOnUpdate()
     {
         if (!AutoExitReplay || !_replayReadyToExit) return;
-        if (Time.realtimeSinceStartup - _replayEnteredAt < 0.04f) return;
+        float elapsed = Time.realtimeSinceStartup - _replayEnteredAt;
+        if (elapsed < 0.04f) return;
 
         var cur = GameInspector.GetCurrentAppState();
         if (cur == null || cur.GetType().Name != "ReplayState")
@@ -1203,10 +1644,17 @@ internal static class CombatPatch
         }
 
         if (GameInspector.GetMember(cur, "IsReplaying") is bool isRep && isRep) return;
+
+        // P1-02：等待当前 SpawnCombatCards 异步任务完结后再退场（2.5s 安全上限防卡死，超时后由退出取消标记兜底拦截并清理）
+        if (Volatile.Read(ref _replaySpawningCount) > 0 && elapsed < 2.5f)
+            return;
+
         if (GameInspector.IsClientBusy(out _)) return;
         if (GameInspector.HasCardsPendingRemoval()) return;
 
         _replayReadyToExit = false;
+        _replayExitRequested = true;
+        Interlocked.Increment(ref _replaySpawnGeneration);
         try
         {
             var bm = GameInspector.GetBoardManagerCached();
@@ -1676,6 +2124,9 @@ internal static class CombatPatch
     /// </summary>
     private static void ReplayOnExitVisualCleanupPostfix(Task __result)
     {
+        _replayExitRequested = true;
+        Interlocked.Increment(ref _replaySpawnGeneration);
+        ResetEndBattleDialogBannerSafely("ReplayState.OnExit");
         try { CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: false); }
         catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1675", diagEx); }
 
@@ -1687,8 +2138,13 @@ internal static class CombatPatch
                 {
                     try { CleanupResidualFreezeAndFlyVisuals(onlyWhenOutOfCombat: true); }
                     catch (Exception diagEx) { global::BazaarLauncher.Core.DiagLog.SwallowOnce("CombatPatch:L1684", diagEx); }
+                    CleanupResidualOpponentGhostEntitiesAndControllers("ReplayState.OnExitComplete");
                 });
             }, TaskScheduler.Default);
+        }
+        else
+        {
+            SchedulePostReplayOpponentGhostCleanup("ReplayState.OnExitSync");
         }
     }
 

@@ -260,6 +260,163 @@ public sealed class PurchaseAttributeDiffEntry
     [JsonProperty("zeroToNonZero")] public bool ZeroToNonZero { get; set; }
 }
 
+/// <summary>
+/// P3-01（RC-AUDIT-AURA-PURCHASE-FP）：同包 NetMessageGameSim 携带的 EffectAuraExecuted 光环上下文。
+/// 仅记录真实规则光环（排除服务端纯合成 UI 重绘事件），供货架购入属性跳变比对器豁免合法入场光环。
+/// </summary>
+public sealed class BareAuditPurchaseAuraContext
+{
+    /// <summary>已知的纯合成 UI 刷新型 EffectId（非真实规则光环，不得用于豁免货架缺失属性/附魔的异常跳变）。</summary>
+    private static readonly HashSet<string> SyntheticRefreshEffectIds = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "OutOfCombatAuraSync",
+        "OutOfCombatSync",
+        "CardUpgradeAttrSync",
+        "EncounterStepAttrSync",
+    };
+
+    /// <summary>同包内是否包含至少一条真实规则 EffectAuraExecuted 光环事件。</summary>
+    public bool HasAuraExecuted { get; set; }
+
+    /// <summary>同包内真实光环事件条数。</summary>
+    public int RealAuraEventCount { get; set; }
+
+    /// <summary>同包内被忽略的纯合成 UI 刷新事件条数。</summary>
+    public int SyntheticRefreshEventCount { get; set; }
+
+    /// <summary>同包真实光环事件是否显式声明了目标集合（用于区分玩家目标光环与未提供目标的简略调用）。</summary>
+    public bool HasExplicitTargetScope { get; set; }
+
+    /// <summary>受同包真实光环直接影响的卡牌实例 ID 集合（来自 AppliedTo / RemovedFrom 的卡牌目标）。</summary>
+    public HashSet<string> AffectedCardInstanceIds { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>同包真实光环的来源实例 ID 集合（用于审计日志溯源）。</summary>
+    public HashSet<string> SourceInstanceIds { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>同包真实光环的 EffectId 列表（去重，最多保留 16 条用于日志溯源）。</summary>
+    public List<string> EffectIds { get; set; } = new();
+
+    /// <summary>判定某条 EffectAuraExecuted 是否仅为服务端合成的 UI 刷新事件而非真实规则光环。</summary>
+    public static bool IsSyntheticRefreshAuraEvent(string effectId, string executionContextId, bool hasSource)
+    {
+        if (!string.IsNullOrWhiteSpace(effectId) && SyntheticRefreshEffectIds.Contains(effectId.Trim()))
+            return true;
+
+        if (!string.IsNullOrWhiteSpace(executionContextId))
+        {
+            string ctx = executionContextId.Trim();
+            if (ctx.StartsWith("ooc_sync_", StringComparison.OrdinalIgnoreCase)
+                || ctx.StartsWith("sync_", StringComparison.OrdinalIgnoreCase)
+                || ctx.StartsWith("upg_sync_", StringComparison.OrdinalIgnoreCase)
+                || ctx.StartsWith("step_sync_", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(effectId) && !hasSource)
+            return true;
+
+        return false;
+    }
+
+    /// <summary>将一条同包 EffectAuraExecuted 事件登记到当前购买批次光环上下文。</summary>
+    public void RecordAuraEvent(
+        string effectId,
+        string executionContextId,
+        string sourceInstanceId,
+        IEnumerable<string> targetCardInstanceIds,
+        bool hasAnyExplicitTarget)
+    {
+        bool hasSource = !string.IsNullOrWhiteSpace(sourceInstanceId);
+        if (IsSyntheticRefreshAuraEvent(effectId, executionContextId, hasSource))
+        {
+            SyntheticRefreshEventCount++;
+            return;
+        }
+
+        HasAuraExecuted = true;
+        RealAuraEventCount++;
+        if (hasAnyExplicitTarget)
+        {
+            HasExplicitTargetScope = true;
+        }
+
+        if (hasSource)
+        {
+            SourceInstanceIds.Add(sourceInstanceId.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(effectId))
+        {
+            string trimmedId = effectId.Trim();
+            bool exists = false;
+            for (int i = 0; i < EffectIds.Count; i++)
+            {
+                if (string.Equals(EffectIds[i], trimmedId, StringComparison.OrdinalIgnoreCase))
+                {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists && EffectIds.Count < 16)
+            {
+                EffectIds.Add(trimmedId);
+            }
+        }
+
+        bool addedAnyCardTarget = false;
+        if (targetCardInstanceIds != null)
+        {
+            foreach (string tid in targetCardInstanceIds)
+            {
+                if (!string.IsNullOrWhiteSpace(tid))
+                {
+                    AffectedCardInstanceIds.Add(tid.Trim());
+                    addedAnyCardTarget = true;
+                }
+            }
+        }
+
+        // 仅当事件完全未提供 AppliedTo/RemovedFrom 显式目标时，兜底回落关联 Source 自身
+        if (!hasAnyExplicitTarget && !addedAnyCardTarget && hasSource)
+        {
+            AffectedCardInstanceIds.Add(sourceInstanceId.Trim());
+        }
+    }
+
+    /// <summary>判断指定购入卡牌实例是否被同包真实光环覆盖解释。</summary>
+    public bool IsCardAffectedByAura(string instanceId)
+    {
+        if (!HasAuraExecuted || string.IsNullOrWhiteSpace(instanceId))
+            return false;
+
+        if (AffectedCardInstanceIds != null && AffectedCardInstanceIds.Count > 0)
+        {
+            return AffectedCardInstanceIds.Contains(instanceId.Trim());
+        }
+
+        // 若同包光环声明了显式目标但全为非卡牌目标（例如玩家属性光环），不豁免单卡属性跳变
+        if (HasExplicitTargetScope)
+            return false;
+
+        return true;
+    }
+}
+
+/// <summary>单次 NetMessageGameSim 购买批次的黑匣子透传状态（供 Harmony Prefix->Postfix 传递）。</summary>
+public sealed class BareAuditPurchaseBatchState
+{
+    public List<string> PurchasedIds { get; }
+    public BareAuditPurchaseAuraContext AuraContext { get; }
+
+    public BareAuditPurchaseBatchState(List<string> purchasedIds, BareAuditPurchaseAuraContext auraContext)
+    {
+        PurchasedIds = purchasedIds ?? new List<string>();
+        AuraContext = auraContext;
+    }
+}
+
 /// <summary>货架购入前后属性跳变比对结果。</summary>
 public sealed class PurchaseAttributeJumpResult
 {
@@ -267,6 +424,9 @@ public sealed class PurchaseAttributeJumpResult
     public string TemplateId { get; set; } = string.Empty;
     public string CardTitle { get; set; } = string.Empty;
     public bool HasZeroToNonZeroJump { get; set; }
+    public bool ExplainedByAura { get; set; }
+    public string[] AuraEffectIds { get; set; } = Array.Empty<string>();
+    public string SuggestedSeverity { get; set; } = "warning";
     public Dictionary<string, int> BeforeAttributes { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, int> AfterAttributes { get; set; } = new(StringComparer.Ordinal);
     public List<PurchaseAttributeDiffEntry> Diffs { get; set; } = new();
@@ -348,6 +508,21 @@ public sealed class ShopPurchaseAttributeDiffDetector
         long nowMs,
         out PurchaseAttributeJumpResult result)
     {
+        return CompareAfterPurchaseWithAura(instanceId, afterAttributes, nowMs, auraContext: null, out result);
+    }
+
+    /// <summary>
+    /// P3-01（RC-AUDIT-AURA-PURCHASE-FP）：结合同包 EffectAuraExecuted 上下文比对购入前后属性跳变。
+    /// 若该卡被同包真实光环命中且不存在基础冷却 0/null->非0 等无法由光环解释的结构缺失，
+    /// 则标记 ExplainedByAura = true 并将建议严重度降级为 info；无光环覆盖时保持原有 error/warning 判定。
+    /// </summary>
+    public bool CompareAfterPurchaseWithAura(
+        string instanceId,
+        IReadOnlyDictionary<string, int> afterAttributes,
+        long nowMs,
+        BareAuditPurchaseAuraContext auraContext,
+        out PurchaseAttributeJumpResult result)
+    {
         result = null;
         if (string.IsNullOrWhiteSpace(instanceId) || afterAttributes == null) return false;
 
@@ -378,6 +553,7 @@ public sealed class ShopPurchaseAttributeDiffDetector
 
         var diffs = new List<PurchaseAttributeDiffEntry>();
         bool hasZeroToNonZero = false;
+        bool hasUnexplainableBaseCooldownJump = false;
 
         foreach (string key in allKeys)
         {
@@ -391,7 +567,15 @@ public sealed class ShopPurchaseAttributeDiffDetector
             if (effBefore == effAfter) continue;
 
             bool zeroToNonZero = effBefore == 0 && effAfter != 0;
-            if (zeroToNonZero) hasZeroToNonZero = true;
+            if (zeroToNonZero)
+            {
+                hasZeroToNonZero = true;
+                // 冷却减免光环只会调整既有正值 CooldownMax（如 5000->4500），绝不会凭空将 CooldownMax 从 0/null 造为正值
+                if (string.Equals(key, "CooldownMax", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasUnexplainableBaseCooldownJump = true;
+                }
+            }
 
             diffs.Add(new PurchaseAttributeDiffEntry
             {
@@ -405,12 +589,28 @@ public sealed class ShopPurchaseAttributeDiffDetector
         if (diffs.Count == 0) return false;
 
         diffs.Sort((x, y) => string.Compare(x.Attribute, y.Attribute, StringComparison.OrdinalIgnoreCase));
+
+        bool explainedByAura = auraContext != null
+            && !hasUnexplainableBaseCooldownJump
+            && auraContext.IsCardAffectedByAura(beforeSnap.InstanceId);
+
+        string[] effectIds = (explainedByAura && auraContext.EffectIds != null && auraContext.EffectIds.Count > 0)
+            ? auraContext.EffectIds.ToArray()
+            : Array.Empty<string>();
+
+        string suggestedSeverity = explainedByAura
+            ? "info"
+            : (hasZeroToNonZero ? "error" : "warning");
+
         result = new PurchaseAttributeJumpResult
         {
             InstanceId = beforeSnap.InstanceId,
             TemplateId = beforeSnap.TemplateId,
             CardTitle = beforeSnap.CardTitle,
             HasZeroToNonZeroJump = hasZeroToNonZero,
+            ExplainedByAura = explainedByAura,
+            AuraEffectIds = effectIds,
+            SuggestedSeverity = suggestedSeverity,
             BeforeAttributes = new Dictionary<string, int>(beforeSnap.Attributes, StringComparer.Ordinal),
             AfterAttributes = new Dictionary<string, int>(afterCopy, StringComparer.Ordinal),
             Diffs = diffs,
@@ -592,6 +792,186 @@ public sealed class BareAuditDeadlockDetector
     }
 }
 
+/// <summary>P3-02（RC-AUDIT-REVEAL-NOISE）：翻牌跳过瞬态窗口去抖判定结果。</summary>
+public readonly struct RevealSkipDebounceDecision
+{
+    public readonly bool ShouldEmit;
+    public readonly bool ImmediateBecauseSpawned;
+    public readonly long ElapsedMs;
+    public readonly int SuppressedTransientCount;
+    public readonly string SuppressReason;
+
+    public RevealSkipDebounceDecision(
+        bool shouldEmit,
+        bool immediateBecauseSpawned,
+        long elapsedMs,
+        int suppressedTransientCount,
+        string suppressReason)
+    {
+        ShouldEmit = shouldEmit;
+        ImmediateBecauseSpawned = immediateBecauseSpawned;
+        ElapsedMs = elapsedMs;
+        SuppressedTransientCount = suppressedTransientCount;
+        SuppressReason = suppressReason ?? string.Empty;
+    }
+}
+
+/// <summary>
+/// P3-02（RC-AUDIT-REVEAL-NOISE）：PlayRevealAnimations 跳过告警去抖器（纯 C#、支持虚拟时钟单测）。
+/// 规则对齐官方 BoardManager.cs:1306-1321：
+///   1. Data.CardRemoval.HasCardsPendingRemoval() == true 时官方本就静默早退，立即重置窗口并抑制误报；
+///   2. 无加载/翻牌阻塞或无待翻牌时，立即重置窗口；
+///   3. spawned == true（CardSpawned 并发阻塞翻牌）属高危协议冲突，立即可靠上报不延迟；
+///   4. 纯多卡异步 SpawnCard 加载瞬态窗口（dealt=true, spawned=false 等）短于 2.0s 时静默去抖，
+///      仅在连续超过 2.0s（且相邻采样间隔未断开）时才上报持续异常。
+/// </summary>
+public sealed class BareAuditRevealSkipDebouncer
+{
+    public const long DefaultDebounceWindowMs = 2000L;
+    public const long DefaultMaxContinuousGapMs = 1000L;
+
+    private readonly object _sync = new();
+    private readonly long _debounceWindowMs;
+    private readonly long _maxContinuousGapMs;
+
+    private bool _tracking;
+    private string _windowKey = string.Empty;
+    private long _firstSkipMs;
+    private long _lastSampleMs;
+    private int _suppressedCount;
+
+    public long DebounceWindowMs => _debounceWindowMs;
+
+    public BareAuditRevealSkipDebouncer(
+        long debounceWindowMs = DefaultDebounceWindowMs,
+        long maxContinuousGapMs = DefaultMaxContinuousGapMs)
+    {
+        _debounceWindowMs = Math.Max(0L, debounceWindowMs);
+        _maxContinuousGapMs = Math.Max(200L, maxContinuousGapMs);
+    }
+
+    public RevealSkipDebounceDecision Evaluate(
+        long nowMs,
+        bool hasCardsPendingRemoval,
+        bool dealt,
+        bool spawned,
+        bool collectibles,
+        bool revealing,
+        bool hasCardsToReveal,
+        string appState,
+        string runState)
+    {
+        lock (_sync)
+        {
+            if (hasCardsPendingRemoval)
+            {
+                ResetLocked();
+                return new RevealSkipDebounceDecision(false, false, 0L, 0, "pending_removal");
+            }
+
+            if (!(dealt || spawned || collectibles || revealing) || !hasCardsToReveal)
+            {
+                ResetLocked();
+                return new RevealSkipDebounceDecision(false, false, 0L, 0, "not_skipped");
+            }
+
+            // spawned=true（与 Choice/LevelUp 混发 CardSpawned 阻塞翻牌）保持零延迟立即告警
+            if (spawned)
+            {
+                return new RevealSkipDebounceDecision(true, true, 0L, 0, string.Empty);
+            }
+
+            string stateKey = (appState ?? string.Empty) + "|" + (runState ?? string.Empty);
+            if (!_tracking
+                || !string.Equals(_windowKey, stateKey, StringComparison.Ordinal)
+                || nowMs < _lastSampleMs
+                || (nowMs - _lastSampleMs) > _maxContinuousGapMs)
+            {
+                _tracking = true;
+                _windowKey = stateKey;
+                _firstSkipMs = nowMs;
+                _lastSampleMs = nowMs;
+                _suppressedCount = 1;
+                if (_debounceWindowMs == 0L)
+                {
+                    return new RevealSkipDebounceDecision(true, false, 0L, 0, string.Empty);
+                }
+                return new RevealSkipDebounceDecision(false, false, 0L, 1, "transient_loading_window");
+            }
+
+            _lastSampleMs = nowMs;
+            long elapsedMs = nowMs - _firstSkipMs;
+            if (elapsedMs < _debounceWindowMs)
+            {
+                _suppressedCount++;
+                return new RevealSkipDebounceDecision(false, false, elapsedMs, _suppressedCount, "transient_loading_window");
+            }
+
+            int suppressed = _suppressedCount;
+            return new RevealSkipDebounceDecision(true, false, elapsedMs, suppressed, string.Empty);
+        }
+    }
+
+    public void Reset()
+    {
+        lock (_sync) ResetLocked();
+    }
+
+    private void ResetLocked()
+    {
+        _tracking = false;
+        _windowKey = string.Empty;
+        _firstSkipMs = 0L;
+        _lastSampleMs = 0L;
+        _suppressedCount = 0;
+    }
+
+    /// <summary>
+    /// 从官方 BoardManager.PlayRevealAnimations skipped 告警文本中解析 (dealt=..., spawned=..., collectibles=..., revealing=...) 标记。
+    /// </summary>
+    public static bool TryParseRevealSkipFlags(
+        string message,
+        out bool dealt,
+        out bool spawned,
+        out bool collectibles,
+        out bool revealing)
+    {
+        dealt = false;
+        spawned = false;
+        collectibles = false;
+        revealing = false;
+        if (string.IsNullOrWhiteSpace(message)) return false;
+
+        bool hasDealt = TryReadBoolFlag(message, "dealt=", out dealt);
+        bool hasSpawned = TryReadBoolFlag(message, "spawned=", out spawned);
+        TryReadBoolFlag(message, "collectibles=", out collectibles);
+        TryReadBoolFlag(message, "revealing=", out revealing);
+        return hasDealt && hasSpawned;
+    }
+
+    private static bool TryReadBoolFlag(string text, string key, out bool value)
+    {
+        value = false;
+        int idx = text.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return false;
+
+        int valStart = idx + key.Length;
+        if (valStart + 4 <= text.Length
+            && string.Compare(text, valStart, "true", 0, 4, StringComparison.OrdinalIgnoreCase) == 0)
+        {
+            value = true;
+            return true;
+        }
+        if (valStart + 5 <= text.Length
+            && string.Compare(text, valStart, "false", 0, 5, StringComparison.OrdinalIgnoreCase) == 0)
+        {
+            value = false;
+            return true;
+        }
+        return false;
+    }
+}
+
 /// <summary>协议信号匹配结果。</summary>
 public sealed class ProtocolSignalMatch
 {
@@ -599,6 +979,7 @@ public sealed class ProtocolSignalMatch
     public string Severity { get; set; } = "error";
     public string SignalId { get; set; } = string.Empty;
     public string Signature { get; set; } = string.Empty;
+    public bool IsExpectedNoise { get; set; }
 }
 
 /// <summary>
@@ -645,6 +1026,34 @@ public sealed class BareAuditProtocolSignalClassifier
 
     public ProtocolSignalMatch ClassifyUnityLog(string logType, string message, string stackTrace)
     {
+        return ClassifyUnityLogInternal(logType, message, stackTrace, scene: null, appState: null, runState: null, filterExpectedSseCancel: false);
+    }
+
+    /// <summary>
+    /// P3-03（RC-AUDIT-SSE-CANCEL）：带场景与 AppState 上下文的 Unity 日志分类入口。
+    /// 自动识别 StartRunAppState 切入对局取消主菜单 SSE GET /events 时触发的无业务栈 Winsock 995 取消噪音并降级为 info/IsExpectedNoise，
+    /// 绝不误杀携带业务堆栈、处于局内活跃态或非取消性质的真实异常。
+    /// </summary>
+    public ProtocolSignalMatch ClassifyUnityLogWithContext(
+        string logType,
+        string message,
+        string stackTrace,
+        string scene,
+        string appState,
+        string runState)
+    {
+        return ClassifyUnityLogInternal(logType, message, stackTrace, scene, appState, runState, filterExpectedSseCancel: true);
+    }
+
+    private ProtocolSignalMatch ClassifyUnityLogInternal(
+        string logType,
+        string message,
+        string stackTrace,
+        string scene,
+        string appState,
+        string runState,
+        bool filterExpectedSseCancel)
+    {
         if (string.IsNullOrWhiteSpace(message)) return null;
 
         // 绝对禁止捕获黑匣子自身日志造成递归风暴
@@ -690,6 +1099,19 @@ public sealed class BareAuditProtocolSignalClassifier
             return null;
         }
 
+        // P3-03：识别主菜单 SSE 主动取消触发的底层 Winsock 995 / OperationCanceled 释放噪音
+        if (filterExpectedSseCancel && IsExpectedSseCancellation(logType, message, stackTrace, scene, appState, runState))
+        {
+            return new ProtocolSignalMatch
+            {
+                Category = BareAuditCategory.UnityErrorOrException,
+                Severity = "info",
+                SignalId = "expected_sse_cancel",
+                Signature = "unity|sse_cancel|" + (appState ?? string.Empty),
+                IsExpectedNoise = true,
+            };
+        }
+
         string topFrame = ExtractFirstStackLine(stackTrace);
         return new ProtocolSignalMatch
         {
@@ -700,14 +1122,260 @@ public sealed class BareAuditProtocolSignalClassifier
         };
     }
 
+    /// <summary>
+    /// P3-03（RC-AUDIT-SSE-CANCEL）：严格判定某条 Unity 异常是否为 StartRunAppState / 主菜单主动取消 SSE GET /events 的预期释放噪音。
+    /// 必须同时满足：
+    ///   1. 属于 SocketException / IOException / OperationCanceledException / ObjectDisposedException / HttpRequestException 族；
+    ///   2. 携带 Winsock 995（中英文 WSA_OPERATION_ABORTED / NativeErrorCode 995）或 SSE 流主动取消/释放特征；
+    ///   3. 堆栈中不包含任何业务 C# 帧（仅允许空栈、Rethrow 包装行、纯 BCL 网络/IO 帧或官方 ReadServerSentEvent/TournamentAssignedLobbyService 帧）；
+    ///   4. 发生在 StartRunAppState / 主菜单切局窗口，或堆栈显式指明为官方 SSE 读流取消。
+    /// </summary>
+    public static bool IsExpectedSseCancellation(
+        string logType,
+        string message,
+        string stackTrace,
+        string scene,
+        string appState,
+        string runState)
+    {
+        if (string.IsNullOrWhiteSpace(message)) return false;
+
+        bool isExceptionOrError = string.Equals(logType, "Exception", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(logType, "Error", StringComparison.OrdinalIgnoreCase);
+        if (!isExceptionOrError) return false;
+
+        string msg = message;
+        string st = stackTrace ?? string.Empty;
+
+        // 1. 必须是底层网络/IO/取消/流释放异常族（绝不过滤 NullReferenceException/ArgumentException 等崩溃）
+        bool isNetIoCancelEx = ContainsAnyOrdinalIgnoreCase(
+            msg,
+            "SocketException",
+            "IOException",
+            "OperationCanceledException",
+            "TaskCanceledException",
+            "ObjectDisposedException",
+            "HttpRequestException")
+            || ContainsAnyOrdinalIgnoreCase(
+                st,
+                "SocketException",
+                "IOException",
+                "OperationCanceledException",
+                "TaskCanceledException",
+                "ObjectDisposedException",
+                "HttpRequestException");
+        if (!isNetIoCancelEx) return false;
+
+        // 2. 必须携带明确的 Winsock 995 / I/O 中止 / SSE 主动取消释放特征（严禁裸匹配 "995" 防误撞毫秒时间戳 .995）
+        bool hasWinsock995OrAbort = ContainsAnyOrdinalIgnoreCase(
+            msg,
+            "The I/O operation has been aborted because of either a thread exit or an application request",
+            "I/O operation has been aborted",
+            "由于线程退出或应用程序请求，已中止 I/O 操作",
+            "已中止 I/O 操作",
+            "WSA_OPERATION_ABORTED",
+            "OperationAborted",
+            "NativeErrorCode=995",
+            "NativeErrorCode: 995",
+            "NativeErrorCode 995",
+            "ErrorCode=995",
+            "ErrorCode: 995",
+            "ErrorCode 995",
+            "error 995",
+            "(995)",
+            "WSACancelBlockingCall")
+            || ContainsAnyOrdinalIgnoreCase(
+                st,
+                "The I/O operation has been aborted because of either a thread exit or an application request",
+                "I/O operation has been aborted",
+                "由于线程退出或应用程序请求，已中止 I/O 操作",
+                "已中止 I/O 操作",
+                "WSA_OPERATION_ABORTED",
+                "OperationAborted",
+                "NativeErrorCode=995",
+                "NativeErrorCode: 995",
+                "NativeErrorCode 995",
+                "ErrorCode=995",
+                "ErrorCode: 995",
+                "ErrorCode 995",
+                "error 995",
+                "(995)",
+                "WSACancelBlockingCall");
+
+        bool hasOperationCanceled = ContainsAnyOrdinalIgnoreCase(msg, "OperationCanceledException", "TaskCanceledException")
+            || ContainsAnyOrdinalIgnoreCase(st, "OperationCanceledException", "TaskCanceledException");
+
+        bool hasTransportCancel = (ContainsAnyOrdinalIgnoreCase(msg, "Unable to read data from the transport connection")
+                || ContainsAnyOrdinalIgnoreCase(st, "Unable to read data from the transport connection"))
+            && (ContainsAnyOrdinalIgnoreCase(msg, "aborted", "已中止", "canceled", "cancelled", "已取消", "disposed", "已释放", "closed", "已关闭", "interrupted")
+                || ContainsAnyOrdinalIgnoreCase(st, "aborted", "已中止", "canceled", "cancelled", "已取消", "disposed", "已释放", "closed", "已关闭", "interrupted"));
+
+        bool hasSseStreamDisposed = (ContainsAnyOrdinalIgnoreCase(msg, "ObjectDisposedException", "Cannot access a disposed object")
+                || ContainsAnyOrdinalIgnoreCase(st, "ObjectDisposedException", "Cannot access a disposed object"))
+            && (ContainsAnyOrdinalIgnoreCase(msg, "Stream", "Socket", "HttpResponse", "ReadServerSentEvent", "Chunked")
+                || ContainsAnyOrdinalIgnoreCase(st, "Stream", "Socket", "HttpResponse", "ReadServerSentEvent", "Chunked"));
+
+        if (!hasWinsock995OrAbort && !hasOperationCanceled && !hasTransportCancel && !hasSseStreamDisposed)
+            return false;
+
+        // 3. 严禁过滤带业务 C# 堆栈帧的真实异常（如 GameSimHandler / NetworkManager / NameAuth / StartRunAppState 自身业务报错）
+        if (HasBusinessStackFrame(st))
+            return false;
+
+        // 4. 必须处于 StartRunAppState / 主菜单切局 SSE 取消窗口，或堆栈显式指向官方 SSE 读流取消路径
+        bool isExplicitSseStack = ContainsAnyOrdinalIgnoreCase(msg, "ReadServerSentEvent", "TournamentAssignedLobbyService")
+            || ContainsAnyOrdinalIgnoreCase(st, "ReadServerSentEvent", "TournamentAssignedLobbyService");
+        if (isExplicitSseStack)
+            return true;
+
+        return IsSseCancelLifecycleWindow(scene, appState);
+    }
+
+    private static bool IsSseCancelLifecycleWindow(string scene, string appState)
+    {
+        if (!string.IsNullOrWhiteSpace(appState))
+        {
+            string s = appState.Trim();
+            if (s.IndexOf("StartRunAppState", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            return string.Equals(s, "MainMenuAppState", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(s, "MainMenu", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(s, "MainMenuState", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(s, "TitleAppState", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(s, "InitializationAppState", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(s, "LoadingAppState", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(s, "ShutdownAppState", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (string.IsNullOrWhiteSpace(scene))
+            return true;
+
+        string sc = scene.Trim();
+        return string.Equals(sc, "MainMenuScene", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sc, "DefaultLoadingScene", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sc, "AppStart", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sc, "Initialization", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// 检测堆栈是否包含任意业务 C# 帧。空栈、Rethrow 包装行、纯 BCL 网络/IO 底层帧以及官方 SSE 读流/取消帧返回 false；
+    /// 其余任意业务调用帧（如 TheBazaar.*、BazaarLauncher.*、Networking.NetworkManager.* 等）一律返回 true 拒绝过滤。
+    /// </summary>
+    private static bool HasBusinessStackFrame(string stackTrace)
+    {
+        if (string.IsNullOrWhiteSpace(stackTrace)) return false;
+
+        string[] lines = stackTrace.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        for (int i = 0; i < lines.Length; i++)
+        {
+            string line = lines[i].Trim();
+            if (line.Length == 0) continue;
+
+            // 跳过 Mono/Unity 异常链包装头行（非堆栈帧）
+            if (line.StartsWith("Rethrow as ", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("--- End of stack trace", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("--->", StringComparison.Ordinal)
+                || line.StartsWith("SocketException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("IOException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("OperationCanceledException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("TaskCanceledException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("ObjectDisposedException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("HttpRequestException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("System.Net.Sockets.SocketException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("System.IO.IOException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("System.OperationCanceledException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("System.Threading.Tasks.TaskCanceledException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("System.ObjectDisposedException", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("System.Net.Http.HttpRequestException", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            string frame = line;
+            if (frame.StartsWith("at ", StringComparison.OrdinalIgnoreCase))
+            {
+                frame = frame.Substring(3).TrimStart();
+            }
+            else if (frame.StartsWith("在 ", StringComparison.Ordinal))
+            {
+                frame = frame.Substring(2).TrimStart();
+            }
+
+            if (IsAllowedLowLevelOrSseFrame(frame))
+                continue;
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsAllowedLowLevelOrSseFrame(string frame)
+    {
+        if (string.IsNullOrEmpty(frame)) return true;
+
+        if (frame.StartsWith("System.Net.", StringComparison.OrdinalIgnoreCase)
+            || frame.StartsWith("System.IO.", StringComparison.OrdinalIgnoreCase)
+            || frame.StartsWith("System.Threading.", StringComparison.OrdinalIgnoreCase)
+            || frame.StartsWith("System.Runtime.", StringComparison.OrdinalIgnoreCase)
+            || frame.StartsWith("System.Buffers.", StringComparison.OrdinalIgnoreCase)
+            || frame.StartsWith("Mono.Net.", StringComparison.OrdinalIgnoreCase)
+            || frame.StartsWith("Mono.Security.", StringComparison.OrdinalIgnoreCase)
+            || frame.StartsWith("Microsoft.Win32.", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // 仅放行官方 SSE 读流与大厅监听取消链，其他 Networking.*（如 NetworkManager）仍视为业务帧
+        if ((frame.StartsWith("Networking.HttpClientHelpers", StringComparison.OrdinalIgnoreCase)
+                && frame.IndexOf("ReadServerSentEvent", StringComparison.OrdinalIgnoreCase) >= 0)
+            || frame.StartsWith("Networking.TournamentAssignedLobbyService", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool ContainsAnyOrdinalIgnoreCase(string source, params string[] needles)
+    {
+        if (string.IsNullOrEmpty(source) || needles == null) return false;
+        for (int i = 0; i < needles.Length; i++)
+        {
+            string n = needles[i];
+            if (!string.IsNullOrEmpty(n) && source.IndexOf(n, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+        return false;
+    }
+
     private static string BuildCompactSignatureSeed(string msg)
     {
         if (string.IsNullOrEmpty(msg)) return string.Empty;
         string trimmed = msg.Trim();
         int nl = trimmed.IndexOf('\n');
-        if (nl >= 0) trimmed = trimmed.Substring(0, nl);
+        if (nl >= 0) trimmed = trimmed.Substring(0, nl).TrimEnd('\r');
+        trimmed = StripLeadingClockPrefix(trimmed);
         if (trimmed.Length > 120) trimmed = trimmed.Substring(0, 120);
         return trimmed;
+    }
+
+    /// <summary>剥离 AppLogger 常见前缀时间戳 [HH:mm:ss.fff] / [HH:mm:ss]，避免毫秒时间戳穿透速率去重。</summary>
+    private static string StripLeadingClockPrefix(string s)
+    {
+        if (string.IsNullOrEmpty(s) || s[0] != '[') return s;
+        int closeIdx = s.IndexOf(']');
+        if (closeIdx < 8 || closeIdx > 16) return s;
+
+        // 校验 [HH:mm:ss...] 格式：下标 1,2 数字，3 为 ':'，4,5 数字，6 为 ':'，7,8 数字
+        if (char.IsDigit(s[1]) && char.IsDigit(s[2]) && s[3] == ':'
+            && char.IsDigit(s[4]) && char.IsDigit(s[5]) && s[6] == ':'
+            && char.IsDigit(s[7]) && char.IsDigit(s[8]))
+        {
+            return s.Substring(closeIdx + 1).TrimStart();
+        }
+        return s;
     }
 
     private static string ExtractFirstStackLine(string stackTrace)
@@ -968,6 +1636,8 @@ public sealed class BareClientAuditEngine : IDisposable
     private readonly ShopPurchaseAttributeDiffDetector _purchaseDetector;
     private readonly BareAuditDeadlockDetector _deadlockDetector;
     private readonly BareAuditProtocolSignalClassifier _signalClassifier;
+    private readonly BareAuditRevealSkipDebouncer _directRevealDebouncer;
+    private readonly BareAuditRevealSkipDebouncer _logRevealDebouncer;
 
     private readonly ConcurrentQueue<string> _writeQueue = new();
     private readonly AutoResetEvent _wakeWriter = new(false);
@@ -1001,6 +1671,12 @@ public sealed class BareClientAuditEngine : IDisposable
         _purchaseDetector = new ShopPurchaseAttributeDiffDetector();
         _deadlockDetector = new BareAuditDeadlockDetector(deadlockThresholdMs, 15_000L);
         _signalClassifier = new BareAuditProtocolSignalClassifier();
+        _directRevealDebouncer = new BareAuditRevealSkipDebouncer(
+            BareAuditRevealSkipDebouncer.DefaultDebounceWindowMs,
+            BareAuditRevealSkipDebouncer.DefaultMaxContinuousGapMs);
+        _logRevealDebouncer = new BareAuditRevealSkipDebouncer(
+            BareAuditRevealSkipDebouncer.DefaultDebounceWindowMs,
+            BareAuditRevealSkipDebouncer.DefaultMaxContinuousGapMs);
 
         if (_enabled && !string.IsNullOrWhiteSpace(_jsonlFilePath))
         {
@@ -1047,11 +1723,55 @@ public sealed class BareClientAuditEngine : IDisposable
         int day,
         int hour)
     {
+        return VerifyShopItemAfterPurchaseWithAura(
+            instanceId,
+            afterAttributes,
+            scene,
+            appState,
+            runState,
+            day,
+            hour,
+            auraContext: null,
+            emitAuraExplainedInfo: false);
+    }
+
+    /// <summary>
+    /// P3-01（RC-AUDIT-AURA-PURCHASE-FP）：结合同包 EffectAuraExecuted 光环上下文校验货架购入前后属性跳变。
+    /// 命中合法入场光环时，写入事件链 trace 并默认豁免误报（返回 false）；若调用方显式要求 emitAuraExplainedInfo=true，
+    /// 则以 severity="info" 落盘。无真实光环解释的跳变仍保持原有 error/warning 报警能力。
+    /// </summary>
+    public bool VerifyShopItemAfterPurchaseWithAura(
+        string instanceId,
+        IReadOnlyDictionary<string, int> afterAttributes,
+        string scene,
+        string appState,
+        string runState,
+        int day,
+        int hour,
+        BareAuditPurchaseAuraContext auraContext,
+        bool emitAuraExplainedInfo = false)
+    {
         if (!_enabled || Volatile.Read(ref _disposed) != 0) return false;
         long nowMs = _clockMs();
-        if (!_purchaseDetector.CompareAfterPurchase(instanceId, afterAttributes, nowMs, out var jump))
+        if (!_purchaseDetector.CompareAfterPurchaseWithAura(instanceId, afterAttributes, nowMs, auraContext, out var jump))
         {
             return false;
+        }
+
+        if (jump.ExplainedByAura)
+        {
+            string auraIdsText = jump.AuraEffectIds != null && jump.AuraEffectIds.Length > 0
+                ? string.Join(",", jump.AuraEffectIds)
+                : "aura";
+            RecordTrace(
+                "audit",
+                "ShopPurchaseAuraExplained",
+                $"{jump.CardTitle} ({jump.InstanceId}) diffs={jump.Diffs.Count} auras=[{auraIdsText}]");
+
+            if (!emitAuraExplainedInfo)
+            {
+                return false;
+            }
         }
 
         var ctx = new Dictionary<string, object>
@@ -1060,18 +1780,99 @@ public sealed class BareClientAuditEngine : IDisposable
             ["templateId"] = jump.TemplateId,
             ["cardTitle"] = jump.CardTitle,
             ["hasZeroToNonZeroJump"] = jump.HasZeroToNonZeroJump,
+            ["auraExplained"] = jump.ExplainedByAura,
+            ["hasBatchRealAura"] = auraContext != null && auraContext.HasAuraExecuted,
+            ["auraEffectIds"] = jump.AuraEffectIds ?? Array.Empty<string>(),
             ["diffs"] = jump.Diffs,
             ["beforeAttributes"] = jump.BeforeAttributes,
             ["afterAttributes"] = jump.AfterAttributes,
         };
 
-        string sig = "purchase_jump|" + jump.TemplateId + "|" + jump.InstanceId;
-        string summary = $"货架购入前后属性跳变: {jump.CardTitle} ({jump.InstanceId}), 差异字段数={jump.Diffs.Count}, zeroToNonZero={jump.HasZeroToNonZeroJump}";
+        string sig = (jump.ExplainedByAura ? "purchase_jump_aura|" : "purchase_jump|") + jump.TemplateId + "|" + jump.InstanceId;
+        string summary = jump.ExplainedByAura
+            ? $"货架购入合法入场光环属性变化: {jump.CardTitle} ({jump.InstanceId}), 差异字段数={jump.Diffs.Count}, auras=[{string.Join(",", jump.AuraEffectIds ?? Array.Empty<string>())}]"
+            : $"货架购入前后属性跳变: {jump.CardTitle} ({jump.InstanceId}), 差异字段数={jump.Diffs.Count}, zeroToNonZero={jump.HasZeroToNonZeroJump}";
         return EmitAnomaly(
             BareAuditCategory.ShopPurchaseAttributeJump,
-            jump.HasZeroToNonZeroJump ? "error" : "warning",
+            jump.SuggestedSeverity,
             sig,
             summary,
+            scene,
+            appState,
+            runState,
+            day,
+            hour,
+            ctx,
+            nowMs);
+    }
+
+    /// <summary>P3-02（RC-AUDIT-REVEAL-NOISE）：在翻牌恢复正常或存在待移除队列时重置翻牌跳过瞬态去抖窗口。</summary>
+    public void ResetRevealSkipDebounce()
+    {
+        if (!_enabled || Volatile.Read(ref _disposed) != 0) return;
+        _directRevealDebouncer.Reset();
+        _logRevealDebouncer.Reset();
+    }
+
+    /// <summary>
+    /// P3-02（RC-AUDIT-REVEAL-NOISE）：评估来自 BoardManager.PlayRevealAnimations 前置钩子的跳过状态。
+    /// 若存在 HasCardsPendingRemoval 或属于短于 2.0s 的多卡异步 SpawnCard 瞬态加载窗口，则静默抑制；
+    /// 持续超过 2.0s 或 spawned=true 并发阻塞时立即上报 critical 告警。
+    /// </summary>
+    public bool RecordDirectRevealSkip(
+        bool hasCardsPendingRemoval,
+        bool dealt,
+        bool spawned,
+        bool collectibles,
+        bool revealing,
+        bool hasCardsToReveal,
+        string scene,
+        string appState,
+        string runState,
+        int day,
+        int hour)
+    {
+        if (!_enabled || Volatile.Read(ref _disposed) != 0) return false;
+        long nowMs = _clockMs();
+        var decision = _directRevealDebouncer.Evaluate(
+            nowMs,
+            hasCardsPendingRemoval,
+            dealt,
+            spawned,
+            collectibles,
+            revealing,
+            hasCardsToReveal,
+            appState,
+            runState);
+
+        if (!decision.ShouldEmit)
+        {
+            return false;
+        }
+
+        var ctx = new Dictionary<string, object>
+        {
+            ["dealt"] = dealt,
+            ["spawned"] = spawned,
+            ["collectibles"] = collectibles,
+            ["revealing"] = revealing,
+            ["hasCardsToReveal"] = hasCardsToReveal,
+            ["hasCardsPendingRemoval"] = false,
+            ["elapsedMs"] = decision.ElapsedMs,
+            ["debouncedTransientCount"] = decision.SuppressedTransientCount,
+            ["signalId"] = "play_reveal_animations_skipped_direct",
+        };
+
+        string sig = BareAuditCategory.ProtocolRevealSkipped + "|play_reveal_animations_skipped_direct|" + (appState ?? "") + "|" + (runState ?? "");
+        string summary = decision.ImmediateBecauseSpawned
+            ? $"PlayRevealAnimations skipped (dealt={dealt}, spawned={spawned}, collectibles={collectibles}, revealing={revealing})"
+            : $"PlayRevealAnimations skipped 持续 {decision.ElapsedMs}ms (dealt={dealt}, spawned={spawned}, collectibles={collectibles}, revealing={revealing})";
+
+        return EmitAnomaly(
+            BareAuditCategory.ProtocolRevealSkipped,
+            "critical",
+            sig,
+            Truncate(summary, 500),
             scene,
             appState,
             runState,
@@ -1093,8 +1894,42 @@ public sealed class BareClientAuditEngine : IDisposable
     {
         if (!_enabled || Volatile.Read(ref _disposed) != 0) return false;
 
-        var matched = _signalClassifier.ClassifyUnityLog(logType, message, stackTrace);
+        var matched = _signalClassifier.ClassifyUnityLogWithContext(logType, message, stackTrace, scene, appState, runState);
         if (matched == null) return false;
+
+        // P3-03（RC-AUDIT-SSE-CANCEL）：主菜单/开局切态 SSE 主动取消触发的底层 Winsock 995 降级记录到 trace 并过滤告警
+        if (matched.IsExpectedNoise)
+        {
+            RecordTrace("network", "ExpectedSseCancel", Truncate(message, 200));
+            return false;
+        }
+
+        long nowMs = _clockMs();
+        long revealElapsedMs = 0L;
+        int revealDebouncedCount = 0;
+
+        // P3-02（RC-AUDIT-REVEAL-NOISE）：对 Unity 日志流中的纯多卡异步加载瞬态（dealt=True, spawned=False）同步实施 2.0s 去抖
+        if (string.Equals(matched.Category, BareAuditCategory.ProtocolRevealSkipped, StringComparison.Ordinal)
+            && BareAuditRevealSkipDebouncer.TryParseRevealSkipFlags(message, out bool dealt, out bool spawned, out bool collectibles, out bool revealing)
+            && !spawned)
+        {
+            var decision = _logRevealDebouncer.Evaluate(
+                nowMs,
+                hasCardsPendingRemoval: false,
+                dealt,
+                spawned,
+                collectibles,
+                revealing,
+                hasCardsToReveal: true,
+                appState,
+                runState);
+            if (!decision.ShouldEmit)
+            {
+                return false;
+            }
+            revealElapsedMs = decision.ElapsedMs;
+            revealDebouncedCount = decision.SuppressedTransientCount;
+        }
 
         var ctx = new Dictionary<string, object>
         {
@@ -1102,6 +1937,11 @@ public sealed class BareClientAuditEngine : IDisposable
             ["signalId"] = matched.SignalId,
             ["stackTrace"] = Truncate(stackTrace, MaxStackTraceChars),
         };
+        if (revealElapsedMs > 0L || revealDebouncedCount > 0)
+        {
+            ctx["elapsedMs"] = revealElapsedMs;
+            ctx["debouncedTransientCount"] = revealDebouncedCount;
+        }
 
         return EmitAnomaly(
             matched.Category,
@@ -1114,7 +1954,7 @@ public sealed class BareClientAuditEngine : IDisposable
             day,
             hour,
             ctx,
-            _clockMs());
+            nowMs);
     }
 
     public bool RecordProtocolSignal(
@@ -1302,6 +2142,8 @@ public sealed class BareClientAuditEngine : IDisposable
     {
         _purchaseDetector.Clear();
         _deadlockDetector.Reset();
+        _directRevealDebouncer.Reset();
+        _logRevealDebouncer.Reset();
     }
 
     public void Flush(int timeoutMs = 2000)

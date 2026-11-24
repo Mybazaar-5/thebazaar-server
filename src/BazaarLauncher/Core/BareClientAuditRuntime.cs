@@ -11,6 +11,7 @@ using BazaarGameShared.Domain.Core.Types;
 using BazaarGameShared.Domain.Runs;
 using BazaarGameShared.Infra.Messages;
 using BazaarGameShared.Infra.Messages.GameSimEvents;
+using BazaarGameShared.Infra.Messages.Shared;
 using HarmonyLib;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -43,6 +44,8 @@ internal static class BareClientAuditRuntime
     private static PropertyInfo _dataTransitionInProp;
     private static PropertyInfo _dataNewDayCtrlProp;
     private static PropertyInfo _dataPlayerSpmProp;
+    private static PropertyInfo _dataCardRemovalProp;
+    private static MethodInfo _cardRemovalHasPendingMethod;
     private static FieldInfo _tiWaitForNewDayField;
     private static PropertyInfo _newDayIsActiveProp;
     private static PropertyInfo _newDayHasPendingProp;
@@ -53,6 +56,7 @@ internal static class BareClientAuditRuntime
     private static FieldInfo _bmIsRevealingField;
     private static PropertyInfo _bmIsRevealingProp;
     private static MethodInfo _bmHasCardsToRevealMethod;
+    private static MethodInfo _bmHasCardsPendingRemovalMethod;
     private static PropertyInfo _bmIsProcessingUpgradeProp;
     private static PropertyInfo _bmDialogOpenProp;
     private static FieldInfo _bmBoardTransitionField;
@@ -205,7 +209,15 @@ internal static class BareClientAuditRuntime
             _dataTransitionInProp = dataType.GetProperty("TransitionIn", anyStatic);
             _dataNewDayCtrlProp = dataType.GetProperty("NewDayTransitionController", anyStatic);
             _dataPlayerSpmProp = dataType.GetProperty("PlayerSkillPresentationManager", anyStatic);
+            _dataCardRemovalProp = dataType.GetProperty("CardRemoval", anyStatic);
             _dataGetStaticMethod = dataType.GetMethod("GetStatic", anyStatic, null, Type.EmptyTypes, null);
+        }
+
+        // P3-02：对齐官方 BoardManager.cs:1306（Data.CardRemoval.HasCardsPendingRemoval()）
+        var cardRemovalType = GameInspector.FindTypeSafe("TheBazaar.CardRemoval", "CardRemoval");
+        if (cardRemovalType != null)
+        {
+            _cardRemovalHasPendingMethod = cardRemovalType.GetMethod("HasCardsPendingRemoval", anyInst, null, Type.EmptyTypes, null);
         }
 
         var tiType = GameInspector.FindTypeSafe("TheBazaar.SequenceFramework.VisualSequences.TransitionInComponent");
@@ -229,6 +241,7 @@ internal static class BareClientAuditRuntime
             _bmIsRevealingField = bmType.GetField("_isRevealing", anyInst);
             _bmIsRevealingProp = bmType.GetProperty("IsRevealing", anyInst);
             _bmHasCardsToRevealMethod = bmType.GetMethod("HasCardsToReveal", anyInst, null, Type.EmptyTypes, null);
+            _bmHasCardsPendingRemovalMethod = bmType.GetMethod("HasCardsPendingRemoval", anyInst, null, Type.EmptyTypes, null);
             _bmIsProcessingUpgradeProp = bmType.GetProperty("IsProcessingUpgradeOrFuseOrEnchant", anyInst);
             _bmDialogOpenProp = bmType.GetProperty("DialogOpen", anyInst);
             _bmBoardTransitionField = bmType.GetField("_boardTransition", anyInst);
@@ -519,7 +532,7 @@ internal static class BareClientAuditRuntime
         catch { }
     }
 
-    private static void GameSimHandleMessagePrefix(NetMessageGameSim message, out List<string> __state)
+    private static void GameSimHandleMessagePrefix(NetMessageGameSim message, out BareAuditPurchaseBatchState __state)
     {
         __state = null;
         var eng = _engine;
@@ -564,6 +577,9 @@ internal static class BareClientAuditRuntime
                     if (!string.IsNullOrEmpty(key)) batch.SimUpdateCardKeys.Add(key);
                 }
             }
+
+            List<string> purchasedIds = null;
+            BareAuditPurchaseAuraContext auraContext = null;
 
             if (events != null && events.Count > 0)
             {
@@ -638,14 +654,23 @@ internal static class BareClientAuditRuntime
                         case GameSimEventCardPurchased pur:
                             if (!string.IsNullOrEmpty(pur.InstanceId))
                             {
-                                __state ??= new List<string>(2);
-                                __state.Add(pur.InstanceId);
+                                purchasedIds ??= new List<string>(2);
+                                purchasedIds.Add(pur.InstanceId);
                             }
+                            break;
+                        case GameSimEventEffectAuraExecuted aura:
+                            // P3-01：采集同包真实光环事件与受影响卡牌实例 ID，透传给购入属性跳变比对器
+                            CollectAuraEventIntoContext(ref auraContext, aura);
                             break;
                     }
                 }
                 if (shown > 8) summarySb.Append(",+").Append(shown - 8);
                 summarySb.Append(']');
+            }
+
+            if (purchasedIds != null && purchasedIds.Count > 0)
+            {
+                __state = new BareAuditPurchaseBatchState(purchasedIds, auraContext);
             }
 
             eng.RecordTrace("server_msg", "NetMessageGameSim", summarySb.ToString());
@@ -654,9 +679,45 @@ internal static class BareClientAuditRuntime
         catch { }
     }
 
-    private static void GameSimHandleMessagePostfix(List<string> __state, Task __result)
+    private static void CollectAuraEventIntoContext(ref BareAuditPurchaseAuraContext auraContext, GameSimEventEffectAuraExecuted aura)
     {
-        if (__state == null || __state.Count == 0) return;
+        if (aura == null) return;
+
+        bool hasAnyExplicitTarget = (aura.AppliedTo != null && aura.AppliedTo.Count > 0)
+            || (aura.RemovedFrom != null && aura.RemovedFrom.Count > 0);
+
+        List<string> cardTargets = null;
+        if (aura.AppliedTo != null)
+        {
+            foreach (var target in aura.AppliedTo)
+            {
+                if (target is EffectTargetCard tc && !string.IsNullOrEmpty(tc.Target.Value))
+                {
+                    cardTargets ??= new List<string>(4);
+                    cardTargets.Add(tc.Target.Value);
+                }
+            }
+        }
+        if (aura.RemovedFrom != null)
+        {
+            foreach (var target in aura.RemovedFrom)
+            {
+                if (target is EffectTargetCard tc && !string.IsNullOrEmpty(tc.Target.Value))
+                {
+                    cardTargets ??= new List<string>(4);
+                    cardTargets.Add(tc.Target.Value);
+                }
+            }
+        }
+
+        string sourceId = aura.Source.HasValue ? aura.Source.Value.Value : null;
+        auraContext ??= new BareAuditPurchaseAuraContext();
+        auraContext.RecordAuraEvent(aura.EffectId, aura.ExecutionContextId, sourceId, cardTargets, hasAnyExplicitTarget);
+    }
+
+    private static void GameSimHandleMessagePostfix(BareAuditPurchaseBatchState __state, Task __result)
+    {
+        if (__state == null || __state.PurchasedIds.Count == 0) return;
         var eng = _engine;
         if (eng == null || !eng.Enabled) return;
 
@@ -720,6 +781,14 @@ internal static class BareClientAuditRuntime
 
         try
         {
+            // P3-02（RC-AUDIT-REVEAL-NOISE）：严格对齐官方 BoardManager.cs:1306，
+            // 当 Data.CardRemoval.HasCardsPendingRemoval() 为 true 时官方本就静默早退，绝不应误报告警
+            if (HasCardsPendingRemovalSafe(__instance))
+            {
+                eng.ResetRevealSkipDebounce();
+                return;
+            }
+
             bool dealt = _bmCardsBeingDealtField?.GetValue(__instance) is bool d && d;
             bool spawned = _bmCardsBeingSpawnedField?.GetValue(__instance) is bool s && s;
             bool collectibles = _bmIsLoadingCollectiblesField?.GetValue(__instance) is bool c && c;
@@ -727,34 +796,71 @@ internal static class BareClientAuditRuntime
                 ? rf
                 : (_bmIsRevealingProp?.GetValue(__instance) is bool rp && rp);
 
-            if (!(dealt || spawned || collectibles || revealing)) return;
+            if (!(dealt || spawned || collectibles || revealing))
+            {
+                eng.ResetRevealSkipDebounce();
+                return;
+            }
 
             bool hasToReveal = _bmHasCardsToRevealMethod?.Invoke(__instance, null) is bool hr && hr;
-            if (!hasToReveal) return;
+            if (!hasToReveal)
+            {
+                eng.ResetRevealSkipDebounce();
+                return;
+            }
 
             RefreshCachedGameContext();
             var snap = _ctx;
-            var ctx = new Dictionary<string, object>
-            {
-                ["dealt"] = dealt,
-                ["spawned"] = spawned,
-                ["collectibles"] = collectibles,
-                ["revealing"] = revealing,
-                ["hasCardsToReveal"] = true,
-            };
-            eng.RecordProtocolSignal(
-                BareAuditCategory.ProtocolRevealSkipped,
-                "critical",
-                "play_reveal_animations_skipped_direct",
-                $"PlayRevealAnimations skipped (dealt={dealt}, spawned={spawned}, collectibles={collectibles}, revealing={revealing})",
+            // 交由引擎内置 2.0s 瞬态去抖器判定：短于 2.0s 的多卡异步 SpawnCard 加载窗静默抑制，
+            // 持续超时或 spawned=true 并发阻塞立即上报 critical
+            eng.RecordDirectRevealSkip(
+                hasCardsPendingRemoval: false,
+                dealt,
+                spawned,
+                collectibles,
+                revealing,
+                hasCardsToReveal: true,
                 snap.Scene,
                 snap.AppState,
                 snap.RunState,
                 snap.Day,
-                snap.Hour,
-                ctx);
+                snap.Hour);
         }
         catch { }
+    }
+
+    private static bool HasCardsPendingRemovalSafe(object boardManager)
+    {
+        try
+        {
+            if (_dataCardRemovalProp != null)
+            {
+                var cardRemoval = _dataCardRemovalProp.GetValue(null);
+                if (cardRemoval != null)
+                {
+                    _cardRemovalHasPendingMethod ??= cardRemoval.GetType().GetMethod(
+                        "HasCardsPendingRemoval",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                        null,
+                        Type.EmptyTypes,
+                        null);
+                    if (_cardRemovalHasPendingMethod?.Invoke(cardRemoval, null) is bool pending && pending)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            if (boardManager != null && _bmHasCardsPendingRemovalMethod != null)
+            {
+                if (_bmHasCardsPendingRemovalMethod.Invoke(boardManager, null) is bool bmPending && bmPending)
+                {
+                    return true;
+                }
+            }
+        }
+        catch { }
+        return false;
     }
 
     // ── 货架购入属性快照与比对辅助 ────────────────────────────────────────────
@@ -803,10 +909,10 @@ internal static class BareClientAuditRuntime
         eng.CaptureShopItemBeforePurchase(instanceId, tplId, title, attrs);
     }
 
-    private static void VerifyPurchasedCardsOnMain(List<string> purchasedIds)
+    private static void VerifyPurchasedCardsOnMain(BareAuditPurchaseBatchState batchState)
     {
         var eng = _engine;
-        if (eng == null || !eng.Enabled || purchasedIds == null) return;
+        if (eng == null || !eng.Enabled || batchState == null || batchState.PurchasedIds.Count == 0) return;
 
         try
         {
@@ -814,6 +920,9 @@ internal static class BareClientAuditRuntime
             var snap = _ctx;
             var entities = GameInspector.GetDataEntities();
             if (entities == null) return;
+
+            var purchasedIds = batchState.PurchasedIds;
+            var auraContext = batchState.AuraContext;
 
             for (int i = 0; i < purchasedIds.Count; i++)
             {
@@ -826,14 +935,15 @@ internal static class BareClientAuditRuntime
                 var afterAttrs = ReadCardAttributes(cardObj);
                 if (afterAttrs == null) continue;
 
-                eng.VerifyShopItemAfterPurchase(
+                eng.VerifyShopItemAfterPurchaseWithAura(
                     id,
                     afterAttrs,
                     snap.Scene,
                     snap.AppState,
                     snap.RunState,
                     snap.Day,
-                    snap.Hour);
+                    snap.Hour,
+                    auraContext);
             }
         }
         catch { }

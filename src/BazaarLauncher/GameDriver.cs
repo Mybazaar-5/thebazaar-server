@@ -10,7 +10,13 @@ using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using BazaarGameShared.Domain.Cards;
+using BazaarGameShared.Domain.Cards.Enchantments;
+using BazaarGameShared.Domain.Cards.Encounter.Pedestal;
+using BazaarGameShared.Domain.Cards.Encounter.Pedestal.Behaviors;
+using BazaarGameShared.Domain.Cards.Item;
 using BazaarGameShared.Domain.Core.Types;
+using BazaarGameShared.Domain.Prerequisites.Conditionals;
 using BazaarLauncher.Core;
 using BepInEx;
 using HarmonyLib;
@@ -55,6 +61,13 @@ internal sealed class GameDriver : MonoBehaviour
     private static HttpListener _listener;
     private static bool _started;
     private static string _activeToken = string.Empty;
+    // P2-12：记录最近一次 /resume 成功派发时刻，为慢速重连铺牌提供自适应 pre_wait 宽限期
+    private static long _lastResumeAtTicks;
+    // P2-10：记录最近一次进入 hovercard 升阶预览的 CardController，便于隐藏或切卡时配对调用 ExitUpgradePreview()
+    private static Component _lastHoverUpgradePreviewCtrl;
+    // P0-01：缓存祭坛条件求值上下文构造器与 CanCardUpgrade 委托，避免重复反射扫描
+    private static ConstructorInfo _cardCondContextCtor;
+    private static MethodInfo _canCardUpgradeMethod;
 
     internal static bool IsRunning => _started && _listener != null && _listener.IsListening;
     internal static string ActiveToken => _activeToken;
@@ -603,17 +616,112 @@ internal sealed class GameDriver : MonoBehaviour
     private static bool IsMutatingWaitOp(string opLower)
     {
         return opLower is "buy" or "sell" or "selectskill" or "selectencounter" or "encounterstep" or "encounter_step"
-            or "commitpedestal" or "reroll" or "exit" or "move" or "cheat" or "sync";
+            or "commitpedestal" or "reroll" or "exit" or "move" or "cheat" or "sync"
+            or "startcombat" or "start_combat";
+    }
+
+    /// <summary>
+    /// P2-12：高风险切态/写操作命令集合。当客户端处于忙碌态且 waitIdle 超时时，
+    /// 严禁盲目放行发包（防止重连慢铺牌期奇遇卡幽灵残留或动画竞态），必须拒绝执行并返回 retryable_busy。
+    /// </summary>
+    private static bool IsHighRiskStateTransitionOp(string opLower)
+    {
+        return opLower is "selectencounter" or "encounterstep" or "encounter_step"
+            or "exit" or "commitpedestal" or "reroll"
+            or "startcombat" or "start_combat"
+            or "buy" or "sell" or "selectskill" or "move";
+    }
+
+    private static bool IsWithinPostResumeGraceWindow()
+    {
+        long resumeTicks = Interlocked.Read(ref _lastResumeAtTicks);
+        if (resumeTicks <= 0) return false;
+        double elapsedSec = (Stopwatch.GetTimestamp() - resumeTicks) / (double)Stopwatch.Frequency;
+        return elapsedSec >= 0.0 && elapsedSec <= 15.0;
+    }
+
+    /// <summary>
+    /// P2-12：在直接主线程命令入口（如 batch/DriverOps 或前置等待后的 1 帧竞态窗口）兜底检查客户端是否仍处于忙碌态；
+    /// 除非调用方显式传 allowBusy=true / force=true / waitIdle=false，否则拒绝发包并返回 retryable_busy。
+    /// </summary>
+    private static object TryRejectIfClientBusy(string opName, JObject req)
+    {
+        if (req != null && ((bool?)req["allowBusy"] == true || (bool?)req["force"] == true || (bool?)req["waitIdle"] == false))
+        {
+            return null;
+        }
+
+        if (GameInspector.IsClientBusy(out string busyReason))
+        {
+            return new
+            {
+                ok = false,
+                op = opName,
+                error = "retryable_busy",
+                errorCode = "retryable_busy",
+                retryable = true,
+                dispatched = false,
+                waitIdle = true,
+                idleTimedOut = true,
+                idleWaitMs = 0,
+                busyReason = busyReason ?? "busy",
+                stage = "dispatch_guard",
+            };
+        }
+        return null;
     }
 
     private static async Task HandleActionWithWaitAsync(
         HttpListenerContext ctx, JObject req, Func<object> mainAction, string opLower)
     {
         bool waitIdle = (bool?)req["waitIdle"] ?? IsMutatingWaitOp(opLower);
+        bool isHighRisk = IsHighRiskStateTransitionOp(opLower);
+        bool allowBusy = (bool?)req["allowBusy"] ?? (bool?)req["force"] ?? false;
         bool includeCompactState = (bool?)req["includeCompactState"] ?? false;
         bool includeUi = (bool?)req["includeUi"] ?? true;
         int waitTimeoutMs = Math.Clamp((int?)req["waitTimeoutMs"] ?? 3000, 50, 15000);
         bool compactFmt = includeCompactState || ((bool?)req["compact"] ?? false);
+
+        // P2-12：高风险切态命令派发前必须先确认客户端已空闲；若忙碌则等待至多 waitTimeoutMs（重连宽限期内至少 10s）。
+        // 超时（idleTimedOut）时严禁盲目放行发包，直接拒绝执行并显式返回 retryable_busy（附 busyReason 与耗时）交上层退避重试。
+        int preIdleWaitMs = 0;
+        if (waitIdle && isHighRisk && !allowBusy)
+        {
+            string preBusyReason = RunOnMain(() => GameInspector.IsClientBusy(out string r) ? (r ?? "busy") : null);
+            if (preBusyReason != null)
+            {
+                int preWaitTimeoutMs = IsWithinPostResumeGraceWindow()
+                    ? Math.Max(waitTimeoutMs, 10000)
+                    : waitTimeoutMs;
+                var (preTimedOut, preElapsedMs, latestBusyReason, preCompactState) =
+                    await WaitForClientIdleAsync(preWaitTimeoutMs, includeCompactState, includeUi).ConfigureAwait(false);
+                preIdleWaitMs = preElapsedMs;
+
+                if (preTimedOut)
+                {
+                    var busyObj = new JObject
+                    {
+                        ["ok"] = false,
+                        ["op"] = opLower,
+                        ["error"] = "retryable_busy",
+                        ["errorCode"] = "retryable_busy",
+                        ["retryable"] = true,
+                        ["dispatched"] = false,
+                        ["waitIdle"] = true,
+                        ["idleTimedOut"] = true,
+                        ["idleWaitMs"] = preElapsedMs,
+                        ["busyReason"] = latestBusyReason ?? preBusyReason ?? "busy",
+                        ["stage"] = "pre_wait",
+                    };
+                    if (includeCompactState && preCompactState != null)
+                    {
+                        busyObj["compactState"] = JObject.FromObject(preCompactState);
+                    }
+                    Respond(ctx, 200, busyObj.ToString(compactFmt ? Formatting.None : Formatting.Indented));
+                    return;
+                }
+            }
+        }
 
         if (opLower == "buy")
         {
@@ -629,15 +737,21 @@ internal sealed class GameDriver : MonoBehaviour
 
         var res = RunOnMain(mainAction);
         var resObj = res as JObject ?? JObject.FromObject(res ?? new { ok = false });
+        if (preIdleWaitMs > 0) resObj["preIdleWaitMs"] = preIdleWaitMs;
         bool actionOk = resObj["ok"]?.Value<bool>() == true;
 
         if (waitIdle && actionOk)
         {
-            var (timedOut, idleWaitMs, compactState) =
+            var (timedOut, idleWaitMs, postBusyReason, compactState) =
                 await WaitForClientIdleAsync(waitTimeoutMs, includeCompactState, includeUi).ConfigureAwait(false);
             resObj["waitIdle"] = true;
             resObj["idleWaitMs"] = idleWaitMs;
-            if (timedOut) resObj["idleTimedOut"] = true;
+            if (timedOut)
+            {
+                resObj["idleTimedOut"] = true;
+                resObj["busyReason"] = postBusyReason ?? "busy";
+                resObj["retryableBusy"] = true;
+            }
             if (includeCompactState && compactState != null)
             {
                 resObj["compactState"] = JObject.FromObject(compactState);
@@ -652,7 +766,7 @@ internal sealed class GameDriver : MonoBehaviour
         Respond(ctx, 200, resObj.ToString(compactFmt ? Formatting.None : Formatting.Indented));
     }
 
-    private static async Task<(bool timedOut, int elapsedMs, Dictionary<string, object> compactState)> WaitForClientIdleAsync(
+    private static async Task<(bool timedOut, int elapsedMs, string busyReason, Dictionary<string, object> compactState)> WaitForClientIdleAsync(
         int timeoutMs, bool includeCompactState, bool includeUi)
     {
         var sw = Stopwatch.StartNew();
@@ -664,18 +778,27 @@ internal sealed class GameDriver : MonoBehaviour
             var completed = await Task.WhenAny(waiter.Tcs.Task, Task.Delay(8)).ConfigureAwait(false);
             if (waiter.Tcs.Task.IsCompleted)
             {
-                return (false, (int)sw.ElapsedMilliseconds, waiter.CompactState);
+                return (false, (int)sw.ElapsedMilliseconds, null, waiter.CompactState);
             }
         }
 
         waiter.Cancelled = true;
+        string busyReason = null;
         Dictionary<string, object> fallbackState = null;
-        if (includeCompactState)
+        try
         {
-            try { fallbackState = RunOnMain(() => GameInspector.InspectAll(compact: true, includeUi: includeUi)); }
-            catch { }
+            RunOnMain(() =>
+            {
+                GameInspector.IsClientBusy(out busyReason);
+                if (includeCompactState)
+                {
+                    fallbackState = GameInspector.InspectAll(compact: true, includeUi: includeUi);
+                }
+                return true;
+            });
         }
-        return (true, (int)sw.ElapsedMilliseconds, fallbackState);
+        catch { }
+        return (true, (int)sw.ElapsedMilliseconds, busyReason, fallbackState);
     }
 
     private static JObject ReadJsonBody(HttpListenerContext ctx, out string parseError)
@@ -1078,11 +1201,11 @@ internal sealed class GameDriver : MonoBehaviour
                 case "autoexitreplay":
                     CombatPatch.AutoExitReplay = (bool?)req["enabled"] ?? (bool?)req["autoExitReplay"] ?? true;
                     return new { ok = true, op = "autoExitReplay", autoExitReplay = CombatPatch.AutoExitReplay };
-                case "reroll": return DoSimple("SendReRollSelection", "reroll");
-                case "exit": return DoExit();
+                case "reroll": return DoSimple("SendReRollSelection", "reroll", req);
+                case "exit": return DoExit(req);
                 case "returntomenu":
                 case "return_to_menu": return ReturnToMenuInternal("returnToMenu");
-                case "abandon": return DoSimple("SendAbandonRun", "abandon");
+                case "abandon": return DoSimple("SendAbandonRun", "abandon", req);
                 case "move": return DoMove(req);
                 case "inspect":
                     return GameInspector.InspectAll((bool?)req["compact"] ?? false, (bool?)req["ui"] ?? true);
@@ -1135,26 +1258,42 @@ internal sealed class GameDriver : MonoBehaviour
         var tipParent = dataType?.GetProperty("TooltipParentComponent", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
         if (tipParent == null) return new { ok = false, error = "TooltipParentComponent unavailable" };
 
+        var ccType = GameInspector.FindTypeSafe("CardController", "TheBazaar.CardController");
+
         if (hide || string.IsNullOrWhiteSpace(targetId))
         {
-            var hideM = tipParent.GetType().GetMethod("HideCardTooltipController", BindingFlags.Public | BindingFlags.Instance);
-            try { hideM?.Invoke(tipParent, null); } catch (Exception ex) { Core.DiagLog.SwallowOnce("GameDriver.HideTooltip", ex); }
+            ExitPreviousHoverUpgradePreview(ccType, except: null);
+            ForceHideCardTooltip(tipParent, null);
             return new { ok = true, op = "hovercard", hidden = true };
         }
 
-        var ccType = GameInspector.FindTypeSafe("CardController", "TheBazaar.CardController");
         if (ccType == null) return new { ok = false, error = "CardController type missing" };
-        var allCtrls = UnityEngine.Object.FindObjectsByType(ccType, FindObjectsSortMode.None);
+
+        // P2-10：优先走官方 Data.CardAndSkillLookup.GetCardController（与 CardTooltipTypeHandler.SetupCardData 同源），
+        // 确保对同一 CardController 实例执行 EnterUpgradePreview()，避免场景池化副本导致 CanFuse() 读错实例。
         Component matched = null;
-        foreach (var o in allCtrls)
+        var cardObj = FindCard(targetId);
+        if (cardObj != null)
         {
-            if (o is not Component c) continue;
-            var cd = ccType.GetProperty("CardData", BindingFlags.Public | BindingFlags.Instance)?.GetValue(c);
-            string cid = cd?.GetType().GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance)?.GetValue(cd)?.ToString();
-            if (string.Equals(cid, targetId, StringComparison.OrdinalIgnoreCase))
+            var lookup = GameInspector.GetDataLookup();
+            if (GetCardControllerSafe(lookup, cardObj) is Component lookedUpComp && ccType.IsInstanceOfType(lookedUpComp))
             {
-                matched = c;
-                break;
+                matched = lookedUpComp;
+            }
+        }
+        if (matched == null)
+        {
+            var allCtrls = UnityEngine.Object.FindObjectsByType(ccType, FindObjectsSortMode.None);
+            foreach (var o in allCtrls)
+            {
+                if (o is not Component c) continue;
+                var cd = ccType.GetProperty("CardData", BindingFlags.Public | BindingFlags.Instance)?.GetValue(c);
+                string cid = cd?.GetType().GetProperty("InstanceId", BindingFlags.Public | BindingFlags.Instance)?.GetValue(cd)?.ToString();
+                if (string.Equals(cid, targetId, StringComparison.OrdinalIgnoreCase))
+                {
+                    matched = c;
+                    break;
+                }
             }
         }
         if (matched == null) return new { ok = false, error = "CardController not found: " + targetId };
@@ -1163,12 +1302,29 @@ internal sealed class GameDriver : MonoBehaviour
         var td = tdField?.GetValue(matched);
         if (td == null) return new { ok = false, error = "_cardTooltipData null" };
 
+        // P2-10：先退出旧卡升阶预览并强制隐藏旧同卡弹窗（清零 CurrentTooltipData），
+        // 避免 TooltipParentComponent.ShowCardTooltipController 因 CurrentTooltipData == td 直接跳过重绘，
+        // 同时避免 HideCardTooltipController 内部调用 ExitUpgradePreview 把新设的预览状态清掉。
+        ExitPreviousHoverUpgradePreview(ccType, except: matched);
+        ForceHideCardTooltip(tipParent, td);
+
+        // P2-10：改调官方 CardController.EnterUpgradePreview() / ExitUpgradePreview()，
+        // 使 CardTooltipTypeHandler.SetupCardData 调用 cardController.CanFuse() 时走官方 _isInUpgradePreview 链路而不被覆写清零。
+        if (upgradePreview)
+        {
+            ccType.GetMethod("EnterUpgradePreview", BindingFlags.Public | BindingFlags.Instance)?.Invoke(matched, null);
+            _lastHoverUpgradePreviewCtrl = matched;
+        }
+        else
+        {
+            ccType.GetMethod("ExitUpgradePreview", BindingFlags.Public | BindingFlags.Instance)?.Invoke(matched, null);
+            if (ReferenceEquals(_lastHoverUpgradePreviewCtrl, matched))
+                _lastHoverUpgradePreviewCtrl = null;
+        }
+
+        // 兜底：若目标卡未注册在 CardAndSkillLookup 中，SetupCardData 会保留 tooltipData.CanFuse，这里同步对齐
         var canFuseProp = td.GetType().GetProperty("CanFuse", BindingFlags.Public | BindingFlags.Instance);
         canFuseProp?.SetValue(td, upgradePreview);
-        if (upgradePreview)
-            ccType.GetMethod("EnterUpgradePreview", BindingFlags.Public | BindingFlags.Instance)?.Invoke(matched, null);
-        else
-            ccType.GetMethod("ExitUpgradePreview", BindingFlags.Public | BindingFlags.Instance)?.Invoke(matched, null);
 
         var offsetProp = ccType.GetProperty("TooltipOffset", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
         Vector3 offset = offsetProp?.GetValue(matched) is Vector3 v ? v : Vector3.zero;
@@ -1183,6 +1339,56 @@ internal sealed class GameDriver : MonoBehaviour
         for (int i = 3; i < parms.Length; i++) args[i] = parms[i].HasDefaultValue ? parms[i].DefaultValue : null;
         showM.Invoke(tipParent, args);
         return new { ok = true, op = "hovercard", instanceId = targetId, upgradePreview };
+    }
+
+    private static void ExitPreviousHoverUpgradePreview(Type ccType, Component except)
+    {
+        var prev = _lastHoverUpgradePreviewCtrl;
+        if (ReferenceEquals(prev, null) || ReferenceEquals(prev, except)) return;
+        _lastHoverUpgradePreviewCtrl = null;
+        try
+        {
+            if (prev != null && ccType != null && ccType.IsInstanceOfType(prev))
+            {
+                ccType.GetMethod("ExitUpgradePreview", BindingFlags.Public | BindingFlags.Instance)?.Invoke(prev, null);
+            }
+        }
+        catch (Exception ex)
+        {
+            Core.DiagLog.SwallowOnce("GameDriver.ExitPrevHoverUpgradePreview", ex);
+        }
+    }
+
+    private static void ForceHideCardTooltip(object tipParent, object expectedTooltipData)
+    {
+        if (tipParent == null) return;
+        try
+        {
+            var tipType = tipParent.GetType();
+            // 先解锁锁定态弹窗，防止 HideCardTooltipController 因 IsCardTooltipControllerLocked 提前返回
+            tipType.GetMethod("UnlockAllLockedTooltipControllers", BindingFlags.Public | BindingFlags.Instance)
+                ?.Invoke(tipParent, null);
+            tipType.GetMethod("HideCardTooltipController", BindingFlags.Public | BindingFlags.Instance)
+                ?.Invoke(tipParent, null);
+
+            // 若卡间过渡（IsCardToCardTransitionActive）导致 HideCardTooltipController 早退，
+            // 直接清理 CardTooltipController.CurrentTooltipData 确保后续 ShowCardTooltipController 必然重绘。
+            var curTipCtrl = GetProp(tipParent, "CardTooltipController");
+            if (curTipCtrl != null && (curTipCtrl is not UnityEngine.Object uo || uo != null))
+            {
+                var curTd = GetProp(curTipCtrl, "CurrentTooltipData");
+                if (expectedTooltipData == null || ReferenceEquals(curTd, expectedTooltipData))
+                {
+                    curTipCtrl.GetType()
+                        .GetMethod("ClearCurrentCard", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                        ?.Invoke(curTipCtrl, null);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Core.DiagLog.SwallowOnce("GameDriver.HideTooltip", ex);
+        }
     }
 
     private static object GetCurrentAppState() => GameInspector.GetCurrentAppState();
@@ -1210,6 +1416,9 @@ internal sealed class GameDriver : MonoBehaviour
 
     private static object DoBuy(JObject req)
     {
+        var busyReject = TryRejectIfClientBusy("buy", req);
+        if (busyReject != null) return busyReject;
+
         string id = (string)req["instanceId"];
         if (string.IsNullOrEmpty(id)) id = FirstSelectionId();
         if (string.IsNullOrEmpty(id)) return new { ok = false, error = "empty selection set" };
@@ -1282,6 +1491,9 @@ internal sealed class GameDriver : MonoBehaviour
 
     private static object DoSell(JObject req)
     {
+        var busyReject = TryRejectIfClientBusy("sell", req);
+        if (busyReject != null) return busyReject;
+
         string id = (string)req["instanceId"];
         if (string.IsNullOrEmpty(id)) return new { ok = false, error = "instanceId required" };
 
@@ -1321,6 +1533,9 @@ internal sealed class GameDriver : MonoBehaviour
 
     private static object DoSelectSkill(JObject req)
     {
+        var busyReject = TryRejectIfClientBusy("selectSkill", req);
+        if (busyReject != null) return busyReject;
+
         string id = (string)req["instanceId"] ?? FirstSelectionId();
         if (string.IsNullOrEmpty(id)) return new { ok = false, error = "empty selection set" };
 
@@ -1348,6 +1563,9 @@ internal sealed class GameDriver : MonoBehaviour
 
     private static object DoSelectEncounter(JObject req)
     {
+        var busyReject = TryRejectIfClientBusy("selectEncounter", req);
+        if (busyReject != null) return busyReject;
+
         string id = (string)req["instanceId"] ?? FirstSelectionId();
         if (string.IsNullOrEmpty(id)) return new { ok = false, error = "empty selection set" };
 
@@ -1375,6 +1593,9 @@ internal sealed class GameDriver : MonoBehaviour
     /// <summary>点选奇遇选项卡（EncounterStep / EventEncounter）。</summary>
     private static object DoEncounterStep(JObject req)
     {
+        var busyReject = TryRejectIfClientBusy("encounterstep", req);
+        if (busyReject != null) return busyReject;
+
         string id = (string)req["instanceId"];
         if (string.IsNullOrEmpty(id))
         {
@@ -1453,36 +1674,552 @@ internal sealed class GameDriver : MonoBehaviour
 
     private static object DoCommitPedestal(JObject req)
     {
-        string id = (string)req["instanceId"];
-        if (string.IsNullOrEmpty(id)) return new { ok = false, error = "instanceId required" };
+        var busyReject = TryRejectIfClientBusy("commitPedestal", req);
+        if (busyReject != null) return busyReject;
 
+        string id = (string)req["instanceId"];
+        if (string.IsNullOrEmpty(id)) return new { ok = false, op = "commitPedestal", error = "instanceId required" };
+
+        var cur = GetCurrentAppState();
+        string appStateName = cur?.GetType().Name ?? "null";
+        var ds = GameInspector.GetDataCurrentState();
+        string runStateName = GetProp(ds, "StateName")?.ToString() ?? "";
+
+        // P0-01：提交前校验是否处于有效祭坛态且未在播上一轮升阶/附魔动画，防止并发重复提交触发服务端拒单与 GameStateSync 死锁
+        bool inPedestal = string.Equals(appStateName, "PedestalState", StringComparison.Ordinal)
+                          || string.Equals(runStateName, "Pedestal", StringComparison.OrdinalIgnoreCase);
+        if (!inPedestal)
+        {
+            return new
+            {
+                ok = false,
+                op = "commitPedestal",
+                rejected = true,
+                dispatched = false,
+                errorCode = "NOT_IN_PEDESTAL_STATE",
+                error = $"当前不在祭坛状态（appState={appStateName}, runState={runStateName}），拒绝提交卡牌 {id}",
+                instanceId = id,
+                appState = appStateName,
+                runState = runStateName,
+            };
+        }
+
+        if (string.Equals(appStateName, "PedestalState", StringComparison.Ordinal)
+            && GetProp(cur, "CanHandleCurrentUpgradeMessage") is bool pedHandling && pedHandling
+            && GetProp(cur, "_animationCompleted") is bool pedDone && !pedDone)
+        {
+            return new
+            {
+                ok = false,
+                op = "commitPedestal",
+                error = "retryable_busy",
+                errorCode = "PEDESTAL_ALREADY_COMMITTED",
+                retryable = true,
+                dispatched = false,
+                busyReason = "pedestalAnimating",
+                instanceId = id,
+            };
+        }
+
+        var card = FindCard(id);
+        if (card == null)
+        {
+            return new
+            {
+                ok = false,
+                op = "commitPedestal",
+                rejected = true,
+                dispatched = false,
+                errorCode = "CARD_NOT_FOUND",
+                error = $"未找到目标卡牌实例: {id}",
+                instanceId = id,
+            };
+        }
+
+        if (!IsItemCard(card, out string actualCardType))
+        {
+            return new
+            {
+                ok = false,
+                op = "commitPedestal",
+                rejected = true,
+                dispatched = false,
+                errorCode = "NOT_ITEM_CARD",
+                error = $"祭坛仅接受物品卡（ItemCard），拒绝提交 {actualCardType}: {id}",
+                instanceId = id,
+                cardType = actualCardType,
+            };
+        }
+
+        var owner = GetProp(card, "Owner");
+        string ownerId = owner == null ? null : GetProp(owner, "CombatantId")?.ToString();
+        string sectionStr = GetProp(card, "Section")?.ToString() ?? "";
+        if (!string.Equals(ownerId, "Player", StringComparison.OrdinalIgnoreCase)
+            || (!string.Equals(sectionStr, "Hand", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(sectionStr, "Stash", StringComparison.OrdinalIgnoreCase)))
+        {
+            return new
+            {
+                ok = false,
+                op = "commitPedestal",
+                rejected = true,
+                dispatched = false,
+                errorCode = "CARD_NOT_OWNED_IN_INVENTORY",
+                error = $"卡牌 {id} 不在玩家手牌或背包中（owner={ownerId}, section={sectionStr}），无法提交祭坛",
+                instanceId = id,
+                owner = ownerId,
+                section = sectionStr,
+            };
+        }
+
+        // P0-01（驱动层预校验）：按当前祭坛 allowedTiers、附魔资格、升阶上限与 SelectionCriteria 预校验；
+        // 不满足条件时直接返回清晰业务错误，严禁提前伪造 PedestalRequirementMet / ItemDroppedOnPedestal 视觉吸卡事件！
+        if (!ValidatePedestalCommitEligibility(cur, card, id, out object rejectResult))
+        {
+            return rejectResult;
+        }
+
+        var iid = MakeInstanceId(id);
+        MethodInfo mPed = cur?.GetType().GetMethod("CommitToPedestalCommand",
+            BindingFlags.Public | BindingFlags.Instance, null, new[] { iid.GetType() }, null);
+
+        object cmd = null;
+        MethodInfo mCmdSend = null;
+        if (mPed == null)
+        {
+            cmd = GetCmd();
+            if (cmd == null) return new { ok = false, op = "commitPedestal", dispatched = false, error = "Cmd not available" };
+            mCmdSend = cmd.GetType().GetMethod("SendCommitToPedestal");
+            if (mCmdSend == null) return new { ok = false, op = "commitPedestal", dispatched = false, error = "SendCommitToPedestal not found" };
+        }
+
+        // 仅在全部预校验与发包入口均通过后，才触发祭坛动画看门狗与合法视觉吸卡事件
         CompatAuditPatch.NotifyPedestalCommitted();
         TryTriggerPedestalDropEvents(id);
 
-        var iid = MakeInstanceId(id);
-        var cur = GetCurrentAppState();
-        if (cur != null)
+        if (mPed != null)
         {
-            var mPed = cur.GetType().GetMethod("CommitToPedestalCommand",
-                BindingFlags.Public | BindingFlags.Instance, null, new[] { iid.GetType() }, null);
-            if (mPed != null)
+            mPed.Invoke(cur, new object[] { iid });
+            return new { ok = true, op = "commitPedestal", dispatched = true, via = "AppState.CommitToPedestalCommand", instanceId = id };
+        }
+
+        mCmdSend.Invoke(cmd, new object[] { iid });
+        return new { ok = true, op = "commitPedestal", dispatched = true, via = "Cmd.SendCommitToPedestal", instanceId = id };
+    }
+
+    /// <summary>
+    /// P0-01：提交祭坛前按当前祭坛 allowedTiers、附魔白名单/防重复附魔、升阶上限及 SelectionCriteria 做严格只读预校验。
+    /// 任一条件不满足均立即返回清晰业务错误并阻止伪造视觉吸卡与发包。
+    /// </summary>
+    private static bool ValidatePedestalCommitEligibility(object curState, object card, string instanceId, out object rejectResult)
+    {
+        rejectResult = null;
+
+        string currentEncounterId = GetProp(GameInspector.GetDataCurrentState(), "CurrentEncounterId")?.ToString()
+                                    ?? GameInspector.GetDataCurrentEncounterId()?.ToString();
+        var pedInfo = GameInspector.DescribePedestalState(currentEncounterId);
+        var pedTpl = ResolveActivePedestalTemplate(curState);
+
+        string pedName = pedTpl?.InternalName
+                         ?? (pedInfo != null && pedInfo.TryGetValue("name", out var pn) ? pn?.ToString() : null)
+                         ?? currentEncounterId
+                         ?? "Pedestal";
+        string pedKind = pedInfo != null && pedInfo.TryGetValue("kind", out var pk) ? pk?.ToString() ?? "unknown" : "unknown";
+
+        string cardTierStr = GetProp(card, "Tier")?.ToString() ?? "";
+        ETier? cardTier = GetProp(card, "Tier") is ETier et
+            ? et
+            : (Enum.TryParse<ETier>(cardTierStr, true, out var parsedTier) ? parsedTier : (ETier?)null);
+
+        // 1. 校验祭坛 allowedTiers 白名单（例如 B1&B2 青铜祭坛拒绝银/金/钻卡）
+        List<string> allowedTiers = null;
+        if (pedInfo != null && pedInfo.TryGetValue("allowedTiers", out var atObj) && atObj is List<string> atList && atList.Count > 0)
+        {
+            allowedTiers = atList;
+        }
+        if (allowedTiers != null && allowedTiers.Count > 0
+            && !allowedTiers.Any(t => string.Equals(t, cardTierStr, StringComparison.OrdinalIgnoreCase)))
+        {
+            rejectResult = new
             {
-                mPed.Invoke(cur, new object[] { iid });
-                return new { ok = true, op = "commitPedestal", via = "AppState.CommitToPedestalCommand", instanceId = id };
+                ok = false,
+                op = "commitPedestal",
+                rejected = true,
+                dispatched = false,
+                errorCode = "PEDESTAL_TIER_NOT_ALLOWED",
+                error = $"卡牌 {instanceId} 品阶 ({cardTierStr}) 不在当前祭坛 {pedName} 允许品阶 [{string.Join(", ", allowedTiers)}] 内",
+                instanceId,
+                cardTier = cardTierStr,
+                allowedTiers,
+                pedestalKind = pedKind,
+                pedestalName = pedName,
+            };
+            return false;
+        }
+
+        var itemTpl = GetProp(card, "Template") as TCardItem;
+        EEnchantmentType? currentEnchantment = ReadCardEnchantment(card);
+        var behavior = pedTpl?.Behavior;
+
+        // 2. 按祭坛行为做专项业务校验（升阶上限 / 变形限制 / 附魔白名单与防重复附魔）
+        if (behavior is TPedestalBehaviorTransform || string.Equals(pedKind, "transform", StringComparison.OrdinalIgnoreCase))
+        {
+            if (cardTier == ETier.Legendary)
+            {
+                rejectResult = new
+                {
+                    ok = false,
+                    op = "commitPedestal",
+                    rejected = true,
+                    dispatched = false,
+                    errorCode = "PEDESTAL_LEGENDARY_CANNOT_TRANSFORM",
+                    error = $"传奇品阶卡牌 {instanceId} 无法在变形祭坛 {pedName} 提交变形",
+                    instanceId,
+                    cardTier = cardTierStr,
+                    pedestalKind = "transform",
+                    pedestalName = pedName,
+                };
+                return false;
+            }
+        }
+        else if (behavior is TPedestalBehaviorEnchant fixedEnchBeh)
+        {
+            EEnchantmentType targetEnch = fixedEnchBeh.Enchantment;
+            if (currentEnchantment.HasValue && currentEnchantment.Value == targetEnch)
+            {
+                rejectResult = new
+                {
+                    ok = false,
+                    op = "commitPedestal",
+                    rejected = true,
+                    dispatched = false,
+                    errorCode = "PEDESTAL_ENCHANT_DUPLICATE",
+                    error = $"卡牌 {instanceId} 已拥有 {targetEnch} 附魔，无法在祭坛 {pedName} 重复附魔",
+                    instanceId,
+                    currentEnchantment = currentEnchantment.Value.ToString(),
+                    targetEnchantment = targetEnch.ToString(),
+                    pedestalKind = "enchant",
+                    pedestalName = pedName,
+                };
+                return false;
+            }
+            if (itemTpl != null && (itemTpl.Enchantments == null || !itemTpl.Enchantments.ContainsKey(targetEnch)))
+            {
+                rejectResult = new
+                {
+                    ok = false,
+                    op = "commitPedestal",
+                    rejected = true,
+                    dispatched = false,
+                    errorCode = "PEDESTAL_ENCHANT_NOT_ELIGIBLE",
+                    error = $"卡牌 {instanceId} 不支持 {targetEnch} 附魔（祭坛 {pedName}）",
+                    instanceId,
+                    targetEnchantment = targetEnch.ToString(),
+                    pedestalKind = "enchant",
+                    pedestalName = pedName,
+                };
+                return false;
+            }
+        }
+        else if (behavior is TPedestalBehaviorEnchantRandom randEnchBeh)
+        {
+            if (itemTpl != null)
+            {
+                if (itemTpl.Enchantments == null || itemTpl.Enchantments.Count == 0)
+                {
+                    rejectResult = new
+                    {
+                        ok = false,
+                        op = "commitPedestal",
+                        rejected = true,
+                        dispatched = false,
+                        errorCode = "PEDESTAL_ENCHANT_NOT_ELIGIBLE",
+                        error = $"卡牌 {instanceId} 不支持任何附魔（祭坛 {pedName}）",
+                        instanceId,
+                        pedestalKind = "enchant",
+                        pedestalName = pedName,
+                    };
+                    return false;
+                }
+
+                bool hasCandidate = randEnchBeh.Enchantments != null && randEnchBeh.Enchantments.Count > 0
+                    ? randEnchBeh.Enchantments.Any(entry => entry != null
+                                                            && itemTpl.Enchantments.ContainsKey(entry.Enchantment)
+                                                            && (!currentEnchantment.HasValue || currentEnchantment.Value != entry.Enchantment))
+                    : itemTpl.Enchantments.Keys.Any(e => !currentEnchantment.HasValue || currentEnchantment.Value != e);
+                if (!hasCandidate)
+                {
+                    rejectResult = new
+                    {
+                        ok = false,
+                        op = "commitPedestal",
+                        rejected = true,
+                        dispatched = false,
+                        errorCode = "PEDESTAL_ENCHANT_NOT_ELIGIBLE",
+                        error = $"卡牌 {instanceId} 没有可应用的新随机附魔（当前附魔={currentEnchantment?.ToString() ?? "无"}，祭坛 {pedName}）",
+                        instanceId,
+                        currentEnchantment = currentEnchantment?.ToString(),
+                        pedestalKind = "enchant",
+                        pedestalName = pedName,
+                    };
+                    return false;
+                }
+            }
+        }
+        else if (behavior is TPedestalBehaviorUpgrade upgBeh)
+        {
+            if (!CanCardUpgradeForPedestal(card, itemTpl, cardTier))
+            {
+                rejectResult = new
+                {
+                    ok = false,
+                    op = "commitPedestal",
+                    rejected = true,
+                    dispatched = false,
+                    errorCode = "PEDESTAL_MAX_TIER",
+                    error = $"卡牌 {instanceId} ({cardTierStr}) 已达最高品阶，无法在升阶祭坛 {pedName} 继续升阶",
+                    instanceId,
+                    cardTier = cardTierStr,
+                    pedestalKind = "upgrade",
+                    pedestalName = pedName,
+                };
+                return false;
+            }
+            if (upgBeh.TargetTier.HasValue && cardTier.HasValue && cardTier.Value >= upgBeh.TargetTier.Value)
+            {
+                rejectResult = new
+                {
+                    ok = false,
+                    op = "commitPedestal",
+                    rejected = true,
+                    dispatched = false,
+                    errorCode = "PEDESTAL_TIER_NOT_ALLOWED",
+                    error = $"卡牌 {instanceId} ({cardTierStr}) 已不低于祭坛目标品阶 {upgBeh.TargetTier.Value}",
+                    instanceId,
+                    cardTier = cardTierStr,
+                    targetTier = upgBeh.TargetTier.Value.ToString(),
+                    pedestalKind = "upgrade",
+                    pedestalName = pedName,
+                };
+                return false;
+            }
+        }
+        else if (string.Equals(pedKind, "enchant", StringComparison.OrdinalIgnoreCase))
+        {
+            string targetEnchStr = pedInfo != null && pedInfo.TryGetValue("targetEnchantment", out var te) ? te?.ToString() : null;
+            if (!string.IsNullOrEmpty(targetEnchStr) && Enum.TryParse<EEnchantmentType>(targetEnchStr, true, out var targetEnch))
+            {
+                if (currentEnchantment.HasValue && currentEnchantment.Value == targetEnch)
+                {
+                    rejectResult = new
+                    {
+                        ok = false,
+                        op = "commitPedestal",
+                        rejected = true,
+                        dispatched = false,
+                        errorCode = "PEDESTAL_ENCHANT_DUPLICATE",
+                        error = $"卡牌 {instanceId} 已拥有 {targetEnch} 附魔，无法重复附魔",
+                        instanceId,
+                        currentEnchantment = currentEnchantment.Value.ToString(),
+                        targetEnchantment = targetEnch.ToString(),
+                        pedestalKind = "enchant",
+                        pedestalName = pedName,
+                    };
+                    return false;
+                }
+                if (itemTpl != null && (itemTpl.Enchantments == null || !itemTpl.Enchantments.ContainsKey(targetEnch)))
+                {
+                    rejectResult = new
+                    {
+                        ok = false,
+                        op = "commitPedestal",
+                        rejected = true,
+                        dispatched = false,
+                        errorCode = "PEDESTAL_ENCHANT_NOT_ELIGIBLE",
+                        error = $"卡牌 {instanceId} 不支持 {targetEnch} 附魔",
+                        instanceId,
+                        targetEnchantment = targetEnch.ToString(),
+                        pedestalKind = "enchant",
+                        pedestalName = pedName,
+                    };
+                    return false;
+                }
+            }
+            else if (itemTpl != null && (itemTpl.Enchantments == null || itemTpl.Enchantments.Count == 0))
+            {
+                rejectResult = new
+                {
+                    ok = false,
+                    op = "commitPedestal",
+                    rejected = true,
+                    dispatched = false,
+                    errorCode = "PEDESTAL_ENCHANT_NOT_ELIGIBLE",
+                    error = $"卡牌 {instanceId} 不支持任何附魔",
+                    instanceId,
+                    pedestalKind = "enchant",
+                    pedestalName = pedName,
+                };
+                return false;
+            }
+        }
+        else if (string.Equals(pedKind, "upgrade", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!CanCardUpgradeForPedestal(card, itemTpl, cardTier))
+            {
+                rejectResult = new
+                {
+                    ok = false,
+                    op = "commitPedestal",
+                    rejected = true,
+                    dispatched = false,
+                    errorCode = "PEDESTAL_MAX_TIER",
+                    error = $"卡牌 {instanceId} ({cardTierStr}) 已达最高品阶，无法继续升阶",
+                    instanceId,
+                    cardTier = cardTierStr,
+                    pedestalKind = "upgrade",
+                    pedestalName = pedName,
+                };
+                return false;
             }
         }
 
-        var cmd = GetCmd();
-        if (cmd == null) return new { ok = false, error = "Cmd not available" };
-        var m = cmd.GetType().GetMethod("SendCommitToPedestal");
-        m?.Invoke(cmd, new object[] { iid });
-        return new { ok = true, op = "commitPedestal", via = "Cmd.SendCommitToPedestal", instanceId = id };
+        // 3. 严格只读执行官方 SelectionCriteria.IsSatisfiedBy（覆盖全部复合条件：品阶/附魔资格/标签/尺寸/无附魔等，不改写 PedestalState 状态）
+        if (pedTpl?.SelectionCriteria != null && TryEvaluatePedestalSelectionCriteriaReadOnly(pedTpl, card, out bool criteriaSatisfied) && !criteriaSatisfied)
+        {
+            string targetEnchHint = pedInfo != null && pedInfo.TryGetValue("targetEnchantment", out var te2) ? te2?.ToString() : null;
+            rejectResult = new
+            {
+                ok = false,
+                op = "commitPedestal",
+                rejected = true,
+                dispatched = false,
+                errorCode = "PEDESTAL_CRITERIA_NOT_MET",
+                error = $"卡牌 {instanceId} ({cardTierStr}) 不满足当前祭坛 {pedName} 的选择条件（SelectionCriteria）",
+                instanceId,
+                cardTier = cardTierStr,
+                allowedTiers,
+                currentEnchantment = currentEnchantment?.ToString(),
+                targetEnchantment = targetEnchHint,
+                pedestalKind = pedKind,
+                pedestalName = pedName,
+            };
+            return false;
+        }
+
+        return true;
+    }
+
+    private static TCardEncounterPedestal ResolveActivePedestalTemplate(object curState)
+    {
+        try
+        {
+            if (curState != null && string.Equals(curState.GetType().Name, "PedestalState", StringComparison.Ordinal))
+            {
+                if (GetProp(curState, "_pedestalTemplate") is TCardEncounterPedestal fromState)
+                    return fromState;
+            }
+
+            var dataType = GameInspector.FindTypeSafe("TheBazaar.Data", "Data");
+            var curEncCtrl = dataType?.GetProperty("CurrentEncounterController", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            if (curEncCtrl != null && (curEncCtrl is not UnityEngine.Object uo || uo != null))
+            {
+                var encCard = GetProp(curEncCtrl, "CardData");
+                if (GetProp(encCard, "Template") is TCardEncounterPedestal fromCtrl)
+                    return fromCtrl;
+            }
+
+            if (GameInspector.GetDataCurrentEncounterId() is Guid encGuid && encGuid != Guid.Empty && dataType != null)
+            {
+                var getStaticM = dataType.GetMethod("GetStatic", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+                var staticMgr = getStaticM?.Invoke(null, null);
+                var getCardM = staticMgr?.GetType().GetMethod("GetCardById", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(Guid) }, null);
+                if (getCardM?.Invoke(staticMgr, new object[] { encGuid }) is TCardEncounterPedestal fromStatic)
+                    return fromStatic;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static EEnchantmentType? ReadCardEnchantment(object card)
+    {
+        if (card == null) return null;
+        try
+        {
+            var raw = GetProp(card, "Enchantment")
+                      ?? card.GetType().GetMethod("GetEnchantment", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null)?.Invoke(card, null);
+            if (raw is EEnchantmentType et) return et;
+            if (raw != null && Enum.TryParse<EEnchantmentType>(raw.ToString(), true, out var parsed))
+                return parsed;
+        }
+        catch { }
+        return null;
+    }
+
+    private static bool CanCardUpgradeForPedestal(object card, TCardItem itemTpl, ETier? cardTier)
+    {
+        try
+        {
+            if (_canCardUpgradeMethod == null)
+            {
+                var cardExtType = GameInspector.FindTypeSafe("TheBazaar.CardExtensions");
+                _canCardUpgradeMethod = cardExtType?.GetMethod("CanCardUpgrade", BindingFlags.Public | BindingFlags.Static);
+            }
+            if (_canCardUpgradeMethod != null)
+            {
+                return _canCardUpgradeMethod.Invoke(null, new[] { card }) is bool canUpg && canUpg;
+            }
+        }
+        catch { }
+
+        if (!cardTier.HasValue) return true;
+        if (itemTpl?.Tiers != null && itemTpl.Tiers.Count > 0)
+        {
+            return itemTpl.Tiers.Keys.Any(t => t > cardTier.Value);
+        }
+        return cardTier.Value < ETier.Diamond;
+    }
+
+    private static bool TryEvaluatePedestalSelectionCriteriaReadOnly(TCardEncounterPedestal pedTpl, object card, out bool satisfied)
+    {
+        satisfied = true;
+        if (pedTpl?.SelectionCriteria == null || card is not ICard icard)
+            return false;
+        try
+        {
+            var run = GameInspector.GetDataRun();
+            if (run == null) return false;
+            if (_cardCondContextCtor == null)
+            {
+                var ctors = typeof(CardConditionalContext).GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                _cardCondContextCtor = ctors.FirstOrDefault(c =>
+                {
+                    var ps = c.GetParameters();
+                    return ps.Length == 4 && ps[0].ParameterType.IsInstanceOfType(run);
+                });
+            }
+            if (_cardCondContextCtor == null) return false;
+            if (_cardCondContextCtor.Invoke(new[] { run, null, null, null }) is not CardConditionalContext ctx)
+                return false;
+
+            satisfied = pedTpl.SelectionCriteria.IsSatisfiedBy(icard, ctx);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static void TryTriggerPedestalDropEvents(string instanceId)
     {
         try
         {
+            // 仅当场景存在活跃的 3D BoardStatePresentation 时才派发吸卡视觉事件，避免无呈现载体时伪造事件污染状态机
+            var bm = GameInspector.GetBoardManagerCached();
+            var pres = bm != null ? GetProp(bm, "BoardStatePresentation") : null;
+            if (pres == null || (pres is UnityEngine.Object presUo && presUo == null)) return;
+
             var card = FindCard(instanceId);
             var lookup = GameInspector.GetDataLookup();
             if (card == null || lookup == null) return;
@@ -1492,6 +2229,14 @@ internal sealed class GameDriver : MonoBehaviour
 
             var itemCtrlType = GameInspector.FindTypeSafe("TheBazaar.ItemController", "ItemController");
             if (itemCtrlType == null || !itemCtrlType.IsInstanceOfType(ctrl)) return;
+
+            // 若合法提交的卡牌来自关闭态背包，先激活并显形，与官方 PrepareObservedPedestalPresentation 保持一致
+            if (ctrl is Component comp && comp.gameObject != null && !comp.gameObject.activeSelf)
+            {
+                comp.gameObject.SetActive(true);
+            }
+            var showCardM = ctrl.GetType().GetMethod("ShowCard", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(bool) }, null);
+            showCardM?.Invoke(ctrl, new object[] { true });
 
             GameEventsBridge.TryTrigger("PedestalRequirementMet");
             GameEventsBridge.TryTrigger("ItemDroppedOnPedestal", ctrl);
@@ -1575,8 +2320,11 @@ internal sealed class GameDriver : MonoBehaviour
         };
     }
 
-    private static object DoExit()
+    private static object DoExit(JObject req = null)
     {
+        var busyReject = TryRejectIfClientBusy("exit", req);
+        if (busyReject != null) return busyReject;
+
         var advanced = TryAdvanceNonCommandState();
         if (advanced != null) return advanced;
 
@@ -1621,14 +2369,17 @@ internal sealed class GameDriver : MonoBehaviour
         return new { ok = true, op = "exit", via = "Cmd.SendExitCurrentState" };
     }
 
-    private static object DoSimple(string methodName, string opName)
+    private static object DoSimple(string methodName, string opName, JObject req = null)
     {
         if (opName == "exit")
         {
-            return DoExit();
+            return DoExit(req);
         }
         else if (opName == "reroll")
         {
+            var busyReject = TryRejectIfClientBusy("reroll", req);
+            if (busyReject != null) return busyReject;
+
             var cur = GetCurrentAppState();
             var mReroll = cur?.GetType().GetMethod("RerollCommand", BindingFlags.Public | BindingFlags.Instance);
             if (mReroll != null)
@@ -1816,6 +2567,9 @@ internal sealed class GameDriver : MonoBehaviour
                 startNewRun.Invoke(gi, null);
                 via = "GameInstance.StartNewRun (Resume)";
             }
+
+            // P2-12：记录重连派发时刻，为重连后慢铺牌窗口自动提供至少 10s 的 pre_wait 宽限期
+            Interlocked.Exchange(ref _lastResumeAtTicks, Stopwatch.GetTimestamp());
 
             return (object)new
             {
@@ -2226,6 +2980,9 @@ internal sealed class GameDriver : MonoBehaviour
     /// <summary>精准移动与挤位：支持指定 socket/section、数字槽位、自动找空位以及移动前后快照对比。</summary>
     private static object DoMove(JObject req)
     {
+        var busyReject = TryRejectIfClientBusy("move", req);
+        if (busyReject != null) return busyReject;
+
         string id = (string)req["instanceId"];
         if (string.IsNullOrEmpty(id)) return new { ok = false, error = "instanceId required" };
 
@@ -2310,7 +3067,8 @@ internal sealed class GameDriver : MonoBehaviour
 
                 string actualSection = GetProp(card, "Section")?.ToString();
                 string actualSocket = GetProp(card, "LeftSocketId")?.ToString();
-                var displaced = DiffDisplacedCards(beforePositions, id);
+                var displacedToHandIds = new List<string>();
+                var displaced = DiffDisplacedCards(beforePositions, id, displacedToHandIds);
                 bool moved = !string.Equals(origSection, actualSection, StringComparison.OrdinalIgnoreCase) ||
                              !string.Equals(origSocket, actualSocket, StringComparison.OrdinalIgnoreCase) ||
                              displaced.Count > 0;
@@ -2331,6 +3089,18 @@ internal sealed class GameDriver : MonoBehaviour
                         targetSection = section.ToString(),
                         targetSocket = socketName,
                     };
+                }
+
+                // P2-11：关闭态 Stash 移入 Hand 走 movedLocally=true 时，官方 BoardManager.HandleCardMoved 会跳过 SetActive(true)，
+                // 致目标 3D 卡永久 activeInHierarchy=false 隐身留空蓝毯；此处对移入 Hand 的主卡及被挤入 Hand 的关联卡强制激活并显形。
+                if (string.Equals(actualSection, "Hand", StringComparison.OrdinalIgnoreCase))
+                {
+                    EnsureMovedHandCardVisible(card);
+                }
+                foreach (string dispHandId in displacedToHandIds)
+                {
+                    var dispCard = FindCard(dispHandId);
+                    if (dispCard != null) EnsureMovedHandCardVisible(dispCard);
                 }
 
                 return new
@@ -2356,6 +3126,10 @@ internal sealed class GameDriver : MonoBehaviour
 
         var m = cmd.GetType().GetMethod("SendMoveItem");
         m.Invoke(cmd, new object[] { card, sockets, section, null });
+        if (string.Equals(section.ToString(), "Hand", StringComparison.OrdinalIgnoreCase))
+        {
+            EnsureMovedHandCardVisible(card);
+        }
         return new
         {
             ok = true,
@@ -2367,6 +3141,38 @@ internal sealed class GameDriver : MonoBehaviour
             targetSection = section.ToString(),
             targetSocket = socketName,
         };
+    }
+
+    /// <summary>
+    /// P2-11：确保移入玩家 Hand 的目标卡牌 3D 对象处于激活且可见状态（SetActive(true) + ShowCard(true)），
+    /// 根治关闭态 Stash 直移至 Hand 后永久隐身留空蓝毯的问题。
+    /// </summary>
+    private static void EnsureMovedHandCardVisible(object card)
+    {
+        if (card == null) return;
+        try
+        {
+            var lookup = GameInspector.GetDataLookup();
+            var ctrl = GetCardControllerSafe(lookup, card);
+            if (ctrl == null) return;
+
+            if (ctrl is Component comp && comp.gameObject != null)
+            {
+                comp.gameObject.SetActive(true);
+            }
+
+            var showCardM = ctrl.GetType().GetMethod(
+                "ShowCard",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                null,
+                new[] { typeof(bool) },
+                null);
+            showCardM?.Invoke(ctrl, new object[] { true });
+        }
+        catch (Exception ex)
+        {
+            Core.DiagLog.SwallowOnce("GameDriver.EnsureMovedHandCardVisible", ex);
+        }
     }
 
     private static string NormalizeSocketName(string raw)
@@ -2418,7 +3224,10 @@ internal sealed class GameDriver : MonoBehaviour
         return map;
     }
 
-    private static List<object> DiffDisplacedCards(Dictionary<string, (string Section, string Socket)> before, string primaryId)
+    private static List<object> DiffDisplacedCards(
+        Dictionary<string, (string Section, string Socket)> before,
+        string primaryId,
+        List<string> movedToHandIds = null)
     {
         var after = SnapshotPlayerItemPositions();
         var list = new List<object>();
@@ -2429,6 +3238,11 @@ internal sealed class GameDriver : MonoBehaviour
                 (!string.Equals(prev.Section, kv.Value.Section, StringComparison.OrdinalIgnoreCase) ||
                  !string.Equals(prev.Socket, kv.Value.Socket, StringComparison.OrdinalIgnoreCase)))
             {
+                if (movedToHandIds != null
+                    && string.Equals(kv.Value.Section, "Hand", StringComparison.OrdinalIgnoreCase))
+                {
+                    movedToHandIds.Add(kv.Key);
+                }
                 list.Add(new
                 {
                     instanceId = kv.Key,

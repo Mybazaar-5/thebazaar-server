@@ -7,7 +7,9 @@
     <RootNamespace>BazaarServer</RootNamespace>
     <NoWarn>$(NoWarn);MSB3277;NU1701</NoWarn>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <ServerGarbageCollection Condition="'$(ServerGarbageCollection)'==''">true</ServerGarbageCollection>
+    <!-- P1-18：本地单机自建服默认采用 WorkstationGC 压降 16 核峰值内存（~2.92GB -> ~430MB），并启用 .NET 8 DATAS；此处必须无条件声明以覆盖 Microsoft.NET.Sdk.Web.ProjectSystem.props 默认的 true，高并发公网服仍可通过命令行全局属性 -p:ServerGarbageCollection=true 覆盖 -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <GarbageCollectionAdaptationMode Condition="'$(GarbageCollectionAdaptationMode)'==''">1</GarbageCollectionAdaptationMode>
     <ManagedExtDir Condition="'$(ManagedExtDir)'==''">..\..\ext\Managed</ManagedExtDir>
   </PropertyGroup>
   <ItemGroup>

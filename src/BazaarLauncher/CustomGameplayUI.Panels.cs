@@ -2198,6 +2198,7 @@ internal sealed partial class CustomGameplayUI
             if (!string.IsNullOrEmpty(runKey)
                 && !string.Equals(_activeRunFetchedId, runKey, StringComparison.OrdinalIgnoreCase)
                 && !_activeRunFetchInFlight
+                && Time.unscaledTime >= _nextActiveRunRetryTime
                 && (readyToFetchOpeningState || leftOpeningWindow))
             {
                 _activeRunFetchedId = runKey;
@@ -2246,10 +2247,9 @@ internal sealed partial class CustomGameplayUI
         if (showInRunBadge)
         {
             bool isTourneyRun = IsActiveRunTournamentMode();
-            var effectiveDisplayRules = ResolveInRunDisplayRules(isTourneyRun);
-            var sum = SummarizeRules(effectiveDisplayRules, isTourneyRun);
+            var sum = SummarizeInRunDisplayRules(isTourneyRun);
             inRunBadgeIsCustom = sum.IsCustomActive;
-            string key = $"{isTourneyRun}|{sum.IsCustomActive}|{sum.ActiveCount}|{sum.SummaryText}|{inCombat}|{hasGlyphs}|{_ui.HasVerifiedChineseFont}|{safeWidthBucket}|{_activeRunTendencyLocked}";
+            string key = $"{isTourneyRun}|{sum.IsCustomActive}|{sum.ActiveCount}|{sum.SummaryText}|{inCombat}|{hasGlyphs}|{_ui.HasVerifiedChineseFont}|{safeWidthBucket}|{_activeRunTendencyLocked}|{_activeRunRules != null}|{_activeRunIsCustomRuleRun}";
             if (force || !string.Equals(_lastInRunBadgeKey, key, StringComparison.Ordinal))
             {
                 _lastInRunBadgeKey = key;
@@ -2358,7 +2358,11 @@ internal sealed partial class CustomGameplayUI
 
     private CustomRunRuleSet ResolveInRunDisplayRules(bool isTourneyRun)
     {
-        var baseRules = isTourneyRun ? (_currentLobby?.Rules ?? _lobbyRules) : _normalRules;
+        // P1-15：在活跃局中优先展示服务端 /custom-rules/me/active-run-tendency 下发的权威 SQLite 活跃局规则 _activeRunRules，
+        // 不再误读大厅可变 _normalRules，彻底根治冷重启续玩后右上角 HUD 退回灰色「官方标准规则 (F8)」
+        var baseRules = _activeRunRules != null
+            ? _activeRunRules
+            : (isTourneyRun ? (_currentLobby?.Rules ?? _lobbyRules) : _normalRules);
         var display = baseRules != null ? baseRules.Clone() : new CustomRunRuleSet();
         if (!_activeRunAllowTendency)
         {
@@ -2370,9 +2374,25 @@ internal sealed partial class CustomGameplayUI
         }
         else
         {
-            display.SelectedArchetypeMask = _normalRules?.SelectedArchetypeMask ?? 0UL;
+            display.SelectedArchetypeMask = _activeRunRules != null
+                ? _activeRunRules.SelectedArchetypeMask
+                : (_normalRules?.SelectedArchetypeMask ?? 0UL);
         }
         return display;
+    }
+
+    /// <summary>P1-15：统一汇总局内权威展示规则；若服务端显式标注 isCustomRuleRun=true（例如仅勾选本局 Mod 列表）则兜底点亮自定义规则状态。</summary>
+    private RuleActivationSummary SummarizeInRunDisplayRules(bool isTourneyRun)
+    {
+        var effectiveDisplayRules = ResolveInRunDisplayRules(isTourneyRun);
+        var sum = SummarizeRules(effectiveDisplayRules, isTourneyRun);
+        if (!sum.IsCustomActive && _activeRunRules != null && _activeRunIsCustomRuleRun)
+        {
+            int modCount = _activeRunRules.SelectedModIds?.Count ?? 0;
+            string fallbackSummary = modCount > 0 ? $"本局 Mod×{modCount}" : "自定义规则";
+            return new RuleActivationSummary(true, true, Math.Max(1, modCount), fallbackSummary);
+        }
+        return sum;
     }
 
     private void ApplyInRunBadgeVisuals(RuleActivationSummary sum, bool isTourneyRun, bool inCombat, bool hasGlyphs, float safeW)

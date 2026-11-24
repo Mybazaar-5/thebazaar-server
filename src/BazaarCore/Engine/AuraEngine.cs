@@ -755,10 +755,14 @@ public static class AuraEngine
                 if (double.IsNaN(sharedVal) || double.IsInfinity(sharedVal)) sharedVal = 0;
                 var attr = action.ResolveCardAttributeName("Custom_0");
                 var op = action.Operation ?? "Add";
+                bool requireExistingOutputAttr = CardInstance.RequiresExistingOutputAttribute(action.Target, attr, op);
                 var targets = TargetResolver.ResolveCards(action.Target, ctx);
                 for (int i = 0; i < targets.Count; i++)
                 {
                     var target = targets[i];
+                    // P1-05：无条件非自身输出量级光环（如 All Talk / Pantry / Potent Potables / Synth）仅作用于原本已具备该属性的卡牌，避免凭空写入红标伤害/灼烧等
+                    if (requireExistingOutputAttr && !target.HasNonAuraAttribute(attr))
+                        continue;
                     double val = perTargetEval
                         ? EvaluateAuraCardValueForTarget(valNode!, target, sourceCard, ctx)
                         : sharedVal;

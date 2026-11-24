@@ -42,7 +42,7 @@
       "nameZh": "星港罗盘短刃",
       "descZh": "星港领航员的防身短刃，每逢相邻工具运转便以星轨校准锋芒，并从战斗中敛财。",
       "activeTooltipsZh": [
-        "造成 {attr.DamageAmount} 点伤害并获得 {attr.GoldGainAmount} 金币"
+        "造成 {attr.DamageAmount} 点伤害并获得 {attr.Custom_1} 金币"
       ],
       "passiveTooltipsZh": [
         "当你使用相邻工具时，此物品在本场战斗中获得 +{attr.Custom_0} 伤害"
@@ -65,7 +65,7 @@
             "SellPrice": 1,
             "CooldownMax": 4000,
             "DamageAmount": 12,
-            "GoldGainAmount": 1,
+            "Custom_1": 1,
             "Custom_0": 4,
             "CritChance": 5
           },
@@ -78,7 +78,7 @@
             "SellPrice": 2,
             "CooldownMax": 4000,
             "DamageAmount": 24,
-            "GoldGainAmount": 1,
+            "Custom_1": 1,
             "Custom_0": 8,
             "CritChance": 10
           },
@@ -91,7 +91,7 @@
             "SellPrice": 4,
             "CooldownMax": 3500,
             "DamageAmount": 48,
-            "GoldGainAmount": 2,
+            "Custom_1": 2,
             "Custom_0": 16,
             "CritChance": 15
           },
@@ -104,7 +104,7 @@
             "SellPrice": 8,
             "CooldownMax": 3500,
             "DamageAmount": 96,
-            "GoldGainAmount": 3,
+            "Custom_1": 3,
             "Custom_0": 32,
             "CritChance": 20
           },
@@ -139,7 +139,7 @@
             "operation": "Add",
             "value": {
               "$type": "TReferenceValueCardAttribute",
-              "attributeType": "GoldGainAmount",
+              "attributeType": "Custom_1",
               "target": {
                 "$type": "TTargetCardSelf"
               }
@@ -662,8 +662,19 @@
               "modifier": {
                 "modifyMode": "Multiply",
                 "value": {
-                  "$type": "TFixedValue",
-                  "value": 1.5
+                  "$type": "TReferenceValueCardAttribute",
+                  "attributeType": "Custom_0",
+                  "target": {
+                    "$type": "TTargetCardSelf"
+                  },
+                  "modifier": {
+                    "modifyMode": "Multiply",
+                    "shouldRound": false,
+                    "value": {
+                      "$type": "TFixedValue",
+                      "value": 0.1
+                    }
+                  }
                 }
               }
             },
@@ -689,8 +700,19 @@
               "modifier": {
                 "modifyMode": "Multiply",
                 "value": {
-                  "$type": "TFixedValue",
-                  "value": 1.5
+                  "$type": "TReferenceValueCardAttribute",
+                  "attributeType": "Custom_0",
+                  "target": {
+                    "$type": "TTargetCardSelf"
+                  },
+                  "modifier": {
+                    "modifyMode": "Multiply",
+                    "shouldRound": false,
+                    "value": {
+                      "$type": "TFixedValue",
+                      "value": 0.1
+                    }
+                  }
                 }
               }
             },
@@ -819,8 +841,19 @@
               "modifier": {
                 "modifyMode": "Multiply",
                 "value": {
-                  "$type": "TFixedValue",
-                  "value": 0.3
+                  "$type": "TReferenceValueCardAttribute",
+                  "attributeType": "Custom_0",
+                  "target": {
+                    "$type": "TTargetCardSelf"
+                  },
+                  "modifier": {
+                    "modifyMode": "Multiply",
+                    "shouldRound": false,
+                    "value": {
+                      "$type": "TFixedValue",
+                      "value": 0.1
+                    }
+                  }
                 }
               }
             },

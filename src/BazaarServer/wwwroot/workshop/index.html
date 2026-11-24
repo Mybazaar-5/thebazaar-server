@@ -65,16 +65,16 @@
       <section class="tab-panel active" id="tab-overview">
         <div class="grid-two-col">
           <div class="card-panel">
-            <div class="panel-header">
+            <div class="panel-header panel-header-tight">
               <div>
                 <h2>已有扩展包列表</h2>
-                <p class="muted" id="metaStatsText">正在加载服务器状态...</p>
               </div>
               <div class="btn-row">
                 <button class="btn btn-gold btn-sm" id="btnNewMod">+ 新建空白扩展包</button>
                 <button class="btn btn-subtle btn-sm" id="btnRefreshMods">↻ 刷新</button>
               </div>
             </div>
+            <p class="muted panel-subtitle" id="metaStatsText">正在加载服务器状态...</p>
 
             <div class="mod-list" id="modListContainer">
               <div class="empty-hint">正在扫描扩展包目录...</div>
@@ -91,21 +91,21 @@
           </div>
 
           <div class="card-panel">
-            <div class="panel-header">
+            <div class="panel-header panel-header-tight">
               <div>
                 <h2>当前扩展包基本信息</h2>
-                <p class="muted">本扩展包内的卡牌、机制和奇遇会自动带独立编号前缀，不会和别人撞车</p>
               </div>
               <div class="btn-row">
                 <button class="btn btn-outline btn-sm" id="btnExportCurrentZip">⬇ 打包导出分享</button>
                 <button class="btn btn-danger btn-sm" id="btnDeleteCurrentMod">🗑 删除草稿</button>
               </div>
             </div>
+            <p class="muted panel-subtitle">本扩展包内的卡牌、机制和奇遇会自动带独立编号前缀，不会和别人撞车</p>
 
             <div class="form-grid">
-              <label class="field">
-                <span>扩展包英文代号（用于防撞车前缀，仅小写字母/数字/短横线）*</span>
-                <input type="text" id="mfId" placeholder="例如：starport-forge" />
+              <label class="field" title="用于防撞车前缀，仅支持小写字母、数字和短横线">
+                <span>扩展包英文代号（防撞车前缀）*</span>
+                <input type="text" id="mfId" placeholder="例如：starport-forge（仅小写字母/数字/短横线）" />
               </label>
               <label class="field">
                 <span>扩展包中文名称 *</span>
@@ -263,8 +263,8 @@
           <!-- 左栏：原版白名单检索 + 本 Mod 已有卡/补丁 -->
           <div class="card-panel studio-col-left">
             <div class="subtab-row">
-              <button class="subtab active" data-sub="vanilla">🔍 原版白名单库 (3,368)</button>
-              <button class="subtab" data-sub="mine">📁 本 Mod 卡牌 &amp; 补丁</button>
+              <button type="button" class="subtab active" data-sub="vanilla">🔍 原版白名单库 (3,368)</button>
+              <button type="button" class="subtab" data-sub="mine">📁 本 Mod 卡牌 &amp; 补丁</button>
             </div>
 
             <div class="subpanel active" id="sub-vanilla">
@@ -314,8 +314,8 @@
             <div class="empty-hero" id="cardEditorEmpty">
               <div class="empty-hero-icon">⚔️</div>
               <h3>从左侧搜索并选择一张原版卡开始创作</h3>
-              <p>点 <strong>「📋 克隆为新卡」</strong> 自动继承合法 3D 白名单视觉载体并生成独立新卡；<br />
-                 点 <strong>「🔧 原位改数值」</strong> 直接创建轻量补丁调整原版卡数值、冷却或标签。</p>
+              <p>点 <strong>「📋 复制为新卡」</strong> 自动继承合法 3D 白名单视觉载体并生成独立新卡；<br />
+                 点 <strong>「🔧 直接改原版」</strong> 直接创建轻量补丁调整原版卡数值、冷却或标签。</p>
             </div>
 
             <!-- 自定义新卡表单 -->
@@ -745,11 +745,11 @@
             <div class="panel-header compact">
               <h2>实时鎏金卡面预览</h2>
               <div class="tier-switcher" id="previewTierSwitcher">
-                <button class="tier-dot active" data-tier="Bronze" title="青铜">铜</button>
-                <button class="tier-dot" data-tier="Silver" title="白银">银</button>
-                <button class="tier-dot" data-tier="Gold" title="黄金">金</button>
-                <button class="tier-dot" data-tier="Diamond" title="钻石">钻</button>
-                <button class="tier-dot" data-tier="Legendary" title="传说">传</button>
+                <button type="button" class="tier-dot active" data-tier="Bronze" title="青铜">铜</button>
+                <button type="button" class="tier-dot" data-tier="Silver" title="白银">银</button>
+                <button type="button" class="tier-dot" data-tier="Gold" title="黄金">金</button>
+                <button type="button" class="tier-dot" data-tier="Diamond" title="钻石">钻</button>
+                <button type="button" class="tier-dot" data-tier="Legendary" title="传说">传</button>
               </div>
             </div>
 
@@ -1025,7 +1025,7 @@
                   <input type="text" id="evHours" placeholder="例如：1, 2, 3, 4" />
                 </label>
                 <div class="field span-2">
-                  <span>适用英雄（直接点击勾选；选「全英雄通用」表示任意英雄都能遇到）</span>
+                  <span>适用英雄（直接点击勾选；选<b>「✨ 全英雄通用 (Common)」</b>表示任意英雄都能遇到）</span>
                   <div class="pill-picker" id="evHeroPills"></div>
                   <input type="hidden" id="evHeroes" value="Common" />
                 </div>
@@ -1124,13 +1124,12 @@
         </div>
       </section>
 
-      <!-- ════════ TAB 4: 10 道防 Bug 铁闸 & 50 场真战斗试跑体检 ════════ -->
+      <!-- ════════ TAB 5: 10 道防 Bug 铁闸 & 50 场真战斗试跑体检 ════════ -->
       <section class="tab-panel" id="tab-validate">
         <div class="card-panel">
-          <div class="panel-header">
+          <div class="panel-header panel-header-tight">
             <div>
               <h2>10 道工业级防 Bug 铁闸 &amp; 50 场真实战斗体检</h2>
-              <p class="muted" id="valSummaryBanner">点击右侧按钮，在隔离内存沙盒上运行全量静态规则校验 + 50 场真实 CombatSimulator 压测。</p>
             </div>
             <div class="btn-row">
               <button class="btn btn-subtle" id="btnAutoFixCommon">✨ 一键自动标准化</button>
@@ -1138,6 +1137,7 @@
               <button class="btn btn-gold" id="btnPublishReload" disabled>🚀 全绿安全发布并热重载进游戏</button>
             </div>
           </div>
+          <p class="muted panel-subtitle val-summary-banner" id="valSummaryBanner">点击右上角按钮，在隔离内存沙盒上运行全量静态规则校验 + 50 场真实 CombatSimulator 压测。</p>
 
           <!-- 50 场真实战斗压测仪表盘 -->
           <div class="stress-dashboard hidden" id="stressDashboard">
@@ -1162,7 +1162,7 @@
 
           <!-- 10 张闸门红黄绿卡片 -->
           <div class="gates-grid" id="gatesGrid">
-            <div class="empty-hint">尚未执行体检。点击右上角「🧪 体检当前草稿」或「🛡️ 10道体检」立即开始。</div>
+            <div class="empty-hint">尚未执行体检。点击上方「🧪 体检当前草稿（不写盘）」或顶部导航栏「🛡️ 安全检测」立即开始。</div>
           </div>
         </div>
       </section>
@@ -1195,9 +1195,9 @@
             <div class="flow-arrow">→</div>
             <div class="flow-step"><b>第 3 步</b><span>改名字、点选英雄和标签、用自由拼装加效果、决定商店刷新还是事件限定</span></div>
             <div class="flow-arrow">→</div>
-            <div class="flow-step"><b>第 4 步</b><span>点右上角「保存」，再去「安全检测与上线」一键自动检查与模拟 50 场战斗</span></div>
+            <div class="flow-step"><b>第 4 步</b><span>点右上角「💾 保存」，再去「安全检测与上线」点击「🧪 体检当前草稿（不写盘）」或顶部「🛡️ 安全检测」跑 50 场模拟战斗</span></div>
             <div class="flow-arrow">→</div>
-            <div class="flow-step"><b>第 5 步</b><span>全部通过后点「安全发布并热更新」，进游戏立刻就能玩到！</span></div>
+            <div class="flow-step"><b>第 5 步</b><span>全部通过后点「🚀 全绿安全发布并热重载进游戏」，进游戏立刻就能玩到！</span></div>
           </div>
         </div>
 
