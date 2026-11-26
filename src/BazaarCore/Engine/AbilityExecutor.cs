@@ -2214,13 +2214,20 @@ public static class AbilityExecutor
                         allowDisabledTargets);
                     bool disableEnchInherit = HasDisabledInheritEnchantment(action.SpawnContext);
                     bool allowLegendarySpawn = HasExplicitCardOrLegendaryFilter(action.SpawnContext);
+                    bool hasExplicitTargetId = HasExplicitIdCondition(action.Target?.GetSingleCondition(GameDatabaseLoader.JsonOptions));
+                    bool isScriptedEncounterStep = sourceCard.Template.Type is "EncounterStep" or "EventEncounter";
+                    bool allowNonSelfLegendaryTransform = hasExplicitTargetId
+                        && (isScriptedEncounterStep || SpawnsExplicitLegendaryTemplate(action.SpawnContext, ctx.Repo));
 
                     foreach (var card in transformTargets)
                     {
-                        // 非自身目标即使通过特定条件/位置锁定也不得转化 Legendary 卡牌
+                        // 非自身随机/泛化目标不得误转 Legendary 卡牌；
+                        // 仅当由 EncounterStep/EventEncounter 显式通过 TCardConditionalId 点名（如微型世界 Ethergy Nexus 将 Depleted Device 充能变形为 Sizeinator），
+                        // 或显式点名传奇卡转为显式传奇目标时放行。
                         if (string.Equals(action.Type, "TActionCardTransform", StringComparison.Ordinal) &&
                             !ReferenceEquals(card, sourceCard) &&
-                            IsLegendaryCard(card))
+                            IsLegendaryCard(card) &&
+                            !allowNonSelfLegendaryTransform)
                         {
                             continue;
                         }
@@ -3302,6 +3309,43 @@ public static class AbilityExecutor
             return true;
         if (spawnContext.Tiers != null && spawnContext.Tiers.Contains("Legendary", StringComparer.OrdinalIgnoreCase))
             return true;
+        return false;
+    }
+
+    private static bool SpawnsExplicitLegendaryTemplate(RuleNode? spawnContext, GameDataRepository? repo)
+    {
+        if (spawnContext == null) return false;
+        if (spawnContext.Tiers != null && spawnContext.Tiers.Contains("Legendary", StringComparer.OrdinalIgnoreCase))
+            return true;
+        if (repo != null)
+        {
+            if (!string.IsNullOrEmpty(spawnContext.Id) && repo.GetCard(spawnContext.Id)?.DefaultTier == CardTier.Legendary)
+                return true;
+            if (spawnContext.Ids != null)
+            {
+                foreach (string id in spawnContext.Ids)
+                {
+                    if (repo.GetCard(id)?.DefaultTier == CardTier.Legendary)
+                        return true;
+                }
+            }
+        }
+        if (spawnContext.Filters != null)
+        {
+            foreach (var f in spawnContext.Filters)
+            {
+                if (SpawnsExplicitLegendaryTemplate(f, repo))
+                    return true;
+            }
+        }
+        if (spawnContext.Groups != null)
+        {
+            foreach (var g in spawnContext.Groups)
+            {
+                if (SpawnsExplicitLegendaryTemplate(g, repo))
+                    return true;
+            }
+        }
         return false;
     }
 

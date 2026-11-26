@@ -949,4 +949,119 @@ public sealed class Wave5A_CombatSimConverterTests
         Assert.Equal(750, baselineStartMaxHp.P1MaxHp);
         Assert.Equal(1000, baselineStartMaxHp.P2MaxHp);
     }
+
+    [Fact]
+    public void Bug1_InvulnerabilityPotion_TimedPercentDamageReduction_EmitsExpiryAndClearsVisualEffect()
+    {
+        var repo = Repo.Value;
+        var invulnTpl = repo.GetCard("4fdc947b-3646-429e-ba4e-bb693fe44bc2");
+        Assert.NotNull(invulnTpl);
+
+        // 1) 完整验证：P2 携带银阶 Invulnerability Potion（7s 触发 1s 100% 无敌，Ammo=1），
+        //    P1 每 1s 造成 200 伤害；7s~8s 期间免疫，8s 到期后必须发出 PercentDamageReduction 100->0 且恢复受击死亡。
+        var p1 = new PlayerState("player", "P1", HeroNames.Vanessa, initialHealthMax: 5000, unlockedHandSlots: 10);
+        var p2 = new PlayerState("opponent", "P2", HeroNames.Mak, initialHealthMax: 2500, unlockedHandSlots: 10);
+
+        var striker = MakeCustomItem(
+            Guid.NewGuid().ToString(),
+            "SteadyStriker",
+            new() { ["CooldownMax"] = 1000, ["DamageAmount"] = 200, ["SellPrice"] = 2 },
+            abilities: new()
+            {
+                ["0"] = new AbilityDefinition
+                {
+                    Id = "0",
+                    ActiveIn = "HandOnly",
+                    Trigger = ParseNode("""{"$type":"TTriggerOnCardFired"}"""),
+                    Action = ParseNode("""{"$type":"TActionPlayerDamage","Target":{"$type":"TTargetPlayerRelative","TargetMode":"Opponent"}}"""),
+                },
+            },
+            tags: ["Weapon"],
+            instanceId: "p1_steady_striker");
+        p1.Hand.TryPlaceOrShift(striker, 0);
+
+        var invulnCard = new CardInstance(invulnTpl!, CardTier.Silver, "p2_invuln_potion");
+        p2.Hand.TryPlaceOrShift(invulnCard, 0);
+
+        var res = CombatSimulator.Simulate(
+            repo,
+            p1,
+            p2,
+            seed: 50901,
+            combatType: "PVP",
+            recordTimeline: true,
+            recordEvents: true,
+            syncPermanentChanges: false);
+
+        // 内核必须未陷入永久无敌：P2 在无敌 1s 到期后被持续打死（P1 胜）
+        Assert.Equal("player", res.WinnerPlayerId);
+        Assert.Equal(0, res.Player2RemainingHp);
+
+        // 核心事件流必须成对记录 PercentDamageReduction 0->100（开启）与 100->0（1000ms 后 TCombatDurationExpired 到期回落）
+        var pdrEvents = res.Events
+            .Where(e => e.Type == CombatEventType.PlayerAttributeModified
+                     && string.Equals(e.TargetPlayerId, "opponent", StringComparison.OrdinalIgnoreCase)
+                     && string.Equals(e.PlayerAttributeName, "PercentDamageReduction", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        Assert.Equal(2, pdrEvents.Count);
+        Assert.True(pdrEvents[0].TryGetPlayerAttributeModification(out _, out double applyPrev, out double applyCur));
+        Assert.Equal(0, applyPrev);
+        Assert.Equal(100, applyCur);
+        Assert.True(pdrEvents[1].TryGetPlayerAttributeModification(out _, out double expPrev, out double expCur));
+        Assert.Equal(100, expPrev);
+        Assert.Equal(0, expCur);
+        Assert.Equal("TCombatDurationExpired", pdrEvents[1].ActionType);
+        Assert.Equal(pdrEvents[0].TimeMs + 1000, pdrEvents[1].TimeMs);
+
+        // 转换后的客户端 CombatSim 帧流必须同样成对下发 OpponentUpdates[PercentDamageReduction] = 100 与 0
+        var (p1Entries, p1Map) = BuildBoardEntries(p1, ECombatantId.Player);
+        var (p2Entries, p2Map) = BuildBoardEntries(p2, ECombatantId.Opponent);
+        var sim = CombatSimConverter.ToCombatSim(res, repo, p1Map, p2Map, p1Entries, p2Entries);
+
+        var oppPdrFrames = sim.Frames
+            .Select((frame, idx) => (idx, upd: frame.OpponentUpdates?.Attributes.TryGetValue(EPlayerAttributeType.PercentDamageReduction, out var u) == true ? u : null))
+            .Where(x => x.upd != null)
+            .ToList();
+        Assert.True(oppPdrFrames.Count >= 2, $"期望至少 2 帧 PercentDamageReduction 更新（开启与到期归零），实际 {oppPdrFrames.Count}");
+        Assert.Equal(0, oppPdrFrames[0].upd!.PreviousValue);
+        Assert.Equal(100, oppPdrFrames[0].upd!.CurrentValue);
+        Assert.Equal(100, oppPdrFrames[1].upd!.PreviousValue);
+        Assert.Equal(0, oppPdrFrames[1].upd!.CurrentValue);
+        Assert.True(oppPdrFrames[1].idx > oppPdrFrames[0].idx, "无敌到期归零帧必须晚于开启帧");
+
+        // 2) 边界兜底验证：若战斗在无敌未到期时提前结束（例如对手被一击必杀或超时），末帧清理也必须把 PercentDamageReduction 归零
+        var syntheticRes = new CombatResult
+        {
+            WinnerPlayerId = "player",
+            Player1RemainingHp = 1000,
+            Player2RemainingHp = 0,
+            DurationMs = 500,
+            Timeline =
+            [
+                new CombatTickState { TimeMs = 0, P1Hp = 1000, P1MaxHp = 1000, P2Hp = 1000, P2MaxHp = 1000, P2PercentDamageReduction = 0 },
+                new CombatTickState { TimeMs = 100, P1Hp = 1000, P1MaxHp = 1000, P2Hp = 1000, P2MaxHp = 1000, P2PercentDamageReduction = 100 },
+                new CombatTickState { TimeMs = 500, P1Hp = 1000, P1MaxHp = 1000, P2Hp = 0, P2MaxHp = 1000, P2PercentDamageReduction = 100 },
+            ],
+            Events =
+            [
+                new CombatEvent
+                {
+                    TimeMs = 100,
+                    Type = CombatEventType.PlayerAttributeModified,
+                    SourcePlayerId = "opponent",
+                    TargetPlayerId = "opponent",
+                    SourceCardInstanceId = invulnCard.InstanceId,
+                    Value = 100,
+                    Detail = CombatEvent.FormatPlayerAttributeModifiedDetail("PercentDamageReduction", 0, 100),
+                    ActionType = "TActionPlayerModifyAttribute",
+                },
+            ],
+        };
+        var simEarlyEnd = CombatSimConverter.ToCombatSim(syntheticRes, repo, p1Map, p2Map, p1Entries, p2Entries);
+        var lastFrame = simEarlyEnd.Frames[^1];
+        Assert.NotNull(lastFrame.OpponentUpdates);
+        Assert.True(lastFrame.OpponentUpdates!.Attributes.TryGetValue(EPlayerAttributeType.PercentDamageReduction, out var endPdr));
+        Assert.Equal(100, endPdr!.PreviousValue);
+        Assert.Equal(0, endPdr.CurrentValue);
+    }
 }

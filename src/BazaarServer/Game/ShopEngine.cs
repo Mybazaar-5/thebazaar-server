@@ -1136,7 +1136,8 @@ public sealed class ShopEngine
                 midPick = preRolledTakeover;
             }
 
-            // 常规地图基座（B1&B2 Day 3/5、Sterling Day 6–8、Forja Day 9+、The Artist Day 8+）归属中槽配额（21.3 万局实测铁证）
+            // 常规地图基座（B1&B2 Day 3/5、Sterling Day 6–8、Forja Day 9+、The Artist Day 8+）以及
+            // 运行期动态解锁子基座（如 Partner Portal - Forja，自 Day 2 起即可随伙伴技能解锁入池）归属中槽配额。
             bool guaranteedPedestalHour =
                 hour == 2 &&
                 (effectiveRules?.SpecialModeId == ESpecialModeId.BossRush ||
@@ -1144,7 +1145,7 @@ public sealed class ShopEngine
                   EndlessTowerScaler.Compute((int)day, effectiveRules.EndlessMaxDay).IsMilestoneDay));
             bool skipRegularPedestalForAmplifiedAgent = !guaranteedPedestalHour && allowAmplifiedTravelAgent && travelAgentMult >= 4.0;
 
-            if (midPick == null && (guaranteedPedestalHour || (actualDay >= 3 && !skipRegularPedestalForAmplifiedAgent)) && _run.SelectionSet.Count < targetChoiceCount)
+            if (midPick == null && (guaranteedPedestalHour || (actualDay >= 2 && !skipRegularPedestalForAmplifiedAgent)) && _run.SelectionSet.Count < targetChoiceCount)
             {
                 var rawPedestals = _pool.HourlyEncounters(hero, "PedestalEncounter");
                 var eligiblePedestals = guaranteedPedestalHour
@@ -1411,7 +1412,12 @@ public sealed class ShopEngine
             });
 
         // 5. Day 10 Tiny World Expedition (NewSetIdOnExit = e40c7e1f)
-        //    P1-23：H2 Where am I?（内含 Barnacle Bigwig 与条件绕过）-> H3 聚焦投放 Bananniboss（不再重复并列 Barnacle Bigwig）-> H4 Ethergy Nexus
+        //    官方 Patch 20.0 完整 5 小时探险日程：
+        //      H1 Tiny World Expedition (You have been shrunk! 获 Depleted Device)
+        //      -> H2 Where am I? (Barnacle Bigwig / 持指定物品绕过)
+        //      -> H3 Sprout (微型世界专属免费物品池)
+        //      -> H4 Bananniboss (远征首领战)
+        //      -> H5 Ethergy Nexus (Charge the Depleted Device -> 充能变形为 Sizeinator)
         reg[CardPool.ReplacementSetTinyWorldId] = new ReplacementSetDefinition(
             CardPool.ReplacementSetTinyWorldId,
             CardPool.TinyWorldExpeditionRoomId,
@@ -1419,8 +1425,9 @@ public sealed class ShopEngine
             Hours: new Dictionary<int, IReadOnlyList<ReplacementSetEntry>>
             {
                 [2] = List(("875caea4-93c5-440b-a9fd-2886eeaa0fc5", ECardType.EventEncounter)), // Where am I?
-                [3] = List(("1a3f7d6a-3f24-42dc-ba27-9d4bf199d0b8", ECardType.CombatEncounter)), // Bananniboss
-                [4] = List(("f418a73c-d442-4ee1-aa7f-ec43f0418d9f", ECardType.EventEncounter)), // Ethergy Nexus
+                [3] = List((CardPool.SproutEncounterId, ECardType.EventEncounter)),              // Sprout
+                [4] = List(("1a3f7d6a-3f24-42dc-ba27-9d4bf199d0b8", ECardType.CombatEncounter)), // Bananniboss
+                [5] = List(("f418a73c-d442-4ee1-aa7f-ec43f0418d9f", ECardType.EventEncounter)),  // Ethergy Nexus
             });
 
         return reg;

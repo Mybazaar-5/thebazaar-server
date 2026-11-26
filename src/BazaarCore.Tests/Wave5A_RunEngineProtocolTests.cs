@@ -744,4 +744,92 @@ public sealed class Wave5A_RunEngineProtocolTests
         Assert.Equal(afterDirectLvlMax, run.PlayerAttributes[EPlayerAttributeType.Health]);
         Assert.Equal(afterDirectLvlMax, (int)Math.Round(run.BasePlayerAttributes["Health"]));
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Bug 2（实机反馈）：巧克力（Candy Stash）与给 5 金币（Cache of Riches / Borrow）等直效奇遇
+    // 必须走官方瞬发直跳（_currentEncounterIsInstant），绝不进入空 ERunState.Encounter 房间
+    // ──────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Bug2_InstantEncounters_CandyStashAndCacheOfRiches_ResolveWithoutEmptyEncounterRoom()
+    {
+        const string candyStashDay1To3Id = "e6e09e6a-ebe0-46f8-bfbb-716b74f78bc6";
+        const string cacheOfRichesDay1To2Id = "937489c5-22bf-4190-89b1-f396894c85f1";
+
+        static RunState.CardEntry InjectChoiceEncounter(RunState run, string encTemplateId)
+        {
+            var entry = new RunState.CardEntry
+            {
+                InstanceId = $"enc_{Guid.NewGuid():N}"[..16],
+                TemplateId = Guid.Parse(encTemplateId),
+                Type = ECardType.EventEncounter,
+                Owner = ECombatantId.Opponent,
+                Section = EInventorySection.Hand,
+                Socket = EContainerSocketId.Socket_0,
+                Tier = ETier.Bronze,
+                Size = ECardSize.Medium,
+            };
+            run.Cards[entry.InstanceId] = entry;
+            run.SelectionSet.Add(entry.InstanceId);
+            return entry;
+        }
+
+        // 1) Candy Stash（给 3 块青铜巧克力）在 Day 1 Hour 1：
+        //    必须不进空 Encounter，直接发巧克力进手牌/背包并瞬发推进到 Hour 2 Choice，且经 PreSplitGameSim + SecondaryGameSimEvents 严格拆包隔离
+        var (runCandy, engineCandy) = CreateRun(hero: EHero.Vanessa, day: 1, hour: 1, seed: 50911);
+        int ownedBeforeCandy = runCandy.Cards.Values.Count(c => c.Owner == ECombatantId.Player && c.Type == ECardType.Item);
+        var candyCard = InjectChoiceEncounter(runCandy, candyStashDay1To3Id);
+
+        var candyOutcome = engineCandy.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(candyCard.InstanceId) });
+        Assert.Null(candyOutcome.Error);
+        Assert.Equal(ERunState.Choice, runCandy.State);
+        Assert.Equal(2u, runCandy.Hour);
+        Assert.Null(runCandy.CurrentEncounterId);
+        Assert.Null(runCandy.ParentEncounterTemplateId);
+        int ownedAfterCandy = runCandy.Cards.Values.Count(c => c.Owner == ECombatantId.Player && c.Type == ECardType.Item);
+        Assert.True(ownedAfterCandy >= ownedBeforeCandy + 3, $"Candy Stash 应发 3 块巧克力入包/手牌，实际新增 {ownedAfterCandy - ownedBeforeCandy}");
+
+        Assert.NotNull(candyOutcome.PreSplitGameSim);
+        Assert.NotNull(candyOutcome.SecondaryGameSimEvents);
+        Assert.Contains(candyOutcome.PreSplitGameSim!.Events, e => e is GameSimEventCardSpawned);
+        Assert.DoesNotContain(candyOutcome.PreSplitGameSim.Events, e => e is GameSimEventCardDealt);
+        Assert.DoesNotContain(candyOutcome.PreSplitGameSim.Events, e => e is GameSimEventStateTransitioned);
+        Assert.Null(candyOutcome.PreSplitGameSim.CurrentState!.CurrentEncounterId);
+
+        Assert.DoesNotContain(candyOutcome.SecondaryGameSimEvents!, e => e is GameSimEventCardSpawned);
+        Assert.Contains(candyOutcome.SecondaryGameSimEvents!, e => e is GameSimEventStateTransitioned st && st.ToState == ERunState.Choice);
+        Assert.Contains(candyOutcome.SecondaryGameSimEvents!, e => e is GameSimEventRunHourChanged hr && hr.NewHour == 2u);
+        Assert.Contains(candyOutcome.SecondaryGameSimEvents!, e => e is GameSimEventCardDealt);
+
+        // 2) Cache of Riches（给金币）在 Day 1 Hour 1：
+        //    无发卡，单包瞬发加金币并直接推进至 Hour 2 Choice，绝不进入空 Encounter
+        var (runGold, engineGold) = CreateRun(hero: EHero.Vanessa, day: 1, hour: 1, seed: 50912);
+        int goldBefore = runGold.PlayerAttributes[EPlayerAttributeType.Gold];
+        var goldCard = InjectChoiceEncounter(runGold, cacheOfRichesDay1To2Id);
+
+        var goldOutcome = engineGold.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(goldCard.InstanceId) });
+        Assert.Null(goldOutcome.Error);
+        Assert.Equal(ERunState.Choice, runGold.State);
+        Assert.Equal(2u, runGold.Hour);
+        Assert.Null(runGold.CurrentEncounterId);
+        Assert.True(runGold.PlayerAttributes[EPlayerAttributeType.Gold] > goldBefore, "Cache of Riches 必须即时发放金币");
+        Assert.Null(goldOutcome.PreSplitGameSim);
+        Assert.Contains(goldOutcome.Events, e => e is GameSimEventStateTransitioned st && st.ToState == ERunState.Choice);
+        Assert.Contains(goldOutcome.Events, e => e is GameSimEventRunHourChanged hr && hr.NewHour == 2u);
+        Assert.Contains(goldOutcome.Events, e => e is GameSimEventCardDealt);
+        Assert.DoesNotContain(goldOutcome.Events, e => e is GameSimEventStateTransitioned st && st.ToState == ERunState.Encounter);
+
+        // 3) Day 2 Hour 5 选 Cache of Riches 且距离升级仅差 1 XP：
+        //    必须瞬发直入 LevelUp（不进空 Encounter），且 Hour 保持 5（绝不提前切到 Hour 6 触发客户端时钟锁死）
+        var (runLv, engineLv) = CreateRun(hero: EHero.Vanessa, day: 2, hour: 5, seed: 50913);
+        int xpPerLevel = Math.Max(1, Mode.Value.ExperiencePerLevel);
+        runLv.SetBasePlayerAttribute(EPlayerAttributeType.Experience, xpPerLevel - 1);
+        var goldCardH5 = InjectChoiceEncounter(runLv, cacheOfRichesDay1To2Id);
+
+        var lvOutcome = engineLv.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(goldCardH5.InstanceId) });
+        Assert.Null(lvOutcome.Error);
+        Assert.Equal(ERunState.LevelUp, runLv.State);
+        Assert.Equal(5u, runLv.Hour);
+        Assert.DoesNotContain(lvOutcome.Events, e => e is GameSimEventRunHourChanged hr && hr.NewHour == 6u);
+    }
 }

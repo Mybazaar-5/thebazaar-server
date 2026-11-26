@@ -2148,6 +2148,21 @@ public static class CombatSimulator
                     if (exp.Attribute.Equals("HealthMax", StringComparison.OrdinalIgnoreCase))
                         exp.Player.CurrentHealth = Math.Min(exp.Player.CurrentHealth, exp.Player.HealthMax);
                     double cur = exp.Player.GetAttribute(exp.Attribute);
+                    if (recordEvents && Math.Abs(cur - prev) > 1e-6)
+                    {
+                        // 补发玩家限时修饰到期回落事件（如无敌药水 PercentDamageReduction 100 -> 0），
+                        // 确保客户端 StatusEffectManager 在精确到期毫秒关闭无敌特效与状态，绝不永久残留。
+                        Emit(new CombatEvent
+                        {
+                            TimeMs = timeMs,
+                            Type = CombatEventType.PlayerAttributeModified,
+                            SourcePlayerId = exp.Player.PlayerId,
+                            TargetPlayerId = exp.Player.PlayerId,
+                            Value = cur - prev,
+                            Detail = CombatEvent.FormatPlayerAttributeModifiedDetail(exp.Attribute, prev, cur),
+                            ActionType = "TCombatDurationExpired"
+                        });
+                    }
                     if (Math.Abs(cur - prev) > 1e-6)
                         DispatchEvent("TTriggerOnPlayerAttributeChanged", exp.Player, null, null, exp.Player, exp.Attribute, prev, cur);
                 }
@@ -4647,6 +4662,7 @@ public static class CombatSimulator
             P1Tempo = p1.Tempo,
             P1TempoGainCooldownMax = p1TempoActive ? (p1TempoCdMax > 0 ? p1TempoCdMax : 2000) : 0,
             P1Joy = Math.Max(0, ReadPlayerIntAttr(p1, "Joy")),
+            P1PercentDamageReduction = Math.Clamp(ReadPlayerIntAttr(p1, "PercentDamageReduction"), 0, 100),
             P1PortraitIndex = p1.PortraitIndex,
             P2Hp = p2.CurrentHealth > 0 ? p2.CurrentHealth : -Math.Max(0, p2Overkill),
             P2MaxHp = p2.HealthMax,
@@ -4662,6 +4678,7 @@ public static class CombatSimulator
             P2Tempo = p2.Tempo,
             P2TempoGainCooldownMax = p2TempoActive ? (p2TempoCdMax > 0 ? p2TempoCdMax : 2000) : 0,
             P2Joy = Math.Max(0, ReadPlayerIntAttr(p2, "Joy")),
+            P2PercentDamageReduction = Math.Clamp(ReadPlayerIntAttr(p2, "PercentDamageReduction"), 0, 100),
             P2PortraitIndex = p2.PortraitIndex,
             SandstormActive = sandstormActive,
             SandstormNextDamage = nextSandstormDmg,

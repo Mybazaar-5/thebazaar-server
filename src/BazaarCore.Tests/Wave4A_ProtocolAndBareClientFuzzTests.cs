@@ -139,11 +139,11 @@ public sealed class Wave4A_ProtocolAndBareClientFuzzTests
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // #1 (A)：Day 3 Hour 5 选直效发卡事件（巧克力等）必须落地 Encounter，绝不同包 Choice -> Choice
+    // #1 (A)：Day 3 Hour 5 选直效发卡事件（巧克力等）走官方瞬发流并严格拆包隔离 CardSpawned 与 CardDealt
     // ──────────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void Task1_Day3Hour5_DirectCardSpawnEncounter_LandsInEncounter_NoSamePacketChoiceConflict()
+    public void Task1_Day3Hour5_DirectCardSpawnEncounter_ResolvesInstantlyViaSplitPacket_NoSamePacketChoiceConflict()
     {
         string directSpawnEncId = FindDirectCardSpawningEventEncounterId();
         var (run, engine) = CreateStartedRun(hero: EHero.Vanessa, day: 3, hour: 5, seed: 40102);
@@ -153,27 +153,34 @@ public sealed class Wave4A_ProtocolAndBareClientFuzzTests
         var selectOutcome = engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(encCard.InstanceId) });
         Assert.Null(selectOutcome.Error);
 
-        var selectSim = run.BuildFullGameSim(selectOutcome.Events);
-        // 1. 严禁 Choice -> Choice 同包直跳下一小时
+        // 1. 对齐官方 _currentEncounterIsInstant：绝不落地空 ERunState.Encounter 房间，直接安全推进至 Hour 6 PvP（或触发升级时停在 Hour 5 LevelUp）
         Assert.Equal(ERunState.Choice, prevState);
-        Assert.Equal(ERunState.Encounter, selectSim.CurrentState!.StateName);
-        Assert.Equal(5u, selectSim.Run!.Hour);
-        Assert.True(selectSim.CurrentState.SelectionContextRules!.CanExit, "直效事件落地 Encounter 必须开放 CanExit=true");
-        // 2. 本包包含直效发卡（CardSpawned）且绝不混发下一小时 Choice 的 CardDealt
-        Assert.Contains(selectSim.Events, e => e is GameSimEventStateTransitioned st && st.ToState == ERunState.Encounter);
-        Assert.DoesNotContain(selectSim.Events, e => e is GameSimEventCardDealt);
-        Assert.DoesNotContain(selectSim.Events, e => e is GameSimEventRunHourChanged);
+        Assert.NotEqual(ERunState.Encounter, run.State);
+        Assert.Equal(ERunState.Choice, run.State);
+        Assert.Equal(6u, run.Hour);
 
-        // 3. 玩家点击离开事件 -> 走标准 Encounter -> Choice 沙尘门控安全推进至 Hour 6 PvP
-        var exitOutcome = engine.Handle(new ExitCurrentStateCommand());
-        Assert.Null(exitOutcome.Error);
-        var exitSim = run.BuildFullGameSim(exitOutcome.Events);
+        // 2. 直效发卡事件（Candy Stash 等）必须拆分为两包：
+        //    包 1（PreSplitGameSim）：仅落地 CardSpawned（无 CardDealt / 无 RunHourChanged / 无 StateTransitioned）；
+        //    包 2（SecondaryGameSim）：StateTransitioned(Choice) + RunHourChanged(6) + Hour 6 PvP CardDealt（无 CardSpawned）。
+        Assert.NotNull(selectOutcome.PreSplitGameSim);
+        Assert.NotNull(selectOutcome.SecondaryGameSimEvents);
+        var preSim = selectOutcome.PreSplitGameSim!;
+        var secSim = run.BuildFullGameSim(selectOutcome.SecondaryGameSimEvents!);
 
-        Assert.Equal(ERunState.Choice, exitSim.CurrentState!.StateName);
-        Assert.Equal(6u, exitSim.Run!.Hour);
-        Assert.NotEmpty(exitSim.CurrentState.SelectionSet!);
-        Assert.NotNull(exitSim.CurrentState.PvpOpponent);
-        Assert.Contains("_d3_", exitSim.CurrentState.PvpOpponent!.PlayerLoadout?.accountId ?? "", StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(preSim.Events, e => e is GameSimEventCardSpawned);
+        Assert.DoesNotContain(preSim.Events, e => e is GameSimEventCardDealt);
+        Assert.DoesNotContain(preSim.Events, e => e is GameSimEventRunHourChanged);
+        Assert.DoesNotContain(preSim.Events, e => e is GameSimEventStateTransitioned);
+
+        Assert.DoesNotContain(secSim.Events, e => e is GameSimEventCardSpawned);
+        Assert.Contains(secSim.Events, e => e is GameSimEventStateTransitioned st && st.ToState == ERunState.Choice);
+        Assert.Contains(secSim.Events, e => e is GameSimEventRunHourChanged hr && hr.NewHour == 6u);
+        Assert.Contains(secSim.Events, e => e is GameSimEventCardDealt);
+        Assert.Equal(ERunState.Choice, secSim.CurrentState!.StateName);
+        Assert.Equal(6u, secSim.Run!.Hour);
+        Assert.NotEmpty(secSim.CurrentState.SelectionSet!);
+        Assert.NotNull(secSim.CurrentState.PvpOpponent);
+        Assert.Contains("_d3_", secSim.CurrentState.PvpOpponent!.PlayerLoadout?.accountId ?? "", StringComparison.OrdinalIgnoreCase);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -255,7 +262,7 @@ public sealed class Wave4A_ProtocolAndBareClientFuzzTests
         Assert.NotEmpty(run.SelectionSet);
         Assert.NotNull(run.CurrentPvpOpponent);
 
-        // 场景 B：Hour 5 选 Study (+2 离场 XP) 触发连升 2 级，同样全程保持 Hour < 6 并在升级结束后安全进入 Hour 6 PvP
+        // 场景 B：Hour 5 选 Study (+2 XP) 瞬发直跳并触发连升 2 级（不再落入空 Encounter 房间），同样全程保持 Hour < 6 并在升级结束后安全进入 Hour 6 PvP
         var (runStudy, engineStudy) = CreateStartedRun(
             hero: EHero.Vanessa,
             day: 3,
@@ -264,14 +271,14 @@ public sealed class Wave4A_ProtocolAndBareClientFuzzTests
             experience: xpPerLevel - 1,
             seed: 40106);
         var studyCard = InjectChoiceEncounter(runStudy, "ce38f4a2-f156-4082-b8ce-e8956c71fc0d");
-        Assert.Null(engineStudy.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(studyCard.InstanceId) }).Error);
-        Assert.Equal(ERunState.Encounter, runStudy.State);
         runStudy.PendingLevelUps = 1;
-        var studyExit = engineStudy.Handle(new ExitCurrentStateCommand());
-        Assert.Null(studyExit.Error);
+        var studySelect = engineStudy.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(studyCard.InstanceId) });
+        Assert.Null(studySelect.Error);
         Assert.Equal(ERunState.LevelUp, runStudy.State);
         Assert.Equal(5u, runStudy.Hour);
-        Assert.DoesNotContain(studyExit.Events, e => e is GameSimEventRunHourChanged);
+        Assert.DoesNotContain(studySelect.Events, e => e is GameSimEventRunHourChanged);
+        if (studySelect.SecondaryGameSimEvents != null)
+            Assert.DoesNotContain(studySelect.SecondaryGameSimEvents, e => e is GameSimEventRunHourChanged);
         int studyGuard = 0;
         while (runStudy.State != ERunState.Choice && studyGuard++ < 20)
         {
@@ -408,7 +415,6 @@ public sealed class Wave4A_ProtocolAndBareClientFuzzTests
             run.SelectionSet.Clear();
             var study = InjectChoiceEncounter(run, "ce38f4a2-f156-4082-b8ce-e8956c71fc0d");
             Assert.Null(engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(study.InstanceId) }).Error);
-            Assert.Null(engine.Handle(new ExitCurrentStateCommand()).Error);
 
             while (run.State == ERunState.LevelUp)
             {
@@ -502,7 +508,7 @@ public sealed class Wave4A_ProtocolAndBareClientFuzzTests
             // 每局推进至少跨完 Day 1..Day 3（含多场 PvE 与 PvP、商店、事件、升级），最多 45 步防死循环
             for (int step = 0; step < 45 && run.State is not (ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown) && run.Day <= 3; step++)
             {
-                // 1. 定期在 Hour 5 注入直效发卡事件（模拟 Day 3 Hour 5 选巧克力），压测无 Choice->Choice 软锁
+                // 1. 定期在 Hour 5 注入直效发卡事件（模拟 Day 3 Hour 5 选巧克力），压测官方瞬发拆包绝不落空房且无同包冲突
                 if (!injectedDirectAtHour5 && run.State == ERunState.Choice && run.Hour == 5 && run.Day == (uint)((runIdx % 3) + 1))
                 {
                     injectedDirectAtHour5 = true;
@@ -510,8 +516,11 @@ public sealed class Wave4A_ProtocolAndBareClientFuzzTests
                     var directOutcome = engine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(directCard.InstanceId) });
                     Assert.Null(directOutcome.Error);
                     VerifyBareClientPacketInvariants(run, directOutcome, clientState, clientHour, hoursInDay, runIdx, step, ref totalCombatsVerified);
-                    Assert.Equal(ERunState.Encounter, run.State);
-                    Assert.True(run.SelectionRules.CanExit);
+                    Assert.NotEqual(ERunState.Encounter, run.State);
+                    Assert.True(
+                        (run.State == ERunState.Choice && run.Hour == hoursInDay)
+                        || (run.State == ERunState.LevelUp && run.Hour < hoursInDay),
+                        $"Run #{runIdx} Hour 5 瞬发直效事件应直达 Hour {hoursInDay} Choice 或 Hour < {hoursInDay} LevelUp，实际 {run.State} H{run.Hour}");
                     clientState = run.State;
                     clientHour = run.Hour;
                     totalCommandsExecuted++;
@@ -644,7 +653,19 @@ public sealed class Wave4A_ProtocolAndBareClientFuzzTests
         if (outcome.CombatSpawnSim != null) simsToCheck.Add(outcome.CombatSpawnSim);
         if (outcome.CombatDespawnSim != null) simsToCheck.Add(outcome.CombatDespawnSim);
         if (outcome.CombatSpawnSim == null && outcome.CombatDespawnSim == null)
-            simsToCheck.Add(run.BuildFullGameSim(outcome.Events));
+        {
+            if (outcome.PreSplitGameSim != null && outcome.SecondaryGameSimEvents is { Count: > 0 })
+            {
+                simsToCheck.Add(outcome.PreSplitGameSim);
+                if (outcome.AdditionalPreSplitGameSims is { Count: > 0 })
+                    simsToCheck.AddRange(outcome.AdditionalPreSplitGameSims);
+                simsToCheck.Add(run.BuildFullGameSim(outcome.SecondaryGameSimEvents));
+            }
+            else
+            {
+                simsToCheck.Add(run.BuildFullGameSim(outcome.Events));
+            }
+        }
 
         ERunState trackingState = prevState;
         uint trackingHour = prevHour;
@@ -654,13 +675,12 @@ public sealed class Wave4A_ProtocolAndBareClientFuzzTests
             ERunState nextState = sim.CurrentState!.StateName;
             uint nextHour = sim.Run!.Hour;
 
-            // 不变量 1（#1 核心）：严禁 Choice -> Choice 同包携带 CardSpawned 或跨小时 CardDealt（防 PlayRevealAnimations skipped）
+            // 不变量 1（#1 核心）：单条 NetMessageGameSim 严禁在 Choice -> Choice 中同包混发 CardSpawned 与 CardDealt（防 PlayRevealAnimations skipped）
             bool hasSpawned = sim.Events.Any(e => e is GameSimEventCardSpawned);
             bool hasDealt = sim.Events.Any(e => e is GameSimEventCardDealt);
-            bool hourChanged = sim.Events.Any(e => e is GameSimEventRunHourChanged or GameSimEventRunDayChanged);
-            if (trackingState == ERunState.Choice && nextState == ERunState.Choice && (hasSpawned || (hasDealt && hourChanged)))
+            if (trackingState == ERunState.Choice && nextState == ERunState.Choice && hasSpawned && hasDealt)
             {
-                Assert.Fail($"Run#{runIdx} Step#{step}: 检测到致命 Choice -> Choice 冲突包 (hasSpawned={hasSpawned}, hasDealt={hasDealt}, hourChanged={hourChanged})");
+                Assert.Fail($"Run#{runIdx} Step#{step}: 检测到致命 Choice -> Choice 同包混发 CardSpawned + CardDealt");
             }
 
             // 不变量 2（#1 时钟门控）：严禁从 Hour < HoursInADay 推进直接落在非 Choice 态且 Hour == HoursInADay（防止 _waitForNewDayTransition 锁死）

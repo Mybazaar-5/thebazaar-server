@@ -429,6 +429,8 @@ public static class CombatSimConverter
         var passiveUseRecorded = new HashSet<(int TimeMs, string CardInstanceId, string ChainKey)>();
         bool sandstormCountdownEmitted = false;
         bool sandstormStartedEmitted = false;
+        int lastP1PercentDamageReduction = prevSnap?.P1PercentDamageReduction ?? 0;
+        int lastP2PercentDamageReduction = prevSnap?.P2PercentDamageReduction ?? 0;
         int tlIdx = 0;
         int evIdx = 0;
         var events = result.Events;
@@ -539,11 +541,39 @@ public static class CombatSimConverter
                 EnsureHealthAttributeSynced(frame.OpponentUpdates, prevSnap.P2Hp, curSnap.P2Hp);
             }
 
+            // 追踪双方 PercentDamageReduction（无敌/减伤）实时值，供战末清理归零防提前结束战斗时残留无敌特效
+            if (frame.PlayerUpdates?.Attributes.TryGetValue(EPlayerAttributeType.PercentDamageReduction, out var p1PdrUpd) == true)
+                lastP1PercentDamageReduction = p1PdrUpd.CurrentValue;
+            if (frame.OpponentUpdates?.Attributes.TryGetValue(EPlayerAttributeType.PercentDamageReduction, out var p2PdrUpd) == true)
+                lastP2PercentDamageReduction = p2PdrUpd.CurrentValue;
+
             // 3. 最后一帧：在 CombatSimEventCombatantDied 触发前完成全量战后清理（P1-04）：
             //    先归位瞬态视觉状态（关闭冰冻/飞行特效），再对战前不存在的战中动态新增属性发射 CombatSimEventCardAttributeDeleted，
             //    并对战前存在但被临时改动的非永久属性复原至战前基线值（完整保留真正的永久/当日/本小时战中成长属性）。
             if (isLastFrame)
             {
+                if (lastP1PercentDamageReduction != 0)
+                {
+                    frame.PlayerUpdates ??= new CombatSimPlayerUpdate();
+                    frame.PlayerUpdates.Attributes[EPlayerAttributeType.PercentDamageReduction] = new CombatSimPlayerAttributeUpdate
+                    {
+                        AttributeType = EPlayerAttributeType.PercentDamageReduction,
+                        PreviousValue = lastP1PercentDamageReduction,
+                        CurrentValue = 0,
+                    };
+                    lastP1PercentDamageReduction = 0;
+                }
+                if (lastP2PercentDamageReduction != 0)
+                {
+                    frame.OpponentUpdates ??= new CombatSimPlayerUpdate();
+                    frame.OpponentUpdates.Attributes[EPlayerAttributeType.PercentDamageReduction] = new CombatSimPlayerAttributeUpdate
+                    {
+                        AttributeType = EPlayerAttributeType.PercentDamageReduction,
+                        PreviousValue = lastP2PercentDamageReduction,
+                        CurrentValue = 0,
+                    };
+                    lastP2PercentDamageReduction = 0;
+                }
                 EmitCrossedMonsterRewards(frame, rewardTracker, result.Player2RemainingHp, forceFlushRemaining: true);
                 EmitPostCombatCleanupIntoFrame(frame, cardEntryByCoreId, result, repo);
 
@@ -947,6 +977,7 @@ public static class CombatSimConverter
         int p1RageDelta = 0, p2RageDelta = 0;
         int p1TempoDelta = 0, p2TempoDelta = 0;
         int p1JoyDelta = 0, p2JoyDelta = 0;
+        int p1PdrDelta = 0, p2PdrDelta = 0;
         int p1MaxHpDelta = 0, p2MaxHpDelta = 0;
         int p1HpNetDelta = 0, p2HpNetDelta = 0;
         bool p1EnragedAtStart = false, p2EnragedAtStart = false;
@@ -1012,6 +1043,10 @@ public static class CombatSimConverter
                             {
                                 if (isP1) { p1HpNetDelta += signedDelta; p1HasStartHpChange = true; }
                                 else { p2HpNetDelta += signedDelta; p2HasStartHpChange = true; }
+                            }
+                            else if (string.Equals(effectiveAttr, "PercentDamageReduction", StringComparison.OrdinalIgnoreCase) && signedDelta != 0)
+                            {
+                                if (isP1) p1PdrDelta += signedDelta; else p2PdrDelta += signedDelta;
                             }
                             break;
                         }
@@ -1082,6 +1117,7 @@ public static class CombatSimConverter
             P1Tempo = Math.Max(0, firstSnap.P1Tempo - p1TempoDelta),
             P1TempoGainCooldownMax = firstSnap.P1TempoGainCooldownMax,
             P1Joy = Math.Max(0, firstSnap.P1Joy - p1JoyDelta),
+            P1PercentDamageReduction = Math.Clamp(firstSnap.P1PercentDamageReduction - p1PdrDelta, 0, 100),
             P1PortraitIndex = p1EnragedAtStart ? 0 : firstSnap.P1PortraitIndex,
             P2Hp = p2InitHp,
             P2MaxHp = p2InitMaxHp,
@@ -1097,6 +1133,7 @@ public static class CombatSimConverter
             P2Tempo = Math.Max(0, firstSnap.P2Tempo - p2TempoDelta),
             P2TempoGainCooldownMax = firstSnap.P2TempoGainCooldownMax,
             P2Joy = Math.Max(0, firstSnap.P2Joy - p2JoyDelta),
+            P2PercentDamageReduction = Math.Clamp(firstSnap.P2PercentDamageReduction - p2PdrDelta, 0, 100),
             P2PortraitIndex = p2EnragedAtStart ? 0 : firstSnap.P2PortraitIndex,
             SandstormActive = firstSnap.SandstormActive,
             SandstormNextDamage = firstSnap.SandstormNextDamage,
@@ -2149,7 +2186,8 @@ public static class CombatSimConverter
         EPlayerAttributeType.EnragedDurationMax or
         EPlayerAttributeType.Tempo or
         EPlayerAttributeType.TempoGainCooldownMax or
-        EPlayerAttributeType.Joy;
+        EPlayerAttributeType.Joy or
+        EPlayerAttributeType.PercentDamageReduction;
 
     private static void HandleCardUpgradedEvent(
         CombatSim sim,
@@ -2847,6 +2885,7 @@ public static class CombatSimConverter
             Check(EPlayerAttributeType.Tempo, prev.P1Tempo, cur.P1Tempo);
             Check(EPlayerAttributeType.TempoGainCooldownMax, prev.P1TempoGainCooldownMax, cur.P1TempoGainCooldownMax);
             Check(EPlayerAttributeType.Joy, prev.P1Joy, cur.P1Joy);
+            Check(EPlayerAttributeType.PercentDamageReduction, prev.P1PercentDamageReduction, cur.P1PercentDamageReduction);
             prevPortraitIdx = prev.P1PortraitIndex;
             curPortraitIdx = cur.P1PortraitIndex;
         }
@@ -2866,6 +2905,7 @@ public static class CombatSimConverter
             Check(EPlayerAttributeType.Tempo, prev.P2Tempo, cur.P2Tempo);
             Check(EPlayerAttributeType.TempoGainCooldownMax, prev.P2TempoGainCooldownMax, cur.P2TempoGainCooldownMax);
             Check(EPlayerAttributeType.Joy, prev.P2Joy, cur.P2Joy);
+            Check(EPlayerAttributeType.PercentDamageReduction, prev.P2PercentDamageReduction, cur.P2PercentDamageReduction);
             prevPortraitIdx = prev.P2PortraitIndex;
             curPortraitIdx = cur.P2PortraitIndex;
         }

@@ -605,23 +605,17 @@ public sealed class AuditWave2EncountersTests
             Assert.True(checkShop.HasPlayableEncounterPayload(tpl!), $"直效/纯 XP 遭遇 {directId} ({tpl!.InternalName}) 应通过 HasPlayableEncounterPayload");
         }
 
-        // 3. Wave 4A #1 架构根治同步更新：选中 Study (Default Option) 与 Borrow (Day 1-2) 等直效/纯 XP 事件遭遇后，
-        //    先立刻执行直效动作并安全落地 ERunState.Encounter（CanExit=true，避免同包 Choice -> Choice 绕过客户端沙尘门控软锁），
-        //    随后玩家点击 ExitEncounterCommand 离场结算延迟 XP 并推进至下一小时 Choice 且候选项非空。
+        // 3. 对齐官方瞬发直效奇遇交互（BoardManager._currentEncounterIsInstant）：选中 Study / Borrow 等无 SelectionContext
+        //    与 NextEncounterOnSelection 的直效事件后，立刻结算直效与 XP 并直接由 Choice 推进至下一小时 Choice，绝不落地进空 Encounter 房间。
         {
             var (runStudy, engineStudy) = CreateStartedRun(day: 1, hour: 1, seed: 16001);
             int xpBefore = runStudy.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0);
             var studyEnc = InjectChoiceEncounter(runStudy, "ce38f4a2-f156-4082-b8ce-e8956c71fc0d");
             var outcome = engineStudy.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(studyEnc.InstanceId) });
             Assert.Null(outcome.Error);
-            Assert.Equal(ERunState.Encounter, runStudy.State);
-            Assert.True(runStudy.SelectionRules.CanExit);
-            Assert.Equal(2, runStudy.PendingEncounterExitXp);
-
-            var exitOutcome = engineStudy.Handle(new ExitCurrentStateCommand());
-            Assert.Null(exitOutcome.Error);
             Assert.Equal(ERunState.Choice, runStudy.State);
             Assert.Equal(2u, runStudy.Hour);
+            Assert.Equal(0, runStudy.PendingEncounterExitXp);
             Assert.Equal(xpBefore + 2, runStudy.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0));
             Assert.NotEmpty(runStudy.SelectionSet);
         }
@@ -632,15 +626,11 @@ public sealed class AuditWave2EncountersTests
             var borrowEnc = InjectChoiceEncounter(runBorrow, "036ce025-fc8a-4924-b1bd-a4f6f470ebc7");
             var outcome = engineBorrow.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(borrowEnc.InstanceId) });
             Assert.Null(outcome.Error);
-            Assert.Equal(ERunState.Encounter, runBorrow.State);
-            Assert.True(runBorrow.SelectionRules.CanExit);
-            Assert.True(runBorrow.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0) > goldBefore, "Borrow (Day 1-2) 选中后应立刻执行 TTriggerOnCardSelected 发放金币");
-
-            var exitOutcome = engineBorrow.Handle(new ExitCurrentStateCommand());
-            Assert.Null(exitOutcome.Error);
             Assert.Equal(ERunState.Choice, runBorrow.State);
             Assert.Equal(2u, runBorrow.Hour);
+            Assert.True(runBorrow.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Gold, 0) > goldBefore, "Borrow (Day 1-2) 选中后应立刻执行 TTriggerOnCardSelected 发放金币");
             Assert.Equal(xpBefore + 1, runBorrow.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Experience, 0));
+            Assert.NotEmpty(runBorrow.SelectionSet);
         }
     }
 
@@ -758,10 +748,14 @@ public sealed class AuditWave2EncountersTests
         Assert.Equal("3b249f86c639545b784d8c699cc6edd1", restored.CurrentBoardId);
         Assert.Equal("3b249f86c639545b784d8c699cc6edd1", restored.BuildSnapshot().CurrentState?.Board);
 
-        // 3. 离开探险（Hour 5 退出替换集）复位 CurrentBoardId=null 并同包发射 GameSimEventBoardOverridden(null, null)
+        // 3. 离开探险（Hour 5 仍在 Ethergy Nexus 替换集内，Hour 6 PvP 退出替换集）复位 CurrentBoardId=null 并同包发射 GameSimEventBoardOverridden(null, null)
         run.Hour = 5;
         run.ActiveReplacementSetId = CardPool.ReplacementSetTinyWorldId;
         var shop = new ShopEngine(run, Pool.Value, Repo.Value, run.CustomRules);
+        shop.DealHourEncounters();
+        Assert.Equal("3b249f86c639545b784d8c699cc6edd1", run.CurrentBoardId);
+
+        run.Hour = 6;
         var exitEvents = shop.DealHourEncounters();
         Assert.Null(run.CurrentBoardId);
         Assert.Null(run.BuildSnapshot().CurrentState?.Board);
@@ -897,12 +891,13 @@ public sealed class AuditWave2EncountersTests
         }
     }
 
-    // ── P1-23：Tiny World Expedition Day 10 严格时间表（H2 Where am I? / H3 仅 Bananniboss / H4 Ethergy Nexus / H5 退出） ──
+    // ── P1-23：Tiny World Expedition Day 10 严格时间表（H2 Where am I? / H3 Sprout / H4 Bananniboss / H5 Ethergy Nexus / H6 退出） ──
 
     [Fact]
-    public void P1_23_TinyWorldExpedition_StrictSchedule_H2WhereAmI_H3BanannibossOnly_H4EthergyNexus()
+    public void P1_23_TinyWorldExpedition_StrictSchedule_H2WhereAmI_H3Sprout_H4Bananniboss_H5EthergyNexus()
     {
         var whereAmIGuid = Guid.Parse("875caea4-93c5-440b-a9fd-2886eeaa0fc5");
+        var sproutGuid = Guid.Parse(CardPool.SproutEncounterId);
         var banannibossGuid = Guid.Parse("1a3f7d6a-3f24-42dc-ba27-9d4bf199d0b8");
         var barnacleBigwigGuid = Guid.Parse("9f8fa7f6-c322-4ff6-b81f-c379305b97f4");
         var ethergyNexusGuid = Guid.Parse("f418a73c-d442-4ee1-aa7f-ec43f0418d9f");
@@ -919,27 +914,35 @@ public sealed class AuditWave2EncountersTests
         Assert.Single(run.SelectionSet);
         Assert.Equal(whereAmIGuid, run.Cards[run.SelectionSet[0]].TemplateId);
 
-        // H3 -> 仅 [Tiny World Expedition] Bananniboss，绝不误发 Barnacle Bigwig
+        // H3 -> Sprout（微型世界专属免费物品池，绝不误发 Barnacle Bigwig）
         run.Hour = 3;
+        shop.DealHourEncounters();
+        Assert.Single(run.SelectionSet);
+        Assert.Equal(sproutGuid, run.Cards[run.SelectionSet[0]].TemplateId);
+        Assert.DoesNotContain(run.SelectionSet, id => run.Cards[id].TemplateId == barnacleBigwigGuid);
+
+        // H4 -> 仅 [Tiny World Expedition] Bananniboss，绝不误发 Barnacle Bigwig
+        run.Hour = 4;
         shop.DealHourEncounters();
         Assert.Single(run.SelectionSet);
         Assert.Equal(banannibossGuid, run.Cards[run.SelectionSet[0]].TemplateId);
         Assert.DoesNotContain(run.SelectionSet, id => run.Cards[id].TemplateId == barnacleBigwigGuid);
 
-        // H4 -> Ethergy Nexus
-        run.Hour = 4;
+        // H5 -> Ethergy Nexus（最终充能事件，绝不提前退回常规 3 选遭遇）
+        run.Hour = 5;
         shop.DealHourEncounters();
         Assert.Single(run.SelectionSet);
         Assert.Equal(ethergyNexusGuid, run.Cards[run.SelectionSet[0]].TemplateId);
+        Assert.Equal(CardPool.ReplacementSetTinyWorldId, run.ActiveReplacementSetId);
 
-        // H5 -> 自然退出替换集、复位棋盘并恢复常规 3 选遭遇
-        run.Hour = 5;
-        var h5Events = shop.DealHourEncounters();
+        // H6 -> 自然退出替换集、复位棋盘并进入当日 PvP
+        run.Hour = 6;
+        var h6Events = shop.DealHourEncounters();
         Assert.Null(run.ActiveReplacementSetId);
         Assert.Null(run.ActiveExpeditionId);
         Assert.Null(run.CurrentBoardId);
-        Assert.Contains(h5Events, e => e is GameSimEventBoardOverridden bo && bo.Board == null && bo.Presentation == null);
-        Assert.Equal(3, run.SelectionSet.Count);
+        Assert.Contains(h6Events, e => e is GameSimEventBoardOverridden bo && bo.Board == null && bo.Presentation == null);
+        Assert.Single(run.SelectionSet);
     }
 
     // ── P1-24：Crash Site Expedition Day 6 严格线性时间表（H2 晶核 -> H3 三 Boss -> H4 Command Nexus -> H5 Cargo Hold） ──

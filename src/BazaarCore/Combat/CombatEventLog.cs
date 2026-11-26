@@ -242,6 +242,7 @@ public sealed class CombatTickState
     public int P1Tempo { get; init; }
     public int P1TempoGainCooldownMax { get; init; }
     public int P1Joy { get; init; }
+    public int P1PercentDamageReduction { get; init; }
     public int P1PortraitIndex { get; init; }
 
     public int P2Hp { get; init; }
@@ -258,6 +259,7 @@ public sealed class CombatTickState
     public int P2Tempo { get; init; }
     public int P2TempoGainCooldownMax { get; init; }
     public int P2Joy { get; init; }
+    public int P2PercentDamageReduction { get; init; }
     public int P2PortraitIndex { get; init; }
 
     public bool SandstormActive { get; init; }

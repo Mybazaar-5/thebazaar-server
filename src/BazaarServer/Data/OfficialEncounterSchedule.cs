@@ -277,6 +277,13 @@ public static class OfficialEncounterSchedule
         return EOfficialEncounterSlot.MiddleEvent;
     }
 
+    /// <summary>判断是否为 Partner Portal 动态解锁的 8 座英雄升级子基座（Day 2–10+ 入中槽基座池）。</summary>
+    public static bool IsPartnerPortalUpgradePedestal(CardPool.CardTemplate? tpl)
+        => tpl != null
+        && string.Equals(tpl.Type, "PedestalEncounter", StringComparison.OrdinalIgnoreCase)
+        && !string.IsNullOrWhiteSpace(tpl.InternalName)
+        && tpl.InternalName.StartsWith("Partner Portal - Forja", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
     /// 计算指定遭遇在指定天数的单小时抽签权重：
     /// 采用 Plackett-Luce 一阶精确 Hazard 变换 <c>w = -ln(1 - min(p, 0.96))</c>，
@@ -285,6 +292,11 @@ public static class OfficialEncounterSchedule
     public static double GetEmpiricalDrawWeight(CardPool.CardTemplate? tpl, int day, double fallbackWeight = 1.0)
     {
         if (tpl == null) return fallbackWeight;
+        if (IsPartnerPortalUpgradePedestal(tpl))
+        {
+            // Partner Portal - Forja 子基座按日级参考概率 4.5% 折算 Hazard 权重，避免回退 1.0 挤占 B1&B2 / Forja / The Artist
+            return day >= 2 ? -Math.Log(1.0 - 0.045) : 0.0;
+        }
         if (!TryGetRule(tpl, out var rule) || rule == null || rule.DailyOfferedPct.Length == 0)
             return fallbackWeight;
 
@@ -309,11 +321,12 @@ public static class OfficialEncounterSchedule
     /// <summary>
     /// 根据当前剩余未访问的合法常规地图基座列表，动态折算本小时中槽刷出基座的触发概率：
     /// <c>p_hour = 1 - (1 - sum(DailyOfferedPct[day]))^(1/4)</c>。
-    /// 彻底避免 Day 8 抽走 Sterling 后剩余小时仍用 24.8% 高概率强刷 The Artist（使 Artist 精确保持 ~1.8%）。
+    /// 彻底避免 Day 8 抽走 Sterling 后剩余小时仍用 24.8% 高概率强刷 The Artist（使 Artist 精确保持 ~1.8%），
+    /// 并允许 Day 2 动态解锁的 Partner Portal - Forja 子基座正常出池。
     /// </summary>
     public static double ComputeDynamicMiddlePedestalHourChance(IReadOnlyList<CardPool.CardTemplate> remainingPedestals, int day)
     {
-        if (remainingPedestals == null || remainingPedestals.Count == 0 || day <= 2)
+        if (remainingPedestals == null || remainingPedestals.Count == 0 || day <= 1)
             return 0.0;
 
         double sumPct = 0.0;
@@ -324,10 +337,16 @@ public static class OfficialEncounterSchedule
             {
                 sumPct += Math.Max(0.0, rule.DailyOfferedPct[idx]);
             }
+            else if (IsPartnerPortalUpgradePedestal(ped))
+            {
+                if (day >= 2)
+                    sumPct += 4.5;
+            }
             else
             {
-                // 自定义 Mod 基座默认给 5% 日级参考概率
-                sumPct += 5.0;
+                // 自定义 Mod 基座默认给 5% 日级参考概率（仅 Day 3+ 常规基座日窗起）
+                if (day >= 3)
+                    sumPct += 5.0;
             }
         }
         if (sumPct <= 0.0) return 0.0;

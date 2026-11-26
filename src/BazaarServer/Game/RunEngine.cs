@@ -236,9 +236,11 @@ public sealed class RunEngine
         public bool AppendStateSyncAtTail { get; set; }
         /// <summary>需要临时附带到本帧 GameSim.Cards 的瞬态卡牌（如技能融合源卡 Placement(Owner=Player)）。</summary>
         public List<RunState.CardEntry> ExtraSimCards { get; } = new();
-        /// <summary>P2-32：Pedestal 链式跳转（NextEncounterOnExit -> Encounter/Pedestal）时的第一帧 GameSim 快照（仅含祭坛结算事件，不含下一跳 StateTransitioned）。</summary>
+        /// <summary>P2-32：Pedestal 链式跳转（NextEncounterOnExit -> Encounter/Pedestal）或产卡拆包时的第一帧 GameSim 快照。</summary>
         public GameSim? PreSplitGameSim { get; set; }
-        /// <summary>P2-32：Pedestal 链式跳转时的第二帧事件流（由 GameServerEndpoints 包装为独立第二条 NetMessageGameSim）。</summary>
+        /// <summary>多段拆包时位于 PreSplitGameSim 与 SecondaryGameSimEvents 之间的附加中间帧快照（如直效产卡后紧接 OnHourStarted 再次产卡）。</summary>
+        public List<GameSim>? AdditionalPreSplitGameSims { get; set; }
+        /// <summary>P2-32：拆包后的尾帧事件流（由 GameServerEndpoints 包装为独立尾条 NetMessageGameSim）。</summary>
         public List<IGameSimEvent>? SecondaryGameSimEvents { get; set; }
     }
 
@@ -2375,6 +2377,58 @@ public sealed class RunEngine
             return;
         }
 
+        // 2. 官方瞬发直效/纯 XP 事件遭遇（无 SpawnContext 与 NextEncounterOnSelection，含 TTriggerOnCardSelected 或 ExperienceAwardUponSelection > 0）：
+        //    如 Candy Stash（给巧克力）/ Cache of Riches（给 5 金币）/ Borrow / Look for Spare Change / Trophy Hunt / Invest in Yourself / Study / Snack Time 等。
+        //    对齐官方客户端 BoardManager._currentEncounterIsInstant = (PreviousState is ChoiceState && (CurrentState is ChoiceState || LevelUpState))：
+        //    绝不落地进空 ERunState.Encounter 房间，也不将奇遇卡移入顶栏肖像槽；
+        //    若直效动作产出了发卡（CardSpawned，如巧克力），经 ExecutePostActionTransitionWithSplit 自动拆为两包：
+        //      - 包 1（PreSplitGameSim）：仅落地 CardSpawned 与属性同步（仍处原 Choice，无 CardDealt / 无 StateTransitioned）；
+        //      - 包 2（SecondaryGameSim）：CardPurchased + 清旧 Choice 货架 + 结算 XP + StateTransitioned(Choice/LevelUp) + 下一小时 CardDealt（无 CardSpawned），
+        //    既 100% 还原官方丝滑瞬发体验，又彻底杜绝同包混发 CardSpawned + CardDealt 导致的 PlayRevealAnimations skipped。
+        if (cardType == ECardType.EventEncounter)
+        {
+            bool hasSpawnCtx = (coreTpl?.SelectionContext?.SpawnContext ?? tpl?.SelectionContext?.SpawnContext) != null;
+            bool hasNextEnc = (coreTpl?.NextEncounterOnSelection is { Count: > 0 })
+                           || (tpl?.NextEncounterOnSelection is { Count: > 0 });
+            bool hasDirectCardSelected = coreTpl?.Abilities.Values.Any(a =>
+                a.Trigger != null &&
+                string.Equals(a.Trigger.Type, "TTriggerOnCardSelected", StringComparison.OrdinalIgnoreCase)) == true;
+            int directXp = Math.Max(0, coreTpl?.ExperienceAwardUponSelection ?? tpl?.ExperienceAwardUponSelection ?? 0);
+
+            if (!hasSpawnCtx && !hasNextEnc && (hasDirectCardSelected || directXp > 0))
+            {
+                // 保持原 Choice 态 CurrentEncounterId = null，确保拆包时的包 1（PreSplitGameSim）状态纯粹不闪现顶栏奇遇肖像
+                _run.CurrentEncounterId = null;
+                RecalculateAurasAndSyncBoard(o.Events);
+                ReconcileAndVerifyBoardInvariants("InstantEncounterPreTransition", o.DirtyCardIds, o.Events);
+
+                ExecutePostActionTransitionWithSplit(o, next =>
+                {
+                    if (selectedCard != null)
+                    {
+                        _run.SelectionSet.Remove(selectedCard.InstanceId);
+                        next.Events.Add(new GameSimEventCardPurchased(
+                            selectedCard.InstanceId,
+                            0u,
+                            null,
+                            null,
+                            null));
+                        if (_run.Cards.Remove(selectedCard.InstanceId))
+                            next.Events.Add(new GameSimEventCardDisposed(selectedCard.InstanceId, ECardDisposalReason.Cleared));
+                    }
+
+                    _run.PendingEncounterExitXp = directXp;
+                    FlushPendingEncounterExitXp(next.Events);
+                    _run.CurrentEncounterCoreCard = null;
+                    _run.CurrentEncounterId = null;
+                    _run.ParentEncounterTemplateId = null;
+                    next.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: false));
+                    ExitEncounterOrAdvance(next, nextOnExit: null, exitingRootId: encId, exitingStepId: encId);
+                });
+                return;
+            }
+        }
+
         // 服务端 #19：进入根级 EventEncounter / PedestalEncounter 时记录 ParentEncounterTemplateId；
         // 进入子级 EncounterStep 时保留既有的 ParentEncounterTemplateId，并将 Socket_5 头像卡持续锚定在父级遭遇模板，
         // 避免客户端 EncounterController/BoardManager 因找不到 EncounterStep 肖像而清屏。
@@ -2389,7 +2443,7 @@ public sealed class RunEngine
                 : selectedCard;
         ActivateEncounterCard(portraitAnchorId, anchorSelectedCard, o.Events, emitPurchaseIfSelected: anchorSelectedCard != null);
 
-        // 2. 升阶/附魔基座 → 进入 PedestalState（经验延迟到离场结算，且禁止进门同帧抢跳 LevelUp，修复 Bug #12/#16）
+        // 3. 升阶/附魔基座 → 进入 PedestalState（经验延迟到离场结算，且禁止进门同帧抢跳 LevelUp，修复 Bug #12/#16）
         if (cardType == ECardType.PedestalEncounter)
         {
             o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: true));
@@ -2414,61 +2468,6 @@ public sealed class RunEngine
             o.Events.Add(new GameSimEventStateTransitioned(ERunState.Pedestal, _run.CurrentEncounterId));
             TriggerOnEncounterEnteredAndDealt(encId, o.Events);
             return;
-        }
-
-        // 3. Wave 4A #1 架构根治：直效/纯 XP 事件遭遇（无 SpawnContext 与 NextEncounterOnSelection，含 TTriggerOnCardSelected 或 ExperienceAwardUponSelection > 0）
-        //    严禁在同包中跳过 Encounter 态直接 Choice -> Choice（会绕过客户端 TransitionOutComponent 的 VisualSequenceGate，导致
-        //    BoardManager: PlayRevealAnimations skipped (spawned=True / dealt=True)，在 Hour 5 -> Hour 6 更会永久锁死 _waitForNewDayTransition 致 PvP 空白与整板锁死）。
-        //    改为统一落地标准 ERunState.Encounter（保留顶栏事件肖像、CanExit=true、清空刷新态、延迟至离场结算 PendingEncounterExitXp），
-        //    使所有直效发卡（如 Candy Stash 巧克力入储物箱）与纯 XP/属性收益平稳展示，玩家点击离开后由 Encounter -> Choice 走原生沙尘门控安全翻牌。
-        if (cardType == ECardType.EventEncounter)
-        {
-            bool hasSpawnCtx = (coreTpl?.SelectionContext?.SpawnContext ?? tpl?.SelectionContext?.SpawnContext) != null;
-            bool hasNextEnc = (coreTpl?.NextEncounterOnSelection is { Count: > 0 })
-                           || (tpl?.NextEncounterOnSelection is { Count: > 0 });
-            bool hasDirectCardSelected = coreTpl?.Abilities.Values.Any(a =>
-                a.Trigger != null &&
-                string.Equals(a.Trigger.Type, "TTriggerOnCardSelected", StringComparison.OrdinalIgnoreCase)) == true;
-            int directXp = Math.Max(0, coreTpl?.ExperienceAwardUponSelection ?? tpl?.ExperienceAwardUponSelection ?? 0);
-
-            if (!hasSpawnCtx && !hasNextEnc && (hasDirectCardSelected || directXp > 0))
-            {
-                o.Events.AddRange(ClearShelfPreservingActiveEncounter(preserveActiveEncounter: true));
-                _run.State = ERunState.Encounter;
-                _run.CurrentEncounterId = encId;
-                _run.SelectionsMadeInCurrentContext = 0;
-                _run.CurrentMaxSelections = null;
-                _run.PendingEncounterExitXp = directXp;
-                _run.CurrentEncounterCoreCard = CreateEncounterCoreCard(encId);
-                _run.SelectionRules = new TSelectionContextRules
-                {
-                    CanSelectMultiple = false,
-                    SelectionIsFree = true,
-                    CanExit = true,
-                    RerollRules = null,
-                };
-                _run.BaseRerollCost = null;
-                _run.RerollCost = 0;
-                _run.RerollsRemaining = 0;
-
-                string? directBoardOverride = coreTpl?.BoardOverride ?? tpl?.BoardOverride;
-                string? directPresentation = coreTpl?.Presentation ?? tpl?.Presentation;
-                if (!string.IsNullOrWhiteSpace(directBoardOverride))
-                {
-                    _run.CurrentBoardId = directBoardOverride;
-                    o.Events.Add(new GameSimEventBoardOverridden(directBoardOverride, directPresentation));
-                }
-                else if (!string.IsNullOrWhiteSpace(_run.CurrentBoardId) && string.IsNullOrWhiteSpace(_run.ActiveReplacementSetId))
-                {
-                    ResetBoardOverrideIfNeeded(o.Events);
-                }
-
-                RecalculateAurasAndSyncBoard(o.Events);
-                ReconcileAndVerifyBoardInvariants("EnterDirectEncounter", o.DirtyCardIds, o.Events);
-                o.Events.Add(new GameSimEventStateTransitioned(ERunState.Encounter, ResolveClientTransitionEncounterId(encId)));
-                TriggerOnEncounterEnteredAndDealt(encId, o.Events);
-                return;
-            }
         }
 
         // 4. 商人 / 奇遇事件遭遇（及多步链式 EncounterStep）→ 进入 EncounterState 揭开迷雾并铺开真实选项
@@ -2695,7 +2694,7 @@ public sealed class RunEngine
         // 严禁在 Hour == 6 当场消费 PendingLevelUp 进入 LevelUp，改为先完成跨天（Day+1, Hour=1）再于新日首态安全消费！
         if (isExitingFates && _run.Hour >= (uint)_mode.HoursInADay && _run.SuspendedStates.Count == 0)
         {
-            ExecutePostActionTransitionWithSplit(o, next => AdvanceHourOrDay(next.Events, justCompletedPvp: true));
+            ExecutePostActionTransitionWithSplit(o, next => AdvanceHourOrDayCore(next.Events, justCompletedPvp: true, splitTarget: next));
             return o;
         }
 
@@ -2736,6 +2735,33 @@ public sealed class RunEngine
     /// 1) 阻断 BoardManager.SpawnCards 在 OnCardSpawned 与 OnCardDealt 同帧并发重入导致的技能栏克隆爆炸（P1-11）；
     /// 2) 阻断 LevelUp 选技（PlayerSkillEquipped）与跨小时（RunHourChanged->6）+ CardDealt 混包引发的 10.1s 时钟锁死（P1-12）。
     /// </summary>
+    private void AppendPreSplitSnapshot(Outcome target, List<IGameSimEvent> events, List<RunState.CardEntry>? extraCards = null)
+    {
+        var snap = _run.BuildFullGameSim(events, extraCards);
+        if (target.PreSplitGameSim == null)
+        {
+            target.PreSplitGameSim = snap;
+        }
+        else
+        {
+            target.AdditionalPreSplitGameSims ??= new List<GameSim>();
+            target.AdditionalPreSplitGameSims.Add(snap);
+        }
+    }
+
+    private void SplitPendingSpawnedBeforeDeal(List<IGameSimEvent> events, Outcome? splitTarget)
+    {
+        if (splitTarget == null || events.Count == 0)
+            return;
+        if (!events.Any(e => e is GameSimEventCardSpawned or GameSimEventPlayerSkillEquipped))
+            return;
+
+        AppendPreSplitSnapshot(splitTarget, events);
+        events.Clear();
+        if (ReferenceEquals(events, splitTarget.Events))
+            splitTarget.SecondaryGameSimEvents = events;
+    }
+
     private void ExecutePostActionTransitionWithSplit(Outcome o, Action<Outcome> transitionAction)
     {
         bool hasPreCardSpawned = o.Events.Any(e => e is GameSimEventCardSpawned);
@@ -2766,21 +2792,36 @@ public sealed class RunEngine
             return;
         }
 
-        bool nextHasCardDealt = nextOutcome.Events.Any(e => e is GameSimEventCardDealt);
-        bool nextHasHourOrDayAdvance = nextOutcome.Events.Any(e =>
-            e is GameSimEventRunHourChanged or GameSimEventRunDayChanged);
+        var tailEvents = nextOutcome.SecondaryGameSimEvents ?? nextOutcome.Events;
+        bool nextHasNestedSplit = nextOutcome.PreSplitGameSim != null;
+        bool nextHasCardDealt = tailEvents.Any(e => e is GameSimEventCardDealt)
+                             || nextOutcome.Events.Any(e => e is GameSimEventCardDealt);
+        bool nextHasHourOrDayAdvance = tailEvents.Any(e =>
+            e is GameSimEventRunHourChanged or GameSimEventRunDayChanged)
+            || nextOutcome.Events.Any(e =>
+                e is GameSimEventRunHourChanged or GameSimEventRunDayChanged);
         bool nextEndsInChoice = _run.State == ERunState.Choice;
 
-        bool shouldSplit = nextOutcome.Events.Count > 0 && (
+        bool shouldSplit = nextHasNestedSplit || (tailEvents.Count > 0 && (
             // P1-11：凡前置含 CardSpawned 且后段含 CardDealt 一律拆包，彻底禁止同包混发
             (hasPreCardSpawned && nextHasCardDealt)
             // P1-12：凡前置含 PlayerSkillEquipped 且后段跨小时/跨天发牌或切回 Choice 发牌一律拆包
-            || (hasPreSkillEquipped && nextHasCardDealt && (nextHasHourOrDayAdvance || nextEndsInChoice)));
+            || (hasPreSkillEquipped && nextHasCardDealt && (nextHasHourOrDayAdvance || nextEndsInChoice))));
 
         if (shouldSplit)
         {
             o.PreSplitGameSim = preSplitSnapshot;
-            o.SecondaryGameSimEvents = nextOutcome.Events;
+            if (nextOutcome.PreSplitGameSim != null)
+            {
+                o.AdditionalPreSplitGameSims ??= new List<GameSim>();
+                o.AdditionalPreSplitGameSims.Add(nextOutcome.PreSplitGameSim);
+            }
+            if (nextOutcome.AdditionalPreSplitGameSims is { Count: > 0 })
+            {
+                o.AdditionalPreSplitGameSims ??= new List<GameSim>();
+                o.AdditionalPreSplitGameSims.AddRange(nextOutcome.AdditionalPreSplitGameSims);
+            }
+            o.SecondaryGameSimEvents = tailEvents;
             foreach (string id in nextOutcome.DirtyCardIds) o.DirtyCardIds.Add(id);
             if (nextOutcome.ExtraSimCards.Count > 0) o.ExtraSimCards.AddRange(nextOutcome.ExtraSimCards);
             o.ForceStateSync |= nextOutcome.ForceStateSync;
@@ -2988,7 +3029,7 @@ public sealed class RunEngine
         if (!hasNextEnc && isExitingFates && _run.Hour >= (uint)_mode.HoursInADay && _run.SuspendedStates.Count == 0)
         {
             // P1-12：从 Fates 退出且处于 Hour >= HoursInADay 时先完成跨天（Day+1, Hour=1），绝不在 Hour == 6 直接进入 LevelUp
-            ExecutePostActionTransitionWithSplit(o, next => AdvanceHourOrDay(next.Events, justCompletedPvp: true));
+            ExecutePostActionTransitionWithSplit(o, next => AdvanceHourOrDayCore(next.Events, justCompletedPvp: true, splitTarget: next));
             return o;
         }
         // P1-11：若 TriggerOnEncounterExited 赐予了新技能/新卡，拆包隔离 CardSpawned 与下一阶段 CardDealt
@@ -3085,7 +3126,7 @@ public sealed class RunEngine
             if (_run.Hour >= (uint)_mode.HoursInADay &&
                 (HasCompletedPvpForCurrentDay() || !RequiresPvpOnDay(_run.Day) || IsFatesEncounter(rootEncId) || IsFatesEncounter(currentEncId)))
             {
-                AdvanceHourOrDay(o.Events, justCompletedPvp: true);
+                AdvanceHourOrDayCore(o.Events, justCompletedPvp: true, splitTarget: o);
                 return;
             }
             // 先压入空 Choice 快照再进入升级：升级完成后回到当前小时重新发牌，绝不误跨下一小时
@@ -3097,9 +3138,12 @@ public sealed class RunEngine
         o.Events.AddRange(DealHourEncountersAndClearActive());
     }
 
-    private void AdvanceAfterSubState(Outcome o) => AdvanceAfterSubStateToEvents(o.Events);
+    private void AdvanceAfterSubState(Outcome o) => AdvanceAfterSubStateToEventsCore(o.Events, splitTarget: o);
 
     private void AdvanceAfterSubStateToEvents(List<IGameSimEvent> events)
+        => AdvanceAfterSubStateToEventsCore(events, splitTarget: null);
+
+    private void AdvanceAfterSubStateToEventsCore(List<IGameSimEvent> events, Outcome? splitTarget)
     {
         if (_run.PendingLevelUp)
         {
@@ -3258,7 +3302,7 @@ public sealed class RunEngine
         {
             _run.PendingAdvanceHourAfterLevelUp = false;
         }
-        AdvanceHourOrDay(events);
+        AdvanceHourOrDayCore(events, justCompletedPvp: false, splitTarget: splitTarget);
         EmitPostLevelUpSocketsUnlockedIfNeeded(prevSubState, events);
     }
 
@@ -4756,7 +4800,7 @@ public sealed class RunEngine
         }
     }
 
-    private void AdvanceHour(Outcome o) => AdvanceHourOrDay(o.Events);
+    private void AdvanceHour(Outcome o) => AdvanceHourOrDayCore(o.Events, justCompletedPvp: false, splitTarget: o);
 
     private void AdvanceHourToEvents(List<IGameSimEvent> events) => AdvanceHourOrDay(events);
 
@@ -4786,6 +4830,9 @@ public sealed class RunEngine
     }
 
     private void AdvanceHourOrDay(List<IGameSimEvent> events, bool justCompletedPvp = false)
+        => AdvanceHourOrDayCore(events, justCompletedPvp, splitTarget: null);
+
+    private void AdvanceHourOrDayCore(List<IGameSimEvent> events, bool justCompletedPvp, Outcome? splitTarget)
     {
         // 1. 切小时前清理 UntilEndOfHour 临时层并回写同步事件
         ClearHourModifiersOnRun(events);
@@ -4809,6 +4856,7 @@ public sealed class RunEngine
             if (_run.PendingLevelUp)
             {
                 _run.PendingAdvanceHourAfterLevelUp = true;
+                SplitPendingSpawnedBeforeDeal(events, splitTarget);
                 ConsumeNextPendingLevelUpToEvents(events);
                 return;
             }
@@ -4839,6 +4887,7 @@ public sealed class RunEngine
             if (_run.PendingLevelUp)
             {
                 _run.PendingAdvanceHourAfterLevelUp = true;
+                SplitPendingSpawnedBeforeDeal(events, splitTarget);
                 ConsumeNextPendingLevelUpToEvents(events);
                 return;
             }
@@ -4988,12 +5037,34 @@ public sealed class RunEngine
             _run.Hour = prevHourBeforeAdvance;
             _run.GainedAdvanceHourXpThisHour = true;
             _run.PendingAdvanceHourAfterLevelUp = true;
+            SplitPendingSpawnedBeforeDeal(events, splitTarget);
             ConsumeNextPendingLevelUpToEvents(events);
             return;
         }
 
-        events.Add(new GameSimEventRunHourChanged(_run.Hour));
-        events.AddRange(hourEffects);
+        // 系统性拆包守卫：若 OnDayStarted / OnHourStarted（如 Fishing Rod / Shovel / Port / Book of Secrets）
+        // 在本小时切换前已发射 CardSpawned / PlayerSkillEquipped，在下发新小时 CardDealt（或 LevelUp）前先切出独立帧，
+        // 彻底杜绝任何 Choice -> Choice / LevelUp 路径同包混发 CardSpawned + CardDealt；
+        // 且对于非跨天推进，切出前置衍生卡帧时暂保 prevHourBeforeAdvance、将 RunHourChanged(targetHour) 留在第二包与 CardDealt 同发，
+        // 既避免时钟提前跳动空货架，更彻底杜绝非 Choice 态（如 LevelUp/Encounter/Loot/Pedestal）提前出现 Hour == HoursInADay 导致裸端死锁。
+        bool hasPendingSpawnBeforeDeal =
+            events.Any(e => e is GameSimEventCardSpawned or GameSimEventPlayerSkillEquipped) ||
+            hourEffects.Any(e => e is GameSimEventCardSpawned or GameSimEventPlayerSkillEquipped);
+        if (!newDay && hasPendingSpawnBeforeDeal && splitTarget != null)
+        {
+            uint targetHour = _run.Hour;
+            _run.Hour = prevHourBeforeAdvance;
+            events.AddRange(hourEffects);
+            SplitPendingSpawnedBeforeDeal(events, splitTarget);
+            _run.Hour = targetHour;
+            events.Add(new GameSimEventRunHourChanged(_run.Hour));
+        }
+        else
+        {
+            events.Add(new GameSimEventRunHourChanged(_run.Hour));
+            events.AddRange(hourEffects);
+            SplitPendingSpawnedBeforeDeal(events, splitTarget);
+        }
 
         // 4. 若小时推进时升级经验足够，先把新小时的 Choice 现场压入 SuspendedStates 再进入 LevelUp，
         //    确保升级结束后恢复至新小时 Choice；Day 6/9/10 Hour 1 持对应探险门票时直接在 Choice 下发第 4 张探险入口卡。
@@ -5526,7 +5597,17 @@ public sealed class RunEngine
                 o.PreSplitGameSim = _run.BuildFullGameSim(o.Events, preExtraCards);
                 var chainedOutcome = new Outcome();
                 ExitEncounterOrAdvance(chainedOutcome, nextOnExit, exitingRootId, exitingStepId);
-                o.SecondaryGameSimEvents = chainedOutcome.Events;
+                if (chainedOutcome.PreSplitGameSim != null)
+                {
+                    o.AdditionalPreSplitGameSims ??= new List<GameSim>();
+                    o.AdditionalPreSplitGameSims.Add(chainedOutcome.PreSplitGameSim);
+                }
+                if (chainedOutcome.AdditionalPreSplitGameSims is { Count: > 0 })
+                {
+                    o.AdditionalPreSplitGameSims ??= new List<GameSim>();
+                    o.AdditionalPreSplitGameSims.AddRange(chainedOutcome.AdditionalPreSplitGameSims);
+                }
+                o.SecondaryGameSimEvents = chainedOutcome.SecondaryGameSimEvents ?? chainedOutcome.Events;
                 return o;
             }
         }

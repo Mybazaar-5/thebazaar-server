@@ -348,13 +348,18 @@ public static class GameServerEndpoints
         if (outcome.PreSplitGameSim != null && outcome.SecondaryGameSimEvents is { Count: > 0 })
         {
             isPureBoardMove = false;
-            // P2-32：存在 Pedestal NextEncounterOnExit 跳往 Encounter / Pedestal 时，拆分为两条独立 NetMessageGameSim，
-            // 避免客户端 PedestalState 在同一条 GameSim 中吞并 StateTransitioned 并强清 CurrentEncounterId。
+            // P2-32 & 多段拆包守卫：依序发送 PreSplitGameSim -> AdditionalPreSplitGameSims -> SecondaryGameSimEvents，
+            // 避免 Pedestal 链式跳转被吞并，且确保 CardSpawned/PlayerSkillEquipped 与 CardDealt 永不同包混发。
             var splitList = new List<INetMessage>
             {
                 new NetMessageGameSim(outcome.PreSplitGameSim),
-                new NetMessageGameSim(run.BuildFullGameSim(outcome.SecondaryGameSimEvents)),
             };
+            if (outcome.AdditionalPreSplitGameSims is { Count: > 0 })
+            {
+                foreach (var extraPre in outcome.AdditionalPreSplitGameSims)
+                    splitList.Add(new NetMessageGameSim(extraPre));
+            }
+            splitList.Add(new NetMessageGameSim(run.BuildFullGameSim(outcome.SecondaryGameSimEvents)));
             if (outcome.Combat != null) splitList.Add(new NetMessageCombatSim(outcome.Combat));
             if ((outcome.ForceStateSync || outcome.AppendStateSyncAtTail) &&
                 run.State is not (ERunState.Combat or ERunState.PVPCombat or ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown))

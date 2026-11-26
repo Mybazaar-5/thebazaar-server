@@ -303,13 +303,10 @@ public sealed class V9ScheduleXpPvpTests
         Assert.Equal(2, run.PlayerAttributes[EPlayerAttributeType.Level]);
         Assert.Equal(3, run.PlayerAttributes[EPlayerAttributeType.Experience]);
 
-        // 2b. P0-1 / P0-16 单份经验与直效规范落地校验（Wave 4A #1 裸端防软锁）：Study (xp=2, 无 SpawnContext) 选中先落地 Encounter(CanExit=true)，退出后推进至 Hour==2 Choice 且 XP==3+2=5；Aldric (xp=1) + Exploit (xp=1 同小时去重) = 3+1=4
+        // 2b. P0-1 / P0-16 单份经验与官方瞬发直效校验：Study (xp=2, 无 SpawnContext) 选中直接免空房间瞬发推进至 Hour==2 Choice 且 XP==3+2=5；Aldric (xp=1) + Exploit (xp=1 同小时去重) = 3+1=4
         var (studyRun, studyEngine) = CreateStartedEngine(fx.Pool, fx.Monsters, fx.LevelUps, fx.Mode, fx.Repo, fx.Ghosts);
         var studyOpt = InjectChoiceEncounter(studyRun, fx.Pool, StudyDefaultEventId);
         Assert.Null(studyEngine.Handle(new SelectEncounterCommand { InstanceId = new InstanceId(studyOpt.InstanceId) }).Error);
-        Assert.Equal(ERunState.Encounter, studyRun.State);
-        Assert.True(studyRun.SelectionRules.CanExit);
-        Assert.Null(studyEngine.Handle(new ExitCurrentStateCommand()).Error);
         Assert.Equal(ERunState.Choice, studyRun.State);
         Assert.Equal(2u, studyRun.Hour);
         Assert.Equal(5, studyRun.PlayerAttributes[EPlayerAttributeType.Experience]);

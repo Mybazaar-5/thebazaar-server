@@ -537,7 +537,17 @@ public sealed class V10RunAndTournamentSyncTests
         Assert.True(RunSnapshotSerializer.TryDeserialize(snap, ov.Repo, out var resumed, out _));
         Assert.Contains(resumed!.Cards.Values, c => c.Owner == ECombatantId.Player && c.Type == ECardType.Skill);
 
-        // 直接验证非 PvP 路径退出可退出商店触发 AdvanceHourOrDay 跨天：当回合事件流必定包含 GameSimEventCardSpawned + GameSimEventPlayerSkillEquipped
+        static List<IGameSimEvent> CollectAllWireEvents(RunEngine.Outcome o)
+        {
+            var list = new List<IGameSimEvent>();
+            if (o.PreSplitGameSim != null) list.AddRange(o.PreSplitGameSim.Events);
+            if (o.AdditionalPreSplitGameSims is { Count: > 0 })
+                foreach (var s in o.AdditionalPreSplitGameSims) list.AddRange(s.Events);
+            list.AddRange(o.SecondaryGameSimEvents ?? o.Events);
+            return list;
+        }
+
+        // 直接验证非 PvP 路径退出可退出商店触发 AdvanceHourOrDay 跨天：跨天产出的新技能经拆包守卫隔离在 PreSplitGameSim，整命令事件流必含 CardSpawned + PlayerSkillEquipped 且不与 CardDealt 同包混发
         var (runDirectDay, engDirectDay) = CreateStartedEngine(ov.Pool, ov.Monsters, ov.LevelUps, ov.Mode, ov.Repo, ov.Ghosts, seed: 621);
         AddOwnedItem(runDirectDay, ov.Repo, ov.Pool, BookOfSecretsId, EInventorySection.Hand, slot: 3, ETier.Silver, enchantment: "Radiant");
         runDirectDay.Victories = 1; // 满足每日 PvP 已结算兜底守卫，使退店后可直接从 Hour 6 跨入 Day 2
@@ -547,8 +557,9 @@ public sealed class V10RunAndTournamentSyncTests
         var crossDayOut = engDirectDay.Handle(new ExitCurrentStateCommand());
         Assert.Null(crossDayOut.Error);
         Assert.Equal(2u, runDirectDay.Day);
-        Assert.Contains(crossDayOut.Events, e => e is GameSimEventCardSpawned sp && sp.Type == ECardType.Skill && sp.CombatantId == ECombatantId.Player);
-        Assert.Contains(crossDayOut.Events, e => e is GameSimEventPlayerSkillEquipped eq && eq.Owner == ECombatantId.Player);
+        var crossDayAllEvents = CollectAllWireEvents(crossDayOut);
+        Assert.Contains(crossDayAllEvents, e => e is GameSimEventCardSpawned sp && sp.Type == ECardType.Skill && sp.CombatantId == ECombatantId.Player);
+        Assert.Contains(crossDayAllEvents, e => e is GameSimEventPlayerSkillEquipped eq && eq.Owner == ECombatantId.Player);
 
         // 2a-plain. 无附魔（Plain）Book of Secrets 跨天 OnDayStarted：验证四路合流后（ValueAndConditionEvaluator 修复 Enchantment==null + RunEngine 跨天同步）直接生成并装备新技能
         var (runPlainBook, engPlainBook) = CreateStartedEngine(ov.Pool, ov.Monsters, ov.LevelUps, ov.Mode, ov.Repo, ov.Ghosts, seed: 624);
@@ -562,8 +573,9 @@ public sealed class V10RunAndTournamentSyncTests
         Assert.Null(plainCrossDayOut.Error);
         Assert.Equal(2u, runPlainBook.Day);
         var plainBookSkill = Assert.Single(runPlainBook.Cards.Values, c => c.Owner == ECombatantId.Player && c.Type == ECardType.Skill);
-        Assert.Contains(plainCrossDayOut.Events, e => e is GameSimEventCardSpawned sp && sp.InstanceId == plainBookSkill.InstanceId && sp.Type == ECardType.Skill && sp.CombatantId == ECombatantId.Player);
-        Assert.Contains(plainCrossDayOut.Events, e => e is GameSimEventPlayerSkillEquipped eq && eq.InstanceId == plainBookSkill.InstanceId && eq.Owner == ECombatantId.Player);
+        var plainCrossDayAllEvents = CollectAllWireEvents(plainCrossDayOut);
+        Assert.Contains(plainCrossDayAllEvents, e => e is GameSimEventCardSpawned sp && sp.InstanceId == plainBookSkill.InstanceId && sp.Type == ECardType.Skill && sp.CombatantId == ECombatantId.Player);
+        Assert.Contains(plainCrossDayAllEvents, e => e is GameSimEventPlayerSkillEquipped eq && eq.InstanceId == plainBookSkill.InstanceId && eq.Owner == ECombatantId.Player);
 
         // 2b. 卖出 Skill Voucher (Gold + Radiant 与 Plain 无附魔青铜两路验证)：OnSell 立即同步新技能与双重事件
         var (runSell, engSell) = CreateStartedEngine(ov.Pool, ov.Monsters, ov.LevelUps, ov.Mode, ov.Repo, ov.Ghosts, seed: 622);
