@@ -1,7 +1,7 @@
 # 大巴扎编年史：星港奇物志（`bazaar-chronicles-sample`）
 
 > **官方风格原创示例 Mod 扩展包 & 社区 Mod 创作完整指南**  
-> 遵循 `BazaarModKit` 协议规范（`docs/audit/wave1_l10n_mod_compat.md` 第 2.3 节 & `docs/audit/wave1_core_parity_perf.md` 第 5.3 节），纯 JSON 数据驱动 + 高清 PNG 贴图，**零白块、零客户端崩溃、未装视觉插件亦可优雅降级运行**。
+> 遵循 `BazaarModKit` 标准化协议规范（见 [docs/MOD_AUTHORING_STANDARD.md](../../docs/MOD_AUTHORING_STANDARD.md)），纯 JSON 数据驱动 + 高清 PNG 贴图，**零白块、零客户端崩溃、未装视觉插件亦可优雅降级运行**。
 
 ---
 

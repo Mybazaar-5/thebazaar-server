@@ -92,7 +92,7 @@ dotnet test Bazaar.sln -c Release
 | `mods/bazaar-chronicles-sample` | 官方端到端示例扩展包（自定义卡牌/技能/奇遇/词条/PNG 贴图） |
 | `tools/` | 离线兼容体检器 `compat_doctor.py`、汉化热更词典 `tools/data/`、单机与部署脚本 |
 | `dist/client/` | 防撞号安装器（双 DLL 部署）、单机引导脚本与客户端默认配置模板 |
-| `docs/` | 部署运维指南、战斗/架构文档与全链路深度审计报告 |
+| `docs/` | 部署运维指南、Mod 创作标准手册、JSON Schema 与 AI 创作 Skill |
 
 ---
 

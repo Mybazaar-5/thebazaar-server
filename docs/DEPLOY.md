@@ -23,7 +23,7 @@
 - 防火墙/云安全组放行端口：TCP `8080`（如用 Nginx 域名反代，放行 `80`/`443` 或你自定义的代理端口即可）。
 
 ### 一键部署步骤
-1. 从 GitHub Release 下载 `TheBazaar-SelfHosted-Full-v12.1.zip` 并解压，将里面的 **`server-linux/`** 和 **`data/`** 两个文件夹上传到服务器同级目录（例如 `~/bazaar-pkg/server-linux` 和 `~/bazaar-pkg/data`）：
+1. 从 GitHub Release 下载 `TheBazaar-SelfHosted-Full-<Tag>.zip` 并解压，将里面的 **`server-linux/`** 和 **`data/`** 两个文件夹上传到服务器同级目录（例如 `~/bazaar-pkg/server-linux` 和 `~/bazaar-pkg/data`）：
    ```bash
    cd ~/bazaar-pkg/server-linux
    bash deploy-linux.sh
