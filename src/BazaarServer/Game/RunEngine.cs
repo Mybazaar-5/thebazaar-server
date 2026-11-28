@@ -4784,7 +4784,12 @@ public sealed class RunEngine
             TemplateId = wireGuid,
             CustomCardId = customCardId,
             Type = type,
-            Size = ShopEngine.ParseSize(ci.Template.Size),
+            Size = ci.EffectiveSize switch
+            {
+                CardSize.Small => ECardSize.Small,
+                CardSize.Large => ECardSize.Large,
+                _ => ECardSize.Medium,
+            },
             Tier = ShopEngine.ParseTier(ci.Tier.ToString()),
             Enchantment = Enum.TryParse<EEnchantmentType>(ci.Enchantment, true, out var ench) ? ench : null,
             Owner = ECombatantId.Opponent,

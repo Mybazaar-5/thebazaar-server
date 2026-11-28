@@ -283,6 +283,13 @@ public static class PlannerEndpoints
             foreach (var kv in PlannerCatalogConstants.DayBaseSlots.OrderBy(k => k.Key))
                 dayBaseSlots[kv.Key.ToString()] = kv.Value;
 
+            var ctxModEnv = modHost.ResolveRunModContext(
+                rules.SelectedModIds,
+                cardPool,
+                monsterPoolStore.SnapshotList(),
+                runtimeSnapshots.Current.ArchetypeIndex);
+            var socketEffects = BuildSocketEffectsCatalog(ctxModEnv.Repository);
+
             return Results.Json(new
             {
                 username,
@@ -313,6 +320,10 @@ public static class PlannerEndpoints
                     levelMax = PlannerCatalogConstants.LevelMax,
                     prestigeMax = PlannerCatalogConstants.PrestigeMax,
                     dayBaseSlots,
+                    socketEffects,
+                    editableToggles = PlannerCatalogConstants.EditableToggleRules,
+                    editableTags = PlannerCatalogConstants.EditableExtraTags,
+                    maxExtraTags = PlannerCatalogConstants.MaxExtraTags,
                 },
             }, PlannerJsonOpts);
         });
@@ -522,9 +533,65 @@ public static class PlannerEndpoints
                         List<string> lines;
                         try
                         {
+                            string zhCardName = GhostBoardValidator.ResolveCardNameZh(tpl, repo);
                             var inst = new BazaarCore.Runtime.CardInstance(tpl, TierHelper.ParseTier(tier), ench, "describe");
-                            // 可选：按阵容里的当前数值（伤害 / 护盾 / 冷却等白名单键）渲染，让说明和编辑后的数字一致
-                            if (el.TryGetProperty("attributes", out var attrsEl) && attrsEl.ValueKind == JsonValueKind.Object)
+
+                            // 1) 模块 C：先清洗并挂载任务状态，再重建品阶/附魔/任务奖励数据（与校验器同口径）
+                            var reqCompletedQuests = ReadOptionalStringList(el, "completedQuests");
+                            var reqQuestProgress = ReadOptionalDoubleDict(el, "questProgress");
+                            if ((reqCompletedQuests is { Count: > 0 }) || (reqQuestProgress is { Count: > 0 }))
+                            {
+                                var dummyErrors = new List<string>();
+                                var dummyWarnings = new List<string>();
+                                var (cleanCompleted, cleanProgress) = GhostBoardValidator.SanitizeItemQuests(
+                                    tpl, zhCardName, reqCompletedQuests, reqQuestProgress, dummyErrors, dummyWarnings);
+                                foreach (var (qk, qv) in cleanProgress)
+                                    inst.QuestProgress[qk] = qv;
+                                if (cleanCompleted.Count > 0)
+                                {
+                                    foreach (string qid in cleanCompleted)
+                                        inst.CompletedQuests.Add(qid);
+                                    inst.RebuildTierAndEnchantmentData();
+                                }
+                            }
+
+                            // 2) 模块 D3：挂载合法附加类型标签
+                            var reqExtraTags = ReadOptionalStringList(el, "extraTags");
+                            if (reqExtraTags is { Count: > 0 })
+                            {
+                                var dummyWarnings = new List<string>();
+                                var cleanTags = GhostBoardValidator.SanitizeExtraTags(tpl, zhCardName, reqExtraTags, dummyWarnings);
+                                foreach (string tag in cleanTags)
+                                    inst.ExtraTags.Add(tag);
+                            }
+
+                            // 3) 模块 D1/D3：叠加可选状态开关（Tiny/Lifesteal/Flying/DestroyImmunity）
+                            var reqToggles = ReadOptionalBoolDict(el, "toggles");
+                            if (reqToggles is { Count: > 0 })
+                            {
+                                foreach (var (rawToggle, enabled) in reqToggles)
+                                {
+                                    if (!PlannerCatalogConstants.TryGetCanonicalToggle(rawToggle, out string canonToggle, out double onVal))
+                                        continue;
+                                    if (string.Equals(canonToggle, "Tiny", StringComparison.OrdinalIgnoreCase) &&
+                                        tpl.CardSize == CardSize.Small)
+                                        continue;
+                                    if (enabled)
+                                    {
+                                        double baseVal = inst.BaseAttributes.GetValueOrDefault(canonToggle, 0.0);
+                                        if (baseVal < onVal - 1e-6)
+                                            inst.PermanentAdd[canonToggle] = onVal - baseVal;
+                                    }
+                                    else
+                                    {
+                                        inst.PermanentAdd.Remove(canonToggle);
+                                    }
+                                }
+                                inst.MarkAttributeDirty();
+                            }
+
+                            // 4) 可选：按阵容里的当前数值（伤害 / 护盾 / 冷却等白名单键）渲染，让说明和编辑后的数字一致
+                            if (TryGetPropertyCaseInsensitive(el, "attributes", out var attrsEl) && attrsEl.ValueKind == JsonValueKind.Object)
                             {
                                 foreach (var prop in attrsEl.EnumerateObject())
                                 {
@@ -538,7 +605,9 @@ public static class PlannerEndpoints
                                     if (canonKey == "CooldownMax" && !(baseVal > 0)) continue;
                                     inst.PermanentAdd[canonKey] = target - baseVal;
                                 }
+                                inst.MarkAttributeDirty();
                             }
+
                             lines = TooltipFormatter.FormatTooltips(inst, null, repo.Localization);
                         }
                         catch
@@ -1605,7 +1674,73 @@ public static class PlannerEndpoints
 
     // ── 目录与解析小工具 ─────────────────────────────────────────────────────
 
-    private static object BuildCatalogCardDto(BazaarCore.Models.CardTemplate tpl, GameDataRepository repo)
+    private static List<PlannerSocketEffectCatalogDto> BuildSocketEffectsCatalog(GameDataRepository repo)
+    {
+        var items = new List<(int SortRank, PlannerSocketEffectCatalogDto Dto)>();
+        foreach (var tpl in repo.CardsById.Values)
+        {
+            if (!GhostBoardValidator.IsValidSocketEffectTemplate(tpl))
+                continue;
+
+            var tiers = GhostBoardValidator.GetSupportedTiers(tpl);
+            string defaultTier = tiers.FirstOrDefault(t => string.Equals(t, tpl.StartingTier, StringComparison.OrdinalIgnoreCase))
+                ?? tiers[0];
+            string nameZh = ResolveCatalogCardNameZh(tpl, repo);
+            string descriptionZh = "";
+            try
+            {
+                var inst = new BazaarCore.Runtime.CardInstance(tpl, TierHelper.ParseTier(defaultTier), null, "se_cat");
+                var lines = TooltipFormatter.FormatTooltips(inst, null, repo.Localization);
+                descriptionZh = string.Join("；", lines.Where(l => !string.IsNullOrWhiteSpace(l)));
+            }
+            catch
+            {
+                descriptionZh = "";
+            }
+
+            int sortRank = ResolveSocketEffectSortRank(tpl);
+            items.Add((sortRank, new PlannerSocketEffectCatalogDto
+            {
+                TemplateId = tpl.Id,
+                NameZh = nameZh,
+                InternalName = tpl.InternalName ?? "",
+                DefaultTier = defaultTier,
+                Tiers = tiers,
+                DescriptionZh = descriptionZh,
+            }));
+        }
+
+        items.Sort((a, b) =>
+        {
+            int c = a.SortRank.CompareTo(b.SortRank);
+            if (c != 0) return c;
+            c = StringComparer.Ordinal.Compare(a.Dto.NameZh, b.Dto.NameZh);
+            if (c != 0) return c;
+            return StringComparer.OrdinalIgnoreCase.Compare(a.Dto.TemplateId, b.Dto.TemplateId);
+        });
+
+        var result = new List<PlannerSocketEffectCatalogDto>(items.Count);
+        for (int i = 0; i < items.Count; i++)
+            result.Add(items[i].Dto);
+        return result;
+    }
+
+    private static int ResolveSocketEffectSortRank(BazaarCore.Models.CardTemplate tpl)
+    {
+        if (string.Equals(tpl.Id, "c017c0dd-af3c-47e0-b510-3661d9dcd7f2", StringComparison.OrdinalIgnoreCase))
+            return 0; // 炉灶
+        if (string.Equals(tpl.Id, "d5515ae3-b98d-4272-8add-82f441969ffe", StringComparison.OrdinalIgnoreCase))
+            return 1; // 冷藏箱
+        if (tpl.MusicNote is { ValueKind: JsonValueKind.String } mn)
+        {
+            string? note = mn.GetString()?.Trim();
+            if (!string.IsNullOrEmpty(note) && note.Length == 1 && note[0] >= 'A' && note[0] <= 'G')
+                return 10 + (note[0] - 'A');
+        }
+        return 100;
+    }
+
+    private static PlannerCatalogCardDto BuildCatalogCardDto(BazaarCore.Models.CardTemplate tpl, GameDataRepository repo)
     {
         bool isSkill = string.Equals(tpl.Type, "Skill", StringComparison.OrdinalIgnoreCase);
         string nameZh = ResolveCatalogCardNameZh(tpl, repo);
@@ -1614,6 +1749,9 @@ public static class PlannerEndpoints
             : (tpl.InternalName ?? tpl.Id);
         string? size = isSkill ? null : (string.IsNullOrWhiteSpace(tpl.Size) ? "Medium" : tpl.Size);
         var tiers = GhostBoardValidator.GetSupportedTiers(tpl);
+        string startingTier = tiers.FirstOrDefault(t => string.Equals(t, tpl.StartingTier, StringComparison.OrdinalIgnoreCase))
+            ?? (string.IsNullOrWhiteSpace(tpl.StartingTier) ? tiers[0] : tpl.StartingTier);
+        var coreStartTier = TierHelper.ParseTier(startingTier);
         var enchantments = isSkill ? new List<string>() : GhostBoardValidator.GetSupportedEnchantments(tpl);
         var baseAttrs = GhostBoardValidator.BuildBaseAttributesByTier(tpl);
         bool isMod = tpl.IsCustomModCard;
@@ -1623,21 +1761,89 @@ public static class PlannerEndpoints
             .Where(h => !string.IsNullOrWhiteSpace(h) && !string.Equals(h, "Common", StringComparison.OrdinalIgnoreCase))
             .ToList();
 
-        return new
+        // 模块 D4：仅当支持附魔时附带各附魔的中文单行效果摘要（无附魔时省略该字段）
+        Dictionary<string, string>? enchantmentSummaries = null;
+        if (enchantments.Count > 0)
         {
-            templateId = tpl.Id,
-            nameZh,
-            nameEn,
-            type = tpl.Type,
-            size,
-            heroes,
-            tags = tpl.Tags ?? new List<string>(),
-            startingTier = string.IsNullOrWhiteSpace(tpl.StartingTier) ? "Bronze" : tpl.StartingTier,
-            tiers,
-            enchantments,
-            baseAttributesByTier = baseAttrs,
-            isMod,
-            modId,
+            var summaries = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (string ench in enchantments)
+            {
+                string summary = TooltipFormatter.FormatEnchantmentSummary(tpl, ench, coreStartTier, repo.Localization);
+                if (!string.IsNullOrWhiteSpace(summary))
+                    summaries[ench] = summary;
+            }
+            if (summaries.Count > 0)
+                enchantmentSummaries = summaries;
+        }
+
+        // 模块 C：仅当卡牌包含任务时附带 quests 结构化元数据（无任务卡不返回，不增体积）
+        List<PlannerQuestGroupCatalogDto>? quests = null;
+        if (tpl.Quests is { Count: > 0 })
+        {
+            var previewCard = new BazaarCore.Runtime.CardInstance(tpl, coreStartTier, null, "cat_q");
+            var groupList = new List<PlannerQuestGroupCatalogDto>(tpl.Quests.Count);
+            for (int gIdx = 0; gIdx < tpl.Quests.Count; gIdx++)
+            {
+                var group = tpl.Quests[gIdx];
+                if (group?.Entries == null || group.Entries.Count == 0) continue;
+                bool isRep = group.EffectiveRepeatable;
+                bool mutEx = !isRep && group.Entries.Count > 1;
+                var entriesDto = new List<PlannerQuestEntryCatalogDto>(group.Entries.Count);
+                for (int eIdx = 0; eIdx < group.Entries.Count; eIdx++)
+                {
+                    var entry = group.Entries[eIdx];
+                    if (entry == null || string.IsNullOrWhiteSpace(entry.AttributeType)) continue;
+                    entriesDto.Add(new PlannerQuestEntryCatalogDto
+                    {
+                        EntryIndex = eIdx,
+                        AttributeType = entry.AttributeType.Trim(),
+                        Target = Math.Max(1, (int)Math.Round(entry.Target)),
+                        GoalZh = TooltipFormatter.FormatQuestGoalText(previewCard, entry, repo.Localization),
+                        RewardZh = TooltipFormatter.FormatQuestRewardText(previewCard, entry, repo.Localization),
+                    });
+                }
+                if (entriesDto.Count > 0)
+                {
+                    groupList.Add(new PlannerQuestGroupCatalogDto
+                    {
+                        GroupIndex = gIdx,
+                        IsRepeatable = isRep,
+                        MutuallyExclusive = mutEx,
+                        Entries = entriesDto,
+                    });
+                }
+            }
+            if (groupList.Count > 0)
+                quests = groupList;
+        }
+
+        // 模块 D3：仅当原卡自带状态开关（如 Lifesteal / DestroyImmunity）时返回 nativeToggles 供前端标只读
+        List<string>? nativeToggles = null;
+        if (!isSkill)
+        {
+            var native = GhostBoardValidator.GetNativeToggles(tpl);
+            if (native.Count > 0)
+                nativeToggles = native;
+        }
+
+        return new PlannerCatalogCardDto
+        {
+            TemplateId = tpl.Id,
+            NameZh = nameZh,
+            NameEn = nameEn,
+            Type = tpl.Type,
+            Size = size,
+            Heroes = heroes,
+            Tags = tpl.Tags ?? new List<string>(),
+            StartingTier = startingTier,
+            Tiers = tiers,
+            Enchantments = enchantments,
+            EnchantmentSummaries = enchantmentSummaries,
+            Quests = quests,
+            NativeToggles = nativeToggles,
+            BaseAttributesByTier = baseAttrs,
+            IsMod = isMod,
+            ModId = modId,
         };
     }
 
@@ -1749,6 +1955,38 @@ public static class PlannerEndpoints
                 list.Add(item.GetString()!.Trim());
         }
         return list;
+    }
+
+    private static Dictionary<string, double>? ReadOptionalDoubleDict(JsonElement obj, string name)
+    {
+        if (!TryGetPropertyCaseInsensitive(obj, name, out var el) || el.ValueKind != JsonValueKind.Object)
+            return null;
+        var dict = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        foreach (var prop in el.EnumerateObject())
+        {
+            if (prop.Value.ValueKind == JsonValueKind.Number && prop.Value.TryGetDouble(out double num) && double.IsFinite(num))
+                dict[prop.Name.Trim()] = num;
+            else if (prop.Value.ValueKind == JsonValueKind.String &&
+                     double.TryParse(prop.Value.GetString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double parsed) &&
+                     double.IsFinite(parsed))
+                dict[prop.Name.Trim()] = parsed;
+        }
+        return dict;
+    }
+
+    private static Dictionary<string, bool>? ReadOptionalBoolDict(JsonElement obj, string name)
+    {
+        if (!TryGetPropertyCaseInsensitive(obj, name, out var el) || el.ValueKind != JsonValueKind.Object)
+            return null;
+        var dict = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        foreach (var prop in el.EnumerateObject())
+        {
+            if (prop.Value.ValueKind == JsonValueKind.True)
+                dict[prop.Name.Trim()] = true;
+            else if (prop.Value.ValueKind == JsonValueKind.False)
+                dict[prop.Name.Trim()] = false;
+        }
+        return dict;
     }
 
     private static string? ResolvePlannerStaticDirectory()

@@ -1085,7 +1085,7 @@ CustomRuleJsonHash = abcdef123456
 
     private static Task TestUnifiedVersionAndCasPoolAsync(string sandboxRoot)
     {
-        Assert(LauncherConstants.HubVersion == "15.5.0", $"HubVersion 应动态读取根级 Directory.Build.props 为 15.5.0，实际：{LauncherConstants.HubVersion}");
+        Assert(LauncherConstants.HubVersion == "15.6.0", $"HubVersion 应动态读取根级 Directory.Build.props 为 15.6.0，实际：{LauncherConstants.HubVersion}");
         string casDir = Path.Combine(sandboxRoot, LauncherConstants.ModCacheRelativeDir, "assets");
         string normalized = casDir.Replace('/', '\\');
         Assert(normalized.EndsWith(@"BepInEx\config\BazaarModCache\assets", StringComparison.OrdinalIgnoreCase),

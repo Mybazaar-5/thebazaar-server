@@ -168,6 +168,80 @@ public sealed record SharedBlueprintSummaryRecord(
     int ImportCount,
     DateTime CreatedAtUtc);
 
+/// <summary>编排台特殊状态开关规则条目（对应 me/context 中 boardEditRules.editableToggles）。</summary>
+public sealed class PlannerToggleRuleDto
+{
+    public string Key { get; set; } = "";
+    public string LabelZh { get; set; } = "";
+    public double OnValue { get; set; } = 1;
+    public string Scope { get; set; } = "item"; // nonSmallItem | item
+}
+
+/// <summary>编排台可选附加类型标签条目（对应 me/context 中 boardEditRules.editableTags）。</summary>
+public sealed class PlannerEditableTagDto
+{
+    public string Id { get; set; } = "";
+    public string NameZh { get; set; } = "";
+}
+
+/// <summary>编排台可选插槽特效目录条目（对应 me/context 中 boardEditRules.socketEffects）。</summary>
+public sealed class PlannerSocketEffectCatalogDto
+{
+    public string TemplateId { get; set; } = "";
+    public string NameZh { get; set; } = "";
+    public string InternalName { get; set; } = "";
+    public string DefaultTier { get; set; } = "Diamond";
+    public List<string> Tiers { get; set; } = new();
+    public string DescriptionZh { get; set; } = "";
+}
+
+/// <summary>编排台卡牌目录中的单条任务条目描述。</summary>
+public sealed class PlannerQuestEntryCatalogDto
+{
+    public int EntryIndex { get; set; }
+    public string AttributeType { get; set; } = "";
+    public int Target { get; set; } = 1;
+    public string GoalZh { get; set; } = "";
+    public string RewardZh { get; set; } = "";
+}
+
+/// <summary>编排台卡牌目录中的任务分组描述。</summary>
+public sealed class PlannerQuestGroupCatalogDto
+{
+    public int GroupIndex { get; set; }
+    public bool IsRepeatable { get; set; }
+    public bool MutuallyExclusive { get; set; }
+    public List<PlannerQuestEntryCatalogDto> Entries { get; set; } = new();
+}
+
+/// <summary>编排台卡牌目录返回项 DTO（可选扩展字段为空时省略以保持轻量）。</summary>
+public sealed class PlannerCatalogCardDto
+{
+    public string TemplateId { get; set; } = "";
+    public string NameZh { get; set; } = "";
+    public string NameEn { get; set; } = "";
+    public string Type { get; set; } = "";
+    public string? Size { get; set; }
+    public List<string> Heroes { get; set; } = new();
+    public List<string> Tags { get; set; } = new();
+    public string StartingTier { get; set; } = "Bronze";
+    public List<string> Tiers { get; set; } = new();
+    public List<string> Enchantments { get; set; } = new();
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, string>? EnchantmentSummaries { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<PlannerQuestGroupCatalogDto>? Quests { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? NativeToggles { get; set; }
+
+    public Dictionary<string, Dictionary<string, int>> BaseAttributesByTier { get; set; } = new();
+    public bool IsMod { get; set; }
+    public string? ModId { get; set; }
+}
+
 /// <summary>
 /// 编排台与种子蓝图共享常量、英雄/品阶/属性目录映射与 Mod 环境构建工具。
 /// </summary>
@@ -186,6 +260,7 @@ public static class PlannerCatalogConstants
     public const int LevelMax = 99;
     public const int PrestigeMin = 0;
     public const int PrestigeMax = 100;
+    public const int MaxExtraTags = 6;
     public const int MaxLineupJsonBytes = 256 * 1024; // 一天的真实阵容约 2~5 KB，30 天都排满也放得下
     public const int MaxSharedBlueprintsPerAccount = 100;
 
@@ -239,6 +314,76 @@ public static class PlannerCatalogConstants
     /// <summary>数量类属性白名单集合（大小写不敏感）。</summary>
     public static readonly HashSet<string> QuantityAttributeSet =
         new(QuantityAttributes, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>编排台允许通过 editedToggles 显式开关的非频率状态属性规则（按 UI 展示顺序）。</summary>
+    public static IReadOnlyList<PlannerToggleRuleDto> EditableToggleRules { get; } = new[]
+    {
+        new PlannerToggleRuleDto { Key = "Tiny",            LabelZh = "微型（缩小 1 格）", OnValue = 1,   Scope = "nonSmallItem" },
+        new PlannerToggleRuleDto { Key = "Lifesteal",       LabelZh = "吸血",             OnValue = 100, Scope = "item" },
+        new PlannerToggleRuleDto { Key = "Flying",          LabelZh = "开局飞行",         OnValue = 1,   Scope = "item" },
+        new PlannerToggleRuleDto { Key = "DestroyImmunity", LabelZh = "不可摧毁",         OnValue = 1,   Scope = "item" },
+    };
+
+    /// <summary>编排台可开关状态属性及其开启数值（大小写不敏感）。</summary>
+    public static IReadOnlyDictionary<string, double> EditableToggleAttributes { get; } =
+        new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Tiny"] = 1,
+            ["Lifesteal"] = 100,
+            ["Flying"] = 1,
+            ["DestroyImmunity"] = 1,
+        };
+
+    /// <summary>编排台可开关状态属性中文名映射（大小写不敏感）。</summary>
+    public static IReadOnlyDictionary<string, string> EditableToggleLabelsZh { get; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Tiny"] = "微型",
+            ["Lifesteal"] = "吸血",
+            ["Flying"] = "开局飞行",
+            ["DestroyImmunity"] = "不可摧毁",
+        };
+
+    private static readonly Dictionary<string, (string CanonicalKey, double OnValue)> CanonicalToggleMap =
+        BuildCanonicalToggleMap();
+
+    /// <summary>校验并归一化编排台可开关状态属性键；非法或频率黑名单键返回 false。</summary>
+    public static bool TryGetCanonicalToggle(string? rawKey, out string canonicalKey, out double onValue)
+    {
+        canonicalKey = "";
+        onValue = 0;
+        if (string.IsNullOrWhiteSpace(rawKey)) return false;
+        if (!CanonicalToggleMap.TryGetValue(rawKey.Trim(), out var info)) return false;
+        canonicalKey = info.CanonicalKey;
+        onValue = info.OnValue;
+        return true;
+    }
+
+    /// <summary>编排台可选附加类型标签有序列表（17 项，全部为官方合法 ECardTag）。</summary>
+    public static IReadOnlyList<PlannerEditableTagDto> EditableExtraTags { get; } = new[]
+    {
+        new PlannerEditableTagDto { Id = "Aquatic",  NameZh = "水生" },
+        new PlannerEditableTagDto { Id = "Weapon",   NameZh = "武器" },
+        new PlannerEditableTagDto { Id = "Friend",   NameZh = "伙伴" },
+        new PlannerEditableTagDto { Id = "Relic",    NameZh = "遗物" },
+        new PlannerEditableTagDto { Id = "Tool",     NameZh = "工具" },
+        new PlannerEditableTagDto { Id = "Food",     NameZh = "食物" },
+        new PlannerEditableTagDto { Id = "Tech",     NameZh = "科技" },
+        new PlannerEditableTagDto { Id = "Property", NameZh = "地产" },
+        new PlannerEditableTagDto { Id = "Toy",      NameZh = "玩具" },
+        new PlannerEditableTagDto { Id = "Dragon",   NameZh = "龙" },
+        new PlannerEditableTagDto { Id = "Core",     NameZh = "核心" },
+        new PlannerEditableTagDto { Id = "Apparel",  NameZh = "服饰" },
+        new PlannerEditableTagDto { Id = "Vehicle",  NameZh = "载具" },
+        new PlannerEditableTagDto { Id = "Potion",   NameZh = "药水" },
+        new PlannerEditableTagDto { Id = "Loot",     NameZh = "战利品" },
+        new PlannerEditableTagDto { Id = "Ray",      NameZh = "射线" },
+        new PlannerEditableTagDto { Id = "Dinosaur", NameZh = "恐龙" },
+    };
+
+    /// <summary>编排台可选附加类型标签中文名映射（大小写不敏感）。</summary>
+    public static IReadOnlyDictionary<string, string> EditableExtraTagNameZhById { get; } =
+        BuildEditableExtraTagMap();
 
     /// <summary>第 1~4 天基础解锁格子数（第 4 天及以后统一为 10 格）。</summary>
     public static IReadOnlyDictionary<int, int> DayBaseSlots { get; } = new Dictionary<int, int>
@@ -402,6 +547,22 @@ public static class PlannerCatalogConstants
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (id, nameZh) in SupportedHeroes)
             map[id] = nameZh;
+        return map;
+    }
+
+    private static Dictionary<string, (string CanonicalKey, double OnValue)> BuildCanonicalToggleMap()
+    {
+        var map = new Dictionary<string, (string CanonicalKey, double OnValue)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rule in EditableToggleRules)
+            map[rule.Key] = (rule.Key, rule.OnValue);
+        return map;
+    }
+
+    private static Dictionary<string, string> BuildEditableExtraTagMap()
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var tag in EditableExtraTags)
+            map[tag.Id] = tag.NameZh;
         return map;
     }
 }

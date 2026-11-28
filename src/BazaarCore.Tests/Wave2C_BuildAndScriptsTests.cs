@@ -21,17 +21,17 @@ public sealed class Wave2C_BuildAndScriptsTests
         Assert.True(File.Exists(propsPath), $"缺少根级 Directory.Build.props：{propsPath}");
 
         string propsXml = File.ReadAllText(propsPath, Encoding.UTF8);
-        Assert.Contains("<Version>15.5.0</Version>", propsXml, StringComparison.Ordinal);
+        Assert.Contains("<Version>15.6.0</Version>", propsXml, StringComparison.Ordinal);
         Assert.Contains("<IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>", propsXml, StringComparison.Ordinal);
 
-        // 校验当前已编译加载的 BazaarCore 与 BazaarServer 程序集 InformationalVersion 均为精确 15.5.0（无 +gitsha）
+        // 校验当前已编译加载的 BazaarCore 与 BazaarServer 程序集 InformationalVersion 均为精确 15.6.0（无 +gitsha）
         string? coreVer = typeof(BazaarCore.Models.CustomRunRuleSet).Assembly
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
         string? srvVer = typeof(BazaarServer.Mods.ClientUpdateEndpoints).Assembly
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
 
-        Assert.Equal("15.5.0", coreVer);
-        Assert.Equal("15.5.0", srvVer);
+        Assert.Equal("15.6.0", coreVer);
+        Assert.Equal("15.6.0", srvVer);
 
         // BazaarHub.csproj 与 BazaarModSdk.csproj 不应保留重复 <Version>
         Assert.DoesNotContain("<Version>", File.ReadAllText(Path.Combine(repoRoot, "src", "BazaarHub", "BazaarHub.csproj")), StringComparison.OrdinalIgnoreCase);

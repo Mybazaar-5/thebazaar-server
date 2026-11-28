@@ -1784,16 +1784,17 @@ public static class AbilityExecutor
                         var cardOwner = TargetResolver.FindOwner(card, ctx);
                         if (!next)
                         {
-                            // 若当前由光环赋予 Flying，写入 CombatAdd 负偏移以压制光环飞行，保证 FlyingStop / Toggle 立即落地
-                            double auraFly = card.AuraAdd.GetValueOrDefault("Flying", 0);
-                            if (auraFly > 0)
+                            // 抵消全部属性层（Base/Permanent/Day/Hour/Combat/Aura）中的 Flying 正值，仅写战斗层 CombatAdd，
+                            // 既保证 FlyingStop / Toggle 立即落地，又不破坏局外 PermanentAdd 且在 ResetForCombat 后自动复原
+                            double layerFly = card.GetFlyingLayerSum();
+                            if (layerFly > 0)
                             {
-                                card.CombatAdd["Flying"] = -auraFly;
+                                double nextCombatFly = card.CombatAdd.GetValueOrDefault("Flying", 0) - layerFly;
+                                if (Math.Abs(nextCombatFly) < 1e-9)
+                                    card.CombatAdd.Remove("Flying");
+                                else
+                                    card.CombatAdd["Flying"] = nextCombatFly;
                                 card.MarkAttributeDirty();
-                            }
-                            else
-                            {
-                                card.CombatAdd.Remove("Flying");
                             }
                         }
                         else if (card.CombatAdd.TryGetValue("Flying", out var negSuppress) && negSuppress < 0)

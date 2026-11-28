@@ -38,6 +38,9 @@ public sealed class PlannerItemInput
 
     /// <summary>前端手改的当前品阶目标最终数值（折算进 PermanentAdd 后在输出中移除）。</summary>
     public Dictionary<string, double>? EditedAttributes { get; set; }
+
+    /// <summary>前端显式切换的非频率特殊状态开关（Tiny / Lifesteal / Flying / DestroyImmunity；折算进 PermanentAdd 后在输出中移除）。</summary>
+    public Dictionary<string, bool>? EditedToggles { get; set; }
 }
 
 /// <summary>编排台请求中的单个技能输入（兼容 GhostSkill 全部字段 + 前端手改 editedAttributes）。</summary>
@@ -320,6 +323,262 @@ public static class GhostBoardValidator
         return tpl.InternalName?.Trim() ?? tpl.Id;
     }
 
+    /// <summary>
+    /// 判断模板是否为编排台允许配置的合法插槽特效（Type=="SocketEffect" 且非调试模板）。
+    /// 注意：官方 9 种 SocketEffect 不属于 valid_card_ids.json 的 6 类卡牌图白名单，客户端由 SocketEffectController 原生渲染，故不对其检查 CardPool.IsAssetValid。
+    /// </summary>
+    public static bool IsValidSocketEffectTemplate(CardTemplate? tpl)
+    {
+        if (tpl == null || string.IsNullOrWhiteSpace(tpl.Id))
+            return false;
+        if (!string.Equals(tpl.Type, "SocketEffect", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (!string.IsNullOrWhiteSpace(tpl.InternalName) &&
+            tpl.InternalName.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (MonsterPool.IsBlockedDebugOrBlankArtSkill(tpl))
+            return false;
+        return true;
+    }
+
+    /// <summary>返回物品模板在默认起始品阶下本身自带的状态开关键列表（如原卡自带 Lifesteal 或 DestroyImmunity）。</summary>
+    public static List<string> GetNativeToggles(CardTemplate tpl)
+    {
+        ArgumentNullException.ThrowIfNull(tpl);
+        var result = new List<string>();
+        if (!string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase))
+            return result;
+        var card = new CardInstance(tpl, tpl.DefaultTier, null, "cat_toggles");
+        foreach (var rule in PlannerCatalogConstants.EditableToggleRules)
+        {
+            if (card.BaseAttributes.TryGetValue(rule.Key, out double val) && double.IsFinite(val) && val > 0)
+                result.Add(rule.Key);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// 模块 C：清洗单件物品的任务完成态与进度（供盘面校验与 catalog/describe 共用，保证口径 100% 一致）：
+    /// 1) 无任务卡忽略并给 warning；
+    /// 2) 键白名单大小写归一，非法键丢弃并 warning；
+    /// 3) 进度整数化并钳制到 [0, target]；不可重复任务与 completedQuests 双向对齐；
+    /// 4) 可重复任务不锁入 completedQuests，进度仅允许 0..max(0, target - 1)；
+    /// 5) 不可重复多分支互斥组（如魂石）同时完成多个时保留首个并清除同组其余分支，给中文 warning。
+    /// </summary>
+    public static (List<string> CompletedQuests, Dictionary<string, double> QuestProgress) SanitizeItemQuests(
+        CardTemplate tpl,
+        string zhName,
+        List<string>? rawCompletedQuests,
+        Dictionary<string, double>? rawQuestProgress,
+        List<string> errors,
+        List<string> warnings)
+    {
+        ArgumentNullException.ThrowIfNull(tpl);
+
+        var entryByAttr = new Dictionary<string, (int GroupIndex, bool IsRepeatable, bool MutuallyExclusive, string CanonicalAttr, double Target)>(
+            StringComparer.OrdinalIgnoreCase);
+
+        if (tpl.Quests is { Count: > 0 })
+        {
+            for (int gIdx = 0; gIdx < tpl.Quests.Count; gIdx++)
+            {
+                var group = tpl.Quests[gIdx];
+                if (group?.Entries == null || group.Entries.Count == 0) continue;
+                bool isRep = group.EffectiveRepeatable;
+                bool mutEx = !isRep && group.Entries.Count > 1;
+                for (int eIdx = 0; eIdx < group.Entries.Count; eIdx++)
+                {
+                    var entry = group.Entries[eIdx];
+                    string attr = entry?.AttributeType?.Trim() ?? "";
+                    if (string.IsNullOrEmpty(attr)) continue;
+                    double target = Math.Max(1.0, Math.Round(entry!.Target));
+                    entryByAttr.TryAdd(attr, (gIdx, isRep, mutEx, attr, target));
+                }
+            }
+        }
+
+        bool hasAnyRawCompleted = rawCompletedQuests != null && rawCompletedQuests.Any(s => !string.IsNullOrWhiteSpace(s));
+        bool hasAnyRawProgress = rawQuestProgress != null && rawQuestProgress.Count > 0;
+
+        if (entryByAttr.Count == 0)
+        {
+            if (hasAnyRawCompleted || hasAnyRawProgress)
+                AddWarningOnce(warnings, $"「{zhName}」没有任务机制，任务配置已忽略");
+            return (new List<string>(), new Dictionary<string, double>(StringComparer.Ordinal));
+        }
+
+        var completedOrder = new List<string>();
+        var completedSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var progress = new Dictionary<string, double>(StringComparer.Ordinal);
+
+        if (rawCompletedQuests != null)
+        {
+            foreach (string rawKey in rawCompletedQuests)
+            {
+                if (string.IsNullOrWhiteSpace(rawKey)) continue;
+                string trimmed = rawKey.Trim();
+                if (!entryByAttr.TryGetValue(trimmed, out var info))
+                {
+                    AddWarningOnce(warnings, $"「{zhName}」没有任务 {trimmed}，已忽略");
+                    continue;
+                }
+                if (info.IsRepeatable)
+                {
+                    AddWarningOnce(warnings, $"「{zhName}」的 {info.CanonicalAttr} 为可重复任务，不可锁定为已完成，已忽略");
+                    continue;
+                }
+                if (completedSeen.Add(info.CanonicalAttr))
+                    completedOrder.Add(info.CanonicalAttr);
+            }
+        }
+
+        if (rawQuestProgress != null)
+        {
+            foreach (var (rawKey, rawVal) in rawQuestProgress)
+            {
+                if (string.IsNullOrWhiteSpace(rawKey)) continue;
+                string trimmed = rawKey.Trim();
+                if (!double.IsFinite(rawVal))
+                {
+                    errors.Add($"「{zhName}」的任务进度 {trimmed} 数值无效");
+                    continue;
+                }
+                if (!entryByAttr.TryGetValue(trimmed, out var info))
+                {
+                    AddWarningOnce(warnings, $"「{zhName}」没有任务 {trimmed}，进度已忽略");
+                    continue;
+                }
+
+                if (info.IsRepeatable)
+                {
+                    double maxRep = Math.Max(0.0, info.Target - 1.0);
+                    double clamped = Math.Clamp(Math.Round(rawVal), 0.0, maxRep);
+                    if (rawVal > maxRep + 1e-6)
+                        AddWarningOnce(warnings, $"「{zhName}」的可重复任务 {info.CanonicalAttr} 进度上限为 {(int)maxRep}，已调整");
+                    if (clamped > 0)
+                        progress[info.CanonicalAttr] = clamped;
+                }
+                else
+                {
+                    double clamped = Math.Clamp(Math.Round(rawVal), 0.0, info.Target);
+                    if (clamped >= info.Target)
+                    {
+                        if (completedSeen.Add(info.CanonicalAttr))
+                            completedOrder.Add(info.CanonicalAttr);
+                        progress[info.CanonicalAttr] = info.Target;
+                    }
+                    else if (clamped > 0)
+                    {
+                        progress[info.CanonicalAttr] = clamped;
+                    }
+                }
+            }
+        }
+
+        // 不可重复多分支互斥防呆：同组仅保留首个已完成分支，清除同组其余分支
+        var winnerByGroup = new Dictionary<int, string>();
+        var finalCompleted = new List<string>(completedOrder.Count);
+        foreach (string canonAttr in completedOrder)
+        {
+            var info = entryByAttr[canonAttr];
+            if (info.MutuallyExclusive)
+            {
+                if (!winnerByGroup.TryGetValue(info.GroupIndex, out string? winner))
+                {
+                    winnerByGroup[info.GroupIndex] = info.CanonicalAttr;
+                    finalCompleted.Add(info.CanonicalAttr);
+                }
+                else
+                {
+                    progress.Remove(info.CanonicalAttr);
+                    AddWarningOnce(warnings, $"「{zhName}」的互斥任务分支不能同时完成，已保留 {winner} 并清除 {info.CanonicalAttr}");
+                }
+            }
+            else
+            {
+                finalCompleted.Add(info.CanonicalAttr);
+            }
+        }
+
+        // 若某互斥组已有已完成分支，清除同组其他分支的残留进度以保证状态干净且二次校验幂等
+        if (winnerByGroup.Count > 0 && progress.Count > 0)
+        {
+            var staleKeys = new List<string>();
+            foreach (string pk in progress.Keys)
+            {
+                var info = entryByAttr[pk];
+                if (info.MutuallyExclusive &&
+                    winnerByGroup.TryGetValue(info.GroupIndex, out string? winner) &&
+                    !string.Equals(winner, info.CanonicalAttr, StringComparison.OrdinalIgnoreCase))
+                {
+                    staleKeys.Add(pk);
+                }
+            }
+            foreach (string sk in staleKeys)
+                progress.Remove(sk);
+        }
+
+        // 不可重复已完成任务双向对齐：确保 questProgress[attr] = target
+        foreach (string canonAttr in finalCompleted)
+        {
+            var info = entryByAttr[canonAttr];
+            progress[info.CanonicalAttr] = info.Target;
+        }
+
+        return (finalCompleted, progress);
+    }
+
+    /// <summary>
+    /// 模块 D3：清洗物品的附加类型标签（合法 ECardTag、大小写归一、剔除模板自带 tpl.Tags 与 "Tiny"、去重、单卡上限 6 个）。
+    /// </summary>
+    public static List<string> SanitizeExtraTags(
+        CardTemplate tpl,
+        string zhName,
+        List<string>? rawExtraTags,
+        List<string> warnings)
+    {
+        ArgumentNullException.ThrowIfNull(tpl);
+        var result = new List<string>();
+        if (rawExtraTags == null || rawExtraTags.Count == 0)
+            return result;
+
+        var nativeTags = new HashSet<string>(tpl.Tags ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string raw in rawExtraTags)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) continue;
+            string trimmed = raw.Trim();
+
+            // Tiny 通过状态开关（PermanentAdd["Tiny"]）管理，绝不落入 ExtraTags
+            if (string.Equals(trimmed, "Tiny", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!Enum.TryParse<ECardTag>(trimmed, ignoreCase: true, out var parsedTag))
+            {
+                AddWarningOnce(warnings, $"「{zhName}」的附加标签「{trimmed}」无效，已忽略");
+                continue;
+            }
+
+            string canonical = parsedTag.ToString();
+            if (nativeTags.Contains(canonical))
+                continue;
+
+            if (!seen.Add(canonical))
+                continue;
+
+            if (result.Count >= PlannerCatalogConstants.MaxExtraTags)
+            {
+                AddWarningOnce(warnings, $"「{zhName}」的附加类型标签最多 {PlannerCatalogConstants.MaxExtraTags} 个，超出部分已忽略");
+                continue;
+            }
+
+            result.Add(canonical);
+        }
+
+        return result;
+    }
+
     // ── 2. 盘面校验与归一化入口（JsonElement / PlannerBoardInput / GhostBoard）───
 
     /// <summary>
@@ -492,8 +751,6 @@ public static class GhostBoardValidator
                 continue;
 
             string zhName = ResolveCardNameZh(tpl, effectiveRepo);
-            int width = Math.Clamp(tpl.CardSize.SlotCount(), 1, 3);
-            totalItemWidth += width;
 
             // 品阶校验
             var supportedTiers = GetSupportedTiers(tpl);
@@ -515,7 +772,51 @@ public static class GhostBoardValidator
                     result.Errors.Add($"「{zhName}」不支持「{item.Enchantment.Trim()}」附魔");
             }
 
-            // 槽位越界与重叠校验
+            // 模块 C：任务进度与完成态清洗（键白名单、双向对齐、可重复上限、互斥分支防呆）
+            var (cleanCompletedQuests, cleanQuestProgress) = SanitizeItemQuests(
+                tpl, zhName, item.CompletedQuests, item.QuestProgress, result.Errors, result.Warnings);
+
+            // 模块 D1 & D3：状态开关白名单校验与 Tiny 有效宽度计算（须在 10 格越界/重叠/掩码校验之前完成）
+            var cleanToggles = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            if (item.EditedToggles is { Count: > 0 })
+            {
+                foreach (var (rawKey, toggleVal) in item.EditedToggles)
+                {
+                    if (string.IsNullOrWhiteSpace(rawKey)) continue;
+                    if (!PlannerCatalogConstants.TryGetCanonicalToggle(rawKey, out string canonToggle, out _))
+                    {
+                        AddWarningOnce(result.Warnings, $"「{zhName}」的状态开关 {rawKey.Trim()} 不支持或禁止修改，已忽略");
+                        continue;
+                    }
+                    cleanToggles[canonToggle] = toggleVal;
+                }
+            }
+
+            bool hasIncomingLayered = (item.PermanentAdd is { Count: > 0 }) || (item.PermanentMult is { Count: > 0 });
+            bool permAddTiny = HasPositiveDoubleKey(item.PermanentAdd, "Tiny");
+            bool permAttrTiny = HasPositiveIntKey(item.PermanentAttributes, "Tiny");
+            bool extraTagTiny = ContainsIgnoreCase(item.ExtraTags, "Tiny");
+            bool incomingTiny = hasIncomingLayered ? (permAddTiny || extraTagTiny) : (permAttrTiny || extraTagTiny);
+            bool desiredTiny = cleanToggles.TryGetValue("Tiny", out bool explicitTiny) ? explicitTiny : incomingTiny;
+
+            if (desiredTiny && tpl.CardSize == CardSize.Small)
+            {
+                AddWarningOnce(result.Warnings, $"「{zhName}」本身就是小型物品（1 格），无需微型化");
+                desiredTiny = false;
+                cleanToggles["Tiny"] = false;
+            }
+            else if (desiredTiny && !cleanToggles.ContainsKey("Tiny") && (!permAddTiny || !hasIncomingLayered))
+            {
+                // 历史平铺 Tiny 或 ExtraTags["Tiny"] 统一迁移为 PermanentAdd["Tiny"]=1 & PermanentAttributes["Tiny"]=1
+                cleanToggles["Tiny"] = true;
+            }
+
+            int width = desiredTiny
+                ? (tpl.CardSize == CardSize.Large ? 2 : 1)
+                : Math.Clamp(tpl.CardSize.SlotCount(), 1, 3);
+            totalItemWidth += width;
+
+            // 槽位越界与重叠校验（使用结合 Tiny 后的有效宽度）
             int slot = item.Slot;
             if (slot < 0 || slot + width > 10)
             {
@@ -547,12 +848,10 @@ public static class GhostBoardValidator
             AppendCrossHeroWarningIfNeeded(tpl, zhName, normalizedHero, result.Warnings);
             AppendUnselectedModWarningIfNeeded(tpl, zhName, modHost, explicitAllowedModIds, result.Warnings);
 
-            // 清洗任务与额外标签
-            var cleanCompletedQuests = CleanStringList(item.CompletedQuests);
-            var cleanQuestProgress = CleanFiniteDoubleDict(item.QuestProgress, zhName, "任务进度", result.Errors);
-            var cleanExtraTags = CleanStringList(item.ExtraTags);
+            // 模块 D3：附加类型标签清洗（合法 ECardTag、剔除 tpl.Tags 与 "Tiny"、去重、单卡上限 6 个）
+            var cleanExtraTags = SanitizeExtraTags(tpl, zhName, item.ExtraTags, result.Warnings);
 
-            // 频率类属性剥除/钳回 + 数量类 editedAttributes 幂等折算
+            // 频率类属性剥除/钳回 + A2 任务重建顺序 + 数量类 editedAttributes / editedToggles 幂等折算
             var (outPermAttrs, outPermAdd, outPermMult) = SanitizeAndFoldAttributes(
                 tpl: tpl,
                 zhName: zhName,
@@ -564,6 +863,7 @@ public static class GhostBoardValidator
                 inputPermAdd: item.PermanentAdd,
                 inputPermMult: item.PermanentMult,
                 inputEditedAttrs: item.EditedAttributes,
+                inputEditedToggles: cleanToggles.Count > 0 ? cleanToggles : null,
                 errors: result.Errors,
                 warnings: result.Warnings);
 
@@ -640,6 +940,7 @@ public static class GhostBoardValidator
                 inputPermAdd: sk.PermanentAdd,
                 inputPermMult: sk.PermanentMult,
                 inputEditedAttrs: sk.EditedAttributes,
+                inputEditedToggles: null,
                 errors: result.Errors,
                 warnings: result.Warnings);
 
@@ -656,11 +957,12 @@ public static class GhostBoardValidator
             });
         }
 
-        // 6) 插座效果校验（克隆盘面原样保留合法项，过滤/钳制非数量篡改）
+        // 6) 模块 D2：插槽效果校验（强校验 Type == "SocketEffect"、同槽 0..9 最多 1 个、并入 unlockedMask、按 Slot 升序稳定输出）
         var rawSockets = input.SocketEffects ?? new List<PlannerSocketEffectInput>();
         if (rawSockets.Count > MaxSocketEffects)
             result.Errors.Add($"插座效果最多 {MaxSocketEffects} 个");
 
+        var usedSocketSlots = new HashSet<int>();
         var normalizedSockets = new List<PvpGhostPool.GhostSocketEffect>(Math.Min(rawSockets.Count, MaxSocketEffects));
         for (int i = 0; i < rawSockets.Count && i < MaxSocketEffects; i++)
         {
@@ -671,14 +973,42 @@ public static class GhostBoardValidator
                 result.Errors.Add($"第 {i + 1} 个插座效果槽位（{se.Slot}）超出 0–9 范围");
                 continue;
             }
+            if (!usedSocketSlots.Add(se.Slot))
+            {
+                result.Errors.Add($"第 {se.Slot + 1} 格不能同时放置多个插座效果");
+                continue;
+            }
 
             string tplId = se.TemplateId?.Trim() ?? "";
             var seTpl = !string.IsNullOrEmpty(tplId) ? effectiveRepo.GetCard(tplId) : null;
-            if (seTpl == null || !effectivePool.IsAssetValid(seTpl.Id) || MonsterPool.IsBlockedDebugOrBlankArtSkill(seTpl))
+            if (seTpl == null)
             {
-                result.Errors.Add($"第 {i + 1} 个插座效果模板无效：{tplId}");
+                var globalSeTpl = !string.IsNullOrEmpty(tplId) ? modHost?.ActiveRepository.GetCard(tplId) : null;
+                if (globalSeTpl != null && globalSeTpl.IsCustomModCard && !string.IsNullOrWhiteSpace(globalSeTpl.CustomModOrigin))
+                {
+                    string gName = ResolveCardNameZh(globalSeTpl, modHost?.ActiveRepository);
+                    result.Errors.Add($"插座效果「{gName}」来自当前环境未启用的 Mod「{globalSeTpl.CustomModOrigin}」");
+                }
+                else
+                {
+                    result.Errors.Add($"第 {i + 1} 个插座效果模板无效：{tplId}");
+                }
                 continue;
             }
+
+            string seZhName = ResolveCardNameZh(seTpl, effectiveRepo);
+            if (!string.Equals(seTpl.Type, "SocketEffect", StringComparison.OrdinalIgnoreCase))
+            {
+                result.Errors.Add($"「{seZhName}」不是合法的插座效果模板");
+                continue;
+            }
+            if (!IsValidSocketEffectTemplate(seTpl))
+            {
+                result.Errors.Add($"插座效果「{seZhName}」为调试或禁用模板，不可使用");
+                continue;
+            }
+
+            AppendUnselectedModWarningIfNeeded(seTpl, seZhName, modHost, explicitAllowedModIds, result.Warnings);
 
             var supportedTiers = GetSupportedTiers(seTpl);
             string canonicalTier = MatchSupportedValue(se.Tier, supportedTiers) ?? supportedTiers[0];
@@ -692,7 +1022,6 @@ public static class GhostBoardValidator
             if (se.PermanentAttributes is { Count: > 0 })
             {
                 var seCard = new CardInstance(seTpl, TierHelper.ParseTier(canonicalTier), canonicalEnch, "val_se");
-                string seZhName = ResolveCardNameZh(seTpl, effectiveRepo);
                 cleanSeAttrs = new Dictionary<string, int>(StringComparer.Ordinal);
                 foreach (var (ak, av) in se.PermanentAttributes)
                 {
@@ -732,6 +1061,7 @@ public static class GhostBoardValidator
                 if (cleanSeAttrs.Count == 0) cleanSeAttrs = null;
             }
 
+            unlockedMask |= 1 << se.Slot;
             normalizedSockets.Add(new PvpGhostPool.GhostSocketEffect
             {
                 Slot = se.Slot,
@@ -741,6 +1071,8 @@ public static class GhostBoardValidator
                 PermanentAttributes = cleanSeAttrs,
             });
         }
+
+        normalizedSockets.Sort((a, b) => a.Slot.CompareTo(b.Slot));
 
         if (normalizedItems.Count == 0 && normalizedSkills.Count == 0)
             result.Warnings.Add("这一天的对手什么都没带，开局时会是一个空手对手");
@@ -797,10 +1129,11 @@ public static class GhostBoardValidator
         Dictionary<string, double>? inputPermAdd,
         Dictionary<string, double>? inputPermMult,
         Dictionary<string, double>? inputEditedAttrs,
+        Dictionary<string, bool>? inputEditedToggles,
         List<string> errors,
         List<string> warnings)
     {
-        // 1) 构建 CardInstance 并挂载任务状态（注意：是否先调 RebuildTierAndEnchantmentData 需按分支严格对齐 PvpGhostPool.ToPlayerState）
+        // 1) 构建 CardInstance 并先挂载清洗后任务、重建品阶/附魔/任务奖励属性（A2 顺序统一：消除平铺 + 任务双倍叠算）
         var card = new CardInstance(tpl, coreTier, enchantment, "val");
         if (questProgress is { Count: > 0 })
         {
@@ -812,11 +1145,13 @@ public static class GhostBoardValidator
         {
             foreach (string qid in completedQuests!)
                 card.CompletedQuests.Add(qid);
+            card.RebuildTierAndEnchantmentData();
         }
 
         // 2) 过滤原有 PermanentAdd / PermanentMult：
         //    - 按显式频率/控制黑名单剥除篡改并追加去重中文 warnings；
-        //    - 保留 7 项数量类及克隆卡的合法非频率成长（如 Lifesteal、SellPrice、JoyApplyAmount、Custom_* 等）。
+        //    - Quest_* 进度统一由 QuestProgress / CompletedQuests 承载，不混入永久属性层；
+        //    - 保留 8 项数量类及克隆卡的合法非频率成长（如 Tiny、Lifesteal、Flying、DestroyImmunity、SellPrice 等）。
         var cleanAdd = new Dictionary<string, double>(StringComparer.Ordinal);
         if (inputPermAdd != null)
         {
@@ -829,7 +1164,7 @@ public static class GhostBoardValidator
                     errors.Add($"「{zhName}」的永久属性增量 {trimmedKey} 数值无效");
                     continue;
                 }
-                if (DerivedGhostAttributeKeys.Contains(trimmedKey)) continue;
+                if (DerivedGhostAttributeKeys.Contains(trimmedKey) || IsQuestProgressAttributeKey(trimmedKey)) continue;
                 if (IsBlockedFrequencyAttribute(trimmedKey))
                 {
                     if (Math.Abs(val) > 1e-6)
@@ -865,7 +1200,7 @@ public static class GhostBoardValidator
                     errors.Add($"「{zhName}」的永久属性倍率 {trimmedKey} 数值无效");
                     continue;
                 }
-                if (DerivedGhostAttributeKeys.Contains(trimmedKey)) continue;
+                if (DerivedGhostAttributeKeys.Contains(trimmedKey) || IsQuestProgressAttributeKey(trimmedKey)) continue;
                 if (IsBlockedFrequencyAttribute(trimmedKey))
                 {
                     if (Math.Abs(val - 1.0) > 1e-6)
@@ -894,14 +1229,13 @@ public static class GhostBoardValidator
             }
         }
 
-        // 3) 还原到 CardInstance（严格对齐 PvpGhostPool.ToPlayerState L3126–3155 顺序）：
-        //    - 有分层 PermanentAdd/Mult 时：先 RebuildTierAndEnchantmentData 再挂载分层；
-        //    - 无分层而走平铺 PermanentAttributes 时：先基于任务前 BaseAttributes 算平铺 delta 再 RebuildTierAndEnchantmentData。
+        // 3) 还原到 CardInstance（此时 card.BaseAttributes 已含品阶 + 附魔 + 已完成任务奖励）：
+        //    - 有分层 PermanentAdd/Mult 时直接挂载；
+        //    - 无分层而走旧格式平铺 PermanentAttributes 时，基于任务后 BaseAttributes 反解差值（绝不双倍叠算），
+        //      若同时含已完成任务且存在非零差值，升格写入 cleanAdd 以确保与 ToPlayerState 100% 幂等一致。
         bool hasLayeredPerm = cleanAdd.Count > 0 || cleanMult.Count > 0;
         if (hasLayeredPerm)
         {
-            if (hasCompletedQuests)
-                card.RebuildTierAndEnchantmentData();
             foreach (var (ak, av) in cleanAdd)
                 card.PermanentAdd[ak] = av;
             foreach (var (ak, mv) in cleanMult)
@@ -913,7 +1247,8 @@ public static class GhostBoardValidator
             {
                 if (string.IsNullOrWhiteSpace(ak)) continue;
                 string trimmedKey = ak.Trim();
-                if (DerivedGhostAttributeKeys.Contains(trimmedKey) || IsBlockedFrequencyAttribute(trimmedKey)) continue;
+                if (DerivedGhostAttributeKeys.Contains(trimmedKey) || IsQuestProgressAttributeKey(trimmedKey) || IsBlockedFrequencyAttribute(trimmedKey))
+                    continue;
                 if (!TryResolveAllowedNonFrequencyKey(trimmedKey, out string canonKey)) continue;
                 if (IsCooldownKey(canonKey) && !HasNativeCooldown(card)) continue;
                 double baseVal = card.BaseAttributes.GetValueOrDefault(canonKey, 0.0);
@@ -921,16 +1256,20 @@ public static class GhostBoardValidator
                 if (Math.Abs(delta) > 0.001)
                     card.PermanentAdd[canonKey] = delta;
             }
-            if (hasCompletedQuests)
-                card.RebuildTierAndEnchantmentData();
+            if (hasCompletedQuests && card.PermanentAdd.Count > 0)
+            {
+                foreach (var (pk, pv) in card.PermanentAdd)
+                {
+                    if (Math.Abs(pv) > 1e-6)
+                        cleanAdd[pk] = pv;
+                }
+                hasLayeredPerm = cleanAdd.Count > 0;
+            }
         }
-        else if (hasCompletedQuests)
-        {
-            card.RebuildTierAndEnchantmentData();
-        }
+        card.MarkAttributeDirty();
 
-        // 4) 折算前端手改 editedAttributes → PermanentAdd（严格保持 7 项数量类白名单）
-        bool appliedQuantityEdit = false;
+        // 4) 折算前端手改 editedAttributes → PermanentAdd（严格保持 8 项数量类白名单）
+        bool layeredActive = hasLayeredPerm;
         if (inputEditedAttrs is { Count: > 0 })
         {
             // 先检查是否存在有效数量类编辑；若存在且原卡走平铺回退分支，必须先提升其他属性差值至 cleanAdd，
@@ -954,7 +1293,7 @@ public static class GhostBoardValidator
                     continue;
                 }
 
-                if (!appliedQuantityEdit && !hasLayeredPerm && card.PermanentAdd.Count > 0)
+                if (!layeredActive && card.PermanentAdd.Count > 0)
                 {
                     foreach (var (pk, pv) in card.PermanentAdd)
                     {
@@ -962,15 +1301,67 @@ public static class GhostBoardValidator
                             cleanAdd[pk] = pv;
                     }
                 }
-                appliedQuantityEdit = true;
+                layeredActive = true;
 
                 double target = Math.Clamp(Math.Round(rawVal), QuantityMinFor(card, key), PlannerCatalogConstants.QuantityMax);
                 ApplyTargetQuantityValue(card, cleanAdd, cleanMult, key, target);
             }
         }
 
+        // 4b) 模块 D1 & D3：折算前端显式切换的 editedToggles → PermanentAdd / PermanentAttributes 后剥离 editedToggles
+        var explicitlyDisabledToggles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (inputEditedToggles is { Count: > 0 })
+        {
+            foreach (var (toggleKey, enabled) in inputEditedToggles)
+            {
+                if (!PlannerCatalogConstants.TryGetCanonicalToggle(toggleKey, out string canonKey, out double onVal))
+                    continue;
+
+                if (!layeredActive && card.PermanentAdd.Count > 0)
+                {
+                    foreach (var (pk, pv) in card.PermanentAdd)
+                    {
+                        if (Math.Abs(pv) > 1e-6)
+                            cleanAdd[pk] = pv;
+                    }
+                }
+                layeredActive = true;
+
+                double baseVal = card.BaseAttributes.GetValueOrDefault(canonKey, 0.0);
+                if (enabled)
+                {
+                    card.PermanentMult.Remove(canonKey);
+                    cleanMult.Remove(canonKey);
+                    if (baseVal >= onVal - 1e-6)
+                    {
+                        card.PermanentAdd.Remove(canonKey);
+                        cleanAdd.Remove(canonKey);
+                    }
+                    else
+                    {
+                        double neededAdd = onVal - baseVal;
+                        card.PermanentAdd[canonKey] = neededAdd;
+                        cleanAdd[canonKey] = neededAdd;
+                    }
+                }
+                else
+                {
+                    card.PermanentAdd.Remove(canonKey);
+                    cleanAdd.Remove(canonKey);
+                    card.PermanentMult.Remove(canonKey);
+                    cleanMult.Remove(canonKey);
+                    explicitlyDisabledToggles.Add(canonKey);
+                    if (baseVal > 0)
+                    {
+                        string lbl = PlannerCatalogConstants.EditableToggleLabelsZh.TryGetValue(canonKey, out var zh) ? zh : canonKey;
+                        AddWarningOnce(warnings, $"「{zhName}」本身自带{lbl}，不可关闭");
+                    }
+                }
+                card.MarkAttributeDirty();
+            }
+        }
+
         // 5) 对所有数量类属性做越界安全钳制（0..QuantityMax），并将原始未钳制负值归零至 -baseVal
-        bool layeredActive = hasLayeredPerm || appliedQuantityEdit;
         foreach (string key in PlannerCatalogConstants.QuantityAttributes)
         {
             bool exists = card.BaseAttributes.ContainsKey(key)
@@ -1005,8 +1396,8 @@ public static class GhostBoardValidator
         }
 
         // 6) 重算输出 PermanentAttributes：
-        //    - 7 项数量类：凡 BaseAttributes / PermanentAdd / PermanentMult 存在的键，写入最终值；
-        //    - 合法非频率成长键：保留其真实计算终值（确保未编辑克隆卡的 Lifesteal/SellPrice 等不丢失）；
+        //    - 8 项数量类：凡 BaseAttributes / PermanentAdd / PermanentMult 存在的键，写入最终值；
+        //    - 合法非频率成长键（含开启的 Tiny/Lifesteal/Flying/DestroyImmunity）：保留真实计算终值；
         //    - 频率/控制类：存在于 BaseAttributes 时钳回基础值（若被篡改则追加去重 warning），否则移除并追加去重 warning。
         var outPermAttrs = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (string key in PlannerCatalogConstants.QuantityAttributes)
@@ -1026,12 +1417,12 @@ public static class GhostBoardValidator
         var nonFreqGrowthKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (string k in card.PermanentAdd.Keys)
         {
-            if (!TryGetCanonicalQuantityKey(k, out _) && !IsBlockedFrequencyAttribute(k))
+            if (!TryGetCanonicalQuantityKey(k, out _) && !IsBlockedFrequencyAttribute(k) && !IsQuestProgressAttributeKey(k))
                 nonFreqGrowthKeys.Add(k);
         }
         foreach (string k in card.PermanentMult.Keys)
         {
-            if (!TryGetCanonicalQuantityKey(k, out _) && !IsBlockedFrequencyAttribute(k))
+            if (!TryGetCanonicalQuantityKey(k, out _) && !IsBlockedFrequencyAttribute(k) && !IsQuestProgressAttributeKey(k))
                 nonFreqGrowthKeys.Add(k);
         }
         foreach (string k in nonFreqGrowthKeys)
@@ -1047,7 +1438,7 @@ public static class GhostBoardValidator
             {
                 if (string.IsNullOrWhiteSpace(rawKey)) continue;
                 string trimmedKey = rawKey.Trim();
-                if (DerivedGhostAttributeKeys.Contains(trimmedKey)) continue;
+                if (DerivedGhostAttributeKeys.Contains(trimmedKey) || IsQuestProgressAttributeKey(trimmedKey)) continue;
                 if (TryGetCanonicalQuantityKey(trimmedKey, out _)) continue;
                 if (outPermAttrs.ContainsKey(trimmedKey)) continue;
 
@@ -1073,6 +1464,10 @@ public static class GhostBoardValidator
                     }
                     continue;
                 }
+
+                if (explicitlyDisabledToggles.Contains(trimmedKey) &&
+                    card.BaseAttributes.GetValueOrDefault(trimmedKey, 0.0) <= 0)
+                    continue;
 
                 if (card.BaseAttributes.TryGetValue(trimmedKey, out double baseVal) && double.IsFinite(baseVal))
                     outPermAttrs[trimmedKey] = (int)Math.Round(baseVal);
@@ -1444,6 +1839,7 @@ public static class GhostBoardValidator
                         QuestProgress = ReadDoubleDict(el, "questProgress", $"第 {idx} 件物品任务进度", errors),
                         ExtraTags = ReadStringList(el, "extraTags"),
                         EditedAttributes = ReadDoubleDict(el, "editedAttributes", $"第 {idx} 件物品手改属性", errors),
+                        EditedToggles = ReadBoolDict(el, "editedToggles", $"第 {idx} 件物品状态开关", errors),
                     });
                 }
             }
@@ -1649,5 +2045,63 @@ public static class GhostBoardValidator
             }
         }
         return list;
+    }
+
+    private static Dictionary<string, bool>? ReadBoolDict(JsonElement obj, string name, string labelZh, List<string> errors)
+    {
+        if (!TryGetPropertyCI(obj, name, out var el) || el.ValueKind == JsonValueKind.Null) return null;
+        if (el.ValueKind != JsonValueKind.Object)
+        {
+            errors.Add($"{labelZh}格式无效");
+            return null;
+        }
+        var dict = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        foreach (var prop in el.EnumerateObject())
+        {
+            if (prop.Value.ValueKind == JsonValueKind.Null) continue;
+            if (prop.Value.ValueKind == JsonValueKind.True)
+                dict[prop.Name] = true;
+            else if (prop.Value.ValueKind == JsonValueKind.False)
+                dict[prop.Name] = false;
+            else
+                errors.Add($"{labelZh} {prop.Name} 须为布尔值");
+        }
+        return dict;
+    }
+
+    private static bool IsQuestProgressAttributeKey(string key)
+        => key.StartsWith("Quest_", StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasPositiveDoubleKey(Dictionary<string, double>? dict, string targetKey)
+    {
+        if (dict == null || dict.Count == 0) return false;
+        foreach (var (k, v) in dict)
+        {
+            if (string.Equals(k?.Trim(), targetKey, StringComparison.OrdinalIgnoreCase) && double.IsFinite(v) && v > 0)
+                return true;
+        }
+        return false;
+    }
+
+    private static bool HasPositiveIntKey(Dictionary<string, int>? dict, string targetKey)
+    {
+        if (dict == null || dict.Count == 0) return false;
+        foreach (var (k, v) in dict)
+        {
+            if (string.Equals(k?.Trim(), targetKey, StringComparison.OrdinalIgnoreCase) && v > 0)
+                return true;
+        }
+        return false;
+    }
+
+    private static bool ContainsIgnoreCase(List<string>? list, string target)
+    {
+        if (list == null || list.Count == 0) return false;
+        for (int i = 0; i < list.Count; i++)
+        {
+            if (string.Equals(list[i]?.Trim(), target, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 }

@@ -27,7 +27,7 @@ public sealed record ClientUpdateFilePolicy(
 /// </summary>
 public static class ClientUpdateEndpoints
 {
-    private const string DefaultFallbackVersion = "15.5.0";
+    private const string DefaultFallbackVersion = "15.6.0";
 
     private static readonly StringComparer PathComparer =
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;

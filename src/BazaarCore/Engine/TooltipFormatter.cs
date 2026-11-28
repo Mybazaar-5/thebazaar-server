@@ -84,8 +84,8 @@ public static partial class TooltipFormatter
                     double prog = card.GetQuestProgress(entry.AttributeType);
                     bool done = card.IsQuestCompleted(entry.AttributeType);
 
-                    string? goalText = RenderLocalizedBlockFirstLine(entry.Localization, loc, card, ctx);
-                    string? rewardText = RenderLocalizedBlockFirstLine(entry.Reward?.Localization, loc, card, ctx);
+                    string goalText = FormatQuestGoalTextInternal(card, entry, loc, ctx);
+                    string rewardText = FormatQuestRewardTextInternal(card, entry, loc, ctx);
 
                     if (!string.IsNullOrWhiteSpace(goalText))
                     {
@@ -110,6 +110,160 @@ public static partial class TooltipFormatter
         }
 
         return lines;
+    }
+
+    /// <summary>
+    /// 渲染单条任务的目标文本（优先官方中文词库并动态解析占位符；缺省返回空字符串）。
+    /// </summary>
+    public static string FormatQuestGoalText(CardInstance card, QuestEntry entry, ILocalizationStore? loc = null)
+        => FormatQuestGoalTextInternal(card, entry, loc, null);
+
+    /// <summary>
+    /// 渲染单条任务的奖励文本；若任务尚未完成，内部构建无副作用隔离预览副本计算奖励数值，绝不修改原 <paramref name="card"/>。
+    /// </summary>
+    public static string FormatQuestRewardText(CardInstance card, QuestEntry entry, ILocalizationStore? loc = null)
+        => FormatQuestRewardTextInternal(card, entry, loc, null);
+
+    /// <summary>
+    /// 渲染指定卡牌模板在给定品阶下某附魔的效果摘要文本（不含 "[附魔名]" 前缀）；附魔不存在或无文案时返回空字符串。
+    /// </summary>
+    public static string FormatEnchantmentSummary(CardTemplate tpl, string enchantment, CardTier tier, ILocalizationStore? loc = null)
+    {
+        if (tpl == null || string.IsNullOrWhiteSpace(enchantment) || tpl.Enchantments == null)
+            return string.Empty;
+
+        string? canonKey = null;
+        EnchantmentData? ench = null;
+        if (tpl.Enchantments.TryGetValue(enchantment, out var direct))
+        {
+            canonKey = enchantment;
+            ench = direct;
+        }
+        else
+        {
+            foreach (var kv in tpl.Enchantments)
+            {
+                if (string.Equals(kv.Key, enchantment, StringComparison.OrdinalIgnoreCase))
+                {
+                    canonKey = kv.Key;
+                    ench = kv.Value;
+                    break;
+                }
+            }
+        }
+
+        if (ench?.Localization == null || string.IsNullOrEmpty(canonKey))
+            return string.Empty;
+
+        var preview = new CardInstance(tpl, tier, canonKey);
+        return RenderLocalizedBlockFirstLine(ench.Localization, loc, preview, null) ?? string.Empty;
+    }
+
+    /// <summary>
+    /// 查找指定卡牌模板中不可重复任务的目标进度值（严格跳过 <see cref="QuestDefinition.EffectiveRepeatable"/> 为 true 的任务组）。
+    /// 命中时返回 <c>Math.Max(1, entry.Target)</c>；未命中或属于可重复任务组时返回 false。
+    /// </summary>
+    public static bool TryFindNonRepeatableQuestTarget(CardTemplate? tpl, string? questAttr, out double target)
+    {
+        target = 0;
+        if (tpl?.Quests == null || string.IsNullOrWhiteSpace(questAttr))
+            return false;
+
+        for (int qi = 0; qi < tpl.Quests.Count; qi++)
+        {
+            var group = tpl.Quests[qi];
+            if (group.EffectiveRepeatable || group.Entries == null)
+                continue;
+
+            for (int ei = 0; ei < group.Entries.Count; ei++)
+            {
+                var entry = group.Entries[ei];
+                if (string.Equals(entry.AttributeType, questAttr, StringComparison.OrdinalIgnoreCase))
+                {
+                    target = Math.Max(1, entry.Target);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static string FormatQuestGoalTextInternal(
+        CardInstance card,
+        QuestEntry entry,
+        ILocalizationStore? loc,
+        RuleExecutionContext? ctx)
+    {
+        if (card == null || entry == null) return string.Empty;
+        var effectiveLoc = loc ?? ctx?.Repo?.Localization;
+        return RenderLocalizedBlockFirstLine(entry.Localization, effectiveLoc, card, ctx) ?? string.Empty;
+    }
+
+    private static string FormatQuestRewardTextInternal(
+        CardInstance card,
+        QuestEntry entry,
+        ILocalizationStore? loc,
+        RuleExecutionContext? ctx)
+    {
+        if (card == null || entry?.Reward?.Localization == null) return string.Empty;
+        var effectiveLoc = loc ?? ctx?.Repo?.Localization;
+        bool done = card.IsQuestCompleted(entry.AttributeType);
+        CardInstance evalCard = !done ? BuildQuestRewardPreviewCard(card, entry) : card;
+        return RenderLocalizedBlockFirstLine(entry.Reward.Localization, effectiveLoc, evalCard, ctx) ?? string.Empty;
+    }
+
+    /// <summary>
+    /// 为未完成任务的奖励文本构造轻量级无副作用隔离预览副本：
+    /// 保留原卡品阶、附魔、既有已完成任务与持久层修正，仅临时加入当前任务以计算准确奖励数值，绝不修改原 <paramref name="card"/>。
+    /// </summary>
+    private static CardInstance BuildQuestRewardPreviewCard(CardInstance card, QuestEntry entry)
+    {
+        var preview = new CardInstance(card.Template, card.Tier, card.Enchantment, card.InstanceId)
+        {
+            AttachedStandardPrices = card.AttachedStandardPrices
+        };
+
+        foreach (string q in card.CompletedQuests)
+            preview.CompletedQuests.Add(q);
+        foreach (string q in card.CombatCompletedQuests)
+            preview.CombatCompletedQuests.Add(q);
+        if (!string.IsNullOrWhiteSpace(entry.AttributeType))
+            preview.CompletedQuests.Add(entry.AttributeType);
+
+        preview.RebuildTierAndEnchantmentData();
+
+        CopyDict(card.PermanentAdd, preview.PermanentAdd);
+        CopyDict(card.PermanentMult, preview.PermanentMult);
+        CopyDict(card.PermanentAdditiveMult, preview.PermanentAdditiveMult);
+        CopyDict(card.DayAdd, preview.DayAdd);
+        CopyDict(card.DayMult, preview.DayMult);
+        CopyDict(card.DayAdditiveMult, preview.DayAdditiveMult);
+        CopyDict(card.HourAdd, preview.HourAdd);
+        CopyDict(card.HourMult, preview.HourMult);
+        CopyDict(card.HourAdditiveMult, preview.HourAdditiveMult);
+        CopyDict(card.CombatAdd, preview.CombatAdd);
+        CopyDict(card.CombatMult, preview.CombatMult);
+        CopyDict(card.CombatAdditiveMult, preview.CombatAdditiveMult);
+        CopyDict(card.AuraAdd, preview.AuraAdd);
+        CopyDict(card.AuraMult, preview.AuraMult);
+        CopyDict(card.AuraAdditiveMult, preview.AuraAdditiveMult);
+        CopyDict(card.QuestProgress, preview.QuestProgress);
+        CopyDict(card.CombatQuestProgress, preview.CombatQuestProgress);
+        foreach (string tag in card.ExtraTags) preview.ExtraTags.Add(tag);
+        foreach (string tag in card.DayTags) preview.DayTags.Add(tag);
+        foreach (string tag in card.HourTags) preview.HourTags.Add(tag);
+        foreach (string tag in card.CombatTags) preview.CombatTags.Add(tag);
+        foreach (string tag in card.AuraTags) preview.AuraTags.Add(tag);
+        preview.MarkAttributeDirty();
+        return preview;
+    }
+
+    private static void CopyDict(Dictionary<string, double> src, Dictionary<string, double> dst)
+    {
+        if (src.Count == 0) return;
+        foreach (var (k, v) in src)
+            dst[k] = v;
     }
 
     private static string? RenderLocalizedBlockFirstLine(
@@ -234,6 +388,42 @@ public static partial class TooltipFormatter
             card.Template.Enchantments.TryGetValue(card.Enchantment, out var ench) &&
             ench.Abilities.TryGetValue(id, out var eab) && eab.Action != null)
             return eab.Action;
+        // V15.6 B1：第 4 级回退扫描任务奖励能力与一次性完成效果（对齐客户端 TooltipComponentAbility）
+        if (card.Template.Quests != null)
+        {
+            for (int qi = 0; qi < card.Template.Quests.Count; qi++)
+            {
+                var entries = card.Template.Quests[qi].Entries;
+                if (entries == null) continue;
+                for (int ei = 0; ei < entries.Count; ei++)
+                {
+                    var entry = entries[ei];
+                    var rewardAbilities = entry.Reward?.Abilities;
+                    if (rewardAbilities != null)
+                    {
+                        if (rewardAbilities.TryGetValue(id, out var qab) && qab.Action != null)
+                            return qab.Action;
+                        foreach (var qabVal in rewardAbilities.Values)
+                        {
+                            if (string.Equals(qabVal.Id, id, StringComparison.Ordinal) && qabVal.Action != null)
+                                return qabVal.Action;
+                        }
+                    }
+
+                    var completionEffects = entry.CompletionEffects;
+                    if (completionEffects != null)
+                    {
+                        if (completionEffects.TryGetValue(id, out var cab) && cab.Action != null)
+                            return cab.Action;
+                        foreach (var cabVal in completionEffects.Values)
+                        {
+                            if (string.Equals(cabVal.Id, id, StringComparison.Ordinal) && cabVal.Action != null)
+                                return cabVal.Action;
+                        }
+                    }
+                }
+            }
+        }
         return null;
     }
 
@@ -253,6 +443,29 @@ public static partial class TooltipFormatter
             card.Template.Enchantments.TryGetValue(card.Enchantment, out var ench) &&
             ench.Auras.TryGetValue(id, out var eau) && eau.Action != null)
             return eau.Action;
+        // V15.6 B1：第 4 级回退扫描任务奖励光环（对齐客户端 TooltipComponentAura）
+        if (card.Template.Quests != null)
+        {
+            for (int qi = 0; qi < card.Template.Quests.Count; qi++)
+            {
+                var entries = card.Template.Quests[qi].Entries;
+                if (entries == null) continue;
+                for (int ei = 0; ei < entries.Count; ei++)
+                {
+                    var rewardAuras = entries[ei].Reward?.Auras;
+                    if (rewardAuras != null)
+                    {
+                        if (rewardAuras.TryGetValue(id, out var qau) && qau.Action != null)
+                            return qau.Action;
+                        foreach (var qauVal in rewardAuras.Values)
+                        {
+                            if (string.Equals(qauVal.Id, id, StringComparison.Ordinal) && qauVal.Action != null)
+                                return qauVal.Action;
+                        }
+                    }
+                }
+            }
+        }
         return null;
     }
 
@@ -327,6 +540,12 @@ public static partial class TooltipFormatter
 
         var fixedNum = action.GetFixedNumericValue();
         if (fixedNum.HasValue) return fixedNum.Value;
+
+        if (action.SpawnContext?.Limit != null)
+            return ValueAndConditionEvaluator.EvaluateValue(action.SpawnContext.Limit, evalCtx);
+
+        if (action.Limit != null)
+            return ValueAndConditionEvaluator.EvaluateValue(action.Limit, evalCtx);
 
         if (action.AttributeType != null)
             return card.GetAttribute(action.AttributeType);

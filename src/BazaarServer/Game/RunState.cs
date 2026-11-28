@@ -1,4 +1,5 @@
 using System.Collections.Frozen;
+using BazaarCore.Engine;
 using BazaarCore.Models;
 using BazaarCore.Runtime;
 using BazaarGameShared.Domain.Core;
@@ -2206,10 +2207,11 @@ public sealed class RunState
             }
         }
 
-        // 4. 汇总全部可渲染属性键（固定核心键 + CardInstance 权威全层键 + QuestProgress 键）
+        // 4. 汇总全部可渲染属性键（固定核心键 + CardInstance 权威全层键 + QuestProgress / CompletedQuests 键）
         var candidateKeys = new HashSet<string>(RenderableCardAttributeNames, StringComparer.OrdinalIgnoreCase);
         foreach (var k in core.EnumeratePresentAttributeKeys()) candidateKeys.Add(k);
         foreach (var k in core.QuestProgress.Keys) candidateKeys.Add(k);
+        foreach (var k in core.CompletedQuests) candidateKeys.Add(k);
 
         foreach (string key in candidateKeys)
         {
@@ -2249,7 +2251,10 @@ public sealed class RunState
             {
                 double qp = core.QuestProgress.TryGetValue(key, out double qVal) ? qVal : 0;
                 double attrVal = core.GetAttribute(key);
-                newVal = (int)Math.Round(Math.Max(qp, attrVal));
+                double completedFloor = (core.IsQuestCompleted(key)
+                    && TooltipFormatter.TryFindNonRepeatableQuestTarget(core.Template, key, out double t))
+                    ? t : 0;
+                newVal = (int)Math.Round(Math.Max(Math.Max(qp, attrVal), completedFloor));
             }
             else if (attrType == ECardAttributeType.QuestCompletedCount)
             {

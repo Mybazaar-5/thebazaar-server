@@ -34,7 +34,7 @@ public static class WorkshopEndpoints
             if (!string.IsNullOrEmpty(cleaned))
                 return cleaned;
         }
-        return asm.GetName().Version?.ToString(3) ?? "15.5.0";
+        return asm.GetName().Version?.ToString(3) ?? "15.6.0";
     }
     private static readonly JsonSerializerOptions JsonOpts = new()
     {

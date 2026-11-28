@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Security.Cryptography;
 using System.Text;
@@ -153,6 +154,9 @@ public sealed class PvpGhostPool
         public bool IsPlayerGhost { get; init; }
         public bool IsCustomRule { get; init; }
         public string PoolPartition { get; init; } = StandardPartition;
+        /// <summary>录制该镜像时的底层 GameData.db 版本指纹（单一权威持久化于 SQLite pvp_ghosts.game_data_hash 列，绝不写入 JSON）。</summary>
+        [JsonIgnore]
+        public string GameDataHash { get; init; } = "";
         public List<GhostItem> Items { get; init; } = new();
         public List<GhostSkill> Skills { get; init; } = new();
         public List<GhostSocketEffect>? SocketEffects { get; init; }
@@ -165,6 +169,66 @@ public sealed class PvpGhostPool
              || Source.StartsWith("bazaarplusplus", StringComparison.OrdinalIgnoreCase)
              || Source.StartsWith("compass", StringComparison.OrdinalIgnoreCase)
              || Source.StartsWith("bazaarhub", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>跨版本/旧锚点读时清洗审计聚合键。</summary>
+    public readonly record struct GhostSanitizationAuditKey(
+        string Source,
+        string TemplateId,
+        string Attribute,
+        string Reason);
+
+    /// <summary>跨版本/旧锚点读时清洗审计汇总快照。</summary>
+    public sealed class GhostSanitizationAuditSummary
+    {
+        public int ScannedBoards { get; init; }
+        public int AffectedBoards { get; init; }
+        public long TotalCleanedEntries { get; init; }
+        public IReadOnlyDictionary<GhostSanitizationAuditKey, long> CountsByKey { get; init; }
+            = new Dictionary<GhostSanitizationAuditKey, long>();
+        public IReadOnlyDictionary<string, long> CountsByReason { get; init; }
+            = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>线程安全的读时清洗审计收集器（按 (source, templateId, attr, reason) 聚合计数）。</summary>
+    public sealed class GhostSanitizationAuditCollector
+    {
+        private readonly ConcurrentDictionary<GhostSanitizationAuditKey, long> _counts = new();
+        private int _scannedBoards;
+        private int _affectedBoards;
+
+        public void RecordBoardScanned(bool wasAffected)
+        {
+            Interlocked.Increment(ref _scannedBoards);
+            if (wasAffected)
+                Interlocked.Increment(ref _affectedBoards);
+        }
+
+        public void Record(string source, string templateId, string attribute, string reason)
+        {
+            var key = new GhostSanitizationAuditKey(source, templateId, attribute, reason);
+            _counts.AddOrUpdate(key, 1L, static (_, old) => old + 1L);
+        }
+
+        public GhostSanitizationAuditSummary BuildSummary()
+        {
+            var snapshot = new Dictionary<GhostSanitizationAuditKey, long>(_counts);
+            var byReason = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            long total = 0;
+            foreach (var (k, v) in snapshot)
+            {
+                total += v;
+                byReason[k.Reason] = byReason.GetValueOrDefault(k.Reason, 0L) + v;
+            }
+            return new GhostSanitizationAuditSummary
+            {
+                ScannedBoards = Volatile.Read(ref _scannedBoards),
+                AffectedBoards = Volatile.Read(ref _affectedBoards),
+                TotalCleanedEntries = total,
+                CountsByKey = snapshot,
+                CountsByReason = byReason,
+            };
+        }
     }
 
     private sealed class StoredGhostBoardPayload
@@ -190,6 +254,7 @@ public sealed class PvpGhostPool
         IsRealCommunityGhost = 1 << 2,
         IsFull10Slots = 1 << 3,
         IsHighPower = 1 << 4,
+        IsLegacyAnchor = 1 << 5,
     }
 
     private const byte PowerBucketNormal = 0;
@@ -239,6 +304,7 @@ public sealed class PvpGhostPool
         public bool IsRealCommunityGhost => (Flags & GhostEntryFlags.IsRealCommunityGhost) != 0;
         public bool IsFull10Slots => (Flags & GhostEntryFlags.IsFull10Slots) != 0;
         public bool IsHighPower => (Flags & GhostEntryFlags.IsHighPower) != 0;
+        public bool IsLegacyAnchor => (Flags & GhostEntryFlags.IsLegacyAnchor) != 0;
         public bool IsDiskBacked => InMemoryBoard == null && FileOffset >= 0 && ByteLength > 0;
     }
 
@@ -373,6 +439,11 @@ public sealed class PvpGhostPool
     private volatile KeywordIndexData? _keywordIndex;
     private volatile DiskKeywordCache? _diskKeywordCache;
     private bool _keywordIndexBuilding;
+    private volatile string _currentGameDataHash = "";
+
+    private static volatile string _activeGameDataHash = "";
+    private static readonly GhostSanitizationAuditCollector RuntimeSanitizationAudit = new();
+    private static int _runtimeFirstAuditLogged;
 
     public PvpGhostPool()
         : this(DefaultLruCacheCapacity)
@@ -382,6 +453,126 @@ public sealed class PvpGhostPool
     public PvpGhostPool(int lruCacheCapacity)
     {
         _lru = new BoundedGhostLruCache(lruCacheCapacity);
+    }
+
+    /// <summary>当前服务实例加载的 GameData.db 短 SHA-256 指纹（16 位小写十六进制；未知时为空串）。</summary>
+    public string CurrentGameDataHash => _currentGameDataHash;
+
+    /// <summary>进程级当前激活的 GameData.db 短指纹（供静态 ToPlayerState 2 参调用读取）。</summary>
+    public static string ActiveGameDataHash => _activeGameDataHash;
+
+    /// <summary>注入当前运行期的底层 GameData.db 版本指纹（用于跨版本读时清洗判定与新录制镜像落库）。</summary>
+    public void SetCurrentGameDataHash(string? hash)
+    {
+        string normalized = string.IsNullOrWhiteSpace(hash) ? "" : hash.Trim().ToLowerInvariant();
+        _currentGameDataHash = normalized;
+        _activeGameDataHash = normalized;
+        Console.WriteLine($"[PvpGhostPool] GameDataHash={(string.IsNullOrEmpty(normalized) ? "<empty>" : normalized)}");
+    }
+
+    /// <summary>获取运行期累计的读时清洗审计汇总快照。</summary>
+    public static GhostSanitizationAuditSummary GetRuntimeSanitizationAuditSummary()
+        => RuntimeSanitizationAudit.BuildSummary();
+
+    /// <summary>
+    /// 在服务启动或审计测试中扫描池内全部旧版本罗盘锚点（real_compass_anchor）与跨版本已加载真人镜像，
+    /// 直接按磁盘偏移只读扫描且不污染热点 LRU 缓存，输出按 (source, templateId, attr, reason) 聚合的清洗审计汇总。
+    /// </summary>
+    public GhostSanitizationAuditSummary RunStartupSanitizationAudit(GameDataRepository repo, bool logSummary = true)
+    {
+        ArgumentNullException.ThrowIfNull(repo);
+        var collector = new GhostSanitizationAuditCollector();
+        var entries = _index.AllEntries;
+        string currentHash = _currentGameDataHash;
+
+        string? filePath = _sourceFilePath;
+        SafeFileHandle? handle = null;
+        byte[]? rented = null;
+        try
+        {
+            for (int i = 0; i < entries.Length; i++)
+            {
+                var entry = entries[i];
+                GhostBoard? board = null;
+                if (entry.InMemoryBoard != null)
+                {
+                    var mem = entry.InMemoryBoard;
+                    bool needAudit = string.Equals(mem.Source, "real_compass_anchor", StringComparison.OrdinalIgnoreCase)
+                        || (!IsExemptFromCrossVersionSanitization(mem.Source)
+                            && mem.IsPlayerGhost
+                            && !string.IsNullOrEmpty(currentHash)
+                            && !string.Equals(mem.GameDataHash, currentHash, StringComparison.OrdinalIgnoreCase));
+                    if (!needAudit) continue;
+                    board = mem;
+                }
+                else if (entry.IsLegacyAnchor && entry.IsDiskBacked)
+                {
+                    if (handle == null)
+                    {
+                        if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
+                            continue;
+                        handle = File.OpenHandle(
+                            filePath,
+                            FileMode.Open,
+                            FileAccess.Read,
+                            FileShare.ReadWrite | FileShare.Delete,
+                            FileOptions.RandomAccess);
+                    }
+                    if (rented == null || rented.Length < entry.ByteLength)
+                    {
+                        if (rented != null) ArrayPool<byte>.Shared.Return(rented);
+                        rented = ArrayPool<byte>.Shared.Rent(Math.Max(entry.ByteLength, 8192));
+                    }
+                    int totalRead = 0;
+                    while (totalRead < entry.ByteLength)
+                    {
+                        int n = RandomAccess.Read(
+                            handle,
+                            rented.AsSpan(totalRead, entry.ByteLength - totalRead),
+                            entry.FileOffset + totalRead);
+                        if (n <= 0) break;
+                        totalRead += n;
+                    }
+                    if (totalRead == entry.ByteLength)
+                        board = ParseLineUtf8(rented.AsSpan(0, totalRead));
+                }
+
+                if (board != null)
+                {
+                    _ = ToPlayerState(board, repo, currentHash, collector);
+                }
+            }
+        }
+        finally
+        {
+            if (rented != null) ArrayPool<byte>.Shared.Return(rented);
+            handle?.Dispose();
+        }
+
+        var summary = collector.BuildSummary();
+        if (logSummary)
+            Console.WriteLine(FormatSanitizationAuditSummary("startup_audit", summary));
+        return summary;
+    }
+
+    /// <summary>将清洗审计汇总格式化为单行可读日志（ASCII 键名确保不同控制台代码页下清晰可读）。</summary>
+    public static string FormatSanitizationAuditSummary(string stage, GhostSanitizationAuditSummary summary)
+    {
+        var reasonsPart = summary.CountsByReason.Count == 0
+            ? "none"
+            : string.Join(", ", summary.CountsByReason
+                .OrderByDescending(kv => kv.Value)
+                .ThenBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(kv => $"{kv.Key}={kv.Value}"));
+        var topKeysPart = summary.CountsByKey.Count == 0
+            ? "none"
+            : string.Join("; ", summary.CountsByKey
+                .OrderByDescending(kv => kv.Value)
+                .ThenBy(kv => kv.Key.TemplateId, StringComparer.OrdinalIgnoreCase)
+                .Take(8)
+                .Select(kv => $"({kv.Key.Source},{kv.Key.TemplateId},{kv.Key.Attribute},{kv.Key.Reason})={kv.Value}"));
+        return $"[PvpGhostPool][SanitizeAudit] stage={stage} scannedBoards={summary.ScannedBoards} affectedBoards={summary.AffectedBoards} " +
+               $"totalCleaned={summary.TotalCleanedEntries} uniqueKeys={summary.CountsByKey.Count} byReason={{{reasonsPart}}} top=[{topKeysPart}]";
     }
 
     public int Count => _index.TotalCount;
@@ -846,6 +1037,7 @@ public sealed class PvpGhostPool
             if (!isPlayerGhost && IsRealCommunitySource(source)) flags |= GhostEntryFlags.IsRealCommunityGhost;
             if (day >= 4 && totalWidth >= 10) flags |= GhostEntryFlags.IsFull10Slots;
             if (pbCode is PowerBucketStrong or PowerBucketMetaBoss) flags |= GhostEntryFlags.IsHighPower;
+            if (string.Equals(source, "real_compass_anchor", StringComparison.OrdinalIgnoreCase)) flags |= GhostEntryFlags.IsLegacyAnchor;
 
             return new GhostIndexEntry
             {
@@ -884,6 +1076,7 @@ public sealed class PvpGhostPool
         if (board.IsRealCommunityGhost) flags |= GhostEntryFlags.IsRealCommunityGhost;
         if (clampedDay >= 4 && GetTotalSlotWidth(board, null) >= 10) flags |= GhostEntryFlags.IsFull10Slots;
         if (pbCode is PowerBucketStrong or PowerBucketMetaBoss) flags |= GhostEntryFlags.IsHighPower;
+        if (string.Equals(board.Source, "real_compass_anchor", StringComparison.OrdinalIgnoreCase)) flags |= GhostEntryFlags.IsLegacyAnchor;
 
         return new GhostIndexEntry
         {
@@ -2354,6 +2547,8 @@ public sealed class PvpGhostPool
         if (db == null) return 0;
         var rows = db.LoadPvpGhosts(2000, includeCustomRule: includeCustomRule);
         int added = 0;
+        int crossVersionCount = 0;
+        string currentHash = _currentGameDataHash;
 
         lock (_writeLock)
         {
@@ -2362,14 +2557,23 @@ public sealed class PvpGhostPool
                 var board = ParseDbRow(row);
                 if (board == null) continue;
                 if (!board.IsCustomRule && !IsSaneGhostForDay(board, board.Day)) continue;
-                if (AddBoardUnlocked(board)) added++;
+                if (AddBoardUnlocked(board))
+                {
+                    added++;
+                    if (!string.IsNullOrEmpty(currentHash)
+                        && !IsExemptFromCrossVersionSanitization(board.Source)
+                        && !string.Equals(board.GameDataHash, currentHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        crossVersionCount++;
+                    }
+                }
             }
             if (added > 0)
                 RebuildReadIndexUnlocked();
         }
 
         if (added > 0)
-            Console.WriteLine($"[PvpGhostPool] loaded {added} player ghost boards from db (total={Count})");
+            Console.WriteLine($"[PvpGhostPool] loaded {added} player ghost boards from db (total={Count}, crossVersionReadSanitize={crossVersionCount})");
         return added;
     }
 
@@ -2707,6 +2911,7 @@ public sealed class PvpGhostPool
             SocketEffects = socketEffects.Count > 0 ? socketEffects : null,
         };
 
+        string currentGameDataHash = _currentGameDataHash;
         var board = new GhostBoard
         {
             BoardId = boardId,
@@ -2723,6 +2928,7 @@ public sealed class PvpGhostPool
             IsPlayerGhost = true,
             IsCustomRule = effectiveCustom,
             PoolPartition = resolvedPartition,
+            GameDataHash = currentGameDataHash,
             Items = items,
             Skills = skills,
             SocketEffects = socketEffects.Count > 0 ? socketEffects : null,
@@ -2745,7 +2951,7 @@ public sealed class PvpGhostPool
         string boardJson = JsonSerializer.Serialize(payload, JsonOpts);
         var now = DateTime.UtcNow;
 
-        // D2-P1-10：完整传入全部 14 参（显式传入 ModeId 与 PoolPartition），杜绝自定义/Mod/无尽幽灵误落 SQLite standard 分区
+        // D2-P1-10 & v15.6 A3：完整传入 ModeId / PoolPartition / GameDataHash（单一权威持久化于数据库列，绝不写入 payload JSON）
         db.InsertPvpGhost(new Persistence.PvpGhostRow(
             Id: 0,
             Day: day,
@@ -2760,7 +2966,8 @@ public sealed class PvpGhostPool
             CreatedAt: now,
             IsCustomRule: effectiveCustom,
             ModeId: effectiveModeId,
-            PoolPartition: resolvedPartition));
+            PoolPartition: resolvedPartition,
+            GameDataHash: currentGameDataHash));
 
         lock (_writeLock)
         {
@@ -3342,6 +3549,7 @@ public sealed class PvpGhostPool
                 IsPlayerGhost = true,
                 IsCustomRule = isCustom,
                 PoolPartition = partition,
+                GameDataHash = row.GameDataHash ?? "",
                 Items = payload.Items ?? new List<GhostItem>(),
                 Skills = payload.Skills ?? new List<GhostSkill>(),
                 SocketEffects = payload.SocketEffects,
@@ -3417,19 +3625,57 @@ public sealed class PvpGhostPool
     private static bool IsSupportedClientHero(string? hero)
         => !string.IsNullOrWhiteSpace(hero) && SupportedClientHeroes.Contains(hero.Trim());
 
+    /// <summary>判断镜像物品是否携带 Tiny 缩小状态（PermanentAdd / PermanentAttributes 正值 Tiny 或历史 ExtraTags 含 "Tiny"）。</summary>
+    public static bool HasGhostItemTiny(GhostItem? it)
+    {
+        if (it == null) return false;
+        if (it.PermanentAdd != null)
+        {
+            foreach (var (k, v) in it.PermanentAdd)
+            {
+                if (string.Equals(k, "Tiny", StringComparison.OrdinalIgnoreCase) && double.IsFinite(v) && v > 0)
+                    return true;
+            }
+        }
+        if (it.PermanentAttributes != null)
+        {
+            foreach (var (k, v) in it.PermanentAttributes)
+            {
+                if (string.Equals(k, "Tiny", StringComparison.OrdinalIgnoreCase) && v > 0)
+                    return true;
+            }
+        }
+        if (it.ExtraTags != null)
+        {
+            for (int i = 0; i < it.ExtraTags.Count; i++)
+            {
+                if (string.Equals(it.ExtraTags[i]?.Trim(), "Tiny", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>计算镜像物品的有效占格宽度（带 Tiny 时 Large → 2、Medium → 1、Small → 1；无模板回退已存 Width）。</summary>
+    public static int ResolveGhostItemEffectiveWidth(GhostItem it, CardTemplate? tpl)
+    {
+        if (tpl != null)
+        {
+            bool isTiny = HasGhostItemTiny(it);
+            return isTiny
+                ? (tpl.CardSize == CardSize.Large ? 2 : 1)
+                : Math.Clamp(tpl.CardSize.SlotCount(), 1, 3);
+        }
+        return Math.Clamp(it.Width, 1, 3);
+    }
+
     private static int GetTotalSlotWidth(GhostBoard board, GameDataRepository? repo)
     {
         int total = 0;
         foreach (var it in board.Items)
         {
-            int w = Math.Clamp(it.Width, 1, 3);
-            if (repo != null)
-            {
-                var tpl = repo.GetCard(it.TemplateId);
-                if (tpl != null)
-                    w = Math.Clamp((int)tpl.CardSize, 1, 3);
-            }
-            total += w;
+            var tpl = repo?.GetCard(it.TemplateId);
+            total += ResolveGhostItemEffectiveWidth(it, tpl);
         }
         return total;
     }
@@ -3473,12 +3719,8 @@ public sealed class PvpGhostPool
         {
             foreach (var it in ghost.Items)
             {
-                int w = Math.Clamp(it.Width, 1, 3);
-                if (repo != null)
-                {
-                    var tpl = repo.GetCard(it.TemplateId);
-                    if (tpl != null) w = Math.Clamp((int)tpl.CardSize, 1, 3);
-                }
+                var tpl = repo?.GetCard(it.TemplateId);
+                int w = ResolveGhostItemEffectiveWidth(it, tpl);
                 for (int offset = 0; offset < w; offset++)
                 {
                     int slot = it.Slot + offset;
@@ -3487,17 +3729,277 @@ public sealed class PvpGhostPool
                 }
             }
         }
+        if (ghost.SocketEffects != null)
+        {
+            foreach (var se in ghost.SocketEffects)
+            {
+                if (se != null && se.Slot is >= 0 and < 10)
+                    mask |= 1 << se.Slot;
+            }
+        }
         return mask & 1023;
+    }
+
+    /// <summary>判断镜像来源是否豁免跨版本读时清洗（编排台自定义盘面与沙盒盘面绝不触及）。</summary>
+    private static bool IsExemptFromCrossVersionSanitization(string? source)
+        => string.Equals(source, "custom", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(source, "sandbox", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>判断属性键是否为受跨版本存在性与非倒扣守卫约束的输出属性（显式豁免 CooldownMax）。</summary>
+    private static bool IsGuardedOutputAttribute(string attr)
+        => !string.Equals(attr, "CooldownMax", StringComparison.OrdinalIgnoreCase)
+        && (CardInstance.IsOutputMagnitudeAttribute(attr)
+            || string.Equals(attr, "AmmoMax", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>判断属性键能否解析为当前版本合法的 ECardAttributeType 枚举成员（拒绝纯数字字符串伪匹配）。</summary>
+    private static bool IsValidCardAttributeKey(string? key)
+        => !string.IsNullOrWhiteSpace(key)
+        && !char.IsDigit(key[0])
+        && key[0] != '-'
+        && Enum.TryParse<ECardAttributeType>(key, ignoreCase: true, out var parsed)
+        && Enum.IsDefined(typeof(ECardAttributeType), parsed);
+
+    private static bool TryResolveValidEnchantment(CardTemplate tpl, string enchantment, out string canonical)
+    {
+        if (tpl.Enchantments != null)
+        {
+            if (tpl.Enchantments.ContainsKey(enchantment))
+            {
+                canonical = enchantment;
+                return true;
+            }
+            foreach (string key in tpl.Enchantments.Keys)
+            {
+                if (string.Equals(key, enchantment, StringComparison.OrdinalIgnoreCase))
+                {
+                    canonical = key;
+                    return true;
+                }
+            }
+        }
+        canonical = "";
+        return false;
+    }
+
+    private static bool TryResolveValidQuestKey(CardTemplate tpl, string questKey, out string canonical)
+    {
+        if (tpl.Quests is { Count: > 0 })
+        {
+            for (int qi = 0; qi < tpl.Quests.Count; qi++)
+            {
+                var entries = tpl.Quests[qi].Entries;
+                for (int ei = 0; ei < entries.Count; ei++)
+                {
+                    string attr = entries[ei].AttributeType;
+                    if (!string.IsNullOrWhiteSpace(attr)
+                        && string.Equals(attr, questKey, StringComparison.OrdinalIgnoreCase))
+                    {
+                        canonical = attr;
+                        return true;
+                    }
+                }
+            }
+        }
+        canonical = "";
+        return false;
     }
 
     /// <summary>把 GhostBoard 转换为可供 BazaarCore.CombatSimulator 直接演算的 PlayerState。</summary>
     public static PlayerState ToPlayerState(GhostBoard ghost, GameDataRepository repo)
+        => ToPlayerState(ghost, repo, _activeGameDataHash, auditCollector: null);
+
+    /// <summary>
+    /// 把 GhostBoard 转换为 PlayerState，显式支持注入当前 GameDataHash 与审计收集器：
+    /// 1) 统一先挂载任务并重建品阶/附魔/任务奖励，再挂载分层或平铺永久属性（消除平铺+已完成任务双倍叠算）；
+    /// 2) 仅对旧版本罗盘锚点（real_compass_anchor）与跨版本真人镜像（含空指纹 "" 视作未知版本，不回写库）执行双轨读时清洗；
+    /// 3) 编排台自定义盘面（custom）、沙盒盘面（sandbox）与当期同版本真人镜像严格零改动。
+    /// </summary>
+    public static PlayerState ToPlayerState(
+        GhostBoard ghost,
+        GameDataRepository repo,
+        string? currentGameDataHash,
+        GhostSanitizationAuditCollector? auditCollector = null)
     {
         EHero parsedHero = ParseHero(ghost.Hero);
         string safeHero = parsedHero.ToString();
         string label = ghost.IsPlayerGhost
             ? $"{safeHero}(真人镜像)"
             : $"{safeHero}镜像";
+
+        string effectiveHash = currentGameDataHash ?? _activeGameDataHash;
+        bool isExempt = IsExemptFromCrossVersionSanitization(ghost.Source);
+        bool isLegacyAnchor = string.Equals(ghost.Source, "real_compass_anchor", StringComparison.OrdinalIgnoreCase);
+        bool isCrossVersionPlayerGhost = !isExempt
+            && ghost.IsPlayerGhost
+            && !string.IsNullOrEmpty(effectiveHash)
+            && !string.Equals(ghost.GameDataHash, effectiveHash, StringComparison.OrdinalIgnoreCase);
+        bool shouldSanitize = !isExempt && (isLegacyAnchor || isCrossVersionPlayerGhost);
+
+        string auditSource = !string.IsNullOrWhiteSpace(ghost.Source)
+            ? ghost.Source
+            : (ghost.IsPlayerGhost ? "player_ghost" : "unknown");
+        var activeCollector = auditCollector ?? (shouldSanitize ? RuntimeSanitizationAudit : null);
+        bool boardAffected = false;
+
+        void RecordClean(string tplId, string attr, string reason)
+        {
+            boardAffected = true;
+            activeCollector?.Record(auditSource, tplId, attr, reason);
+        }
+
+        void ApplySanitizedLayeredAttributes(
+            CardInstance targetCard,
+            string tplId,
+            Dictionary<string, double>? permAdd,
+            Dictionary<string, double>? permMult)
+        {
+            var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (permAdd != null)
+            {
+                foreach (string k in permAdd.Keys) keys.Add(k);
+            }
+            if (permMult != null)
+            {
+                foreach (string k in permMult.Keys) keys.Add(k);
+            }
+
+            foreach (string ak in keys)
+            {
+                if (IsDerivedGhostAttributeKey(ak))
+                    continue;
+
+                double addVal = 0.0;
+                bool hasAdd = permAdd != null
+                    && permAdd.TryGetValue(ak, out addVal)
+                    && double.IsFinite(addVal)
+                    && Math.Abs(addVal) > 1e-6;
+                if (!hasAdd) addVal = 0.0;
+
+                double multVal = 1.0;
+                bool hasMult = permMult != null
+                    && permMult.TryGetValue(ak, out multVal)
+                    && double.IsFinite(multVal)
+                    && Math.Abs(multVal - 1.0) > 1e-6;
+                if (!hasMult) multVal = 1.0;
+
+                if (!hasAdd && !hasMult)
+                    continue;
+
+                if (!IsValidCardAttributeKey(ak))
+                {
+                    RecordClean(tplId, ak, "invalid_attribute_key");
+                    continue;
+                }
+
+                if (IsGuardedOutputAttribute(ak))
+                {
+                    bool hasOutputAttr = targetCard.BaseAttributes.ContainsKey(ak)
+                        || targetCard.EnchantmentBaseAttributes.ContainsKey(ak);
+                    if (!hasOutputAttr)
+                    {
+                        RecordClean(tplId, ak, "orphan_output_attribute");
+                        continue;
+                    }
+
+                    double baseVal = targetCard.BaseAttributes.TryGetValue(ak, out double bv)
+                        ? bv
+                        : targetCard.EnchantmentBaseAttributes.GetValueOrDefault(ak, 0);
+                    double effAdd = hasAdd ? addVal : 0.0;
+                    double effMult = hasMult ? multVal : 1.0;
+                    double projected = (baseVal + effAdd) * effMult;
+                    if (projected < baseVal - 1e-6)
+                    {
+                        if (hasAdd && effAdd < -1e-6)
+                        {
+                            RecordClean(tplId, ak, "negative_output_delta");
+                            hasAdd = false;
+                            effAdd = 0.0;
+                            projected = baseVal * effMult;
+                        }
+                        if (projected < baseVal - 1e-6 && hasMult && effMult < 1.0 - 1e-6)
+                        {
+                            RecordClean(tplId, ak, "negative_output_mult");
+                            hasMult = false;
+                        }
+                    }
+                }
+
+                if (hasAdd)
+                    targetCard.PermanentAdd[ak] = addVal;
+                if (hasMult)
+                    targetCard.PermanentMult[ak] = multVal;
+            }
+        }
+
+        void ApplySanitizedFlatAttributes(
+            CardInstance targetCard,
+            CardTemplate tpl,
+            Dictionary<string, int> permAttrs)
+        {
+            foreach (var (ak, av) in permAttrs)
+            {
+                if (IsDerivedGhostAttributeKey(ak))
+                    continue;
+
+                if (!IsValidCardAttributeKey(ak))
+                {
+                    RecordClean(tpl.Id, ak, "invalid_attribute_key");
+                    continue;
+                }
+
+                if (string.Equals(ak, "Lifesteal", StringComparison.OrdinalIgnoreCase) && av <= 0)
+                {
+                    RecordClean(tpl.Id, ak, "non_positive_lifesteal");
+                    continue;
+                }
+
+                if (string.Equals(ak, "Multicast", StringComparison.OrdinalIgnoreCase))
+                {
+                    double baseMc = targetCard.BaseAttributes.TryGetValue("Multicast", out double mcVal)
+                        ? mcVal
+                        : (string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase) ? 1.0 : 0.0);
+                    if (av <= baseMc + 1e-6)
+                    {
+                        RecordClean(tpl.Id, ak, "redundant_multicast");
+                        continue;
+                    }
+                    double mcDelta = av - baseMc;
+                    if (Math.Abs(mcDelta) > 0.001)
+                        targetCard.PermanentAdd[ak] = mcDelta;
+                    continue;
+                }
+
+                if (IsGuardedOutputAttribute(ak))
+                {
+                    bool hasOutputAttr = targetCard.BaseAttributes.ContainsKey(ak)
+                        || targetCard.EnchantmentBaseAttributes.ContainsKey(ak);
+                    if (!hasOutputAttr)
+                    {
+                        RecordClean(tpl.Id, ak, "orphan_output_attribute");
+                        continue;
+                    }
+
+                    double baseVal = targetCard.BaseAttributes.TryGetValue(ak, out double bv)
+                        ? bv
+                        : targetCard.EnchantmentBaseAttributes.GetValueOrDefault(ak, 0);
+                    double delta = av - baseVal;
+                    if (delta < -1e-6)
+                    {
+                        RecordClean(tpl.Id, ak, "negative_output_delta");
+                        continue;
+                    }
+                    if (Math.Abs(delta) > 0.001)
+                        targetCard.PermanentAdd[ak] = delta;
+                    continue;
+                }
+
+                // CooldownMax 等非输出属性明确豁免，允许正向减 CD 与常规属性覆盖
+                double nonGuardedBase = targetCard.BaseAttributes.GetValueOrDefault(ak, 0);
+                double nonGuardedDelta = av - nonGuardedBase;
+                if (Math.Abs(nonGuardedDelta) > 0.001)
+                    targetCard.PermanentAdd[ak] = nonGuardedDelta;
+            }
+        }
 
         var ps = new PlayerState(
             "pvp_" + ghost.BoardId,
@@ -3520,67 +4022,141 @@ public sealed class PvpGhostPool
             var tpl = repo.GetCard(it.TemplateId);
             if (tpl == null) continue;
             string prefix = tpl.Id.Length >= 6 ? tpl.Id[..6] : tpl.Id;
-            var card = new CardInstance(tpl, TierHelper.ParseTier(it.Tier), it.Enchantment, $"opp_{itemIdx++}_{it.Slot}_{prefix}");
 
-            // D2-P1-10：优先无损还原 PermanentAdd / PermanentMult 双层；历史 JSONL 缺省时平滑回退 PermanentAttributes
+            // 1. 构造 CardInstance 前先做附魔合法性清洗（仅跨版本/旧锚点触发）
+            string? effectiveEnchantment = it.Enchantment;
+            if (shouldSanitize && !string.IsNullOrWhiteSpace(effectiveEnchantment))
+            {
+                if (TryResolveValidEnchantment(tpl, effectiveEnchantment, out string canonicalEnch))
+                {
+                    effectiveEnchantment = canonicalEnch;
+                }
+                else
+                {
+                    RecordClean(tpl.Id, $"Enchantment:{effectiveEnchantment}", "invalid_enchantment");
+                    effectiveEnchantment = null;
+                }
+            }
+
+            var card = new CardInstance(tpl, TierHelper.ParseTier(it.Tier), effectiveEnchantment, $"opp_{itemIdx++}_{it.Slot}_{prefix}");
+
+            // 2. 统一先挂载 QuestProgress 与 CompletedQuests（不可重复任务补满 Target），再重建品阶/附魔/任务奖励，
+            //    确保后续平铺差值反解与分层跨版本检查基于完整的“品阶 + 附魔 + 已完成任务”基础值，彻底消除双倍叠算。
+            if (it.QuestProgress is { Count: > 0 })
+            {
+                foreach (var (qk, qv) in it.QuestProgress)
+                {
+                    if (string.IsNullOrWhiteSpace(qk) || !double.IsFinite(qv))
+                        continue;
+                    if (shouldSanitize)
+                    {
+                        if (TryResolveValidQuestKey(tpl, qk, out string canonicalQ))
+                            card.QuestProgress[canonicalQ] = qv;
+                        else
+                            RecordClean(tpl.Id, qk, "invalid_quest_progress");
+                    }
+                    else
+                    {
+                        card.QuestProgress[qk] = qv;
+                    }
+                }
+            }
+            if (it.CompletedQuests is { Count: > 0 })
+            {
+                bool anyCompletedQuest = false;
+                foreach (string qid in it.CompletedQuests)
+                {
+                    if (string.IsNullOrWhiteSpace(qid))
+                        continue;
+                    string effectiveQid = qid;
+                    if (shouldSanitize)
+                    {
+                        if (!TryResolveValidQuestKey(tpl, qid, out string canonicalQ))
+                        {
+                            RecordClean(tpl.Id, qid, "invalid_completed_quest");
+                            continue;
+                        }
+                        effectiveQid = canonicalQ;
+                    }
+                    card.CompletedQuests.Add(effectiveQid);
+                    anyCompletedQuest = true;
+                    if (TooltipFormatter.TryFindNonRepeatableQuestTarget(tpl, effectiveQid, out double questTarget)
+                        && card.QuestProgress.GetValueOrDefault(effectiveQid, 0) < questTarget)
+                    {
+                        card.QuestProgress[effectiveQid] = questTarget;
+                    }
+                }
+                if (anyCompletedQuest)
+                {
+                    // 激活已完成任务对应的奖励能力与属性，使 BaseAttributes 包含任务奖励
+                    card.RebuildTierAndEnchantmentData();
+                }
+            }
+
+            // 3. 再挂载永久属性：优先无损还原 PermanentAdd / PermanentMult 双层；历史 JSONL 缺省时回退平铺 PermanentAttributes
             bool hasLayeredPerm = (it.PermanentAdd is { Count: > 0 }) || (it.PermanentMult is { Count: > 0 });
             if (hasLayeredPerm)
             {
-                if (it.PermanentAdd != null)
+                if (shouldSanitize)
                 {
-                    foreach (var (ak, av) in it.PermanentAdd)
-                    {
-                        if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(av) && Math.Abs(av) > 1e-6)
-                            card.PermanentAdd[ak] = av;
-                    }
+                    ApplySanitizedLayeredAttributes(card, tpl.Id, it.PermanentAdd, it.PermanentMult);
                 }
-                if (it.PermanentMult != null)
+                else
                 {
-                    foreach (var (ak, mv) in it.PermanentMult)
+                    if (it.PermanentAdd != null)
                     {
-                        if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(mv) && Math.Abs(mv - 1.0) > 1e-6)
-                            card.PermanentMult[ak] = mv;
+                        foreach (var (ak, av) in it.PermanentAdd)
+                        {
+                            if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(av) && Math.Abs(av) > 1e-6)
+                                card.PermanentAdd[ak] = av;
+                        }
+                    }
+                    if (it.PermanentMult != null)
+                    {
+                        foreach (var (ak, mv) in it.PermanentMult)
+                        {
+                            if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(mv) && Math.Abs(mv - 1.0) > 1e-6)
+                                card.PermanentMult[ak] = mv;
+                        }
                     }
                 }
             }
             else if (it.PermanentAttributes != null)
             {
-                foreach (var (ak, av) in it.PermanentAttributes)
+                if (shouldSanitize)
                 {
-                    if (IsDerivedGhostAttributeKey(ak))
-                        continue;
-                    double baseVal = card.BaseAttributes.GetValueOrDefault(ak, 0);
-                    double delta = av - baseVal;
-                    if (Math.Abs(delta) > 0.001)
-                        card.PermanentAdd[ak] = delta;
+                    ApplySanitizedFlatAttributes(card, tpl, it.PermanentAttributes);
+                }
+                else
+                {
+                    foreach (var (ak, av) in it.PermanentAttributes)
+                    {
+                        if (IsDerivedGhostAttributeKey(ak))
+                            continue;
+                        double baseVal = card.BaseAttributes.GetValueOrDefault(ak, 0);
+                        double delta = av - baseVal;
+                        if (Math.Abs(delta) > 0.001)
+                            card.PermanentAdd[ak] = delta;
+                    }
                 }
             }
 
-            if (it.QuestProgress is { Count: > 0 })
-            {
-                foreach (var (qk, qv) in it.QuestProgress)
-                {
-                    if (!string.IsNullOrWhiteSpace(qk) && double.IsFinite(qv))
-                        card.QuestProgress[qk] = qv;
-                }
-            }
-            if (it.CompletedQuests is { Count: > 0 })
-            {
-                foreach (string qid in it.CompletedQuests)
-                {
-                    if (!string.IsNullOrWhiteSpace(qid))
-                        card.CompletedQuests.Add(qid);
-                }
-                // 激活已完成任务对应的奖励能力与属性
-                card.RebuildTierAndEnchantmentData();
-            }
             if (it.ExtraTags is { Count: > 0 })
             {
+                bool hasTinyExtraTag = false;
                 foreach (string tag in it.ExtraTags)
                 {
                     if (!string.IsNullOrWhiteSpace(tag))
-                        card.ExtraTags.Add(tag);
+                    {
+                        string trimmedTag = tag.Trim();
+                        card.ExtraTags.Add(trimmedTag);
+                        if (string.Equals(trimmedTag, "Tiny", StringComparison.OrdinalIgnoreCase))
+                            hasTinyExtraTag = true;
+                    }
                 }
+                // D1：历史镜像仅在 ExtraTags 写 "Tiny" 未写属性时，补 PermanentAdd["Tiny"] = 1 保证客户端 IsTiny() 正常识别
+                if (hasTinyExtraTag && (!card.PermanentAdd.TryGetValue("Tiny", out double curTiny) || curTiny <= 0))
+                    card.PermanentAdd["Tiny"] = 1;
             }
 
             if (!ps.Hand.TryPlaceOrShift(card, Math.Clamp(it.Slot, 0, 9)))
@@ -3597,32 +4173,46 @@ public sealed class PvpGhostPool
             bool hasSkLayered = (sk.PermanentAdd is { Count: > 0 }) || (sk.PermanentMult is { Count: > 0 });
             if (hasSkLayered)
             {
-                if (sk.PermanentAdd != null)
+                if (shouldSanitize)
                 {
-                    foreach (var (ak, av) in sk.PermanentAdd)
-                    {
-                        if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(av) && Math.Abs(av) > 1e-6)
-                            skillCard.PermanentAdd[ak] = av;
-                    }
+                    ApplySanitizedLayeredAttributes(skillCard, tpl.Id, sk.PermanentAdd, sk.PermanentMult);
                 }
-                if (sk.PermanentMult != null)
+                else
                 {
-                    foreach (var (ak, mv) in sk.PermanentMult)
+                    if (sk.PermanentAdd != null)
                     {
-                        if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(mv) && Math.Abs(mv - 1.0) > 1e-6)
-                            skillCard.PermanentMult[ak] = mv;
+                        foreach (var (ak, av) in sk.PermanentAdd)
+                        {
+                            if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(av) && Math.Abs(av) > 1e-6)
+                                skillCard.PermanentAdd[ak] = av;
+                        }
+                    }
+                    if (sk.PermanentMult != null)
+                    {
+                        foreach (var (ak, mv) in sk.PermanentMult)
+                        {
+                            if (!IsDerivedGhostAttributeKey(ak) && double.IsFinite(mv) && Math.Abs(mv - 1.0) > 1e-6)
+                                skillCard.PermanentMult[ak] = mv;
+                        }
                     }
                 }
             }
             else if (sk.PermanentAttributes is { Count: > 0 })
             {
-                foreach (var (ak, av) in sk.PermanentAttributes)
+                if (shouldSanitize)
                 {
-                    if (IsDerivedGhostAttributeKey(ak)) continue;
-                    double baseVal = skillCard.BaseAttributes.GetValueOrDefault(ak, 0);
-                    double delta = av - baseVal;
-                    if (Math.Abs(delta) > 0.001)
-                        skillCard.PermanentAdd[ak] = delta;
+                    ApplySanitizedFlatAttributes(skillCard, tpl, sk.PermanentAttributes);
+                }
+                else
+                {
+                    foreach (var (ak, av) in sk.PermanentAttributes)
+                    {
+                        if (IsDerivedGhostAttributeKey(ak)) continue;
+                        double baseVal = skillCard.BaseAttributes.GetValueOrDefault(ak, 0);
+                        double delta = av - baseVal;
+                        if (Math.Abs(delta) > 0.001)
+                            skillCard.PermanentAdd[ak] = delta;
+                    }
                 }
             }
             if (sk.ExtraTags is { Count: > 0 })
@@ -3645,22 +4235,49 @@ public sealed class PvpGhostPool
                 var tpl = repo.GetCard(se.TemplateId);
                 if (tpl == null) continue;
                 string prefix = tpl.Id.Length >= 6 ? tpl.Id[..6] : tpl.Id;
-                var seCard = new CardInstance(tpl, TierHelper.ParseTier(se.Tier), se.Enchantment, $"oppse_{seIdx++}_{se.Slot}_{prefix}")
+                string? seEnchantment = se.Enchantment;
+                if (shouldSanitize && !string.IsNullOrWhiteSpace(seEnchantment))
+                {
+                    if (TryResolveValidEnchantment(tpl, seEnchantment, out string canonSeEnch))
+                        seEnchantment = canonSeEnch;
+                    else
+                    {
+                        RecordClean(tpl.Id, $"Enchantment:{seEnchantment}", "invalid_enchantment");
+                        seEnchantment = null;
+                    }
+                }
+                var seCard = new CardInstance(tpl, TierHelper.ParseTier(se.Tier), seEnchantment, $"oppse_{seIdx++}_{se.Slot}_{prefix}")
                 {
                     StartSlot = Math.Clamp(se.Slot, 0, 9),
                 };
                 if (se.PermanentAttributes is { Count: > 0 })
                 {
-                    foreach (var (ak, av) in se.PermanentAttributes)
+                    if (shouldSanitize)
                     {
-                        if (IsDerivedGhostAttributeKey(ak)) continue;
-                        double baseVal = seCard.BaseAttributes.GetValueOrDefault(ak, 0);
-                        double delta = av - baseVal;
-                        if (Math.Abs(delta) > 0.001)
-                            seCard.PermanentAdd[ak] = delta;
+                        ApplySanitizedFlatAttributes(seCard, tpl, se.PermanentAttributes);
+                    }
+                    else
+                    {
+                        foreach (var (ak, av) in se.PermanentAttributes)
+                        {
+                            if (IsDerivedGhostAttributeKey(ak)) continue;
+                            double baseVal = seCard.BaseAttributes.GetValueOrDefault(ak, 0);
+                            double delta = av - baseVal;
+                            if (Math.Abs(delta) > 0.001)
+                                seCard.PermanentAdd[ak] = delta;
+                        }
                     }
                 }
                 ps.SocketEffects.Add(seCard);
+            }
+        }
+
+        if (activeCollector != null)
+        {
+            activeCollector.RecordBoardScanned(boardAffected);
+            if (auditCollector == null && boardAffected && Interlocked.CompareExchange(ref _runtimeFirstAuditLogged, 1, 0) == 0)
+            {
+                Console.WriteLine(FormatSanitizationAuditSummary("first_runtime_match", RuntimeSanitizationAudit.BuildSummary()));
             }
         }
 

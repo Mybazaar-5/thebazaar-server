@@ -285,7 +285,7 @@ public static class SocialEndpoints
         var raw = typeof(SocialEndpoints).Assembly
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
             ?? typeof(SocialEndpoints).Assembly.GetName().Version?.ToString(3)
-            ?? "15.5.0";
+            ?? "15.6.0";
         int plusIdx = raw.IndexOf('+');
         return plusIdx > 0 ? raw[..plusIdx] : raw;
     }

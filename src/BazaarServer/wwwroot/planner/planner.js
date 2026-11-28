@@ -28,6 +28,22 @@
     attributeLabelsZh: { DamageAmount: '伤害', ShieldApplyAmount: '护盾', HealAmount: '治疗', BurnApplyAmount: '灼烧', PoisonApplyAmount: '剧毒', RegenApplyAmount: '回复', CritChance: '暴击率%' },
     quantityMax: 1000000, healthMin: 1, healthMax: 1000000, levelMax: 99, prestigeMax: 100,
     dayBaseSlots: { 1: 4, 2: 6, 3: 8, 4: 10 },
+    socketEffects: [],
+    editableToggles: [
+      { key: 'Tiny', labelZh: '微型（缩小 1 格）', onValue: 1, scope: 'nonSmallItem' },
+      { key: 'Lifesteal', labelZh: '吸血', onValue: 100, scope: 'item' },
+      { key: 'Flying', labelZh: '开局飞行', onValue: 1, scope: 'item' },
+      { key: 'DestroyImmunity', labelZh: '不可摧毁', onValue: 1, scope: 'item' },
+    ],
+    editableTags: [
+      { id: 'Aquatic', nameZh: '水生' }, { id: 'Weapon', nameZh: '武器' }, { id: 'Friend', nameZh: '伙伴' },
+      { id: 'Relic', nameZh: '遗物' }, { id: 'Tool', nameZh: '工具' }, { id: 'Food', nameZh: '食物' },
+      { id: 'Tech', nameZh: '科技' }, { id: 'Property', nameZh: '地产' }, { id: 'Toy', nameZh: '玩具' },
+      { id: 'Dragon', nameZh: '龙' }, { id: 'Core', nameZh: '核心' }, { id: 'Apparel', nameZh: '服饰' },
+      { id: 'Vehicle', nameZh: '载具' }, { id: 'Potion', nameZh: '药水' }, { id: 'Loot', nameZh: '战利品' },
+      { id: 'Ray', nameZh: '射线' }, { id: 'Dinosaur', nameZh: '恐龙' },
+    ],
+    maxExtraTags: 6,
   };
   const DEFAULT_LIMITS = { maxLineups: 50, maxLineupDays: 30, maxSeedTextLength: 48, maxDisplayName: 24, maxLineupName: 40, maxDescription: 200 };
   const VISIBLE_DAYS_DEFAULT = 15;
@@ -357,6 +373,7 @@
     state.editor = null;
     state.cardCache.clear();
     state.eventsCache.clear();
+    describeCache.clear();
     state.finder = { jobId: null, timer: null, conds: [], hits: [], scanned: 0, running: false, lastReq: null, nextSeed: null };
     state.importPreview = null;
     state.importCode = '';
@@ -645,6 +662,8 @@
     b.skills = Array.isArray(b.skills) ? b.skills : [];
     b.socketEffects = Array.isArray(b.socketEffects) ? b.socketEffects : [];
     for (const it of b.items) it.slot = clamp(parseInt(it.slot, 10) || 0, 0, 9);
+    for (const se of b.socketEffects) se.slot = clamp(parseInt(se.slot, 10) || 0, 0, 9);
+    b.socketEffects.sort((a, c) => a.slot - c.slot);
     return b;
   }
 
@@ -943,12 +962,13 @@
       h('label', { class: 'field' }, h('span', { text: '等级' }), numIn('level', 1, state.editRules.levelMax)),
       h('label', { class: 'field' }, h('span', { text: '声望' }), numIn('prestige', 1, state.editRules.prestigeMax))));
 
-    // 10 格棋盘
+    // 10 格棋盘与下方插槽特效条
     const used = b.items.reduce((s, it) => s + itemWidth(it), 0);
     wrap.appendChild(h('div', { class: 'board-title' },
-      h('span', null, '物品（点空格添加，拖动换位置；带斜纹的格子这一天本来没解锁，放了东西会自动解锁）'),
+      h('span', null, '物品（点空格添加，拖动换位置；带斜纹的格子这一天本来没解锁，放了东西或插槽特效会自动解锁）'),
       h('span', { text: `占用 ${used}/10 格` })));
     wrap.appendChild(renderBoard(d, b));
+    wrap.appendChild(renderSocketStrip(d, b));
 
     // 技能（点一下在下面看效果、改品阶）
     const skillsRow = h('div', { class: 'skills-row' }, h('span', { class: 'muted', text: '技能（点开看效果）：' }));
@@ -968,9 +988,6 @@
       skillsRow.appendChild(h('button', { type: 'button', class: 'btn btn-subtle btn-xs', onclick: () => openCardPicker(d, 'Skill') }, '+ 技能'));
     }
     wrap.appendChild(skillsRow);
-    if (b.socketEffects && b.socketEffects.length) {
-      wrap.appendChild(h('div', { class: 'socket-note', text: `这套阵容带 ${b.socketEffects.length} 个插座效果（从镜像池克隆来的，会原样保留）。` }));
-    }
 
     // 物品 / 技能详情
     if (e.selectedItem >= 0 && b.items[e.selectedItem]) wrap.appendChild(renderInspector(d, b, e.selectedItem));
@@ -980,10 +997,148 @@
     wrap.appendChild(renderValidation(d));
   }
 
-  function itemWidth(it) {
+  // ── 开关 / 微型 / 任务 / 标签 / 插槽特效辅助 ──
+  function lookupNumCaseInsensitive(obj, key) {
+    if (!obj || typeof obj !== 'object' || !key) return undefined;
+    if (obj[key] !== undefined) return obj[key];
+    const kl = String(key).toLowerCase();
+    for (const [k, v] of Object.entries(obj)) {
+      if (k.toLowerCase() === kl) return v;
+    }
+    return undefined;
+  }
+  function hasTagCaseInsensitive(tags, tag) {
+    if (!Array.isArray(tags) || !tag) return false;
+    const tl = String(tag).toLowerCase();
+    return tags.some((t) => String(t).toLowerCase() === tl);
+  }
+  function hasNativeToggle(card, key) {
+    if (!card || !Array.isArray(card.nativeToggles) || !key) return false;
+    const kl = String(key).toLowerCase();
+    return card.nativeToggles.some((t) => String(t).toLowerCase() === kl);
+  }
+  /** 开关状态读取优先级：editedToggles -> card.nativeToggles -> permanentAdd/permanentAttributes（Tiny 额外兼容历史 extraTags）。 */
+  function isToggleOn(it, key, cardOverride) {
+    if (!it || !key) return false;
+    const card = cardOverride !== undefined ? cardOverride : state.cardCache.get(it.templateId);
+    if (it.editedToggles && Object.prototype.hasOwnProperty.call(it.editedToggles, key)) {
+      return !!it.editedToggles[key];
+    }
+    if (hasNativeToggle(card, key)) return true;
+    const pAdd = lookupNumCaseInsensitive(it.permanentAdd, key);
+    const pAttr = lookupNumCaseInsensitive(it.permanentAttributes, key);
+    if (Number(pAdd) > 0 || Number(pAttr) > 0) return true;
+    if (String(key).toLowerCase() === 'tiny' && hasTagCaseInsensitive(it.extraTags, 'Tiny')) return true;
+    return false;
+  }
+  function isSmallItem(it, cardOverride) {
+    const c = cardOverride !== undefined ? cardOverride : state.cardCache.get(it.templateId);
+    if (c && c.size) return c.size === 'Small';
+    return !isToggleOn(it, 'Tiny', c) && (parseInt(it.width, 10) || 1) <= 1;
+  }
+  function itemBaseWidth(it) {
     const c = state.cardCache.get(it.templateId);
     if (c && SIZE_W[c.size]) return SIZE_W[c.size];
+    const w = clamp(parseInt(it.width, 10) || 1, 1, 3);
+    if (isToggleOn(it, 'Tiny', c) && w < 3) return w + 1;
+    return w;
+  }
+  function itemWidth(it) {
+    const c = state.cardCache.get(it.templateId);
+    const tiny = isToggleOn(it, 'Tiny', c);
+    if (c && SIZE_W[c.size]) {
+      const base = SIZE_W[c.size];
+      return (tiny && base > 1) ? base - 1 : base;
+    }
     return clamp(parseInt(it.width, 10) || 1, 1, 3);
+  }
+  function completedQuestCount(it) {
+    if (!it || !Array.isArray(it.completedQuests) || !it.completedQuests.length) return 0;
+    const seen = new Set();
+    for (const q of it.completedQuests) {
+      if (q && String(q).trim()) seen.add(String(q).trim().toLowerCase());
+    }
+    return seen.size;
+  }
+  function hasQuestCompleted(it, attr) {
+    if (!it || !Array.isArray(it.completedQuests) || !attr) return false;
+    const al = String(attr).toLowerCase();
+    return it.completedQuests.some((q) => String(q).toLowerCase() === al);
+  }
+  function getQuestProgress(it, attr) {
+    const v = lookupNumCaseInsensitive(it && it.questProgress, attr);
+    return Number.isFinite(Number(v)) ? Math.max(0, Math.round(Number(v))) : 0;
+  }
+  function setQuestCompletedFlag(it, attr, completed) {
+    const al = String(attr).toLowerCase();
+    const list = Array.isArray(it.completedQuests)
+      ? it.completedQuests.filter((q) => String(q).toLowerCase() !== al)
+      : [];
+    if (completed) list.push(attr);
+    it.completedQuests = list;
+  }
+  function setQuestProgressVal(it, attr, val) {
+    const al = String(attr).toLowerCase();
+    const next = {};
+    if (it.questProgress && typeof it.questProgress === 'object') {
+      for (const [k, v] of Object.entries(it.questProgress)) {
+        if (k.toLowerCase() !== al) next[k] = v;
+      }
+    }
+    if (val > 0) next[attr] = val;
+    it.questProgress = next;
+  }
+  function getItemExtraTags(it, cardOverride) {
+    if (!it || !Array.isArray(it.extraTags)) return [];
+    const card = cardOverride !== undefined ? cardOverride : state.cardCache.get(it.templateId);
+    const nativeLower = new Set((card && Array.isArray(card.tags) ? card.tags : []).map((t) => String(t).toLowerCase()));
+    const seen = new Set();
+    const out = [];
+    for (const raw of it.extraTags) {
+      const s = String(raw || '').trim();
+      if (!s) continue;
+      const sl = s.toLowerCase();
+      if (sl === 'tiny' || nativeLower.has(sl) || seen.has(sl)) continue;
+      seen.add(sl);
+      out.push(s);
+    }
+    return out;
+  }
+  function findSocketCatalog(templateId) {
+    const list = Array.isArray(state.editRules.socketEffects) ? state.editRules.socketEffects : [];
+    return list.find((x) => x.templateId === templateId) || null;
+  }
+  function socketEffectKind(meta) {
+    if (!meta) return 'mod';
+    const id = String(meta.templateId || '').toLowerCase();
+    const s = `${meta.internalName || ''} ${meta.nameZh || ''}`;
+    if (id === 'c017c0dd-af3c-47e0-b510-3661d9dcd7f2' || /stove|heat|炉灶|火炉/i.test(s)) return 'stove';
+    if (id === 'd5515ae3-b98d-4272-8add-82f441969ffe' || /cooler|chill|冷藏|冰柜/i.test(s)) return 'cooler';
+    if (/note|music|音符/i.test(s)) return 'note';
+    return 'mod';
+  }
+  function socketEffectIcon(meta) {
+    const k = socketEffectKind(meta);
+    if (k === 'stove') return '🔥';
+    if (k === 'cooler') return '❄️';
+    if (k === 'note') return '🎵';
+    return '✦';
+  }
+  function socketEffectDisplayName(meta) {
+    if (!meta) return '未知插槽特效';
+    const raw = (meta.nameZh || meta.internalName || meta.templateId || '').trim();
+    const icon = socketEffectIcon(meta);
+    return raw.startsWith(icon) ? raw : `${icon}${raw}`;
+  }
+  function socketEffectShortName(meta) {
+    if (!meta) return '✦未知';
+    const raw = (meta.nameZh || meta.internalName || meta.templateId || '').trim();
+    const compact = raw
+      .replace(/[（(][^）)]*[）)]/g, '')
+      .replace(/^(音符)\s+([A-G])$/i, '$1$2')
+      .trim() || raw;
+    const icon = socketEffectIcon(meta);
+    return compact.startsWith(icon) ? compact : `${icon}${compact}`;
   }
   function baseMaskForDay(day) {
     const base = state.editRules.dayBaseSlots || DEFAULT_EDIT_RULES.dayBaseSlots;
@@ -1032,14 +1187,26 @@
     const board = h('div', { class: 'board' });
     const base = baseMaskForDay(day);
     const occ = occupancy(b.items);
+    const seBySlot = new Map();
+    for (const se of (b.socketEffects || [])) {
+      const sl = clamp(parseInt(se.slot, 10) || 0, 0, 9);
+      if (!seBySlot.has(sl)) seBySlot.set(sl, se);
+    }
     const slots = [];
     const clearMarks = () => slots.forEach((x) => x.classList.remove('drop-ok', 'drop-bad'));
     for (let s = 0; s < 10; s++) {
       const locked = !(base & (1 << s));
+      const se = seBySlot.get(s) || null;
+      const seMeta = se ? (findSocketCatalog(se.templateId) || se) : null;
+      const seKind = se ? socketEffectKind(seMeta) : '';
+      const seDesc = seMeta && seMeta.descriptionZh ? `：${seMeta.descriptionZh}` : '';
       const slot = h('div', {
-        class: `slot ${locked ? 'locked' : ''}`,
+        class: `slot ${locked ? 'locked' : ''} ${se ? `has-se se-${seKind}` : ''}`,
         style: { gridColumn: `${s + 1} / span 1` },
-        title: locked ? `第 ${s + 1} 格：这一天本来没解锁，放物品会自动解锁` : `第 ${s + 1} 格：点击放一件物品`,
+        title: [
+          locked ? `第 ${s + 1} 格：这一天本来没解锁，放物品或插槽特效会自动解锁` : `第 ${s + 1} 格：点击放一件物品`,
+          se ? `插槽特效：${socketEffectDisplayName(seMeta)}${seDesc}` : '',
+        ].filter(Boolean).join('\n'),
         onclick: () => { if (occ[s] === -1) openCardPicker(day, 'Item', s); },
       }, h('span', { class: 'slot-plus', text: '+' }), `${s + 1}`);
       slot.addEventListener('dragover', (ev) => {
@@ -1072,22 +1239,40 @@
       });
       slots.push(slot);
       board.appendChild(slot);
+      if (se) {
+        // 底边高亮条置于卡片上方且不拦截鼠标事件，确保格上有物品（含宽物品）时仍清晰可见
+        board.appendChild(h('div', {
+          class: `slot-se-bar se-${seKind}`,
+          style: { gridColumn: `${s + 1} / span 1` },
+        }, h('span', { class: 'slot-se-pip', text: socketEffectIcon(seMeta) })));
+      }
     }
     board.addEventListener('dragleave', (ev) => { if (!board.contains(ev.relatedTarget)) clearMarks(); });
     b.items.forEach((it, idx) => {
       const w = itemWidth(it);
       const attrs = summarizeAttrs(it);
+      const isTiny = isToggleOn(it, 'Tiny');
+      const qCount = completedQuestCount(it);
+      const badges = [];
+      if (isTiny) badges.push(h('span', { class: 'it-badge it-badge-tiny', title: '微型：占格缩小 1 格', text: '微型' }));
+      if (qCount > 0) badges.push(h('span', { class: 'it-badge it-badge-quest', title: `已完成 ${qCount} 个任务`, text: `✓任务×${qCount}` }));
+      const hidden = hasHiddenGrowth(it);
+      const titleParts = [
+        `${it.zhName || it.internalName || it.templateId}（${tierZh(it.tier)}${isTiny ? ' · 微型' : ''}${qCount > 0 ? ` · ✓任务×${qCount}` : ''}）`,
+        '点击编辑，拖动换位置',
+      ];
       const tile = h('div', {
-        class: `item-tile tier-${it.tier || 'Bronze'} ${state.editor.selectedItem === idx ? 'selected' : ''}`,
+        class: `item-tile tier-${it.tier || 'Bronze'} ${state.editor.selectedItem === idx ? 'selected' : ''} ${isTiny ? 'is-tiny' : ''} ${hidden ? 'has-hidden' : ''}`,
         style: { gridColumn: `${clamp(it.slot, 0, 9) + 1} / span ${w}` },
         draggable: 'true',
-        title: `${it.zhName || it.internalName || it.templateId}（${tierZh(it.tier)}）\n点击编辑，拖动换位置`,
+        title: titleParts.join('\n'),
         onclick: () => { state.editor.selectedItem = idx; state.editor.selectedSkill = -1; renderDayPanel(); },
       },
-        hasHiddenGrowth(it) ? h('span', { class: 'it-hidden', title: '带有成长 / 任务 / 永久加成，未修改时原样保留', text: '★' }) : null,
+        hidden ? h('span', { class: 'it-hidden', title: '带有成长 / 任务 / 永久加成，未修改时原样保留', text: '★' }) : null,
         h('div', { class: 'it-name', text: it.zhName || it.internalName || '物品' }),
         h('div', { class: 'it-tier', text: tierZh(it.tier) }),
         it.enchantment ? h('div', { class: 'it-ench', text: ENCH_ZH[it.enchantment] || it.enchantment }) : null,
+        badges.length ? h('div', { class: 'it-badges' }, ...badges) : null,
         attrs ? h('div', { class: 'it-attrs', text: attrs }) : null,
         cooldownText(it) ? h('div', { class: 'it-cd', text: `⏱ ${cooldownText(it)}` }) : null);
       tile.addEventListener('dragstart', (ev) => {
@@ -1111,6 +1296,92 @@
     return board;
   }
 
+  /** 10 格棋盘下方的插槽特效条：与 1–10 格垂直对齐，支持配置炉灶 / 冷藏箱 / 音符 A–G 等。 */
+  function renderSocketStrip(day, b) {
+    const catalogList = Array.isArray(state.editRules.socketEffects) ? state.editRules.socketEffects : [];
+    const curList = Array.isArray(b.socketEffects) ? b.socketEffects : [];
+    if (!catalogList.length && !curList.length) return h('div', { class: 'hidden' });
+
+    const seBySlot = new Map();
+    for (const se of curList) {
+      const sl = clamp(parseInt(se.slot, 10) || 0, 0, 9);
+      if (!seBySlot.has(sl)) seBySlot.set(sl, se);
+    }
+
+    const wrap = h('div', { class: 'socket-strip-wrap' });
+    const headRight = h('div', { class: 'socket-strip-actions' },
+      curList.length ? h('span', { class: 'muted', text: `已配置 ${curList.length} 格` }) : h('span', { class: 'muted', text: '全部为空' }),
+      curList.length ? h('button', {
+        type: 'button', class: 'btn btn-subtle btn-xs',
+        onclick: () => { b.socketEffects = []; onBoardEdited(day, { rerenderPanel: true }); },
+      }, '清空插槽') : null);
+    wrap.appendChild(h('div', { class: 'socket-strip-head' },
+      h('span', { class: 'muted', text: '插槽特效（对应上方第 1–10 格：炉灶 / 冷藏箱 / 音符）' }),
+      headRight));
+
+    const strip = h('div', { class: 'socket-strip' });
+    const activeSummaries = [];
+    for (let s = 0; s < 10; s++) {
+      const curSe = seBySlot.get(s) || null;
+      const curMeta = curSe ? findSocketCatalog(curSe.templateId) : null;
+      const curKind = curSe ? socketEffectKind(curMeta || curSe) : '';
+      const sel = h('select', {
+        class: `socket-select ${curSe ? `active se-${curKind}` : ''}`,
+        dataset: { fk: `socket-${s}` },
+        'aria-label': `第 ${s + 1} 格插槽特效`,
+        title: curSe
+          ? `第 ${s + 1} 格：${socketEffectDisplayName(curMeta || curSe)}${curMeta && curMeta.descriptionZh ? `\n${curMeta.descriptionZh}` : ''}`
+          : `第 ${s + 1} 格插槽特效（无）`,
+      },
+        h('option', { value: '' }, '—'),
+        catalogList.map((opt) => {
+          const shortLbl = socketEffectShortName(opt);
+          const fullLbl = socketEffectDisplayName(opt);
+          return h('option', {
+            value: opt.templateId,
+            selected: !!(curSe && curSe.templateId === opt.templateId),
+            title: opt.descriptionZh ? `${fullLbl}：${opt.descriptionZh}` : fullLbl,
+          }, shortLbl);
+        }));
+      if (curSe && !curMeta) {
+        sel.appendChild(h('option', { value: curSe.templateId, selected: true }, `✦ 已有特效`));
+      }
+      sel.addEventListener('change', () => {
+        const nextVal = sel.value;
+        b.socketEffects = (b.socketEffects || []).filter((x) => clamp(parseInt(x.slot, 10) || 0, 0, 9) !== s);
+        if (nextVal) {
+          const meta = findSocketCatalog(nextVal);
+          if (meta) {
+            b.socketEffects.push({ slot: s, templateId: meta.templateId, tier: meta.defaultTier || 'Diamond' });
+          } else if (curSe && curSe.templateId === nextVal) {
+            b.socketEffects.push(curSe);
+          }
+        }
+        b.socketEffects.sort((a, c) => a.slot - c.slot);
+        onBoardEdited(day, { rerenderPanel: true });
+      });
+      if (curSe) {
+        activeSummaries.push({
+          slot: s,
+          kind: curKind,
+          label: socketEffectDisplayName(curMeta || curSe),
+          desc: curMeta && curMeta.descriptionZh ? curMeta.descriptionZh : '',
+        });
+      }
+      strip.appendChild(h('div', { class: 'socket-cell' }, sel));
+    }
+    wrap.appendChild(strip);
+
+    if (activeSummaries.length) {
+      wrap.appendChild(h('div', { class: 'socket-summary-list' },
+        activeSummaries.map((item) => h('span', { class: `socket-summary-chip se-${item.kind}` },
+          h('b', { text: `第${item.slot + 1}格 ` }),
+          item.label,
+          item.desc ? `：${item.desc}` : ''))));
+    }
+    return wrap;
+  }
+
   function currentAttrValue(it, key) {
     if (it.editedAttributes && it.editedAttributes[key] !== undefined) return it.editedAttributes[key];
     if (it.permanentAttributes && it.permanentAttributes[key] !== undefined) return it.permanentAttributes[key];
@@ -1131,45 +1402,115 @@
     return !!(base && base.CooldownMax > 0);
   }
 
-  // ── 效果说明（服务器按品阶 / 附魔 / 当前数值渲染官方中文说明，带缓存）──
+  // ── 效果说明（服务器按品阶 / 附魔 / 当前数值 / 任务 / 状态开关 / 附加标签渲染官方中文说明，带缓存）──
   const describeCache = new Map();
   function describeKey(x) {
+    const card = state.cardCache.get(x.templateId);
     const attrs = {};
     for (const key of state.editRules.quantityAttributes) {
-      const v = currentAttrValue(x, key);
+      let v;
+      if (x.editedAttributes && x.editedAttributes[key] !== undefined) v = x.editedAttributes[key];
+      else if (x.permanentAttributes && x.permanentAttributes[key] !== undefined) v = x.permanentAttributes[key];
       if (v !== undefined) attrs[key] = v;
     }
-    return { key: `${x.templateId}|${x.tier || ''}|${x.enchantment || ''}|${JSON.stringify(attrs)}`, attrs };
+
+    const completedQuests = [];
+    if (Array.isArray(x.completedQuests) && x.completedQuests.length) {
+      const seen = new Set();
+      for (const q of x.completedQuests) {
+        const s = String(q || '').trim();
+        if (!s) continue;
+        const sl = s.toLowerCase();
+        if (seen.has(sl)) continue;
+        seen.add(sl);
+        completedQuests.push(s);
+      }
+      completedQuests.sort();
+    }
+
+    const questProgress = {};
+    if (x.questProgress && typeof x.questProgress === 'object') {
+      for (const qk of Object.keys(x.questProgress).sort()) {
+        const v = Math.round(Number(x.questProgress[qk]));
+        if (Number.isFinite(v) && v > 0) questProgress[qk] = v;
+      }
+    }
+
+    const extraTags = getItemExtraTags(x, card).slice().sort();
+
+    const toggles = {};
+    const isItem = Object.prototype.hasOwnProperty.call(x, 'slot');
+    if (isItem) {
+      const ruleToggles = Array.isArray(state.editRules.editableToggles) ? state.editRules.editableToggles : DEFAULT_EDIT_RULES.editableToggles;
+      for (const tg of ruleToggles) {
+        const k = tg.key;
+        if (!k) continue;
+        if ((tg.scope === 'nonSmallItem' || k === 'Tiny') && isSmallItem(x, card)) continue;
+        if (hasNativeToggle(card, k)) continue;
+        if (isToggleOn(x, k, card)) toggles[k] = true;
+      }
+    }
+
+    const req = {
+      templateId: x.templateId,
+      tier: x.tier || null,
+      enchantment: x.enchantment || null,
+      attributes: attrs,
+    };
+    if (completedQuests.length) req.completedQuests = completedQuests;
+    if (Object.keys(questProgress).length) req.questProgress = questProgress;
+    if (extraTags.length) req.extraTags = extraTags;
+    if (Object.keys(toggles).length) req.toggles = toggles;
+
+    const key = JSON.stringify([
+      req.templateId,
+      req.tier || '',
+      req.enchantment || '',
+      attrs,
+      completedQuests,
+      questProgress,
+      extraTags,
+      toggles,
+    ]);
+    return { key, attrs, req };
   }
   async function describeCards(list) {
     const want = [];
+    const pendingByKey = new Map();
     const out = new Map();
     for (const x of list) {
       if (!x || !x.templateId) continue;
-      const { key, attrs } = describeKey(x);
+      const { key, req } = describeKey(x);
       if (describeCache.has(key)) { out.set(x, describeCache.get(key)); continue; }
-      want.push({ x, key, req: { templateId: x.templateId, tier: x.tier || null, enchantment: x.enchantment || null, attributes: attrs } });
+      if (pendingByKey.has(key)) { pendingByKey.get(key).targets.push(x); continue; }
+      const entry = { key, req, targets: [x] };
+      pendingByKey.set(key, entry);
+      want.push(entry);
     }
     for (let i = 0; i < want.length; i += 40) {
       const chunk = want.slice(i, i + 40);
       try {
         const r = await api('catalog/describe', { method: 'POST', json: { cards: chunk.map((w) => w.req), selectedModIds: state.modEnv || [] } });
         const items = r.items || [];
-        // 服务器按请求顺序返回、跳过不认识的卡；同一张卡可能有不同品阶，所以按「卡 + 品阶」对，对不上再只按卡对
-        const byExact = new Map();
-        const byId = new Map();
-        for (const it of items) {
-          byExact.set(`${it.templateId}|${it.tier || ''}|${it.enchantment || ''}`, it);
-          if (!byId.has(it.templateId)) byId.set(it.templateId, it);
-        }
+        // 服务器严格按请求顺序返回、仅跳过未知卡；使用顺序游标逐条配对，避免同卡同品阶但不同任务/开关态互相覆盖缓存
+        let cursor = 0;
         chunk.forEach((w) => {
-          const hit = byExact.get(`${w.req.templateId}|${w.req.tier || ''}|${w.req.enchantment || ''}`) || byId.get(w.req.templateId) || null;
+          let hit = null;
+          if (cursor < items.length && items[cursor] && items[cursor].templateId === w.req.templateId) {
+            hit = items[cursor++];
+          } else {
+            const foundIdx = items.findIndex((it, idx) => idx >= cursor && it && it.templateId === w.req.templateId);
+            if (foundIdx >= 0) {
+              hit = items[foundIdx];
+              cursor = foundIdx + 1;
+            }
+          }
           const lines = hit ? (hit.lines || []) : [];
           describeCache.set(w.key, lines);
-          out.set(w.x, lines);
+          for (const target of w.targets) out.set(target, lines);
         });
       } catch {
-        chunk.forEach((w) => out.set(w.x, null)); // 拿不到说明就不显示，不影响编辑
+        chunk.forEach((w) => { for (const target of w.targets) out.set(target, null); }); // 拿不到说明就不显示，不影响编辑
       }
     }
     return out;
@@ -1224,10 +1565,311 @@
     return parts.join(' ');
   }
 
+  /** 任务进度分区（仅对 card.quests 非空的任务卡渲染）：支持独立任务与互斥多分支单选。 */
+  function renderQuestSection(day, it, card) {
+    const groups = card && Array.isArray(card.quests) ? card.quests : [];
+    const wrap = h('div', { class: 'quest-section' });
+
+    for (const group of groups) {
+      const entries = Array.isArray(group.entries) ? group.entries : [];
+      if (!entries.length) continue;
+
+      if (group.mutuallyExclusive && entries.length > 1) {
+        const activeEntry = entries.find((en) => hasQuestCompleted(it, en.attributeType)) || null;
+        const gBox = h('div', { class: 'quest-group quest-mutex' });
+        gBox.appendChild(h('div', { class: 'quest-group-head' },
+          h('span', { class: 'quest-group-title', text: `互斥任务分支（${entries.length} 选 1）` }),
+          h('span', { class: 'muted', text: activeEntry ? '已选定完成分支' : '未完成' })));
+
+        const chips = h('div', { class: 'quest-chips' });
+        chips.appendChild(h('button', {
+          type: 'button',
+          class: `quest-chip quest-chip-none ${!activeEntry ? 'active' : ''}`,
+          onclick: () => {
+            for (const en of entries) {
+              setQuestCompletedFlag(it, en.attributeType, false);
+              const t = Math.max(1, parseInt(en.target, 10) || 1);
+              if (getQuestProgress(it, en.attributeType) >= t) setQuestProgressVal(it, en.attributeType, 0);
+            }
+            onBoardEdited(day, { rerenderPanel: true });
+          },
+        }, h('span', { class: 'qc-head', text: !activeEntry ? '● 未完成' : '○ 未完成' })));
+
+        entries.forEach((en, ei) => {
+          const isDone = activeEntry === en;
+          const target = Math.max(1, parseInt(en.target, 10) || 1);
+          const prog = getQuestProgress(it, en.attributeType);
+          const branchName = `分支 ${String.fromCharCode(65 + ei)}`;
+          chips.appendChild(h('button', {
+            type: 'button',
+            class: `quest-chip quest-branch ${isDone ? 'active' : ''}`,
+            onclick: () => {
+              for (const other of entries) {
+                if (other === en) {
+                  setQuestCompletedFlag(it, other.attributeType, true);
+                  setQuestProgressVal(it, other.attributeType, target);
+                } else {
+                  setQuestCompletedFlag(it, other.attributeType, false);
+                  setQuestProgressVal(it, other.attributeType, 0);
+                }
+              }
+              onBoardEdited(day, { rerenderPanel: true });
+            },
+          },
+            h('span', { class: 'qc-head' },
+              h('b', { text: `${isDone ? '✓ ' : ''}${branchName}` }),
+              (!activeEntry && prog > 0 && target > 1)
+                ? h('span', { class: 'qc-prog-tag', text: `进度 ${Math.min(prog, target - 1)}/${target}` })
+                : null),
+            h('span', { class: 'qc-goal', text: en.goalZh || en.attributeType }),
+            en.rewardZh ? h('span', { class: 'qc-reward', text: `奖励：${en.rewardZh}` }) : null));
+        });
+
+        gBox.appendChild(chips);
+        wrap.appendChild(gBox);
+        continue;
+      }
+
+      // 独立任务组（单条或非互斥多条，含可重复任务）
+      const gBox = h('div', { class: 'quest-group quest-indep' });
+      const repeatable = !!group.isRepeatable;
+      for (const en of entries) {
+        const attr = en.attributeType;
+        const target = Math.max(1, parseInt(en.target, 10) || 1);
+        const maxProg = repeatable ? Math.max(0, target - 1) : target;
+        const done = !repeatable && hasQuestCompleted(it, attr);
+        const rawProg = getQuestProgress(it, attr);
+        const curProg = done ? target : clamp(rawProg, 0, maxProg);
+
+        let leftCtrl;
+        if (!repeatable) {
+          const cb = h('input', { type: 'checkbox', checked: done });
+          cb.addEventListener('change', () => {
+            if (cb.checked) {
+              setQuestCompletedFlag(it, attr, true);
+              setQuestProgressVal(it, attr, target);
+            } else {
+              setQuestCompletedFlag(it, attr, false);
+              setQuestProgressVal(it, attr, 0);
+            }
+            onBoardEdited(day, { rerenderPanel: true });
+          });
+          leftCtrl = h('label', { class: `quest-check ${done ? 'done' : ''}` },
+            cb,
+            h('span', { text: done ? '✓ 已完成' : '已完成' }));
+        } else {
+          leftCtrl = h('span', {
+            class: 'badge badge-blue quest-rep-badge',
+            title: maxProg > 0 ? `可重复任务不锁定已完成状态，进度上限 ${maxProg}` : '可重复任务触发即结算，不锁定已完成状态',
+            text: '↻ 可重复',
+          });
+        }
+
+        let rightCtrl = null;
+        if (target > 1) {
+          const inp = h('input', {
+            type: 'number',
+            class: 'quest-prog-input',
+            dataset: { fk: `quest-prog-${attr}` },
+            min: 0,
+            max: maxProg,
+            step: 1,
+            value: curProg,
+            title: repeatable ? `可重复任务当前累计进度（0..${maxProg}）` : `当前进度（0..${target}，填 ${target} 自动勾选已完成）`,
+          });
+          inp.addEventListener('change', () => {
+            let v = parseInt(inp.value, 10);
+            if (!Number.isFinite(v)) v = 0;
+            v = clamp(v, 0, maxProg);
+            inp.value = String(v);
+            if (repeatable) {
+              setQuestCompletedFlag(it, attr, false);
+              setQuestProgressVal(it, attr, v);
+            } else if (v >= target) {
+              setQuestCompletedFlag(it, attr, true);
+              setQuestProgressVal(it, attr, target);
+            } else {
+              setQuestCompletedFlag(it, attr, false);
+              setQuestProgressVal(it, attr, v);
+            }
+            onBoardEdited(day, { rerenderPanel: true });
+          });
+          rightCtrl = h('div', { class: 'quest-prog' },
+            inp,
+            h('span', { class: 'quest-prog-max', text: `/ ${target}` }));
+        } else if (repeatable) {
+          rightCtrl = h('span', { class: 'muted quest-prog-note', text: '触发即生效' });
+        }
+
+        gBox.appendChild(h('div', { class: `quest-row ${done ? 'done' : ''}` },
+          leftCtrl,
+          h('div', { class: 'quest-info' },
+            h('div', { class: 'quest-goal', text: en.goalZh || attr }),
+            en.rewardZh ? h('div', { class: 'quest-reward', text: `奖励：${en.rewardZh}` }) : null),
+          rightCtrl));
+      }
+      wrap.appendChild(gBox);
+    }
+
+    return wrap;
+  }
+
+  /** 状态开关区（Tiny / Lifesteal / Flying / DestroyImmunity）。 */
+  function renderToggleControls(day, b, idx, it, card) {
+    const ruleToggles = Array.isArray(state.editRules.editableToggles) && state.editRules.editableToggles.length
+      ? state.editRules.editableToggles
+      : DEFAULT_EDIT_RULES.editableToggles;
+    const row = h('div', { class: 'toggle-bar' });
+
+    for (const tg of ruleToggles) {
+      const key = tg.key;
+      const label = tg.labelZh || key;
+      const isTinyKey = key === 'Tiny';
+      const native = hasNativeToggle(card, key);
+      const disabledBySize = (tg.scope === 'nonSmallItem' || isTinyKey) && isSmallItem(it, card);
+      const checked = disabledBySize ? false : (native ? true : isToggleOn(it, key, card));
+      const cb = h('input', { type: 'checkbox', checked, disabled: native || disabledBySize });
+
+      cb.addEventListener('change', () => {
+        if (native || disabledBySize) return;
+        const wantOn = !!cb.checked;
+        if (isTinyKey) {
+          if (wantOn) {
+            it.editedToggles = it.editedToggles || {};
+            it.editedToggles.Tiny = true;
+            it.width = itemWidth(it);
+            if (Array.isArray(it.extraTags)) {
+              it.extraTags = it.extraTags.filter((t) => String(t).toLowerCase() !== 'tiny');
+            }
+            onBoardEdited(day, { rerenderPanel: true });
+          } else {
+            const origW = itemBaseWidth(it);
+            if (canPlace(b.items, origW, it.slot, idx)) {
+              it.editedToggles = it.editedToggles || {};
+              it.editedToggles.Tiny = false;
+              it.width = origW;
+              if (Array.isArray(it.extraTags)) {
+                it.extraTags = it.extraTags.filter((t) => String(t).toLowerCase() !== 'tiny');
+              }
+              onBoardEdited(day, { rerenderPanel: true });
+            } else {
+              const fitSlot = nearestFit(b.items, origW, it.slot, idx);
+              if (fitSlot !== undefined) {
+                it.slot = fitSlot;
+                it.editedToggles = it.editedToggles || {};
+                it.editedToggles.Tiny = false;
+                it.width = origW;
+                if (Array.isArray(it.extraTags)) {
+                  it.extraTags = it.extraTags.filter((t) => String(t).toLowerCase() !== 'tiny');
+                }
+                b.items.sort((x, y) => x.slot - y.slot);
+                state.editor.selectedItem = b.items.indexOf(it);
+                toast(`已取消微型：恢复为 ${origW} 格并自动挪至第 ${fitSlot + 1} 格`, 'ok');
+                onBoardEdited(day, { rerenderPanel: true });
+              } else {
+                cb.checked = true;
+                toast(`无法取消微型：棋盘没有连续 ${origW} 个空位，请先挪动或移除其他物品`, 'warn', 5000);
+              }
+            }
+          }
+          return;
+        }
+        it.editedToggles = it.editedToggles || {};
+        it.editedToggles[key] = wantOn;
+        onBoardEdited(day, { rerenderPanel: true });
+      });
+
+      const title = native
+        ? '原卡自带该状态（只读）'
+        : (disabledBySize ? '小型物品本身仅占 1 格，无需微型化' : '');
+      row.appendChild(h('label', {
+        class: `toggle-chip ${checked ? 'on' : ''} ${native ? 'native' : ''} ${disabledBySize ? 'disabled' : ''}`,
+        title,
+      },
+        cb,
+        h('span', { text: label }),
+        native ? h('span', { class: 'toggle-tag', text: '原卡自带' }) : null,
+        (!native && disabledBySize) ? h('span', { class: 'toggle-tag', text: '小型禁用' }) : null));
+    }
+
+    return row;
+  }
+
+  /** 附加类型标签芯片选择器（排除原卡自带 tags 与 "Tiny"，单卡最多 maxExtraTags 个）。 */
+  function renderExtraTagControls(day, it, card) {
+    const ruleTags = Array.isArray(state.editRules.editableTags) && state.editRules.editableTags.length
+      ? state.editRules.editableTags
+      : DEFAULT_EDIT_RULES.editableTags;
+    const maxTags = parseInt(state.editRules.maxExtraTags, 10) || 6;
+    const nativeTagsRaw = (card && Array.isArray(card.tags)) ? card.tags : [];
+    const nativeLower = new Set(nativeTagsRaw.map((t) => String(t).toLowerCase()));
+    const tagZhMap = new Map(ruleTags.map((t) => [String(t.id).toLowerCase(), t.nameZh || t.id]));
+
+    const selected = getItemExtraTags(it, card);
+    const selectedLower = new Set(selected.map((t) => t.toLowerCase()));
+    const selectable = ruleTags.filter((t) => {
+      const tl = String(t.id || '').toLowerCase();
+      return tl && tl !== 'tiny' && !nativeLower.has(tl);
+    });
+    const knownLower = new Set(ruleTags.map((t) => String(t.id).toLowerCase()));
+    const extraCustom = selected.filter((t) => !knownLower.has(t.toLowerCase()));
+
+    const nativeKnownZh = nativeTagsRaw
+      .map((t) => tagZhMap.get(String(t).toLowerCase()))
+      .filter(Boolean);
+
+    const wrap = h('div', { class: 'extra-tags-wrap' });
+    wrap.appendChild(h('div', { class: 'extra-tags-meta' },
+      h('span', { class: 'muted', text: `已附加 ${selected.length}/${maxTags}` }),
+      nativeKnownZh.length ? h('span', { class: 'muted', text: `· 原卡自带：${nativeKnownZh.join('、')}` }) : null));
+
+    const chips = h('div', { class: 'tag-chips' });
+    const toggleTag = (tagId) => {
+      const tl = String(tagId).toLowerCase();
+      const next = getItemExtraTags(it, card);
+      const existsIdx = next.findIndex((x) => x.toLowerCase() === tl);
+      if (existsIdx >= 0) {
+        next.splice(existsIdx, 1);
+      } else {
+        if (next.length >= maxTags) {
+          toast(`单卡最多附加 ${maxTags} 个类型标签`, 'warn');
+          return;
+        }
+        next.push(tagId);
+      }
+      it.extraTags = next;
+      onBoardEdited(day, { rerenderPanel: true });
+    };
+
+    for (const tag of selectable) {
+      const active = selectedLower.has(String(tag.id).toLowerCase());
+      const atLimit = !active && selected.length >= maxTags;
+      chips.appendChild(h('button', {
+        type: 'button',
+        class: `tag-chip ${active ? 'active' : ''}`,
+        disabled: atLimit,
+        title: atLimit ? `单卡最多附加 ${maxTags} 个类型标签` : (active ? '点击移除该附加标签' : `附加「${tag.nameZh}」类型标签`),
+        onclick: () => toggleTag(tag.id),
+      }, `${active ? '✓ ' : '+ '}${tag.nameZh}`));
+    }
+    for (const customTag of extraCustom) {
+      chips.appendChild(h('button', {
+        type: 'button',
+        class: 'tag-chip active',
+        title: '点击移除该附加标签',
+        onclick: () => toggleTag(customTag),
+      }, `✓ ${customTag}`));
+    }
+
+    wrap.appendChild(chips);
+    return wrap;
+  }
+
   function renderInspector(day, b, idx) {
     const it = b.items[idx];
     const card = state.cardCache.get(it.templateId);
     const w = itemWidth(it);
+    const isTiny = isToggleOn(it, 'Tiny', card);
     const tiers = card && card.tiers && card.tiers.length ? card.tiers : TIERS;
     const box = h('div', { class: 'inspector' });
 
@@ -1238,7 +1880,7 @@
       onBoardEdited(day, { rerenderPanel: true });
     };
     box.appendChild(h('div', { class: 'inspector-head' },
-      h('h4', { text: `${it.zhName || it.internalName || '物品'}（占 ${w} 格 · 第 ${it.slot + 1}${w > 1 ? `–${it.slot + w}` : ''} 格）` }),
+      h('h4', { text: `${it.zhName || it.internalName || '物品'}（占 ${w} 格${isTiny ? ' · 微型' : ''} · 第 ${it.slot + 1}${w > 1 ? `–${it.slot + w}` : ''} 格）` }),
       h('div', { class: 'btn-row', style: { marginTop: '0' } },
         h('button', { type: 'button', class: 'btn btn-subtle btn-xs', onclick: () => moveBy(-1) }, '← 左移'),
         h('button', { type: 'button', class: 'btn btn-subtle btn-xs', onclick: () => moveBy(1) }, '右移 →'),
@@ -1254,18 +1896,51 @@
     }, tierZh(t))));
 
     const enchList = card && Array.isArray(card.enchantments) ? card.enchantments : Object.keys(ENCH_ZH);
+    const enchSummaries = (card && card.enchantmentSummaries && typeof card.enchantmentSummaries === 'object') ? card.enchantmentSummaries : {};
+    const getEnchSummary = (k) => {
+      if (!k) return '';
+      if (enchSummaries[k]) return enchSummaries[k];
+      const kl = String(k).toLowerCase();
+      for (const [ek, ev] of Object.entries(enchSummaries)) {
+        if (ek.toLowerCase() === kl) return ev || '';
+      }
+      return '';
+    };
     const enchSel = h('select', { dataset: { fk: 'ench' }, disabled: card && Array.isArray(card.enchantments) && card.enchantments.length === 0 },
       h('option', { value: '' }, '无附魔'),
-      enchList.map((k) => h('option', { value: k, selected: it.enchantment === k }, ENCH_ZH[k] || k)));
+      enchList.map((k) => {
+        const zh = ENCH_ZH[k] || k;
+        const sum = getEnchSummary(k);
+        return h('option', { value: k, selected: it.enchantment === k, title: sum || zh }, sum ? `${zh} — ${sum}` : zh);
+      }));
     if (it.enchantment && !enchList.includes(it.enchantment)) {
       enchSel.appendChild(h('option', { value: it.enchantment, selected: true }, `${ENCH_ZH[it.enchantment] || it.enchantment}（不支持）`));
     }
     enchSel.addEventListener('change', () => { it.enchantment = enchSel.value || null; onBoardEdited(day, { rerenderPanel: true }); });
 
-    box.appendChild(h('div', { class: 'inspector-grid' },
+    const selEnchSummary = it.enchantment ? getEnchSummary(it.enchantment) : '';
+    const enchControl = h('div', { class: 'ench-field' },
+      enchSel,
+      selEnchSummary
+        ? h('div', { class: 'ench-summary' },
+          h('span', { class: 'ench-summary-tag', text: ENCH_ZH[it.enchantment] || it.enchantment }),
+          h('span', { text: selEnchSummary }))
+        : null);
+
+    const hasQuests = !!(card && Array.isArray(card.quests) && card.quests.length > 0);
+    const inspectorRows = [
       h('span', { text: '品阶' }), tierPicker,
-      h('span', { text: '附魔' }), enchSel,
-      h('span', { text: '效果' }), effectBox(it)));
+      h('span', { text: '附魔' }), enchControl,
+      h('span', { text: '效果' }), effectBox(it),
+    ];
+    if (hasQuests) {
+      inspectorRows.push(h('span', { text: '任务进度' }), renderQuestSection(day, it, card));
+    }
+    inspectorRows.push(
+      h('span', { text: '特殊状态' }), renderToggleControls(day, b, idx, it, card),
+      h('span', { text: '附加标签' }), renderExtraTagControls(day, it, card));
+
+    box.appendChild(h('div', { class: 'inspector-grid' }, ...inspectorRows));
 
     // 数量类数值
     const grid = h('div', { class: 'attr-grid' });
@@ -1648,13 +2323,23 @@
 
   function renderMiniBoard(g) {
     const mb = h('div', { class: 'mini-board' });
-    for (let s = 0; s < 10; s++) mb.appendChild(h('div', { class: 'mini-slot', style: { gridColumn: `${s + 1} / span 1` } }));
+    const seBySlot = new Map();
+    for (const se of (g.socketEffects || [])) seBySlot.set(clamp(parseInt(se.slot, 10) || 0, 0, 9), se);
+    for (let s = 0; s < 10; s++) {
+      const se = seBySlot.get(s);
+      const seMeta = se ? (findSocketCatalog(se.templateId) || se) : null;
+      mb.appendChild(h('div', {
+        class: `mini-slot ${se ? `has-se se-${socketEffectKind(seMeta)}` : ''}`,
+        style: { gridColumn: `${s + 1} / span 1` },
+      }));
+    }
     for (const it of g.items || []) {
       const w = clamp(parseInt(it.width, 10) || 1, 1, 3);
+      const isTiny = isToggleOn(it, 'Tiny', null);
       mb.appendChild(h('div', {
-        class: `mini-item tier-${it.tier || 'Bronze'}`,
+        class: `mini-item tier-${it.tier || 'Bronze'} ${isTiny ? 'is-tiny' : ''}`,
         style: { gridColumn: `${clamp(it.slot, 0, 9) + 1} / span ${w}` },
-        title: `${it.zhName || it.internalName}（${tierZh(it.tier)}${it.enchantment ? ` · ${ENCH_ZH[it.enchantment] || it.enchantment}` : ''}）`,
+        title: `${it.zhName || it.internalName}（${tierZh(it.tier)}${isTiny ? ' · 微型' : ''}${it.enchantment ? ` · ${ENCH_ZH[it.enchantment] || it.enchantment}` : ''}）`,
         text: it.zhName || it.internalName || '',
       }));
     }
@@ -1702,17 +2387,22 @@
     const row = (x, kind) => {
       const box = h('div', { class: 'effect-lines' }, h('span', { class: 'muted', text: '读取中…' }));
       const cd = h('span', { class: 'muted' });   // 冷却要等卡牌资料到了才知道
+      const isTiny = kind === 'item' && isToggleOn(x, 'Tiny', null);
+      const qCount = kind === 'item' ? completedQuestCount(x) : 0;
       const node = h('div', { class: `detail-row tier-${x.tier || 'Bronze'}` },
         h('div', { class: 'detail-name' },
           h('b', { text: x.zhName || x.internalName || (kind === 'item' ? '物品' : '技能') }),
           h('span', { class: 'tier-text', text: ` ${tierZh(x.tier)}` }),
           x.enchantment ? h('span', { class: 'it-ench', text: ` · ${ENCH_ZH[x.enchantment] || x.enchantment}` }) : null,
+          isTiny ? h('span', { class: 'it-badge it-badge-tiny', style: { marginLeft: '5px' }, text: '微型' }) : null,
+          qCount > 0 ? h('span', { class: 'it-badge it-badge-quest', style: { marginLeft: '5px' }, text: `✓任务×${qCount}` }) : null,
           cd),
         box);
       return { node, box, x, cd, kind };
     };
     const itemRows = items.map((x) => row(x, 'item'));
     const skillRows = skills.map((x) => row(x, 'skill'));
+    const socketList = [...(g.socketEffects || [])].sort((a, c) => (a.slot || 0) - (c.slot || 0));
     const body = h('div', { class: 'board-detail' },
       h('div', { class: 'pc-stats' },
         h('span', { text: g.displayName || heroName(g.hero) }),
@@ -1721,6 +2411,14 @@
         h('span', { text: `第 ${g.day} 天录制` }),
         h('span', { text: POWER_ZH[g.powerBucket] || g.powerBucket || '普通' })),
       renderMiniBoard(g),
+      socketList.length ? h('div', { class: 'socket-summary-list', style: { marginTop: '6px' } },
+        socketList.map((se) => {
+          const meta = findSocketCatalog(se.templateId) || se;
+          return h('span', { class: `socket-summary-chip se-${socketEffectKind(meta)}` },
+            h('b', { text: `第${(se.slot || 0) + 1}格 ` }),
+            socketEffectDisplayName(meta),
+            meta && meta.descriptionZh ? `：${meta.descriptionZh}` : '');
+        })) : null,
       h('h4', { text: `物品（${items.length}）` }),
       itemRows.length ? itemRows.map((r) => r.node) : h('div', { class: 'muted', text: '没有物品' }),
       h('h4', { text: `技能（${skills.length}）` }),
@@ -1755,6 +2453,13 @@
         const w = itemWidth(it);
         it.width = w;
         for (let i = 0; i < w; i++) { const s = it.slot + i; if (s >= 0 && s < 10) mask |= 1 << s; }
+      }
+      copy.socketEffects = Array.isArray(copy.socketEffects) ? copy.socketEffects : [];
+      copy.socketEffects.sort((a, c) => (a.slot || 0) - (c.slot || 0));
+      for (const se of copy.socketEffects) {
+        const s = clamp(parseInt(se.slot, 10) || 0, 0, 9);
+        se.slot = s;
+        mask |= 1 << s;
       }
       copy.unlockedSlotsMask = mask & 1023;
       days[d] = copy;

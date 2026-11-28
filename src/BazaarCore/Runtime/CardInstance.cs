@@ -1351,6 +1351,12 @@ public sealed class CardInstance
 
     private double GetRawScalar(string attr) => GetAttributeRaw(attr);
 
+    /// <summary>
+    /// 返回各属性层（Base/Permanent/Hour/Day/Combat/Aura 含乘区）对 "Flying" 的原始叠加值（不含运行时 IsFlying 布尔位），
+    /// 供同程序集 AbilityExecutor 在停飞时计算战斗层抵消偏移。
+    /// </summary>
+    internal double GetFlyingLayerSum() => GetAttributeRaw("Flying");
+
     private double GetAttributeRaw(string attr)
     {
         double sum = GetEffectiveBaseAttribute(attr);

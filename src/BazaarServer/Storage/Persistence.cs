@@ -575,6 +575,13 @@ public sealed partial class Persistence : IDisposable
                     );
                     """);
             });
+
+            ApplyMigration(conn, 7, "v7_pvp_ghosts_gamedata_hash", c =>
+            {
+                EnsureColumn(c, "pvp_ghosts", "game_data_hash", "TEXT NOT NULL DEFAULT ''");
+            });
+
+            Console.WriteLine($"[Persistence] SQLite schema ready (latest=v7_pvp_ghosts_gamedata_hash, db={DbPath})");
         }
     }
 
@@ -602,6 +609,7 @@ public sealed partial class Persistence : IDisposable
             ins.Parameters.AddWithValue("$n", name);
             ins.Parameters.AddWithValue("$at", DateTime.UtcNow.ToString("O"));
             ins.ExecuteNonQuery();
+            Console.WriteLine($"[Persistence] Applied migration #{version}: {name}");
         }
     }
 
@@ -1944,7 +1952,8 @@ public sealed partial class Persistence : IDisposable
         long Id, int Day, string Hero, int Wins, int Losses,
         int HealthMax, int Prestige, int Level, int UnlockedSlots,
         string BoardJson, DateTime CreatedAt, bool IsCustomRule = false,
-        string ModeId = "standard", string PoolPartition = "standard");
+        string ModeId = "standard", string PoolPartition = "standard",
+        string GameDataHash = "");
 
     /// <summary>返回指定天数对应的标准镜像合理生命上限（直接与 PvpGhostPool.GetSaneBoundsForDay 对齐）。</summary>
     public static int MaxSaneGhostHealthForDay(int day)
@@ -1981,14 +1990,18 @@ public sealed partial class Persistence : IDisposable
 
         string effectiveMode = string.IsNullOrWhiteSpace(modeId) ? (effectiveCustom ? partition : "standard") : modeId.Trim();
 
+        string effectiveGameDataHash = string.IsNullOrWhiteSpace(row.GameDataHash)
+            ? ""
+            : row.GameDataHash.Trim().ToLowerInvariant();
+
         return ExecuteWrite((conn, tx) =>
         {
             using var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText = """
                 INSERT INTO pvp_ghosts (day, hero, wins, losses, health_max, prestige, level,
-                                        unlocked_slots, board_json, created_at, is_custom_rule, mode_id, pool_partition)
-                VALUES ($d, $h, $w, $l, $hm, $p, $lvl, $us, $bj, $ca, $icr, $mid, $part);
+                                        unlocked_slots, board_json, created_at, is_custom_rule, mode_id, pool_partition, game_data_hash)
+                VALUES ($d, $h, $w, $l, $hm, $p, $lvl, $us, $bj, $ca, $icr, $mid, $part, $gdh);
                 SELECT last_insert_rowid();
                 """;
             cmd.Parameters.AddWithValue("$d", row.Day);
@@ -2004,6 +2017,7 @@ public sealed partial class Persistence : IDisposable
             cmd.Parameters.AddWithValue("$icr", effectiveCustom ? 1 : 0);
             cmd.Parameters.AddWithValue("$mid", effectiveMode);
             cmd.Parameters.AddWithValue("$part", partition);
+            cmd.Parameters.AddWithValue("$gdh", effectiveGameDataHash);
             return Convert.ToInt64(cmd.ExecuteScalar());
         });
     }
@@ -2075,7 +2089,7 @@ public sealed partial class Persistence : IDisposable
 
             cmd.CommandText = $"""
                 SELECT id, day, hero, wins, losses, health_max, prestige, level,
-                       unlocked_slots, board_json, created_at, is_custom_rule, mode_id, pool_partition
+                       unlocked_slots, board_json, created_at, is_custom_rule, mode_id, pool_partition, game_data_hash
                 FROM pvp_ghosts
                 {filter}
                 ORDER BY id DESC
@@ -2092,6 +2106,7 @@ public sealed partial class Persistence : IDisposable
                 string rowPart = r.FieldCount > 13 && !r.IsDBNull(13) && !string.IsNullOrWhiteSpace(r.GetString(13))
                     ? r.GetString(13)
                     : (rowIsCustom ? "custom" : "standard");
+                string rowGameDataHash = r.FieldCount > 14 && !r.IsDBNull(14) ? r.GetString(14) : "";
 
                 if (!rowIsCustom && string.Equals(rowPart, "standard", StringComparison.OrdinalIgnoreCase) && !IsSaneGhostForDay(day, healthMax))
                     continue;
@@ -2110,7 +2125,8 @@ public sealed partial class Persistence : IDisposable
                     ParseUtc(r.GetString(10)),
                     rowIsCustom,
                     rowMode,
-                    rowPart));
+                    rowPart,
+                    rowGameDataHash));
             }
             return list;
         });

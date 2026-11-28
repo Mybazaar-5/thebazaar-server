@@ -118,9 +118,28 @@ static HashSet<string>? TryLoadValidAssetWhitelist(string dataRoot)
     return null;
 }
 
-// 1. 单次加载权威 GameData.db + 官方简体中文词库
+static string ComputeShortFileSha256(string? path)
+{
+    if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        return "";
+    try
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        byte[] hash = SHA256.HashData(fs);
+        return Convert.ToHexString(hash, 0, 8).ToLowerInvariant();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[CoreEngine][WARN] 计算 GameDataHash 失败 ({path}): {ex.Message}");
+        return "";
+    }
+}
+
+// 1. 单次加载权威 GameData.db + 官方简体中文词库（先解析实际生效路径，支持 SteamPathResolver 回退）
+string? resolvedGameDataPath = SteamPathResolver.ResolveGameDataSourcePath(File.Exists(dbPath) ? dbPath : null);
+string gameDataHash = ComputeShortFileSha256(resolvedGameDataPath);
 var rawCoreRepo = GameDatabaseLoader.Load(
-    File.Exists(dbPath) ? dbPath : null,
+    resolvedGameDataPath,
     File.Exists(zhPath) ? zhPath : null);
 var validVisualWhitelist = TryLoadValidAssetWhitelist(dataRoot);
 
@@ -141,6 +160,8 @@ var cardPool = CardPool.FromRepository(
     visualBindings: modHost.VisualBindingsByCustomId);
 var monsterPoolStore = new MonsterPoolStore(MonsterPool.FromRepository(modHost.ActiveRepository), modHost.ActiveRepository);
 var ghostPool = PvpGhostPool.Load(dataRoot);
+ghostPool.SetCurrentGameDataHash(gameDataHash);
+ghostPool.RunStartupSanitizationAudit(modHost.ActiveRepository, logSummary: true);
 modHost.BindPools(cardPool, monsterPoolStore);
 
 // D2-P2-04 & D8-P2-06：统一按 ModSetHash 原子刷新 OverlayLocalizationStore / LevelUpTable / GameModeConfig / CardArchetypeIndex 与目录 DTO
@@ -191,7 +212,8 @@ builder.Services.AddSingleton<EventSeedFinderService>(sp => new EventSeedFinderS
 Console.WriteLine(
     $"[CoreEngine] 单次共享加载完成：卡牌={modHost.ActiveRepository.CardsById.Count}（有效资产={cardPool.TotalCards}），" +
     $"野怪={monsterPoolStore.Count}，已启Mod={modHost.EnabledModCount}，词典条数={modHost.ActiveLocalization.EntryCount}，" +
-    $"未知规则类型={modHost.ActiveRepository.UnknownRuleTypes.Count}");
+    $"未知规则类型={modHost.ActiveRepository.UnknownRuleTypes.Count}，" +
+    $"GameDataHash={(string.IsNullOrEmpty(gameDataHash) ? "<empty>" : gameDataHash)}");
 
 // 4. 注册沙盒实验室桥接实现（必须在 MultiplayerEndpointModule.RegisterServices 之前注册以覆盖默认 Null 实现！）
 builder.Services.AddSingleton<ISandboxEngineBridge, SandboxEngineService>();
