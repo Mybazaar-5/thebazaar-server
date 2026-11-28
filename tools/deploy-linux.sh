@@ -24,6 +24,21 @@ fi
 sudo mkdir -p "${INSTALL_ROOT}/server" "${INSTALL_ROOT}/data" "${INSTALL_ROOT}/state" "${INSTALL_ROOT}/logs" "${INSTALL_ROOT}/payload" "${INSTALL_ROOT}/mods"
 sudo chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_ROOT}"
 
+# 部署前预检：确认 4 个原版共享 DLL 已按 LOCAL_ASSET_EXTRACTION.md 提取到当前目录或既有 server 目录
+MISSING_DLLS=()
+for dll in BazaarGameShared.dll BazaarBattleService.dll BazaarGameClient.dll BazaarUnityTools.dll; do
+    if [ ! -s "${SCRIPT_DIR}/${dll}" ] && [ ! -s "${INSTALL_ROOT}/server/${dll}" ]; then
+        MISSING_DLLS+=("${dll}")
+    fi
+done
+if [ ${#MISSING_DLLS[@]} -gt 0 ]; then
+    echo "[ERROR] 缺少原版游戏共享库: ${MISSING_DLLS[*]}"
+    echo "[ERROR] 开源发布包依版权规范不含上述原版商业 DLL，请先在您的 Windows 电脑上："
+    echo "        1) 运行一次 BazaarHub.exe 或 启动本地单机版.bat（会自动补齐到 server-linux/ 与 data/），或按 LOCAL_ASSET_EXTRACTION.md 手动提取；"
+    echo "        2) 再将补齐后的 server-linux/ 与 data/ 上传到本机后重新执行 deploy-linux.sh。"
+    exit 1
+fi
+
 cp -rf "${SCRIPT_DIR}/." "${INSTALL_ROOT}/server/"
 if [ -f "${INSTALL_ROOT}/server/BazaarServer" ]; then
     chmod +x "${INSTALL_ROOT}/server/BazaarServer"

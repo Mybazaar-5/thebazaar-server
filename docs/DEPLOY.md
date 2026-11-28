@@ -2,6 +2,11 @@
 
 本项目支持 **本地单机离线运行** 与 **自建 Linux / Windows 联机服务器** 两种部署方式。发布包默认以本地单机（`http://127.0.0.1:8080`）开箱即玩；如需与朋友跨网段或云端联机，可按本指南将服务端部署至你自己的服务器。
 
+> [!IMPORTANT]
+> **自建服务端前置要求（必看）**：开源发布包严格不包含受版权保护的原版商业 DLL（`BazaarGameShared.dll`、`BazaarBattleService.dll`、`BazaarGameClient.dll`、`BazaarUnityTools.dll`）、`GameData.db` 与 `translations/*.bytes`。
+> - **Windows 本地单机玩家**：直接双击 `BazaarHub\BazaarHub.exe` 或 `启动本地单机版.bat`，程序会自动从你本机的 Steam 官方测试服（PTR）客户端目录提取补齐上述文件（并顺便补齐同级 `server-linux\`），无需手动操作。
+> - **Linux 云服务器 / 独立服务器部署**：上传前请先在安装了 Steam PTR 客户端的 Windows 电脑上运行一次 `BazaarHub.exe`（或按包内 `LOCAL_ASSET_EXTRACTION.md` 一步脚本提取），确认 `server-linux/`（或 `server/`）已含上述 4 个 DLL 且 `data/` 已含 `GameData.db` 与 `translations/*.bytes` 后再上传部署。
+
 ---
 
 ## 一、快速选择：你想怎么玩？
