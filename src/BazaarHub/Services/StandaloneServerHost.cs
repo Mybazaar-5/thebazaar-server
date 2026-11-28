@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -388,12 +389,401 @@ public sealed class StandaloneServerHost : IDisposable
     }
 
     /// <summary>
+    /// 开源发布包因版权合规剥离的 4 个原版商业共享程序集（启动本地单机服前自动从玩家本机 Steam PTR 客户端提取）。
+    /// </summary>
+    public static readonly string[] RequiredVanillaServerDlls =
+    {
+        "BazaarGameShared.dll",
+        "BazaarBattleService.dll",
+        "BazaarGameClient.dll",
+        "BazaarUnityTools.dll"
+    };
+
+    /// <summary>
+    /// 本机原版运行资产自动补齐结果。
+    /// </summary>
+    public sealed record VanillaAssetProvisionResult(
+        bool Ready,
+        int CopiedDllCount,
+        bool ExtractedGameDataDb,
+        bool CopiedGameDataZip,
+        int CopiedTranslationCount,
+        string Message);
+
+    /// <summary>
+    /// 在拉起本地单机服务端前，自动检测 server\ 与 data\ 是否缺少原版受版权运行资产；
+    /// 若缺失，则自动从玩家本机已安装的 Steam 测试服（PTR）客户端目录与 LocalLow 缓存安全复制/解压补齐：
+    ///   1. 4 个共享 DLL（BazaarGameShared.dll / BazaarBattleService.dll / BazaarGameClient.dll / BazaarUnityTools.dll）→ server\（及同级 server-linux\）；
+    ///   2. GameData.db 与 GameData.db.zip → data\（优先读取 ptr\cache → prod\cache → StreamingAssets，遇 GameData.db.zip 自动解压）；
+    ///   3. translations\*.bytes 多语包 → data\translations\。
+    /// </summary>
+    public static VanillaAssetProvisionResult EnsureVanillaRuntimeAssets(
+        string serverDir,
+        string dataDir,
+        string? gameDir,
+        string? localLowBazaarRoot = null,
+        Action<string>? log = null)
+    {
+        if (string.IsNullOrWhiteSpace(serverDir))
+        {
+            return new VanillaAssetProvisionResult(false, 0, false, false, 0, "无效的本地服务端目录。");
+        }
+
+        string fullServerDir = Path.GetFullPath(serverDir);
+        string fullDataDir = string.IsNullOrWhiteSpace(dataDir)
+            ? Path.GetFullPath(Path.Combine(fullServerDir, "..", "data"))
+            : Path.GetFullPath(dataDir);
+        Directory.CreateDirectory(fullDataDir);
+
+        string? resolvedGameDir = ResolveValidGameDirForAssets(gameDir);
+        string? managedDir = string.IsNullOrWhiteSpace(resolvedGameDir)
+            ? null
+            : Path.Combine(resolvedGameDir, "TheBazaar_Data", "Managed");
+        string? streamingDir = string.IsNullOrWhiteSpace(resolvedGameDir)
+            ? null
+            : Path.Combine(resolvedGameDir, "TheBazaar_Data", "StreamingAssets");
+
+        string localLowRoot = !string.IsNullOrWhiteSpace(localLowBazaarRoot)
+            ? Path.GetFullPath(localLowBazaarRoot)
+            : Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "AppData", "LocalLow", "Tempo Storm", "The Bazaar");
+
+        // 1. 补齐 4 个原版共享 DLL 到 server\（并顺便补齐同级 server-linux\）
+        int copiedDlls = 0;
+        var missingDlls = RequiredVanillaServerDlls
+            .Where(dll => !IsNonEmptyFile(Path.Combine(fullServerDir, dll)))
+            .ToList();
+
+        if (missingDlls.Count > 0)
+        {
+            if (string.IsNullOrWhiteSpace(managedDir) || !Directory.Exists(managedDir))
+            {
+                string err =
+                    $"本地单机服务端缺少原版游戏共享库（{string.Join(" / ", missingDlls)}），" +
+                    "且未能自动定位《The Bazaar》Steam 游戏目录（需包含 TheBazaar_Data\\Managed）。\n" +
+                    "请先在启动器下方选择正确的 Steam 官方测试服（PTR）安装目录后重试。";
+                log?.Invoke($"[错误] {err}");
+                return new VanillaAssetProvisionResult(false, 0, false, false, 0, err);
+            }
+
+            foreach (string dll in missingDlls)
+            {
+                string src = Path.Combine(managedDir, dll);
+                if (!IsNonEmptyFile(src))
+                {
+                    string err =
+                        $"游戏目录中缺少原版共享库 {dll}（已检查：{managedDir}）。\n" +
+                        "请先在 Steam 库中确认《The Bazaar》已切换至官方测试服（PTR）并完成游戏文件完整性验证。";
+                    log?.Invoke($"[错误] {err}");
+                    return new VanillaAssetProvisionResult(false, copiedDlls, false, false, 0, err);
+                }
+
+                CopyFileAtomically(src, Path.Combine(fullServerDir, dll));
+                copiedDlls++;
+            }
+
+            log?.Invoke($"[自动提取] 已从本机游戏目录自动补齐 {copiedDlls} 个原版服务端共享库至 {fullServerDir}。");
+        }
+
+        // 若同级存在 server-linux\ 目录，也顺便补齐缺失的 4 个共享 DLL，方便用户后续部署 Linux 服
+        try
+        {
+            string? pkgRoot = Directory.GetParent(fullServerDir)?.FullName;
+            if (!string.IsNullOrWhiteSpace(pkgRoot) && !string.IsNullOrWhiteSpace(managedDir) && Directory.Exists(managedDir))
+            {
+                string linuxDir = Path.Combine(pkgRoot, "server-linux");
+                if (Directory.Exists(linuxDir) && !string.Equals(linuxDir, fullServerDir, StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (string dll in RequiredVanillaServerDlls)
+                    {
+                        string dst = Path.Combine(linuxDir, dll);
+                        string src = Path.Combine(managedDir, dll);
+                        if (!IsNonEmptyFile(dst) && IsNonEmptyFile(src))
+                        {
+                            CopyFileAtomically(src, dst);
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // 顺带同步 server-linux 失败不影响 Windows 单机服启动
+        }
+
+        // 2. 补齐 data\GameData.db 与 data\GameData.db.zip
+        string targetDbPath = Path.Combine(fullDataDir, "GameData.db");
+        string targetZipPath = Path.Combine(fullDataDir, "GameData.db.zip");
+        bool extractedDb = false;
+        bool copiedZip = false;
+
+        var dbCandidates = new List<string>
+        {
+            Path.Combine(localLowRoot, "ptr", "cache", "GameData.db"),
+            Path.Combine(localLowRoot, "prod", "cache", "GameData.db")
+        };
+        var zipCandidates = new List<string>
+        {
+            Path.Combine(localLowRoot, "ptr", "cache", "GameData.db.zip"),
+            Path.Combine(localLowRoot, "prod", "cache", "GameData.db.zip")
+        };
+        if (!string.IsNullOrWhiteSpace(streamingDir))
+        {
+            dbCandidates.Add(Path.Combine(streamingDir, "GameData.db"));
+            zipCandidates.Add(Path.Combine(streamingDir, "GameData.db.zip"));
+        }
+
+        if (!IsNonEmptyFile(targetDbPath))
+        {
+            string? foundDb = dbCandidates.FirstOrDefault(IsNonEmptyFile);
+            if (!string.IsNullOrWhiteSpace(foundDb))
+            {
+                CopyFileAtomically(foundDb, targetDbPath);
+                extractedDb = true;
+                log?.Invoke($"[自动提取] 已从本机缓存补齐 GameData.db（来源：{foundDb}）。");
+            }
+            else
+            {
+                string? foundZip = zipCandidates.FirstOrDefault(IsNonEmptyFile);
+                if (!string.IsNullOrWhiteSpace(foundZip))
+                {
+                    if (!TryExtractGameDataDbFromZip(foundZip, targetDbPath))
+                    {
+                        string err = $"无法从 {foundZip} 中解压 GameData.db，请检查游戏文件完整性后重试。";
+                        log?.Invoke($"[错误] {err}");
+                        return new VanillaAssetProvisionResult(false, copiedDlls, false, false, 0, err);
+                    }
+                    extractedDb = true;
+                    log?.Invoke($"[自动提取] 已从 {foundZip} 自动解压补齐 GameData.db。");
+                }
+                else
+                {
+                    string err =
+                        "本地单机服务端缺少原版数据库 GameData.db，且未在本机游戏目录（StreamingAssets\\GameData.db.zip）或 LocalLow 缓存中找到。\n" +
+                        "请先在启动器下方选择正确的《The Bazaar》Steam PTR 游戏目录，或先通过 Steam 启动一次官方客户端后重试。";
+                    log?.Invoke($"[错误] {err}");
+                    return new VanillaAssetProvisionResult(false, copiedDlls, false, false, 0, err);
+                }
+            }
+        }
+
+        if (!IsNonEmptyFile(targetZipPath))
+        {
+            string? foundZip = zipCandidates.FirstOrDefault(IsNonEmptyFile);
+            if (!string.IsNullOrWhiteSpace(foundZip))
+            {
+                CopyFileAtomically(foundZip, targetZipPath);
+                copiedZip = true;
+            }
+            else if (IsNonEmptyFile(targetDbPath))
+            {
+                try
+                {
+                    CreateGameDataZipAtomically(targetDbPath, targetZipPath);
+                    copiedZip = true;
+                }
+                catch
+                {
+                    // GameData.db.zip 为客户端可选缓存包，生成失败不阻塞单机服启动
+                }
+            }
+        }
+
+        // 3. 补齐 data\translations\*.bytes（优先 ptr\cache\translations，次选 prod\cache\translations 与 StreamingAssets）
+        int copiedTranslations = 0;
+        string targetTransDir = Path.Combine(fullDataDir, "translations");
+        Directory.CreateDirectory(targetTransDir);
+
+        var transSearchDirs = new List<(string Dir, SearchOption Option)>
+        {
+            (Path.Combine(localLowRoot, "ptr", "cache", "translations"), SearchOption.TopDirectoryOnly),
+            (Path.Combine(localLowRoot, "prod", "cache", "translations"), SearchOption.TopDirectoryOnly)
+        };
+        if (!string.IsNullOrWhiteSpace(streamingDir))
+        {
+            transSearchDirs.Add((streamingDir, SearchOption.AllDirectories));
+        }
+
+        foreach ((string srcDir, SearchOption opt) in transSearchDirs)
+        {
+            if (!Directory.Exists(srcDir)) continue;
+            try
+            {
+                foreach (string srcBytes in Directory.EnumerateFiles(srcDir, "*.bytes", opt))
+                {
+                    string leaf = Path.GetFileName(srcBytes);
+                    if (string.IsNullOrWhiteSpace(leaf)) continue;
+                    string dstBytes = Path.Combine(targetTransDir, leaf);
+                    if (!IsNonEmptyFile(dstBytes) && IsNonEmptyFile(srcBytes))
+                    {
+                        CopyFileAtomically(srcBytes, dstBytes);
+                        copiedTranslations++;
+                    }
+                }
+            }
+            catch
+            {
+                // 跳过无权限或损坏的扫描子目录
+            }
+        }
+
+        if (copiedTranslations > 0)
+        {
+            log?.Invoke($"[自动提取] 已从本机客户端自动补齐 {copiedTranslations} 个原版多语言数据包至 {targetTransDir}。");
+        }
+
+        string summary = (copiedDlls > 0 || extractedDb || copiedZip || copiedTranslations > 0)
+            ? $"已自动补齐本机原版运行资产（DLL={copiedDlls}，GameData.db={(extractedDb ? "已提取" : "已就绪")}，语言包={copiedTranslations}）。"
+            : "本地服务端原版运行资产已完整就绪。";
+        return new VanillaAssetProvisionResult(true, copiedDlls, extractedDb, copiedZip, copiedTranslations, summary);
+    }
+
+    private static string? ResolveValidGameDirForAssets(string? preferredGameDir)
+    {
+        if (!string.IsNullOrWhiteSpace(preferredGameDir))
+        {
+            string full = Path.GetFullPath(preferredGameDir);
+            if (Directory.Exists(Path.Combine(full, "TheBazaar_Data", "Managed")))
+            {
+                return full;
+            }
+        }
+
+        try
+        {
+            var locator = new GameLocatorService();
+            GameInstallInfo? detected = locator.AutoLocate(preferredGameDir);
+            if (detected != null && detected.IsValidGameInstall)
+            {
+                return detected.GameDirectory;
+            }
+        }
+        catch
+        {
+            // 自动定位异常时返回 null，交由调用方给出清晰错误提示
+        }
+
+        return null;
+    }
+
+    private static bool IsNonEmptyFile(string path)
+    {
+        try
+        {
+            var fi = new FileInfo(path);
+            return fi.Exists && fi.Length > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void CopyFileAtomically(string srcPath, string dstPath)
+    {
+        string? parent = Path.GetDirectoryName(dstPath);
+        if (!string.IsNullOrWhiteSpace(parent))
+        {
+            Directory.CreateDirectory(parent);
+        }
+
+        string tmpPath = dstPath + $".tmp.{Guid.NewGuid():N}";
+        try
+        {
+            File.Copy(srcPath, tmpPath, overwrite: true);
+            File.Move(tmpPath, dstPath, overwrite: true);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tmpPath)) File.Delete(tmpPath);
+            }
+            catch { }
+        }
+    }
+
+    private static bool TryExtractGameDataDbFromZip(string zipPath, string dstDbPath)
+    {
+        string? parent = Path.GetDirectoryName(dstDbPath);
+        if (!string.IsNullOrWhiteSpace(parent))
+        {
+            Directory.CreateDirectory(parent);
+        }
+
+        string tmpPath = dstDbPath + $".tmp.{Guid.NewGuid():N}";
+        try
+        {
+            using var archive = ZipFile.OpenRead(zipPath);
+            ZipArchiveEntry? entry = archive.Entries.FirstOrDefault(e =>
+                string.Equals(Path.GetFileName(e.FullName.Replace('\\', '/')), "GameData.db", StringComparison.OrdinalIgnoreCase) &&
+                e.Length > 0);
+            if (entry == null)
+            {
+                return false;
+            }
+
+            using (Stream inStream = entry.Open())
+            using (var outStream = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                inStream.CopyTo(outStream);
+            }
+
+            File.Move(tmpPath, dstDbPath, overwrite: true);
+            return IsNonEmptyFile(dstDbPath);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tmpPath)) File.Delete(tmpPath);
+            }
+            catch { }
+        }
+    }
+
+    private static void CreateGameDataZipAtomically(string srcDbPath, string dstZipPath)
+    {
+        string? parent = Path.GetDirectoryName(dstZipPath);
+        if (!string.IsNullOrWhiteSpace(parent))
+        {
+            Directory.CreateDirectory(parent);
+        }
+
+        string tmpPath = dstZipPath + $".tmp.{Guid.NewGuid():N}";
+        try
+        {
+            using (var fs = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var archive = new ZipArchive(fs, ZipArchiveMode.Create, leaveOpen: false))
+            {
+                archive.CreateEntryFromFile(srcDbPath, "GameData.db", CompressionLevel.Fastest);
+            }
+            File.Move(tmpPath, dstZipPath, overwrite: true);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tmpPath)) File.Delete(tmpPath);
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>
     /// 确保本机单机服务端就绪（预检端口占用 + /healthz 专属指纹校验；仅复用真实 BazaarServer，遇外部冲突明确报错阻断）。
+    /// 启动前自动检查并从本机 Steam 游戏目录补齐受版权剥离的 4 个原版 DLL、GameData.db 与多语言数据包。
     /// </summary>
     public async Task<(bool Ready, string Message)> EnsureStartedAsync(
         int port = 8080,
         Action<string>? log = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? gameDir = null)
     {
         string localBase = $"http://127.0.0.1:{port}";
 
@@ -422,7 +812,14 @@ public sealed class StandaloneServerHost : IDisposable
         }
 
         string serverDir = Path.GetDirectoryName(serverExe)!;
-        string? dataDir = LocateDataDirectory(serverExe);
+        string dataDir = LocateDataDirectory(serverExe) ?? Path.GetFullPath(Path.Combine(serverDir, "..", "data"));
+
+        VanillaAssetProvisionResult provision = EnsureVanillaRuntimeAssets(serverDir, dataDir, gameDir, localLowBazaarRoot: null, log: log);
+        if (!provision.Ready)
+        {
+            return (false, provision.Message);
+        }
+
         string stateDir = ResolveStateDirectory(serverDir, dataDir);
         Directory.CreateDirectory(stateDir);
 

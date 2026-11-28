@@ -24,7 +24,7 @@ public static class SelfTestRunner
         int failed = 0;
 
         Console.WriteLine("==================================================================");
-        Console.WriteLine("  BazaarHub 无头自动化自检 (--self-test · 14 项契约回归)");
+        Console.WriteLine("  BazaarHub 无头自动化自检 (--self-test · 15 项契约回归)");
         Console.WriteLine($"  沙盒目录：{sandboxRoot}");
         Console.WriteLine("==================================================================");
 
@@ -59,6 +59,7 @@ public static class SelfTestRunner
             await RunCase("12. [D7-P1-01/02] 统一版本号动态读取 + CAS 资产池共享路径契约校验", () => TestUnifiedVersionAndCasPoolAsync(sandboxRoot));
             await RunCase("13. [D7-P2-02] PrivacyRedaction 诊断导出隐私脱敏（MachineName/UserName/Token/路径/URL凭证）", () => TestDiagnosticsPrivacyRedactionAsync(sandboxRoot));
             await RunCase("14. [D7-P2-05] AtomicFileWriter 唯一随机临时文件名 + 异常自动清理 + 原子落盘", () => TestAtomicFileWriterAsync(sandboxRoot));
+            await RunCase("15. [V15.5.1] StandaloneServerHost 本地原版运行资产自动提取（4 DLL + GameData.db.zip 解压 + 语言包 + 幂等与缺目录阻断）", () => TestVanillaAssetAutoProvisioningAsync(sandboxRoot));
         }
         finally
         {
@@ -1299,6 +1300,79 @@ CustomRuleJsonHash = abcdef123456
         int port = ((IPEndPoint)listener.LocalEndpoint).Port;
         listener.Stop();
         return port;
+    }
+
+    private static Task TestVanillaAssetAutoProvisioningAsync(string sandboxRoot)
+    {
+        string caseRoot = Path.Combine(sandboxRoot, "case15_vanilla_assets");
+        string pkgRoot = Path.Combine(caseRoot, "pkg");
+        string srvDir = Path.Combine(pkgRoot, "server");
+        string srvLinuxDir = Path.Combine(pkgRoot, "server-linux");
+        string dataDir = Path.Combine(pkgRoot, "data");
+        string fakeGameDir = Path.Combine(caseRoot, "steam_game");
+        string fakeManaged = Path.Combine(fakeGameDir, "TheBazaar_Data", "Managed");
+        string fakeStreaming = Path.Combine(fakeGameDir, "TheBazaar_Data", "StreamingAssets");
+        string fakeLocalLow = Path.Combine(caseRoot, "locallow_bazaar");
+        string fakePtrTrans = Path.Combine(fakeLocalLow, "ptr", "cache", "translations");
+
+        Directory.CreateDirectory(srvDir);
+        Directory.CreateDirectory(srvLinuxDir);
+        Directory.CreateDirectory(dataDir);
+        Directory.CreateDirectory(fakeManaged);
+        Directory.CreateDirectory(fakeStreaming);
+        Directory.CreateDirectory(fakePtrTrans);
+
+        // 构造模拟 Steam 游戏目录：4 个原版 DLL + StreamingAssets\GameData.db.zip（内含 GameData.db）+ LocalLow 语言包
+        foreach (string dll in StandaloneServerHost.RequiredVanillaServerDlls)
+        {
+            File.WriteAllText(Path.Combine(fakeManaged, dll), $"FAKE_VANILLA_{dll}", Utf8NoBom);
+        }
+
+        string zipSrc = Path.Combine(fakeStreaming, "GameData.db.zip");
+        using (var fs = new FileStream(zipSrc, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        using (var za = new ZipArchive(fs, ZipArchiveMode.Create, leaveOpen: false))
+        {
+            var entry = za.CreateEntry("GameData.db");
+            using var es = entry.Open();
+            byte[] payload = Utf8NoBom.GetBytes("FAKE_SQLITE_GAMEDATA_DB_PAYLOAD");
+            es.Write(payload, 0, payload.Length);
+        }
+
+        File.WriteAllText(Path.Combine(fakePtrTrans, "zh-CN.bytes"), "FAKE_ZH_CN_BYTES", Utf8NoBom);
+        File.WriteAllText(Path.Combine(fakePtrTrans, "ko-KR.bytes"), "FAKE_KO_KR_BYTES", Utf8NoBom);
+
+        // 1. 首次补齐：应自动复制 4 个 DLL（含 server-linux）、解压 GameData.db、复制 GameData.db.zip 与 2 个语言包
+        var res1 = StandaloneServerHost.EnsureVanillaRuntimeAssets(srvDir, dataDir, fakeGameDir, fakeLocalLow);
+        Assert(res1.Ready, $"首次原版资产自动补齐应成功：{res1.Message}");
+        Assert(res1.CopiedDllCount == 4, $"应补齐 4 个 DLL，实际 {res1.CopiedDllCount}");
+        Assert(res1.ExtractedGameDataDb, "应从 GameData.db.zip 自动解压 GameData.db");
+        Assert(res1.CopiedGameDataZip, "应同步补齐 GameData.db.zip");
+        Assert(res1.CopiedTranslationCount == 2, $"应补齐 2 个语言包，实际 {res1.CopiedTranslationCount}");
+        foreach (string dll in StandaloneServerHost.RequiredVanillaServerDlls)
+        {
+            Assert(File.Exists(Path.Combine(srvDir, dll)), $"server\\ 缺少 {dll}");
+            Assert(File.Exists(Path.Combine(srvLinuxDir, dll)), $"server-linux\\ 缺少 {dll}");
+        }
+        Assert(File.ReadAllText(Path.Combine(dataDir, "GameData.db"), Utf8NoBom) == "FAKE_SQLITE_GAMEDATA_DB_PAYLOAD", "解压出的 GameData.db 内容不符");
+        Assert(File.Exists(Path.Combine(dataDir, "GameData.db.zip")), "data\\GameData.db.zip 未生成");
+        Assert(File.Exists(Path.Combine(dataDir, "translations", "zh-CN.bytes")), "zh-CN.bytes 未补齐");
+
+        // 2. 幂等校验：再次调用应零重复拷贝且保持 Ready=true
+        var res2 = StandaloneServerHost.EnsureVanillaRuntimeAssets(srvDir, dataDir, fakeGameDir, fakeLocalLow);
+        Assert(res2.Ready && res2.CopiedDllCount == 0 && !res2.ExtractedGameDataDb && !res2.CopiedGameDataZip && res2.CopiedTranslationCount == 0,
+            $"二次调用应幂等零拷贝，实际：{res2}");
+
+        // 3. 缺少关键 DLL 且游戏目录缺文件时，应明确报错阻断并指出 BazaarGameShared.dll
+        string brokenSrv = Path.Combine(caseRoot, "broken_srv");
+        string brokenData = Path.Combine(caseRoot, "broken_data");
+        string emptyGame = Path.Combine(caseRoot, "empty_game");
+        Directory.CreateDirectory(brokenSrv);
+        Directory.CreateDirectory(Path.Combine(emptyGame, "TheBazaar_Data", "Managed"));
+        var resFail = StandaloneServerHost.EnsureVanillaRuntimeAssets(brokenSrv, brokenData, emptyGame, fakeLocalLow);
+        Assert(!resFail.Ready, "缺少 BazaarGameShared.dll 时应明确返回 Ready=false");
+        Assert(resFail.Message.Contains("BazaarGameShared.dll", StringComparison.Ordinal), $"报错信息应点名 BazaarGameShared.dll，实际：{resFail.Message}");
+
+        return Task.CompletedTask;
     }
 
     private static void Assert(bool condition, string message)

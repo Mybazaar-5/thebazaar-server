@@ -8,7 +8,7 @@
 
 1. 解压发布包到任意文件夹（建议路径不含特殊符号），确保本机已安装 **.NET 8 Desktop Runtime**。
 2. 双击 **`BazaarHub\BazaarHub.exe`**：
-   - 自动扫描全盘与 Steam 游戏库定位《The Bazaar》；
+   - 自动扫描全盘与 Steam 游戏库定位《The Bazaar》，首次启动单机服时**自动**从本机 Steam PTR 客户端提取原版 4 个 DLL、`GameData.db` 与语言包，真正开箱即玩；
    - 自动增量同步最新 `BazaarModSdk.dll`、`BazaarLauncher.dll`、服务端中文热更词典与 Mod 贴图；
    - 一键点击 **「打开创意工坊编辑器（Web）」** 直达 `http://127.0.0.1:8080/workshop`，零代码改原版卡、做新卡/奇遇、拖拽换 PNG 卡图并一键跑 10 道防 Bug 铁闸 + 50 场真实战斗试跑；
    - 游戏内按 `F8 → 常规规则 → 种子与对手` 可设置自定义种子、粘贴/生成跨服分享码，并一键免密打开 Web 编排台（`/planner`）安排每日对手或按期望事件搜种子；

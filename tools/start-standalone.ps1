@@ -57,7 +57,105 @@ function Resolve-DataRoot {
     if (Test-Path (Join-Path $siblingData "GameData.db")) {
         return (Resolve-Path $siblingData).Path
     }
-    throw "Cannot locate GameData.db. Please pass -DataRoot explicitly."
+    if (-not [string]::IsNullOrWhiteSpace($Explicit)) {
+        New-Item -ItemType Directory -Force -Path $Explicit | Out-Null
+        return (Resolve-Path $Explicit).Path
+    }
+    New-Item -ItemType Directory -Force -Path $localData | Out-Null
+    return $localData
+}
+
+function Ensure-VanillaRuntimeAssets {
+    param([string]$TargetGameDir, [string]$TargetDataRoot, [string]$TargetServerDir = "")
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $managedDir = Join-Path $TargetGameDir "TheBazaar_Data\Managed"
+    $streamingDir = Join-Path $TargetGameDir "TheBazaar_Data\StreamingAssets"
+    $localLowRoot = Join-Path $env:USERPROFILE "AppData\LocalLow\Tempo Storm\The Bazaar"
+
+    if (-not [string]::IsNullOrWhiteSpace($TargetServerDir) -and (Test-Path $TargetServerDir)) {
+        $copiedDlls = 0
+        foreach ($dll in @("BazaarGameShared.dll", "BazaarBattleService.dll", "BazaarGameClient.dll", "BazaarUnityTools.dll")) {
+            $dstDll = Join-Path $TargetServerDir $dll
+            if (-not (Test-Path -LiteralPath $dstDll -PathType Leaf) -or (Get-Item -LiteralPath $dstDll).Length -le 0) {
+                $srcDll = Join-Path $managedDir $dll
+                if (-not (Test-Path -LiteralPath $srcDll -PathType Leaf)) {
+                    throw "Missing vanilla library '$dll' in '$managedDir'. Please verify Steam PTR game files."
+                }
+                Copy-Item -LiteralPath $srcDll -Destination $dstDll -Force
+                $copiedDlls++
+            }
+        }
+        if ($copiedDlls -gt 0) {
+            Write-Host "[Standalone] Auto-extracted $copiedDlls vanilla DLLs from Steam PTR client into $TargetServerDir" -ForegroundColor Green
+        }
+    }
+
+    New-Item -ItemType Directory -Force -Path $TargetDataRoot | Out-Null
+    $targetDb = Join-Path $TargetDataRoot "GameData.db"
+    $targetZip = Join-Path $TargetDataRoot "GameData.db.zip"
+
+    $dbCandidates = @(
+        (Join-Path $localLowRoot "ptr\cache\GameData.db"),
+        (Join-Path $localLowRoot "prod\cache\GameData.db"),
+        (Join-Path $streamingDir "GameData.db")
+    )
+    $zipCandidates = @(
+        (Join-Path $localLowRoot "ptr\cache\GameData.db.zip"),
+        (Join-Path $localLowRoot "prod\cache\GameData.db.zip"),
+        (Join-Path $streamingDir "GameData.db.zip")
+    )
+
+    if (-not (Test-Path -LiteralPath $targetDb -PathType Leaf) -or (Get-Item -LiteralPath $targetDb).Length -le 0) {
+        $srcDb = $dbCandidates | Where-Object { (Test-Path -LiteralPath $_ -PathType Leaf) -and (Get-Item -LiteralPath $_).Length -gt 0 } | Select-Object -First 1
+        if ($srcDb) {
+            Copy-Item -LiteralPath $srcDb -Destination $targetDb -Force
+            Write-Host "[Standalone] Auto-extracted GameData.db from $srcDb" -ForegroundColor Green
+        } else {
+            $srcZip = $zipCandidates | Where-Object { (Test-Path -LiteralPath $_ -PathType Leaf) -and (Get-Item -LiteralPath $_).Length -gt 0 } | Select-Object -First 1
+            if (-not $srcZip) {
+                throw "Cannot locate GameData.db or GameData.db.zip in Steam game dir or LocalLow cache."
+            }
+            $za = [System.IO.Compression.ZipFile]::OpenRead($srcZip)
+            try {
+                $entry = $za.Entries | Where-Object { [System.IO.Path]::GetFileName($_.FullName.Replace('\', '/')) -ieq "GameData.db" -and $_.Length -gt 0 } | Select-Object -First 1
+                if (-not $entry) { throw "GameData.db entry not found inside $srcZip" }
+                $tmpDb = "$targetDb.tmp"
+                if (Test-Path -LiteralPath $tmpDb) { Remove-Item -LiteralPath $tmpDb -Force }
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $tmpDb, $true)
+                Move-Item -LiteralPath $tmpDb -Destination $targetDb -Force
+            } finally {
+                $za.Dispose()
+            }
+            Write-Host "[Standalone] Auto-extracted GameData.db from $srcZip" -ForegroundColor Green
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $targetZip -PathType Leaf) -or (Get-Item -LiteralPath $targetZip).Length -le 0) {
+        $srcZip = $zipCandidates | Where-Object { (Test-Path -LiteralPath $_ -PathType Leaf) -and (Get-Item -LiteralPath $_).Length -gt 0 } | Select-Object -First 1
+        if ($srcZip) {
+            Copy-Item -LiteralPath $srcZip -Destination $targetZip -Force
+        }
+    }
+
+    $transDst = Join-Path $TargetDataRoot "translations"
+    New-Item -ItemType Directory -Force -Path $transDst | Out-Null
+    foreach ($tDir in @(
+        (Join-Path $localLowRoot "ptr\cache\translations"),
+        (Join-Path $localLowRoot "prod\cache\translations"),
+        $streamingDir
+    )) {
+        if (-not (Test-Path -LiteralPath $tDir -PathType Container)) { continue }
+        $isRecurse = ($tDir -eq $streamingDir)
+        $files = if ($isRecurse) { Get-ChildItem -LiteralPath $tDir -Recurse -File -Filter "*.bytes" -ErrorAction SilentlyContinue } else { Get-ChildItem -LiteralPath $tDir -File -Filter "*.bytes" -ErrorAction SilentlyContinue }
+        foreach ($f in $files) {
+            $dstFile = Join-Path $transDst $f.Name
+            if (-not (Test-Path -LiteralPath $dstFile -PathType Leaf) -and $f.Length -gt 0) {
+                Copy-Item -LiteralPath $f.FullName -Destination $dstFile -Force
+            }
+        }
+    }
 }
 
 function Resolve-GameDir {
@@ -206,8 +304,10 @@ function Test-ServerHealth {
 }
 
 $repoRoot = Resolve-RepoRoot -StartDir $PSScriptRoot
-$resolvedData = Resolve-DataRoot -Explicit $DataRoot -RepoRoot $repoRoot
 $resolvedGame = Resolve-GameDir -Explicit $GameDir
+$resolvedData = Resolve-DataRoot -Explicit $DataRoot -RepoRoot $repoRoot
+$prebuiltDir = Join-Path $repoRoot "dist\server"
+Ensure-VanillaRuntimeAssets -TargetGameDir $resolvedGame -TargetDataRoot $resolvedData -TargetServerDir $prebuiltDir
 if (-not $StateDir) {
     $StateDir = Join-Path $repoRoot "logs\standalone-state"
 }

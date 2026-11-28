@@ -612,7 +612,7 @@ public sealed class MainForm : Form
             else
             {
                 _launchPage.SetLaunchBusy(false, "正在拉起本地单机服务端并等待 /healthz 就绪...", 40);
-                (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog, ct);
+                (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog, ct, _gameInstall?.GameDirectory);
                 if (IsClosingOrDisposed) return;
                 _launchPage.SetLaunchBusy(false, msg, ready ? 100 : 0);
                 if (!ready)
@@ -735,7 +735,7 @@ public sealed class MainForm : Form
             if (mode == ServerMode.LocalStandalone)
             {
                 _launchPage.SetLaunchBusy(true, "正在拉起本地单机服务端并等待 /healthz 就绪...", 20);
-                (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog, _formCts.Token);
+                (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog, _formCts.Token, gameDir);
                 if (IsClosingOrDisposed) return;
                 RefreshStandaloneStatusUi();
                 if (!ready)
@@ -1404,7 +1404,7 @@ public sealed class MainForm : Form
                 if (!probe.IsOnline)
                 {
                     AppendLog("[工坊] 正在自动拉起本地单机服务端以承载 /workshop/ 创意工坊编辑器...");
-                    (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog, _formCts.Token);
+                    (bool ready, string msg) = await _standaloneHost.EnsureStartedAsync(8080, AppendLog, _formCts.Token, _gameInstall?.GameDirectory);
                     if (IsClosingOrDisposed) return;
                     RefreshStandaloneStatusUi();
                     if (!ready)

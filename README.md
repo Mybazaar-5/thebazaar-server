@@ -52,8 +52,8 @@
 
 前往本仓库 **Releases** 下载完整发布包：
 
-1. **推荐：使用 `BazaarHub.exe` 图形启动器**（依赖 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)）：自动定位游戏、增量同步双插件（`BazaarModSdk.dll` + `BazaarLauncher.dll`）与汉化/Mod 资产，一键启动单机或远程服。
-2. **命令行单机离线直接玩**：解压后直接双击 `启动本地单机版.bat`，自动安装补丁并在本机 `127.0.0.1:8080` 拉起服务端后启动游戏。
+1. **推荐：使用 `BazaarHub.exe` 图形启动器**（依赖 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)）：自动定位游戏、首次启动本地单机服时自动从本机 Steam PTR 客户端提取所需的 4 个原版 DLL、`GameData.db` 与多语包（无需手工拷贝），并增量同步双插件（`BazaarModSdk.dll` + `BazaarLauncher.dll`）与汉化/Mod 资产，一键启动单机或远程服。
+2. **命令行单机离线直接玩**：解压后直接双击 `启动本地单机版.bat`，自动补齐本机 Steam PTR 原版运行资产、安装补丁并在本机 `127.0.0.1:8080` 拉起服务端后启动游戏。
 3. **搭建自己的云端 / 局域网多人服**：参照 [docs/DEPLOY.md](docs/DEPLOY.md) 使用发布包内的 `server-linux/`（附一键脚本 `deploy-linux.sh`）或 `server/` 配合 `data/` 与 `mods/` 部署在自己的服务器上；客户端运行 `install.bat` 选 `[2]` 填入你的服务器地址即可联机。
 
 ---
