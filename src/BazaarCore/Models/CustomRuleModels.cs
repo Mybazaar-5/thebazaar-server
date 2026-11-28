@@ -215,6 +215,16 @@ public enum GamePlayMode
 }
 
 /// <summary>
+/// Hour 6 PvP 镜像对手模式枚举。
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum EGhostOpponentMode
+{
+    Random = 0,       // 全随机对手
+    FixedLineup = 1,  // 按 SelectedGhostLineupId 出战；剧本里没配的天回落随机
+}
+
+/// <summary>
 /// 预设档位元数据描述。
 /// </summary>
 public sealed record PresetMetadata(
@@ -895,6 +905,18 @@ public sealed class CustomRunRuleSet
     [JsonPropertyName("selectedModIds")]
     public List<string> SelectedModIds { get; set; } = new();
 
+    /// <summary>自定义种子文本（支持 8 位 S 种子码、整数或任意文本；不参与平衡性限制判定）。</summary>
+    [JsonPropertyName("customSeedText")]
+    public string? CustomSeedText { get; set; }
+
+    /// <summary>PvP 镜像对手模式（全随机或固定剧本；不参与平衡性限制判定）。</summary>
+    [JsonPropertyName("ghostOpponentMode")]
+    public EGhostOpponentMode GhostOpponentMode { get; set; } = EGhostOpponentMode.Random;
+
+    /// <summary>当前选用的每日对手剧本 ID（不参与平衡性限制判定）。</summary>
+    [JsonPropertyName("selectedGhostLineupId")]
+    public string? SelectedGhostLineupId { get; set; }
+
     [JsonIgnore]
     public GamePlayMode PlayModeCategory => PresetCatalog.ToGamePlayMode(SpecialModeId);
 
@@ -1041,6 +1063,11 @@ public sealed class CustomRunRuleSet
                 ? null
                 : FixedRunSeed);
 
+        string? seedText = BazaarCore.Engine.DailyChallengeSeedGenerator.NormalizeSeedText(CustomSeedText);
+        // 文本种子取代旧整数种子（仅非每日；每日的 FixedRunSeed 仍由原逻辑接管）
+        if (seedText != null && specialMode != ESpecialModeId.DailyChallenge)
+            effectiveFixedSeed = null;
+
         var normalized = new CustomRunRuleSet
         {
             SelectedArchetypeMask = CardArchetypeCatalog.ClampMaxBits(
@@ -1082,7 +1109,12 @@ public sealed class CustomRunRuleSet
             MonsterLootTierBonus = Math.Clamp(MonsterLootTierBonus, 0, 3),
             EnemyStatMultiplier = ClampFinite(EnemyStatMultiplier, 0.25, 10.0, 1.0),
             DisableFatesRevive = DisableFatesRevive,
-            SelectedModIds = CloneDistinctIds(SelectedModIds, maxCount: 16)
+            SelectedModIds = CloneDistinctIds(SelectedModIds, maxCount: 16),
+            CustomSeedText = seedText,
+            GhostOpponentMode = Enum.IsDefined(GhostOpponentMode) ? GhostOpponentMode : EGhostOpponentMode.Random,
+            SelectedGhostLineupId = string.IsNullOrWhiteSpace(SelectedGhostLineupId) || SelectedGhostLineupId.Trim().Length > 64
+                ? null
+                : SelectedGhostLineupId.Trim()
         };
 
         return normalized;

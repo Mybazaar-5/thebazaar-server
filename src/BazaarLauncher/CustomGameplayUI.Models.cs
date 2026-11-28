@@ -4,6 +4,29 @@ using Newtonsoft.Json;
 
 namespace BazaarLauncher;
 
+/// <summary>对手模式既接受字符串（"Random" / "FixedLineup"）也接受数字（0 / 1），服务端换序列化方式也不会解析失败。</summary>
+internal sealed class GhostOpponentModeJsonConverter : JsonConverter
+{
+    public override bool CanConvert(Type objectType) => objectType == typeof(string);
+
+    public override object ReadJson(JsonReader reader, Type objectType, object existingValue, JsonSerializer serializer)
+    {
+        switch (reader.TokenType)
+        {
+            case JsonToken.Integer:
+                return Convert.ToInt64(reader.Value) == 1 ? "FixedLineup" : "Random";
+            case JsonToken.String:
+                string s = (string)reader.Value;
+                return string.Equals(s, "FixedLineup", StringComparison.OrdinalIgnoreCase) || s == "1" ? "FixedLineup" : "Random";
+            default:
+                return "Random";
+        }
+    }
+
+    public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
+        => writer.WriteValue(value as string ?? "Random");
+}
+
 internal sealed class StartingItemRule
 {
     [JsonProperty("templateId")] public string TemplateId { get; set; } = string.Empty;
@@ -63,6 +86,23 @@ internal sealed class CustomRunRuleSet
     [JsonProperty("disableFatesRevive")] public bool DisableFatesRevive { get; set; } = false;
     [JsonProperty("selectedModIds")] public List<string> SelectedModIds { get; set; } = new();
 
+    // ── v4 种子与每日对手剧本 ──
+    // 这三项只由「种子与每日对手」卡片通过 /api/planner/apply-rules 修改；整份保存（PUT /custom-rules/me）时
+    // 故意不发送（ShouldSerialize 返回 false），服务端按「没带就保留」处理，避免面板里旧的副本把网页刚改的设置冲掉。
+    [JsonProperty("customSeedText")] public string CustomSeedText { get; set; }
+    [JsonProperty("ghostOpponentMode")][JsonConverter(typeof(GhostOpponentModeJsonConverter))] public string GhostOpponentMode { get; set; } = "Random";
+    [JsonProperty("selectedGhostLineupId")] public string SelectedGhostLineupId { get; set; }
+    public bool ShouldSerializeCustomSeedText() => false;
+    public bool ShouldSerializeGhostOpponentMode() => false;
+    public bool ShouldSerializeSelectedGhostLineupId() => false;
+
+    // Mod 自定义玩法模式：以前客户端不认识这个字段，整份保存时会把它冲掉，这里补上让它原样往返
+    [JsonProperty("customModeId")] public string CustomModeId { get; set; }
+
+    internal bool UsesFixedLineup
+        => string.Equals(GhostOpponentMode, "FixedLineup", StringComparison.OrdinalIgnoreCase)
+           && !string.IsNullOrWhiteSpace(SelectedGhostLineupId);
+
     public void EnsureCollections()
     {
         StartingItems ??= new List<StartingItemRule>();
@@ -73,6 +113,7 @@ internal sealed class CustomRunRuleSet
         SelectedModIds ??= new List<string>();
         if (string.IsNullOrWhiteSpace(PresetId)) PresetId = "PureOfficial";
         if (string.IsNullOrWhiteSpace(SpecialModeId)) SpecialModeId = "Standard";
+        if (string.IsNullOrWhiteSpace(GhostOpponentMode)) GhostOpponentMode = "Random";
     }
 
     /// <summary>D6-P1-02：统一默认重置入口（彻底清空全部 Wave 2/3 扩展字段与旧预设残留）。</summary>
@@ -125,6 +166,9 @@ internal sealed class CustomRunRuleSet
         EnemyStatMultiplier = 1.0;
         DisableFatesRevive = false;
         SelectedModIds = new List<string>();
+        CustomModeId = null;
+        // 种子与对手剧本不在这里清：它们由服务端保管、只在「种子与每日对手」卡片里改，
+        // 本地清掉而服务端没清会让卡片显示和实际不一致（「一键恢复官方默认」走服务端重置，会一起清）。
         IsCustomPowerModified = false;
     }
 
@@ -134,20 +178,30 @@ internal sealed class CustomRunRuleSet
         EnsureCollections();
         ArchetypeWeightMultiplier = Math.Clamp(ArchetypeWeightMultiplier, 1.0, 10.0);
         ArchetypeMultiMatchCap = Math.Clamp(ArchetypeMultiMatchCap, 1.0, 10.0);
-        StartingGold = Math.Clamp(StartingGold, 0, 9999);
-        StartingIncome = Math.Clamp(StartingIncome, 0, 999);
-        StartingExperience = Math.Clamp(StartingExperience, 0, 999);
-        StartingPrestige = Math.Clamp(StartingPrestige, 1, 999);
-        StartingHealth = Math.Clamp(StartingHealth, 50, 99999);
+        // 上限与服务端 CustomRunRuleSet.CloneNormalized 一致：以前这里放得更宽，填了也会被服务端悄悄截断
+        StartingGold = Math.Clamp(StartingGold, 0, 999);
+        StartingIncome = Math.Clamp(StartingIncome, 0, 200);
+        StartingExperience = Math.Clamp(StartingExperience, 0, 500);
+        StartingPrestige = Math.Clamp(StartingPrestige, 1, 100);
+        StartingHealth = Math.Clamp(StartingHealth, 50, 10000);
         PlayerCap = Math.Clamp(PlayerCap, 2, 16);
-        EndlessMaxDay = Math.Clamp(EndlessMaxDay, 15, 999);
+        EndlessMaxDay = Math.Clamp(EndlessMaxDay, 15, 99);
         CrossHeroOwnHeroBias = Math.Clamp(CrossHeroOwnHeroBias, 0.0, 1.0);
         BossRushTotalWaves = Math.Clamp(BossRushTotalWaves, 5, 30);
-        ShopHighTierBonusPct = Math.Clamp(ShopHighTierBonusPct, -50.0, 100.0);
+        ShopHighTierBonusPct = Math.Clamp(ShopHighTierBonusPct, 0.0, 100.0);
         ShopPriceMultiplier = Math.Clamp(ShopPriceMultiplier, 0.1, 5.0);
         MonsterLootBonusChoices = Math.Clamp(MonsterLootBonusChoices, 0, 5);
         MonsterLootTierBonus = Math.Clamp(MonsterLootTierBonus, 0, 3);
         EnemyStatMultiplier = Math.Clamp(EnemyStatMultiplier, 0.25, 5.0);
+        if (CustomSeedText != null)
+        {
+            string s = CustomSeedText.Trim();
+            CustomSeedText = s.Length == 0 ? null : (s.Length > 48 ? s.Substring(0, 48) : s);
+        }
+        if (!string.Equals(GhostOpponentMode, "FixedLineup", StringComparison.OrdinalIgnoreCase)) GhostOpponentMode = "Random";
+        else GhostOpponentMode = "FixedLineup";
+        if (SelectedGhostLineupId != null && (SelectedGhostLineupId.Trim().Length == 0 || SelectedGhostLineupId.Length > 64)) SelectedGhostLineupId = null;
+        if (string.IsNullOrWhiteSpace(CustomModeId)) CustomModeId = null;
         RefreshPowerFlag();
     }
 
@@ -248,8 +302,10 @@ internal sealed class CustomRunRuleSet
         if (!string.Equals(SpecialModeId, "Standard", StringComparison.OrdinalIgnoreCase)
             || !string.Equals(PresetId, "PureOfficial", StringComparison.OrdinalIgnoreCase)
             || MutatorIds.Count > 0
-            || SelectedModIds.Count > 0)
+            || SelectedModIds.Count > 0
+            || !string.IsNullOrWhiteSpace(CustomModeId))
         {
+            // 与服务端一致：种子 / 对手剧本不算改强度，只有 Mod 自定义模式算
             return true;
         }
         if (StartingGold != 15 || StartingIncome != 5 || StartingExperience != 3
@@ -317,6 +373,10 @@ internal sealed class CustomRunRuleSet
             EnemyStatMultiplier = EnemyStatMultiplier,
             DisableFatesRevive = DisableFatesRevive,
             SelectedModIds = new List<string>(SelectedModIds),
+            CustomSeedText = CustomSeedText,
+            GhostOpponentMode = GhostOpponentMode,
+            SelectedGhostLineupId = SelectedGhostLineupId,
+            CustomModeId = CustomModeId,
         };
 
         for (int i = 0; i < StartingItems.Count; i++)
@@ -688,6 +748,14 @@ internal sealed partial class CustomGameplayUI
             || rules.DisableFatesRevive)
         {
             tags.Add("进阶调参");
+        }
+
+        if (!isTournament)
+        {
+            // 每日挑战用当天官方种子，自填的种子不生效，就不标了
+            bool isDaily = string.Equals(rules.SpecialModeId, "DailyChallenge", StringComparison.OrdinalIgnoreCase);
+            if (!isDaily && !string.IsNullOrWhiteSpace(rules.CustomSeedText)) tags.Add("固定种子");
+            if (rules.UsesFixedLineup) tags.Add("固定对手方案");
         }
 
         if (isTournament && (rules.PlayerCap != 8 || !rules.BotNonLethalPrestigeLock

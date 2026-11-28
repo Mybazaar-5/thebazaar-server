@@ -81,6 +81,13 @@ public static class RunSnapshotSerializer
         public Dictionary<string, double>? TakeoverChanceBonuses { get; set; }
         public bool PendingClearExpeditionAfterLoot { get; set; }
         public int RngSeed { get; set; }
+        public int MasterSeed { get; set; }
+        public string? SeedText { get; set; }
+        public bool IsCustomSeededRun { get; set; }
+        public string? PinnedLineupName { get; set; }
+        public Dictionary<string, int>? StreamOccurrences { get; set; }
+        public int StreamOccurrenceStamp { get; set; }
+        public int NextInstanceSeq { get; set; }
         public int BossRushWavesCleared { get; set; }
         public bool EndlessTenWinCelebrated { get; set; }
         public int DailyRerollSequence { get; set; }
@@ -447,6 +454,12 @@ public static class RunSnapshotSerializer
             CurrentMaxSelections = run.CurrentMaxSelections,
             PendingClearExpeditionAfterLoot = run.PendingClearExpeditionAfterLoot,
             RngSeed = run.RngSeed,
+            MasterSeed = run.MasterSeed,
+            SeedText = run.SeedText,
+            IsCustomSeededRun = run.IsCustomSeededRun,
+            PinnedLineupName = run.PinnedLineupName,
+            StreamOccurrenceStamp = run.StreamOccurrenceStamp,
+            NextInstanceSeq = run.NextInstanceSeq,
             BossRushWavesCleared = run.BossRushWavesCleared,
             EndlessTenWinCelebrated = run.EndlessTenWinCelebrated,
             DailyRerollSequence = run.DailyRerollSequence,
@@ -477,6 +490,12 @@ public static class RunSnapshotSerializer
             dto.TakeoverChanceBonuses = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
             foreach (var kv in run.TakeoverChanceBonuses)
                 dto.TakeoverChanceBonuses[kv.Key] = kv.Value;
+        }
+        if (run.StreamOccurrences.Count > 0)
+        {
+            dto.StreamOccurrences = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var kv in run.StreamOccurrences)
+                dto.StreamOccurrences[kv.Key] = kv.Value;
         }
 
         foreach (string expRoomId in run.ExpeditionVisitedRoomIds)
@@ -765,6 +784,12 @@ public static class RunSnapshotSerializer
             StartSelectionDone = dto.StartSelectionDone,
             PendingClearExpeditionAfterLoot = dto.PendingClearExpeditionAfterLoot,
             RngSeed = dto.RngSeed,
+            MasterSeed = dto.MasterSeed,
+            SeedText = dto.SeedText,
+            IsCustomSeededRun = dto.IsCustomSeededRun,
+            PinnedLineupName = dto.PinnedLineupName,
+            StreamOccurrenceStamp = dto.StreamOccurrenceStamp,
+            NextInstanceSeq = Math.Max(0, dto.NextInstanceSeq),
             BossRushWavesCleared = Math.Max(0, dto.BossRushWavesCleared),
             EndlessTenWinCelebrated = dto.EndlessTenWinCelebrated,
             DailyRerollSequence = Math.Max(0, dto.DailyRerollSequence),
@@ -808,6 +833,14 @@ public static class RunSnapshotSerializer
             {
                 if (!string.IsNullOrWhiteSpace(kv.Key) && double.IsFinite(kv.Value) && kv.Value > 0)
                     run.TakeoverChanceBonuses[kv.Key] = Math.Min(1.0, kv.Value);
+            }
+        }
+        if (dto.StreamOccurrences != null)
+        {
+            foreach (var kv in dto.StreamOccurrences)
+            {
+                if (!string.IsNullOrWhiteSpace(kv.Key) && kv.Value > 0)
+                    run.StreamOccurrences[kv.Key] = kv.Value;
             }
         }
 
@@ -1090,6 +1123,39 @@ public static class RunSnapshotSerializer
 
         PlaceEntriesIntoGrid(handEntries, run.HandGrid, EInventorySection.Hand, defaultSlot: 3, fallbackEntries: stashEntries);
         PlaceEntriesIntoGrid(stashEntries, run.StashGrid, EInventorySection.Stash, defaultSlot: 0, fallbackEntries: null);
+
+        // 旧快照兼容：若未持久化 NextInstanceSeq，从已有卡牌键第一个与第二个 '_' 间的十六进制序号推导最大值 + 1，防止重连后实例 ID 碰撞
+        if (run.NextInstanceSeq == 0)
+        {
+            int maxSeq = -1;
+            static void ScanInstanceSeq(string? id, ref int currentMax)
+            {
+                if (string.IsNullOrEmpty(id)) return;
+                int first = id.IndexOf('_');
+                if (first < 0) return;
+                int second = id.IndexOf('_', first + 1);
+                if (second <= first + 1) return;
+                if (int.TryParse(
+                        id.AsSpan(first + 1, second - first - 1),
+                        System.Globalization.NumberStyles.HexNumber,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out int parsedSeq) &&
+                    parsedSeq >= 0 && parsedSeq < int.MaxValue && parsedSeq > currentMax)
+                {
+                    currentMax = parsedSeq;
+                }
+            }
+            foreach (string id in run.Cards.Keys)
+                ScanInstanceSeq(id, ref maxSeq);
+            foreach (var snap in run.SuspendedStates)
+            {
+                ScanInstanceSeq(snap.ActiveEncounterCard?.InstanceId, ref maxSeq);
+                foreach (var sc in snap.SuspendedCards)
+                    ScanInstanceSeq(sc.InstanceId, ref maxSeq);
+            }
+            if (maxSeq >= 0)
+                run.NextInstanceSeq = maxSeq + 1;
+        }
 
         // 兜底校验（D2-P1-14 + D3-P1-10）：兼容非 GUID 自定义 Mod 遭遇，按逻辑模板 ID 或 Wire GUID 字符串忽略大小写匹配回填
         if (string.IsNullOrEmpty(run.ActiveEncounterCardInstanceId))

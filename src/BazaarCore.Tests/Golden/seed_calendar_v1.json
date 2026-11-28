@@ -1,0 +1,857 @@
+{
+  "seedAlgoVersion": 1,
+  "cases": [
+    {
+      "seedText": "S00031N1",
+      "masterSeed": 100001,
+      "hero": "Vanessa",
+      "days": [
+        {
+          "day": 1,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "12a50b2d-340f-4603-a5a4-a3d63d80c504"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "0370b2b5-e856-457e-a8dc-b7fd0ab098fc"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "bb1e3506-3735-4669-be90-915a55a7ee05",
+                "1d24717f-7bfb-48e9-9320-6a69d72e233e",
+                "f6962ffe-efdf-4da2-9803-6671f42d9811"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a",
+                "e6e09e6a-ebe0-46f8-bfbb-716b74f78bc6"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "e3b894b0-a078-4b1d-8793-ac6459a8361a",
+                "87c6a586-fea5-4bbd-9296-2b2883bcac24",
+                "08111534-157d-4603-b157-03ac0f6d02cf"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 2,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "592c3f31-a6a0-4b1a-a1d9-4016224f09ab"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "323e2c05-f077-4774-84a5-9e89d8d1c9b9",
+                "87c6a586-fea5-4bbd-9296-2b2883bcac24",
+                "fe756e73-bedb-4700-901f-07ef13b3c512"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "289ff978-dd65-4484-b905-8ee16d28033c",
+                "66245d12-d5eb-4c08-9185-6ddaf626bbd3",
+                "dbf8eefa-99bd-475b-ad4d-91a9734518cf"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "c28b6e9c-dd6d-4bb7-97e7-14aee53e528b",
+                "8f83e037-1420-4210-a2b0-b4d80f7d86f5"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "c6cffe25-8e94-4a7b-a821-3e3c7093333b",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "79557839-d5cc-4638-ba7b-234f0142a38a"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 3,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "85db60ee-3619-4e39-bfb2-2f4ac56f172b",
+                "26164d27-60b8-4935-840c-816bbe535a64",
+                "f7467c4b-87c5-4e55-957b-813ac703a3c1"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "04ac552f-c292-455e-bf5f-438119dfa196",
+                "2b3bbe43-06b7-4dcd-b486-a9d9b337ace1"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "6547a38e-d27f-4443-84bb-db8e04bae467",
+                "35d68424-87ba-4d8a-8776-8d8302a425f9",
+                "c69bf8e8-944c-4b42-b59e-8ad568e0d3f7"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "8f0aea10-9894-4ded-a726-72b23142589c",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "bfa6d377-2fbe-4c8f-82ab-685e93dde1cb"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "b8f55bb0-536e-4d5f-a328-d38f88c6d479",
+                "39e4aeb6-06f8-45af-a5d1-7e0ca01bd194",
+                "1bd4edc9-0cb9-49f7-bc03-703c36835de1"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "seedText": "S00031N1",
+      "masterSeed": 100001,
+      "hero": "Pygmalien",
+      "days": [
+        {
+          "day": 1,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "79557839-d5cc-4638-ba7b-234f0142a38a"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "5b7c5fc4-c942-44fe-9ca8-726dc36a2ad6",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "c1d4c505-4c97-47b5-b205-ae28c1415cd2"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "bb1e3506-3735-4669-be90-915a55a7ee05",
+                "1d24717f-7bfb-48e9-9320-6a69d72e233e",
+                "f6962ffe-efdf-4da2-9803-6671f42d9811"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a",
+                "cbe0d294-09db-47ea-a7e8-8127605c1173"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "e3b894b0-a078-4b1d-8793-ac6459a8361a",
+                "87c6a586-fea5-4bbd-9296-2b2883bcac24",
+                "08111534-157d-4603-b157-03ac0f6d02cf"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 2,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "e3b894b0-a078-4b1d-8793-ac6459a8361a",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "a5980f5b-4f19-4826-8919-8d88077d6ba0"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "323e2c05-f077-4774-84a5-9e89d8d1c9b9",
+                "87c6a586-fea5-4bbd-9296-2b2883bcac24",
+                "e6e09e6a-ebe0-46f8-bfbb-716b74f78bc6"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "289ff978-dd65-4484-b905-8ee16d28033c",
+                "66245d12-d5eb-4c08-9185-6ddaf626bbd3",
+                "dbf8eefa-99bd-475b-ad4d-91a9734518cf"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "c28b6e9c-dd6d-4bb7-97e7-14aee53e528b",
+                "a79c70c6-44a8-4553-b715-2e25c83c3b8c"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "d70c7e92-3eff-4cb3-ba01-f9e8c179e407"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 3,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "8f0aea10-9894-4ded-a726-72b23142589c",
+                "3212ade4-8e23-49cd-b9b5-f729280ba0b5",
+                "a5980f5b-4f19-4826-8919-8d88077d6ba0"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "04ac552f-c292-455e-bf5f-438119dfa196",
+                "592c3f31-a6a0-4b1a-a1d9-4016224f09ab"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "6547a38e-d27f-4443-84bb-db8e04bae467",
+                "35d68424-87ba-4d8a-8776-8d8302a425f9",
+                "c69bf8e8-944c-4b42-b59e-8ad568e0d3f7"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "85db60ee-3619-4e39-bfb2-2f4ac56f172b",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "6391c95c-1dc1-420e-ab5e-ab99c6db4267"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "c6cffe25-8e94-4a7b-a821-3e3c7093333b",
+                "39e4aeb6-06f8-45af-a5d1-7e0ca01bd194",
+                "168a04a9-d761-4df4-b9d9-0be88fe90f53"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "seedText": "S00KAA88",
+      "masterSeed": 20261128,
+      "hero": "Vanessa",
+      "days": [
+        {
+          "day": 1,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "5b7c5fc4-c942-44fe-9ca8-726dc36a2ad6",
+                "3212ade4-8e23-49cd-b9b5-f729280ba0b5",
+                "1005cb9f-87f3-4087-a695-a54b7315d586"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "9459a01b-edf5-432b-81cd-1fd2cacfadad",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "8b4d74f6-6491-40d6-87da-023672144e03"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "45c473f5-25bd-4c1c-8357-cfe460c58f69",
+                "1d24717f-7bfb-48e9-9320-6a69d72e233e",
+                "b79845a7-f806-4e7a-9011-d98ebd22a323"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "acaf7c4f-ecd4-4af1-a79c-c5b0b20ee21f",
+                "d70c7e92-3eff-4cb3-ba01-f9e8c179e407"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a",
+                "8f83e037-1420-4210-a2b0-b4d80f7d86f5"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 2,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "1a21931f-6183-4251-914b-c8f83dc58a30",
+                "412fb3ec-88de-40b4-a475-10e583189d8a",
+                "bfc22038-04da-41a1-97c9-7cb8c3608747"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "8f83e037-1420-4210-a2b0-b4d80f7d86f5"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "1eabe08b-2949-407d-b22d-c6e579e0cd14",
+                "b93f5b44-ba9f-4196-a94e-c5de17ab5c5d",
+                "325c88c3-9496-44bf-b900-4adf1f84bf2f"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "f7467c4b-87c5-4e55-957b-813ac703a3c1"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "85db60ee-3619-4e39-bfb2-2f4ac56f172b",
+                "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a",
+                "1005cb9f-87f3-4087-a695-a54b7315d586"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 3,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "6f5c1ce2-19c1-4df8-bc5a-242a0f5b5189",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "e6e09e6a-ebe0-46f8-bfbb-716b74f78bc6"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "1a21931f-6183-4251-914b-c8f83dc58a30",
+                "2e1e5a86-3ace-4f78-8b73-6641ca59e834",
+                "d21fae9a-1cb4-40f2-8574-9c72b51a1ce1"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "8d8c7a87-404b-4bbd-82e1-3c6e3440bdd6",
+                "753ccc3c-726a-4b18-8726-621aedce54b6",
+                "e890b42d-43d7-4c4f-a03b-bef8f9d2e23d"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "85db60ee-3619-4e39-bfb2-2f4ac56f172b",
+                "af395a8a-f327-4ebf-96a3-58f6016976b7",
+                "cbe0d294-09db-47ea-a7e8-8127605c1173"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "47704642-ae7a-4775-a26a-e5e5a8cff7bf",
+                "bfa6d377-2fbe-4c8f-82ab-685e93dde1cb"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "seedText": "S00KAA88",
+      "masterSeed": 20261128,
+      "hero": "Pygmalien",
+      "days": [
+        {
+          "day": 1,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "5b7c5fc4-c942-44fe-9ca8-726dc36a2ad6",
+                "3212ade4-8e23-49cd-b9b5-f729280ba0b5",
+                "0370b2b5-e856-457e-a8dc-b7fd0ab098fc"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "592c3f31-a6a0-4b1a-a1d9-4016224f09ab"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "45c473f5-25bd-4c1c-8357-cfe460c58f69",
+                "1d24717f-7bfb-48e9-9320-6a69d72e233e",
+                "b79845a7-f806-4e7a-9011-d98ebd22a323"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "2708055d-a8be-4c2f-a8d6-574e884a254e",
+                "87c6a586-fea5-4bbd-9296-2b2883bcac24",
+                "08111534-157d-4603-b157-03ac0f6d02cf"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "e3b894b0-a078-4b1d-8793-ac6459a8361a",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "a79c70c6-44a8-4553-b715-2e25c83c3b8c"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 2,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "2708055d-a8be-4c2f-a8d6-574e884a254e",
+                "412fb3ec-88de-40b4-a475-10e583189d8a",
+                "0370b2b5-e856-457e-a8dc-b7fd0ab098fc"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "a79c70c6-44a8-4553-b715-2e25c83c3b8c"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "1eabe08b-2949-407d-b22d-c6e579e0cd14",
+                "b93f5b44-ba9f-4196-a94e-c5de17ab5c5d",
+                "325c88c3-9496-44bf-b900-4adf1f84bf2f"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "f7467c4b-87c5-4e55-957b-813ac703a3c1"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "85db60ee-3619-4e39-bfb2-2f4ac56f172b",
+                "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a",
+                "12a50b2d-340f-4603-a5a4-a3d63d80c504"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 3,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "c28b6e9c-dd6d-4bb7-97e7-14aee53e528b",
+                "e6e09e6a-ebe0-46f8-bfbb-716b74f78bc6"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "210003fa-a20d-4ad1-9ada-d5fad5bf9f89",
+                "2e1e5a86-3ace-4f78-8b73-6641ca59e834",
+                "3db126be-6a4f-48b7-81e0-793287e9eeeb"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "8d8c7a87-404b-4bbd-82e1-3c6e3440bdd6",
+                "753ccc3c-726a-4b18-8726-621aedce54b6",
+                "e890b42d-43d7-4c4f-a03b-bef8f9d2e23d"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "cbe0d294-09db-47ea-a7e8-8127605c1173"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "48a25657-baf6-440d-9085-bd7aeda1638a",
+                "6391c95c-1dc1-420e-ab5e-ab99c6db4267"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "seedText": "S32J35TF",
+      "masterSeed": -987654321,
+      "hero": "Vanessa",
+      "days": [
+        {
+          "day": 1,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "5b7c5fc4-c942-44fe-9ca8-726dc36a2ad6",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "12a50b2d-340f-4603-a5a4-a3d63d80c504"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "efdb2b8a-7475-47fe-ad84-8a40ab49c27e"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "1d24717f-7bfb-48e9-9320-6a69d72e233e",
+                "bb1e3506-3735-4669-be90-915a55a7ee05",
+                "b79845a7-f806-4e7a-9011-d98ebd22a323"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "9459a01b-edf5-432b-81cd-1fd2cacfadad",
+                "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a",
+                "9e3c43fe-0205-4bf6-9da9-2b9bbbef8a65"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "816e6ba0-8f5f-412e-9756-8e1901dd9d49",
+                "0623cedd-f24b-4117-a6b8-5fc41064a00d",
+                "e6e09e6a-ebe0-46f8-bfbb-716b74f78bc6"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 2,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "1005cb9f-87f3-4087-a695-a54b7315d586"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "34dc624d-1046-4e2d-906d-1fd8d19647d8",
+                "8f83e037-1420-4210-a2b0-b4d80f7d86f5"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "82a64f45-ca55-4a24-b1ef-18d41cc77fa5",
+                "b93f5b44-ba9f-4196-a94e-c5de17ab5c5d",
+                "325c88c3-9496-44bf-b900-4adf1f84bf2f"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a",
+                "8b4d74f6-6491-40d6-87da-023672144e03"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "323e2c05-f077-4774-84a5-9e89d8d1c9b9",
+                "87c6a586-fea5-4bbd-9296-2b2883bcac24",
+                "e6e09e6a-ebe0-46f8-bfbb-716b74f78bc6"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 3,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "6f5c1ce2-19c1-4df8-bc5a-242a0f5b5189",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "9037d88a-5e05-4ba6-8219-69360d402759"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "cbe0d294-09db-47ea-a7e8-8127605c1173"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "04b60df4-91d9-4065-94e0-f9f462a3b104",
+                "35d68424-87ba-4d8a-8776-8d8302a425f9",
+                "c69bf8e8-944c-4b42-b59e-8ad568e0d3f7"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "1a21931f-6183-4251-914b-c8f83dc58a30",
+                "412fb3ec-88de-40b4-a475-10e583189d8a",
+                "246ba7e6-f593-4a3c-a57a-c23c77b9532b"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "2e1e5a86-3ace-4f78-8b73-6641ca59e834",
+                "71c529a8-7366-4f69-b2ab-4f0eec8573b5"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "seedText": "S32J35TF",
+      "masterSeed": -987654321,
+      "hero": "Pygmalien",
+      "days": [
+        {
+          "day": 1,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "5b7c5fc4-c942-44fe-9ca8-726dc36a2ad6",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "79557839-d5cc-4638-ba7b-234f0142a38a"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "7c179f37-5845-4041-b123-0c7da0fdabbd"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "1d24717f-7bfb-48e9-9320-6a69d72e233e",
+                "bb1e3506-3735-4669-be90-915a55a7ee05",
+                "b79845a7-f806-4e7a-9011-d98ebd22a323"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a",
+                "a79c70c6-44a8-4553-b715-2e25c83c3b8c"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "0623cedd-f24b-4117-a6b8-5fc41064a00d",
+                "cbe0d294-09db-47ea-a7e8-8127605c1173"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 2,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "912c8b09-3b76-4aa1-8e21-245e0dfb5046",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "12a50b2d-340f-4603-a5a4-a3d63d80c504"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "34dc624d-1046-4e2d-906d-1fd8d19647d8",
+                "f7467c4b-87c5-4e55-957b-813ac703a3c1"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "82a64f45-ca55-4a24-b1ef-18d41cc77fa5",
+                "b93f5b44-ba9f-4196-a94e-c5de17ab5c5d",
+                "325c88c3-9496-44bf-b900-4adf1f84bf2f"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "dc12f4bd-6c33-41f0-b7ad-d62a0be09a47",
+                "54b6cf27-ab0f-4a57-bb0a-83c08de10d5a",
+                "a79c70c6-44a8-4553-b715-2e25c83c3b8c"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "323e2c05-f077-4774-84a5-9e89d8d1c9b9",
+                "87c6a586-fea5-4bbd-9296-2b2883bcac24",
+                "e6e09e6a-ebe0-46f8-bfbb-716b74f78bc6"
+              ]
+            }
+          ]
+        },
+        {
+          "day": 3,
+          "hours": [
+            {
+              "hour": 1,
+              "templateIds": [
+                "705c0d8e-8513-49ce-82e8-81782cdac316",
+                "c5326dd7-3e82-45c5-9a6c-81965a78bf89",
+                "bfa6d377-2fbe-4c8f-82ab-685e93dde1cb"
+              ]
+            },
+            {
+              "hour": 2,
+              "templateIds": [
+                "85db60ee-3619-4e39-bfb2-2f4ac56f172b",
+                "1e511488-af8e-4852-a46a-0f27a2b07aac",
+                "cbe0d294-09db-47ea-a7e8-8127605c1173"
+              ]
+            },
+            {
+              "hour": 3,
+              "templateIds": [
+                "04b60df4-91d9-4065-94e0-f9f462a3b104",
+                "35d68424-87ba-4d8a-8776-8d8302a425f9",
+                "c69bf8e8-944c-4b42-b59e-8ad568e0d3f7"
+              ]
+            },
+            {
+              "hour": 4,
+              "templateIds": [
+                "210003fa-a20d-4ad1-9ada-d5fad5bf9f89",
+                "412fb3ec-88de-40b4-a475-10e583189d8a",
+                "d70c7e92-3eff-4cb3-ba01-f9e8c179e407"
+              ]
+            },
+            {
+              "hour": 5,
+              "templateIds": [
+                "a4fa13f8-6beb-4b6c-839b-60af167628d9",
+                "2e1e5a86-3ace-4f78-8b73-6641ca59e834",
+                "9037d88a-5e05-4ba6-8219-69360d402759"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -309,7 +309,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         {
             ToggleOpen();
         }
-        else if ((_isOpen || _showPreRunPrompt) && _lastEscConsumedFrame != Time.frameCount && WasKeyPressedThisFrame(isEscape: true))
+        else if ((_isOpen || _showPreRunPrompt || SpIsPopupOpen()) && _lastEscConsumedFrame != Time.frameCount && WasKeyPressedThisFrame(isEscape: true))
         {
             if (inputFocused)
             {
@@ -425,6 +425,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
         _lastToolboxKey = "";
 
         if (!_catalogLoaded) StartInitialBackgroundFetch();
+        SpOnPanelOpened();
         if (_activeTab == UiTab.Tournament)
         {
             _nextLobbyPollTime = 0f;
@@ -437,6 +438,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
 
     internal void ClosePanel()
     {
+        SpClosePopup();
         _isOpen = false;
         if (_modalPanelRoot != null)
         {
@@ -1260,6 +1262,11 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                 uint hour = (uint?)obj["hour"] ?? 1u;
                 string stateName = (string)obj["state"] ?? "";
                 bool srvIsCustomRuleRun = (bool?)obj["isCustomRuleRun"] ?? false;
+                // v4 追加字段：旧服务端没有这些字段时全是空，不会弹任何提示
+                string srvSeedText = obj["seedText"]?.Type == JTokenType.String ? (string)obj["seedText"] : null;
+                bool srvCustomSeeded = (bool?)obj["isCustomSeededRun"] ?? false;
+                string srvPinnedLineup = obj["pinnedLineupName"]?.Type == JTokenType.String ? (string)obj["pinnedLineupName"] : null;
+                string srvStartToast = obj["startToastZh"]?.Type == JTokenType.String ? (string)obj["startToastZh"] : null;
 
                 // P1-15：严格对齐服务端契约，解析 GET /custom-rules/me/active-run-tendency 下发的权威 customRules
                 CustomRunRuleSet parsedActiveRunRules = null;
@@ -1304,6 +1311,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
                         _activeRunRules.AllowTendencySelection = allowSel;
                         _activeRunRules.SelectedArchetypeMask = allowSel ? srvMask : 0UL;
                     }
+                    SpOnActiveRunInfo(srvRunId, srvSeedText, srvCustomSeeded, srvPinnedLineup, srvStartToast);
 
                     if (allowSel)
                     {
@@ -1430,6 +1438,13 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
 
     private bool TryConsumeEscapeForCustomModal()
     {
+        // 二级弹窗（分享码 / 收藏对手等）开着时，Esc 先只关它
+        if (SpIsPopupOpen())
+        {
+            _lastEscConsumedFrame = Time.frameCount;
+            SpClosePopup();
+            return true;
+        }
         if (_showPreRunPrompt)
         {
             _lastEscConsumedFrame = Time.frameCount;
@@ -1609,7 +1624,7 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             }
 
             var inst = Instance;
-            if (inst != null && (inst._isOpen || inst._showPreRunPrompt))
+            if (inst != null && (inst._isOpen || inst._showPreRunPrompt || inst.SpIsPopupOpen()))
             {
                 inst.TryConsumeEscapeForCustomModal();
                 return false;
@@ -1628,9 +1643,17 @@ internal sealed partial class CustomGameplayUI : MonoBehaviour
             if (_lastEscConsumedFrame == frame)
                 return false;
 
-            // 顺序 2：PopupManager.HandleEscape 先于 CustomGameplayUI.Update() 执行，立即消费 Esc 关闭自定义弹窗并拦截原生暂停菜单
             var inst = Instance;
-            if (inst != null && (inst._isOpen || inst._showPreRunPrompt))
+            // 顺序 2：正在我们面板的输入框里打字时按 Esc，只取消输入，不弹原生暂停菜单
+            if (inst != null && (inst._isOpen || inst._showPreRunPrompt || inst.SpIsPopupOpen()) && IsAnyTmpInputFieldFocused())
+            {
+                _lastEscConsumedFrame = frame;
+                try { EventSystem.current?.SetSelectedGameObject(null); } catch { }
+                return false;
+            }
+
+            // 顺序 3：PopupManager.HandleEscape 先于 CustomGameplayUI.Update() 执行，立即消费 Esc 关闭自定义弹窗并拦截原生暂停菜单
+            if (inst != null && (inst._isOpen || inst._showPreRunPrompt || inst.SpIsPopupOpen()))
             {
                 inst.TryConsumeEscapeForCustomModal();
                 return false;

@@ -331,8 +331,40 @@ public static partial class TooltipFormatter
         if (action.AttributeType != null)
             return card.GetAttribute(action.AttributeType);
 
+        // 动作本身没写数值时，和战斗结算一样回落到卡面的默认属性（例如加速读 HasteAmount）
+        string? fallbackAttr = ResolveFallbackAmountAttribute(action.Type);
+        if (fallbackAttr != null && card.HasAttribute(fallbackAttr))
+            return card.GetAttribute(fallbackAttr);
+
         return null;
     }
+
+    /// <summary>与 AbilityExecutor 结算时的默认数值属性保持一致。</summary>
+    private static string? ResolveFallbackAmountAttribute(string? actionType) => actionType switch
+    {
+        "TActionPlayerDamage" => "DamageAmount",
+        "TActionPlayerShieldApply" => "ShieldApplyAmount",
+        "TActionPlayerBurnApply" => "BurnApplyAmount",
+        "TActionPlayerPoisonApply" => "PoisonApplyAmount",
+        "TActionPlayerHeal" or "TActionPlayerReviveHeal" => "HealAmount",
+        "TActionPlayerRegenApply" => "RegenApplyAmount",
+        "TActionPlayerRageApply" => "RageApplyAmount",
+        "TActionPlayerRageRemove" => "RageRemoveAmount",
+        "TActionPlayerJoyApply" => "JoyApplyAmount",
+        "TActionPlayerJoyRemove" => "JoyRemoveAmount",
+        "TActionPlayerTempoApply" => "TempoApplyAmount",
+        "TActionPlayerTempoRemove" => "TempoRemoveAmount",
+        "TActionPlayerBurnRemove" => "BurnRemoveAmount",
+        "TActionPlayerPoisonRemove" => "PoisonRemoveAmount",
+        "TActionPlayerShieldRemove" => "ShieldRemoveAmount",
+        "TActionPlayerRegenRemove" => "RegenRemoveAmount",
+        "TActionCardHaste" => "HasteAmount",
+        "TActionCardSlow" => "SlowAmount",
+        "TActionCardFreeze" => "FreezeAmount",
+        "TActionCardCharge" => "ChargeAmount",
+        "TActionCardReload" => "ReloadAmount",
+        _ => null,
+    };
 
     private static string FormatNumber(double val, RuleNode action, bool hasUnitSuffix, bool isZh)
     {

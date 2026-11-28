@@ -941,7 +941,7 @@ CustomRuleJsonHash = abcdef123456
         string pluginsDir = Path.Combine(gameDir, "BepInEx", "plugins");
         Directory.CreateDirectory(pluginsDir);
 
-        // 复制本启动器真实 PE DLL（带 FileVersion 15.4.0.0）作为“高版本本地插件”，验证旧服（14.0.0）不可将其降级覆写
+        // 复制本启动器真实 PE DLL（带 FileVersion 15.5.0.0）作为“高版本本地插件”，验证旧服（14.0.0）不可将其降级覆写
         string selfDll = typeof(SelfTestRunner).Assembly.Location;
         Assert(File.Exists(selfDll), $"无法定位当前 BazaarHub.dll：{selfDll}");
         string localLauncherPath = Path.Combine(pluginsDir, "BazaarLauncher.dll");
@@ -1017,7 +1017,7 @@ CustomRuleJsonHash = abcdef123456
         {
             using var sync = new UpdateSyncService();
 
-            // 1. 连接旧服：本地高版本 15.4.0 绝不可被旧服 14.0.0 降级覆写，且 .webp 资产被优雅跳过
+            // 1. 连接旧服：本地高版本 15.5.0 绝不可被旧服 14.0.0 降级覆写，且 .webp 资产被优雅跳过
             UpdateSyncReport repOld = await sync.SyncAsync(gameDir, baseUrl, applyDownloads: true, null, null, () => false, null);
             Assert(repOld.Success, $"连接旧服防降级同步应成功：{repOld.SummaryMessage}");
             Assert(repOld.DowngradeProtectedCount == 1, $"应触发 1 次防降级保护，实际 {repOld.DowngradeProtectedCount}");
@@ -1084,7 +1084,7 @@ CustomRuleJsonHash = abcdef123456
 
     private static Task TestUnifiedVersionAndCasPoolAsync(string sandboxRoot)
     {
-        Assert(LauncherConstants.HubVersion == "15.4.0", $"HubVersion 应动态读取根级 Directory.Build.props 为 15.4.0，实际：{LauncherConstants.HubVersion}");
+        Assert(LauncherConstants.HubVersion == "15.5.0", $"HubVersion 应动态读取根级 Directory.Build.props 为 15.5.0，实际：{LauncherConstants.HubVersion}");
         string casDir = Path.Combine(sandboxRoot, LauncherConstants.ModCacheRelativeDir, "assets");
         string normalized = casDir.Replace('/', '\\');
         Assert(normalized.EndsWith(@"BepInEx\config\BazaarModCache\assets", StringComparison.OrdinalIgnoreCase),

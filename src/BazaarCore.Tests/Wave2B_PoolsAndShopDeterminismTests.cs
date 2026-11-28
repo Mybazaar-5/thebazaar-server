@@ -194,10 +194,8 @@ public sealed class Wave2B_PoolsAndShopDeterminismTests
             };
             var shop = new ShopEngine(run, p, r) { ActiveRules = rules };
 
-            // 往共享 _rng 注入额外消费噪声，若抽签绕过确定性子流 streamRng 则结果必然偏移
-            var rngField = typeof(ShopEngine).GetField("_rng", BindingFlags.Instance | BindingFlags.NonPublic);
-            Assert.NotNull(rngField);
-            var rawRng = (Random)rngField!.GetValue(shop)!;
+            // 往共享主随机源（原私有 _rng 已按 M1 统一收口为 shop.Rng.Main）注入额外消费噪声，若抽签绕过确定性子流 streamRng 则结果必然偏移
+            var rawRng = shop.Rng.Main;
             for (int n = 0; n < extraRngNoise; n++) _ = rawRng.Next();
 
             // Hour 3 野怪

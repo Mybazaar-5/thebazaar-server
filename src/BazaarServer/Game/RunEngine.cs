@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using BazaarCore.Combat;
 using BazaarCore.Data;
 using BazaarCore.Engine;
@@ -59,7 +60,11 @@ public sealed class RunEngine
     private readonly BazaarServer.Mods.ServerModHost.RunModContext? _runModContext;
     private readonly IReadOnlyDictionary<string, BazaarCore.Mods.CustomCardVisualBinding>? _runVisualBindings;
     private readonly DateTimeOffset _engineAttachedAtUtc = DateTimeOffset.UtcNow;
-    private Random _rng;
+    private readonly RunRandom _rr;
+    private Random _rng => _rr.Main;
+
+    /// <summary>供不经过 Handle 直接推进对局并保存快照的入口（如锦标赛托管推进）同步随机数检查点。</summary>
+    public void CheckpointRandom() => _rr.Checkpoint();
 
     // 玩家局外限时属性层（UntilEndOfHour / UntilEndOfDay），直接绑定 RunState 以便无损快照持久化
     private readonly Dictionary<string, double> _playerHourAdd;
@@ -139,7 +144,7 @@ public sealed class RunEngine
         _runVisualBindings = runVisualBindings ?? runModContext?.VisualBindingsByCustomId;
         if (_run.RngSeed == 0)
             _run.RngSeed = Random.Shared.Next(1, int.MaxValue);
-        _rng = new Random(_run.RngSeed);
+        _rr = new RunRandom(_run);
         _playerHourAdd = run.PlayerHourAdd;
         _playerHourMult = run.PlayerHourMult;
         _playerDayAdd = run.PlayerDayAdd;
@@ -149,8 +154,9 @@ public sealed class RunEngine
         {
             ModRuntimeContext = _modRuntimeContext,
             RunModContext = _runModContext,
+            Rng = _rr,
         };
-        _stepEngine = new EncounterStepEngine(run, pool, repo, _shop, _rng);
+        _stepEngine = new EncounterStepEngine(run, pool, repo, _shop, _rr);
         _runEnded = run.State is ERunState.EndRunVictory or ERunState.EndRunDefeat or ERunState.Shutdown;
         // P1-37：以 RunState.StartSelectionDone 为权威值；仅对未设置该标志但已越过 Day1/Hour1/Starter 的兼容旧构造补推断，
         // 绝不因玩家持有预设开局物品/技能（StartingItems/GoldenStart）而错判 StartSelectionDone=true
@@ -188,6 +194,11 @@ public sealed class RunEngine
 
         if (!_runEnded)
         {
+            // 断线恢复自愈块前后保护随机状态：恢复动作本身不推进任何随机数，保证恢复后与不中断完全等价
+            int seedBefore = _run.RngSeed;
+            var occBefore = new Dictionary<string, int>(_run.StreamOccurrences, StringComparer.Ordinal);
+            int stampBefore = _run.StreamOccurrenceStamp;
+
             if (_run.State is ERunState.Encounter or ERunState.Pedestal or ERunState.Loot &&
                 !string.IsNullOrEmpty(_run.CurrentEncounterId) &&
                 string.IsNullOrEmpty(_run.ActiveEncounterCardInstanceId))
@@ -217,6 +228,12 @@ public sealed class RunEngine
             {
                 RecalculateAurasSilentlyOnResume();
             }
+
+            _rr.ResetMain(seedBefore);
+            _run.StreamOccurrences.Clear();
+            foreach (var kv in occBefore)
+                _run.StreamOccurrences[kv.Key] = kv.Value;
+            _run.StreamOccurrenceStamp = stampBefore;
         }
         _run.RefreshImmutableRulesSnapshot(GetEffectiveCustomMutators());
         _run.PublishPublicSummary();
@@ -265,11 +282,36 @@ public sealed class RunEngine
             _run.CustomRules = _run.CustomRules.CloneNormalized(GetEffectiveCustomMutators());
         }
 
-        if (_run.CustomRules.FixedRunSeed is int fixedSeed && fixedSeed != 0)
+        var rules = _run.CustomRules;
+        int master;
+        string seedText;
+        bool isCustom = false;
+        if (rules.FixedRunSeed is int fixedSeed && fixedSeed != 0)
         {
-            _run.RngSeed = fixedSeed;
-            _rng = new Random(fixedSeed);
+            // 每日挑战（上面刚写入）/ 旧客户端整数种子 / 单测：行为与今天完全一致
+            master = fixedSeed;
+            seedText = rules.SpecialModeId == ESpecialModeId.DailyChallenge
+                ? DailyChallengeSeedGenerator.FormatSeedCode(fixedSeed)
+                : fixedSeed.ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
+        else if (rules.SpecialModeId != ESpecialModeId.DailyChallenge &&
+                 DailyChallengeSeedGenerator.TryParseSeedText(rules.CustomSeedText, out int parsed, out string display))
+        {
+            master = parsed;
+            seedText = display;
+            isCustom = true;
+        }
+        else
+        {
+            master = _run.RngSeed; // 构造期已有的随机值；单测预设的 RngSeed 也走这里，主随机数序列与今天一致
+            seedText = DailyChallengeSeedGenerator.FormatSeedCode(master);
+        }
+        _run.MasterSeed = master;
+        _run.SeedText = seedText;
+        _run.IsCustomSeededRun = isCustom;
+        _run.StreamOccurrences.Clear();
+        _run.StreamOccurrenceStamp = 0;
+        _rr.ResetMain(master);
 
         _run.TendencyLocked = !_run.CustomRules.AllowTendencySelection;
         _shop.ActiveRules = _run.CustomRules;
@@ -431,7 +473,37 @@ public sealed class RunEngine
 
         var startAuditEvents = hasDealtInStart ? new List<IGameSimEvent>() : o.Events;
         ReconcileAndVerifyBoardInvariants("StartRun", o.DirtyCardIds, startAuditEvents);
-        _run.RngSeed = _rng.Next(1, int.MaxValue);
+
+        // 4.1 固定对手剧本开局拷贝：先清理同 RunId 旧记录（防 GM 重开残留），再按当前规则将本人剧本写入 run_ghosts(kind='pinned')
+        _run.PinnedGhostCache = null;
+        _run.PinnedLineupName = null;
+        _run.PendingStartToastZh = null;
+        try { _db?.DeleteRunGhosts(_run.RunId); } catch { }
+
+        if (!IsTournamentRun() &&
+            rules.GhostOpponentMode == EGhostOpponentMode.FixedLineup &&
+            !string.IsNullOrWhiteSpace(rules.SelectedGhostLineupId) &&
+            _db != null &&
+            !string.IsNullOrWhiteSpace(_run.AccountId))
+        {
+            var lineup = _db.LoadGhostLineup(_run.AccountId, rules.SelectedGhostLineupId);
+            if (lineup != null)
+            {
+                _run.PinnedLineupName = lineup.Name;
+                string partition = PvpGhostPool.ResolveGhostPoolPartitionLocal(_run.CustomRules, false, _modHost);
+                foreach (var (day, board) in lineup.Days)
+                {
+                    if (board == null) continue;
+                    _db.SaveRunGhost(_run.RunId, day, "pinned", NormalizePinnedBoard(board, day, lineup.LineupId, partition));
+                }
+            }
+            else
+            {
+                _run.PendingStartToastZh = "所选对手方案不存在，本局改为随机对手";
+            }
+        }
+
+        _rr.Checkpoint();
         _run.RefreshImmutableRulesSnapshot(GetEffectiveCustomMutators());
         _run.PublishPublicSummary();
         return o;
@@ -838,13 +910,13 @@ public sealed class RunEngine
                 {
                     _run.TendencyLocked = true;
                 }
-                _run.RngSeed = _rng.Next(1, int.MaxValue);
             }
             return outcome;
         }
         finally
         {
             _synthesizedEncounterCardThisCommand = false;
+            _rr.Checkpoint();
             _run.PublishPublicSummary();
         }
     }
@@ -3359,6 +3431,7 @@ public sealed class RunEngine
         SimPvpOpponent? pvpInfo = null;
         Data.MonsterTemplate? monster = null;
         LockedPvpBoard? lockedOppBoard = null;
+        bool usedPinnedGhost = false;
         int oppGold = 0;
         int oppIncome = Math.Max(1, tourneyLobby?.Rules?.StartingIncome ?? _run.CustomRules?.StartingIncome ?? _mode.StartingIncome);
         string ghostPartition = PvpGhostPool.ResolveGhostPoolPartitionLocal(
@@ -3416,8 +3489,10 @@ public sealed class RunEngine
                     ? new Random(combatSeed)
                     : (_run.CustomRules.FixedRunSeed is int dSeed && dSeed != 0
                         ? DailyChallengeSeedGenerator.CreateStreamRng(dSeed, DailyChallengeSeedGenerator.StreamPvpOpponent, (int)_run.Day, (int)_run.Hour)
-                        : _rng);
-                var ghost = canUseLockedGhost
+                        : Random.Shared);
+                var pinned = tourneyAssignment == null ? TryResolvePinnedGhostForDay((int)_run.Day) : null;
+                usedPinnedGhost = pinned != null;
+                var ghost = pinned ?? (canUseLockedGhost
                     ? lockedGhost!
                     : _ghosts.PickOpponent(
                         (int)_run.Day,
@@ -3426,7 +3501,7 @@ public sealed class RunEngine
                         ghostRng,
                         _repo,
                         includeCustomRuleGhosts: _run.IsCustomRuleRun,
-                        poolPartition: ghostPartition);
+                        poolPartition: ghostPartition));
                 _run.PendingPvpGhost = ghost;
                 p2Core = PvpGhostPool.ToPlayerState(ghost, _repo);
                 if (p2Core.Hand.Cards.Count == 0)
@@ -3445,13 +3520,15 @@ public sealed class RunEngine
                 }
                 EHero oppHero = PvpGhostPool.ParseHero(ghost.Hero);
                 // Wave 4A #1 (H-1) & #11：非锦标赛幽灵 accountId 嵌入 Day 与 BoardId 确保跨天必异触发客户端原生 PvpOpponentChanged；
-                // 名牌展示去除 ({ghost.PowerBucket}) 英文后缀，仅下发干净英雄名（锦标赛保留 OpponentUsername）。
+                // 名牌优先展示剧本自定义 DisplayName，无则展示干净英雄名（锦标赛保留 OpponentUsername）。
                 string oppAccountId = tourneyAssignment?.OpponentAccountId
-                    ?? (canUseLockedGhost ? _run.CurrentPvpOpponent?.PlayerLoadout?.accountId : null)
+                    ?? (pinned == null && canUseLockedGhost ? _run.CurrentPvpOpponent?.PlayerLoadout?.accountId : null)
                     ?? $"ghost_{oppHero}_d{_run.Day}_{(!string.IsNullOrWhiteSpace(ghost.BoardId) ? ghost.BoardId : Guid.NewGuid().ToString("N"))}";
                 string oppDisplayName = tourneyAssignment != null
                     ? tourneyAssignment.OpponentUsername
-                    : (string.IsNullOrWhiteSpace(ghost.Hero) ? "Challenger" : ghost.Hero);
+                    : (!string.IsNullOrWhiteSpace(ghost.DisplayName)
+                        ? ghost.DisplayName
+                        : (string.IsNullOrWhiteSpace(ghost.Hero) ? "Challenger" : ghost.Hero));
                 pvpInfo = BuildRichSimPvpOpponent(
                     displayName: oppDisplayName,
                     accountId: oppAccountId,
@@ -3543,7 +3620,7 @@ public sealed class RunEngine
             && !string.IsNullOrWhiteSpace(_run.AccountId);
 
         int? endlessGhostSourceDay = (isPvp && !isSymmetricHumanPvp)
-            ? _run.PendingPvpGhost?.EffectiveSourceDay
+            ? (usedPinnedGhost ? (int)_run.Day : _run.PendingPvpGhost?.EffectiveSourceDay)
             : null;
         var combatModifiers = CombatModifiers.FromRulesAndDay(
             _run.CustomRules,
@@ -3972,6 +4049,12 @@ public sealed class RunEngine
         var despawnEvents = new List<IGameSimEvent>();
         foreach (var oe in oppEntries)
             despawnEvents.Add(new GameSimEventCardDisposed(oe.InstanceId, ECardDisposalReason.Cleared));
+
+        // 4.3 记录实际交手的 PvP 对手镜像（供蓝图导出与收藏），必须在 ClearNonCombatOpponentState 清空 PendingPvpGhost 之前落库
+        if (isPvp && !IsTournamentRun() && _run.PendingPvpGhost is { } faced)
+        {
+            try { _db?.SaveRunGhost(_run.RunId, (int)_run.Day, "faced", faced); } catch { }
+        }
 
         // P1-09（RC-PVP-DESPAWN-OPP-HP-RESET）：
         // 战后清场同步清空 OpponentHero、CurrentPvpOpponent、PendingPvpGhost 与非战斗态对手实体属性，
@@ -4907,9 +4990,7 @@ public sealed class RunEngine
             // V7-1.9 严格跨天顺序：
             // 1) 清理 UntilEndOfDay 临时层（并同步回写属性/附魔还原事件）与当日已访问遭遇集合
             ClearDayModifiersOnRun(events);
-            _run.VisitedDayEncounterIds.Clear();
-            _run.ClearOfferedDayEncounters();
-            _run.ClearActiveReplacementSet();
+            _run.ApplyNewDayEncounterBookkeeping();
             ResetBoardOverrideIfNeeded(events);
             _run.PendingPvpGhost = null;
             _run.CurrentPvpOpponent = null;
@@ -5865,9 +5946,10 @@ public sealed class RunEngine
                 }
 
                 double sum = pool.Sum(p => Math.Max(0.0, p.Weight));
+                var pedRng = _rr.Stream(DailyChallengeSeedGenerator.StreamPedestalEnchant) ?? _rng;
                 if (sum > 0)
                 {
-                    double roll = _rng.NextDouble() * sum;
+                    double roll = pedRng.NextDouble() * sum;
                     double acc = 0;
                     foreach (var p in pool)
                     {
@@ -5879,7 +5961,7 @@ public sealed class RunEngine
                         }
                     }
                 }
-                if (Enum.TryParse<EEnchantmentType>(pool[_rng.Next(pool.Count)].Enchantment, true, out var fb))
+                if (Enum.TryParse<EEnchantmentType>(pool[pedRng.Next(pool.Count)].Enchantment, true, out var fb))
                 {
                     chosen = fb;
                     return true;
@@ -5899,7 +5981,8 @@ public sealed class RunEngine
                 rejectReason = "该卡牌已拥有全部可用附魔，无法重复附魔";
                 return false;
             }
-            string picked = list[_rng.Next(list.Count)];
+            var pedRng = _rr.Stream(DailyChallengeSeedGenerator.StreamPedestalEnchant) ?? _rng;
+            string picked = list[pedRng.Next(list.Count)];
             if (Enum.TryParse<EEnchantmentType>(picked, true, out var res))
             {
                 chosen = res;
@@ -6372,7 +6455,7 @@ public sealed class RunEngine
             _run.FatesUsed = true;
             _run.PlayerAttributes[EPlayerAttributeType.Prestige] = Math.Max(1, _mode.FatesAfterPrestige);
             TransitionToEncounterById(fatesTemplateId, new Outcome());
-            _run.RngSeed = _rng.Next(1, int.MaxValue);
+            _rr.Checkpoint();
             return;
         }
 
@@ -6420,7 +6503,7 @@ public sealed class RunEngine
                 DealHourEncountersAndClearActive();
             }
         }
-        _run.RngSeed = _rng.Next(1, int.MaxValue);
+        _rr.Checkpoint();
         _run.PublishPublicSummary();
     }
 
@@ -9011,6 +9094,10 @@ public sealed class RunEngine
             }
         }
 
+        var pinned = TryResolvePinnedGhostForDay(day);
+        if (pinned != null)
+            _run.PendingPvpGhost = pinned;
+
         int expectedDay = _run.CustomRules.SpecialModeId == ESpecialModeId.EndlessTower
             ? day
             : Math.Clamp(day, 1, 15);
@@ -9021,13 +9108,13 @@ public sealed class RunEngine
                        && _run.PendingPvpGhost.Day == expectedDay
                        && ghostPartitionOk
                        && (_run.IsCustomRuleRun || (!_run.PendingPvpGhost.IsCustomRule && Storage.Persistence.IsSaneGhostForDay(Math.Clamp(expectedDay, 1, 15), _run.PendingPvpGhost.HealthMax)));
-        if (!ghostValid)
+        if (pinned == null && !ghostValid)
         {
             var ghostRng = tourneyAssignment != null
                 ? new Random(tourneyAssignment.BattleSeed)
                 : (_run.CustomRules.FixedRunSeed is int dSeed && dSeed != 0
                     ? DailyChallengeSeedGenerator.CreateStreamRng(dSeed, DailyChallengeSeedGenerator.StreamPvpOpponent, day, (int)_run.Hour)
-                    : _rng);
+                    : Random.Shared);
             try
             {
                 _run.PendingPvpGhost = _ghosts?.PickOpponent(
@@ -9047,16 +9134,18 @@ public sealed class RunEngine
             _run.PendingPvpGhost ??= BuildEmergencyFallbackGhost(day, ghostPartition, ghostRng);
         }
 
-        var ghost = _run.PendingPvpGhost ?? BuildEmergencyFallbackGhost(day, ghostPartition, _rng);
+        var ghost = _run.PendingPvpGhost ?? BuildEmergencyFallbackGhost(day, ghostPartition, Random.Shared);
         EHero oppHero = PvpGhostPool.ParseHero(ghost.Hero);
-        // Wave 4A #1 (H-1) & #11：非锦标赛幽灵 accountId 嵌入 Day 与 BoardId 保证跨天必异；名牌去除 ({ghost.PowerBucket}) 仅下发干净英雄名
+        // Wave 4A #1 (H-1) & #11：非锦标赛幽灵 accountId 嵌入 Day 与 BoardId 保证跨天必异；名牌优先使用剧本 DisplayName
         string oppAccountId = tourneyAssignment?.OpponentAccountId
             ?? $"ghost_{oppHero}_d{_run.Day}_{(!string.IsNullOrWhiteSpace(ghost.BoardId) ? ghost.BoardId : Guid.NewGuid().ToString("N"))}";
         string oppDisplayName = tourneyAssignment != null
             ? tourneyAssignment.OpponentUsername
-            : (string.IsNullOrWhiteSpace(ghost.Hero) ? "Challenger" : ghost.Hero);
+            : (!string.IsNullOrWhiteSpace(ghost.DisplayName)
+                ? ghost.DisplayName
+                : (string.IsNullOrWhiteSpace(ghost.Hero) ? "Challenger" : ghost.Hero));
 
-        int previewHp = Math.Max(100, ghost.HealthMax);
+        int previewHp = pinned != null ? Math.Max(1, ghost.HealthMax) : Math.Max(100, ghost.HealthMax);
         if (tourneyLobby != null && tourneyAssignment is { OpponentIsBot: true })
         {
             int baseHp = _mode.StartingHealth > 0 ? _mode.StartingHealth : GameDefaults.StartingHealth;
@@ -9079,6 +9168,44 @@ public sealed class RunEngine
             gold: 0,
             income: fallbackIncome);
         EmitHour6OpponentInitializedIfNeeded(events, oppHero);
+    }
+
+    private static readonly JsonSerializerOptions PinnedBoardJsonOpts = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
+    /// <summary>
+    /// 4.1 归一化开局复制进本局的固定镜像盘面：JSON 往返深拷贝并重写 Day/SourceDay/TargetDay/BoardId/PoolPartition/IsPlayerGhost，
+    /// 保留 DisplayName、Items、Skills、SocketEffects 等全部字段且避免无尽模式放大或预览/开战名牌闪烁。
+    /// </summary>
+    private static PvpGhostPool.GhostBoard NormalizePinnedBoard(
+        PvpGhostPool.GhostBoard board,
+        int day,
+        string lineupId,
+        string partition)
+    {
+        var node = JsonSerializer.SerializeToNode(board, PinnedBoardJsonOpts) as JsonObject
+                   ?? new JsonObject();
+        node["Day"] = day;
+        node["SourceDay"] = day;
+        node["TargetDay"] = day;
+        node["BoardId"] = $"lineup_{lineupId}_d{day}";
+        node["PoolPartition"] = partition;
+        node["IsPlayerGhost"] = false;
+        return node.Deserialize<PvpGhostPool.GhostBoard>(PinnedBoardJsonOpts) ?? board;
+    }
+
+    /// <summary>
+    /// 4.2 固定对手剧本唯一解析入口：锦标赛始终返回 null；首次访问时按 RunId 从 DB 懒加载缓存（单测可直接预填 PinnedGhostCache）；
+    /// 若当天盘面因 Mod 被删等原因已无任何合法物品则回落随机。
+    /// </summary>
+    private PvpGhostPool.GhostBoard? TryResolvePinnedGhostForDay(int day)
+    {
+        if (IsTournamentRun()) return null;
+        _run.PinnedGhostCache ??= _db?.LoadRunGhosts(_run.RunId, "pinned") ?? new();
+        if (!_run.PinnedGhostCache.TryGetValue(day, out var board) || board == null) return null;
+        return PvpGhostPool.HasAnyValidItem(board, _repo) ? board : null;
     }
 
     /// <summary>

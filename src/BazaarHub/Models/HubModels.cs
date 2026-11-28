@@ -167,7 +167,7 @@ public sealed class ServerProbeResult
 /// </summary>
 public static class LauncherConstants
 {
-    private const string FallbackHubVersion = "15.4.0";
+    private const string FallbackHubVersion = "15.5.0";
 
     /// <summary>
     /// 启动器版本号（D7-P1-01：动态读取根级 Directory.Build.props 注入的 AssemblyInformationalVersion）。

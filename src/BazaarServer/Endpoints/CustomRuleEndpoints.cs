@@ -181,25 +181,51 @@ public static class CustomRuleEndpoints
 
         app.MapPut("/custom-rules/me", async (HttpContext ctx) =>
         {
-            CustomRunRuleSet? incoming;
             try
             {
-                incoming = await JsonSerializer.DeserializeAsync<CustomRunRuleSet>(
-                    ctx.Request.Body,
-                    JsonOpts,
-                    ctx.RequestAborted);
+                using var doc = await JsonDocument.ParseAsync(ctx.Request.Body, cancellationToken: ctx.RequestAborted);
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                    return Results.BadRequest(new { error = "请求体不能为空。" });
+
+                var incoming = doc.RootElement.Deserialize<CustomRunRuleSet>(JsonOpts);
+                if (incoming == null)
+                    return Results.BadRequest(new { error = "请求体不能为空。" });
+
+                string accountId = ResolveAccountId(ctx, accounts);
+                var current = store.Get(accountId);
+                bool Has(string name)
+                {
+                    foreach (var prop in doc.RootElement.EnumerateObject())
+                    {
+                        if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                    return false;
+                }
+
+                if (!Has("customSeedText"))        incoming.CustomSeedText = current.CustomSeedText;
+                else if (!string.IsNullOrWhiteSpace(incoming.CustomSeedText))
+                {
+                    // 种子只认固定格式的码（S + 7 位）
+                    string? code = DailyChallengeSeedGenerator.NormalizeSeedCode(incoming.CustomSeedText);
+                    if (code == null)
+                        return Results.BadRequest(new { error = "种子码格式不对：应该是 S 开头的 8 位码，比如 S3KZ9QW1" });
+                    incoming.CustomSeedText = code;
+                }
+                if (!Has("ghostOpponentMode"))     incoming.GhostOpponentMode = current.GhostOpponentMode;
+                if (!Has("selectedGhostLineupId")) incoming.SelectedGhostLineupId = current.SelectedGhostLineupId;
+
+                // 老客户端在旧的整数种子框里填了新值 → 清空文本种子，让旧整数种子按旧行为生效
+                if (!Has("customSeedText") && incoming.FixedRunSeed is int legacy && legacy != 0 && legacy != current.FixedRunSeed)
+                    incoming.CustomSeedText = null;
+
+                var updated = store.Set(accountId, incoming);
+                return Results.Json(updated, JsonOpts);
             }
             catch (JsonException)
             {
                 return Results.BadRequest(new { error = "自定义规则 JSON 格式无效，请检查字段类型与括号匹配。" });
             }
-
-            if (incoming == null)
-                return Results.BadRequest(new { error = "请求体不能为空。" });
-
-            string accountId = ResolveAccountId(ctx, accounts);
-            var updated = store.Set(accountId, incoming);
-            return Results.Json(updated, JsonOpts);
         });
 
         // ── 快捷切换预设档位（PureOfficial / EnhancedFun / ExtremeRoguelike / Custom）──
@@ -240,7 +266,7 @@ public static class CustomRuleEndpoints
             CustomRunRuleSet next;
             if (parsedPreset == EGameModePreset.Custom)
             {
-                next = current.CloneNormalized();
+                next = current.CloneNormalized(extraMutators: null, preserveUnregisteredMutators: true);
                 next.PresetId = EGameModePreset.Custom;
                 next.SpecialModeId = targetMode;
             }
@@ -258,7 +284,11 @@ public static class CustomRuleEndpoints
             {
                 next.SelectedModIds = new List<string>(current.SelectedModIds);
             }
-            next = next.CloneNormalized();
+            // 保留种子与每日对手剧本设置（切预设不应清掉）
+            next.CustomSeedText = current.CustomSeedText;
+            next.GhostOpponentMode = current.GhostOpponentMode;
+            next.SelectedGhostLineupId = current.SelectedGhostLineupId;
+            next = next.CloneNormalized(extraMutators: null, preserveUnregisteredMutators: true);
 
             var updated = store.Set(accountId, next);
             return Results.Json(new
@@ -334,7 +364,11 @@ public static class CustomRuleEndpoints
             {
                 next.SelectedModIds = new List<string>(current.SelectedModIds);
             }
-            next = next.CloneNormalized();
+            // 保留种子与每日对手剧本设置（切模式不应清掉）
+            next.CustomSeedText = current.CustomSeedText;
+            next.GhostOpponentMode = current.GhostOpponentMode;
+            next.SelectedGhostLineupId = current.SelectedGhostLineupId;
+            next = next.CloneNormalized(extraMutators: null, preserveUnregisteredMutators: true);
 
             var updated = store.Set(accountId, next);
             return Results.Json(new
@@ -394,6 +428,10 @@ public static class CustomRuleEndpoints
                     selectedArchetypeMask = 0UL,
                     isCustomRuleRun = false,
                     customRules = (CustomRunRuleSet?)null,
+                    seedText = (string?)null,
+                    isCustomSeededRun = false,
+                    pinnedLineupName = (string?)null,
+                    startToastZh = (string?)null,
                 }, JsonOpts);
             }
 
@@ -412,6 +450,10 @@ public static class CustomRuleEndpoints
                     selectedArchetypeMask = 0UL,
                     isCustomRuleRun = false,
                     customRules = (CustomRunRuleSet?)null,
+                    seedText = (string?)null,
+                    isCustomSeededRun = false,
+                    pinnedLineupName = (string?)null,
+                    startToastZh = (string?)null,
                 }, JsonOpts);
             }
 
@@ -429,12 +471,20 @@ public static class CustomRuleEndpoints
                         selectedArchetypeMask = 0UL,
                         isCustomRuleRun = false,
                         customRules = (CustomRunRuleSet?)null,
+                        seedText = (string?)null,
+                        isCustomSeededRun = false,
+                        pinnedLineupName = (string?)null,
+                        startToastZh = (string?)null,
                     }, JsonOpts);
                 }
 
                 bool canLock = handle.Engine.CanLockOpeningTendency;
                 // P1-15：向后兼容增补当前活跃对局（含 SQLite 冷重启恢复态）的 customRules 作为局内 HUD 唯一权威事实源
                 var activeRules = handle.Run.CustomRules ?? new CustomRunRuleSet();
+                // 契约第 8 节：开局一次性提示读出后立即清空，确保只提示一次
+                string? toast = handle.Run.PendingStartToastZh;
+                if (toast != null)
+                    handle.Run.PendingStartToastZh = null;
                 return Results.Json(new
                 {
                     hasActiveRun = true,
@@ -451,6 +501,10 @@ public static class CustomRuleEndpoints
                     selectedArchetypeMask = activeRules.SelectedArchetypeMask,
                     isCustomRuleRun = handle.Run.IsCustomRuleRun,
                     customRules = activeRules,
+                    seedText = handle.Run.SeedText,
+                    isCustomSeededRun = handle.Run.IsCustomSeededRun,
+                    pinnedLineupName = handle.Run.PinnedLineupName,
+                    startToastZh = toast,
                 }, JsonOpts);
             }
             finally

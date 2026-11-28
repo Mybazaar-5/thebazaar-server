@@ -90,7 +90,21 @@ public sealed class EncounterStepEngine
     private readonly CardPool _pool;
     private readonly GameDataRepository _repo;
     private readonly ShopEngine _shop;
-    private readonly Random _rng;
+    private readonly RunRandom _rr;
+
+    public EncounterStepEngine(
+        RunState run,
+        CardPool pool,
+        GameDataRepository repo,
+        ShopEngine shop,
+        RunRandom rr)
+    {
+        _run = run;
+        _pool = pool;
+        _repo = repo;
+        _shop = shop;
+        _rr = rr ?? new RunRandom(run);
+    }
 
     public EncounterStepEngine(
         RunState run,
@@ -98,12 +112,8 @@ public sealed class EncounterStepEngine
         GameDataRepository repo,
         ShopEngine shop,
         Random? rng = null)
+        : this(run, pool, repo, shop, rng != null ? new RunRandom(run, rng) : new RunRandom(run))
     {
-        _run = run;
-        _pool = pool;
-        _repo = repo;
-        _shop = shop;
-        _rng = rng ?? new Random();
     }
 
     public EncounterStepResult ExecuteStep(
@@ -155,7 +165,8 @@ public sealed class EncounterStepEngine
         var producedToRoot = new Dictionary<CardInstance, CardInstance>();
 
         var stepArchetypeResolver = ResolveStepArchetypeResolver();
-        var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, playerState, playerState, _rng)
+        var stepRng = _rr.Stream(DailyChallengeSeedGenerator.StreamEncounterStep) ?? _rr.Main;
+        var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, playerState, playerState, stepRng)
         {
             CurrentDay = (int)_run.Day,
             CurrentHour = (int)_run.Hour,
@@ -224,7 +235,8 @@ public sealed class EncounterStepEngine
                     result,
                     playerState: playerState,
                     hasExplicitSpawnContext: true,
-                    typedRules: payload.SelectionContextRules);
+                    typedRules: payload.SelectionContextRules,
+                    stepRng: stepRng);
                 RefreshShelfCards(shelfCards, shelfByCore);
             },
             OnDealCardsToSelection = (dealtCards, spawnMode) =>
@@ -235,7 +247,8 @@ public sealed class EncounterStepEngine
                     rulesNode: null,
                     result,
                     playerState: playerState,
-                    hasExplicitSpawnContext: true);
+                    hasExplicitSpawnContext: true,
+                    stepRng: stepRng);
                 RefreshShelfCards(shelfCards, shelfByCore);
             },
         };
@@ -571,7 +584,8 @@ public sealed class EncounterStepEngine
                     hasExplicitSpawnContext: action.SpawnContext != null,
                     spawnContextNode: action.SpawnContext,
                     evalCtx: ctx,
-                    typedRules: typedStepRules);
+                    typedRules: typedStepRules,
+                    stepRng: ctx.Rng);
                 refreshShelfCards?.Invoke();
                 return;
 
@@ -610,8 +624,10 @@ public sealed class EncounterStepEngine
         bool hasExplicitSpawnContext = false,
         RuleNode? spawnContextNode = null,
         RuleExecutionContext? evalCtx = null,
-        SelectionRulesData? typedRules = null)
+        SelectionRulesData? typedRules = null,
+        Random? stepRng = null)
     {
+        var effectiveRng = stepRng ?? evalCtx?.Rng ?? _rr.Main;
         bool isReplaceMode = string.Equals(spawnMode, "Replace", StringComparison.OrdinalIgnoreCase);
         bool isMerchant = IsCurrentEncounterMerchant();
         if (isReplaceMode)
@@ -676,7 +692,7 @@ public sealed class EncounterStepEngine
             RuleScope.OutOfCombat,
             playerState ?? new PlayerState("p1", "Player", _run.Hero.ToString(), GameDefaults.StartingHealth, GameDefaults.StartingPrestige, 0, 10),
             null,
-            _rng)
+            effectiveRng)
         {
             CurrentDay = (int)_run.Day,
             CurrentHour = (int)_run.Hour,
@@ -738,7 +754,7 @@ public sealed class EncounterStepEngine
 
             var entry = _shop.CreateEntryFromCoreInstance(inst, _run.SelectionRules.SelectionIsFree);
             // 同步应用模式与词条修正（万物附魔 / 五折商店 / 预设物价倍率 / 沙盒 0 元商店），避免步骤发牌旁路词条生效
-            _shop.ApplyModeAndMutatorModifiersToEntry(entry, _run.SelectionRules.SelectionIsFree, isMerchant, _rng);
+            _shop.ApplyModeAndMutatorModifiersToEntry(entry, _run.SelectionRules.SelectionIsFree, isMerchant, effectiveRng);
             // P1-41：确保所有候选技能显式携带 BuyPrice 键（免费为 0），保证双端免费判定一致
             if (entry.Type == ECardType.Skill && !entry.Attributes.ContainsKey(ECardAttributeType.BuyPrice))
             {
@@ -1062,11 +1078,13 @@ public sealed class EncounterStepEngine
 
         if (eligible.Count == 0) return null;
 
+        var stepRng = _rr.Stream(DailyChallengeSeedGenerator.StreamEncounterStep) ?? _rr.Main;
+
         double totalWeight = eligible.Sum(o => Math.Max(0.0, o.Weight));
         if (totalWeight <= 0)
-            return eligible[_rng.Next(eligible.Count)].Id;
+            return eligible[stepRng.Next(eligible.Count)].Id;
 
-        double roll = _rng.NextDouble() * totalWeight;
+        double roll = stepRng.NextDouble() * totalWeight;
         double acc = 0.0;
         foreach (var opt in eligible)
         {

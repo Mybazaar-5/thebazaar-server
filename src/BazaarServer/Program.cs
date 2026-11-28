@@ -10,6 +10,7 @@ using BazaarServer.Data;
 using BazaarServer.Endpoints;
 using BazaarServer.Game;
 using BazaarServer.Mods;
+using BazaarServer.Planner;
 using BazaarServer.TempoNet;
 
 // Wave 4A #10：记录服务端进程启动单调时间戳，确保 /healthz uptime 反映真实进程运行时长而非宿主机开机时长
@@ -27,7 +28,10 @@ var persistence = new BazaarServer.Storage.Persistence(statePath);
 builder.Services.AddSingleton(persistence);
 
 builder.Services.AddSingleton<AccountStore>();
-builder.Services.AddSingleton<PlayerRuleStore>();
+builder.Services.AddSingleton<PlayerRuleStore>(sp =>
+    new PlayerRuleStore(
+        sp.GetRequiredService<BazaarServer.Storage.Persistence>(),
+        sp.GetRequiredService<ServerModHost>()));
 builder.Services.AddSingleton<SessionStore>();
 builder.Services.AddSingleton<BazaarServer.Tournament.LobbyStore>();
 
@@ -158,6 +162,32 @@ builder.Services.AddTransient<List<BazaarServer.Data.MonsterTemplate>>(sp =>
     sp.GetRequiredService<MonsterPoolStore>().SnapshotList());
 builder.Services.AddSingleton(ghostPool);
 
+// 3.5 注册编排台与种子模式服务（显式工厂委托绑定热重载主构造，避免 ServiceProvider 对双构造产生歧义）
+builder.Services.AddSingleton<PlannerSessionStore>(_ => new PlannerSessionStore());
+builder.Services.AddSingleton<GhostLineupStore>(sp => new GhostLineupStore(
+    sp.GetRequiredService<BazaarServer.Storage.Persistence>(),
+    sp.GetRequiredService<PlayerRuleStore>(),
+    sp.GetRequiredService<GameDataRepository>(),
+    sp.GetRequiredService<CardPool>(),
+    sp.GetRequiredService<MonsterPoolStore>(),
+    sp.GetRequiredService<ServerRuntimeSnapshotProvider>(),
+    sp.GetRequiredService<ServerModHost>(),
+    sp.GetRequiredService<CommunityModStore>()));
+builder.Services.AddSingleton<RunBlueprintService>(sp => new RunBlueprintService(
+    sp.GetRequiredService<BazaarServer.Storage.Persistence>(),
+    sp.GetRequiredService<PlayerRuleStore>(),
+    sp.GetRequiredService<SessionStore>(),
+    sp.GetRequiredService<ServerModHost>(),
+    sp.GetRequiredService<CommunityModStore>(),
+    sp.GetRequiredService<CardPool>(),
+    sp.GetRequiredService<MonsterPoolStore>(),
+    sp.GetRequiredService<ServerRuntimeSnapshotProvider>()));
+builder.Services.AddSingleton<EventSeedFinderService>(sp => new EventSeedFinderService(
+    sp.GetRequiredService<ServerModHost>(),
+    sp.GetRequiredService<CardPool>(),
+    sp.GetRequiredService<MonsterPoolStore>(),
+    sp.GetRequiredService<ServerRuntimeSnapshotProvider>()));
+
 Console.WriteLine(
     $"[CoreEngine] 单次共享加载完成：卡牌={modHost.ActiveRepository.CardsById.Count}（有效资产={cardPool.TotalCards}），" +
     $"野怪={monsterPoolStore.Count}，已启Mod={modHost.EnabledModCount}，词典条数={modHost.ActiveLocalization.EntryCount}，" +
@@ -232,6 +262,7 @@ WorkshopEndpoints.Map(app);
 CommunityModEndpoints.Map(app);
 ClientUpdateEndpoints.Map(app, dataRoot);
 MultiplayerEndpointModule.MapEndpoints(app);
+app.MapPlannerEndpoints();
 
 // 100-CCU 长跑：每 15 分钟驱逐超过 2 小时无活动的空闲会话，同步清理孤儿 RidCaches
 var evictionCts = CancellationTokenSource.CreateLinkedTokenSource(app.Lifetime.ApplicationStopping);
@@ -248,9 +279,11 @@ _ = Task.Run(async () =>
             int purgedChatBuckets = SocialEndpoints.PurgeStaleRateBuckets();
             int purgedChestBuckets = TempoNetEndpoints.PurgeStaleRateBuckets();
             int evictedChallengeCache = app.Services.GetService<ChallengeService>()?.EvictStaleCacheEntries() ?? 0;
-            if (evicted > 0 || detachedHandles > 0 || purgedCaches > 0 || purgedChatBuckets > 0 || purgedChestBuckets > 0 || evictedChallengeCache > 0)
+            int prunedPlannerAuth = app.Services.GetService<PlannerSessionStore>()?.PruneExpired() ?? 0;
+            int prunedFinderJobs = app.Services.GetService<EventSeedFinderService>()?.PruneExpiredJobs() ?? 0;
+            if (evicted > 0 || detachedHandles > 0 || purgedCaches > 0 || purgedChatBuckets > 0 || purgedChestBuckets > 0 || evictedChallengeCache > 0 || prunedPlannerAuth > 0 || prunedFinderJobs > 0)
             {
-                Console.WriteLine($"[SessionStore] 定时清理完成：驱逐空闲会话={evicted}，回收句柄={detachedHandles}，清理幂等缓存={purgedCaches}，清理限流桶={purgedChatBuckets + purgedChestBuckets}，驱逐挑战缓存={evictedChallengeCache}");
+                Console.WriteLine($"[SessionStore] 定时清理完成：驱逐空闲会话={evicted}，回收句柄={detachedHandles}，清理幂等缓存={purgedCaches}，清理限流桶={purgedChatBuckets + purgedChestBuckets}，驱逐挑战缓存={evictedChallengeCache}，清理编排台鉴权={prunedPlannerAuth}，清理搜种任务={prunedFinderJobs}");
             }
         }
     }

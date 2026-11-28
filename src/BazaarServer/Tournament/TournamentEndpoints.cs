@@ -2338,6 +2338,7 @@ public sealed class LobbyStore
                                 {
                                     try
                                     {
+                                        handle.Engine.CheckpointRandom();
                                         string snapJson = RunSnapshotSerializer.Serialize(run, startSelectionDone: run.StartSelectionDone);
                                         _db.SaveRunSnapshot(run, action.AccountId, snapJson, isCustomRule: run.IsCustomRuleRun);
                                         _db.MarkRunEnded(run.RunId, ERunState.EndRunDefeat, "afk_eliminated");
@@ -2370,6 +2371,7 @@ public sealed class LobbyStore
                                 {
                                     try
                                     {
+                                        handle.Engine.CheckpointRandom();
                                         string snapJson = RunSnapshotSerializer.Serialize(run, startSelectionDone: run.StartSelectionDone);
                                         _db.SaveRunSnapshot(run, action.AccountId, snapJson, isCustomRule: run.IsCustomRuleRun);
                                     }
@@ -2552,6 +2554,10 @@ public sealed class LobbyStore
         string? presetIdOverride = null)
     {
         var normalized = (incomingRules ?? lobby.Rules ?? new CustomRunRuleSet()).CloneNormalized();
+        // 锦标赛边界：清空房主个人种子与对手剧本三字段，防止带入锦标赛大厅
+        normalized.CustomSeedText = null;
+        normalized.GhostOpponentMode = EGhostOpponentMode.Random;
+        normalized.SelectedGhostLineupId = null;
 
         if (!string.IsNullOrWhiteSpace(presetIdOverride) &&
             Enum.TryParse<EGameModePreset>(presetIdOverride.Trim(), ignoreCase: true, out var parsedPreset))

@@ -325,6 +325,35 @@ public sealed class RunState
     /// <summary>单局运行期随机种子（供快照序列化/恢复保持随机序列衔接）。</summary>
     public int RngSeed { get; set; }
 
+    /// <summary>本局主种子，StartRun 定下后不再改（旧存档为 0 时走旧逻辑）。</summary>
+    public int MasterSeed { get; set; }
+
+    /// <summary>可读种子码（用于展示与蓝图导出）。</summary>
+    public string? SeedText { get; set; }
+
+    /// <summary>仅用于界面显示「种子局」徽标，不影响任何玩法/榜单/镜像池判定。</summary>
+    public bool IsCustomSeededRun { get; set; }
+
+    /// <summary>开局命中固定对手剧本时记录的剧本名称（持久化以确保重连/重启后 active-run-tendency 准确展示）。</summary>
+    public string? PinnedLineupName { get; set; }
+
+    /// <summary>当前 (Day, Hour) 内每条确定性随机流已用次数，供 RunRandom.Stream 自动递增防撞车。</summary>
+    public Dictionary<string, int> StreamOccurrences { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>StreamOccurrences 对应的 Day * 100 + Hour 时间戳，换小时时自动清空。</summary>
+    public int StreamOccurrenceStamp { get; set; }
+
+    /// <summary>卡牌实例 ID 递增计数器（持久化以防重连后实例 ID 碰撞与排序偏移）。</summary>
+    public int NextInstanceSeq { get; set; }
+
+    /// <summary>本局固定剧本镜像缓存（按需从 DB 加载，非持久化；单测可直接赋值）。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public Dictionary<int, PvpGhostPool.GhostBoard>? PinnedGhostCache { get; set; }
+
+    /// <summary>开局一次性中文提示文案（如所选剧本不存在，由客户端拉取展示后清空，非持久化）。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? PendingStartToastZh { get; set; }
+
     /// <summary>进入当前奇遇时暂存的退出奖励经验（延迟至离开/推进奇遇时再结算，避免进门先跳升级，修复 Bug #12/#16）。</summary>
     public int PendingEncounterExitXp { get; set; }
 
@@ -799,6 +828,16 @@ public sealed class RunState
         ActiveExpeditionId = null;
         ActiveExpeditionVariant = null;
         ExpeditionVisitedRoomIds.Clear();
+    }
+
+    /// <summary>
+    /// 跨天遭遇账本清理（与 RunEngine.AdvanceHourOrDay 和搜种推演共用，严格保持原三行顺序）。
+    /// </summary>
+    public void ApplyNewDayEncounterBookkeeping()
+    {
+        VisitedDayEncounterIds.Clear();
+        ClearOfferedDayEncounters();
+        ClearActiveReplacementSet();
     }
 
     /// <summary>本局运行期动态遭遇排除集（初始化自 GameMode.ExclusionSet，并支持 Burn it Down 等事件动态增删）。</summary>

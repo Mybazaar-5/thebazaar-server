@@ -1,10 +1,16 @@
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Data.Sqlite;
 using BazaarCore.Models;
 using BazaarGameShared.Domain.Core.Types;
 using BazaarGameShared.Domain.Runs;
+using BazaarServer.Data;
 using BazaarServer.Game;
+using BazaarServer.Planner;
 
 namespace BazaarServer.Storage;
 
@@ -528,6 +534,46 @@ public sealed partial class Persistence : IDisposable
                 EnsureColumn(c, "match_history_and_replays", "visual_bindings_json", "TEXT NOT NULL DEFAULT ''");
                 // D6-P2-01：幂等补列 invite_token_expires_at，确保邀请码过期时间跨重启持久化
                 EnsureColumn(c, "tournament_lobbies", "invite_token_expires_at", "TEXT NOT NULL DEFAULT ''");
+            });
+
+            ApplyMigration(conn, 6, "v6_seed_lineup_blueprint", c =>
+            {
+                ExecuteNonQuery(c, """
+                    CREATE TABLE IF NOT EXISTS player_ghost_lineups (
+                        lineup_id   TEXT PRIMARY KEY,
+                        account_id  TEXT NOT NULL,
+                        name        TEXT NOT NULL,
+                        days_count  INTEGER NOT NULL DEFAULT 0,
+                        lineup_json TEXT NOT NULL,
+                        created_at  TEXT NOT NULL,
+                        updated_at  TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_ghost_lineups_account ON player_ghost_lineups(account_id, updated_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS shared_run_blueprints (
+                        share_code         TEXT PRIMARY KEY,
+                        creator_account_id TEXT NOT NULL,
+                        creator_username   TEXT NOT NULL,
+                        title              TEXT NOT NULL DEFAULT '',
+                        export_scope       TEXT NOT NULL,
+                        hero               TEXT NOT NULL,
+                        seed_text          TEXT NOT NULL DEFAULT '',
+                        master_seed        INTEGER NOT NULL,
+                        blueprint_gzip     BLOB NOT NULL,
+                        import_count       INTEGER NOT NULL DEFAULT 0,
+                        created_at         TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_shared_blueprints_creator ON shared_run_blueprints(creator_account_id, created_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS run_ghosts (
+                        run_id      TEXT NOT NULL,
+                        day         INTEGER NOT NULL,
+                        kind        TEXT NOT NULL,
+                        ghost_json  TEXT NOT NULL,
+                        recorded_at TEXT NOT NULL,
+                        PRIMARY KEY (run_id, day, kind)
+                    );
+                    """);
             });
         }
     }
@@ -1619,6 +1665,65 @@ public sealed partial class Persistence : IDisposable
         });
     }
 
+    /// <summary>
+    /// 查询指定账号最近一局已结束且快照为合法 JSON 对象的对局（兼容 Guid("D") 与 Guid("N") 双格式 account_id 匹配）。
+    /// </summary>
+    public (string RunId, string SnapshotJson, int State, bool IsEnded, DateTime SavedAtUtc)? LoadLatestFinishedRun(string accountId)
+    {
+        var (canonical, altNoDash) = ResolveAccountIdCandidates(accountId);
+        if (string.IsNullOrEmpty(canonical)) return null;
+
+        return ExecuteRead<(string RunId, string SnapshotJson, int State, bool IsEnded, DateTime SavedAtUtc)?>(conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            if (altNoDash != null)
+            {
+                cmd.CommandText = """
+                    SELECT run_id, snapshot, state, is_ended, saved_at
+                    FROM runs
+                    WHERE account_id IN ($aidD, $aidN)
+                      AND (is_ended = 1 OR state IN (3, 4, 10))
+                      AND snapshot IS NOT NULL
+                      AND TRIM(snapshot) LIKE '{%'
+                    ORDER BY saved_at DESC
+                    LIMIT 5;
+                    """;
+                cmd.Parameters.AddWithValue("$aidD", canonical);
+                cmd.Parameters.AddWithValue("$aidN", altNoDash);
+            }
+            else
+            {
+                cmd.CommandText = """
+                    SELECT run_id, snapshot, state, is_ended, saved_at
+                    FROM runs
+                    WHERE account_id = $aid
+                      AND (is_ended = 1 OR state IN (3, 4, 10))
+                      AND snapshot IS NOT NULL
+                      AND TRIM(snapshot) LIKE '{%'
+                    ORDER BY saved_at DESC
+                    LIMIT 5;
+                    """;
+                cmd.Parameters.AddWithValue("$aid", canonical);
+            }
+
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                string snapshot = r.IsDBNull(1) ? "" : r.GetString(1);
+                if (!IsValidJsonObject(snapshot))
+                    continue;
+
+                return (
+                    r.GetString(0),
+                    snapshot,
+                    r.GetInt32(2),
+                    !r.IsDBNull(3) && r.GetInt32(3) != 0,
+                    ParseUtc(r.GetString(4)));
+            }
+            return null;
+        });
+    }
+
     /// <summary>标记指定对局已结束（胜利/战败/投降），同步剔除挂起防抖快照并设置不可逆代数栅栏。</summary>
     public void MarkRunEnded(string runId, ERunState endState, string reason)
     {
@@ -2035,20 +2140,753 @@ public sealed partial class Persistence : IDisposable
             return Convert.ToInt32(cmd.ExecuteScalar());
         });
 
-    // ── 存储空间治理（过期令牌/回放二进制/超限聊天/归档大厅定期裁剪）─────────
+    // ── 种子模式：自定义每日镜像剧本、单局幽灵快照与分享蓝图（v6）─────────────
+
+    private const string ShareCodeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+    private static readonly JsonSerializerOptions PlannerJsonOpts = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        WriteIndented = false,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
+    private static (string Canonical, string? AltNoDash) ResolveAccountIdCandidates(string? accountId)
+    {
+        if (string.IsNullOrWhiteSpace(accountId)) return ("", null);
+        if (Guid.TryParse(accountId, out var g))
+            return (g.ToString("D"), g.ToString("N"));
+        return (accountId.Trim(), null);
+    }
+
+    private static bool IsValidJsonObject(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.ValueKind == JsonValueKind.Object;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string GenerateBlueprintShareCode()
+    {
+        Span<char> chars = stackalloc char[12];
+        chars[0] = 'B';
+        chars[1] = 'Z';
+        chars[2] = '-';
+        for (int i = 3; i < 7; i++)
+            chars[i] = ShareCodeAlphabet[RandomNumberGenerator.GetInt32(ShareCodeAlphabet.Length)];
+        chars[7] = '-';
+        for (int i = 8; i < 12; i++)
+            chars[i] = ShareCodeAlphabet[RandomNumberGenerator.GetInt32(ShareCodeAlphabet.Length)];
+        return new string(chars);
+    }
+
+    private static CustomGhostLineup? TryDeserializeGhostLineup(
+        string? json,
+        string lineupId,
+        string accountId,
+        string fallbackName,
+        DateTime createdAtUtc,
+        DateTime updatedAtUtc)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try
+        {
+            var item = JsonSerializer.Deserialize<CustomGhostLineup>(json, PlannerJsonOpts);
+            if (item == null) return null;
+            item.LineupId = lineupId;
+            item.AccountId = accountId;
+            if (string.IsNullOrWhiteSpace(item.Name))
+                item.Name = fallbackName;
+            item.Description ??= "";
+            item.SourceType = string.IsNullOrWhiteSpace(item.SourceType) ? "custom" : item.SourceType;
+            item.ModEnvironment ??= new ModEnvironmentSpec();
+            item.ModEnvironment.Mods ??= new List<ModRequirementEntry>();
+            item.Days ??= new Dictionary<int, PvpGhostPool.GhostBoard>();
+            item.CreatedAtUtc = createdAtUtc;
+            item.UpdatedAtUtc = updatedAtUtc;
+            return item;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>列出指定账号名下全部自定义每日镜像剧本（按 updated_at 降序；单行脏 JSON 自动跳过）。</summary>
+    public List<CustomGhostLineup> ListGhostLineups(string accountId)
+    {
+        var (canonical, altNoDash) = ResolveAccountIdCandidates(accountId);
+        if (string.IsNullOrEmpty(canonical)) return new List<CustomGhostLineup>();
+
+        return ExecuteRead(conn =>
+        {
+            var list = new List<CustomGhostLineup>();
+            using var cmd = conn.CreateCommand();
+            if (altNoDash != null)
+            {
+                cmd.CommandText = """
+                    SELECT lineup_id, account_id, name, lineup_json, created_at, updated_at
+                    FROM player_ghost_lineups
+                    WHERE account_id IN ($aidD, $aidN)
+                    ORDER BY updated_at DESC, lineup_id ASC;
+                    """;
+                cmd.Parameters.AddWithValue("$aidD", canonical);
+                cmd.Parameters.AddWithValue("$aidN", altNoDash);
+            }
+            else
+            {
+                cmd.CommandText = """
+                    SELECT lineup_id, account_id, name, lineup_json, created_at, updated_at
+                    FROM player_ghost_lineups
+                    WHERE account_id = $aid
+                    ORDER BY updated_at DESC, lineup_id ASC;
+                    """;
+                cmd.Parameters.AddWithValue("$aid", canonical);
+            }
+
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var lineup = TryDeserializeGhostLineup(
+                    r.IsDBNull(3) ? "" : r.GetString(3),
+                    r.GetString(0),
+                    r.GetString(1),
+                    r.GetString(2),
+                    ParseUtc(r.GetString(4)),
+                    ParseUtc(r.GetString(5)));
+                if (lineup != null)
+                    list.Add(lineup);
+            }
+            return list;
+        });
+    }
+
+    /// <summary>按账号与剧本 ID 加载单个剧本（严格校验归属权，跨账号访问返回 null）。</summary>
+    public CustomGhostLineup? LoadGhostLineup(string accountId, string lineupId)
+    {
+        var (canonical, altNoDash) = ResolveAccountIdCandidates(accountId);
+        if (string.IsNullOrEmpty(canonical) || string.IsNullOrWhiteSpace(lineupId))
+            return null;
+        string trimmedId = lineupId.Trim();
+
+        return ExecuteRead<CustomGhostLineup?>(conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            if (altNoDash != null)
+            {
+                cmd.CommandText = """
+                    SELECT lineup_id, account_id, name, lineup_json, created_at, updated_at
+                    FROM player_ghost_lineups
+                    WHERE lineup_id = $lid AND account_id IN ($aidD, $aidN)
+                    LIMIT 1;
+                    """;
+                cmd.Parameters.AddWithValue("$lid", trimmedId);
+                cmd.Parameters.AddWithValue("$aidD", canonical);
+                cmd.Parameters.AddWithValue("$aidN", altNoDash);
+            }
+            else
+            {
+                cmd.CommandText = """
+                    SELECT lineup_id, account_id, name, lineup_json, created_at, updated_at
+                    FROM player_ghost_lineups
+                    WHERE lineup_id = $lid AND account_id = $aid
+                    LIMIT 1;
+                    """;
+                cmd.Parameters.AddWithValue("$lid", trimmedId);
+                cmd.Parameters.AddWithValue("$aid", canonical);
+            }
+
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            return TryDeserializeGhostLineup(
+                r.IsDBNull(3) ? "" : r.GetString(3),
+                r.GetString(0),
+                r.GetString(1),
+                r.GetString(2),
+                ParseUtc(r.GetString(4)),
+                ParseUtc(r.GetString(5)));
+        });
+    }
+
+    /// <summary>
+    /// 在单个写事务内保存或更新玩家自定义镜像剧本：
+    /// 校验 JSON UTF-8 字节上限（PAYLOAD_TOO_LARGE）、归属权与存在性（NOT_FOUND）以及账号套数上限（LINEUP_LIMIT）。
+    /// </summary>
+    public (bool Ok, string? ErrorCode, CustomGhostLineup? Saved) SaveGhostLineup(
+        CustomGhostLineup lineup,
+        int maxPerAccount = 50,
+        int maxJsonBytes = 65536,
+        bool requireExisting = false)
+    {
+        if (lineup == null)
+            return (false, "INVALID_ARGUMENT", null);
+
+        var (accountKey, altNoDash) = ResolveAccountIdCandidates(lineup.AccountId);
+        if (string.IsNullOrEmpty(accountKey))
+            return (false, "INVALID_ACCOUNT", null);
+
+        string lineupId = string.IsNullOrWhiteSpace(lineup.LineupId)
+            ? (requireExisting ? "" : $"ln_{Guid.NewGuid():N}")
+            : lineup.LineupId.Trim();
+        if (string.IsNullOrEmpty(lineupId))
+            return (false, "NOT_FOUND", null);
+
+        int effectiveMaxPerAccount = Math.Max(1, maxPerAccount);
+        int effectiveMaxJsonBytes = Math.Max(1, maxJsonBytes);
+        DateTime now = DateTime.UtcNow;
+
+        var daysCopy = lineup.Days != null
+            ? new Dictionary<int, PvpGhostPool.GhostBoard>(lineup.Days)
+            : new Dictionary<int, PvpGhostPool.GhostBoard>();
+        var modEnv = lineup.ModEnvironment ?? new ModEnvironmentSpec();
+        modEnv.Mods ??= new List<ModRequirementEntry>();
+        string name = lineup.Name ?? "";
+        string description = lineup.Description ?? "";
+        string sourceType = string.IsNullOrWhiteSpace(lineup.SourceType) ? "custom" : lineup.SourceType.Trim();
+        string? sourceCode = string.IsNullOrWhiteSpace(lineup.SourceCode) ? null : lineup.SourceCode.Trim();
+        string? seedText = string.IsNullOrWhiteSpace(lineup.SeedText) ? null : lineup.SeedText.Trim();
+        string? seedHero = string.IsNullOrWhiteSpace(lineup.SeedHero) ? null : lineup.SeedHero.Trim();
+
+        DateTime initialCreatedAt = lineup.CreatedAtUtc == default
+            ? now
+            : (lineup.CreatedAtUtc.Kind == DateTimeKind.Utc ? lineup.CreatedAtUtc : lineup.CreatedAtUtc.ToUniversalTime());
+
+        CustomGhostLineup BuildPayload(DateTime createdAtUtc) => new()
+        {
+            LineupId = lineupId,
+            AccountId = accountKey,
+            Name = name,
+            Description = description,
+            SourceType = sourceType,
+            SourceCode = sourceCode,
+            SeedText = seedText,
+            SeedHero = seedHero,
+            ModEnvironment = modEnv,
+            Days = daysCopy,
+            CreatedAtUtc = createdAtUtc,
+            UpdatedAtUtc = now,
+        };
+
+        // 写锁外先序列化一次，及早拦截超大载荷避免长时间占用 _writeLock
+        var prePayload = BuildPayload(initialCreatedAt);
+        string preJson = JsonSerializer.Serialize(prePayload, PlannerJsonOpts);
+        if (Encoding.UTF8.GetByteCount(preJson) > effectiveMaxJsonBytes)
+            return (false, "PAYLOAD_TOO_LARGE", null);
+
+        return ExecuteWrite<(bool Ok, string? ErrorCode, CustomGhostLineup? Saved)>((conn, tx) =>
+        {
+            string? existingAccountId = null;
+            string? existingCreatedAtRaw = null;
+            using (var sel = conn.CreateCommand())
+            {
+                sel.Transaction = tx;
+                sel.CommandText = "SELECT account_id, created_at FROM player_ghost_lineups WHERE lineup_id = $lid LIMIT 1;";
+                sel.Parameters.AddWithValue("$lid", lineupId);
+                using var r = sel.ExecuteReader();
+                if (r.Read())
+                {
+                    existingAccountId = r.GetString(0);
+                    existingCreatedAtRaw = r.GetString(1);
+                }
+            }
+
+            if (existingAccountId != null)
+            {
+                string existingCanonical = NormalizeAccountKey(existingAccountId);
+                if (!string.Equals(existingCanonical, accountKey, StringComparison.Ordinal))
+                    return (false, "NOT_FOUND", (CustomGhostLineup?)null);
+
+                DateTime preservedCreatedAt = ParseUtc(existingCreatedAtRaw);
+                var saved = BuildPayload(preservedCreatedAt);
+                string finalJson = JsonSerializer.Serialize(saved, PlannerJsonOpts);
+                if (Encoding.UTF8.GetByteCount(finalJson) > effectiveMaxJsonBytes)
+                    return (false, "PAYLOAD_TOO_LARGE", (CustomGhostLineup?)null);
+
+                using var upd = conn.CreateCommand();
+                upd.Transaction = tx;
+                upd.CommandText = """
+                    UPDATE player_ghost_lineups
+                    SET account_id = $aid,
+                        name = $name,
+                        days_count = $dc,
+                        lineup_json = $json,
+                        updated_at = $ua
+                    WHERE lineup_id = $lid;
+                    """;
+                upd.Parameters.AddWithValue("$aid", accountKey);
+                upd.Parameters.AddWithValue("$name", saved.Name);
+                upd.Parameters.AddWithValue("$dc", saved.Days.Count);
+                upd.Parameters.AddWithValue("$json", finalJson);
+                upd.Parameters.AddWithValue("$ua", saved.UpdatedAtUtc.ToString("O"));
+                upd.Parameters.AddWithValue("$lid", saved.LineupId);
+                upd.ExecuteNonQuery();
+
+                return (true, (string?)null, (CustomGhostLineup?)saved);
+            }
+
+            if (requireExisting)
+                return (false, "NOT_FOUND", (CustomGhostLineup?)null);
+
+            int currentCount;
+            using (var cnt = conn.CreateCommand())
+            {
+                cnt.Transaction = tx;
+                if (altNoDash != null)
+                {
+                    cnt.CommandText = "SELECT COUNT(*) FROM player_ghost_lineups WHERE account_id IN ($aidD, $aidN);";
+                    cnt.Parameters.AddWithValue("$aidD", accountKey);
+                    cnt.Parameters.AddWithValue("$aidN", altNoDash);
+                }
+                else
+                {
+                    cnt.CommandText = "SELECT COUNT(*) FROM player_ghost_lineups WHERE account_id = $aid;";
+                    cnt.Parameters.AddWithValue("$aid", accountKey);
+                }
+                currentCount = Convert.ToInt32(cnt.ExecuteScalar());
+            }
+
+            if (currentCount >= effectiveMaxPerAccount)
+                return (false, "LINEUP_LIMIT", (CustomGhostLineup?)null);
+
+            using (var ins = conn.CreateCommand())
+            {
+                ins.Transaction = tx;
+                ins.CommandText = """
+                    INSERT INTO player_ghost_lineups (lineup_id, account_id, name, days_count, lineup_json, created_at, updated_at)
+                    VALUES ($lid, $aid, $name, $dc, $json, $ca, $ua);
+                    """;
+                ins.Parameters.AddWithValue("$lid", prePayload.LineupId);
+                ins.Parameters.AddWithValue("$aid", accountKey);
+                ins.Parameters.AddWithValue("$name", prePayload.Name);
+                ins.Parameters.AddWithValue("$dc", prePayload.Days.Count);
+                ins.Parameters.AddWithValue("$json", preJson);
+                ins.Parameters.AddWithValue("$ca", prePayload.CreatedAtUtc.ToString("O"));
+                ins.Parameters.AddWithValue("$ua", prePayload.UpdatedAtUtc.ToString("O"));
+                ins.ExecuteNonQuery();
+            }
+
+            return (true, (string?)null, (CustomGhostLineup?)prePayload);
+        });
+    }
+
+    /// <summary>删除指定账号名下的单个自定义剧本（仅删本人记录，返回是否实际删除）。</summary>
+    public bool DeleteGhostLineup(string accountId, string lineupId)
+    {
+        var (canonical, altNoDash) = ResolveAccountIdCandidates(accountId);
+        if (string.IsNullOrEmpty(canonical) || string.IsNullOrWhiteSpace(lineupId))
+            return false;
+        string trimmedId = lineupId.Trim();
+
+        return ExecuteWrite((conn, tx) =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            if (altNoDash != null)
+            {
+                cmd.CommandText = "DELETE FROM player_ghost_lineups WHERE lineup_id = $lid AND account_id IN ($aidD, $aidN);";
+                cmd.Parameters.AddWithValue("$lid", trimmedId);
+                cmd.Parameters.AddWithValue("$aidD", canonical);
+                cmd.Parameters.AddWithValue("$aidN", altNoDash);
+            }
+            else
+            {
+                cmd.CommandText = "DELETE FROM player_ghost_lineups WHERE lineup_id = $lid AND account_id = $aid;";
+                cmd.Parameters.AddWithValue("$lid", trimmedId);
+                cmd.Parameters.AddWithValue("$aid", canonical);
+            }
+            return cmd.ExecuteNonQuery() > 0;
+        });
+    }
+
+    /// <summary>保存单局某天的固定剧本镜像（pinned）或实际交手镜像（faced）。</summary>
+    public void SaveRunGhost(string runId, int day, string kind, PvpGhostPool.GhostBoard board)
+    {
+        if (string.IsNullOrWhiteSpace(runId) || day <= 0 || string.IsNullOrWhiteSpace(kind) || board == null)
+            return;
+
+        string trimmedRunId = runId.Trim();
+        string normalizedKind = kind.Trim().ToLowerInvariant();
+        string ghostJson = JsonSerializer.Serialize(board, PlannerJsonOpts);
+        string recordedAt = DateTime.UtcNow.ToString("O");
+
+        ExecuteWrite((conn, tx) =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                INSERT OR REPLACE INTO run_ghosts (run_id, day, kind, ghost_json, recorded_at)
+                VALUES ($rid, $day, $kind, $json, $ra);
+                """;
+            cmd.Parameters.AddWithValue("$rid", trimmedRunId);
+            cmd.Parameters.AddWithValue("$day", day);
+            cmd.Parameters.AddWithValue("$kind", normalizedKind);
+            cmd.Parameters.AddWithValue("$json", ghostJson);
+            cmd.Parameters.AddWithValue("$ra", recordedAt);
+            cmd.ExecuteNonQuery();
+        });
+    }
+
+    /// <summary>按天升序读取单局指定类型的全部镜像盘面（单条脏 JSON 容错跳过）。</summary>
+    public Dictionary<int, PvpGhostPool.GhostBoard> LoadRunGhosts(string runId, string kind)
+    {
+        var result = new Dictionary<int, PvpGhostPool.GhostBoard>();
+        if (string.IsNullOrWhiteSpace(runId) || string.IsNullOrWhiteSpace(kind))
+            return result;
+
+        string trimmedRunId = runId.Trim();
+        string normalizedKind = kind.Trim().ToLowerInvariant();
+
+        return ExecuteRead(conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT day, ghost_json
+                FROM run_ghosts
+                WHERE run_id = $rid AND kind = $kind
+                ORDER BY day ASC;
+                """;
+            cmd.Parameters.AddWithValue("$rid", trimmedRunId);
+            cmd.Parameters.AddWithValue("$kind", normalizedKind);
+
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                int day = r.GetInt32(0);
+                string json = r.IsDBNull(1) ? "" : r.GetString(1);
+                if (string.IsNullOrWhiteSpace(json)) continue;
+                try
+                {
+                    var board = JsonSerializer.Deserialize<PvpGhostPool.GhostBoard>(json, PlannerJsonOpts);
+                    if (board != null)
+                        result[day] = board;
+                }
+                catch
+                {
+                    // 单条坏数据容错跳过，避免影响整局读取
+                }
+            }
+            return result;
+        });
+    }
+
+    /// <summary>仅读取单局指定类型已记录的天数列表（升序，不反序列化 JSON）。</summary>
+    public List<int> LoadRunGhostDays(string runId, string kind)
+    {
+        var days = new List<int>();
+        if (string.IsNullOrWhiteSpace(runId) || string.IsNullOrWhiteSpace(kind))
+            return days;
+
+        string trimmedRunId = runId.Trim();
+        string normalizedKind = kind.Trim().ToLowerInvariant();
+
+        return ExecuteRead(conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT day
+                FROM run_ghosts
+                WHERE run_id = $rid AND kind = $kind
+                ORDER BY day ASC;
+                """;
+            cmd.Parameters.AddWithValue("$rid", trimmedRunId);
+            cmd.Parameters.AddWithValue("$kind", normalizedKind);
+
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                days.Add(r.GetInt32(0));
+            return days;
+        });
+    }
+
+    /// <summary>删除指定对局的全部 run_ghosts 记录（pinned 与 faced）。</summary>
+    public void DeleteRunGhosts(string runId)
+    {
+        if (string.IsNullOrWhiteSpace(runId)) return;
+        string trimmedRunId = runId.Trim();
+
+        ExecuteWrite((conn, tx) =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM run_ghosts WHERE run_id = $rid;";
+            cmd.Parameters.AddWithValue("$rid", trimmedRunId);
+            cmd.ExecuteNonQuery();
+        });
+    }
+
+    /// <summary>
+    /// 保存分享蓝图并生成唯一短码（BZ-XXXX-XXXX，碰撞重试最多 5 次）；
+    /// 同一事务内自动裁剪该账号超出 maxPerAccount 的最旧记录。
+    /// </summary>
+    public (string ShortCode, DateTime CreatedAtUtc) SaveSharedBlueprint(
+        string creatorAccountId,
+        string creatorUsername,
+        string title,
+        string exportScope,
+        string hero,
+        string seedText,
+        int masterSeed,
+        byte[] blueprintGzip,
+        int maxPerAccount = 100)
+    {
+        var (accountKey, altNoDash) = ResolveAccountIdCandidates(creatorAccountId);
+        int effectiveMax = Math.Max(1, maxPerAccount);
+        DateTime createdAtUtc = DateTime.UtcNow;
+        string createdAtIso = createdAtUtc.ToString("O");
+        string safeUsername = creatorUsername ?? "";
+        string safeTitle = title ?? "";
+        string safeScope = string.IsNullOrWhiteSpace(exportScope) ? "events_only" : exportScope.Trim();
+        string safeHero = hero ?? "";
+        string safeSeedText = seedText ?? "";
+        byte[] safeGzip = blueprintGzip ?? Array.Empty<byte>();
+
+        return ExecuteWrite<(string ShortCode, DateTime CreatedAtUtc)>((conn, tx) =>
+        {
+            string? assignedCode = null;
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                string candidate = GenerateBlueprintShareCode();
+                using var ins = conn.CreateCommand();
+                ins.Transaction = tx;
+                ins.CommandText = """
+                    INSERT OR IGNORE INTO shared_run_blueprints (
+                        share_code, creator_account_id, creator_username, title, export_scope,
+                        hero, seed_text, master_seed, blueprint_gzip, import_count, created_at)
+                    VALUES ($code, $aid, $user, $title, $scope, $hero, $seed, $mseed, $gzip, 0, $ca);
+                    """;
+                ins.Parameters.AddWithValue("$code", candidate);
+                ins.Parameters.AddWithValue("$aid", accountKey);
+                ins.Parameters.AddWithValue("$user", safeUsername);
+                ins.Parameters.AddWithValue("$title", safeTitle);
+                ins.Parameters.AddWithValue("$scope", safeScope);
+                ins.Parameters.AddWithValue("$hero", safeHero);
+                ins.Parameters.AddWithValue("$seed", safeSeedText);
+                ins.Parameters.AddWithValue("$mseed", masterSeed);
+                ins.Parameters.AddWithValue("$gzip", safeGzip);
+                ins.Parameters.AddWithValue("$ca", createdAtIso);
+
+                if (ins.ExecuteNonQuery() > 0)
+                {
+                    assignedCode = candidate;
+                    break;
+                }
+            }
+
+            if (assignedCode == null)
+                throw new InvalidOperationException("生成分享短码多次碰撞失败，请稍后重试。");
+
+            if (!string.IsNullOrEmpty(accountKey))
+            {
+                using var prune = conn.CreateCommand();
+                prune.Transaction = tx;
+                if (altNoDash != null)
+                {
+                    prune.CommandText = """
+                        DELETE FROM shared_run_blueprints
+                        WHERE creator_account_id IN ($aidD, $aidN)
+                          AND share_code NOT IN (
+                              SELECT share_code
+                              FROM shared_run_blueprints
+                              WHERE creator_account_id IN ($aidD, $aidN)
+                              ORDER BY created_at DESC, rowid DESC
+                              LIMIT $keep
+                          );
+                        """;
+                    prune.Parameters.AddWithValue("$aidD", accountKey);
+                    prune.Parameters.AddWithValue("$aidN", altNoDash);
+                    prune.Parameters.AddWithValue("$keep", effectiveMax);
+                }
+                else
+                {
+                    prune.CommandText = """
+                        DELETE FROM shared_run_blueprints
+                        WHERE creator_account_id = $aid
+                          AND share_code NOT IN (
+                              SELECT share_code
+                              FROM shared_run_blueprints
+                              WHERE creator_account_id = $aid
+                              ORDER BY created_at DESC, rowid DESC
+                              LIMIT $keep
+                          );
+                        """;
+                    prune.Parameters.AddWithValue("$aid", accountKey);
+                    prune.Parameters.AddWithValue("$keep", effectiveMax);
+                }
+                prune.ExecuteNonQuery();
+            }
+
+            return (assignedCode, createdAtUtc);
+        });
+    }
+
+    /// <summary>按短码加载完整分享蓝图记录（自动去空白并转大写）。</summary>
+    public SharedBlueprintRecord? LoadSharedBlueprint(string shortCode)
+    {
+        if (string.IsNullOrWhiteSpace(shortCode)) return null;
+        string normalized = shortCode.Trim().ToUpperInvariant();
+
+        return ExecuteRead<SharedBlueprintRecord?>(conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT share_code, creator_account_id, creator_username, title, export_scope,
+                       hero, seed_text, master_seed, blueprint_gzip, import_count, created_at
+                FROM shared_run_blueprints
+                WHERE share_code = $code
+                LIMIT 1;
+                """;
+            cmd.Parameters.AddWithValue("$code", normalized);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+
+            byte[] gzip = r.IsDBNull(8) ? Array.Empty<byte>() : (r.GetValue(8) as byte[] ?? Array.Empty<byte>());
+            return new SharedBlueprintRecord(
+                r.GetString(0),
+                r.GetString(1),
+                r.GetString(2),
+                r.GetString(3),
+                r.GetString(4),
+                r.GetString(5),
+                r.GetString(6),
+                r.GetInt32(7),
+                gzip,
+                r.GetInt32(9),
+                ParseUtc(r.GetString(10)));
+        });
+    }
+
+    /// <summary>列出指定账号发布的分享蓝图轻量摘要（不含 BLOB，按 created_at 降序）。</summary>
+    public List<SharedBlueprintSummaryRecord> ListSharedBlueprintsByCreator(string creatorAccountId)
+    {
+        var (canonical, altNoDash) = ResolveAccountIdCandidates(creatorAccountId);
+        if (string.IsNullOrEmpty(canonical)) return new List<SharedBlueprintSummaryRecord>();
+
+        return ExecuteRead(conn =>
+        {
+            var list = new List<SharedBlueprintSummaryRecord>();
+            using var cmd = conn.CreateCommand();
+            if (altNoDash != null)
+            {
+                cmd.CommandText = """
+                    SELECT share_code, creator_account_id, creator_username, title, export_scope,
+                           hero, seed_text, master_seed, import_count, created_at
+                    FROM shared_run_blueprints
+                    WHERE creator_account_id IN ($aidD, $aidN)
+                    ORDER BY created_at DESC, rowid DESC;
+                    """;
+                cmd.Parameters.AddWithValue("$aidD", canonical);
+                cmd.Parameters.AddWithValue("$aidN", altNoDash);
+            }
+            else
+            {
+                cmd.CommandText = """
+                    SELECT share_code, creator_account_id, creator_username, title, export_scope,
+                           hero, seed_text, master_seed, import_count, created_at
+                    FROM shared_run_blueprints
+                    WHERE creator_account_id = $aid
+                    ORDER BY created_at DESC, rowid DESC;
+                    """;
+                cmd.Parameters.AddWithValue("$aid", canonical);
+            }
+
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                list.Add(new SharedBlueprintSummaryRecord(
+                    r.GetString(0),
+                    r.GetString(1),
+                    r.GetString(2),
+                    r.GetString(3),
+                    r.GetString(4),
+                    r.GetString(5),
+                    r.GetString(6),
+                    r.GetInt32(7),
+                    r.GetInt32(8),
+                    ParseUtc(r.GetString(9))));
+            }
+            return list;
+        });
+    }
+
+    /// <summary>将指定短码的导入计数加 1，返回是否命中记录。</summary>
+    public bool IncrementSharedBlueprintImportCount(string shortCode)
+    {
+        if (string.IsNullOrWhiteSpace(shortCode)) return false;
+        string normalized = shortCode.Trim().ToUpperInvariant();
+
+        return ExecuteWrite((conn, tx) =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                UPDATE shared_run_blueprints
+                SET import_count = import_count + 1
+                WHERE share_code = $code;
+                """;
+            cmd.Parameters.AddWithValue("$code", normalized);
+            return cmd.ExecuteNonQuery() > 0;
+        });
+    }
+
+    /// <summary>删除指定账号自己创建的分享蓝图（仅删本人，返回是否命中删除）。</summary>
+    public bool DeleteSharedBlueprint(string creatorAccountId, string shortCode)
+    {
+        var (canonical, altNoDash) = ResolveAccountIdCandidates(creatorAccountId);
+        if (string.IsNullOrEmpty(canonical) || string.IsNullOrWhiteSpace(shortCode))
+            return false;
+        string normalized = shortCode.Trim().ToUpperInvariant();
+
+        return ExecuteWrite((conn, tx) =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            if (altNoDash != null)
+            {
+                cmd.CommandText = """
+                    DELETE FROM shared_run_blueprints
+                    WHERE share_code = $code AND creator_account_id IN ($aidD, $aidN);
+                    """;
+                cmd.Parameters.AddWithValue("$code", normalized);
+                cmd.Parameters.AddWithValue("$aidD", canonical);
+                cmd.Parameters.AddWithValue("$aidN", altNoDash);
+            }
+            else
+            {
+                cmd.CommandText = """
+                    DELETE FROM shared_run_blueprints
+                    WHERE share_code = $code AND creator_account_id = $aid;
+                    """;
+                cmd.Parameters.AddWithValue("$code", normalized);
+                cmd.Parameters.AddWithValue("$aid", canonical);
+            }
+            return cmd.ExecuteNonQuery() > 0;
+        });
+    }
+
+    // ── 存储空间治理（过期令牌/回放二进制/超限聊天/归档大厅/单局幽灵定期裁剪）──
 
     public sealed record StorageMaintenanceReport(
         int DeletedExpiredTokens,
         int TrimmedReplayBlobs,
         int DeletedOldChatMessages,
-        int PurgedArchivedLobbies);
+        int PurgedArchivedLobbies,
+        int DeletedRunGhosts = 0);
 
     /// <summary>
     /// 执行定期存储空间治理：
     /// 1. 清理过期超 7 天或已吊销超 1 天的 account_tokens；
     /// 2. 清理超过 30 天或超出 50,000 条上限的旧回放 combat_sim_gzip BLOB（保留轻量摘要 JSON）；
     /// 3. 单频道保留最近 500 条聊天，全服/系统播报保留最近 2,000 条；
-    /// 4. 清理结束/取消超过 14 天的历史锦标赛大厅及附属对阵数据。
+    /// 4. 清理结束/取消超过 14 天的历史锦标赛大厅及附属对阵数据；
+    /// 5. 清理对应对局不存在（且记录早于孤儿宽限期，默认 5 分钟，避免与 StartRun 落盘窗口竞态）或已结束超过 30 天的 run_ghosts 行。
     /// </summary>
     public StorageMaintenanceReport RunStorageMaintenance(
         DateTime? nowUtc = null,
@@ -2056,13 +2894,19 @@ public sealed partial class Persistence : IDisposable
         int maxReplayBlobs = 50000,
         int maxLobbyChatPerChannel = 500,
         int maxGlobalChatMessages = 2000,
-        int archivedLobbyRetentionDays = 14)
+        int archivedLobbyRetentionDays = 14,
+        TimeSpan? orphanRunGhostGrace = null)
     {
         DateTime now = nowUtc ?? DateTime.UtcNow;
         string tokenCutoff = now.AddDays(-7).ToString("O");
         string revokedCutoff = now.AddDays(-1).ToString("O");
         string replayCutoff = now.AddDays(-Math.Max(1, replayBlobRetentionDays)).ToString("O");
         string lobbyCutoff = now.AddDays(-Math.Max(1, archivedLobbyRetentionDays)).ToString("O");
+        string runGhostCutoff = now.AddDays(-30).ToString("O");
+        TimeSpan effectiveOrphanGrace = orphanRunGhostGrace ?? TimeSpan.FromMinutes(5);
+        string? orphanRunGhostCutoff = effectiveOrphanGrace > TimeSpan.Zero
+            ? now.Subtract(effectiveOrphanGrace).ToString("O")
+            : null;
 
         return ExecuteWrite((conn, tx) =>
         {
@@ -2191,7 +3035,50 @@ public sealed partial class Persistence : IDisposable
                 }
             }
 
-            return new StorageMaintenanceReport(deletedTokens, trimmedBlobs, deletedChat, staleLobbyIds.Count);
+            // 清理对应 runs 行不存在（需满足孤儿宽限期，防与 StartRun 先写 pinned 后写 runs 竞态），或对应对局已结束超过 30 天的 run_ghosts 记录
+            int deletedRunGhosts;
+            using (var delGhosts = conn.CreateCommand())
+            {
+                delGhosts.Transaction = tx;
+                if (orphanRunGhostCutoff != null)
+                {
+                    delGhosts.CommandText = """
+                        DELETE FROM run_ghosts
+                        WHERE (
+                            recorded_at < $orphanCut
+                            AND NOT EXISTS (
+                                SELECT 1 FROM runs r WHERE r.run_id = run_ghosts.run_id
+                            )
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM runs r
+                            WHERE r.run_id = run_ghosts.run_id
+                              AND (r.is_ended = 1 OR r.state IN (3, 4, 10))
+                              AND r.saved_at < $runGhostCut
+                        );
+                        """;
+                    delGhosts.Parameters.AddWithValue("$orphanCut", orphanRunGhostCutoff);
+                }
+                else
+                {
+                    delGhosts.CommandText = """
+                        DELETE FROM run_ghosts
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM runs r WHERE r.run_id = run_ghosts.run_id
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM runs r
+                            WHERE r.run_id = run_ghosts.run_id
+                              AND (r.is_ended = 1 OR r.state IN (3, 4, 10))
+                              AND r.saved_at < $runGhostCut
+                        );
+                        """;
+                }
+                delGhosts.Parameters.AddWithValue("$runGhostCut", runGhostCutoff);
+                deletedRunGhosts = delGhosts.ExecuteNonQuery();
+            }
+
+            return new StorageMaintenanceReport(deletedTokens, trimmedBlobs, deletedChat, staleLobbyIds.Count, deletedRunGhosts);
         });
     }
 

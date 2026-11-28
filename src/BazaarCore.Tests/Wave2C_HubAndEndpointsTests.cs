@@ -50,7 +50,7 @@ public sealed class Wave2C_HubAndEndpointsTests : IClassFixture<BazaarHubExecuta
         {
             Environment.SetEnvironmentVariable("BAZAAR_CLIENT_PAYLOAD", payloadDir);
             Environment.SetEnvironmentVariable("BAZAAR_MIN_CLIENT_VERSION", "15.0.0");
-            Environment.SetEnvironmentVariable("BAZAAR_MIN_HUB_VERSION", "15.4.0");
+            Environment.SetEnvironmentVariable("BAZAAR_MIN_HUB_VERSION", "15.5.0");
 
             var builder = WebApplication.CreateBuilder(Array.Empty<string>());
             builder.Logging.ClearProviders();
@@ -70,17 +70,17 @@ public sealed class Wave2C_HubAndEndpointsTests : IClassFixture<BazaarHubExecuta
             var root = doc.RootElement;
 
             string serverVer = root.GetProperty("serverVersion").GetString()!;
-            Assert.Equal("15.4.0", serverVer);
+            Assert.Equal("15.5.0", serverVer);
             Assert.DoesNotContain("+", serverVer);
-            Assert.Equal("15.4.0", root.GetProperty("hubVersion").GetString());
+            Assert.Equal("15.5.0", root.GetProperty("hubVersion").GetString());
             Assert.Equal("15.0.0", root.GetProperty("minRequiredVersion").GetString());
-            Assert.Equal("15.4.0", root.GetProperty("minHubVersion").GetString());
+            Assert.Equal("15.5.0", root.GetProperty("minHubVersion").GetString());
 
             var files = root.GetProperty("files").EnumerateArray().ToList();
             var launcherEntry = files.First(f =>
                 string.Equals(f.GetProperty("targetPath").GetString(), "BepInEx/plugins/BazaarLauncher.dll", StringComparison.OrdinalIgnoreCase));
             string fileVer = launcherEntry.GetProperty("fileVersion").GetString()!;
-            Assert.StartsWith("15.4.0", fileVer, StringComparison.Ordinal);
+            Assert.StartsWith("15.5.0", fileVer, StringComparison.Ordinal);
         }
         finally
         {

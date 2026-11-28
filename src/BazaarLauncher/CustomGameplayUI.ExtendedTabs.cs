@@ -131,7 +131,7 @@ internal sealed partial class CustomGameplayUI
         }
     }
 
-    internal void ShowToastBanner(string message, bool isError = false)
+    internal void ShowToastBanner(string message, bool isError = false, float seconds = 3.6f)
     {
         if (string.IsNullOrWhiteSpace(message)) return;
         EnsureHudBuilt();
@@ -145,7 +145,7 @@ internal sealed partial class CustomGameplayUI
         _toastText.color = isError ? NativeUguiFactory.ColErrorText : NativeUguiFactory.ColGold;
         _toastText.text = message;
         _toastGo.SetActive(true);
-        _toastExpireAt = Time.unscaledTime + 3.6f;
+        _toastExpireAt = Time.unscaledTime + Mathf.Clamp(seconds, 1f, 15f);
         if (_hudCanvas != null) _hudCanvas.enabled = true;
     }
 
@@ -375,6 +375,14 @@ internal sealed partial class CustomGameplayUI
                 SendSandboxApi("/api/sandbox/test-combat", new { opponentSource = "self_mirror" }, "沙盒自镜像战斗推演完成");
             }, NativeUguiFactory.ColGold);
         NativeUguiFactory.SetLayout(btnMirrorTest.Root, minW: 140f, prefW: 150f, minH: 30f);
+
+        // v4：把沙盒里搭好的盘面存成对手剧本的某一天
+        var sbRow3 = _ui.CreateHorizontalRow("SandboxLineupRow", _sandboxSectionGo.transform, spacing: 8f);
+        var btnToLineup = _ui.CreateButton("BtnSandboxToLineup", sbRow3.transform, "把当前盘面存成方案某天的对手", 13f,
+            NativeUguiFactory.ColBtnNormal, NativeUguiFactory.ColBtnHover, NativeUguiFactory.ColCream, SpOpenCaptureSandboxPopup, NativeUguiFactory.ColGoldDim);
+        NativeUguiFactory.SetLayout(btnToLineup.Root, minW: 230f, prefW: 240f, minH: 30f);
+        var lineupTip = _ui.CreateText("Tip", sbRow3.transform, "在沙盒里搭好一套阵容存进方案，正常对局就能在那一天遇到它。", 12f, NativeUguiFactory.ColMuted);
+        NativeUguiFactory.SetLayout(lineupTip.gameObject, flexW: 1f, minH: 30f);
 
         _sandboxResultText = _ui.CreateText("SandboxResult", _sandboxSectionGo.transform, "提示：请先在主大厅切换至「沙盒实验室」模式进入对局后使用。", 12.5f, NativeUguiFactory.ColCream);
 

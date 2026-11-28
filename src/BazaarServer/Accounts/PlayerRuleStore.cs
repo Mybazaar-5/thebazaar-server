@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using BazaarCore.Models;
+using BazaarServer.Mods;
 using BazaarServer.Storage;
 
 namespace BazaarServer.Accounts;
@@ -19,12 +20,14 @@ public sealed class PlayerRuleStore
     };
 
     private readonly Persistence _persistence;
+    private readonly ServerModHost? _modHost;
     private readonly ConcurrentDictionary<string, CustomRunRuleSet> _cache = new(StringComparer.OrdinalIgnoreCase);
     private readonly object[] _stripeLocks = Enumerable.Range(0, 64).Select(_ => new object()).ToArray();
 
-    public PlayerRuleStore(Persistence persistence)
+    public PlayerRuleStore(Persistence persistence, ServerModHost? modHost = null)
     {
         _persistence = persistence ?? throw new ArgumentNullException(nameof(persistence));
+        _modHost = modHost;
     }
 
     public CustomRunRuleSet Get(Guid accountId) => Get(accountId.ToString("D"));
@@ -37,17 +40,17 @@ public sealed class PlayerRuleStore
             return new CustomRunRuleSet();
 
         if (_cache.TryGetValue(key, out var cached))
-            return cached.CloneNormalized();
+            return NormalizeRules(cached);
 
         lock (GetStripeLock(key))
         {
             if (_cache.TryGetValue(key, out cached))
-                return cached.CloneNormalized();
+                return NormalizeRules(cached);
 
             string json = _persistence.LoadAccountCustomRules(key);
-            var loaded = ParseOrDefault(json).CloneNormalized();
+            var loaded = NormalizeRules(ParseOrDefault(json));
             _cache[key] = loaded;
-            return loaded.CloneNormalized();
+            return NormalizeRules(loaded);
         }
     }
 
@@ -61,7 +64,7 @@ public sealed class PlayerRuleStore
         if (string.IsNullOrEmpty(key))
             throw new ArgumentException("AccountId cannot be empty.", nameof(accountId));
 
-        var normalized = (rules ?? new CustomRunRuleSet()).CloneNormalized();
+        var normalized = NormalizeRules(rules);
         string json = JsonSerializer.Serialize(normalized, JsonOpts);
 
         lock (GetStripeLock(key))
@@ -70,7 +73,18 @@ public sealed class PlayerRuleStore
             _cache[key] = normalized;
         }
 
-        return normalized.CloneNormalized();
+        return NormalizeRules(normalized);
+    }
+
+    private CustomRunRuleSet NormalizeRules(CustomRunRuleSet? rules)
+    {
+        var source = rules ?? new CustomRunRuleSet();
+        if (_modHost == null)
+            return source.CloneNormalized();
+
+        var extra = _modHost.GetAllAvailableMutators(source.SelectedModIds)
+            .ToDictionary(m => m.Id, StringComparer.OrdinalIgnoreCase);
+        return source.CloneNormalized(extra, preserveUnregisteredMutators: false);
     }
 
     public CustomRunRuleSet Reset(Guid accountId) => Reset(accountId.ToString("D"));

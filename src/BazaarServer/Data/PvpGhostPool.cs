@@ -148,6 +148,8 @@ public sealed class PvpGhostPool
         public string Source { get; init; } = "";
         public string Persona { get; init; } = "";
         public string Archetype { get; init; } = "";
+        /// <summary>自定义对手展示名牌（可选，≤24 字；null 表示使用默认英雄名）。</summary>
+        public string? DisplayName { get; init; }
         public bool IsPlayerGhost { get; init; }
         public bool IsCustomRule { get; init; }
         public string PoolPartition { get; init; } = StandardPartition;
@@ -195,6 +197,21 @@ public sealed class PvpGhostPool
     private const byte PowerBucketWeak = 2;
     private const byte PowerBucketMetaBoss = 3;
 
+    private const byte HeroCodeUnknown = 0;
+    private const byte HeroCodeVanessa = 1;
+    private const byte HeroCodePygmalien = 2;
+    private const byte HeroCodeDooley = 3;
+    private const byte HeroCodeMak = 4;
+    private const byte HeroCodeJules = 5;
+    private const byte HeroCodeStelle = 6;
+    private const byte HeroCodeKarnok = 7;
+    private const byte HeroCodeHero8 = 8;
+
+    private const byte SourceCodeUnknown = 0;
+    private const byte SourceCodeCommunity = 1;
+    private const byte SourceCodePlayer = 2;
+    private const byte SourceCodeAi = 3;
+
     public const int DefaultLruCacheCapacity = 256;
 
     /// <summary>
@@ -212,6 +229,8 @@ public sealed class PvpGhostPool
         public byte Level { get; init; }
         public byte Wins { get; init; }
         public byte PowerBucketCode { get; init; }
+        public byte HeroCode { get; init; }
+        public byte SourceCode { get; init; }
         public GhostEntryFlags Flags { get; init; }
         public GhostBoard? InMemoryBoard { get; init; }
 
@@ -237,10 +256,29 @@ public sealed class PvpGhostPool
         public required FrozenDictionary<BucketKey, DayPartitionBucket> Buckets { get; init; }
         public required GhostIndexEntry[] StandardAll { get; init; }
         public required GhostIndexEntry[] HighDayStrongOrMeta { get; init; }
+        public required GhostIndexEntry[] AllEntries { get; init; }
+        public required FrozenDictionary<string, GhostIndexEntry> ByBoardId { get; init; }
         public required int TotalCount { get; init; }
         public required int PlayerGhostCount { get; init; }
         public required int CustomRuleGhostCount { get; init; }
         public required int DiskIndexedCount { get; init; }
+    }
+
+    /// <summary>按 (SourceFilePath, FileOffset) 持久化的磁盘 JSONL 模板编号缓存（跨快照复用，避免真人镜像入池触发重扫磁盘）。</summary>
+    private sealed class DiskKeywordCache
+    {
+        public required string SourceFilePath { get; init; }
+        public required FrozenDictionary<string, int> TemplateToCode { get; init; }
+        public required FrozenDictionary<long, int[]> CodesByFileOffset { get; init; }
+    }
+
+    /// <summary>绑定到特定 <see cref="GhostIndexSnapshot"/> 实例的紧凑物品/技能模板关键词索引（懒加载）。</summary>
+    private sealed class KeywordIndexData
+    {
+        public required GhostIndexSnapshot BoundSnapshot { get; init; }
+        public DiskKeywordCache? DiskCache { get; init; }
+        public required FrozenDictionary<string, int> TemplateToCode { get; init; }
+        public required int[][] EntryTemplateCodes { get; init; }
     }
 
     /// <summary>有界线程安全 LRU 热点缓存（按 FileOffset 键缓存按需反序列化的 GhostBoard，锁内仅操作 O(1) 字典与链表指针）。</summary>
@@ -328,9 +366,13 @@ public sealed class PvpGhostPool
     private readonly HashSet<string> _knownBoardIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _writeLock = new();
     private readonly BoundedGhostLruCache _lru;
-    private string? _sourceFilePath;
+    private volatile string? _sourceFilePath;
 
     private volatile GhostIndexSnapshot _index = BuildEmptySnapshot();
+    private readonly object _keywordIndexLock = new();
+    private volatile KeywordIndexData? _keywordIndex;
+    private volatile DiskKeywordCache? _diskKeywordCache;
+    private bool _keywordIndexBuilding;
 
     public PvpGhostPool()
         : this(DefaultLruCacheCapacity)
@@ -478,6 +520,75 @@ public sealed class PvpGhostPool
         if (powerBucket.Equals("Weak", StringComparison.OrdinalIgnoreCase)) return PowerBucketWeak;
         if (powerBucket.Equals("MetaBoss", StringComparison.OrdinalIgnoreCase)) return PowerBucketMetaBoss;
         return PowerBucketNormal;
+    }
+
+    private static bool TryEncodePowerBucket(string? powerBucket, out byte code)
+    {
+        if (string.IsNullOrWhiteSpace(powerBucket))
+        {
+            code = PowerBucketNormal;
+            return false;
+        }
+        string s = powerBucket.Trim();
+        if (s.Equals("Normal", StringComparison.OrdinalIgnoreCase)) { code = PowerBucketNormal; return true; }
+        if (s.Equals("Strong", StringComparison.OrdinalIgnoreCase)) { code = PowerBucketStrong; return true; }
+        if (s.Equals("Weak", StringComparison.OrdinalIgnoreCase)) { code = PowerBucketWeak; return true; }
+        if (s.Equals("MetaBoss", StringComparison.OrdinalIgnoreCase)) { code = PowerBucketMetaBoss; return true; }
+        code = PowerBucketNormal;
+        return false;
+    }
+
+    private static byte EncodeHeroCode(string? hero)
+    {
+        if (string.IsNullOrWhiteSpace(hero)) return HeroCodeUnknown;
+        string s = hero.Trim();
+        if (s.Equals(HeroNames.Vanessa, StringComparison.OrdinalIgnoreCase)) return HeroCodeVanessa;
+        if (s.Equals(HeroNames.Pygmalien, StringComparison.OrdinalIgnoreCase)) return HeroCodePygmalien;
+        if (s.Equals(HeroNames.Dooley, StringComparison.OrdinalIgnoreCase)) return HeroCodeDooley;
+        if (s.Equals(HeroNames.Mak, StringComparison.OrdinalIgnoreCase)) return HeroCodeMak;
+        if (s.Equals(HeroNames.Jules, StringComparison.OrdinalIgnoreCase)) return HeroCodeJules;
+        if (s.Equals(HeroNames.Stelle, StringComparison.OrdinalIgnoreCase)) return HeroCodeStelle;
+        if (s.Equals(HeroNames.Karnok, StringComparison.OrdinalIgnoreCase)) return HeroCodeKarnok;
+        if (s.Equals(HeroNames.Hero8, StringComparison.OrdinalIgnoreCase)) return HeroCodeHero8;
+        return HeroCodeUnknown;
+    }
+
+    private static byte EncodeSourceCode(bool isPlayerGhost, string? source)
+    {
+        if (isPlayerGhost)
+            return SourceCodePlayer;
+        if (string.IsNullOrWhiteSpace(source))
+            return SourceCodeUnknown;
+
+        string s = source.Trim();
+        if (IsRealCommunitySource(s) || s.Equals("community", StringComparison.OrdinalIgnoreCase))
+            return SourceCodeCommunity;
+        if (s.Equals("player", StringComparison.OrdinalIgnoreCase)
+            || s.StartsWith("player_", StringComparison.OrdinalIgnoreCase))
+            return SourceCodePlayer;
+        if (s.Equals("ai", StringComparison.OrdinalIgnoreCase)
+            || s.StartsWith("ai_", StringComparison.OrdinalIgnoreCase)
+            || s.StartsWith("synthetic", StringComparison.OrdinalIgnoreCase)
+            || s.StartsWith("selfplay", StringComparison.OrdinalIgnoreCase)
+            || s.StartsWith("bot", StringComparison.OrdinalIgnoreCase)
+            || s.Equals("fallback", StringComparison.OrdinalIgnoreCase))
+            return SourceCodeAi;
+        return SourceCodeUnknown;
+    }
+
+    private static bool TryEncodeSourceFilter(string? source, out byte code)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            code = SourceCodeUnknown;
+            return false;
+        }
+        string s = source.Trim();
+        if (s.Equals("community", StringComparison.OrdinalIgnoreCase)) { code = SourceCodeCommunity; return true; }
+        if (s.Equals("player", StringComparison.OrdinalIgnoreCase)) { code = SourceCodePlayer; return true; }
+        if (s.Equals("ai", StringComparison.OrdinalIgnoreCase)) { code = SourceCodeAi; return true; }
+        code = SourceCodeUnknown;
+        return false;
     }
 
     private static bool MatchesPowerBucketCode(byte code, string[] buckets)
@@ -747,6 +858,8 @@ public sealed class PvpGhostPool
                 Level = (byte)Math.Clamp(level, 1, byte.MaxValue),
                 Wins = (byte)Math.Clamp(wins, 0, byte.MaxValue),
                 PowerBucketCode = pbCode,
+                HeroCode = EncodeHeroCode(hero),
+                SourceCode = EncodeSourceCode(isPlayerGhost, source),
                 Flags = flags,
                 InMemoryBoard = null,
             };
@@ -783,6 +896,8 @@ public sealed class PvpGhostPool
             Level = (byte)Math.Clamp(board.Level, 1, byte.MaxValue),
             Wins = (byte)Math.Clamp(board.Wins, 0, byte.MaxValue),
             PowerBucketCode = pbCode,
+            HeroCode = EncodeHeroCode(board.Hero),
+            SourceCode = EncodeSourceCode(board.IsPlayerGhost, board.Source),
             Flags = flags,
             InMemoryBoard = board,
         };
@@ -797,6 +912,22 @@ public sealed class PvpGhostPool
 
         if (_lru.TryGet(entry.FileOffset, out var cached) && cached != null)
             return cached;
+
+        var board = MaterializeEntryNoCache(entry);
+        if (board != null)
+            _lru.Put(entry.FileOffset, board);
+        return board;
+    }
+
+    /// <summary>
+    /// 按磁盘偏移或内存引用实体化单条镜像盘面，但不读写热点 LRU 缓存（供编排台搜索与单条预览复用，避免污染战斗热缓存）。
+    /// </summary>
+    private GhostBoard? MaterializeEntryNoCache(GhostIndexEntry entry)
+    {
+        if (entry.InMemoryBoard != null)
+            return entry.InMemoryBoard;
+        if (!entry.IsDiskBacked)
+            return null;
 
         string? filePath = _sourceFilePath;
         if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
@@ -825,10 +956,7 @@ public sealed class PvpGhostPool
             if (totalRead != entry.ByteLength)
                 return null;
 
-            var board = ParseLineUtf8(rented.AsSpan(0, totalRead));
-            if (board != null)
-                _lru.Put(entry.FileOffset, board);
-            return board;
+            return ParseLineUtf8(rented.AsSpan(0, totalRead));
         }
         catch
         {
@@ -838,6 +966,1270 @@ public sealed class PvpGhostPool
         {
             ArrayPool<byte>.Shared.Return(rented);
         }
+    }
+
+    /// <summary>按 BoardId O(1) 查询单条镜像盘面（包含磁盘静态池与内存真人镜像），读取时不污染战斗 LRU 缓存。</summary>
+    public GhostBoard? GetGhostById(string boardId)
+        => GetGhostById(boardId, effectiveRepo: null);
+
+    /// <summary>按 BoardId O(1) 查询单条镜像盘面，可选按 <paramref name="effectiveRepo"/> 补齐缺失的物品/技能中英文名（不污染 LRU）。</summary>
+    public GhostBoard? GetGhostById(string boardId, GameDataRepository? effectiveRepo)
+    {
+        if (string.IsNullOrWhiteSpace(boardId))
+            return null;
+
+        var snap = _index;
+        if (!snap.ByBoardId.TryGetValue(boardId.Trim(), out var entry))
+            return null;
+
+        var board = MaterializeEntryNoCache(entry);
+        if (board == null)
+            return null;
+
+        return EnrichBoardNamesIfNeeded(board, effectiveRepo);
+    }
+
+    /// <summary>
+    /// 在内存索引快照上按多维条件搜索 PvP 镜像池（支持懒加载物品/技能关键词索引、可选 Mod 过滤、不污染战斗 LRU 缓存）。
+    /// 每页上限 20 条，总命中上限 500 条（超限时 <see cref="GhostPoolSearchResult.Truncated"/> 为 true）。
+    /// </summary>
+    public GhostPoolSearchResult SearchGhosts(
+        GhostPoolSearchRequest req,
+        GameDataRepository? effectiveRepo = null,
+        IReadOnlySet<string>? allowedModIds = null,
+        Func<string, string?>? resolveTemplateModId = null)
+    {
+        req ??= new GhostPoolSearchRequest();
+        const int MaxSearchResults = 500;
+        int page = Math.Max(1, req.Page);
+        int pageSize = req.PageSize <= 0 ? 20 : Math.Min(req.PageSize, 20);
+
+        GhostPoolSearchResult EmptyResult(bool indexBuilding = false) => new()
+        {
+            Total = 0,
+            Page = page,
+            PageSize = pageSize,
+            Truncated = false,
+            IndexBuilding = indexBuilding,
+            Items = new List<GhostBoard>(),
+        };
+
+        var snap = _index;
+        if (snap.TotalCount == 0)
+            return EmptyResult();
+
+        int? dayFilter = req.Day;
+        if (dayFilter.HasValue && dayFilter.Value <= 0)
+            return EmptyResult();
+
+        byte heroFilter = HeroCodeUnknown;
+        if (!string.IsNullOrWhiteSpace(req.Hero))
+        {
+            heroFilter = EncodeHeroCode(req.Hero);
+            if (heroFilter == HeroCodeUnknown)
+                return EmptyResult();
+        }
+
+        byte? powerFilter = null;
+        if (!string.IsNullOrWhiteSpace(req.PowerBucket))
+        {
+            if (!TryEncodePowerBucket(req.PowerBucket, out byte pb))
+                return EmptyResult();
+            powerFilter = pb;
+        }
+
+        byte? sourceFilter = null;
+        if (!string.IsNullOrWhiteSpace(req.Source))
+        {
+            if (!TryEncodeSourceFilter(req.Source, out byte sc))
+                return EmptyResult();
+            sourceFilter = sc;
+        }
+
+        string? partitionFilter = string.IsNullOrWhiteSpace(req.Partition)
+            ? null
+            : req.Partition.Trim().ToLowerInvariant();
+
+        int? hpMin = req.HpMin;
+        int? hpMax = req.HpMax;
+        if (hpMin.HasValue && hpMax.HasValue && hpMin.Value > hpMax.Value)
+            return EmptyResult();
+
+        int? levelMin = req.LevelMin;
+        int? levelMax = req.LevelMax;
+        if (levelMin.HasValue && levelMax.HasValue && levelMin.Value > levelMax.Value)
+            return EmptyResult();
+
+        string? keyword = string.IsNullOrWhiteSpace(req.Keyword) ? null : req.Keyword.Trim();
+        KeywordIndexData? kwIndex = null;
+        HashSet<int>? matchedTemplateCodes = null;
+        int singleMatchedCode = -1;
+
+        if (keyword != null)
+        {
+            if (!TryGetOrStartKeywordIndex(snap, out kwIndex) || kwIndex == null)
+                return EmptyResult(indexBuilding: true);
+
+            matchedTemplateCodes = ResolveMatchedTemplateCodes(kwIndex, keyword, effectiveRepo, out singleMatchedCode);
+            if (matchedTemplateCodes.Count == 0)
+                return EmptyResult();
+        }
+
+        bool hasModFilter = allowedModIds != null && resolveTemplateModId != null;
+        Dictionary<string, bool>? templateAllowedCache = hasModFilter
+            ? new Dictionary<string, bool>(64, StringComparer.Ordinal)
+            : null;
+
+        bool IsTemplateAllowedCached(string? templateId)
+        {
+            if (string.IsNullOrWhiteSpace(templateId))
+                return true;
+            if (templateAllowedCache!.TryGetValue(templateId, out bool cached))
+                return cached;
+            bool allowed = IsTemplateAllowedByMods(templateId, allowedModIds!, resolveTemplateModId!);
+            templateAllowedCache[templateId] = allowed;
+            return allowed;
+        }
+
+        bool IsBoardAllowedCached(GhostBoard board)
+        {
+            if (board.Items != null)
+            {
+                for (int j = 0; j < board.Items.Count; j++)
+                {
+                    if (!IsTemplateAllowedCached(board.Items[j]?.TemplateId))
+                        return false;
+                }
+            }
+            if (board.Skills != null)
+            {
+                for (int j = 0; j < board.Skills.Count; j++)
+                {
+                    if (!IsTemplateAllowedCached(board.Skills[j]?.TemplateId))
+                        return false;
+                }
+            }
+            if (board.SocketEffects != null)
+            {
+                for (int j = 0; j < board.SocketEffects.Count; j++)
+                {
+                    if (!IsTemplateAllowedCached(board.SocketEffects[j]?.TemplateId))
+                        return false;
+                }
+            }
+            return true;
+        }
+
+        KeywordIndexData? modFilterKwIndex = null;
+        HashSet<int>? disallowedTemplateCodes = null;
+        int singleDisallowedCode = -1;
+
+        if (hasModFilter)
+        {
+            var existingKw = kwIndex ?? TryGetReadyKeywordIndexWithoutDiskScan(snap);
+            if (existingKw != null && ReferenceEquals(existingKw.BoundSnapshot, snap))
+            {
+                modFilterKwIndex = existingKw;
+                foreach (var (tid, code) in existingKw.TemplateToCode)
+                {
+                    if (!IsTemplateAllowedCached(tid))
+                    {
+                        disallowedTemplateCodes ??= new HashSet<int>();
+                        disallowedTemplateCodes.Add(code);
+                    }
+                }
+                if (disallowedTemplateCodes is { Count: 1 })
+                {
+                    foreach (int c in disallowedTemplateCodes)
+                        singleDisallowedCode = c;
+                }
+            }
+        }
+
+        var allEntries = snap.AllEntries;
+        int skip = (page - 1) * pageSize;
+        var pageEntries = new List<GhostIndexEntry>(pageSize);
+        List<GhostBoard>? preMaterializedPage = null;
+        int matchedCount = 0;
+        bool truncated = false;
+
+        // 当启用 Mod 过滤且磁盘关键词索引尚未就绪时，按单句柄直检磁盘行模板（不写 LRU），
+        // 避免先把未验证的磁盘项计入 matchedCount 后再在翻页实体化时剔除导致 Total/单页条数错位。
+        bool needDiskModCheck = hasModFilter && modFilterKwIndex == null && snap.DiskIndexedCount > 0;
+        Func<string?, bool>? isTemplateAllowedDelegate = needDiskModCheck ? IsTemplateAllowedCached : null;
+        SafeFileHandle? diskModHandle = null;
+        byte[]? diskModBuf = null;
+        string? diskFilePath = needDiskModCheck ? _sourceFilePath : null;
+        bool diskFileUnavailable = false;
+
+        try
+        {
+            for (int i = 0; i < allEntries.Length; i++)
+            {
+                var e = allEntries[i];
+                if (dayFilter.HasValue && e.Day != dayFilter.Value) continue;
+                if (heroFilter != HeroCodeUnknown && e.HeroCode != heroFilter) continue;
+                if (powerFilter.HasValue && e.PowerBucketCode != powerFilter.Value) continue;
+                if (sourceFilter.HasValue && e.SourceCode != sourceFilter.Value) continue;
+                if (partitionFilter != null && !string.Equals(e.Partition, partitionFilter, StringComparison.OrdinalIgnoreCase)) continue;
+                if (hpMin.HasValue && e.HealthMax < hpMin.Value) continue;
+                if (hpMax.HasValue && e.HealthMax > hpMax.Value) continue;
+                if (levelMin.HasValue && e.Level < levelMin.Value) continue;
+                if (levelMax.HasValue && e.Level > levelMax.Value) continue;
+
+                if (matchedTemplateCodes != null)
+                {
+                    var codes = kwIndex!.EntryTemplateCodes[i];
+                    if (!HasAnyTemplateCode(codes, matchedTemplateCodes, singleMatchedCode))
+                        continue;
+                }
+
+                GhostBoard? preParsedDiskBoard = null;
+
+                if (hasModFilter)
+                {
+                    if (e.InMemoryBoard != null)
+                    {
+                        if (!IsBoardAllowedCached(e.InMemoryBoard))
+                            continue;
+                    }
+                    else if (modFilterKwIndex != null)
+                    {
+                        if (disallowedTemplateCodes is { Count: > 0 })
+                        {
+                            var codes = modFilterKwIndex.EntryTemplateCodes[i];
+                            if (HasAnyTemplateCode(codes, disallowedTemplateCodes, singleDisallowedCode))
+                                continue;
+                        }
+                    }
+                    else if (e.IsDiskBacked)
+                    {
+                        if (diskFileUnavailable)
+                            continue;
+
+                        if (diskModHandle == null)
+                        {
+                            if (string.IsNullOrEmpty(diskFilePath) || !File.Exists(diskFilePath))
+                            {
+                                diskFileUnavailable = true;
+                                continue;
+                            }
+                            try
+                            {
+                                diskModHandle = File.OpenHandle(
+                                    diskFilePath,
+                                    FileMode.Open,
+                                    FileAccess.Read,
+                                    FileShare.ReadWrite | FileShare.Delete,
+                                    FileOptions.RandomAccess);
+                            }
+                            catch
+                            {
+                                diskFileUnavailable = true;
+                                continue;
+                            }
+                        }
+
+                        if (diskModBuf == null || diskModBuf.Length < e.ByteLength)
+                        {
+                            if (diskModBuf != null)
+                                ArrayPool<byte>.Shared.Return(diskModBuf);
+                            diskModBuf = ArrayPool<byte>.Shared.Rent(Math.Max(e.ByteLength, 8192));
+                        }
+
+                        int totalRead = 0;
+                        try
+                        {
+                            while (totalRead < e.ByteLength)
+                            {
+                                int n = RandomAccess.Read(
+                                    diskModHandle,
+                                    diskModBuf.AsSpan(totalRead, e.ByteLength - totalRead),
+                                    e.FileOffset + totalRead);
+                                if (n <= 0) break;
+                                totalRead += n;
+                            }
+                        }
+                        catch
+                        {
+                            continue;
+                        }
+
+                        if (totalRead != e.ByteLength)
+                            continue;
+
+                        ReadOnlySpan<byte> lineSpan = diskModBuf.AsSpan(0, totalRead);
+                        if (!IsUtf8LineAllowedByMods(lineSpan, isTemplateAllowedDelegate!))
+                            continue;
+
+                        if (matchedCount < MaxSearchResults
+                            && matchedCount >= skip
+                            && (preMaterializedPage?.Count ?? 0) < pageSize)
+                        {
+                            preParsedDiskBoard = ParseLineUtf8(lineSpan);
+                            if (preParsedDiskBoard == null)
+                                continue;
+                        }
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                }
+
+                if (matchedCount >= MaxSearchResults)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                if (matchedCount >= skip)
+                {
+                    if (needDiskModCheck)
+                    {
+                        preMaterializedPage ??= new List<GhostBoard>(pageSize);
+                        if (preMaterializedPage.Count < pageSize)
+                        {
+                            var readyBoard = preParsedDiskBoard ?? e.InMemoryBoard;
+                            if (readyBoard != null)
+                                preMaterializedPage.Add(EnrichBoardNamesIfNeeded(readyBoard, effectiveRepo));
+                        }
+                    }
+                    else if (pageEntries.Count < pageSize)
+                    {
+                        pageEntries.Add(e);
+                    }
+                }
+
+                matchedCount++;
+            }
+        }
+        finally
+        {
+            diskModHandle?.Dispose();
+            if (diskModBuf != null)
+                ArrayPool<byte>.Shared.Return(diskModBuf);
+        }
+
+        List<GhostBoard> items;
+        if (needDiskModCheck)
+        {
+            items = preMaterializedPage ?? new List<GhostBoard>();
+        }
+        else
+        {
+            items = new List<GhostBoard>(pageEntries.Count);
+            for (int i = 0; i < pageEntries.Count; i++)
+            {
+                var board = MaterializeEntryNoCache(pageEntries[i]);
+                if (board == null)
+                    continue;
+                if (hasModFilter && !IsBoardAllowedCached(board))
+                    continue;
+                items.Add(EnrichBoardNamesIfNeeded(board, effectiveRepo));
+            }
+        }
+
+        return new GhostPoolSearchResult
+        {
+            Total = matchedCount,
+            Page = page,
+            PageSize = pageSize,
+            Truncated = truncated,
+            IndexBuilding = false,
+            Items = items,
+        };
+    }
+
+    private KeywordIndexData? TryGetReadyKeywordIndexWithoutDiskScan(GhostIndexSnapshot snap)
+    {
+        var current = _keywordIndex;
+        if (current != null && ReferenceEquals(current.BoundSnapshot, snap))
+            return current;
+
+        if (snap.TotalCount == 0 || snap.DiskIndexedCount == 0 || _diskKeywordCache == null)
+            return null;
+
+        lock (_keywordIndexLock)
+        {
+            current = _keywordIndex;
+            if (current != null && ReferenceEquals(current.BoundSnapshot, snap))
+                return current;
+
+            var incremental = TryBuildKeywordIndexFromDiskCache(snap, _diskKeywordCache, _sourceFilePath, current);
+            if (incremental != null)
+            {
+                _keywordIndex = incremental;
+                return incremental;
+            }
+            return null;
+        }
+    }
+
+    private bool TryGetOrStartKeywordIndex(GhostIndexSnapshot snap, out KeywordIndexData? index)
+    {
+        var current = _keywordIndex;
+        if (current != null && ReferenceEquals(current.BoundSnapshot, snap))
+        {
+            index = current;
+            return true;
+        }
+
+        if (snap.TotalCount == 0)
+        {
+            index = null;
+            return true;
+        }
+
+        bool shouldStart = false;
+        lock (_keywordIndexLock)
+        {
+            current = _keywordIndex;
+            if (current != null && ReferenceEquals(current.BoundSnapshot, snap))
+            {
+                index = current;
+                return true;
+            }
+
+            // 若无磁盘项，或 _sourceFilePath 未变且所有磁盘项 FileOffset 均已命中磁盘缓存，
+            // 直接 O(内存条数) 同步构建新快照索引，绝不重扫磁盘、绝不返回 IndexBuilding = true！
+            string? currentFilePath = _sourceFilePath;
+            var incremental = TryBuildKeywordIndexFromDiskCache(snap, _diskKeywordCache, currentFilePath, current);
+            if (incremental != null)
+            {
+                _keywordIndex = incremental;
+                index = incremental;
+                return true;
+            }
+
+            if (!_keywordIndexBuilding)
+            {
+                _keywordIndexBuilding = true;
+                shouldStart = true;
+            }
+        }
+
+        if (shouldStart)
+        {
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    var targetSnap = snap;
+                    for (int pass = 0; pass < 3; pass++)
+                    {
+                        string? latestFilePath = _sourceFilePath;
+                        var (built, builtDiskCache) = BuildDiskCacheAndKeywordIndex(targetSnap, latestFilePath);
+                        lock (_keywordIndexLock)
+                        {
+                            if (builtDiskCache != null)
+                                _diskKeywordCache = builtDiskCache;
+                            _keywordIndex = built;
+
+                            var latestSnap = _index;
+                            string? afterFilePath = _sourceFilePath;
+                            if ((ReferenceEquals(latestSnap, targetSnap)
+                                 && string.Equals(afterFilePath, latestFilePath, StringComparison.Ordinal))
+                                || latestSnap.TotalCount == 0)
+                            {
+                                _keywordIndexBuilding = false;
+                                return;
+                            }
+
+                            // 后台扫描期间若仅新增内存真人镜像（磁盘缓存已覆盖全部磁盘项），同步完成增量构建即可，不再重扫磁盘
+                            var incremental = TryBuildKeywordIndexFromDiskCache(latestSnap, _diskKeywordCache, afterFilePath, built);
+                            if (incremental != null)
+                            {
+                                _keywordIndex = incremental;
+                                _keywordIndexBuilding = false;
+                                return;
+                            }
+
+                            targetSnap = latestSnap;
+                        }
+                    }
+
+                    lock (_keywordIndexLock)
+                    {
+                        _keywordIndexBuilding = false;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[PvpGhostPool] keyword index build failed: {ex.Message}");
+                    lock (_keywordIndexLock)
+                    {
+                        _keywordIndexBuilding = false;
+                    }
+                }
+            });
+        }
+
+        index = null;
+        return false;
+    }
+
+    /// <summary>
+    /// 尝试仅凭已持久化的磁盘行缓存 <see cref="DiskKeywordCache"/> 与内存 <c>InMemoryBoard</c> 同步构建新快照的关键词索引。
+    /// 若存在未缓存的磁盘项或数据源文件路径变更，返回 <c>null</c> 以回退到单飞后台扫描。
+    /// </summary>
+    private static KeywordIndexData? TryBuildKeywordIndexFromDiskCache(
+        GhostIndexSnapshot snap,
+        DiskKeywordCache? diskCache,
+        string? currentFilePath,
+        KeywordIndexData? prevIndex)
+    {
+        if (snap.DiskIndexedCount > 0)
+        {
+            if (diskCache == null
+                || string.IsNullOrEmpty(currentFilePath)
+                || !string.Equals(diskCache.SourceFilePath, currentFilePath, StringComparison.Ordinal))
+            {
+                return null;
+            }
+        }
+
+        var allEntries = snap.AllEntries;
+        int count = allEntries.Length;
+        var entryCodes = new int[count][];
+
+        bool canReusePrevSlots = prevIndex != null
+            && diskCache != null
+            && ReferenceEquals(prevIndex.DiskCache, diskCache);
+        var prevEntries = canReusePrevSlots ? prevIndex!.BoundSnapshot.AllEntries : null;
+        var prevCodes = canReusePrevSlots ? prevIndex!.EntryTemplateCodes : null;
+
+        var baseTemplateMap = snap.DiskIndexedCount > 0 ? diskCache!.TemplateToCode : null;
+        Dictionary<string, int>? extendedTemplateMap = null;
+
+        int GetOrAddCode(string templateId)
+        {
+            if (extendedTemplateMap == null)
+            {
+                if (baseTemplateMap != null && baseTemplateMap.TryGetValue(templateId, out int existing))
+                    return existing;
+                extendedTemplateMap = baseTemplateMap != null
+                    ? new Dictionary<string, int>(baseTemplateMap, StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, int>(64, StringComparer.OrdinalIgnoreCase);
+            }
+            if (!extendedTemplateMap.TryGetValue(templateId, out int code))
+            {
+                code = extendedTemplateMap.Count;
+                extendedTemplateMap[templateId] = code;
+            }
+            return code;
+        }
+
+        var reusableCodes = new HashSet<int>(16);
+
+        for (int i = 0; i < count; i++)
+        {
+            var e = allEntries[i];
+            if (e.InMemoryBoard != null)
+            {
+                reusableCodes.Clear();
+                var b = e.InMemoryBoard;
+                if (b.Items != null)
+                {
+                    for (int j = 0; j < b.Items.Count; j++)
+                    {
+                        string? tid = b.Items[j]?.TemplateId;
+                        if (!string.IsNullOrWhiteSpace(tid))
+                            reusableCodes.Add(GetOrAddCode(tid));
+                    }
+                }
+                if (b.Skills != null)
+                {
+                    for (int j = 0; j < b.Skills.Count; j++)
+                    {
+                        string? tid = b.Skills[j]?.TemplateId;
+                        if (!string.IsNullOrWhiteSpace(tid))
+                            reusableCodes.Add(GetOrAddCode(tid));
+                    }
+                }
+                entryCodes[i] = reusableCodes.Count > 0 ? reusableCodes.ToArray() : Array.Empty<int>();
+            }
+            else if (e.IsDiskBacked)
+            {
+                if (prevEntries != null && i < prevEntries.Length && ReferenceEquals(prevEntries[i], e))
+                {
+                    entryCodes[i] = prevCodes![i];
+                }
+                else if (diskCache != null && diskCache.CodesByFileOffset.TryGetValue(e.FileOffset, out var cachedCodes))
+                {
+                    entryCodes[i] = cachedCodes;
+                }
+                else
+                {
+                    return null;
+                }
+            }
+            else
+            {
+                entryCodes[i] = Array.Empty<int>();
+            }
+        }
+
+        var finalTemplateMap = extendedTemplateMap != null
+            ? extendedTemplateMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase)
+            : (baseTemplateMap ?? FrozenDictionary<string, int>.Empty);
+
+        return new KeywordIndexData
+        {
+            BoundSnapshot = snap,
+            DiskCache = snap.DiskIndexedCount > 0 ? diskCache : null,
+            TemplateToCode = finalTemplateMap,
+            EntryTemplateCodes = entryCodes,
+        };
+    }
+
+    private static (KeywordIndexData Index, DiskKeywordCache? DiskCache) BuildDiskCacheAndKeywordIndex(
+        GhostIndexSnapshot snap,
+        string? sourceFilePath)
+    {
+        var allEntries = snap.AllEntries;
+        int count = allEntries.Length;
+        var entryCodes = new int[count][];
+        var diskTemplateToCode = new Dictionary<string, int>(2048, StringComparer.OrdinalIgnoreCase);
+
+        int GetOrAddDiskCode(string templateId)
+        {
+            if (!diskTemplateToCode.TryGetValue(templateId, out int code))
+            {
+                code = diskTemplateToCode.Count;
+                diskTemplateToCode[templateId] = code;
+            }
+            return code;
+        }
+
+        Dictionary<string, int>? diskSlotByBoardId = null;
+        Dictionary<long, int>? diskSlotByOffset = null;
+        int diskNeeded = 0;
+
+        for (int i = 0; i < count; i++)
+        {
+            var e = allEntries[i];
+            if (e.IsDiskBacked)
+            {
+                diskNeeded++;
+                if (!string.IsNullOrWhiteSpace(e.BoardId))
+                {
+                    diskSlotByBoardId ??= new Dictionary<string, int>(snap.DiskIndexedCount, StringComparer.OrdinalIgnoreCase);
+                    diskSlotByBoardId.TryAdd(e.BoardId, i);
+                }
+                else
+                {
+                    diskSlotByOffset ??= new Dictionary<long, int>();
+                    diskSlotByOffset[e.FileOffset] = i;
+                }
+            }
+        }
+
+        DiskKeywordCache? newDiskCache = null;
+        var reusableCodes = new HashSet<int>(16);
+
+        if (diskNeeded > 0)
+        {
+            if (string.IsNullOrEmpty(sourceFilePath) || !File.Exists(sourceFilePath))
+                throw new FileNotFoundException("Ghost pool JSONL source file not found.", sourceFilePath);
+
+            var codesByOffset = new Dictionary<long, int[]>(diskNeeded);
+            var reusableLineTemplates = new List<string>(24);
+            using var fs = new FileStream(
+                sourceFilePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                bufferSize: 256 * 1024,
+                FileOptions.SequentialScan);
+
+            byte[] buf = ArrayPool<byte>.Shared.Rent(256 * 1024);
+            try
+            {
+                int buffered = 0;
+                long bufStartOffset = 0;
+                bool isFirstLine = true;
+
+                while (true)
+                {
+                    if (buffered == buf.Length)
+                    {
+                        byte[] bigger = ArrayPool<byte>.Shared.Rent(buf.Length * 2);
+                        Buffer.BlockCopy(buf, 0, bigger, 0, buffered);
+                        ArrayPool<byte>.Shared.Return(buf);
+                        buf = bigger;
+                    }
+
+                    int read = fs.Read(buf, buffered, buf.Length - buffered);
+                    int total = buffered + read;
+                    int pos = 0;
+
+                    while (pos < total)
+                    {
+                        int nlRel = Array.IndexOf(buf, (byte)'\n', pos, total - pos);
+                        if (nlRel < 0)
+                        {
+                            if (read > 0)
+                                break;
+                            nlRel = total;
+                        }
+
+                        int lineStart = pos;
+                        int lineEnd = nlRel;
+                        if (lineEnd > lineStart && buf[lineEnd - 1] == (byte)'\r')
+                            lineEnd--;
+
+                        if (isFirstLine)
+                        {
+                            isFirstLine = false;
+                            if (lineEnd - lineStart >= 3 && buf[lineStart] == 0xEF && buf[lineStart + 1] == 0xBB && buf[lineStart + 2] == 0xBF)
+                                lineStart += 3;
+                        }
+
+                        while (lineStart < lineEnd && IsAsciiWhitespace(buf[lineStart])) lineStart++;
+                        while (lineEnd > lineStart && IsAsciiWhitespace(buf[lineEnd - 1])) lineEnd--;
+
+                        int lineLen = lineEnd - lineStart;
+                        if (lineLen > 0)
+                        {
+                            long lineOffset = bufStartOffset + lineStart;
+                            reusableLineTemplates.Clear();
+                            if (TryExtractBoardTemplatesUtf8(
+                                    buf.AsSpan(lineStart, lineLen),
+                                    diskSlotByOffset == null ? diskSlotByBoardId : null,
+                                    out string? boardId,
+                                    reusableLineTemplates))
+                            {
+                                int slot = -1;
+                                if (!string.IsNullOrWhiteSpace(boardId) && diskSlotByBoardId != null && diskSlotByBoardId.TryGetValue(boardId, out int sById))
+                                    slot = sById;
+                                else if (diskSlotByOffset != null && diskSlotByOffset.TryGetValue(lineOffset, out int sByOff))
+                                    slot = sByOff;
+
+                                if (slot >= 0)
+                                {
+                                    reusableCodes.Clear();
+                                    for (int t = 0; t < reusableLineTemplates.Count; t++)
+                                        reusableCodes.Add(GetOrAddDiskCode(reusableLineTemplates[t]));
+                                    int[] lineCodes = reusableCodes.Count > 0 ? reusableCodes.ToArray() : Array.Empty<int>();
+                                    entryCodes[slot] = lineCodes;
+                                    codesByOffset[allEntries[slot].FileOffset] = lineCodes;
+                                }
+                            }
+                        }
+
+                        pos = nlRel < total ? nlRel + 1 : total;
+                    }
+
+                    if (pos < total)
+                    {
+                        int remaining = total - pos;
+                        Buffer.BlockCopy(buf, pos, buf, 0, remaining);
+                        buffered = remaining;
+                        bufStartOffset += pos;
+                    }
+                    else
+                    {
+                        buffered = 0;
+                        bufStartOffset += total;
+                    }
+
+                    if (read == 0)
+                        break;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
+
+            // 兜底确保所有磁盘槽位均写入缓存映射
+            for (int i = 0; i < count; i++)
+            {
+                var e = allEntries[i];
+                if (e.IsDiskBacked)
+                {
+                    entryCodes[i] ??= Array.Empty<int>();
+                    codesByOffset.TryAdd(e.FileOffset, entryCodes[i]);
+                }
+            }
+
+            newDiskCache = new DiskKeywordCache
+            {
+                SourceFilePath = sourceFilePath,
+                TemplateToCode = diskTemplateToCode.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
+                CodesByFileOffset = codesByOffset.ToFrozenDictionary(),
+            };
+        }
+
+        // 在磁盘编号前缀 0..K-1 之上补充内存真人镜像的模板编号（磁盘行 int[] 零拷贝复用）
+        var baseTemplateMap = newDiskCache?.TemplateToCode;
+        Dictionary<string, int>? extendedTemplateMap = null;
+
+        int GetOrAddMemoryCode(string templateId)
+        {
+            if (extendedTemplateMap == null)
+            {
+                if (baseTemplateMap != null && baseTemplateMap.TryGetValue(templateId, out int existing))
+                    return existing;
+                extendedTemplateMap = baseTemplateMap != null
+                    ? new Dictionary<string, int>(baseTemplateMap, StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, int>(64, StringComparer.OrdinalIgnoreCase);
+            }
+            if (!extendedTemplateMap.TryGetValue(templateId, out int code))
+            {
+                code = extendedTemplateMap.Count;
+                extendedTemplateMap[templateId] = code;
+            }
+            return code;
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            var e = allEntries[i];
+            if (e.InMemoryBoard != null)
+            {
+                reusableCodes.Clear();
+                var b = e.InMemoryBoard;
+                if (b.Items != null)
+                {
+                    for (int j = 0; j < b.Items.Count; j++)
+                    {
+                        string? tid = b.Items[j]?.TemplateId;
+                        if (!string.IsNullOrWhiteSpace(tid))
+                            reusableCodes.Add(GetOrAddMemoryCode(tid));
+                    }
+                }
+                if (b.Skills != null)
+                {
+                    for (int j = 0; j < b.Skills.Count; j++)
+                    {
+                        string? tid = b.Skills[j]?.TemplateId;
+                        if (!string.IsNullOrWhiteSpace(tid))
+                            reusableCodes.Add(GetOrAddMemoryCode(tid));
+                    }
+                }
+                entryCodes[i] = reusableCodes.Count > 0 ? reusableCodes.ToArray() : Array.Empty<int>();
+            }
+            else
+            {
+                entryCodes[i] ??= Array.Empty<int>();
+            }
+        }
+
+        var finalTemplateMap = extendedTemplateMap != null
+            ? extendedTemplateMap.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase)
+            : (baseTemplateMap ?? FrozenDictionary<string, int>.Empty);
+
+        var idx = new KeywordIndexData
+        {
+            BoundSnapshot = snap,
+            DiskCache = newDiskCache,
+            TemplateToCode = finalTemplateMap,
+            EntryTemplateCodes = entryCodes,
+        };
+        return (idx, newDiskCache);
+    }
+
+    private static bool IsUtf8LineAllowedByMods(
+        ReadOnlySpan<byte> utf8Line,
+        Func<string?, bool> isTemplateAllowed)
+    {
+        try
+        {
+            var reader = new Utf8JsonReader(utf8Line, isFinalBlock: true, state: default);
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+                return false;
+
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.EndObject)
+                    break;
+                if (reader.TokenType != JsonTokenType.PropertyName)
+                    continue;
+
+                if (PropEquals(ref reader, "items"u8, "Items"u8)
+                    || PropEquals(ref reader, "skills"u8, "Skills"u8)
+                    || PropEquals(ref reader, "socketEffects"u8, "SocketEffects"u8))
+                {
+                    if (!reader.Read()) break;
+                    if (reader.TokenType == JsonTokenType.StartArray)
+                    {
+                        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                        {
+                            if (reader.TokenType != JsonTokenType.StartObject)
+                            {
+                                reader.Skip();
+                                continue;
+                            }
+                            while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+                            {
+                                if (reader.TokenType != JsonTokenType.PropertyName) continue;
+                                if (PropEquals(ref reader, "templateId"u8, "TemplateId"u8))
+                                {
+                                    if (!reader.Read()) break;
+                                    if (reader.TokenType == JsonTokenType.String)
+                                    {
+                                        if (!isTemplateAllowed(reader.GetString()))
+                                            return false;
+                                    }
+                                    else
+                                    {
+                                        reader.Skip();
+                                    }
+                                }
+                                else
+                                {
+                                    if (!reader.Read()) break;
+                                    reader.Skip();
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        reader.Skip();
+                    }
+                }
+                else
+                {
+                    if (!reader.Read()) break;
+                    reader.Skip();
+                }
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryExtractBoardTemplatesUtf8(
+        ReadOnlySpan<byte> utf8Line,
+        Dictionary<string, int>? filterByBoardId,
+        out string? boardId,
+        List<string> templateIds)
+    {
+        boardId = null;
+        try
+        {
+            var reader = new Utf8JsonReader(utf8Line, isFinalBlock: true, state: default);
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+                return false;
+
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.EndObject)
+                    break;
+                if (reader.TokenType != JsonTokenType.PropertyName)
+                    continue;
+
+                if (PropEquals(ref reader, "boardId"u8, "BoardId"u8))
+                {
+                    if (!reader.Read()) break;
+                    if (reader.TokenType == JsonTokenType.String)
+                    {
+                        boardId = reader.GetString();
+                        if (filterByBoardId != null && !string.IsNullOrWhiteSpace(boardId) && !filterByBoardId.ContainsKey(boardId))
+                            return false;
+                    }
+                    else
+                    {
+                        reader.Skip();
+                    }
+                }
+                else if (PropEquals(ref reader, "items"u8, "Items"u8) || PropEquals(ref reader, "skills"u8, "Skills"u8))
+                {
+                    if (!reader.Read()) break;
+                    if (reader.TokenType == JsonTokenType.StartArray)
+                    {
+                        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                        {
+                            if (reader.TokenType != JsonTokenType.StartObject)
+                            {
+                                reader.Skip();
+                                continue;
+                            }
+                            while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+                            {
+                                if (reader.TokenType != JsonTokenType.PropertyName) continue;
+                                if (PropEquals(ref reader, "templateId"u8, "TemplateId"u8))
+                                {
+                                    if (!reader.Read()) break;
+                                    if (reader.TokenType == JsonTokenType.String)
+                                    {
+                                        string? tid = reader.GetString();
+                                        if (!string.IsNullOrWhiteSpace(tid))
+                                            templateIds.Add(tid);
+                                    }
+                                    else
+                                    {
+                                        reader.Skip();
+                                    }
+                                }
+                                else
+                                {
+                                    if (!reader.Read()) break;
+                                    reader.Skip();
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        reader.Skip();
+                    }
+                }
+                else
+                {
+                    if (!reader.Read()) break;
+                    reader.Skip();
+                }
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static HashSet<int> ResolveMatchedTemplateCodes(
+        KeywordIndexData kwIndex,
+        string keyword,
+        GameDataRepository? effectiveRepo,
+        out int singleCode)
+    {
+        var matched = new HashSet<int>();
+        singleCode = -1;
+
+        foreach (var (tid, code) in kwIndex.TemplateToCode)
+        {
+            if (tid.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+            {
+                matched.Add(code);
+                continue;
+            }
+
+            if (effectiveRepo == null)
+                continue;
+
+            var tpl = effectiveRepo.GetCard(tid);
+            if (tpl == null)
+                continue;
+
+            if ((!string.IsNullOrEmpty(tpl.InternalName) && tpl.InternalName.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                || (!string.IsNullOrEmpty(tpl.DisplayTitle) && tpl.DisplayTitle.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
+            {
+                matched.Add(code);
+                continue;
+            }
+
+            var loc = effectiveRepo.Localization;
+            if (loc != null)
+            {
+                string? locText = loc.GetLocalizedText(tpl.Localization?.Title);
+                if (!string.IsNullOrEmpty(locText) && locText.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                {
+                    matched.Add(code);
+                    continue;
+                }
+                string? locTitle = loc.GetLocalizedTitle(tpl);
+                if (!string.IsNullOrEmpty(locTitle) && locTitle.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                {
+                    matched.Add(code);
+                    continue;
+                }
+            }
+        }
+
+        if (matched.Count == 1)
+        {
+            foreach (int c in matched)
+                singleCode = c;
+        }
+        return matched;
+    }
+
+    private static bool HasAnyTemplateCode(int[] codes, HashSet<int> targets, int singleTarget)
+    {
+        if (codes.Length == 0) return false;
+        if (singleTarget >= 0)
+        {
+            for (int i = 0; i < codes.Length; i++)
+            {
+                if (codes[i] == singleTarget)
+                    return true;
+            }
+            return false;
+        }
+
+        for (int i = 0; i < codes.Length; i++)
+        {
+            if (targets.Contains(codes[i]))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool IsTemplateAllowedByMods(
+        string? templateId,
+        IReadOnlySet<string> allowedModIds,
+        Func<string, string?> resolveTemplateModId)
+    {
+        if (string.IsNullOrWhiteSpace(templateId))
+            return true;
+        string? modId = resolveTemplateModId(templateId);
+        if (string.IsNullOrWhiteSpace(modId))
+            return true;
+        return allowedModIds.Contains(modId);
+    }
+
+    private static string ResolveCardZhName(CardTemplate? tpl, GameDataRepository? repo)
+    {
+        if (tpl == null) return "";
+        string? locTitle = repo?.Localization?.GetLocalizedTitle(tpl);
+        if (!string.IsNullOrWhiteSpace(locTitle))
+            return locTitle;
+        string? locText = repo?.Localization?.GetLocalizedText(tpl.Localization?.Title);
+        if (!string.IsNullOrWhiteSpace(locText))
+            return locText;
+        if (!string.IsNullOrWhiteSpace(tpl.DisplayTitle))
+            return tpl.DisplayTitle;
+        return tpl.InternalName ?? "";
+    }
+
+    private static GhostBoard EnrichBoardNamesIfNeeded(GhostBoard board, GameDataRepository? repo)
+    {
+        if (repo == null)
+            return board;
+
+        bool needsEnrich = false;
+        if (board.Items != null)
+        {
+            for (int i = 0; i < board.Items.Count; i++)
+            {
+                var it = board.Items[i];
+                if (it != null
+                    && (string.IsNullOrWhiteSpace(it.ZhName) || string.IsNullOrWhiteSpace(it.InternalName))
+                    && repo.GetCard(it.TemplateId) != null)
+                {
+                    needsEnrich = true;
+                    break;
+                }
+            }
+        }
+
+        if (!needsEnrich && board.Skills != null)
+        {
+            for (int i = 0; i < board.Skills.Count; i++)
+            {
+                var sk = board.Skills[i];
+                if (sk != null
+                    && (string.IsNullOrWhiteSpace(sk.ZhName) || string.IsNullOrWhiteSpace(sk.InternalName))
+                    && repo.GetCard(sk.TemplateId) != null)
+                {
+                    needsEnrich = true;
+                    break;
+                }
+            }
+        }
+
+        if (!needsEnrich)
+            return board;
+
+        var enrichedItems = new List<GhostItem>(board.Items?.Count ?? 0);
+        if (board.Items != null)
+        {
+            for (int i = 0; i < board.Items.Count; i++)
+            {
+                var it = board.Items[i];
+                if (it == null) continue;
+                if (string.IsNullOrWhiteSpace(it.ZhName) || string.IsNullOrWhiteSpace(it.InternalName))
+                {
+                    var tpl = repo.GetCard(it.TemplateId);
+                    if (tpl != null)
+                    {
+                        enrichedItems.Add(new GhostItem
+                        {
+                            Slot = it.Slot,
+                            Width = it.Width,
+                            TemplateId = it.TemplateId,
+                            InternalName = string.IsNullOrWhiteSpace(it.InternalName) ? (tpl.InternalName ?? "") : it.InternalName,
+                            ZhName = string.IsNullOrWhiteSpace(it.ZhName) ? ResolveCardZhName(tpl, repo) : it.ZhName,
+                            Tier = it.Tier,
+                            Enchantment = it.Enchantment,
+                            PermanentAttributes = it.PermanentAttributes,
+                            PermanentAdd = it.PermanentAdd,
+                            PermanentMult = it.PermanentMult,
+                            CompletedQuests = it.CompletedQuests,
+                            QuestProgress = it.QuestProgress,
+                            ExtraTags = it.ExtraTags,
+                        });
+                        continue;
+                    }
+                }
+                enrichedItems.Add(it);
+            }
+        }
+
+        var enrichedSkills = new List<GhostSkill>(board.Skills?.Count ?? 0);
+        if (board.Skills != null)
+        {
+            for (int i = 0; i < board.Skills.Count; i++)
+            {
+                var sk = board.Skills[i];
+                if (sk == null) continue;
+                if (string.IsNullOrWhiteSpace(sk.ZhName) || string.IsNullOrWhiteSpace(sk.InternalName))
+                {
+                    var tpl = repo.GetCard(sk.TemplateId);
+                    if (tpl != null)
+                    {
+                        enrichedSkills.Add(new GhostSkill
+                        {
+                            TemplateId = sk.TemplateId,
+                            InternalName = string.IsNullOrWhiteSpace(sk.InternalName) ? (tpl.InternalName ?? "") : sk.InternalName,
+                            ZhName = string.IsNullOrWhiteSpace(sk.ZhName) ? ResolveCardZhName(tpl, repo) : sk.ZhName,
+                            Tier = sk.Tier,
+                            PermanentAttributes = sk.PermanentAttributes,
+                            PermanentAdd = sk.PermanentAdd,
+                            PermanentMult = sk.PermanentMult,
+                            ExtraTags = sk.ExtraTags,
+                        });
+                        continue;
+                    }
+                }
+                enrichedSkills.Add(sk);
+            }
+        }
+
+        return new GhostBoard
+        {
+            BoardId = board.BoardId,
+            Day = board.Day,
+            SourceDay = board.SourceDay,
+            TargetDay = board.TargetDay,
+            Hero = board.Hero,
+            Level = board.Level,
+            HealthMax = board.HealthMax,
+            Prestige = board.Prestige,
+            Wins = board.Wins,
+            Losses = board.Losses,
+            UnlockedSlotsMask = board.UnlockedSlotsMask,
+            PowerBucket = board.PowerBucket,
+            EstimatedWinRate = board.EstimatedWinRate,
+            Source = board.Source,
+            Persona = board.Persona,
+            Archetype = board.Archetype,
+            DisplayName = board.DisplayName,
+            IsPlayerGhost = board.IsPlayerGhost,
+            IsCustomRule = board.IsCustomRule,
+            PoolPartition = board.PoolPartition,
+            Items = enrichedItems,
+            Skills = enrichedSkills,
+            SocketEffects = board.SocketEffects,
+        };
     }
 
     /// <summary>
@@ -981,39 +2373,97 @@ public sealed class PvpGhostPool
         return added;
     }
 
-    /// <summary>
-    /// 记录当前对局 Hour 6 PvP 玩家真实阵容到 SQLite pvp_ghosts 并热加载进对应分区。
-    /// 严格执行沙盒三禁隔离：SandboxLab 或 <c>poolPartition == "none"</c> 绝不入池！
-    /// </summary>
-    public GhostBoard? RecordPlayerGhost(
-        RunState run,
-        Persistence db,
-        bool isCustomRule = false,
-        string? poolPartition = null)
+    /// <summary>校验镜像盘面是否至少包含一件在指定仓库中存在的合法物品模板（用于固定剧本缺 Mod 时的安全回落判定）。</summary>
+    public static bool HasAnyValidItem(GhostBoard? board, GameDataRepository? repo)
     {
-        if (run == null || db == null) return null;
-        if (run.CustomRules?.ShouldSkipGhostPool == true)
-            return null;
-
-        string resolvedPartition = NormalizePartition(
-            poolPartition ?? run.CustomRules?.ResolveGhostPoolPartition(),
-            isCustomRule || run.IsCustomRuleRun);
-        if (string.Equals(resolvedPartition, "none", StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        bool effectiveCustom = isCustomRule
-            || run.IsCustomRuleRun
-            || !string.Equals(resolvedPartition, StandardPartition, StringComparison.OrdinalIgnoreCase);
-
-        int day = (int)Math.Max(1u, run.Day);
-        string boardId = $"player_{run.RunId}_d{day}";
-
-        lock (_writeLock)
+        if (board?.Items == null || board.Items.Count == 0 || repo == null)
+            return false;
+        for (int i = 0; i < board.Items.Count; i++)
         {
-            if (_knownBoardIds.Contains(boardId))
-                return null;
+            var it = board.Items[i];
+            if (it != null && !string.IsNullOrWhiteSpace(it.TemplateId) && repo.GetCard(it.TemplateId) != null)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 从任意运行态 <see cref="RunState"/> 导出当前盘面快照为 <see cref="GhostBoard"/>（不受 <c>ShouldSkipGhostPool</c> / 沙盒隔离限制），
+    /// 完整保留物品永久双层属性（PermanentAdd/PermanentMult）、任务进度、额外标签、技能与插槽效果，供沙盒捕获等场景使用。
+    /// </summary>
+    public static GhostBoard SnapshotBoardFromRun(
+        RunState run,
+        GameDataRepository? repo,
+        int targetDay,
+        string? displayName = null,
+        string? poolPartition = null,
+        string? source = null)
+    {
+        ArgumentNullException.ThrowIfNull(run);
+        int safeDay = Math.Max(1, targetDay);
+        var (items, skills, socketEffects) = ExtractRunBoardComponents(run, repo);
+
+        int wins = (int)run.Victories;
+        int losses = (int)run.Defeats;
+        int healthMax = Math.Max(1, run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.HealthMax, GameDefaults.StartingHealth));
+        int prestige = run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Prestige, GameDefaults.StartingPrestige);
+        int level = Math.Max(1, run.PlayerAttributes.GetValueOrDefault(EPlayerAttributeType.Level, 1));
+        int unlockedSlots = run.UnlockedSlots > 0 ? run.UnlockedSlots : DefaultUnlockedMaskForDay(safeDay);
+        string hero = run.Hero == EHero.Common ? "Vanessa" : run.Hero.ToString();
+
+        string resolvedPartition;
+        if (!string.IsNullOrWhiteSpace(poolPartition))
+        {
+            resolvedPartition = poolPartition.Trim().ToLowerInvariant();
+        }
+        else
+        {
+            resolvedPartition = NormalizePartition(run.CustomRules?.ResolveGhostPoolPartition(), run.IsCustomRuleRun);
+            if (string.Equals(resolvedPartition, "none", StringComparison.OrdinalIgnoreCase))
+                resolvedPartition = StandardPartition;
         }
 
+        bool effectiveCustom = run.IsCustomRuleRun
+            || !string.Equals(resolvedPartition, StandardPartition, StringComparison.OrdinalIgnoreCase);
+
+        string powerBucket = wins >= Math.Max(1, safeDay - 1)
+            ? "Strong"
+            : losses >= wins + 2
+                ? "Weak"
+                : "Normal";
+        double estWr = Math.Clamp(0.45 + wins * 0.05 - losses * 0.04, 0.15, 0.95);
+        string runKey = string.IsNullOrWhiteSpace(run.RunId) ? "run" : run.RunId;
+
+        return new GhostBoard
+        {
+            BoardId = $"snapshot_{runKey}_d{safeDay}",
+            Day = safeDay,
+            SourceDay = safeDay,
+            TargetDay = safeDay,
+            Hero = hero,
+            Level = level,
+            HealthMax = healthMax,
+            Prestige = prestige,
+            Wins = wins,
+            Losses = losses,
+            UnlockedSlotsMask = unlockedSlots,
+            PowerBucket = powerBucket,
+            EstimatedWinRate = estWr,
+            Source = source ?? (run.IsSandboxRun ? "sandbox" : "player"),
+            DisplayName = displayName,
+            IsPlayerGhost = true,
+            IsCustomRule = effectiveCustom,
+            PoolPartition = resolvedPartition,
+            Items = items,
+            Skills = skills,
+            SocketEffects = socketEffects.Count > 0 ? socketEffects : null,
+        };
+    }
+
+    private static (List<GhostItem> Items, List<GhostSkill> Skills, List<GhostSocketEffect> SocketEffects) ExtractRunBoardComponents(
+        RunState run,
+        GameDataRepository? repo)
+    {
         var items = new List<GhostItem>();
         foreach (var entry in run.Cards.Values
                      .Where(c => c.Owner == ECombatantId.Player &&
@@ -1079,13 +2529,16 @@ public sealed class PvpGhostPool
                 }
             }
 
+            string templateId = string.IsNullOrWhiteSpace(entry.CustomCardId) ? entry.TemplateId.ToString() : entry.CustomCardId!;
+            CardTemplate? tpl = repo?.GetCard(templateId);
+
             items.Add(new GhostItem
             {
                 Slot = Math.Clamp(slot, 0, 9),
                 Width = width,
-                TemplateId = string.IsNullOrWhiteSpace(entry.CustomCardId) ? entry.TemplateId.ToString() : entry.CustomCardId!,
-                InternalName = "",
-                ZhName = "",
+                TemplateId = templateId,
+                InternalName = tpl?.InternalName ?? "",
+                ZhName = tpl != null ? ResolveCardZhName(tpl, repo) : "",
                 Tier = entry.Tier.ToString(),
                 Enchantment = entry.Enchantment?.ToString(),
                 PermanentAttributes = perm,
@@ -1096,9 +2549,6 @@ public sealed class PvpGhostPool
                 ExtraTags = extraTags,
             });
         }
-
-        if (items.Count == 0)
-            return null;
 
         var skills = run.Cards.Values
             .Where(c => c.Owner == ECombatantId.Player && c.Type == ECardType.Skill)
@@ -1139,11 +2589,15 @@ public sealed class PvpGhostPool
                     if (core.ExtraTags.Count > 0)
                         skTags = core.ExtraTags.ToList();
                 }
+
+                string templateId = string.IsNullOrWhiteSpace(c.CustomCardId) ? c.TemplateId.ToString() : c.CustomCardId!;
+                CardTemplate? tpl = repo?.GetCard(templateId);
+
                 return new GhostSkill
                 {
-                    TemplateId = string.IsNullOrWhiteSpace(c.CustomCardId) ? c.TemplateId.ToString() : c.CustomCardId!,
-                    InternalName = "",
-                    ZhName = "",
+                    TemplateId = templateId,
+                    InternalName = tpl?.InternalName ?? "",
+                    ZhName = tpl != null ? ResolveCardZhName(tpl, repo) : "",
                     Tier = c.Tier.ToString(),
                     PermanentAttributes = skPerm,
                     PermanentAdd = skAdd,
@@ -1184,6 +2638,47 @@ public sealed class PvpGhostPool
                 };
             })
             .ToList();
+
+        return (items, skills, socketEffects);
+    }
+
+    /// <summary>
+    /// 记录当前对局 Hour 6 PvP 玩家真实阵容到 SQLite pvp_ghosts 并热加载进对应分区。
+    /// 严格执行沙盒三禁隔离：SandboxLab 或 <c>poolPartition == "none"</c> 绝不入池！
+    /// </summary>
+    public GhostBoard? RecordPlayerGhost(
+        RunState run,
+        Persistence db,
+        bool isCustomRule = false,
+        string? poolPartition = null)
+    {
+        if (run == null || db == null) return null;
+        if (run.CustomRules?.ShouldSkipGhostPool == true)
+            return null;
+
+        string resolvedPartition = NormalizePartition(
+            poolPartition ?? run.CustomRules?.ResolveGhostPoolPartition(),
+            isCustomRule || run.IsCustomRuleRun);
+        if (string.Equals(resolvedPartition, "none", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        bool effectiveCustom = isCustomRule
+            || run.IsCustomRuleRun
+            || !string.Equals(resolvedPartition, StandardPartition, StringComparison.OrdinalIgnoreCase);
+
+        int day = (int)Math.Max(1u, run.Day);
+        string boardId = $"player_{run.RunId}_d{day}";
+
+        lock (_writeLock)
+        {
+            if (_knownBoardIds.Contains(boardId))
+                return null;
+        }
+
+        var (items, skills, socketEffects) = ExtractRunBoardComponents(run, repo: null);
+
+        if (items.Count == 0)
+            return null;
 
         int wins = (int)run.Victories;
         int losses = (int)run.Defeats;
@@ -1759,12 +3254,15 @@ public sealed class PvpGhostPool
             }
         }
 
+        var byBoardId = new Dictionary<string, GhostIndexEntry>(_all.Count, StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < _all.Count; i++)
         {
             var e = _all[i];
             if (e.IsPlayerGhost) playerCount++;
             if (e.IsCustomRule) customCount++;
             if (e.IsDiskBacked) diskCount++;
+            if (!string.IsNullOrWhiteSpace(e.BoardId))
+                byBoardId.TryAdd(e.BoardId, e);
         }
 
         _index = new GhostIndexSnapshot
@@ -1772,6 +3270,8 @@ public sealed class PvpGhostPool
             Buckets = buckets.ToFrozenDictionary(),
             StandardAll = standardAll.ToArray(),
             HighDayStrongOrMeta = highDayStrong.ToArray(),
+            AllEntries = _all.ToArray(),
+            ByBoardId = byBoardId.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
             TotalCount = _all.Count,
             PlayerGhostCount = playerCount,
             CustomRuleGhostCount = customCount,
@@ -1784,6 +3284,8 @@ public sealed class PvpGhostPool
         Buckets = FrozenDictionary<BucketKey, DayPartitionBucket>.Empty,
         StandardAll = Array.Empty<GhostIndexEntry>(),
         HighDayStrongOrMeta = Array.Empty<GhostIndexEntry>(),
+        AllEntries = Array.Empty<GhostIndexEntry>(),
+        ByBoardId = FrozenDictionary<string, GhostIndexEntry>.Empty,
         TotalCount = 0,
         PlayerGhostCount = 0,
         CustomRuleGhostCount = 0,
@@ -1897,6 +3399,7 @@ public sealed class PvpGhostPool
                 Source = board.Source ?? "",
                 Persona = board.Persona ?? "",
                 Archetype = board.Archetype ?? "",
+                DisplayName = board.DisplayName,
                 IsPlayerGhost = board.IsPlayerGhost,
                 IsCustomRule = board.IsCustomRule,
                 PoolPartition = normPartition,
@@ -2236,4 +3739,32 @@ public sealed class PvpGhostPool
     private static int GetInt(JsonElement el, string name, int fallback)
         => el.ValueKind == JsonValueKind.Object && el.TryGetProperty(name, out var v) &&
            v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out int i) ? i : fallback;
+}
+
+/// <summary>镜像池多维内存搜索请求 DTO。</summary>
+public sealed class GhostPoolSearchRequest
+{
+    public int? Day { get; set; }
+    public string? Hero { get; set; }
+    public string? PowerBucket { get; set; }     // "" | Weak | Normal | Strong | MetaBoss
+    public string? Source { get; set; }          // "" | community | player | ai
+    public string? Partition { get; set; }       // 可选分区过滤（为空时不限或按需）
+    public int? HpMin { get; set; }
+    public int? HpMax { get; set; }
+    public int? LevelMin { get; set; }
+    public int? LevelMax { get; set; }
+    public string? Keyword { get; set; }
+    public int Page { get; set; } = 1;
+    public int PageSize { get; set; } = 20;
+}
+
+/// <summary>镜像池搜索分页响应 DTO。</summary>
+public sealed class GhostPoolSearchResult
+{
+    public int Total { get; set; }
+    public int Page { get; set; }
+    public int PageSize { get; set; }
+    public bool Truncated { get; set; }
+    public bool IndexBuilding { get; set; }
+    public List<PvpGhostPool.GhostBoard> Items { get; set; } = new();
 }

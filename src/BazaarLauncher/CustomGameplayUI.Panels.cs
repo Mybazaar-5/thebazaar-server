@@ -182,6 +182,8 @@ internal sealed partial class CustomGameplayUI
     private Image _pillStatusDot;
     private TextMeshProUGUI _pillSubText;
 
+    private NativeUguiFactory.ButtonHandle _menuShareBtn;   // 主菜单规则胶囊下面：「分享码」（导入朋友的 / 分享自己的）
+    private NativeUguiFactory.ButtonHandle _inRunShareBtn;  // 局内规则胶囊下面：「分享这局」
     private GameObject _inRunBadgeGo;
     private RectTransform _inRunBadgeRt;
     private Button _inRunBadgeBtn;
@@ -431,6 +433,50 @@ internal sealed partial class CustomGameplayUI
         ibsrt.offsetMax = new Vector2(-12f, 0f);
         _inRunBadgeSubText.gameObject.SetActive(false);
         _inRunBadgeGo.SetActive(false);
+
+        // 主菜单「分享码」：贴在规则胶囊正下方，点开直接导入（剪贴板里有码就自动识别），里面也能切到分享自己的
+        _menuShareBtn = _ui.CreateButton(
+            "MenuShareCodeBtn",
+            _safeViewportRoot,
+            "分享码：导入 / 分享",
+            13f,
+            NativeUguiFactory.ColDefaultPillBg,
+            NativeUguiFactory.ColBtnHover,
+            NativeUguiFactory.ColDefaultPillText,
+            () => SpOpenImportPopup(fromHud: true),
+            borderColor: NativeUguiFactory.ColDefaultPillBorder,
+            fontStyle: FontStyles.Bold,
+            align: TextAlignmentOptions.Center,
+            padH: 10,
+            padV: 4);
+        var msRt = (RectTransform)_menuShareBtn.Root.transform;
+        msRt.anchorMin = new Vector2(0.5f, 1f);
+        msRt.anchorMax = new Vector2(0.5f, 1f);
+        msRt.pivot = new Vector2(0f, 1f);
+        msRt.sizeDelta = new Vector2(170f, 30f);
+        _menuShareBtn.Root.SetActive(false);
+
+        // 局内「分享这局」：贴在局内规则胶囊正下方（战斗中隐藏，不挡倍速芯片）
+        _inRunShareBtn = _ui.CreateButton(
+            "InRunShareBtn",
+            _safeViewportRoot,
+            "分享这局",
+            12.5f,
+            NativeUguiFactory.ColDefaultPillBg,
+            NativeUguiFactory.ColBtnHover,
+            NativeUguiFactory.ColDefaultPillText,
+            () => SpOpenExportPopup("active", null),
+            borderColor: NativeUguiFactory.ColDefaultPillBorder,
+            fontStyle: FontStyles.Bold,
+            align: TextAlignmentOptions.Center,
+            padH: 8,
+            padV: 2);
+        var isRt = (RectTransform)_inRunShareBtn.Root.transform;
+        isRt.anchorMin = new Vector2(1f, 1f);
+        isRt.anchorMax = new Vector2(1f, 1f);
+        isRt.pivot = new Vector2(1f, 1f);
+        isRt.sizeDelta = new Vector2(96f, 28f);
+        _inRunShareBtn.Root.SetActive(false);
 
         // 3. 战斗界面右上角轻量倍速切换小芯片（1x / 2x / 3x / 5x）
         _speedChipGo = _ui.CreateBox("CombatSpeedChip", _safeViewportRoot, NativeUguiFactory.ColPanelBg, rounded: true, raycastTarget: true);
@@ -954,6 +1000,9 @@ internal sealed partial class CustomGameplayUI
             fontStyle: FontStyles.Bold);
         NativeUguiFactory.SetLayout(_btnSaveNormal.Root, minW: 186f, prefW: 196f, minH: 32f);
 
+        // v4：种子与每日对手（这张卡里的操作即点即生效，不需要再点「保存」）
+        BuildSeedPlannerCard(parent);
+
         _normalArchetypeGrid = BuildArchetypeTendencyCard(parent, () => _normalRules, isPreRunPrompt: false);
         _normalWidgets = BuildRuleEditorSections(
             parent,
@@ -1387,27 +1436,28 @@ internal sealed partial class CustomGameplayUI
         NativeUguiFactory.SetLayout(btnResetStats.Root, minW: 168f, prefW: 176f, minH: 26f);
 
         var statsRow = _ui.CreateHorizontalRow("StatsRow", statsCard.transform, spacing: 8f);
-        w.GoldInput = BuildStatCell(statsRow.transform, "初始金币", 0, 9999, 5, () => getRules().StartingGold, v =>
+        // 上下限与服务端 CloneNormalized 一致（以前放得更宽，超出部分会被服务端悄悄截断）
+        w.GoldInput = BuildStatCell(statsRow.transform, "初始金币", 0, 999, 5, () => getRules().StartingGold, v =>
         {
             getRules().StartingGold = v;
             getBuf().GoldText = v.ToString();
         }, onEdited);
-        w.IncomeInput = BuildStatCell(statsRow.transform, "初始收入", 0, 999, 1, () => getRules().StartingIncome, v =>
+        w.IncomeInput = BuildStatCell(statsRow.transform, "初始收入", 0, 200, 1, () => getRules().StartingIncome, v =>
         {
             getRules().StartingIncome = v;
             getBuf().IncomeText = v.ToString();
         }, onEdited);
-        w.ExpInput = BuildStatCell(statsRow.transform, "初始经验", 0, 999, 1, () => getRules().StartingExperience, v =>
+        w.ExpInput = BuildStatCell(statsRow.transform, "初始经验", 0, 500, 1, () => getRules().StartingExperience, v =>
         {
             getRules().StartingExperience = v;
             getBuf().ExperienceText = v.ToString();
         }, onEdited);
-        w.PrestigeInput = BuildStatCell(statsRow.transform, "初始声望", 1, 999, 5, () => getRules().StartingPrestige, v =>
+        w.PrestigeInput = BuildStatCell(statsRow.transform, "初始声望", 1, 100, 5, () => getRules().StartingPrestige, v =>
         {
             getRules().StartingPrestige = v;
             getBuf().PrestigeText = v.ToString();
         }, onEdited);
-        w.HealthInput = BuildStatCell(statsRow.transform, "最大生命", 50, 99999, 50, () => getRules().StartingHealth, v =>
+        w.HealthInput = BuildStatCell(statsRow.transform, "最大生命", 50, 10000, 50, () => getRules().StartingHealth, v =>
         {
             getRules().StartingHealth = v;
             getBuf().HealthText = v.ToString();
@@ -1612,7 +1662,7 @@ internal sealed partial class CustomGameplayUI
 
         // 第一行数值：经济与掉率（商店高阶概率 / 商店价格倍率 / 野怪额外选 / 野怪品阶加成 / 敌人数值倍率）
         var econRow = _ui.CreateHorizontalRow("EconRow", card.transform, spacing: 6f);
-        w.ShopHighTierInput = BuildDoubleStatCell(econRow.transform, "高阶率加成%", -50.0, 100.0, 5.0, "0.#", () => getRules().ShopHighTierBonusPct, v => getRules().ShopHighTierBonusPct = v, onEdited);
+        w.ShopHighTierInput = BuildDoubleStatCell(econRow.transform, "高阶率加成%", 0.0, 100.0, 5.0, "0.#", () => getRules().ShopHighTierBonusPct, v => getRules().ShopHighTierBonusPct = v, onEdited);
         w.ShopPriceMultInput = BuildDoubleStatCell(econRow.transform, "商店价格倍率", 0.1, 5.0, 0.1, "0.##", () => getRules().ShopPriceMultiplier, v => getRules().ShopPriceMultiplier = v, onEdited);
         w.LootBonusChoicesInput = BuildStatCell(econRow.transform, "野怪额外选", 0, 5, 1, () => getRules().MonsterLootBonusChoices, v => getRules().MonsterLootBonusChoices = v, onEdited);
         w.LootTierBonusInput = BuildStatCell(econRow.transform, "战利品升阶", 0, 3, 1, () => getRules().MonsterLootTierBonus, v => getRules().MonsterLootTierBonus = v, onEdited);
@@ -1620,7 +1670,7 @@ internal sealed partial class CustomGameplayUI
 
         // 第二行数值：模式专参 & 流派权重 & 固定种子
         var modeNumRow = _ui.CreateHorizontalRow("ModeNumRow", card.transform, spacing: 6f);
-        w.EndlessMaxDayInput = BuildStatCell(modeNumRow.transform, "无尽最大天", 15, 999, 5, () => getRules().EndlessMaxDay, v => getRules().EndlessMaxDay = v, onEdited);
+        w.EndlessMaxDayInput = BuildStatCell(modeNumRow.transform, "无尽最大天", 15, 99, 5, () => getRules().EndlessMaxDay, v => getRules().EndlessMaxDay = v, onEdited);
         w.CrossHeroBiasInput = BuildDoubleStatCell(modeNumRow.transform, "本职业权重", 0.0, 1.0, 0.05, "0.##", () => getRules().CrossHeroOwnHeroBias, v => getRules().CrossHeroOwnHeroBias = v, onEdited);
         w.BossRushWavesInput = BuildStatCell(modeNumRow.transform, "Boss总波次", 5, 30, 1, () => getRules().BossRushTotalWaves, v => getRules().BossRushTotalWaves = v, onEdited);
         w.ArchetypeWeightInput = BuildDoubleStatCell(modeNumRow.transform, "流派权重倍率", 1.0, 10.0, 0.5, "0.#", () => getRules().ArchetypeWeightMultiplier, v => getRules().ArchetypeWeightMultiplier = v, onEdited);
@@ -1633,15 +1683,19 @@ internal sealed partial class CustomGameplayUI
         w.SandboxRerollToggle = _ui.CreateToggle("TogSbReroll", flagRow.transform, "沙盒免费刷新", true, v => { getRules().SandboxFreeInfiniteReroll = v; onEdited?.Invoke(); }, fontSize: 12.5f);
         w.SandboxZeroPriceToggle = _ui.CreateToggle("TogSbZero", flagRow.transform, "沙盒0金商店", false, v => { getRules().SandboxZeroShopPrice = v; onEdited?.Invoke(); }, fontSize: 12.5f);
 
-        w.FixedSeedInput = _ui.CreateInputField("FixedSeed", flagRow.transform, "固定种子(可空)", "", 12.5f, 12, TMP_InputField.ContentType.IntegerNumber);
-        NativeUguiFactory.SetLayout(w.FixedSeedInput.gameObject, minW: 128f, prefW: 140f, minH: 26f);
-        w.FixedSeedInput.onEndEdit.AddListener(txt =>
+        // 个人规则页的种子改到顶部「种子与每日对手」卡片里填（支持数字、文字和种子码）；这个整数框只留给锦标赛房间规则
+        if (w.IsTournament)
         {
-            var r = getRules();
-            if (r == null) return;
-            r.FixedRunSeed = int.TryParse(txt?.Trim(), out int s) ? s : (int?)null;
-            onEdited?.Invoke();
-        });
+            w.FixedSeedInput = _ui.CreateInputField("FixedSeed", flagRow.transform, "固定种子(可空)", "", 12.5f, 12, TMP_InputField.ContentType.IntegerNumber);
+            NativeUguiFactory.SetLayout(w.FixedSeedInput.gameObject, minW: 128f, prefW: 140f, minH: 26f);
+            w.FixedSeedInput.onEndEdit.AddListener(txt =>
+            {
+                var r = getRules();
+                if (r == null) return;
+                r.FixedRunSeed = int.TryParse(txt?.Trim(), out int s) ? s : (int?)null;
+                onEdited?.Invoke();
+            });
+        }
 
         // 第四行：来自 /custom-rules/catalog 的动态肉鸽突变词条勾选区
         _ui.CreateText("MutTitle", card.transform, "肉鸽突变词条（来自服务端规则目录，点击开关并自动避让冲突组）", 12.5f, NativeUguiFactory.ColMuted);
@@ -2236,6 +2290,20 @@ internal sealed partial class CustomGameplayUI
             }
         }
 
+        // 1b. 主菜单「分享码」按钮：跟着规则胶囊走（锦标赛大厅不显示，锦标赛不用种子分享）
+        bool showMenuShare = showPill && !IsTournamentUiContext();
+        if (_menuShareBtn != null)
+        {
+            if (_menuShareBtn.Root.activeSelf != showMenuShare) _menuShareBtn.Root.SetActive(showMenuShare);
+            if (showMenuShare)
+            {
+                var pr = (RectTransform)_menuRulePillBtn.Root.transform;
+                var sr = (RectTransform)_menuShareBtn.Root.transform;
+                var want = new Vector2(pr.anchoredPosition.x - pr.sizeDelta.x * 0.5f, pr.anchoredPosition.y - pr.sizeDelta.y - 6f);
+                if ((sr.anchoredPosition - want).sqrMagnitude > 0.25f) sr.anchoredPosition = want;
+            }
+        }
+
         // 2. 局内右上角安全区域规则状态胶囊（紧邻设置齿轮左侧，绝不遮挡齿轮）
         bool showInRunBadge = inRun && !_isOpen;
         if (_inRunBadgeGo != null && _inRunBadgeGo.activeSelf != showInRunBadge)
@@ -2254,6 +2322,19 @@ internal sealed partial class CustomGameplayUI
             {
                 _lastInRunBadgeKey = key;
                 ApplyInRunBadgeVisuals(sum, isTourneyRun, inCombat, hasGlyphs, safeW);
+            }
+        }
+
+        // 2b. 局内「分享这局」按钮：贴在规则胶囊正下方，战斗中和锦标赛里不显示
+        bool showRunShare = showInRunBadge && !inCombat && !IsActiveRunTournamentMode();
+        if (_inRunShareBtn != null)
+        {
+            if (_inRunShareBtn.Root.activeSelf != showRunShare) _inRunShareBtn.Root.SetActive(showRunShare);
+            if (showRunShare && _inRunBadgeRt != null)
+            {
+                var sr = (RectTransform)_inRunShareBtn.Root.transform;
+                var want = new Vector2(_inRunBadgeRt.anchoredPosition.x, _inRunBadgeRt.anchoredPosition.y - _inRunBadgeRt.sizeDelta.y - 6f);
+                if ((sr.anchoredPosition - want).sqrMagnitude > 0.25f) sr.anchoredPosition = want;
             }
         }
 
@@ -2557,6 +2638,7 @@ internal sealed partial class CustomGameplayUI
         {
             layoutDirty |= RefreshArchetypeGrid(_normalArchetypeGrid, _normalRules);
             layoutDirty |= SyncEditorWidgets(_normalWidgets, _normalRules, _normalBuf);
+            layoutDirty |= SpRefreshUi();
             if (_btnSaveNormal != null) _btnSaveNormal.Button.interactable = !_isBusy;
         }
         else if (_activeTab == UiTab.Tournament)

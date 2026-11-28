@@ -749,7 +749,7 @@ public sealed class ServerModHost
         return ComputeEffectiveModSetHashFromPackages(effectivePackages);
     }
 
-    private static bool IsGameplayAffectingPackage(ModPackage pkg)
+    internal static bool IsGameplayAffectingPackage(ModPackage pkg)
     {
         if (pkg == null) return false;
         bool hasGameplayContent = pkg.Cards.Count > 0 || pkg.Patches.Count > 0 || pkg.Events.Count > 0

@@ -1,10 +1,10 @@
 <Project>
   <PropertyGroup>
     <!-- 全仓唯一权威版本号（D7-P1-01），确保 BazaarCore / BazaarServer / BazaarModSdk / BazaarLauncher / BazaarHub 等全工程对齐 -->
-    <Version>15.4.0</Version>
-    <AssemblyVersion>15.4.0.0</AssemblyVersion>
-    <FileVersion>15.4.0.0</FileVersion>
-    <InformationalVersion>15.4.0</InformationalVersion>
+    <Version>15.5.0</Version>
+    <AssemblyVersion>15.5.0.0</AssemblyVersion>
+    <FileVersion>15.5.0.0</FileVersion>
+    <InformationalVersion>15.5.0</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <!-- 隔离 BaseIntermediateOutputPath 构建时显式排除项目默认 obj/ 与 bin/，避免双份 AssemblyInfo.cs 触发 CS0579 -->
     <DefaultItemExcludes>$(DefaultItemExcludes);obj/**;bin/**</DefaultItemExcludes>

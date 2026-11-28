@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="{{ASSET_PREFIX}}icon.svg" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>大巴扎 · 对手与种子编排台</title>
+  <link rel="stylesheet" href="{{ASSET_PREFIX}}planner.css" />
+</head>
+<body>
+  <!-- ═════════ 登录页 ═════════ -->
+  <div class="auth-screen hidden" id="authScreen">
+    <div class="auth-card">
+      <div class="brand brand-lg">
+        <div class="brand-emblem">◆</div>
+        <div class="brand-text">
+          <h1>大巴扎 · 对手与种子编排台</h1>
+          <p>安排每天晚上遇到谁 · 找想要的种子 · 一串码分享给朋友</p>
+        </div>
+      </div>
+
+      <div class="auth-status hidden" id="authStatus"></div>
+
+      <div class="auth-block">
+        <h3>推荐：从游戏里打开</h3>
+        <ol class="auth-steps">
+          <li>在游戏里按 <kbd>F8</kbd> 打开设置面板</li>
+          <li>在「常规规则」最上面的「🌱 种子与对手」卡片里点 <b>🌐 去网页详细编辑</b></li>
+          <li>浏览器会自动登录到这里，不用输密码</li>
+        </ol>
+      </div>
+
+      <div class="auth-divider"><span>或者用设置过口令的账号登录</span></div>
+
+      <form class="auth-form" id="loginForm" autocomplete="on">
+        <label class="field">
+          <span>游戏账号名</span>
+          <input type="text" id="loginUsername" autocomplete="username" maxlength="40" required />
+        </label>
+        <label class="field">
+          <span>口令</span>
+          <input type="password" id="loginPassword" autocomplete="current-password" maxlength="64" required />
+        </label>
+        <button type="submit" class="btn btn-gold btn-block" id="btnLogin">登录</button>
+        <p class="muted">没设置口令的账号只能从游戏里打开。</p>
+      </form>
+    </div>
+  </div>
+
+  <!-- ═════════ 主界面 ═════════ -->
+  <div class="app-shell hidden" id="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-emblem">◆</div>
+        <div class="brand-text">
+          <h1>对手与种子编排台</h1>
+          <p>这里改的东西从你的<b>下一局</b>开始生效</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button type="button" class="pill-btn" id="btnModEnv" title="选择编排时可以用哪些 Mod 的卡牌">
+          <span class="pill-label">编排用 Mod</span><b id="modEnvLabel">原版</b><span class="caret">▾</span>
+        </button>
+        <span class="account-pill" id="accountPill">—</span>
+        <button type="button" class="btn btn-subtle btn-sm" id="btnLogout">退出</button>
+      </div>
+    </header>
+
+    <!-- 下一局的设置（始终可见） -->
+    <section class="game-strip" id="gameStrip">
+      <div class="gs-title">下一局会这样开</div>
+      <div class="gs-item">
+        <span class="gs-label">种子</span>
+        <b class="gs-value" id="gsSeed">未设置（随机）</b>
+        <button type="button" class="btn btn-subtle btn-xs" id="gsSeedEdit">修改</button>
+      </div>
+      <div class="gs-item">
+        <span class="gs-label">对手</span>
+        <b class="gs-value" id="gsOpp">全随机</b>
+        <button type="button" class="btn btn-subtle btn-xs hidden" id="gsOppReset">改回全随机</button>
+      </div>
+      <div class="gs-item">
+        <span class="gs-label">玩法 Mod</span>
+        <b class="gs-value" id="gsMods">原版</b>
+      </div>
+      <div class="gs-run hidden" id="gsRun"></div>
+    </section>
+
+    <nav class="tabbar" role="tablist">
+      <button type="button" class="tab-btn active" data-tab="lineups" role="tab">
+        <span class="tab-num">1</span><span class="tab-txt"><b>安排对手</b><small>指定每天晚上 PvP 遇到谁</small></span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="seeds" role="tab">
+        <span class="tab-num">2</span><span class="tab-txt"><b>找种子</b><small>固定事件和商店，或按想要的事件找种子</small></span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="share" role="tab">
+        <span class="tab-num">3</span><span class="tab-txt"><b>分享码</b><small>把这局 / 方案发给朋友，或导入朋友的</small></span>
+      </button>
+    </nav>
+
+    <main class="main-content">
+      <!-- ══════ Tab 1：安排对手 ══════ -->
+      <section class="tab-panel active" id="tab-lineups">
+        <ol class="step-bar">
+          <li><b>新建一个方案</b>，或点「从对局生成」把打过的一局存下来</li>
+          <li><b>点上面某一天</b> → 从镜像池挑一个真实阵容（能看技能和效果），或者自己摆</li>
+          <li><b>点「▶ 下一局用它」</b>，回游戏开新局；想给朋友就点「🔗 分享」</li>
+        </ol>
+        <div class="lineup-layout">
+          <aside class="card-panel lineup-list-panel">
+            <div class="panel-header compact">
+              <h2>我的对手方案 <span class="count-tag" id="lineupCount">0</span></h2>
+            </div>
+            <div class="btn-row list-actions">
+              <button type="button" class="btn btn-gold btn-sm" id="btnNewLineup">+ 新建</button>
+              <button type="button" class="btn btn-outline btn-sm" id="btnLineupFromRun" title="把正在打的这局 / 上一局存成方案：打过的天用实际对手，没打到的天自动补">⤓ 从对局生成</button>
+            </div>
+            <div class="lineup-list" id="lineupList"></div>
+            <div class="hint-box">
+              <b>方案是什么？</b>方案 = 一个种子 + 每天晚上的固定对手。没安排的天照常随机匹配。<br />
+              朋友给的分享码导入后，也会变成一个方案，可以接着改、再分享。
+            </div>
+          </aside>
+
+          <section class="card-panel lineup-editor" id="lineupEditor"></section>
+        </div>
+      </section>
+
+      <!-- ══════ Tab 2：找种子 ══════ -->
+      <section class="tab-panel" id="tab-seeds">
+        <ol class="step-bar">
+          <li><b>有种子码了？</b>填到 A，点「应用到下一局」</li>
+          <li><b>想先看看？</b>在 B 看这个种子每天会遇到哪些事件</li>
+          <li><b>想遇到某个事件？</b>在 C 说「想在第几天遇到它」，服务器帮你一个个种子试</li>
+        </ol>
+        <div class="seed-layout">
+          <div class="card-panel" id="seedCard">
+            <div class="panel-header compact"><h2><span class="sec-tag">A</span>下一局用哪个种子</h2></div>
+            <p class="muted panel-subtitle">种子固定以后，事件、野怪、商店、升级奖励都一样。种子码是 S 开头的 8 位（比如 S3KZ9QW1）；留空就是普通随机局。</p>
+            <div class="seed-input-row">
+              <input type="text" id="seedInput" class="mono" maxlength="12" placeholder="例如 S3KZ9QW1" spellcheck="false" />
+              <button type="button" class="btn btn-subtle" id="btnSeedRandom" title="随机生成一个种子码">🎲 随机</button>
+              <button type="button" class="btn btn-gold" id="btnSeedApply">应用到下一局</button>
+              <button type="button" class="btn btn-outline" id="btnSeedClear">清空</button>
+            </div>
+            <div class="seed-status" id="seedStatus"></div>
+            <details class="explain">
+              <summary>种子到底固定了什么？</summary>
+              <table class="explain-table">
+                <tr><th>由种子固定</th><td>每小时的 3 个事件、第 3 小时的野怪、商店货架和刷新、升级奖励、战利品、奇遇里的分支、随机附魔祭坛、开局物品</td></tr>
+                <tr><th>跟着你的操作变</th><td>你自己物品的随机效果、战斗中的随机。同样的操作顺序会得到同样的结果</td></tr>
+                <tr><th>种子管不了</th><td>每晚的 PvP 对手（要固定对手，去「安排对手」）</td></tr>
+              </table>
+              <p class="muted">提示：你在某一步做了不同选择（比如选了别的事件），后面的选项可能就不一样了，这是正常的。每日挑战模式会用当天的官方种子，这里填的不生效。</p>
+            </details>
+          </div>
+
+          <div class="card-panel" id="calendarCard">
+            <div class="panel-header compact"><h2><span class="sec-tag">B</span>看看这个种子每天遇到什么</h2></div>
+            <div class="form-row">
+              <label class="field grow"><span>种子码</span><input type="text" id="calSeed" class="mono" maxlength="12" spellcheck="false" placeholder="留空就用 A 里的种子" /></label>
+              <label class="field"><span>英雄</span><select id="calHero"></select></label>
+              <label class="field"><span>看几天</span>
+                <select id="calDays"><option value="3">3 天</option><option value="5" selected>5 天</option><option value="10">10 天</option></select>
+              </label>
+              <label class="inline-check"><input type="checkbox" id="calUseRules" checked /> 按我的规则</label>
+              <button type="button" class="btn btn-gold" id="btnCalPreview">查看</button>
+            </div>
+            <div id="calendarOut" class="calendar-out"></div>
+          </div>
+
+          <div class="card-panel" id="finderCard">
+            <div class="panel-header compact"><h2><span class="sec-tag">C</span>想遇到某个事件？帮你找种子</h2></div>
+            <p class="muted panel-subtitle">比如：想在<b>第 1–3 天</b>遇到「某个奇遇」→ 在下面选这个奇遇、选第 1 到第 3 天 → 点「开始找」→ 找到后点「用这个种子」。条件越多越难找，建议 1~3 个。</p>
+            <div class="form-row">
+              <label class="field"><span>英雄</span><select id="findHero"></select></label>
+              <label class="inline-check"><input type="checkbox" id="findUseRules" checked /> 按我的规则</label>
+            </div>
+            <div class="cond-list" id="condList"></div>
+            <div class="btn-row">
+              <button type="button" class="btn btn-subtle btn-sm" id="btnAddCond">+ 再加一个条件</button>
+              <span class="spacer"></span>
+              <button type="button" class="btn btn-gold" id="btnFindStart">开始找</button>
+              <button type="button" class="btn btn-outline hidden" id="btnFindStop">停止</button>
+            </div>
+            <div class="finder-progress hidden" id="finderProgress">
+              <div class="progress-bar"><div class="progress-fill" id="finderBar"></div></div>
+              <span id="finderText"></span>
+            </div>
+            <div class="finder-results" id="finderResults"></div>
+            <p class="muted small-note">找的时候按「每小时都不进事件」推演；你实际进了某个事件以后，后面的选项可能会变。</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════ Tab 3：分享码 ══════ -->
+      <section class="tab-panel" id="tab-share">
+        <ol class="step-bar">
+          <li><b>游戏里就能分享：</b>局内右上角「分享这局」一键复制；主菜单「分享码」粘贴导入</li>
+          <li><b>这里多一些选项：</b>分享一个改好的方案、带不带规则、下载成文件</li>
+          <li><b>朋友在别的服务器：</b>发「长码」或分享文件（短码只在同一个服务器能用）</li>
+        </ol>
+        <div class="share-layout">
+          <div class="card-panel" id="exportCard">
+            <div class="panel-header compact"><h2>生成分享码</h2></div>
+            <div class="field-group">
+              <div class="group-label">分享什么</div>
+              <div class="radio-cards" id="exportSourceGroup"></div>
+            </div>
+            <label class="field hidden" id="exportLineupField"><span>选一个方案</span><select id="exportLineup"></select></label>
+            <div class="field-group" id="exportScopeField">
+              <div class="group-label">带不带对手</div>
+              <div class="radio-cards" id="exportScopeGroup">
+                <label class="radio-card" id="scopeGhostsCard">
+                  <input type="radio" name="exportScope" value="events_and_ghosts" />
+                  <span class="rc-title">种子 + 对手</span>
+                  <span class="rc-desc" id="scopeGhostsDesc">种子 + 你每天实际遇到的对手。</span>
+                </label>
+                <label class="radio-card">
+                  <input type="radio" name="exportScope" value="events_only" checked />
+                  <span class="rc-title">只带种子</span>
+                  <span class="rc-desc">朋友遇到同样的事件和商店，对手照常随机。</span>
+                </label>
+              </div>
+            </div>
+            <div class="form-row">
+              <label class="inline-check"><input type="checkbox" id="exportIncludeRules" /> 带上我的规则（模式、词条、开局数值）</label>
+            </div>
+            <div class="form-row">
+              <label class="field grow"><span>标题（可选）</span><input type="text" id="exportTitle" maxlength="40" placeholder="例如：开局两把神器的种子" /></label>
+              <label class="field hidden" id="exportHeroField"><span>英雄</span><select id="exportHero"></select></label>
+            </div>
+            <button type="button" class="btn btn-gold btn-block" id="btnExport">生成分享码</button>
+            <div class="export-result hidden" id="exportResult"></div>
+          </div>
+
+          <div class="card-panel" id="importCard">
+            <div class="panel-header compact"><h2>导入朋友的分享</h2></div>
+            <textarea id="importInput" rows="3" spellcheck="false" placeholder="粘贴短码 BZ-XXXX-XXXX，或者 BZR1: 开头的长码"></textarea>
+            <div class="btn-row">
+              <button type="button" class="btn btn-gold" id="btnImportPreview">识别</button>
+              <button type="button" class="btn btn-outline" id="btnImportFile">📄 从文件导入</button>
+              <button type="button" class="btn btn-subtle" id="btnImportClear">清空</button>
+            </div>
+            <div class="import-preview" id="importPreview"></div>
+          </div>
+
+          <div class="card-panel span-2" id="mineCard">
+            <div class="panel-header compact">
+              <h2>我生成过的分享码</h2>
+              <button type="button" class="btn btn-subtle btn-sm" id="btnMineRefresh">↻ 刷新</button>
+            </div>
+            <div id="mineList"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div class="toast-container" id="toastContainer" aria-live="polite"></div>
+  <script src="{{ASSET_PREFIX}}planner.js"></script>
+</body>
+</html>

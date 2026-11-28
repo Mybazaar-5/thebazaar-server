@@ -34,6 +34,71 @@ public static class DailyChallengeSeedGenerator
     public const string StreamLevelUp = "levelup";
     public const string StreamPvpOpponent = "pvp_opp";
     public const string StreamCombat = "combat";
+    public const string StreamEncounterStep = "encounter_step";
+    public const string StreamPedestalEnchant = "pedestal_enchant";
+    private const string SeedCodeAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"; // 32 个，去掉 I L O U
+
+    /// <summary>清洗种子文本：全角转半角、去除所有空白字符并截断至 48 字符，空字符串返回 null。</summary>
+    public static string? NormalizeSeedText(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        string s = raw.Normalize(NormalizationForm.FormKC).Trim(); // 全角 → 半角
+        s = string.Concat(s.Where(c => !char.IsWhiteSpace(c)));
+        if (s.Length == 0) return null;
+        return s.Length <= 48 ? s : s[..48];
+    }
+
+    /// <summary>主种子 → 8 位可读种子码：S + 7 位 32 进制（可精确还原）。</summary>
+    public static string FormatSeedCode(int masterSeed)
+    {
+        uint v = unchecked((uint)masterSeed);
+        Span<char> buf = stackalloc char[7];
+        for (int i = 6; i >= 0; i--) { buf[i] = SeedCodeAlphabet[(int)(v & 31)]; v >>= 5; }
+        return "S" + new string(buf);
+    }
+
+    private static bool TryDecodeSeedCode(ReadOnlySpan<char> s, out uint value)
+    {
+        value = 0;
+        if (s.Length != 7) return false;
+        ulong acc = 0;
+        foreach (char c in s)
+        {
+            int d = SeedCodeAlphabet.IndexOf(c);
+            if (d < 0) return false;
+            acc = (acc << 5) | (uint)d;
+        }
+        if (acc > uint.MaxValue) return false;
+        value = (uint)acc;
+        return true;
+    }
+
+    /// <summary>
+    /// 解析种子：只认固定格式的种子码「S + 7 位」（大小写、空格、全角都可以；O 当 0、I/L 当 1），
+    /// 数字、文字一律不认。返回的 displayText 是规范写法。
+    /// </summary>
+    public static bool TryParseSeedText(string? rawText, out int masterSeed, out string displayText)
+    {
+        masterSeed = 0;
+        displayText = "";
+        string? s = NormalizeSeedText(rawText);
+        if (s == null) return false;
+        var chars = s.ToUpperInvariant().ToCharArray();
+        if (chars.Length != 8 || chars[0] != 'S') return false;
+        for (int i = 1; i < chars.Length; i++)
+        {
+            chars[i] = chars[i] switch { 'O' => '0', 'I' => '1', 'L' => '1', _ => chars[i] };
+        }
+        if (!TryDecodeSeedCode(new string(chars, 1, 7).AsSpan(), out uint decoded)) return false;
+        masterSeed = unchecked((int)decoded);
+        if (masterSeed == 0) masterSeed = 1;
+        displayText = FormatSeedCode(masterSeed);
+        return true;
+    }
+
+    /// <summary>种子文本 → 规范写法的种子码；不是合法种子码返回 null。</summary>
+    public static string? NormalizeSeedCode(string? rawText)
+        => TryParseSeedText(rawText, out _, out string display) ? display : null;
 
     /// <summary>获取东八区（UTC+8）当前日期键（格式 yyyy-MM-dd）。</summary>
     public static string GetTodayDateKeyUtc8(DateTimeOffset? utcNow = null)
@@ -158,6 +223,14 @@ public static class DailyChallengeSeedGenerator
         }
         return hash;
     }
+}
+
+/// <summary>
+/// 种子算法版本号：任何改变“同种子出什么”的改动都必须递增，用于蓝图导入提示与金样测试兜底。
+/// </summary>
+public static class SeedAlgo
+{
+    public const int Current = 1;
 }
 
 /// <summary>

@@ -92,11 +92,17 @@ public sealed class ShopEngine
     private readonly CardPool _pool;
     private readonly GameDataRepository _repo;
     private readonly TierChances _chances;
-    private readonly Random _rng;
+    private RunRandom? _rr;
     private readonly Dictionary<string, MerchantDiscountInfo> _activeShelfDiscounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<List<MonsterLootCandidate>> _monsterLootPages = new();
     private CardArchetypeIndex? _cachedArchetypeIndex;
-    private int _seq;
+
+    /// <summary>本局统一随机数入口（RunEngine 注入共享实例；独立 new ShopEngine 的单测惰性创建）。</summary>
+    public RunRandom Rng
+    {
+        get => _rr ??= new RunRandom(_run);
+        set => _rr = value;
+    }
 
     public ShopEngine(RunState run, CardPool pool, GameDataRepository repo)
     {
@@ -104,7 +110,6 @@ public sealed class ShopEngine
         _pool = pool;
         _repo = repo;
         _chances = pool.CreateTierChances();
-        _rng = run.RngSeed != 0 ? new Random(run.RngSeed) : new Random();
         RestoreMonsterLootPagesFromRun();
         RestoreActiveShelfDiscountsFromRun();
     }
@@ -216,6 +221,9 @@ public sealed class ShopEngine
     /// </summary>
     private Random ResolveStreamRng(string streamTag, int index = 0)
     {
+        var s = Rng.Stream(streamTag, index);
+        if (s != null) return s;
+
         var rules = ActiveRules ?? _run.CustomRules;
         if (rules != null && (rules.SpecialModeId == ESpecialModeId.DailyChallenge || rules.FixedRunSeed.HasValue))
         {
@@ -224,7 +232,7 @@ public sealed class ShopEngine
                     rules.DailyChallengeDate ?? DailyChallengeSeedGenerator.GetTodayDateKeyUtc8());
             return DailyChallengeSeedGenerator.CreateStreamRng(masterSeed, streamTag, (int)_run.Day, (int)_run.Hour, index);
         }
-        return _rng;
+        return Rng.Main;
     }
 
     /// <summary>
@@ -418,7 +426,7 @@ public sealed class ShopEngine
     internal void SetCurrentMaxSelections(int? maxSelections)
         => CurrentMaxSelections = maxSelections.HasValue ? Math.Max(1, maxSelections.Value) : null;
 
-    public string NewId(string prefix) => $"{prefix}_{(_seq++):X4}_{DateTime.UtcNow.Ticks % 100000:X5}";
+    public string NewId(string prefix) => $"{prefix}_{(_run.NextInstanceSeq++):X4}_{DateTime.UtcNow.Ticks % 100000:X5}";
 
     /// <summary>清掉所有待选临时卡（SelectionSet 或 Owner == null 的卡）、重置货架折扣及战利品分页。</summary>
     public List<IGameSimEvent> ClearShelf()
@@ -563,7 +571,7 @@ public sealed class ShopEngine
         if (curatedCore?.SelectionContext?.SpawnContext != null)
         {
             var queryPlayer = BuildDummyQueryPlayer(hero, (int)_run.Day);
-            var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, queryPlayer, _rng)
+            var ctx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, queryPlayer, queryPlayer, Rng.Main)
             {
                 CurrentDay = (int)_run.Day,
                 CurrentHour = (int)_run.Hour,
@@ -883,7 +891,7 @@ public sealed class ShopEngine
                 if (!HasEncounterRuntimePrerequisites(enc, core))
                     return true;
                 var qp = GetQueryPlayer();
-                var checkCtx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, qp, qp, _rng)
+                var checkCtx = new RuleExecutionContext(_repo, RuleScope.OutOfCombat, qp, qp, streamRng)
                 {
                     CurrentDay = actualDay,
                     CurrentHour = (int)hour,
@@ -2259,7 +2267,7 @@ public sealed class ShopEngine
         double total = weightedTiers.Sum(t => t.Weight);
         if (total > 0)
         {
-            double roll = _rng.NextDouble() * total;
+            double roll = Rng.Main.NextDouble() * total;
             double acc = 0;
             ETier chosenTier = weightedTiers[0].Tier;
             foreach (var (tier, w) in weightedTiers)
@@ -2274,12 +2282,12 @@ public sealed class ShopEngine
 
             if (byTier.TryGetValue(chosenTier, out var tierList))
             {
-                var pick = _pool.RollWeightedEncounter(tierList, pickedIds, visitedSingleSpawn, _rng, weightMultiplier, bannedIds);
+                var pick = _pool.RollWeightedEncounter(tierList, pickedIds, visitedSingleSpawn, Rng.Main, weightMultiplier, bannedIds);
                 if (pick != null) return pick;
             }
         }
 
-        return _pool.RollWeightedEncounter(available, pickedIds, visitedSingleSpawn, _rng, weightMultiplier, bannedIds);
+        return _pool.RollWeightedEncounter(available, pickedIds, visitedSingleSpawn, Rng.Main, weightMultiplier, bannedIds);
     }
 
     /// <summary>
@@ -2866,7 +2874,7 @@ public sealed class ShopEngine
     /// <summary>对非免费商人货架物品逐一按 MerchantItemDiscountChance (12%) 掷骰 25%-off 绿标折扣（D6-P1-10 支持透传确定性子流）。</summary>
     public List<MerchantDiscountInfo> ApplyMerchantDiscounts(IEnumerable<RunState.CardEntry> shelfEntries, Random? rngOverride = null)
     {
-        var rng = rngOverride ?? _rng;
+        var rng = rngOverride ?? Rng.Main;
         var applied = new List<MerchantDiscountInfo>();
         foreach (var entry in shelfEntries)
         {
@@ -3847,7 +3855,7 @@ public sealed class ShopEngine
             {
                 while (_run.SelectionSet.Count < 3)
                 {
-                    var sk = PickRandomUnused(fallbackPool, used, archetypeResolver, effectiveRules);
+                    var sk = PickRandomUnused(fallbackPool, used, archetypeResolver, effectiveRules, levelRng);
                     if (sk == null) break;
                     var entry = CreateSkillCandidate(sk, ParseTier(sk.StartingTier), isFree: true);
                     _run.Cards[entry.InstanceId] = entry;
@@ -4437,7 +4445,7 @@ public sealed class ShopEngine
         return !sawAnyRunPrereq;
     }
 
-    private static bool HasEncounterRuntimePrerequisites(
+    internal static bool HasEncounterRuntimePrerequisites(
         CardPool.CardTemplate? poolTpl,
         BazaarCore.Models.CardTemplate? coreTpl)
     {
@@ -4462,7 +4470,7 @@ public sealed class ShopEngine
         return false;
     }
 
-    private bool CheckEncounterRequirements(
+    internal bool CheckEncounterRequirements(
         CardPool.CardTemplate? poolTpl,
         BazaarCore.Models.CardTemplate? coreTpl,
         RuleExecutionContext ctx)
@@ -4582,7 +4590,7 @@ public sealed class ShopEngine
         ISet<string>? visitedTodayIds = null,
         ISet<string>? bannedIds = null,
         Random? rngOverride = null)
-        => OfficialDaySchedule.SelectDayMonsters(day, count, _pool, _repo, rngOverride ?? _rng, visitedTodayIds, bannedIds);
+        => OfficialDaySchedule.SelectDayMonsters(day, count, _pool, _repo, rngOverride ?? Rng.Main, visitedTodayIds, bannedIds);
 
     private bool IsMerchantEncounter(CardPool.CardTemplate? tpl, BazaarCore.Models.CardTemplate? coreTpl = null)
     {
@@ -4603,7 +4611,7 @@ public sealed class ShopEngine
         var avail = list.Where(c => !used.Contains(c.Id)).ToList();
         if (avail.Count == 0) return null;
 
-        var pick = SpawnQueryEngine.PickWeightedByArchetype(avail, c => c.Id, rngOverride ?? _rng, archetypeResolver, rules)!;
+        var pick = SpawnQueryEngine.PickWeightedByArchetype(avail, c => c.Id, rngOverride ?? Rng.Main, archetypeResolver, rules)!;
         used.Add(pick.Id);
         return pick;
     }
